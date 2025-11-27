@@ -295,7 +295,7 @@ impl UnifiedSigner {
         // This scales to millions of users with just ONE relay connection
         let filter = Filter::new().kind(Kind::NostrConnect);
 
-        self.client.subscribe(vec![filter], None).await?;
+        self.client.subscribe(filter, None).await?;
 
         // Spawn background task to handle authorization commands via channel
         let pool_clone = self.pool.clone();
@@ -931,7 +931,7 @@ impl UnifiedSigner {
 
         tracing::debug!("Sending response event {} (size: {} bytes)", response_event.id, response_event.content.len());
 
-        let send_result = client.send_event(response_event.clone()).await.map_err(|e| {
+        let send_result = client.send_event(&response_event).await.map_err(|e| {
             tracing::error!("Failed to send response event: {:?}", e);
             e
         })?;

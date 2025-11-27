@@ -136,7 +136,7 @@ pub fn validate_auth_event(
         ));
     }
 
-    if event.created_at.as_u64() < (chrono::Utc::now().timestamp() - 60) as u64 {
+    if event.created_at.as_secs() < (chrono::Utc::now().timestamp() - 60) as u64 {
         tracing::debug!("Token validation failed: Event too old");
         return Err(AuthenticationError::InvalidEvent(
             "Event too old".to_string(),

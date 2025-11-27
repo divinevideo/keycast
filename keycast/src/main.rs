@@ -432,9 +432,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     heartbeat_handle.abort();
 
     // Shutdown signer client (disconnect from relays)
-    if let Err(e) = client_for_shutdown.shutdown().await {
-        tracing::warn!("Error shutting down signer client: {:?}", e);
-    }
+    client_for_shutdown.shutdown().await;
 
     // Wait for API server to drain (max 25s to leave buffer before Cloud Run's 30s timeout)
     match tokio::time::timeout(Duration::from_secs(25), api_handle).await {

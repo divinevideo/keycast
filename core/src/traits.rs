@@ -1,7 +1,7 @@
 use crate::types::authorization::AuthorizationError;
 use crate::types::permission::{Permission, PermissionError};
 use async_trait::async_trait;
-use nostr::nips::nip46::Request;
+use nostr::nips::nip46::NostrConnectRequest;
 use nostr_sdk::{PublicKey, UnsignedEvent};
 use sqlx::PgPool;
 
@@ -13,7 +13,7 @@ pub trait AuthorizationValidations {
         pool: &PgPool,
         tenant_id: i64,
         pubkey: &PublicKey,
-        request: &Request,
+        request: &NostrConnectRequest,
     ) -> Result<bool, AuthorizationError>;
 }
 

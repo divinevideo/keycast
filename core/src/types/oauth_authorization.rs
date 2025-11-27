@@ -4,7 +4,7 @@
 use crate::traits::AuthorizationValidations;
 use crate::types::authorization::{AuthorizationError, Relays};
 use chrono::DateTime;
-use nostr::nips::nip46::Request;
+use nostr::nips::nip46::NostrConnectRequest;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
@@ -124,7 +124,7 @@ impl AuthorizationValidations for OAuthAuthorization {
         pool: &PgPool,
         tenant_id: i64,
         pubkey: &PublicKey,
-        request: &Request,
+        request: &NostrConnectRequest,
     ) -> Result<bool, AuthorizationError> {
         // Load permissions if policy exists
         let permissions = self.permissions_sync(pool, tenant_id)?;
@@ -138,10 +138,10 @@ impl AuthorizationValidations for OAuthAuthorization {
             .map_err(|_| AuthorizationError::Unauthorized)?;
 
         match request {
-            Request::Connect { public_key, secret } => {
+            NostrConnectRequest::Connect { remote_signer_public_key, secret } => {
                 tracing::info!(target: "keycast_signer::signer_daemon", "OAuth Connect request received");
                 // Check the public key matches
-                if public_key.to_hex() != self.bunker_public_key {
+                if remote_signer_public_key.to_hex() != self.bunker_public_key {
                     return Err(AuthorizationError::Unauthorized);
                 }
                 // Check that secret is correct
@@ -153,11 +153,11 @@ impl AuthorizationValidations for OAuthAuthorization {
                 }
                 Ok(true)
             }
-            Request::GetPublicKey => {
+            NostrConnectRequest::GetPublicKey => {
                 tracing::info!(target: "keycast_signer::signer_daemon", "OAuth Get public key request");
                 Ok(true)
             }
-            Request::SignEvent(event) => {
+            NostrConnectRequest::SignEvent(event) => {
                 tracing::info!(target: "keycast_signer::signer_daemon", "OAuth Sign event request");
                 // Validate against all permissions (AND logic)
                 for permission in &custom_permissions {
@@ -173,12 +173,8 @@ impl AuthorizationValidations for OAuthAuthorization {
                 }
                 Ok(true)
             }
-            Request::GetRelays => {
-                tracing::info!(target: "keycast_signer::signer_daemon", "OAuth Get relays request");
-                Ok(true)
-            }
-            Request::Nip04Encrypt { public_key, text }
-            | Request::Nip44Encrypt { public_key, text } => {
+            NostrConnectRequest::Nip04Encrypt { public_key, text }
+            | NostrConnectRequest::Nip44Encrypt { public_key, text } => {
                 tracing::info!(target: "keycast_signer::signer_daemon", "OAuth NIP04/44 encrypt request");
                 // Validate against all permissions
                 for permission in &custom_permissions {
@@ -193,8 +189,8 @@ impl AuthorizationValidations for OAuthAuthorization {
                 }
                 Ok(true)
             }
-            Request::Nip04Decrypt { public_key, ciphertext }
-            | Request::Nip44Decrypt { public_key, ciphertext } => {
+            NostrConnectRequest::Nip04Decrypt { public_key, ciphertext }
+            | NostrConnectRequest::Nip44Decrypt { public_key, ciphertext } => {
                 tracing::info!(target: "keycast_signer::signer_daemon", "OAuth NIP04/44 decrypt request");
                 // Validate against all permissions
                 for permission in &custom_permissions {
@@ -209,7 +205,7 @@ impl AuthorizationValidations for OAuthAuthorization {
                 }
                 Ok(true)
             }
-            Request::Ping => {
+            NostrConnectRequest::Ping => {
                 tracing::info!(target: "keycast_signer::signer_daemon", "OAuth Ping request");
                 Ok(true)
             }

@@ -5,7 +5,7 @@ use crate::types::permission::Permission;
 use crate::types::policy::Policy;
 use crate::types::stored_key::StoredKey;
 use chrono::DateTime;
-use nostr::nips::nip46::Request;
+use nostr::nips::nip46::NostrConnectRequest;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
@@ -357,7 +357,7 @@ impl AuthorizationValidations for Authorization {
         pool: &PgPool,
         tenant_id: i64,
         pubkey: &PublicKey,
-        request: &Request,
+        request: &NostrConnectRequest,
     ) -> Result<bool, AuthorizationError> {
         // Before anything, check if the authorization is expired
         if self.expired()? {
@@ -365,7 +365,7 @@ impl AuthorizationValidations for Authorization {
         }
 
         // Approve straight away if it's just a ping request, for now?
-        if *request == Request::Ping {
+        if *request == NostrConnectRequest::Ping {
             return Ok(true);
         }
 
@@ -379,10 +379,10 @@ impl AuthorizationValidations for Authorization {
             custom_permissions.expect("Failed to convert permissions to custom permissions");
 
         match request {
-            Request::Connect { public_key, secret } => {
+            NostrConnectRequest::Connect { remote_signer_public_key, secret } => {
                 tracing::info!(target: "keycast_signer::signer_daemon", "Connect request received");
                 // Check the public key is the same as the bunker public key
-                if public_key.to_hex() != self.bunker_public_key {
+                if remote_signer_public_key.to_hex() != self.bunker_public_key {
                     return Err(AuthorizationError::Unauthorized);
                 }
                 // Check if the authorization is fully redeemed
@@ -403,12 +403,12 @@ impl AuthorizationValidations for Authorization {
                 }
                 Ok(true)
             }
-            Request::GetPublicKey => {
+            NostrConnectRequest::GetPublicKey => {
                 tracing::info!(target: "keycast_signer::signer_daemon", "Get public key request received");
                 // Double check that the pubkey has connected to/redeemed this authorization
                 Ok(self.redemptions_pubkeys_sync(pool, tenant_id)?.contains(pubkey))
             }
-            Request::SignEvent(event) => {
+            NostrConnectRequest::SignEvent(event) => {
                 tracing::info!(target: "keycast_signer::signer_daemon", "Sign event request received");
                 for permission in custom_permissions {
                     if !permission.can_sign(event) {
@@ -417,13 +417,9 @@ impl AuthorizationValidations for Authorization {
                 }
                 Ok(true)
             }
-            Request::GetRelays => {
-                tracing::info!(target: "keycast_signer::signer_daemon", "Get relays request received");
-                Ok(true)
-            }
-            Request::Nip04Encrypt { public_key, text }
-            | Request::Nip44Encrypt { public_key, text } => {
-                tracing::info!(target: "keycast_signer::signer_daemon", "NIP04 encrypt request received");
+            NostrConnectRequest::Nip04Encrypt { public_key, text }
+            | NostrConnectRequest::Nip44Encrypt { public_key, text } => {
+                tracing::info!(target: "keycast_signer::signer_daemon", "NIP04/44 encrypt request received");
                 for permission in custom_permissions {
                     if !permission.can_encrypt(text, pubkey, public_key) {
                         return Err(AuthorizationError::Unauthorized);
@@ -431,15 +427,15 @@ impl AuthorizationValidations for Authorization {
                 }
                 Ok(true)
             }
-            Request::Nip04Decrypt {
+            NostrConnectRequest::Nip04Decrypt {
                 public_key,
                 ciphertext,
             }
-            | Request::Nip44Decrypt {
+            | NostrConnectRequest::Nip44Decrypt {
                 public_key,
                 ciphertext,
             } => {
-                tracing::info!(target: "keycast_signer::signer_daemon", "NIP04 decrypt request received");
+                tracing::info!(target: "keycast_signer::signer_daemon", "NIP04/44 decrypt request received");
                 for permission in custom_permissions {
                     if !permission.can_decrypt(ciphertext, public_key, pubkey) {
                         return Err(AuthorizationError::Unauthorized);
@@ -448,7 +444,7 @@ impl AuthorizationValidations for Authorization {
                 Ok(true)
             }
             // We check this earlier but to complete the match statement, we need to return true here
-            Request::Ping => {
+            NostrConnectRequest::Ping => {
                 tracing::info!(target: "keycast_signer::signer_daemon", "Ping request received");
                 Ok(true)
             }
@@ -460,7 +456,7 @@ impl AuthorizationValidations for Authorization {
 mod tests {
     use super::*;
     use chrono::{Duration, Utc};
-    use nostr::nips::nip46::Request;
+    use nostr::nips::nip46::NostrConnectRequest;
     use nostr_sdk::{Keys, PublicKey};
     // Helper function to create a test database connection
     async fn setup_test_db() -> PgPool {
@@ -693,8 +689,8 @@ mod tests {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
         // Test with a simple request
-        let request = Request::Connect {
-            public_key: PublicKey::from_hex(&auth.bunker_public_key).unwrap(),
+        let request = NostrConnectRequest::Connect {
+            remote_signer_public_key: PublicKey::from_hex(&auth.bunker_public_key).unwrap(),
             secret: Some(auth.secret.clone()),
         };
 

@@ -6,6 +6,17 @@
     <title>Keycast OAuth + PKCE Test</title>
     <script src="https://unpkg.com/nostr-tools@2.7.2/lib/nostr.bundle.js"
             crossorigin="anonymous"></script>
+    <script type="module">
+        // Import nip46 separately (not included in bundle)
+        import { BunkerSigner, parseBunkerInput } from 'https://esm.sh/nostr-tools@2.10.2/nip46';
+        import { SimplePool } from 'https://esm.sh/nostr-tools@2.10.2';
+
+        window.BunkerSigner = BunkerSigner;
+        window.parseBunkerInput = parseBunkerInput;
+        window.SimplePool = SimplePool;
+
+        console.log('[NIP-46] BunkerSigner loaded:', !!BunkerSigner);
+    </script>
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -78,13 +89,16 @@
     <h1>Keycast OAuth + PKCE Test</h1>
     <p>OAuth 2.0 authorization code flow with PKCE security and BYOK support (redirect-based, no popups)</p>
 
-    <div class="section">
-        <h2>Configuration</h2>
-        <label>Keycast Server URL:</label>
-        <input type="text" id="apiUrl" value="">
-
-        <label>Client ID:</label>
-        <input type="text" id="clientId" value="standalone-test-app">
+    <div class="section" style="background: #222; border: 1px solid #333;">
+        <h2 style="color: #888; font-size: 14px; margin: 0 0 10px 0;">Environment</h2>
+        <p style="font-size: 12px; margin: 5px 0; color: #666;">
+            <strong>Server:</strong> <code id="apiUrlDisplay" style="color: #888;"></code>
+        </p>
+        <p style="font-size: 12px; margin: 5px 0; color: #666;">
+            <strong>Client ID:</strong> <code style="color: #888;">standalone-test-app</code>
+        </p>
+        <input type="hidden" id="apiUrl" value="">
+        <input type="hidden" id="clientId" value="standalone-test-app">
     </div>
 
     <div class="section">
@@ -118,8 +132,24 @@
         <h2>Bunker URL Received</h2>
         <pre id="bunkerUrl"></pre>
         <p style="color: #03dac6;">You can now use this bunker URL in any NIP-46 client!</p>
-        <button onclick="testBunkerConnection()">Test Bunker Connection</button>
-        <button onclick="clearAndReset()">Clear & Start Over</button>
+
+        <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #444;">
+            <h3 style="color: #bb86fc; margin: 0 0 15px 0;">Test NIP-46 Signing</h3>
+            <p style="color: #888; font-size: 13px; margin-bottom: 15px;">
+                Sign a test event using the bunker URL (remote signing via NIP-46, not local nsec).
+            </p>
+            <textarea id="eventContent" placeholder="Enter message to sign (kind:1 note)"
+                style="width: 100%; height: 80px; background: #1a1a1a; border: 1px solid #444; border-radius: 6px; color: #e0e0e0; padding: 10px; font-size: 14px; resize: vertical;">Hello from Keycast OAuth test!</textarea>
+            <div class="button-group" style="margin-top: 10px;">
+                <button onclick="signWithBunker()" id="signBtn">Sign Event via NIP-46</button>
+                <button onclick="clearAndReset()" style="background: #4a4a4a;">Clear & Start Over</button>
+            </div>
+        </div>
+
+        <div id="signResult" style="display: none; margin-top: 20px;">
+            <h3 style="color: #03dac6; margin: 0 0 10px 0;">Signed Event</h3>
+            <pre id="signedEvent" style="max-height: 300px; overflow-y: auto;"></pre>
+        </div>
     </div>
 
     <script>
@@ -134,6 +164,7 @@
 
         // Set defaults
         document.getElementById('apiUrl').value = defaultApiUrl;
+        document.getElementById('apiUrlDisplay').textContent = defaultApiUrl;
 
         // PKCE Helpers
         function base64URLEncode(buffer) {
@@ -365,29 +396,89 @@
             }
         }
 
-        // Test the bunker connection
-        async function testBunkerConnection() {
-            const bunkerUrl = document.getElementById('bunkerUrl').textContent;
-            showStatus('Testing bunker connection... (check browser console)', 'info');
-            console.log('[Test] Bunker URL:', bunkerUrl);
+        // Global bunker signer instance
+        let bunkerSigner = null;
 
-            // Parse bunker URL
+        // Sign an event using NIP-46 bunker
+        async function signWithBunker() {
+            const bunkerUrl = document.getElementById('bunkerUrl').textContent;
+            const content = document.getElementById('eventContent').value.trim();
+            const signBtn = document.getElementById('signBtn');
+
+            if (!content) {
+                showStatus('Please enter a message to sign.', 'error');
+                return;
+            }
+
+            signBtn.disabled = true;
+            signBtn.textContent = 'Connecting to bunker...';
+            showStatus('Connecting to bunker via NIP-46...', 'info');
+
             try {
+                const { BunkerSigner, finalizeEvent } = window.NostrTools;
+
+                // Parse bunker URL
                 const url = new URL(bunkerUrl);
-                const pubkey = url.hostname || url.pathname.replace('//', '');
+                const remotePubkey = url.hostname || url.pathname.replace('//', '');
                 const relay = url.searchParams.get('relay');
                 const secret = url.searchParams.get('secret');
 
-                console.log('[Test] Parsed bunker URL:');
-                console.log('  - Pubkey:', pubkey);
+                console.log('[NIP-46] Connecting to bunker:');
+                console.log('  - Remote pubkey:', remotePubkey);
                 console.log('  - Relay:', relay);
                 console.log('  - Secret:', secret ? secret.substring(0, 8) + '...' : 'none');
 
-                showStatus(`Bunker URL parsed successfully!<br>
-                    <small>Pubkey: ${pubkey.substring(0, 16)}...</small><br>
-                    <small>Relay: ${relay}</small>`, 'success');
+                // Create BunkerSigner if not already created
+                if (!bunkerSigner) {
+                    signBtn.textContent = 'Establishing connection...';
+                    showStatus(`Connecting to relay: ${relay}...`, 'info');
+
+                    bunkerSigner = new BunkerSigner(
+                        remotePubkey,
+                        secret,
+                        { relays: [relay] }
+                    );
+
+                    // Wait for connection
+                    await bunkerSigner.connect();
+                    console.log('[NIP-46] Connected to bunker');
+                }
+
+                signBtn.textContent = 'Signing event...';
+                showStatus('Requesting signature from bunker...', 'info');
+
+                // Create unsigned event
+                const unsignedEvent = {
+                    kind: 1,
+                    created_at: Math.floor(Date.now() / 1000),
+                    tags: [],
+                    content: content
+                };
+
+                console.log('[NIP-46] Requesting signature for event:', unsignedEvent);
+
+                // Sign with bunker (this sends NIP-46 sign_event request)
+                const signedEvent = await bunkerSigner.signEvent(unsignedEvent);
+
+                console.log('[NIP-46] Received signed event:', signedEvent);
+
+                // Display the result
+                document.getElementById('signResult').style.display = 'block';
+                document.getElementById('signedEvent').textContent = JSON.stringify(signedEvent, null, 2);
+
+                showStatus(`Event signed successfully via NIP-46!<br>
+                    <small>Event ID: ${signedEvent.id.substring(0, 16)}...</small><br>
+                    <small>Pubkey: ${signedEvent.pubkey.substring(0, 16)}...</small>`, 'success');
+
+                signBtn.textContent = 'Sign Another Event';
+                signBtn.disabled = false;
+
             } catch (error) {
-                showStatus(`Failed to parse bunker URL: ${error.message}`, 'error');
+                console.error('[NIP-46] Error:', error);
+                showStatus(`NIP-46 signing failed: ${error.message}`, 'error');
+                signBtn.textContent = 'Sign Event via NIP-46';
+                signBtn.disabled = false;
+                bunkerSigner = null; // Reset on error
             }
         }
 
@@ -401,6 +492,9 @@
             sessionStorage.removeItem('byok_used');
             sessionStorage.removeItem('byok_pubkey');
             document.getElementById('results').style.display = 'none';
+            document.getElementById('signResult').style.display = 'none';
+            // Reset bunker signer
+            bunkerSigner = null;
             // Generate a fresh identity
             generateTestNsec();
             showStatus('Cleared. New identity generated. Ready to start over.', 'info');
