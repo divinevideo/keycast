@@ -1,4 +1,5 @@
 <script lang="ts">
+import { browser } from "$app/environment";
 import { getCurrentUser, setCurrentUser } from "$lib/current_user.svelte";
 import ndk from "$lib/ndk.svelte";
 import { SigninMethod, signin } from "$lib/utils/auth";
@@ -6,12 +7,15 @@ import { KeycastApi } from "$lib/keycast_api.svelte";
 import { BRAND } from "$lib/brand";
 import type { TeamWithRelations, BunkerSession } from "$lib/types";
 import { NDKNip07Signer } from "@nostr-dev-kit/ndk";
-import { Users, Key, ArrowRight, PlusCircle, Gear, Copy, Check, EnvelopeSimple } from "phosphor-svelte";
+import { Users, Key, ArrowRight, PlusCircle, Gear, Copy, Check, EnvelopeSimple, CaretDown, CaretUp } from "phosphor-svelte";
 import Loader from "$lib/components/Loader.svelte";
 import CreateBunkerModal from "$lib/components/CreateBunkerModal.svelte";
 import { onMount } from "svelte";
 import { nip19 } from "nostr-tools";
 import { toast } from "svelte-hot-french-toast";
+
+// Detect iOS - no browser extension support for NIP-07
+const isIOS = $derived(browser ? /iPad|iPhone|iPod/.test(navigator.userAgent) : false);
 
 const api = new KeycastApi();
 const currentUser = $derived(getCurrentUser());
@@ -29,6 +33,9 @@ let userEmail = $state('');
 let emailVerified = $state(false);
 let showCreateModal = $state(false);
 let copiedNpub = $state(false);
+let expandedSessions = $state<Set<string>>(new Set());
+let showRevokeModal = $state(false);
+let sessionToRevoke = $state<BunkerSession | null>(null);
 
 // Check if user is whitelisted for team creation
 const isWhitelisted = $derived(
@@ -100,6 +107,26 @@ async function copyNpub() {
 	}
 }
 
+function toggleSession(secret: string) {
+	const newSet = new Set(expandedSessions);
+	if (newSet.has(secret)) {
+		newSet.delete(secret);
+	} else {
+		newSet.add(secret);
+	}
+	expandedSessions = newSet;
+}
+
+function formatDate(dateStr: string): string {
+	const date = new Date(dateStr);
+	return date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function confirmRevoke(session: BunkerSession) {
+	sessionToRevoke = session;
+	showRevokeModal = true;
+}
+
 async function revokeSession(secret: string, appName: string) {
 	try {
 		let authHeaders: Record<string, string> = {};
@@ -113,6 +140,8 @@ async function revokeSession(secret: string, appName: string) {
 
 		await api.post('/user/sessions/revoke', { secret }, { headers: authHeaders });
 		toast.success(`Revoked access for ${appName}`);
+		showRevokeModal = false;
+		sessionToRevoke = null;
 		await loadSessions();
 	} catch (err) {
 		toast.error('Failed to revoke session');
@@ -226,6 +255,9 @@ onMount(async () => {
 									<Copy size={16} />
 								{/if}
 							</button>
+							<a href="https://nostr.how/en/guides/get-verified#nostr-addresses" target="_blank" rel="noopener noreferrer" class="learn-link" title="What's an npub?">
+								?
+							</a>
 						</div>
 					</div>
 					{#if authMethod === 'cookie'}
@@ -252,27 +284,73 @@ onMount(async () => {
 				{#if sessions.length === 0}
 					<div class="empty-state">
 						<p>No apps connected yet.</p>
-						<p class="hint">Connect your diVine ID to Nostr apps that support NIP-46 remote signing.</p>
+						<p class="hint">
+							Connect your diVine ID to Nostr apps to sign in without sharing your private key.
+							<a href="https://nostr.how/en/guides/login-with-remote-signer" target="_blank" rel="noopener noreferrer">Learn more</a>
+						</p>
 					</div>
 				{:else}
 					<div class="apps-list">
 						{#each sessions as session}
-							<div class="app-item">
-								<div class="app-info">
-									<p class="app-name">{session.application_name}</p>
-									<p class="app-meta">
-										{session.activity_count} signatures
-										{#if session.last_activity}
-											• Last used {new Date(session.last_activity).toLocaleDateString()}
+							{@const isExpanded = expandedSessions.has(session.secret)}
+							<div class="app-card" class:expanded={isExpanded}>
+								<button class="app-header" onclick={() => toggleSession(session.secret)}>
+									<div class="app-info">
+										<p class="app-name">{session.application_name}</p>
+										<p class="app-meta">
+											{session.activity_count} signatures
+											{#if session.last_activity}
+												• Last used {new Date(session.last_activity).toLocaleDateString()}
+											{/if}
+										</p>
+									</div>
+									<div class="app-expand-icon">
+										{#if isExpanded}
+											<CaretUp size={18} />
+										{:else}
+											<CaretDown size={18} />
 										{/if}
-									</p>
-								</div>
-								<button
-									class="btn-revoke"
-									onclick={() => revokeSession(session.secret, session.application_name)}
-								>
-									Revoke
+									</div>
 								</button>
+
+								{#if isExpanded}
+									<div class="app-details">
+										<div class="details-grid">
+											<div class="detail-item">
+												<span class="detail-label">Created</span>
+												<span class="detail-value">{formatDate(session.created_at)}</span>
+											</div>
+											<div class="detail-item">
+												<span class="detail-label">Last Activity</span>
+												<span class="detail-value">
+													{session.last_activity ? formatDate(session.last_activity) : 'Never'}
+												</span>
+											</div>
+											<div class="detail-item">
+												<span class="detail-label">Total Signatures</span>
+												<span class="detail-value">{session.activity_count}</span>
+											</div>
+											{#if session.client_pubkey}
+												<div class="detail-item full-width">
+													<span class="detail-label">Client Pubkey</span>
+													<span class="detail-value mono">{session.client_pubkey.substring(0, 24)}...</span>
+												</div>
+											{/if}
+											<div class="detail-item full-width">
+												<span class="detail-label">Bunker Pubkey</span>
+												<span class="detail-value mono">{session.bunker_pubkey.substring(0, 24)}...</span>
+											</div>
+										</div>
+										<div class="app-actions">
+											<button
+												class="btn-revoke"
+												onclick={(e) => { e.stopPropagation(); confirmRevoke(session); }}
+											>
+												Revoke Access
+											</button>
+										</div>
+									</div>
+								{/if}
 							</div>
 						{/each}
 					</div>
@@ -325,58 +403,99 @@ onMount(async () => {
 			loadSessions();
 		}}
 	/>
+
+	{#if showRevokeModal && sessionToRevoke}
+		<!-- svelte-ignore a11y_click_events_have_key_events -->
+		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		<div class="modal-overlay" onclick={() => { showRevokeModal = false; sessionToRevoke = null; }}>
+			<!-- svelte-ignore a11y_click_events_have_key_events -->
+			<!-- svelte-ignore a11y_no_static_element_interactions -->
+			<div class="modal" onclick={(e) => e.stopPropagation()}>
+				<h3>Revoke Access?</h3>
+				<p>
+					Are you sure you want to revoke access for
+					<strong>{sessionToRevoke.application_name}</strong>?
+				</p>
+				<p class="modal-warning">This app will no longer be able to sign events on your behalf.</p>
+				<div class="modal-actions">
+					<button class="btn-cancel" onclick={() => { showRevokeModal = false; sessionToRevoke = null; }}>
+						Cancel
+					</button>
+					<button
+						class="btn-confirm-revoke"
+						onclick={() => sessionToRevoke && revokeSession(sessionToRevoke.secret, sessionToRevoke.application_name)}
+					>
+						Revoke Access
+					</button>
+				</div>
+			</div>
+		</div>
+	{/if}
 {:else}
 	<!-- Marketing page for unauthenticated users -->
-	<div class="relative min-h-screen overflow-hidden">
+	<div class="landing-page">
 		<!-- Content -->
-		<div class="flex flex-col items-center justify-center mt-8 md:mt-20 relative">
+		<div class="landing-content">
 			<!-- Logo/Branding -->
-			<a href="/" class="flex flex-row items-center gap-3 mb-8 text-2xl font-bold text-white hover:text-gray-300 transition-colors">
-				<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" fill="currentColor" viewBox="0 0 256 256">
+			<a href="/" class="landing-logo">
+				<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" fill="currentColor" viewBox="0 0 256 256">
 					<path d="M216.57,39.43A80,80,0,0,0,83.91,120.78L28.69,176A15.86,15.86,0,0,0,24,187.31V216a16,16,0,0,0,16,16H72a8,8,0,0,0,8-8V208H96a8,8,0,0,0,8-8V184h16a8,8,0,0,0,5.66-2.34l9.56-9.57A79.73,79.73,0,0,0,160,176h.1A80,80,0,0,0,216.57,39.43ZM180,92a16,16,0,1,1,16-16A16,16,0,0,1,180,92Z"></path>
 				</svg>
 				<span>{BRAND.name}</span>
 			</a>
 
-			<h1 class="text-4xl md:text-5xl font-extrabold">Work Together</h1>
-			<h1 class="text-2xl md:text-4xl font-light text-gray-400">without losing your keys</h1>
+			<h1 class="landing-title">Your Nostr Identity</h1>
+			<p class="landing-subtitle">Secure your keys. Connect everywhere.</p>
 
 			<!-- CTAs -->
-			<div class="flex flex-col items-center gap-4 mt-8">
-				<div class="flex flex-row gap-4">
-					<a href="/register" class="button button-primary">Get Started</a>
-					<a href="/login" class="button button-secondary">Sign In</a>
-				</div>
-				<p class="text-gray-500 text-sm">or</p>
-				<button onclick={handleNip07Signin} class="button button-secondary">Sign In with NIP-07 Extension</button>
+			<div class="landing-ctas">
+				<a href="/register" class="button button-primary">Get Started</a>
+				<a href="/login" class="button button-secondary">Sign In</a>
 			</div>
+
+			<!-- NIP-07 option - hidden on iOS -->
+			{#if !isIOS}
+				<div class="landing-divider">
+					<span>or sign in with</span>
+				</div>
+				<button onclick={handleNip07Signin} class="nip07-button">
+					<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" viewBox="0 0 256 256">
+						<path d="M160,16A80.07,80.07,0,0,0,83.91,120.78L26.34,178.34A8,8,0,0,0,24,184v40a8,8,0,0,0,8,8H72a8,8,0,0,0,8-8V208H96a8,8,0,0,0,8-8V184h16a8,8,0,0,0,5.66-2.34l9.56-9.57A80,80,0,1,0,160,16Zm20,76a16,16,0,1,1,16-16A16,16,0,0,1,180,92Z"></path>
+					</svg>
+					Browser Extension (NIP-07)
+				</button>
+			{/if}
 
 			<!-- Feature sections -->
-			<div class="grid md:grid-cols-3 gap-8 max-w-6xl mx-auto mt-20 px-6">
-				<!-- Team Management -->
-				<div class="feature-panel">
-					<h3 class="text-xl font-bold mb-3">Manage Multiple Teams</h3>
-					<p class="text-gray-400">
-						Easily manage keys across multiple teams with secure, organized access control.
-					</p>
+			<div class="features-grid">
+				<div class="feature-card">
+					<div class="feature-icon">
+						<Key size={24} weight="fill" />
+					</div>
+					<h3>One Identity, Many Apps</h3>
+					<p>Sign in to any Nostr app without sharing your private key.</p>
 				</div>
 
-				<!-- Custom Policies -->
-				<div class="feature-panel">
-					<h3 class="text-xl font-bold mb-3">Custom Permissions</h3>
-					<p class="text-gray-400">
-						Create granular policies to control who can sign, encrypt, or decrypt specific events.
-					</p>
+				<div class="feature-card">
+					<div class="feature-icon">
+						<Users size={24} weight="fill" />
+					</div>
+					<h3>Stay in Control</h3>
+					<p>See which apps you've connected and revoke access anytime.</p>
 				</div>
 
-				<!-- NIP-46 Security -->
-				<div class="feature-panel">
-					<h3 class="text-xl font-bold mb-3">Secure Remote Signing</h3>
-					<p class="text-gray-400">
-						Use NIP-46 remote signing to keep private keys encrypted and secure across all clients.
-					</p>
+				<div class="feature-card">
+					<div class="feature-icon">
+						<Gear size={24} weight="fill" />
+					</div>
+					<h3>Secure by Default</h3>
+					<p>Your key never leaves diVine ID. Apps ask permission to sign.</p>
 				</div>
 			</div>
+
+			<p class="nostr-learn-more">
+				New to Nostr? <a href="https://nostr.how/en/what-is-nostr" target="_blank" rel="noopener noreferrer">Learn how it works</a>
+			</p>
 		</div>
 	</div>
 {/if}
@@ -397,7 +516,7 @@ onMount(async () => {
 	.section-title {
 		font-size: 1.25rem;
 		font-weight: 600;
-		color: #e0e0e0;
+		color: var(--color-divine-text);
 		margin-bottom: 1rem;
 	}
 
@@ -411,7 +530,7 @@ onMount(async () => {
 	/* Identity Section */
 	.identity-card {
 		background: var(--color-divine-surface);
-		border: 1px solid #333;
+		border: 1px solid var(--color-divine-border);
 		border-radius: 12px;
 		padding: 1.25rem;
 	}
@@ -421,7 +540,7 @@ onMount(async () => {
 		align-items: center;
 		gap: 0.75rem;
 		padding: 0.75rem 0;
-		border-bottom: 1px solid #2a2a2a;
+		border-bottom: 1px solid var(--color-divine-border);
 	}
 
 	.identity-row:last-child {
@@ -442,7 +561,7 @@ onMount(async () => {
 	}
 
 	.identity-value {
-		color: #e0e0e0;
+		color: var(--color-divine-text);
 		font-size: 0.95rem;
 	}
 
@@ -471,7 +590,7 @@ onMount(async () => {
 	.copy-btn {
 		background: transparent;
 		border: none;
-		color: #666;
+		color: var(--color-divine-text-tertiary);
 		cursor: pointer;
 		padding: 0.25rem;
 		border-radius: 4px;
@@ -480,27 +599,47 @@ onMount(async () => {
 
 	.copy-btn:hover {
 		color: var(--color-divine-green);
-		background: #2a2a2a;
+		background: var(--color-divine-muted);
+	}
+
+	.learn-link {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 18px;
+		height: 18px;
+		font-size: 0.7rem;
+		font-weight: 600;
+		color: var(--color-divine-text-tertiary);
+		background: var(--color-divine-muted);
+		border-radius: 50%;
+		text-decoration: none;
+		transition: all 0.2s;
+	}
+
+	.learn-link:hover {
+		color: var(--color-divine-green);
+		background: color-mix(in srgb, var(--color-divine-green) 20%, transparent);
 	}
 
 	.identity-actions {
 		padding-top: 0.75rem;
 		margin-top: 0.5rem;
-		border-top: 1px solid #2a2a2a;
+		border-top: 1px solid var(--color-divine-border);
 	}
 
 	.identity-link {
 		display: inline-flex;
 		align-items: center;
 		gap: 0.5rem;
-		color: var(--color-divine-purple-light);
+		color: var(--color-divine-green);
 		text-decoration: none;
 		font-size: 0.875rem;
 		transition: color 0.2s;
 	}
 
 	.identity-link:hover {
-		color: var(--color-divine-purple);
+		color: var(--color-divine-green-dark);
 	}
 
 	/* Connected Apps Section */
@@ -512,7 +651,7 @@ onMount(async () => {
 		background: var(--color-divine-green);
 		color: #fff;
 		border: none;
-		border-radius: 6px;
+		border-radius: 9999px;
 		font-size: 0.875rem;
 		font-weight: 600;
 		cursor: pointer;
@@ -535,57 +674,141 @@ onMount(async () => {
 	}
 
 	.btn-link:hover {
-		color: var(--color-divine-green-light);
+		color: var(--color-divine-green-dark);
 	}
 
 	.empty-state {
 		background: var(--color-divine-surface);
-		border: 1px dashed #333;
+		border: 1px dashed var(--color-divine-border);
 		border-radius: 12px;
 		padding: 2rem;
 		text-align: center;
-		color: #888;
+		color: var(--color-divine-text-secondary);
 	}
 
 	.empty-state .hint {
 		font-size: 0.875rem;
-		color: #666;
+		color: var(--color-divine-text-tertiary);
 		margin-top: 0.5rem;
 	}
 
-	.apps-list {
-		background: var(--color-divine-surface);
-		border: 1px solid #333;
-		border-radius: 12px;
-		overflow: hidden;
+	.empty-state .hint a {
+		color: var(--color-divine-green);
+		text-decoration: none;
 	}
 
-	.app-item {
+	.empty-state .hint a:hover {
+		text-decoration: underline;
+	}
+
+	.apps-list {
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
+	}
+
+	.app-card {
+		background: var(--color-divine-surface);
+		border: 1px solid var(--color-divine-border);
+		border-radius: 12px;
+		overflow: hidden;
+		transition: border-color 0.2s;
+	}
+
+	.app-card:hover {
+		border-color: color-mix(in srgb, var(--color-divine-green) 50%, var(--color-divine-border));
+	}
+
+	.app-card.expanded {
+		border-color: var(--color-divine-green);
+	}
+
+	.app-header {
 		display: flex;
 		justify-content: space-between;
 		align-items: center;
+		width: 100%;
 		padding: 1rem 1.25rem;
-		border-bottom: 1px solid #2a2a2a;
-	}
-
-	.app-item:last-child {
-		border-bottom: none;
+		background: transparent;
+		border: none;
+		cursor: pointer;
+		text-align: left;
 	}
 
 	.app-info {
 		min-width: 0;
+		flex: 1;
 	}
 
 	.app-name {
-		color: #e0e0e0;
+		color: var(--color-divine-text);
 		font-weight: 500;
 		margin: 0;
 	}
 
 	.app-meta {
-		color: #666;
+		color: var(--color-divine-text-tertiary);
 		font-size: 0.875rem;
 		margin: 0.25rem 0 0 0;
+	}
+
+	.app-expand-icon {
+		color: var(--color-divine-text-tertiary);
+		flex-shrink: 0;
+		transition: color 0.2s;
+	}
+
+	.app-card:hover .app-expand-icon {
+		color: var(--color-divine-green);
+	}
+
+	.app-details {
+		padding: 0 1.25rem 1.25rem;
+		border-top: 1px solid var(--color-divine-border);
+		margin-top: -1px;
+	}
+
+	.details-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+		gap: 1rem;
+		padding-top: 1rem;
+	}
+
+	.detail-item {
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
+	}
+
+	.detail-item.full-width {
+		grid-column: 1 / -1;
+	}
+
+	.detail-label {
+		font-size: 0.7rem;
+		color: var(--color-divine-text-secondary);
+		text-transform: uppercase;
+		letter-spacing: 0.5px;
+	}
+
+	.detail-value {
+		font-size: 0.875rem;
+		color: var(--color-divine-text);
+	}
+
+	.detail-value.mono {
+		font-family: monospace;
+		font-size: 0.8rem;
+		word-break: break-all;
+	}
+
+	.app-actions {
+		margin-top: 1rem;
+		padding-top: 1rem;
+		border-top: 1px solid var(--color-divine-border);
+		display: flex;
+		justify-content: flex-end;
 	}
 
 	.btn-revoke {
@@ -593,7 +816,7 @@ onMount(async () => {
 		background: transparent;
 		color: var(--color-divine-error);
 		border: 1px solid var(--color-divine-error);
-		border-radius: 4px;
+		border-radius: 9999px;
 		font-size: 0.8rem;
 		cursor: pointer;
 		transition: all 0.2s;
@@ -607,7 +830,7 @@ onMount(async () => {
 	/* Teams Section */
 	.teams-list {
 		background: var(--color-divine-surface);
-		border: 1px solid #333;
+		border: 1px solid var(--color-divine-border);
 		border-radius: 12px;
 		overflow: hidden;
 	}
@@ -617,8 +840,8 @@ onMount(async () => {
 		justify-content: space-between;
 		align-items: center;
 		padding: 1rem 1.25rem;
-		border-bottom: 1px solid #2a2a2a;
-		color: #e0e0e0;
+		border-bottom: 1px solid var(--color-divine-border);
+		color: var(--color-divine-text);
 		text-decoration: none;
 		transition: background 0.2s;
 	}
@@ -628,7 +851,7 @@ onMount(async () => {
 	}
 
 	.team-item:hover {
-		background: #222;
+		background: var(--color-divine-muted);
 	}
 
 	.team-info {
@@ -641,13 +864,13 @@ onMount(async () => {
 	}
 
 	.team-meta {
-		color: #666;
+		color: var(--color-divine-text-tertiary);
 		font-size: 0.875rem;
 		margin: 0.25rem 0 0 0;
 	}
 
 	.arrow-icon {
-		color: #666;
+		color: var(--color-divine-text-tertiary);
 		transition: all 0.2s;
 	}
 
@@ -656,31 +879,251 @@ onMount(async () => {
 		transform: translateX(4px);
 	}
 
-	/* Marketing Page Styles */
-	.feature-panel {
-		position: relative;
-		overflow: hidden;
+	/* Landing Page Styles */
+	.landing-page {
+		min-height: 100vh;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding: 2rem 1rem;
 	}
 
-	.feature-panel::before {
+	.landing-content {
+		max-width: 480px;
+		width: 100%;
+		text-align: center;
+	}
+
+	.landing-logo {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.75rem;
+		font-size: 1.75rem;
+		font-weight: 700;
+		color: var(--color-divine-green);
+		text-decoration: none;
+		margin-bottom: 2rem;
+	}
+
+	.landing-logo:hover {
+		opacity: 0.9;
+	}
+
+	.landing-title {
+		font-size: 2.5rem;
+		font-weight: 700;
+		color: var(--color-divine-text);
+		margin: 0 0 0.5rem 0;
+		line-height: 1.2;
+	}
+
+	.landing-subtitle {
+		font-size: 1.125rem;
+		color: var(--color-divine-text-secondary);
+		margin: 0 0 2rem 0;
+	}
+
+	.landing-ctas {
+		display: flex;
+		gap: 1rem;
+		justify-content: center;
+		margin-bottom: 1.5rem;
+	}
+
+	.landing-divider {
+		display: flex;
+		align-items: center;
+		gap: 1rem;
+		color: var(--color-divine-text-tertiary);
+		font-size: 0.875rem;
+		margin-bottom: 1.5rem;
+	}
+
+	.landing-divider::before,
+	.landing-divider::after {
 		content: '';
-		position: absolute;
+		flex: 1;
+		height: 1px;
+		background: var(--color-divine-border);
+	}
+
+	.nip07-button {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		gap: 0.5rem;
+		width: 100%;
+		max-width: 280px;
+		padding: 0.75rem 1.25rem;
+		background: var(--color-divine-muted);
+		color: var(--color-divine-text);
+		border: 1px solid var(--color-divine-border);
+		border-radius: 9999px;
+		font-size: 0.9rem;
+		font-weight: 500;
+		cursor: pointer;
+		transition: all 0.2s;
+	}
+
+	.nip07-button:hover {
+		background: var(--color-divine-border);
+	}
+
+	.features-grid {
+		display: grid;
+		grid-template-columns: repeat(3, 1fr);
+		gap: 1.5rem;
+		margin-top: 4rem;
+	}
+
+	@media (max-width: 640px) {
+		.features-grid {
+			grid-template-columns: 1fr;
+			gap: 1rem;
+		}
+
+		.landing-title {
+			font-size: 2rem;
+		}
+
+		.landing-ctas {
+			flex-direction: column;
+			align-items: center;
+		}
+
+		.landing-ctas .button {
+			width: 100%;
+			max-width: 280px;
+		}
+	}
+
+	.feature-card {
+		text-align: center;
+		padding: 1.5rem 1rem;
+	}
+
+	.feature-icon {
+		width: 48px;
+		height: 48px;
+		background: color-mix(in srgb, var(--color-divine-green) 15%, transparent);
+		border-radius: 12px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		margin: 0 auto 1rem;
+		color: var(--color-divine-green);
+	}
+
+	.feature-card h3 {
+		font-size: 1rem;
+		font-weight: 600;
+		color: var(--color-divine-text);
+		margin: 0 0 0.5rem 0;
+	}
+
+	.feature-card p {
+		font-size: 0.875rem;
+		color: var(--color-divine-text-secondary);
+		margin: 0;
+		line-height: 1.5;
+	}
+
+	.nostr-learn-more {
+		margin-top: 2rem;
+		font-size: 0.875rem;
+		color: var(--color-divine-text-tertiary);
+	}
+
+	.nostr-learn-more a {
+		color: var(--color-divine-green);
+		text-decoration: none;
+	}
+
+	.nostr-learn-more a:hover {
+		text-decoration: underline;
+	}
+
+	/* Revoke Modal Styles */
+	.modal-overlay {
+		position: fixed;
 		top: 0;
-		left: -100%;
-		width: 200%;
-		height: 100%;
-		background: linear-gradient(
-			115deg,
-			transparent 0%,
-			transparent 40%,
-			rgba(255, 255, 255, 0.04) 45%,
-			rgba(255, 255, 255, 0.10) 50%,
-			rgba(255, 255, 255, 0.08) 60%,
-			rgba(255, 255, 255, 0.04) 75%,
-			rgba(255, 255, 255, 0.02) 80%,
-			transparent 85%,
-			transparent 100%
-		);
-		pointer-events: none;
+		left: 0;
+		right: 0;
+		bottom: 0;
+		background: rgba(0, 0, 0, 0.6);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		z-index: 1000;
+		backdrop-filter: blur(4px);
+	}
+
+	.modal {
+		background: var(--color-divine-surface);
+		border: 1px solid var(--color-divine-border);
+		border-radius: 16px;
+		padding: 1.5rem;
+		max-width: 400px;
+		width: 90%;
+		box-shadow: 0 20px 50px rgba(0, 0, 0, 0.3);
+	}
+
+	.modal h3 {
+		margin: 0 0 1rem 0;
+		color: var(--color-divine-text);
+		font-size: 1.25rem;
+		font-weight: 600;
+	}
+
+	.modal p {
+		color: var(--color-divine-text-secondary);
+		font-size: 0.95rem;
+		margin: 0 0 0.5rem 0;
+		line-height: 1.5;
+	}
+
+	.modal-warning {
+		color: var(--color-divine-error);
+		font-weight: 500;
+	}
+
+	.modal-actions {
+		display: flex;
+		gap: 0.75rem;
+		margin-top: 1.5rem;
+		justify-content: flex-end;
+	}
+
+	.btn-cancel {
+		padding: 0.625rem 1.25rem;
+		background: transparent;
+		color: var(--color-divine-text-secondary);
+		border: 1px solid var(--color-divine-border);
+		border-radius: 9999px;
+		cursor: pointer;
+		font-size: 0.875rem;
+		font-weight: 500;
+		transition: all 0.2s;
+	}
+
+	.btn-cancel:hover {
+		background: var(--color-divine-muted);
+		color: var(--color-divine-text);
+	}
+
+	.btn-confirm-revoke {
+		padding: 0.625rem 1.25rem;
+		background: var(--color-divine-error);
+		color: #fff;
+		border: none;
+		border-radius: 9999px;
+		cursor: pointer;
+		font-size: 0.875rem;
+		font-weight: 600;
+		transition: all 0.2s;
+	}
+
+	.btn-confirm-revoke:hover {
+		background: #dc2626;
 	}
 </style>

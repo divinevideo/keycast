@@ -46,7 +46,6 @@ onMount(async () => {
                 <a class="nav-link bordered" href="/">Dashboard</a>
             {/if}
             <a class="nav-link {activePage === '/teams' ? 'active' : ''} bordered" href="/teams">Teams</a>
-            <a class="nav-link {activePage === '/settings/connected-apps' ? 'active' : ''} bordered" href="/settings/connected-apps">Connected Apps</a>
             <button
                 onclick={() => signout(ndk)}
                 ontouchend={() => signout(ndk)}

@@ -216,25 +216,51 @@ pub struct AuthStatusResponse {
     pub authenticated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pubkey: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email_verified: Option<bool>,
 }
 
 /// GET /oauth/auth-status
 /// Check if user has a valid session cookie
 pub async fn auth_status(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<super::routes::AuthState>,
     headers: HeaderMap,
 ) -> Result<Json<AuthStatusResponse>, OAuthError> {
+    let tenant_id = tenant.0.id;
+    let pool = &auth_state.state.db;
+
     if let Some(user_pubkey) = super::auth::extract_ucan_from_cookie(&headers).and_then(|token| {
         // Parse UCAN from string using ucan_auth helper
-        crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), 0).ok().map(|(pubkey, _)| pubkey)
+        crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), tenant_id).ok().map(|(pubkey, _)| pubkey)
     }) {
+        // Query user email info from database
+        let user_info: Option<(Option<String>, Option<bool>)> = sqlx::query_as(
+            "SELECT email, email_verified FROM users WHERE tenant_id = $1 AND public_key = $2"
+        )
+        .bind(tenant_id)
+        .bind(&user_pubkey)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+
+        let (email, email_verified) = user_info.unwrap_or((None, None));
+
         Ok(Json(AuthStatusResponse {
             authenticated: true,
             pubkey: Some(user_pubkey),
+            email,
+            email_verified,
         }))
     } else {
         Ok(Json(AuthStatusResponse {
             authenticated: false,
             pubkey: None,
+            email: None,
+            email_verified: None,
         }))
     }
 }
@@ -418,144 +444,151 @@ pub async fn authorize_get(
             integrity="sha384-xf02s8T/9FVjKBW2IA0yLDYKsosKPVCYxGwQskHkNKZ/LpB9oM7yZdP5lqQ0ZC2f"
             crossorigin="anonymous"></script>
     <style>
+        :root {{
+            --divine-green: #00B488;
+            --divine-green-dark: #009A72;
+            --bg: hsl(0 0% 100%);
+            --surface: hsl(0 0% 100%);
+            --border: hsl(214.3 31.8% 91.4%);
+            --text: hsl(222.2 84% 4.9%);
+            --text-secondary: hsl(215.4 16.3% 46.9%);
+            --muted: hsl(210 40% 96.1%);
+        }}
+        @media (prefers-color-scheme: dark) {{
+            :root {{
+                --bg: hsl(222.2 84% 4.9%);
+                --surface: hsl(222.2 84% 4.9%);
+                --border: hsl(217.2 32.6% 17.5%);
+                --text: hsl(210 40% 98%);
+                --text-secondary: hsl(215 20.2% 65.1%);
+                --muted: hsl(217.2 32.6% 17.5%);
+            }}
+        }}
         * {{
             box-sizing: border-box;
             margin: 0;
             padding: 0;
         }}
         body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #0f1419;
-            color: #e7e9ea;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
             min-height: 100vh;
             display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 1rem;
         }}
-        .layout {{
-            display: flex;
+        .container {{
             width: 100%;
-            min-height: 100vh;
+            max-width: 420px;
         }}
-        .sidebar {{
-            width: 40%;
-            background: linear-gradient(135deg, #1a2634 0%, #0f1419 100%);
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            padding: 3rem;
+        .header {{
+            text-align: center;
+            margin-bottom: 2rem;
         }}
-        .sidebar h1 {{
-            font-size: 2.5rem;
+        .logo {{
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            color: var(--divine-green);
+            font-size: 1.5rem;
             font-weight: 700;
-            color: #1d9bf0;
-            margin-bottom: 0.75rem;
+            margin-bottom: 1rem;
         }}
-        .sidebar p {{
-            color: #8899a6;
-            font-size: 1.1rem;
+        .logo svg {{
+            width: 32px;
+            height: 32px;
         }}
-        .main {{
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            padding: 2rem 3rem;
-            max-width: 600px;
+        .header h1 {{
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: var(--text);
+            margin-bottom: 0.25rem;
+        }}
+        .header p {{
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }}
+        .card {{
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 1.5rem;
         }}
         .app_header {{
             display: flex;
             align-items: center;
             gap: 1rem;
-            margin-bottom: 1.5rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 1rem;
         }}
         .app_icon {{
             width: 48px;
             height: 48px;
-            background: #1d9bf0;
+            background: var(--divine-green);
             border-radius: 12px;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 1.5rem;
+            font-size: 1.25rem;
+            color: white;
             flex-shrink: 0;
         }}
         .app_info h2 {{
-            font-size: 1.25rem;
+            font-size: 1rem;
             font-weight: 600;
-            color: #e7e9ea;
+            color: var(--text);
             margin-bottom: 0.125rem;
         }}
         .app_domain {{
-            font-size: 0.85rem;
-            color: #536471;
-            margin-bottom: 0.5rem;
-        }}
-        .app_info p {{
-            font-size: 0.9rem;
-            color: #8899a6;
-        }}
-        .account_badge {{
-            font-weight: 600;
-            color: #1d9bf0;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
         }}
         .permissions_list {{
-            margin: 1.5rem 0;
+            margin-bottom: 1rem;
         }}
         .permission_item {{
             display: flex;
-            align-items: flex-start;
-            gap: 1rem;
-            padding: 1rem 0;
-            border-bottom: 1px solid #2f3336;
-        }}
-        .permission_item:last-child {{
-            border-bottom: none;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 0.75rem 0;
         }}
         .permission_icon {{
-            width: 40px;
-            height: 40px;
-            background: #192734;
-            border-radius: 50%;
+            width: 36px;
+            height: 36px;
+            background: color-mix(in srgb, var(--divine-green) 15%, transparent);
+            border-radius: 8px;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 1.1rem;
+            font-size: 1rem;
             flex-shrink: 0;
         }}
         .permission_content {{
             flex: 1;
         }}
         .permission_content h3 {{
-            font-size: 1rem;
-            font-weight: 600;
-            color: #e7e9ea;
-            margin-bottom: 0.25rem;
+            font-size: 0.9rem;
+            font-weight: 500;
+            color: var(--text);
+            margin-bottom: 0.125rem;
         }}
         .permission_content p {{
-            font-size: 0.875rem;
-            color: #8899a6;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
             line-height: 1.4;
         }}
-        .help_icon {{
-            width: 24px;
-            height: 24px;
-            border-radius: 50%;
-            border: 1px solid #536471;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: #536471;
-            font-size: 0.75rem;
-            cursor: help;
-            flex-shrink: 0;
-        }}
         .disclaimer {{
-            font-size: 0.8rem;
-            color: #8899a6;
-            margin: 1.5rem 0;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin-bottom: 1.5rem;
             line-height: 1.5;
+            text-align: center;
         }}
         .disclaimer a {{
-            color: #1d9bf0;
+            color: var(--divine-green);
             text-decoration: none;
         }}
         .disclaimer a:hover {{
@@ -563,67 +596,59 @@ pub async fn authorize_get(
         }}
         .buttons {{
             display: flex;
-            gap: 1rem;
-            margin-top: 1rem;
+            gap: 0.75rem;
         }}
         button {{
             flex: 1;
-            padding: 0.875rem 1.5rem;
+            padding: 0.875rem 1.25rem;
             border-radius: 9999px;
-            font-size: 1rem;
-            font-weight: 700;
+            font-size: 0.9rem;
+            font-weight: 600;
             cursor: pointer;
-            transition: background 0.2s, opacity 0.2s;
+            transition: all 0.2s;
             border: none;
         }}
         .btn_deny {{
-            background: #2f3336;
-            color: #e7e9ea;
+            background: var(--muted);
+            color: var(--text);
+            border: 1px solid var(--border);
         }}
         .btn_deny:hover {{
-            background: #3a3f44;
+            background: var(--border);
         }}
         .btn_approve {{
-            background: #1d9bf0;
+            background: var(--divine-green);
             color: #fff;
         }}
         .btn_approve:hover {{
-            background: #1a8cd8;
+            background: var(--divine-green-dark);
         }}
-        /* Mobile responsive */
-        @media (max-width: 768px) {{
-            .layout {{
-                flex-direction: column;
-            }}
-            .sidebar {{
-                width: 100%;
-                padding: 2rem 1.5rem;
-                min-height: auto;
-            }}
-            .sidebar h1 {{
-                font-size: 1.75rem;
-            }}
-            .main {{
-                padding: 1.5rem;
-                max-width: 100%;
-            }}
-        }}
-        /* Hidden elements */
         #npub_fallback {{
             display: none;
         }}
-        .loading {{
-            color: #8899a6;
+        .nostr-link {{
+            color: var(--divine-green);
+            text-decoration: none;
+        }}
+        .nostr-link:hover {{
+            text-decoration: underline;
         }}
     </style>
 </head>
 <body>
-    <div class="layout">
-        <div class="sidebar">
-            <h1>Authorize</h1>
-            <p>Grant access to your <span class="account_badge" id="account_domain">diVine</span> account</p>
+    <div class="container">
+        <div class="header">
+            <div class="logo">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor">
+                    <path d="M216.57,39.43A80,80,0,0,0,83.91,120.78L28.69,176A15.86,15.86,0,0,0,24,187.31V216a16,16,0,0,0,16,16H72a8,8,0,0,0,8-8V208H96a8,8,0,0,0,8-8V184h16a8,8,0,0,0,5.66-2.34l9.56-9.57A79.73,79.73,0,0,0,160,176h.1A80,80,0,0,0,216.57,39.43ZM180,92a16,16,0,1,1,16-16A16,16,0,0,1,180,92Z"></path>
+                </svg>
+                diVine ID
+            </div>
+            <h1>Authorize App</h1>
+            <p>Grant access to your account</p>
         </div>
-        <div class="main">
+
+        <div class="card">
             <div class="app_header">
                 <div class="app_icon">
                     <span id="app_icon_letter">{}</span>
@@ -631,7 +656,6 @@ pub async fn authorize_get(
                 <div class="app_info">
                     <h2 id="app_name">{}</h2>
                     <div class="app_domain" id="app_domain"></div>
-                    <p>wants to access <span class="account_badge" id="display_name">your account</span></p>
                 </div>
             </div>
 
@@ -640,11 +664,11 @@ pub async fn authorize_get(
             </div>
 
             <p class="disclaimer">
-                By clicking <strong>Authorize</strong>, you will grant this application access to your account in accordance with its <a href="https://divine.video/terms" target="_blank">terms of service</a> and <a href="https://divine.video/privacy" target="_blank">privacy policy</a>.
+                By authorizing, you grant this app access per its <a href="https://divine.video/terms" target="_blank">terms</a> and <a href="https://divine.video/privacy" target="_blank">privacy policy</a>.
             </p>
 
             <div class="buttons">
-                <button class="btn_deny" onclick="deny()">Deny access</button>
+                <button class="btn_deny" onclick="deny()">Deny</button>
                 <button class="btn_approve" onclick="approve()">Authorize</button>
             </div>
         </div>
@@ -853,139 +877,182 @@ pub async fn authorize_get(
             relays_json,  // JS userRelays (JSON array)
         )
     } else {
-        // User not authenticated - show login/register form (Bluesky-inspired design)
+        // User not authenticated - show login/register form (divine.video-inspired design)
         format!(r#"
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Sign in - Keycast</title>
+    <title>Sign in - diVine ID</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Bricolage+Grotesque:wght@600;700&display=swap" rel="stylesheet">
     <script src="https://unpkg.com/nostr-tools@2.7.2/lib/nostr.bundle.js"
             integrity="sha384-xf02s8T/9FVjKBW2IA0yLDYKsosKPVCYxGwQskHkNKZ/LpB9oM7yZdP5lqQ0ZC2f"
             crossorigin="anonymous"></script>
     <style>
+        :root {{
+            --divine-green: #00B488;
+            --divine-green-dark: #009A72;
+            --divine-green-light: #33C49F;
+            --divine-purple: #8B5CF6;
+            --bg: hsl(0 0% 100%);
+            --surface: hsl(0 0% 100%);
+            --border: hsl(214.3 31.8% 91.4%);
+            --text: hsl(222.2 84% 4.9%);
+            --text-secondary: hsl(215.4 16.3% 46.9%);
+            --muted: hsl(210 40% 96.1%);
+            --error: #EF4444;
+            --shadow-sm: 0 2px 8px rgba(0, 180, 136, 0.08);
+            --shadow-md: 0 4px 16px rgba(0, 180, 136, 0.12);
+        }}
+        @media (prefers-color-scheme: dark) {{
+            :root {{
+                --bg: hsl(222.2 84% 4.9%);
+                --surface: hsl(222.2 84% 4.9%);
+                --border: hsl(217.2 32.6% 17.5%);
+                --text: hsl(210 40% 98%);
+                --text-secondary: hsl(215 20.2% 65.1%);
+                --muted: hsl(217.2 32.6% 17.5%);
+            }}
+        }}
         * {{
             box-sizing: border-box;
             margin: 0;
             padding: 0;
         }}
         body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #0f1419;
-            color: #e7e9ea;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
             min-height: 100vh;
             display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 1rem;
+            -webkit-font-smoothing: antialiased;
         }}
-        .layout {{
-            display: flex;
+        .container {{
             width: 100%;
-            min-height: 100vh;
+            max-width: 420px;
         }}
-        .sidebar {{
-            width: 40%;
-            background: linear-gradient(135deg, #1a2634 0%, #0f1419 100%);
+        .header {{
+            text-align: center;
+            margin-bottom: 2rem;
+        }}
+        .logo {{
             display: flex;
-            flex-direction: column;
+            align-items: center;
             justify-content: center;
-            padding: 3rem;
+            gap: 0.5rem;
+            margin-bottom: 1.5rem;
         }}
-        .sidebar h1 {{
-            font-size: 2.5rem;
+        .logo svg {{
+            width: 32px;
+            height: 32px;
+        }}
+        .logo span {{
+            font-family: 'Bricolage Grotesque', system-ui, sans-serif;
+            font-size: 1.5rem;
             font-weight: 700;
-            color: #1d9bf0;
-            margin-bottom: 0.75rem;
+            color: var(--divine-green);
         }}
-        .sidebar p {{
-            color: #8899a6;
-            font-size: 1.1rem;
+        .header h1 {{
+            font-family: 'Bricolage Grotesque', system-ui, sans-serif;
+            font-size: 1.75rem;
+            font-weight: 700;
+            color: var(--text);
+            margin-bottom: 0.5rem;
+            letter-spacing: -0.02em;
         }}
-        .main {{
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            padding: 2rem 3rem;
-            max-width: 500px;
+        .header p {{
+            color: var(--text-secondary);
+            font-size: 0.95rem;
+        }}
+        .card {{
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 1rem;
+            padding: 1.5rem;
+            box-shadow: var(--shadow-sm);
         }}
         .app_header {{
             display: flex;
             align-items: center;
-            gap: 1rem;
-            margin-bottom: 2rem;
+            gap: 0.875rem;
+            padding-bottom: 1.25rem;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 1.25rem;
         }}
         .app_icon {{
-            width: 48px;
-            height: 48px;
-            background: #1d9bf0;
+            width: 44px;
+            height: 44px;
+            background: var(--divine-green);
             border-radius: 12px;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 1.5rem;
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: white;
             flex-shrink: 0;
         }}
         .app_info h2 {{
-            font-size: 1.25rem;
+            font-size: 1rem;
             font-weight: 600;
-            color: #e7e9ea;
+            color: var(--text);
             margin-bottom: 0.125rem;
         }}
         .app_domain {{
-            font-size: 0.85rem;
-            color: #536471;
-            margin-bottom: 0.5rem;
-        }}
-        .app_info p {{
-            font-size: 0.9rem;
-            color: #8899a6;
-        }}
-        .account_badge {{
-            font-weight: 600;
-            color: #1d9bf0;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
         }}
         .form_group {{
-            margin-bottom: 1.25rem;
+            margin-bottom: 1rem;
         }}
         label {{
             display: block;
-            margin-bottom: 0.5rem;
-            font-size: 0.9rem;
-            color: #8899a6;
+            margin-bottom: 0.375rem;
+            font-size: 0.875rem;
+            color: var(--text-secondary);
             font-weight: 500;
         }}
         input {{
             width: 100%;
-            padding: 0.875rem 1rem;
-            border: 1px solid #2f3336;
-            border-radius: 8px;
-            background: #000;
-            color: #e7e9ea;
+            padding: 0.75rem 1rem;
+            border: 1px solid var(--border);
+            border-radius: 0.5rem;
+            background: var(--muted);
+            color: var(--text);
             font-size: 1rem;
-            transition: border-color 0.2s;
+            transition: border-color 0.2s, box-shadow 0.2s;
         }}
         input:focus {{
             outline: none;
-            border-color: #1d9bf0;
+            border-color: var(--divine-green);
+            box-shadow: 0 0 0 2px rgba(0, 180, 136, 0.2);
         }}
         input::placeholder {{
-            color: #536471;
+            color: var(--text-secondary);
+            opacity: 0.6;
         }}
         .btn_primary {{
             width: 100%;
-            padding: 0.875rem 1.5rem;
+            padding: 0.75rem 1.5rem;
             border-radius: 9999px;
             font-size: 1rem;
-            font-weight: 700;
+            font-weight: 600;
             cursor: pointer;
-            transition: background 0.2s;
+            transition: all 0.2s;
             border: none;
-            background: #1d9bf0;
-            color: #fff;
-            margin-top: 1rem;
+            background: var(--divine-green);
+            color: white;
+            margin-top: 0.5rem;
         }}
         .btn_primary:hover {{
-            background: #1a8cd8;
+            background: var(--divine-green-dark);
+            box-shadow: var(--shadow-sm);
         }}
         .btn_primary:disabled {{
             opacity: 0.5;
@@ -1004,12 +1071,12 @@ pub async fn authorize_get(
         }}
         .toggle_link {{
             text-align: center;
-            margin-top: 1.5rem;
-            font-size: 0.9rem;
-            color: #8899a6;
+            margin-top: 1rem;
+            font-size: 0.875rem;
+            color: var(--text-secondary);
         }}
         .toggle_link a {{
-            color: #1d9bf0;
+            color: var(--divine-green);
             text-decoration: none;
             cursor: pointer;
             font-weight: 500;
@@ -1018,25 +1085,25 @@ pub async fn authorize_get(
             text-decoration: underline;
         }}
         .error {{
-            background: rgba(244, 33, 46, 0.1);
-            border: 1px solid #f4212e;
-            color: #f4212e;
-            padding: 0.875rem 1rem;
-            border-radius: 8px;
-            margin-bottom: 1.25rem;
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid var(--error);
+            color: var(--error);
+            padding: 0.75rem 1rem;
+            border-radius: 0.5rem;
+            margin-bottom: 1rem;
             display: none;
-            font-size: 0.9rem;
+            font-size: 0.875rem;
             text-align: center;
         }}
         .advanced_section {{
-            margin: 1.25rem 0;
+            margin: 1rem 0;
         }}
         .advanced_toggle {{
             display: inline-flex;
             align-items: center;
             gap: 0.5rem;
-            color: #1d9bf0;
-            font-size: 0.9rem;
+            color: var(--divine-green);
+            font-size: 0.875rem;
             cursor: pointer;
             text-decoration: none;
             user-select: none;
@@ -1047,56 +1114,45 @@ pub async fn authorize_get(
         .advanced_icon {{
             display: inline-block;
             transition: transform 0.2s;
-            font-size: 0.7rem;
+            font-size: 0.65rem;
         }}
         .advanced_icon.expanded {{
             transform: rotate(90deg);
         }}
         .advanced_content {{
             display: none;
-            margin-top: 1rem;
+            margin-top: 0.75rem;
             padding: 1rem;
-            background: #16181c;
-            border-radius: 12px;
-            border: 1px solid #2f3336;
+            background: var(--muted);
+            border-radius: 0.75rem;
+            border: 1px solid var(--border);
         }}
         .advanced_content.show {{
             display: block;
             animation: fadeIn 0.3s ease;
         }}
         .help_text {{
-            color: #536471;
-            font-size: 0.8rem;
-            margin-top: 0.5rem;
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+            margin-top: 0.375rem;
             line-height: 1.4;
-        }}
-        /* Mobile responsive */
-        @media (max-width: 768px) {{
-            .layout {{
-                flex-direction: column;
-            }}
-            .sidebar {{
-                width: 100%;
-                padding: 2rem 1.5rem;
-                min-height: auto;
-            }}
-            .sidebar h1 {{
-                font-size: 1.75rem;
-            }}
-            .main {{
-                padding: 1.5rem;
-                max-width: 100%;
-            }}
         }}
     </style>
 </head>
 <body>
-    <div class="layout">
-        <div class="sidebar">
+    <div class="container">
+        <div class="header">
+            <div class="logo">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--divine-green)">
+                    <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"></path>
+                </svg>
+                <span>diVine ID</span>
+            </div>
             <h1>Sign in</h1>
-            <p>to continue to <span class="account_badge" id="app_name_display">diVine</span></p>
+            <p>to continue to <strong id="app_name_display">{}</strong></p>
         </div>
-        <div class="main">
+
+        <div class="card">
             <div class="app_header">
                 <div class="app_icon">
                     <span id="app_icon_letter">{}</span>
@@ -1104,7 +1160,6 @@ pub async fn authorize_get(
                 <div class="app_info">
                     <h2 id="app_name">{}</h2>
                     <div class="app_domain" id="app_domain"></div>
-                    <p>wants to access your Nostr account</p>
                 </div>
             </div>
 
@@ -1136,12 +1191,6 @@ pub async fn authorize_get(
                         <label for="register_email">Email</label>
                         <input type="email" id="register_email" placeholder="Enter your email" autocomplete="username" required>
                     </div>
-                    <!-- TODO: Future enhancement - collect profile info at registration:
-                         1. Add display_name field here (optional)
-                         2. Cache in user_profiles table (already exists in schema)
-                         3. Publish kind 0 event to relays via bunker after registration
-                         4. Use cached profile for immediate display on authorization page
-                         This would let us show the user's name instead of "your account" right away. -->
                     <div class="form_group">
                         <label for="register_password">Password</label>
                         <input type="password" id="register_password" placeholder="Create a password" autocomplete="new-password" required minlength="8">
@@ -1333,13 +1382,14 @@ pub async fn authorize_get(
 </body>
 </html>
         "#,
+            params.client_id,  // app_name_display in header
             params.client_id.chars().next().unwrap_or('A').to_uppercase(),  // app icon letter
-            params.client_id,  // app name
-            params.client_id,
-            params.redirect_uri,
-            params.scope.as_deref().unwrap_or("sign_event"),
-            params.code_challenge.as_deref().unwrap_or(""),
-            params.code_challenge_method.as_deref().unwrap_or(""),
+            params.client_id,  // app name in card
+            params.client_id,  // JS clientId
+            params.redirect_uri,  // JS redirectUri
+            params.scope.as_deref().unwrap_or("sign_event"),  // JS scope
+            params.code_challenge.as_deref().unwrap_or(""),  // JS codeChallenge
+            params.code_challenge_method.as_deref().unwrap_or(""),  // JS codeChallengeMethod
         )
     };
 

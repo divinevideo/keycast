@@ -19,18 +19,6 @@
   --color-divine-green-dark: #009A72;
   --color-divine-green-light: #33C49F;
 
-  /* Background colors - deeper, richer dark */
-  --color-divine-bg: hsl(222.2 84% 4.9%);
-  --color-divine-surface: hsl(222.2 84% 4.9%);
-
-  /* Border color - subtle like divine.video */
-  --color-divine-border: hsl(217.2 32.6% 17.5%);
-
-  /* Text colors */
-  --color-divine-text: hsl(210 40% 98%);
-  --color-divine-text-secondary: hsl(215 20.2% 65.1%);
-  --color-divine-text-tertiary: #6B7280;
-
   /* Status colors */
   --color-divine-success: #10B981;
   --color-divine-error: #EF4444;
@@ -71,51 +59,88 @@
   }
 }
 
-:global(:root) {
-    color-scheme: dark;
-}
-
-:global(html) {
-    background-color: var(--color-gray-900);
-    color: var(--color-gray-100);
-}
-
-/* Force dark mode even if user's system is in light mode */
-:global(*) {
-    /* Prevent any light mode flashing */
-    transition: none !important;
-}
-
-
+/* Light mode (default) - matching divine.video */
 :root {
     font-family: 'Inter', system-ui, -apple-system, sans-serif;
-    background-color: var(--color-divine-bg);
-    color: var(--color-divine-text);
-    padding: 1rem;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+    padding: 1rem;
+
+    /* Light mode colors - matching divine.video */
+    --color-divine-bg: hsl(0 0% 100%);
+    --color-divine-surface: hsl(0 0% 100%);
+    --color-divine-border: hsl(214.3 31.8% 91.4%);
+    --color-divine-text: hsl(222.2 84% 4.9%);
+    --color-divine-text-secondary: hsl(215.4 16.3% 46.9%);
+    --color-divine-text-tertiary: #6B7280;
+    --color-divine-muted: hsl(210 40% 96.1%);
+
+    color-scheme: light;
+    background-color: var(--color-divine-bg);
+    color: var(--color-divine-text);
+}
+
+/* Dark mode - matching divine.video dark theme */
+:root.dark {
+    --color-divine-bg: hsl(222.2 84% 4.9%);
+    --color-divine-surface: hsl(222.2 84% 4.9%);
+    --color-divine-border: hsl(217.2 32.6% 17.5%);
+    --color-divine-text: hsl(210 40% 98%);
+    --color-divine-text-secondary: hsl(215 20.2% 65.1%);
+    --color-divine-text-tertiary: #9CA3AF;
+    --color-divine-muted: hsl(217.2 32.6% 17.5%);
+
+    color-scheme: dark;
+    background-color: var(--color-divine-bg);
+    color: var(--color-divine-text);
+}
+
+/* System preference dark mode */
+@media (prefers-color-scheme: dark) {
+    :root:not(.light) {
+        --color-divine-bg: hsl(222.2 84% 4.9%);
+        --color-divine-surface: hsl(222.2 84% 4.9%);
+        --color-divine-border: hsl(217.2 32.6% 17.5%);
+        --color-divine-text: hsl(210 40% 98%);
+        --color-divine-text-secondary: hsl(215 20.2% 65.1%);
+        --color-divine-text-tertiary: #9CA3AF;
+        --color-divine-muted: hsl(217.2 32.6% 17.5%);
+
+        color-scheme: dark;
+        background-color: var(--color-divine-bg);
+        color: var(--color-divine-text);
+    }
 }
 
 h1, h2, h3, h4, h5, h6 {
     font-family: var(--font-heading);
     letter-spacing: -0.02em;
+    color: var(--color-divine-text);
 }
 
 a.bordered {
-    @apply border-b border-gray-500 border-dashed hover:border-gray-300 hover:border-solid;
+    border-bottom: 1px dashed var(--color-divine-border);
+}
+
+a.bordered:hover {
+    border-bottom-style: solid;
+    border-color: var(--color-divine-green);
 }
 
 .page-header {
     @apply text-2xl font-bold mb-4;
+    color: var(--color-divine-text);
 }
 
 .page-subheader {
-    @apply text-lg font-semibold mb-4 border-b border-gray-700;
+    @apply text-lg font-semibold mb-4;
+    border-bottom: 1px solid var(--color-divine-border);
+    color: var(--color-divine-text);
 }
 
 .button {
-    @apply whitespace-nowrap shrink px-3 py-1.5 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200;
-    border-radius: var(--radius-md);
+    @apply whitespace-nowrap shrink px-4 py-2 text-sm font-semibold disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200;
+    border-radius: 9999px;
     border: 1px solid transparent;
 }
 
@@ -131,8 +156,8 @@ a.bordered {
 }
 
 .button-secondary {
-    background: transparent;
-    color: var(--color-divine-text-secondary);
+    background: var(--color-divine-muted);
+    color: var(--color-divine-text);
     border-color: var(--color-divine-border);
 }
 
@@ -177,7 +202,9 @@ a.bordered {
 }
 
 .pill {
-    @apply rounded-full px-2 py-1 text-xs font-light text-white self-start;
+    @apply rounded-full px-2 py-1 text-xs font-medium self-start;
+    background: var(--color-divine-green);
+    color: white;
 }
 
 .form-group {
@@ -185,15 +212,28 @@ a.bordered {
 }
 
 .form-group label {
-    @apply text-sm mb-1 text-gray-400;
+    @apply text-sm mb-1;
+    color: var(--color-divine-text-secondary);
 }
 
-input[type="text"], input[type="password"], select, input[type="number"], input[type="datetime-local"] {
-    @apply bg-transparent text-gray-50 rounded-md px-2 py-1 ring-1 ring-gray-500 text-base;
+input[type="text"], input[type="password"], input[type="email"], select, input[type="number"], input[type="datetime-local"] {
+    background: var(--color-divine-muted);
+    color: var(--color-divine-text);
+    border: 1px solid var(--color-divine-border);
+    border-radius: var(--radius-md);
+    padding: 0.5rem 0.75rem;
+    font-size: 1rem;
+}
+
+input[type="text"]:focus, input[type="password"]:focus, input[type="email"]:focus, select:focus, input[type="number"]:focus {
+    outline: none;
+    border-color: var(--color-divine-green);
+    box-shadow: 0 0 0 2px rgba(0, 180, 136, 0.2);
 }
 
 .input-error {
-    @apply text-red-500 text-sm;
+    color: var(--color-divine-error);
+    font-size: 0.875rem;
 }
 
 .feature-panel {
@@ -208,10 +248,18 @@ input[type="text"], input[type="password"], select, input[type="number"], input[
     box-shadow: var(--shadow-md);
 }
 
+/* Navigation links - cleaner style without dashed underlines */
 .nav-link {
-    @apply hover:border-b hover:border-gray-200 hover:text-gray-200 text-gray-400;
+    color: var(--color-divine-text-secondary);
+    text-decoration: none;
+    transition: color 0.2s;
+}
+
+.nav-link:hover {
+    color: var(--color-divine-text);
 }
 
 .nav-link.active {
-    @apply border-b border-gray-200 text-gray-200;
+    color: var(--color-divine-green);
+    font-weight: 500;
 }
