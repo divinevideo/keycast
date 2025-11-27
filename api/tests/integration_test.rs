@@ -29,7 +29,7 @@ async fn create_test_database() -> Database {
 
     let db = Database::new(db_path, migrations_path).await.unwrap();
 
-    // Create localhost tenant for tests (id=2, since id=1 is oauth.divine.video from migration)
+    // Create localhost tenant for tests (id=2, since id=1 is login.divine.video from migration)
     sqlx::query(
         "INSERT INTO tenants (domain, name, settings, created_at, updated_at)
          VALUES ('localhost', 'Localhost Test', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
@@ -50,24 +50,32 @@ async fn get_localhost_tenant_id(pool: &SqlitePool) -> i64 {
     id
 }
 
-/// Helper to create JWT token for testing
-fn create_test_jwt(user_pubkey: &str) -> String {
-    use jsonwebtoken::{encode, Header, EncodingKey};
-    use serde::{Serialize, Deserialize};
+/// Helper to create UCAN token for testing
+async fn create_test_ucan(user_keys: &nostr_sdk::Keys, tenant_id: i64) -> String {
+    use keycast_api::ucan_auth::{NostrKeyMaterial, nostr_pubkey_to_did};
+    use ucan::builder::UcanBuilder;
+    use serde_json::json;
 
-    #[derive(Debug, Serialize, Deserialize)]
-    struct Claims {
-        sub: String,
-        exp: usize,
-    }
+    let key_material = NostrKeyMaterial::from_keys(user_keys.clone());
+    let user_did = nostr_pubkey_to_did(&user_keys.public_key());
 
-    let claims = Claims {
-        sub: user_pubkey.to_string(),
-        exp: (chrono::Utc::now() + chrono::Duration::hours(24)).timestamp() as usize,
-    };
+    let facts = json!({
+        "tenant_id": tenant_id,
+        "email": "test@example.com",
+    });
 
-    let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "insecure-dev-secret-change-in-production".to_string());
-    encode(&Header::default(), &claims, &EncodingKey::from_secret(secret.as_bytes())).unwrap()
+    let ucan = UcanBuilder::default()
+        .issued_by(&key_material)
+        .for_audience(&user_did)
+        .with_lifetime(24 * 3600)
+        .with_fact(facts)
+        .build()
+        .unwrap()
+        .sign()
+        .await
+        .unwrap();
+
+    ucan.encode().unwrap()
 }
 
 /// Helper to generate a test bunker secret (64 char alphanumeric)
@@ -162,7 +170,7 @@ async fn test_register_user_endpoint() {
 
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-    assert!(json["token"].is_string(), "Response should include JWT token");
+    assert!(json["token"].is_string(), "Response should include UCAN token");
     assert!(json["pubkey"].is_string(), "Response should include user pubkey");
 
     println!("✅ User registration integration test passed");
@@ -223,8 +231,8 @@ async fn test_sign_event_endpoint_slow_path() {
         "event": unsigned
     });
 
-    // Create JWT token for authentication
-    let token = create_test_jwt(&user_pubkey);
+    // Create UCAN token for authentication
+    let token = create_test_ucan(&user_keys, tenant_id).await;
 
     // Act: Sign event via HTTP
     let response = app
@@ -426,7 +434,7 @@ async fn test_concurrent_signing_requests() {
             );
 
             let sign_request = json!({ "event": unsigned });
-            let token = create_test_jwt(&user_pubkey);
+            let token = create_test_ucan(&user_keys, tenant_id).await;
 
             let response = app
                 .oneshot(

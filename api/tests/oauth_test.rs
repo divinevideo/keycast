@@ -115,13 +115,13 @@ async fn test_oauth_authorization_flow() {
         .unwrap()
         .to_bytes();
     let register_json: serde_json::Value = serde_json::from_slice(&register_body).unwrap();
-    let jwt_token = register_json["token"].as_str().unwrap();
+    let ucan_token = register_json["token"].as_str().unwrap();
 
     // Step 2: Request OAuth authorization
     let authorize_req = Request::builder()
         .method("GET")
         .uri("/oauth/authorize?client_id=testapp&redirect_uri=http://localhost:3000/callback&scope=sign_event")
-        .header("cookie", format!("session={}", jwt_token))
+        .header("cookie", format!("session={}", ucan_token))
         .body(Body::empty())
         .unwrap();
 
@@ -135,7 +135,7 @@ async fn test_oauth_authorization_flow() {
         .method("POST")
         .uri("/oauth/authorize")
         .header("content-type", "application/json")
-        .header("cookie", format!("session={}", jwt_token))
+        .header("cookie", format!("session={}", ucan_token))
         .body(Body::from(
             json!({
                 "client_id": "testapp",
@@ -321,7 +321,7 @@ async fn test_oauth_bunker_uses_personal_key() {
         .unwrap()
         .to_bytes();
     let register_json: serde_json::Value = serde_json::from_slice(&register_body).unwrap();
-    let jwt_token = register_json["token"].as_str().unwrap();
+    let ucan_token = register_json["token"].as_str().unwrap();
 
     // Get the user's actual public key from database
     let user_pubkey: String = sqlx::query_scalar(
@@ -335,7 +335,7 @@ async fn test_oauth_bunker_uses_personal_key() {
     let authorize_req = Request::builder()
         .method("GET")
         .uri("/oauth/authorize?client_id=testapp&redirect_uri=http://localhost:3000/callback&scope=sign_event")
-        .header("cookie", format!("session={}", jwt_token))
+        .header("cookie", format!("session={}", ucan_token))
         .body(Body::empty())
         .unwrap();
 
@@ -346,7 +346,7 @@ async fn test_oauth_bunker_uses_personal_key() {
         .method("POST")
         .uri("/oauth/authorize")
         .header("content-type", "application/json")
-        .header("cookie", format!("session={}", jwt_token))
+        .header("cookie", format!("session={}", ucan_token))
         .body(Body::from(
             json!({
                 "client_id": "testapp",
@@ -490,7 +490,7 @@ async fn test_oauth_authorize_uses_authenticated_user_not_most_recent() {
         .method("POST")
         .uri("/oauth/authorize")
         .header("content-type", "application/json")
-        .header("Authorization", format!("Bearer {}", alice_token))  // Alice's JWT
+        .header("Authorization", format!("Bearer {}", alice_token))  // Alice's UCAN
         .body(Body::from(
             json!({
                 "client_id": "testapp",
@@ -600,7 +600,7 @@ async fn test_nostr_connect_uses_authenticated_user_not_most_recent() {
         .method("POST")
         .uri("/oauth/connect")
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .header(header::AUTHORIZATION, format!("Bearer {}", alice_token))  // Alice's JWT
+        .header(header::AUTHORIZATION, format!("Bearer {}", alice_token))  // Alice's UCAN
         .body(Body::from(
             "client_pubkey=abcd1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab&relay=wss://relay.damus.io&secret=test_secret&approved=true"
         ))
