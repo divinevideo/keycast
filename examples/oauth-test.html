@@ -88,20 +88,31 @@
     </div>
 
     <div class="section">
-        <h2>OAuth Flow (Redirect-based)</h2>
-        <div class="button-group">
-            <button onclick="connectWithKeycast()">Connect with Keycast</button>
-            <button onclick="connectWithKeycastBYOK()">Connect with BYOK (Import Key)</button>
+        <h2>Option 1: New Registration (Server-Generated Key)</h2>
+        <p style="color: #888; font-size: 13px; margin-bottom: 15px;">
+            Keycast will generate a new Nostr identity for you.
+        </p>
+        <button onclick="connectWithKeycast()">Connect with Keycast</button>
+    </div>
+
+    <div class="section" id="identity-section">
+        <h2>Option 2: Bring Your Own Key (BYOK)</h2>
+        <p style="color: #888; font-size: 13px; margin-bottom: 15px;">
+            Use an existing Nostr identity. The key below will be securely transferred to Keycast via PKCE.
+            After authorization, verify the bunker URL contains the same pubkey.
+        </p>
+        <div style="background: #2a4a2a; padding: 15px; border-radius: 8px; border-left: 4px solid #03dac6; margin-bottom: 15px;">
+            <p style="font-size: 12px; margin: 5px 0;"><strong>nsec:</strong> <code id="test-nsec" style="color: #03dac6; word-break: break-all;">Loading...</code></p>
+            <p style="font-size: 12px; margin: 5px 0;"><strong>npub:</strong> <code id="test-npub" style="color: #bb86fc; word-break: break-all;">Loading...</code></p>
+            <p style="font-size: 12px; margin: 5px 0;"><strong>pubkey (hex):</strong> <code id="test-pubkey" style="color: #bb86fc; word-break: break-all;">Loading...</code></p>
         </div>
-        <div id="status"></div>
-        <div id="nsec-info" style="display:none; margin-top: 15px; background: #2a4a2a; padding: 15px; border-radius: 8px; border-left: 4px solid #03dac6;">
-            <p style="color: #03dac6; margin: 0 0 10px 0;"><strong>Client-Generated Key (BYOK Mode)</strong></p>
-            <p style="font-size: 13px; color: #aaa; margin: 5px 0;">This nsec will be embedded in code_verifier and sent during token exchange:</p>
-            <p style="font-size: 12px; margin: 5px 0;"><strong>nsec:</strong> <code id="test-nsec" style="color: #03dac6; word-break: break-all;"></code></p>
-            <p style="font-size: 12px; margin: 5px 0;"><strong>pubkey (hex):</strong> <code id="test-pubkey" style="color: #bb86fc; word-break: break-all;"></code></p>
-            <p style="font-size: 12px; margin: 5px 0;"><strong>npub:</strong> <code id="test-npub" style="color: #bb86fc; word-break: break-all;"></code></p>
+        <div class="button-group">
+            <button onclick="connectWithKeycastBYOK()">Connect with This Key</button>
+            <button onclick="regenerateIdentity()" style="background: #4a4a4a;">Generate New Key</button>
         </div>
     </div>
+
+    <div id="status"></div>
 
     <div class="section" id="results" style="display: none;">
         <h2>Bunker URL Received</h2>
@@ -164,6 +175,9 @@
             });
         }
 
+        // Current identity (persisted in sessionStorage)
+        let currentIdentity = null;
+
         // Generate a test nsec with nostr-tools
         function generateTestNsec() {
             const { generateSecretKey, getPublicKey, nip19 } = window.NostrTools;
@@ -174,13 +188,44 @@
             const nsec = nip19.nsecEncode(secretKey);
             const npub = nip19.npubEncode(pubkeyHex);
 
-            // Display in UI
-            document.getElementById('test-nsec').textContent = nsec;
-            document.getElementById('test-pubkey').textContent = pubkeyHex;
-            document.getElementById('test-npub').textContent = npub;
-            document.getElementById('nsec-info').style.display = 'block';
+            currentIdentity = { nsec, pubkey: pubkeyHex, npub };
 
-            return { nsec, pubkey: pubkeyHex, npub };
+            // Persist in sessionStorage so it survives the redirect
+            sessionStorage.setItem('test_identity', JSON.stringify(currentIdentity));
+
+            // Display in UI
+            updateIdentityDisplay();
+
+            return currentIdentity;
+        }
+
+        // Load identity from sessionStorage or generate new one
+        function loadOrGenerateIdentity() {
+            const stored = sessionStorage.getItem('test_identity');
+            if (stored) {
+                try {
+                    currentIdentity = JSON.parse(stored);
+                    updateIdentityDisplay();
+                    return currentIdentity;
+                } catch (e) {
+                    console.error('Failed to parse stored identity:', e);
+                }
+            }
+            return generateTestNsec();
+        }
+
+        // Update the identity display
+        function updateIdentityDisplay() {
+            if (!currentIdentity) return;
+            document.getElementById('test-nsec').textContent = currentIdentity.nsec;
+            document.getElementById('test-pubkey').textContent = currentIdentity.pubkey;
+            document.getElementById('test-npub').textContent = currentIdentity.npub;
+        }
+
+        // Regenerate identity (user action)
+        function regenerateIdentity() {
+            generateTestNsec();
+            showStatus('New identity generated. Use BYOK to authorize with this key.', 'info');
         }
 
         // OAuth Redirect Flow (no popups)
@@ -200,15 +245,22 @@
 
             showStatus('Generating PKCE challenge...', 'info');
 
-            // Generate nsec and pubkey if BYOK mode
+            // Use current identity for BYOK mode
             let nsec = null;
             let pubkey = null;
             if (importKey) {
-                const keyPair = generateTestNsec();
-                nsec = keyPair.nsec;
-                pubkey = keyPair.pubkey;
-                // Store pubkey for verification later
+                if (!currentIdentity) {
+                    showStatus('No identity available. Please wait for page to load.', 'error');
+                    return;
+                }
+                nsec = currentIdentity.nsec;
+                pubkey = currentIdentity.pubkey;
+                // Mark that we used BYOK for verification later
+                sessionStorage.setItem('byok_used', 'true');
                 sessionStorage.setItem('byok_pubkey', pubkey);
+            } else {
+                sessionStorage.removeItem('byok_used');
+                sessionStorage.removeItem('byok_pubkey');
             }
 
             // Generate PKCE with optional embedded nsec
@@ -220,7 +272,7 @@
             sessionStorage.setItem('oauth_client_id', clientId);
 
             if (importKey) {
-                showStatus(`PKCE Generated with embedded nsec (BYOK)<br><small>Redirecting to Keycast...</small>`, 'info');
+                showStatus(`PKCE Generated with embedded nsec (BYOK)<br><small>Using identity: ${pubkey.substring(0, 16)}...</small><br><small>Redirecting to Keycast...</small>`, 'info');
             } else {
                 showStatus(`PKCE Generated<br><small>Redirecting to Keycast...</small>`, 'info');
             }
@@ -250,6 +302,8 @@
             const verifier = sessionStorage.getItem('pkce_verifier');
             const apiUrl = sessionStorage.getItem('oauth_api_url') || document.getElementById('apiUrl').value;
             const clientId = sessionStorage.getItem('oauth_client_id') || document.getElementById('clientId').value;
+            const byokUsed = sessionStorage.getItem('byok_used') === 'true';
+            const expectedPubkey = sessionStorage.getItem('byok_pubkey');
 
             if (!verifier) {
                 showStatus('PKCE verifier not found. Please restart OAuth flow.', 'error');
@@ -274,17 +328,34 @@
                 const data = await response.json();
 
                 if (response.ok && data.bunker_url) {
-                    showStatus('Token exchange successful!', 'success');
                     document.getElementById('results').style.display = 'block';
                     document.getElementById('bunkerUrl').textContent = data.bunker_url;
 
                     // Store bunker URL for later use
                     localStorage.setItem('keycast_bunker_url', data.bunker_url);
 
-                    // Clean up sessionStorage
+                    // Verify BYOK pubkey if applicable
+                    if (byokUsed && expectedPubkey) {
+                        // Extract pubkey from bunker URL
+                        const url = new URL(data.bunker_url);
+                        const bunkerPubkey = url.hostname || url.pathname.replace('//', '');
+
+                        if (bunkerPubkey === expectedPubkey) {
+                            showStatus(`Token exchange successful!<br><span style="color: #03dac6;">✓ BYOK Verified: Bunker pubkey matches your identity!</span>`, 'success');
+                        } else {
+                            showStatus(`Token exchange successful, but pubkey mismatch!<br>
+                                <span style="color: #cf6679;">Expected: ${expectedPubkey.substring(0, 16)}...</span><br>
+                                <span style="color: #cf6679;">Got: ${bunkerPubkey.substring(0, 16)}...</span>`, 'error');
+                        }
+                    } else {
+                        showStatus('Token exchange successful!', 'success');
+                    }
+
+                    // Clean up sessionStorage (but keep test_identity for reference)
                     sessionStorage.removeItem('pkce_verifier');
                     sessionStorage.removeItem('oauth_api_url');
                     sessionStorage.removeItem('oauth_client_id');
+                    sessionStorage.removeItem('byok_used');
                     sessionStorage.removeItem('byok_pubkey');
                 } else {
                     showStatus(`Token exchange failed: ${data.error_description || data.error || 'Unknown error'}`, 'error');
@@ -323,14 +394,24 @@
         // Clear and reset
         function clearAndReset() {
             localStorage.removeItem('keycast_bunker_url');
-            sessionStorage.clear();
+            // Clear OAuth state but regenerate identity
+            sessionStorage.removeItem('pkce_verifier');
+            sessionStorage.removeItem('oauth_api_url');
+            sessionStorage.removeItem('oauth_client_id');
+            sessionStorage.removeItem('byok_used');
+            sessionStorage.removeItem('byok_pubkey');
             document.getElementById('results').style.display = 'none';
-            document.getElementById('nsec-info').style.display = 'none';
-            showStatus('Cleared. Ready to start over.', 'info');
+            // Generate a fresh identity
+            generateTestNsec();
+            showStatus('Cleared. New identity generated. Ready to start over.', 'info');
         }
 
         // On page load, check for OAuth callback (code in URL)
-        window.addEventListener('DOMContentLoaded', () => {
+        window.addEventListener('DOMContentLoaded', async () => {
+            // Initialize identity first (load from sessionStorage or generate new)
+            await waitForNostrTools();
+            loadOrGenerateIdentity();
+
             const urlParams = new URLSearchParams(window.location.search);
             const code = urlParams.get('code');
             const error = urlParams.get('error');
