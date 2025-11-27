@@ -2,6 +2,7 @@
 	import { getCurrentUser, setCurrentUser } from '$lib/current_user.svelte';
 	import { getAccountStatus, isEmailVerified } from '$lib/account_status.svelte';
 	import { KeycastApi } from '$lib/keycast_api.svelte';
+	import { BRAND } from '$lib/brand';
 	import { toast } from 'svelte-hot-french-toast';
 	import { goto } from '$app/navigation';
 
@@ -144,7 +145,7 @@
 </script>
 
 <svelte:head>
-	<title>Security Settings - Keycast</title>
+	<title>Security Settings - {BRAND.name}</title>
 </svelte:head>
 
 <div class="security-page">
@@ -339,7 +340,7 @@
 	.header h1 {
 		font-size: 2.5rem;
 		margin: 0 0 0.5rem 0;
-		color: #bb86fc;
+		color: var(--color-divine-purple);
 	}
 
 	.subtitle {
@@ -402,7 +403,7 @@
 
 	.section-header h2 {
 		margin: 0 0 0.5rem 0;
-		color: #bb86fc;
+		color: var(--color-divine-purple);
 		font-size: 1.5rem;
 	}
 
@@ -460,7 +461,7 @@
 
 	input:focus {
 		outline: none;
-		border-color: rgb(129 140 248);
+		border-color: var(--color-divine-purple);
 	}
 
 	input:disabled {
@@ -498,12 +499,12 @@
 	}
 
 	.btn-primary {
-		background: rgb(79 70 229);
+		background: var(--color-divine-green);
 		color: #fff;
 	}
 
 	.btn-primary:hover:not(:disabled) {
-		background: rgb(67 56 202);
+		background: var(--color-divine-green-dark);
 	}
 
 	.btn-secondary,

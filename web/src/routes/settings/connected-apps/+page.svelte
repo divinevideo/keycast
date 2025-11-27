@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { getCurrentUser } from '$lib/current_user.svelte';
 	import { KeycastApi } from '$lib/keycast_api.svelte';
+	import { BRAND } from '$lib/brand';
 	import ndk from '$lib/ndk.svelte';
 	import { NDKNip07Signer } from '@nostr-dev-kit/ndk';
 	import { toast } from 'svelte-hot-french-toast';
@@ -101,7 +102,7 @@
 </script>
 
 <svelte:head>
-	<title>Connected Apps - Keycast</title>
+	<title>Connected Apps - {BRAND.name}</title>
 </svelte:head>
 
 <div class="permissions-page">
@@ -226,48 +227,50 @@
 		margin: 0 auto;
 		padding: 2rem;
 		min-height: 100vh;
-		background: #0a0a0a;
-		color: #e0e0e0;
+		background: var(--color-divine-bg);
+		color: var(--color-divine-text);
 	}
 
 	.header {
-		margin-bottom: 3rem;
+		margin-bottom: 2rem;
 	}
 
 	.header-content {
 		display: flex;
 		justify-content: space-between;
-		align-items: flex-start;
+		align-items: center;
 		gap: 2rem;
 	}
 
 	.header h1 {
-		font-size: 2.5rem;
-		margin: 0 0 0.5rem 0;
-		color: #bb86fc;
+		font-size: 1.75rem;
+		margin: 0 0 0.25rem 0;
+		color: var(--color-divine-text);
+		font-weight: 600;
 	}
 
 	.subtitle {
-		color: #999;
-		font-size: 1.1rem;
+		color: var(--color-divine-text-secondary);
+		font-size: 0.9rem;
 		margin: 0;
 	}
 
 	.btn-add-bunker {
-		padding: 0.75rem 1.5rem;
-		background: #bb86fc;
-		color: #000;
-		border: none;
-		border-radius: 6px;
-		font-size: 1rem;
-		font-weight: 600;
+		padding: 0.5rem 1rem;
+		background: var(--color-divine-green);
+		color: #fff;
+		border: 1px solid var(--color-divine-green);
+		border-radius: var(--radius-md);
+		font-size: 0.875rem;
+		font-weight: 500;
 		cursor: pointer;
 		white-space: nowrap;
-		transition: background 0.2s;
+		transition: all 0.2s;
 	}
 
 	.btn-add-bunker:hover {
-		background: #cb96fc;
+		background: var(--color-divine-green-dark);
+		box-shadow: var(--shadow-sm);
 	}
 
 	.loading {
@@ -276,10 +279,10 @@
 	}
 
 	.spinner {
-		width: 50px;
-		height: 50px;
-		border: 4px solid #333;
-		border-top: 4px solid #bb86fc;
+		width: 40px;
+		height: 40px;
+		border: 3px solid var(--color-divine-border);
+		border-top: 3px solid var(--color-divine-green);
 		border-radius: 50%;
 		animation: spin 1s linear infinite;
 		margin: 0 auto 1rem;
@@ -292,124 +295,127 @@
 	}
 
 	.error-box {
-		background: #3a1f1f;
-		border: 2px solid #f44336;
-		border-radius: 8px;
+		background: rgba(239, 68, 68, 0.1);
+		border: 1px solid rgba(239, 68, 68, 0.3);
+		border-radius: var(--radius-md);
 		padding: 2rem;
 		text-align: center;
 	}
 
 	.error-box h3 {
-		color: #f44336;
+		color: var(--color-divine-error);
 		margin-top: 0;
 	}
 
 	.error-box button {
 		margin-top: 1rem;
-		padding: 0.5rem 1.5rem;
-		background: #bb86fc;
-		color: #000;
+		padding: 0.5rem 1rem;
+		background: var(--color-divine-green);
+		color: #fff;
 		border: none;
-		border-radius: 4px;
+		border-radius: var(--radius-md);
 		cursor: pointer;
-		font-size: 1rem;
+		font-size: 0.875rem;
 	}
 
 	.empty-state {
 		text-align: center;
 		padding: 4rem 2rem;
-		color: #999;
+		color: var(--color-divine-text-secondary);
 	}
 
 	.permissions-list {
 		display: grid;
-		gap: 1.5rem;
+		gap: 1rem;
 	}
 
 	.permission-card {
-		background: #1a1a1a;
-		border: 1px solid #333;
-		border-radius: 12px;
+		background: var(--color-divine-surface);
+		border: 1px solid var(--color-divine-border);
+		border-radius: var(--radius-md);
 		overflow: hidden;
-		transition: border-color 0.2s;
+		transition: all 0.2s;
 	}
 
 	.permission-card:hover {
-		border-color: #bb86fc;
+		border-color: var(--color-divine-green);
+		box-shadow: var(--shadow-sm);
 	}
 
 	.card-header {
 		display: flex;
 		justify-content: space-between;
 		align-items: flex-start;
-		padding: 1.5rem;
-		border-bottom: 1px solid #333;
+		padding: 1rem 1.25rem;
+		border-bottom: 1px solid var(--color-divine-border);
 	}
 
 	.card-header h3 {
-		margin: 0 0 0.5rem 0;
-		color: #bb86fc;
-		font-size: 1.5rem;
+		margin: 0 0 0.25rem 0;
+		color: var(--color-divine-text);
+		font-size: 1.1rem;
+		font-weight: 600;
 	}
 
 	.policy-name {
 		margin: 0;
-		color: #999;
-		font-size: 0.9rem;
+		color: var(--color-divine-text-secondary);
+		font-size: 0.8rem;
 	}
 
 	.card-actions {
 		display: flex;
-		gap: 1rem;
+		gap: 0.75rem;
 		align-items: center;
 	}
 
 	.btn-revoke {
-		padding: 0.5rem 1rem;
+		padding: 0.375rem 0.75rem;
 		background: transparent;
-		color: #f44336;
-		border: 1px solid #f44336;
-		border-radius: 4px;
+		color: var(--color-divine-error);
+		border: 1px solid var(--color-divine-error);
+		border-radius: var(--radius-sm);
 		cursor: pointer;
-		font-size: 0.9rem;
+		font-size: 0.8rem;
 		transition: all 0.2s;
 	}
 
 	.btn-revoke:hover {
-		background: #f44336;
+		background: var(--color-divine-error);
 		color: #fff;
 	}
 
 	.card-body {
-		padding: 1.5rem;
+		padding: 1rem 1.25rem;
 	}
 
 	.info-grid {
 		display: grid;
-		grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-		gap: 1rem;
+		grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+		gap: 0.75rem;
 	}
 
 	.info-item {
 		display: flex;
 		flex-direction: column;
-		gap: 0.25rem;
+		gap: 0.125rem;
 	}
 
 	.label {
-		font-size: 0.85rem;
-		color: #999;
+		font-size: 0.7rem;
+		color: var(--color-divine-text-secondary);
 		text-transform: uppercase;
 		letter-spacing: 0.5px;
 	}
 
 	.value {
-		font-size: 1rem;
-		color: #e0e0e0;
+		font-size: 0.875rem;
+		color: var(--color-divine-text);
 	}
 
 	.mono {
-		font-family: monospace;
+		font-family: var(--font-mono);
+		font-size: 0.8rem;
 	}
 
 	.modal-overlay {
@@ -418,61 +424,79 @@
 		left: 0;
 		right: 0;
 		bottom: 0;
-		background: rgba(0, 0, 0, 0.8);
+		background: rgba(0, 0, 0, 0.75);
 		display: flex;
 		align-items: center;
 		justify-content: center;
 		z-index: 1000;
+		backdrop-filter: blur(4px);
 	}
 
 	.modal {
-		background: #1a1a1a;
-		border: 1px solid #444;
-		border-radius: 12px;
-		padding: 2rem;
-		max-width: 500px;
+		background: var(--color-divine-surface);
+		border: 1px solid var(--color-divine-border);
+		border-radius: var(--radius-lg);
+		padding: 1.5rem;
+		max-width: 400px;
 		width: 90%;
+		box-shadow: var(--shadow-lg);
 	}
 
 	.modal h3 {
 		margin-top: 0;
-		color: #bb86fc;
+		margin-bottom: 0.75rem;
+		color: var(--color-divine-text);
+		font-size: 1.1rem;
+	}
+
+	.modal p {
+		color: var(--color-divine-text-secondary);
+		font-size: 0.9rem;
+		margin: 0.5rem 0;
 	}
 
 	.modal .warning {
-		color: #f44336;
-		font-weight: bold;
+		color: var(--color-divine-error);
+		font-weight: 500;
 	}
 
 	.modal-actions {
 		display: flex;
-		gap: 1rem;
-		margin-top: 2rem;
+		gap: 0.75rem;
+		margin-top: 1.5rem;
 		justify-content: flex-end;
 	}
 
 	.btn-cancel {
-		padding: 0.75rem 1.5rem;
-		background: #333;
-		color: #e0e0e0;
-		border: none;
-		border-radius: 4px;
+		padding: 0.5rem 1rem;
+		background: transparent;
+		color: var(--color-divine-text-secondary);
+		border: 1px solid var(--color-divine-border);
+		border-radius: var(--radius-md);
 		cursor: pointer;
-		font-size: 1rem;
+		font-size: 0.875rem;
+		transition: all 0.2s;
+	}
+
+	.btn-cancel:hover {
+		background: var(--color-divine-border);
+		color: var(--color-divine-text);
 	}
 
 	.btn-confirm-revoke {
-		padding: 0.75rem 1.5rem;
-		background: #f44336;
+		padding: 0.5rem 1rem;
+		background: var(--color-divine-error);
 		color: #fff;
-		border: none;
-		border-radius: 4px;
+		border: 1px solid var(--color-divine-error);
+		border-radius: var(--radius-md);
 		cursor: pointer;
-		font-size: 1rem;
-		font-weight: bold;
+		font-size: 0.875rem;
+		font-weight: 500;
+		transition: all 0.2s;
 	}
 
 	.btn-confirm-revoke:hover {
-		background: #d32f2f;
+		background: #dc2626;
+		border-color: #dc2626;
 	}
 </style>

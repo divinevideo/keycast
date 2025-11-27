@@ -7,8 +7,46 @@
 
 @theme {
   --font-*: initial;
-  --font-sans: system-ui, -apple-system, sans-serif;
-  --font-mono: system-mono, monospace;
+  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-heading: 'Bricolage Grotesque', system-ui, -apple-system, sans-serif;
+  --font-mono: 'SF Mono', 'Fira Code', monospace;
+
+  /* Divine color palette - aligned with divine.video */
+  --color-divine-purple: #8B5CF6;
+  --color-divine-purple-dark: #7C3AED;
+  --color-divine-purple-light: #A78BFA;
+  --color-divine-green: #00B488;
+  --color-divine-green-dark: #009A72;
+  --color-divine-green-light: #33C49F;
+
+  /* Background colors - deeper, richer dark */
+  --color-divine-bg: hsl(222.2 84% 4.9%);
+  --color-divine-surface: hsl(222.2 84% 4.9%);
+
+  /* Border color - subtle like divine.video */
+  --color-divine-border: hsl(217.2 32.6% 17.5%);
+
+  /* Text colors */
+  --color-divine-text: hsl(210 40% 98%);
+  --color-divine-text-secondary: hsl(215 20.2% 65.1%);
+  --color-divine-text-tertiary: #6B7280;
+
+  /* Status colors */
+  --color-divine-success: #10B981;
+  --color-divine-error: #EF4444;
+  --color-divine-warning: #F59E0B;
+  --color-divine-info: #3B82F6;
+
+  /* Design tokens matching divine.video */
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+
+  /* Shadows with brand color tint */
+  --shadow-sm: 0 2px 8px rgba(0, 180, 136, 0.08);
+  --shadow-md: 0 4px 16px rgba(0, 180, 136, 0.12);
+  --shadow-lg: 0 8px 32px rgba(0, 180, 136, 0.16);
 }
 
 @utility container {
@@ -50,12 +88,17 @@
 
 
 :root {
-    font-family: system-ui, -apple-system, sans-serif;
-    background-color: var(--color-gray-900);
-    color: var(--color-gray-100);
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    background-color: var(--color-divine-bg);
+    color: var(--color-divine-text);
     padding: 1rem;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+}
+
+h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-heading);
+    letter-spacing: -0.02em;
 }
 
 a.bordered {
@@ -71,19 +114,42 @@ a.bordered {
 }
 
 .button {
-    @apply whitespace-nowrap shrink rounded-md px-2 py-1 text-sm font-medium text-white/90 hover:text-white ring-1 ring-offset-2 ring-offset-gray-900 disabled:opacity-50 disabled:cursor-not-allowed;
+    @apply whitespace-nowrap shrink px-3 py-1.5 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200;
+    border-radius: var(--radius-md);
+    border: 1px solid transparent;
 }
 
 .button-primary {
-    @apply bg-indigo-600 hover:bg-indigo-700 ring-indigo-600/50 hover:ring-indigo-500/60;
+    background: var(--color-divine-green);
+    color: white;
+    border-color: var(--color-divine-green);
+}
+
+.button-primary:hover:not(:disabled) {
+    background: var(--color-divine-green-dark);
+    box-shadow: var(--shadow-sm);
 }
 
 .button-secondary {
-    @apply bg-gray-600/50 hover:bg-gray-700 ring-gray-700/50 hover:ring-gray-500/60;
+    background: transparent;
+    color: var(--color-divine-text-secondary);
+    border-color: var(--color-divine-border);
+}
+
+.button-secondary:hover:not(:disabled) {
+    background: var(--color-divine-border);
+    color: var(--color-divine-text);
 }
 
 .button-danger {
-    @apply bg-red-700 hover:bg-red-800 ring-red-700/50 hover:ring-red-500/60;
+    background: transparent;
+    color: var(--color-divine-error);
+    border-color: var(--color-divine-error);
+}
+
+.button-danger:hover:not(:disabled) {
+    background: var(--color-divine-error);
+    color: white;
 }
 
 .button-icon {
@@ -95,11 +161,19 @@ a.bordered {
 }
 
 .card {
-    @apply p-4 bg-gray-800/40 backdrop-blur-xl shadow-xl shadow-black/15 rounded-lg ring-1 ring-gray-500/50 ring-offset-2 ring-offset-gray-900/80 flex flex-col gap-4;
+    @apply p-4 rounded-lg flex flex-col gap-4;
+    background: var(--color-divine-surface);
+    border: 1px solid var(--color-divine-border);
+    box-shadow: var(--shadow-sm);
 }
 
 .hover-card {
-    @apply hover:ring-offset-gray-700/80 hover:ring-gray-600/80 cursor-pointer;
+    @apply cursor-pointer transition-all duration-200;
+}
+
+.hover-card:hover {
+    border-color: var(--color-divine-green);
+    box-shadow: var(--shadow-md);
 }
 
 .pill {
@@ -123,7 +197,15 @@ input[type="text"], input[type="password"], select, input[type="number"], input[
 }
 
 .feature-panel {
-    @apply relative overflow-hidden bg-gray-500/5 backdrop-blur-xl rounded-xl p-6 border border-white/20 shadow-lg shadow-gray-900/15 hover:bg-gray-500/10 transition-all duration-300;
+    @apply relative overflow-hidden rounded-xl p-6 transition-all duration-300;
+    background: var(--color-divine-surface);
+    border: 1px solid var(--color-divine-border);
+    box-shadow: var(--shadow-sm);
+}
+
+.feature-panel:hover {
+    border-color: var(--color-divine-green);
+    box-shadow: var(--shadow-md);
 }
 
 .nav-link {

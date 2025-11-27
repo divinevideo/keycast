@@ -5,6 +5,7 @@ import ndk from "$lib/ndk.svelte";
 import { SigninMethod, signin, signout } from "$lib/utils/auth";
 import { Key, SignIn, SignOut } from "phosphor-svelte";
 import { onMount } from "svelte";
+import { BRAND } from "$lib/brand";
 
 const user = $derived(getCurrentUser()?.user);
 const activePage = $derived($page.url.pathname);
@@ -31,13 +32,12 @@ onMount(async () => {
 </script>
 
 
-<div class="container flex flex-row items-center justify-between mb-12">
-	<a href="/" class="flex flex-col items-start justify-start">
-		<h1 class="text-3xl font-bold flex flex-row gap-1 items-center">
-            <Key size="32" weight="fill" />
-            Keycast
+<div class="container flex flex-row items-center justify-between mb-8">
+	<a href="/" class="flex flex-row items-center gap-2 group">
+		<h1 class="text-2xl font-bold flex flex-row gap-1.5 items-center text-[var(--color-divine-green)] group-hover:text-[var(--color-divine-green-light)] transition-colors">
+            <Key size="28" weight="fill" />
+            {BRAND.name}
         </h1>
-		<p class="hidden md:block text-gray-400">Secure remote signing for your team</p>
 	</a>
 
     <nav class="flex flex-row items-center justify-start gap-4">

@@ -13,7 +13,6 @@
 	let { show = $bindable(false), onClose, onSuccess }: Props = $props();
 
 	let appName = $state('');
-	let relayUrl = $state('wss://relay.damus.io');
 	let isCreating = $state(false);
 	let bunkerUrl = $state('');
 	let showCopySuccess = $state(false);
@@ -34,10 +33,7 @@
 				created_at: string;
 			}>(
 				'/user/bunker/create',
-				{
-					app_name: appName,
-					relay_url: relayUrl
-				}
+				{ app_name: appName }
 			);
 
 			bunkerUrl = response.bunker_url;
@@ -68,7 +64,6 @@
 		}
 		// Reset form
 		appName = '';
-		relayUrl = 'wss://relay.damus.io';
 		bunkerUrl = '';
 		showCopySuccess = false;
 		onClose();
@@ -83,7 +78,7 @@
 		<!-- svelte-ignore a11y_no_static_element_interactions -->
 		<div class="modal" onclick={(e) => e.stopPropagation()}>
 			<div class="modal-header">
-				<h2>{bunkerUrl ? 'Bunker Connection Created' : 'Create Bunker Connection'}</h2>
+				<h2>{bunkerUrl ? 'Connection Ready!' : 'Connect to Nostr App'}</h2>
 				<button class="close-btn" onclick={handleClose}>×</button>
 			</div>
 
@@ -97,20 +92,20 @@
 					</div>
 
 					<button class="btn-copy" onclick={copyBunkerUrl}>
-						{showCopySuccess ? '✓ Copied!' : '📋 Copy Bunker URL'}
+						{showCopySuccess ? '✓ Copied!' : 'Copy Bunker URL'}
 					</button>
 
-					<p class="help-text">
-						This URL allows the app to request signatures via NIP-46. Paste it into your client
-						application.
-					</p>
+					<div class="warning-box">
+						<strong>Keep this URL secret!</strong>
+						<p>This bunker URL acts like a password. Only share it with the app you're connecting to. Anyone with this URL can request signatures from your identity.</p>
+					</div>
 				</div>
 			{:else}
 				<!-- Form state: Create bunker -->
 				<div class="modal-body">
 					<p class="description">
-						Create a NIP-46 bunker connection for apps that don't support OAuth (manual
-						copy/paste flow).
+						Generate a connection URL to use your diVine ID with Nostr apps that support
+						NIP-46 remote signing (Damus, Primal, Amethyst, etc).
 					</p>
 
 					<div class="form-group">
@@ -119,21 +114,11 @@
 							id="appName"
 							type="text"
 							bind:value={appName}
-							placeholder="My NIP-46 Client"
+							placeholder="e.g. Damus, Primal, Amethyst"
 							required
 							disabled={isCreating}
 						/>
-					</div>
-
-					<div class="form-group">
-						<label for="relayUrl">Relay URL</label>
-						<input
-							id="relayUrl"
-							type="text"
-							bind:value={relayUrl}
-							placeholder="wss://relay.damus.io"
-							disabled={isCreating}
-						/>
+						<p class="input-hint">Name of the app you're connecting to</p>
 					</div>
 
 					<div class="modal-actions">
@@ -157,87 +142,95 @@
 		left: 0;
 		right: 0;
 		bottom: 0;
-		background: rgba(0, 0, 0, 0.8);
+		background: rgba(0, 0, 0, 0.75);
 		display: flex;
 		align-items: center;
 		justify-content: center;
 		z-index: 1000;
+		backdrop-filter: blur(4px);
 	}
 
 	.modal {
-		background: #1a1a1a;
-		border: 1px solid #333;
-		border-radius: 12px;
-		max-width: 600px;
+		background: var(--color-divine-surface);
+		border: 1px solid var(--color-divine-border);
+		border-radius: var(--radius-lg);
+		max-width: 480px;
 		width: 90%;
 		max-height: 90vh;
 		overflow-y: auto;
+		box-shadow: var(--shadow-lg);
 	}
 
 	.modal-header {
 		display: flex;
 		justify-content: space-between;
 		align-items: center;
-		padding: 1.5rem;
-		border-bottom: 1px solid #333;
+		padding: 1.25rem;
+		border-bottom: 1px solid var(--color-divine-border);
 	}
 
 	.modal-header h2 {
 		margin: 0;
-		color: #bb86fc;
-		font-size: 1.5rem;
+		color: var(--color-divine-text);
+		font-size: 1.25rem;
+		font-weight: 600;
 	}
 
 	.close-btn {
 		background: none;
 		border: none;
-		color: #999;
-		font-size: 2rem;
+		color: var(--color-divine-text-secondary);
+		font-size: 1.5rem;
 		cursor: pointer;
 		padding: 0;
-		width: 32px;
-		height: 32px;
+		width: 28px;
+		height: 28px;
 		line-height: 1;
+		transition: color 0.2s;
 	}
 
 	.close-btn:hover {
-		color: #e0e0e0;
+		color: var(--color-divine-text);
 	}
 
 	.modal-body {
-		padding: 1.5rem;
+		padding: 1.25rem;
 	}
 
 	.description {
-		color: #999;
-		margin-bottom: 1.5rem;
+		color: var(--color-divine-text-secondary);
+		margin-bottom: 1.25rem;
+		font-size: 0.9rem;
+		line-height: 1.5;
 	}
 
 	.form-group {
-		margin-bottom: 1.5rem;
+		margin-bottom: 1.25rem;
 	}
 
 	label {
 		display: block;
-		margin-bottom: 0.5rem;
-		color: #e0e0e0;
+		margin-bottom: 0.375rem;
+		color: var(--color-divine-text);
 		font-weight: 500;
+		font-size: 0.875rem;
 	}
 
 	input {
 		width: 100%;
-		padding: 0.75rem;
-		background: #0a0a0a;
-		border: 1px solid #444;
-		border-radius: 6px;
-		color: #e0e0e0;
-		font-size: 1rem;
+		padding: 0.625rem 0.75rem;
+		background: var(--color-divine-bg);
+		border: 1px solid var(--color-divine-border);
+		border-radius: var(--radius-md);
+		color: var(--color-divine-text);
+		font-size: 0.9rem;
 		box-sizing: border-box;
+		transition: border-color 0.2s;
 	}
 
 	input:focus {
 		outline: none;
-		border-color: #bb86fc;
+		border-color: var(--color-divine-green);
 	}
 
 	input:disabled {
@@ -245,40 +238,49 @@
 		cursor: not-allowed;
 	}
 
+	.input-hint {
+		margin: 0.375rem 0 0 0;
+		font-size: 0.75rem;
+		color: var(--color-divine-text-secondary);
+	}
+
 	.modal-actions {
 		display: flex;
-		gap: 1rem;
-		margin-top: 2rem;
+		gap: 0.75rem;
+		margin-top: 1.5rem;
 	}
 
 	.btn-cancel,
 	.btn-create {
 		flex: 1;
-		padding: 0.75rem;
-		border: none;
-		border-radius: 6px;
-		font-size: 1rem;
-		font-weight: 600;
+		padding: 0.625rem;
+		border-radius: var(--radius-md);
+		font-size: 0.875rem;
+		font-weight: 500;
 		cursor: pointer;
 		transition: all 0.2s;
 	}
 
 	.btn-cancel {
-		background: #2a2a2a;
-		color: #e0e0e0;
+		background: transparent;
+		color: var(--color-divine-text-secondary);
+		border: 1px solid var(--color-divine-border);
 	}
 
 	.btn-cancel:hover:not(:disabled) {
-		background: #3a3a3a;
+		background: var(--color-divine-border);
+		color: var(--color-divine-text);
 	}
 
 	.btn-create {
-		background: #bb86fc;
-		color: #000;
+		background: var(--color-divine-green);
+		color: #fff;
+		border: 1px solid var(--color-divine-green);
 	}
 
 	.btn-create:hover:not(:disabled) {
-		background: #cb96fc;
+		background: var(--color-divine-green-dark);
+		box-shadow: var(--shadow-sm);
 	}
 
 	.btn-cancel:disabled,
@@ -288,47 +290,70 @@
 	}
 
 	.success-message {
-		color: #03dac6;
+		color: var(--color-divine-green);
 		font-weight: 500;
-		margin-bottom: 1rem;
+		margin-bottom: 0.75rem;
+		font-size: 0.9rem;
 	}
 
 	.bunker-url-display {
-		background: #0a0a0a;
-		border: 1px solid #444;
-		border-radius: 6px;
-		padding: 1rem;
-		margin-bottom: 1rem;
+		background: var(--color-divine-bg);
+		border: 1px solid var(--color-divine-border);
+		border-radius: var(--radius-md);
+		padding: 0.875rem;
+		margin-bottom: 0.875rem;
 		word-break: break-all;
 	}
 
 	.bunker-url-display code {
-		color: #03dac6;
-		font-size: 0.9rem;
-		font-family: 'Courier New', monospace;
+		color: var(--color-divine-green);
+		font-size: 0.8rem;
+		font-family: var(--font-mono);
 	}
 
 	.btn-copy {
 		width: 100%;
-		padding: 0.75rem;
-		background: #03dac6;
-		color: #000;
-		border: none;
-		border-radius: 6px;
-		font-size: 1rem;
-		font-weight: 600;
+		padding: 0.625rem;
+		background: var(--color-divine-green);
+		color: #fff;
+		border: 1px solid var(--color-divine-green);
+		border-radius: var(--radius-md);
+		font-size: 0.875rem;
+		font-weight: 500;
 		cursor: pointer;
-		transition: background 0.2s;
-		margin-bottom: 1rem;
+		transition: all 0.2s;
+		margin-bottom: 0.875rem;
 	}
 
 	.btn-copy:hover {
-		background: #13ebd6;
+		background: var(--color-divine-green-dark);
+		box-shadow: var(--shadow-sm);
 	}
 
 	.help-text {
 		color: #666;
 		font-size: 0.875rem;
 		line-height: 1.5;
+	}
+
+	.warning-box {
+		background: rgba(245, 158, 11, 0.1);
+		border: 1px solid rgba(245, 158, 11, 0.3);
+		border-radius: 8px;
+		padding: 1rem;
+		margin-top: 0.5rem;
+	}
+
+	.warning-box strong {
+		color: #f59e0b;
+		display: block;
+		margin-bottom: 0.5rem;
+	}
+
+	.warning-box p {
+		color: #999;
+		font-size: 0.875rem;
+		line-height: 1.5;
+		margin: 0;
 	}
 </style>

@@ -3,6 +3,7 @@
 	import { page } from '$app/stores';
 	import { toast } from 'svelte-hot-french-toast';
 	import { KeycastApi } from '$lib/keycast_api.svelte';
+	import { BRAND } from '$lib/brand';
 
 	const api = new KeycastApi();
 
@@ -48,7 +49,7 @@
 </script>
 
 <svelte:head>
-	<title>Reset Password - Keycast</title>
+	<title>Reset Password - {BRAND.name}</title>
 </svelte:head>
 
 <div class="auth-page">
@@ -57,7 +58,7 @@
 			<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" fill="currentColor" viewBox="0 0 256 256">
 				<path d="M216.57,39.43A80,80,0,0,0,83.91,120.78L28.69,176A15.86,15.86,0,0,0,24,187.31V216a16,16,0,0,0,16,16H72a8,8,0,0,0,8-8V208H96a8,8,0,0,0,8-8V184h16a8,8,0,0,0,5.66-2.34l9.56-9.57A79.73,79.73,0,0,0,160,176h.1A80,80,0,0,0,216.57,39.43ZM180,92a16,16,0,1,1,16-16A16,16,0,0,1,180,92Z"></path>
 			</svg>
-			<span>Keycast</span>
+			<span>{BRAND.name}</span>
 		</a>
 
 		<h1>Reset Password</h1>
@@ -179,7 +180,7 @@
 
 	input:focus {
 		outline: none;
-		border-color: #bb86fc;
+		border-color: var(--color-divine-purple);
 	}
 
 	input:disabled {
@@ -191,7 +192,7 @@
 		display: block;
 		width: 100%;
 		padding: 0.75rem;
-		background: rgb(79 70 229);
+		background: var(--color-divine-green);
 		color: #fff;
 		border: none;
 		border-radius: 6px;
@@ -204,7 +205,7 @@
 	}
 
 	.btn-primary:hover:not(:disabled) {
-		background: rgb(67 56 202);
+		background: var(--color-divine-green-dark);
 	}
 
 	.btn-primary:disabled {
@@ -219,7 +220,7 @@
 	}
 
 	.auth-link a {
-		color: rgb(129 140 248);
+		color: var(--color-divine-purple-light);
 		text-decoration: none;
 	}
 
