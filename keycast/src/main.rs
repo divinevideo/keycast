@@ -325,13 +325,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // All API endpoints under /api prefix
         .nest("/api", api_routes);
 
-    // Only serve examples in development mode
+    // Only serve examples when enabled
     if enable_examples {
-        let examples_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("examples");
-        tracing::info!("✔︎ Examples directory enabled at /examples");
+        // In Docker, examples are at /app/examples; in dev, relative to workspace root
+        let examples_path = if PathBuf::from("/app/examples").exists() {
+            PathBuf::from("/app/examples")
+        } else {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("examples")
+        };
+        tracing::info!("✔︎ Examples directory enabled at /examples (serving from {:?})", examples_path);
         app = app.nest_service("/examples", ServeDir::new(&examples_path));
     }
 
