@@ -1,12 +1,33 @@
 <script lang="ts">
 import { page } from "$app/stores";
-import { getCurrentUser } from "$lib/current_user.svelte";
+import { getCurrentUser, setCurrentUser } from "$lib/current_user.svelte";
 import ndk from "$lib/ndk.svelte";
 import { SigninMethod, signin, signout } from "$lib/utils/auth";
 import { Key, SignIn, SignOut } from "phosphor-svelte";
+import { onMount } from "svelte";
 
 const user = $derived(getCurrentUser()?.user);
 const activePage = $derived($page.url.pathname);
+
+// Check for cookie-based authentication on mount
+onMount(async () => {
+	if (!user) {
+		try {
+			const response = await fetch('/api/oauth/auth-status', {
+				credentials: 'include'
+			});
+			if (response.ok) {
+				const data = await response.json();
+				if (data.authenticated && data.pubkey) {
+					const savedMethod = localStorage.getItem('keycast_auth_method') as 'nip07' | 'cookie' || 'cookie';
+					setCurrentUser(data.pubkey, savedMethod);
+				}
+			}
+		} catch (err) {
+			console.warn('Failed to check auth status:', err);
+		}
+	}
+});
 </script>
 
 
@@ -21,7 +42,11 @@ const activePage = $derived($page.url.pathname);
 
     <nav class="flex flex-row items-center justify-start gap-4">
         {#if user}
+            {#if activePage !== '/'}
+                <a class="nav-link bordered" href="/">Dashboard</a>
+            {/if}
             <a class="nav-link {activePage === '/teams' ? 'active' : ''} bordered" href="/teams">Teams</a>
+            <a class="nav-link {activePage === '/settings/connected-apps' ? 'active' : ''} bordered" href="/settings/connected-apps">Connected Apps</a>
             <button
                 onclick={() => signout(ndk)}
                 ontouchend={() => signout(ndk)}
