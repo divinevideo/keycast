@@ -8,7 +8,7 @@
     - generic [ref=e5]:
       - text: "Domain:"
       - textbox "Domain:" [ref=e6]:
-        - /placeholder: oauth.divine.video
+        - /placeholder: login.divine.video
         - text: localhost:3000
     - generic [ref=e7]:
       - text: "API Base:"

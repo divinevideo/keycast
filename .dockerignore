@@ -1,0 +1,56 @@
+# Version control
+.git
+.gitignore
+
+# Rust build artifacts
+target/
+**/*.rs.bk
+
+# Node modules
+node_modules/
+web/node_modules/
+api/oauth-ui/node_modules/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+.envrc
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+database/*.db*
+
+# Encryption keys
+master.key
+*.key
+*service-account*.json
+
+# Documentation (not needed in image)
+docs/
+*.md
+!README.md
+
+# Test artifacts
+test-results/
+.private-journal/
+coverage/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Build outputs not needed in final image
+web/build/
+api/oauth-ui/dist/
+
+# Temporary files
+*.log
+*.tmp
+tmp/

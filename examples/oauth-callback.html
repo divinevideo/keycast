@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OAuth Callback</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        .message {
+            text-align: center;
+            font-size: 18px;
+        }
+        .success { color: #03dac6; }
+        .error { color: #cf6679; }
+    </style>
+</head>
+<body>
+    <div class="message" id="message">Processing OAuth callback...</div>
+
+    <script>
+        // OAuth Callback Handler
+        // Handles both popup flow (postMessage) and iOS PWA flow (polling pattern)
+
+        const params = new URLSearchParams(window.location.search);
+        const code = params.get('code');
+        const state = params.get('state');
+        const error = params.get('error');
+        const errorDescription = params.get('error_description');
+
+        const messageEl = document.getElementById('message');
+
+        // Detect flow based on state parameter
+        if (state) {
+            // iOS PWA flow: state-based polling
+            // Code is already stored server-side in polling cache
+            // Parent PWA will poll /oauth/poll?state={state} to retrieve it
+
+            if (code) {
+                messageEl.className = 'message success';
+                messageEl.textContent = '✓ Authorization complete. Please return to your app.';
+            } else {
+                messageEl.className = 'message error';
+                messageEl.textContent = `✗ Authorization ${error || 'failed'}`;
+            }
+        } else if (window.opener) {
+            // Popup flow: postMessage to parent
+            const message = {
+                type: 'oauth_callback',
+                ...(code && { code }),
+                ...(error && { error }),
+                ...(errorDescription && { error_description: errorDescription }),
+            };
+
+            try {
+                window.opener.postMessage(message, window.location.origin);
+
+                if (code) {
+                    messageEl.className = 'message success';
+                    messageEl.textContent = '✓ Authorization successful! Closing window...';
+                } else {
+                    messageEl.className = 'message error';
+                    messageEl.textContent = `✗ Authorization ${error || 'failed'}`;
+                }
+
+                setTimeout(() => window.close(), 1000);
+            } catch (e) {
+                messageEl.className = 'message error';
+                messageEl.textContent = 'Failed to communicate with parent window';
+                console.error('postMessage failed:', e);
+            }
+        } else {
+            messageEl.className = 'message error';
+            messageEl.textContent = 'This page must be opened from the OAuth client';
+        }
+    </script>
+</body>
+</html>

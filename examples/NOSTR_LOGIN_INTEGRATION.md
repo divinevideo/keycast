@@ -100,7 +100,7 @@ To make Keycast work with nostr-login, we need to add two components:
 {
   "nip46": {
     "relay": "wss://relay3.openvine.co",
-    "nostrconnect_url": "https://oauth.divine.video/connect/<nostrconnect>"
+    "nostrconnect_url": "https://login.divine.video/connect/<nostrconnect>"
   }
 }
 ```
@@ -119,7 +119,7 @@ async fn nostr_discovery() -> impl IntoResponse {
     let discovery = serde_json::json!({
         "nip46": {
             "relay": "wss://relay3.openvine.co",
-            "nostrconnect_url": "https://oauth.divine.video/connect/<nostrconnect>"
+            "nostrconnect_url": "https://login.divine.video/connect/<nostrconnect>"
         }
     });
 
@@ -143,7 +143,7 @@ Router::new()
 
 **URL Structure**:
 ```
-https://oauth.divine.video/connect/nostrconnect://CLIENT_PUBKEY?relay=RELAY_URL&secret=SECRET&perms=PERMISSIONS&name=APP_NAME
+https://login.divine.video/connect/nostrconnect://CLIENT_PUBKEY?relay=RELAY_URL&secret=SECRET&perms=PERMISSIONS&name=APP_NAME
 ```
 
 **Flow**:
@@ -460,7 +460,7 @@ app.layer(cors)
 
 **Test Discovery Endpoint**:
 ```bash
-curl https://oauth.divine.video/.well-known/nostr.json?name=_
+curl https://login.divine.video/.well-known/nostr.json?name=_
 ```
 
 Expected response:
@@ -468,7 +468,7 @@ Expected response:
 {
   "nip46": {
     "relay": "wss://relay3.openvine.co",
-    "nostrconnect_url": "https://oauth.divine.video/connect/<nostrconnect>"
+    "nostrconnect_url": "https://login.divine.video/connect/<nostrconnect>"
   }
 }
 ```
@@ -476,7 +476,7 @@ Expected response:
 **Test Connect Endpoint**:
 ```bash
 # This would normally come from nostr-login, but you can test manually
-open "https://oauth.divine.video/connect/nostrconnect://abc123...?relay=wss://relay.damus.io&secret=test&name=TestApp"
+open "https://login.divine.video/connect/nostrconnect://abc123...?relay=wss://relay.damus.io&secret=test&name=TestApp"
 ```
 
 Should show authorization page.
@@ -492,7 +492,7 @@ Create `examples/nostr-login-test.html`:
     <title>Keycast + nostr-login Test</title>
     <script
       src='https://www.unpkg.com/nostr-login@latest/dist/unpkg.js'
-      data-bunkers="oauth.divine.video"
+      data-bunkers="login.divine.video"
       data-perms="sign_event:1"
     ></script>
 </head>
@@ -526,7 +526,7 @@ Create `examples/nostr-login-test.html`:
 1. Open `nostr-login-test.html`
 2. Click "Sign Test Event"
 3. nostr-login shows login modal
-4. Click "Login with oauth.divine.video"
+4. Click "Login with login.divine.video"
 5. Popup opens to Keycast
 6. Login/register and approve
 7. Popup closes
@@ -567,7 +567,7 @@ async fn test_full_nostr_login_flow() {
 - [ ] Create nostr-login test HTML
 - [ ] Test full integration with nostr-login
 - [ ] Update signer daemon if needed (may need to handle client-initiated flow)
-- [ ] Deploy to oauth.divine.video
+- [ ] Deploy to login.divine.video
 - [ ] Test on production
 - [ ] Document in main README
 
@@ -603,8 +603,8 @@ Check `signer/src/signer_daemon.rs` and `signer/src/signer_manager.rs` to see if
 
 When complete, users should be able to:
 
-1. ✅ Add `data-bunkers="oauth.divine.video"` to any nostr-login script tag
-2. ✅ See "Login with oauth.divine.video" (or "Keycast") in the nostr-login modal
+1. ✅ Add `data-bunkers="login.divine.video"` to any nostr-login script tag
+2. ✅ See "Login with login.divine.video" (or "Keycast") in the nostr-login modal
 3. ✅ Click it and get Keycast OAuth popup
 4. ✅ Login/register in popup
 5. ✅ Approve authorization
@@ -616,8 +616,8 @@ This makes Keycast as easy to use as nsec.app for any nostr-login enabled applic
 
 ## Questions / Clarifications Needed
 
-1. **Domain**: Should we use `oauth.divine.video` or a different domain?
-2. **Branding**: What name should appear in nostr-login? "Keycast"? "oauth.divine.video"?
+1. **Domain**: Should we use `login.divine.video` or a different domain?
+2. **Branding**: What name should appear in nostr-login? "Keycast"? "login.divine.video"?
 3. **Relay**: Confirm `wss://relay3.openvine.co` is the correct relay to use
 4. **Session Management**: How do you want to handle user sessions in the popup? JWT in cookie?
 5. **Signer Daemon**: Need to verify if signer daemon handles client-initiated connections or if updates needed

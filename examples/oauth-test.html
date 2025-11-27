@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Keycast OAuth + PKCE Test</title>
+    <script src="https://unpkg.com/nostr-tools@2.7.2/lib/nostr.bundle.js"
+            crossorigin="anonymous"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #1a1a1a;
+            color: #e0e0e0;
+        }
+        h1 { color: #bb86fc; }
+        .section {
+            background: #2a2a2a;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 8px;
+        }
+        input, button {
+            padding: 12px;
+            margin: 8px 0;
+            border-radius: 6px;
+            border: 1px solid #4a4a4a;
+            background: #3a3a3a;
+            color: #e0e0e0;
+            font-size: 14px;
+            width: 100%;
+            box-sizing: border-box;
+        }
+        button {
+            background: #bb86fc;
+            color: #000;
+            font-weight: 600;
+            cursor: pointer;
+            width: auto;
+            padding: 12px 24px;
+        }
+        button:hover { background: #cb96fc; }
+        button:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+        .status {
+            margin-top: 15px;
+            padding: 15px;
+            border-radius: 6px;
+        }
+        .success { background: #1b5e20; border-left: 4px solid #03dac6; }
+        .error { background: #b71c1c; border-left: 4px solid #cf6679; }
+        .info { background: #1a237e; border-left: 4px solid #03a9f4; }
+        pre {
+            background: #1a1a1a;
+            padding: 12px;
+            border-radius: 4px;
+            overflow-x: auto;
+            font-size: 12px;
+            word-break: break-all;
+            white-space: pre-wrap;
+        }
+        .button-group {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .button-group button {
+            flex: 1;
+            min-width: 200px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Keycast OAuth + PKCE Test</h1>
+    <p>OAuth 2.0 authorization code flow with PKCE security and BYOK support (redirect-based, no popups)</p>
+
+    <div class="section">
+        <h2>Configuration</h2>
+        <label>Keycast Server URL:</label>
+        <input type="text" id="apiUrl" value="">
+
+        <label>Client ID:</label>
+        <input type="text" id="clientId" value="standalone-test-app">
+    </div>
+
+    <div class="section">
+        <h2>OAuth Flow (Redirect-based)</h2>
+        <div class="button-group">
+            <button onclick="connectWithKeycast()">Connect with Keycast</button>
+            <button onclick="connectWithKeycastBYOK()">Connect with BYOK (Import Key)</button>
+        </div>
+        <div id="status"></div>
+        <div id="nsec-info" style="display:none; margin-top: 15px; background: #2a4a2a; padding: 15px; border-radius: 8px; border-left: 4px solid #03dac6;">
+            <p style="color: #03dac6; margin: 0 0 10px 0;"><strong>Client-Generated Key (BYOK Mode)</strong></p>
+            <p style="font-size: 13px; color: #aaa; margin: 5px 0;">This nsec will be embedded in code_verifier and sent during token exchange:</p>
+            <p style="font-size: 12px; margin: 5px 0;"><strong>nsec:</strong> <code id="test-nsec" style="color: #03dac6; word-break: break-all;"></code></p>
+            <p style="font-size: 12px; margin: 5px 0;"><strong>pubkey (hex):</strong> <code id="test-pubkey" style="color: #bb86fc; word-break: break-all;"></code></p>
+            <p style="font-size: 12px; margin: 5px 0;"><strong>npub:</strong> <code id="test-npub" style="color: #bb86fc; word-break: break-all;"></code></p>
+        </div>
+    </div>
+
+    <div class="section" id="results" style="display: none;">
+        <h2>Bunker URL Received</h2>
+        <pre id="bunkerUrl"></pre>
+        <p style="color: #03dac6;">You can now use this bunker URL in any NIP-46 client!</p>
+        <button onclick="testBunkerConnection()">Test Bunker Connection</button>
+        <button onclick="clearAndReset()">Clear & Start Over</button>
+    </div>
+
+    <script>
+        // Auto-detect environment
+        const isProduction = window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1';
+        const defaultApiUrl = isProduction
+            ? `${window.location.protocol}//${window.location.host}`
+            : 'http://localhost:3000';
+
+        // Redirect URI is THIS page - we handle the callback here
+        const redirectUri = window.location.origin + window.location.pathname;
+
+        // Set defaults
+        document.getElementById('apiUrl').value = defaultApiUrl;
+
+        // PKCE Helpers
+        function base64URLEncode(buffer) {
+            return btoa(String.fromCharCode(...new Uint8Array(buffer)))
+                .replace(/\+/g, '-')
+                .replace(/\//g, '_')
+                .replace(/=/g, '');
+        }
+
+        async function generatePKCE(nsec) {
+            const verifierBytes = new Uint8Array(32);
+            crypto.getRandomValues(verifierBytes);
+            const randomPart = base64URLEncode(verifierBytes);
+
+            // Embed nsec in verifier if provided (BYOK flow)
+            // Format: {random}.{nsec}
+            const verifier = nsec ? `${randomPart}.${nsec}` : randomPart;
+
+            const encoder = new TextEncoder();
+            const hashBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(verifier));
+            const challenge = base64URLEncode(hashBuffer);
+
+            return { verifier, challenge };
+        }
+
+        function showStatus(message, type = 'info') {
+            const el = document.getElementById('status');
+            el.innerHTML = `<div class="status ${type}">${message}</div>`;
+        }
+
+        // Wait for nostr-tools to load
+        function waitForNostrTools() {
+            return new Promise((resolve) => {
+                if (window.NostrTools) {
+                    resolve();
+                } else {
+                    window.addEventListener('load', () => resolve());
+                }
+            });
+        }
+
+        // Generate a test nsec with nostr-tools
+        function generateTestNsec() {
+            const { generateSecretKey, getPublicKey, nip19 } = window.NostrTools;
+
+            const secretKey = generateSecretKey();
+            const pubkeyHex = getPublicKey(secretKey);
+
+            const nsec = nip19.nsecEncode(secretKey);
+            const npub = nip19.npubEncode(pubkeyHex);
+
+            // Display in UI
+            document.getElementById('test-nsec').textContent = nsec;
+            document.getElementById('test-pubkey').textContent = pubkeyHex;
+            document.getElementById('test-npub').textContent = npub;
+            document.getElementById('nsec-info').style.display = 'block';
+
+            return { nsec, pubkey: pubkeyHex, npub };
+        }
+
+        // OAuth Redirect Flow (no popups)
+        async function connectWithKeycast() {
+            await startOAuthFlow(false);
+        }
+
+        // OAuth Flow with BYOK (client provides key)
+        async function connectWithKeycastBYOK() {
+            await waitForNostrTools();
+            await startOAuthFlow(true);
+        }
+
+        async function startOAuthFlow(importKey) {
+            const apiUrl = document.getElementById('apiUrl').value;
+            const clientId = document.getElementById('clientId').value;
+
+            showStatus('Generating PKCE challenge...', 'info');
+
+            // Generate nsec and pubkey if BYOK mode
+            let nsec = null;
+            let pubkey = null;
+            if (importKey) {
+                const keyPair = generateTestNsec();
+                nsec = keyPair.nsec;
+                pubkey = keyPair.pubkey;
+                // Store pubkey for verification later
+                sessionStorage.setItem('byok_pubkey', pubkey);
+            }
+
+            // Generate PKCE with optional embedded nsec
+            const pkce = await generatePKCE(nsec);
+
+            // Store verifier in sessionStorage (persists across redirect)
+            sessionStorage.setItem('pkce_verifier', pkce.verifier);
+            sessionStorage.setItem('oauth_api_url', apiUrl);
+            sessionStorage.setItem('oauth_client_id', clientId);
+
+            if (importKey) {
+                showStatus(`PKCE Generated with embedded nsec (BYOK)<br><small>Redirecting to Keycast...</small>`, 'info');
+            } else {
+                showStatus(`PKCE Generated<br><small>Redirecting to Keycast...</small>`, 'info');
+            }
+
+            // Build authorization URL
+            const authUrl = new URL(`${apiUrl}/api/oauth/authorize`);
+            authUrl.searchParams.set('client_id', clientId);
+            authUrl.searchParams.set('redirect_uri', redirectUri);
+            authUrl.searchParams.set('scope', 'sign_event encrypt decrypt');
+            authUrl.searchParams.set('code_challenge', pkce.challenge);
+            authUrl.searchParams.set('code_challenge_method', 'S256');
+
+            if (importKey) {
+                authUrl.searchParams.set('default_register', 'true');
+                authUrl.searchParams.set('byok_pubkey', pubkey);
+            }
+
+            // Small delay to show status, then redirect
+            setTimeout(() => {
+                window.location.href = authUrl.toString();
+            }, 500);
+        }
+
+        // Exchange authorization code for bunker URL
+        async function exchangeCode(code) {
+            // Retrieve stored values from sessionStorage
+            const verifier = sessionStorage.getItem('pkce_verifier');
+            const apiUrl = sessionStorage.getItem('oauth_api_url') || document.getElementById('apiUrl').value;
+            const clientId = sessionStorage.getItem('oauth_client_id') || document.getElementById('clientId').value;
+
+            if (!verifier) {
+                showStatus('PKCE verifier not found. Please restart OAuth flow.', 'error');
+                return;
+            }
+
+            showStatus(`Exchanging code for bunker URL...<br><small>Code: ${code.substring(0, 16)}...</small>`, 'info');
+
+            try {
+                const response = await fetch(`${apiUrl}/api/oauth/token`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        grant_type: 'authorization_code',
+                        code,
+                        client_id: clientId,
+                        redirect_uri: redirectUri,
+                        code_verifier: verifier
+                    })
+                });
+
+                const data = await response.json();
+
+                if (response.ok && data.bunker_url) {
+                    showStatus('Token exchange successful!', 'success');
+                    document.getElementById('results').style.display = 'block';
+                    document.getElementById('bunkerUrl').textContent = data.bunker_url;
+
+                    // Store bunker URL for later use
+                    localStorage.setItem('keycast_bunker_url', data.bunker_url);
+
+                    // Clean up sessionStorage
+                    sessionStorage.removeItem('pkce_verifier');
+                    sessionStorage.removeItem('oauth_api_url');
+                    sessionStorage.removeItem('oauth_client_id');
+                    sessionStorage.removeItem('byok_pubkey');
+                } else {
+                    showStatus(`Token exchange failed: ${data.error_description || data.error || 'Unknown error'}`, 'error');
+                }
+            } catch (error) {
+                showStatus(`Error: ${error.message}`, 'error');
+            }
+        }
+
+        // Test the bunker connection
+        async function testBunkerConnection() {
+            const bunkerUrl = document.getElementById('bunkerUrl').textContent;
+            showStatus('Testing bunker connection... (check browser console)', 'info');
+            console.log('[Test] Bunker URL:', bunkerUrl);
+
+            // Parse bunker URL
+            try {
+                const url = new URL(bunkerUrl);
+                const pubkey = url.hostname || url.pathname.replace('//', '');
+                const relay = url.searchParams.get('relay');
+                const secret = url.searchParams.get('secret');
+
+                console.log('[Test] Parsed bunker URL:');
+                console.log('  - Pubkey:', pubkey);
+                console.log('  - Relay:', relay);
+                console.log('  - Secret:', secret ? secret.substring(0, 8) + '...' : 'none');
+
+                showStatus(`Bunker URL parsed successfully!<br>
+                    <small>Pubkey: ${pubkey.substring(0, 16)}...</small><br>
+                    <small>Relay: ${relay}</small>`, 'success');
+            } catch (error) {
+                showStatus(`Failed to parse bunker URL: ${error.message}`, 'error');
+            }
+        }
+
+        // Clear and reset
+        function clearAndReset() {
+            localStorage.removeItem('keycast_bunker_url');
+            sessionStorage.clear();
+            document.getElementById('results').style.display = 'none';
+            document.getElementById('nsec-info').style.display = 'none';
+            showStatus('Cleared. Ready to start over.', 'info');
+        }
+
+        // On page load, check for OAuth callback (code in URL)
+        window.addEventListener('DOMContentLoaded', () => {
+            const urlParams = new URLSearchParams(window.location.search);
+            const code = urlParams.get('code');
+            const error = urlParams.get('error');
+
+            if (error) {
+                const errorDescription = urlParams.get('error_description') || error;
+                showStatus(`Authorization failed: ${errorDescription}`, 'error');
+                // Clean URL
+                window.history.replaceState({}, document.title, window.location.pathname);
+                return;
+            }
+
+            if (code) {
+                showStatus(`OAuth callback received<br><small>Code: ${code.substring(0, 16)}...</small>`, 'info');
+                // Clean URL immediately
+                window.history.replaceState({}, document.title, window.location.pathname);
+                // Exchange code for bunker URL
+                exchangeCode(code);
+                return;
+            }
+
+            // Check if we have a stored bunker URL
+            const storedBunkerUrl = localStorage.getItem('keycast_bunker_url');
+            if (storedBunkerUrl) {
+                document.getElementById('results').style.display = 'block';
+                document.getElementById('bunkerUrl').textContent = storedBunkerUrl;
+                showStatus('Found existing bunker URL from previous session.', 'info');
+            }
+        });
+    </script>
+</body>
+</html>

@@ -2,7 +2,7 @@
 
 ## Deployment Status
 
-- **Environment**: https://oauth.divine.video
+- **Environment**: https://login.divine.video
 - **Build ID**: 4b3a3bd3-082d-4f28-8501-dae545c49189
 - **Status**: Deployed ✅
 - **Deployment Date**: 2025-10-15
@@ -45,23 +45,23 @@ npx playwright test tests/profile-fix-verification.spec.ts
 
 ```bash
 # Check if service is up
-curl -I https://oauth.divine.video/health
+curl -I https://login.divine.video/health
 # Expected: HTTP/2 200
 ```
 
 ```bash
 # Check if pages load
-curl -I https://oauth.divine.video/register
-curl -I https://oauth.divine.video/login
-curl -I https://oauth.divine.video/profile
-curl -I https://oauth.divine.video/dashboard
+curl -I https://login.divine.video/register
+curl -I https://login.divine.video/login
+curl -I https://login.divine.video/profile
+curl -I https://login.divine.video/dashboard
 # Expected: HTTP/2 200 for all
 ```
 
 ### 2. Manual Testing Steps
 
 #### Step 1: Register New User
-1. Open https://oauth.divine.video/register in browser
+1. Open https://login.divine.video/register in browser
 2. Open browser console (F12)
 3. Enter email: `test-production-{timestamp}@example.com` (use current timestamp)
 4. Enter password: `testpass123`
@@ -80,7 +80,7 @@ curl -I https://oauth.divine.video/dashboard
 3. Copy the pubkey for later verification
 
 #### Step 3: Update Profile
-1. Navigate to https://oauth.divine.video/profile
+1. Navigate to https://login.divine.video/profile
 2. Keep browser console open
 3. Fill in profile:
    - Name: `Production Test User {timestamp}`
@@ -127,10 +127,10 @@ Publishing to 3 relays...
 
 ```bash
 # Check if API is responding
-curl https://oauth.divine.video/health
+curl https://login.divine.video/health
 
 # Check nostr.json endpoint
-curl "https://oauth.divine.video/.well-known/nostr.json?name=testuser"
+curl "https://login.divine.video/.well-known/nostr.json?name=testuser"
 
 # Query for events on relays (replace with actual bunker pubkey)
 nak req -k 0 -a <BUNKER_PUBKEY> wss://relay.damus.io wss://nos.lol --limit 1

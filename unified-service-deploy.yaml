@@ -48,15 +48,12 @@ spec:
             - name: GCP_PROJECT_ID
               value: "openvine-co"
             - name: CORS_ALLOWED_ORIGIN
-              value: "https://oauth.divine.video"
+              value: "https://login.divine.video"
             - name: APP_URL
-              value: "https://oauth.divine.video"
+              value: "https://login.divine.video"
             - name: FROM_EMAIL
               value: "noreply@divine.video"
-            - name: JWT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: keycast-jwt-secret
+                  name: keycast-ucan-secret
                   key: latest
             - name: SENDGRID_API_KEY
               valueFrom:

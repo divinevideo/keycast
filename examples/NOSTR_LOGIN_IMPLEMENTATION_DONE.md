@@ -18,7 +18,7 @@ All code needed for Keycast to work as a nostr-login bunker provider is now comp
 
 ```bash
 cd api
-sqlite3 ../database/keycast.db < ../database/migrations/0006_nostr_login_support.sql
+psql ../database/keycast.db < ../database/migrations/0006_nostr_login_support.sql
 ```
 
 ### 2. Start the API Server
@@ -167,7 +167,7 @@ Before production, update these values:
 
 ### 1. Change Discovery URL (`routes.rs:157`)
 ```rust
-"nostrconnect_url": "https://oauth.divine.video/api/connect/<nostrconnect>"
+"nostrconnect_url": "https://login.divine.video/api/connect/<nostrconnect>"
 ```
 
 ### 2. Update Relay (`routes.rs:156`)
@@ -191,7 +191,7 @@ Currently uses "most recent user" for testing. Replace with:
 
 ## Testing Checklist
 
-- [ ] Run migration: `sqlite3 ../database/keycast.db < ../database/migrations/0006_nostr_login_support.sql`
+- [ ] Run migration: `psql ../database/keycast.db < ../database/migrations/0006_nostr_login_support.sql`
 - [ ] Start API: `cd api && cargo run`
 - [ ] Start signer: `cd signer && cargo run`
 - [ ] Verify discovery: `curl http://localhost:3000/.well-known/nostr.json`
@@ -244,7 +244,7 @@ Currently uses "most recent user" for testing. Replace with:
 When working correctly, users should be able to:
 
 ✅ Visit any nostr-login enabled website
-✅ See "localhost:3000" (or "oauth.divine.video") in login options
+✅ See "localhost:3000" (or "login.divine.video") in login options
 ✅ Click it and get Keycast authorization popup
 ✅ Approve once
 ✅ Sign unlimited events automatically

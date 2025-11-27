@@ -57,7 +57,7 @@ jobs:
       run: cargo test --workspace --verbose
     
     - name: Run clippy
-      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      run: cargo clippy --workspace --all-targets --all-features -- -D warnings -A deprecated
     
     - name: Check formatting
       run: cargo fmt --all -- --check

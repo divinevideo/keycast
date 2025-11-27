@@ -205,15 +205,16 @@
             <h2>⚙️ Configuration</h2>
             <div class="form-group">
                 <label for="apiUrl">API Base URL</label>
-                <input type="url" id="apiUrl" value="https://oauth.divine.video" placeholder="https://oauth.divine.video">
+                <input type="url" id="apiUrl" value="http://localhost:3000" placeholder="http://localhost:3000">
             </div>
             <div class="form-group">
                 <label for="clientId">Client ID</label>
                 <input type="text" id="clientId" value="test-client-webapp" placeholder="my-app-name">
             </div>
             <div class="form-group">
-                <label for="redirectUri">Redirect URI</label>
-                <input type="url" id="redirectUri" value="http://localhost:8000/callback" placeholder="http://localhost:8000/callback">
+                <label for="redirectUri">Redirect URI (callback after approval)</label>
+                <input type="url" id="redirectUri" value="http://localhost:3000/examples/oauth-test-client.html" placeholder="http://localhost:3000/examples/oauth-callback.html">
+                <small style="color: #888; display: block; margin-top: 4px;">Using this page as callback (JSON response mode)</small>
             </div>
             <div class="form-group">
                 <label for="scope">Scope (space-separated)</label>
@@ -289,12 +290,37 @@
         let apiUrl, clientId, redirectUri, scope;
         let jwtToken = null;
         let authCode = null;
+        let pkceVerifier = null;
+        let pkceChallenge = null;
 
         function getConfig() {
             apiUrl = document.getElementById('apiUrl').value;
             clientId = document.getElementById('clientId').value;
             redirectUri = document.getElementById('redirectUri').value;
             scope = document.getElementById('scope').value;
+        }
+
+        // PKCE Helper Functions (RFC 7636)
+        function base64URLEncode(buffer) {
+            return btoa(String.fromCharCode(...new Uint8Array(buffer)))
+                .replace(/\+/g, '-')
+                .replace(/\//g, '_')
+                .replace(/=/g, '');
+        }
+
+        async function generatePKCE() {
+            // Generate random code_verifier (32 bytes = 43 chars base64url)
+            const verifierBytes = new Uint8Array(32);
+            crypto.getRandomValues(verifierBytes);
+            const verifier = base64URLEncode(verifierBytes);
+
+            // Generate code_challenge = BASE64URL(SHA256(verifier))
+            const encoder = new TextEncoder();
+            const verifierData = encoder.encode(verifier);
+            const hashBuffer = await crypto.subtle.digest('SHA-256', verifierData);
+            const challenge = base64URLEncode(hashBuffer);
+
+            return { verifier, challenge };
         }
 
         function showStatus(elementId, message, type = 'info') {
@@ -341,11 +367,22 @@
         async function startOAuthFlow() {
             getConfig();
 
+            showStatus('oauthStatus', 'Generating PKCE challenge...', 'info');
+
+            // Generate PKCE values
+            const pkce = await generatePKCE();
+            pkceVerifier = pkce.verifier;
+            pkceChallenge = pkce.challenge;
+
             showStatus('oauthStatus',
-                `Starting OAuth flow...<br>
+                `Starting OAuth flow with PKCE...<br>
                 <small>Client ID: ${clientId}<br>
                 Redirect URI: ${redirectUri}<br>
-                Scope: ${scope}</small>`,
+                Scope: ${scope}<br>
+                <br>
+                <strong>PKCE (RFC 7636):</strong><br>
+                Code Challenge: ${pkceChallenge.substring(0, 32)}...<br>
+                Code Verifier: ${pkceVerifier.substring(0, 32)}... (will be sent later)</small>`,
                 'info');
 
             // Show manual authorization section
@@ -377,7 +414,9 @@
                         client_id: clientId,
                         redirect_uri: redirectUri,
                         scope: scope,
-                        approved: true
+                        approved: true,
+                        code_challenge: pkceChallenge,
+                        code_challenge_method: 'S256'
                     }),
                     redirect: 'manual'
                 });
@@ -483,7 +522,8 @@
                     body: JSON.stringify({
                         code: authCode,
                         client_id: clientId,
-                        redirect_uri: redirectUri
+                        redirect_uri: redirectUri,
+                        code_verifier: pkceVerifier
                     })
                 });
 

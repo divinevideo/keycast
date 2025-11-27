@@ -164,7 +164,7 @@
         let ndk = null;
         let remoteSigner = null;
 
-        const API_BASE = 'http://oauth.divine.video/api';
+        const API_BASE = 'http://login.divine.video/api';
 
         function showStatus(elementId, message, type = 'info') {
             const el = document.getElementById(elementId);
@@ -187,17 +187,17 @@
                 const registerResponse = await fetch(`${API_BASE}/auth/register`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
+                    credentials: 'include',  // Receive cookie
                     body: JSON.stringify({ email, password })
                 });
 
                 const registerData = await registerResponse.json();
 
                 if (registerResponse.ok) {
-                    // Registration succeeded
-                    currentToken = registerData.token;
+                    // Registration succeeded (cookie is set automatically)
                     currentPubkey = registerData.pubkey;
                     showStatus('auth-status', `✓ Registration successful!`, 'success');
-                    await getBunkerUrl();
+                    await createBunkerAndShow();
                     return;
                 }
 
@@ -208,16 +208,16 @@
                     const loginResponse = await fetch(`${API_BASE}/auth/login`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
+                        credentials: 'include',  // Send cookies
                         body: JSON.stringify({ email, password })
                     });
 
                     const loginData = await loginResponse.json();
 
                     if (loginResponse.ok) {
-                        currentToken = loginData.token;
                         currentPubkey = loginData.pubkey;
                         showStatus('auth-status', `✓ Login successful!`, 'success');
-                        await getBunkerUrl();
+                        await createBunkerAndShow();
                     } else {
                         showStatus('auth-status', `✗ Login failed: ${loginData.error}`, 'error');
                     }
@@ -229,27 +229,28 @@
             }
         }
 
-        async function getBunkerUrl() {
-            if (!currentToken) {
-                showStatus('auth-status', '✗ No auth token', 'error');
-                return;
-            }
+        async function createBunkerAndShow() {
+            showStatus('auth-status', 'Creating bunker connection for demo...', 'info');
 
             try {
-                const response = await fetch(`${API_BASE}/user/bunker`, {
-                    method: 'GET',
-                    headers: {
-                        'Authorization': `Bearer ${currentToken}`
-                    }
+                const response = await fetch(`${API_BASE}/user/bunker/create`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'include',  // Use UCAN cookie for auth
+                    body: JSON.stringify({
+                        app_name: 'Keycast Auth Test Demo',
+                        relay_url: 'wss://relay.damus.io'
+                    })
                 });
 
                 const data = await response.json();
 
                 if (response.ok) {
                     currentBunkerUrl = data.bunker_url;
+                    showStatus('auth-status', `✓ Bunker connection created!`, 'success');
                     showBunkerInfo(currentPubkey, currentBunkerUrl);
                 } else {
-                    showStatus('auth-status', `✗ Failed to get bunker URL: ${data.error}`, 'error');
+                    showStatus('auth-status', `✗ Failed to create bunker: ${data.error}`, 'error');
                 }
             } catch (error) {
                 showStatus('auth-status', `✗ Network error: ${error.message}`, 'error');

@@ -432,7 +432,7 @@ for auth_id in recent_auths {
 
 Response:
 {
-  "token": "jwt-token",
+  "token": "ucan-token",
   "pubkey": "npub1...",
   "bunker_url": "bunker://..."
 }</code></pre>
@@ -447,7 +447,7 @@ Response:
 
 Response:
 {
-  "token": "jwt-token"
+  "token": "ucan-token"
 }</code></pre>
 
     <h4>GET /api/user/bunker</h4>

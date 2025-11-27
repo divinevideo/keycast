@@ -11,7 +11,7 @@ import type {
 import { Nip46Client } from '../nip46/Nip46Client';
 
 export interface KeycastProviderConfig {
-  domain: string;       // 'oauth.divine.video'
+  domain: string;       // 'login.divine.video'
   apiBase?: string;     // Custom API path (default: /api)
 }
 

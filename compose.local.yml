@@ -1,0 +1,49 @@
+# Local development - runs PostgreSQL + Keycast unified binary
+# Usage: docker compose -f compose.local.yml up --build
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: keycast-postgres-dev
+    environment:
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: keycast
+      POSTGRES_USER: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  keycast:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: keycast-unified-dev
+    command: unified  # Uses /app/keycast binary via docker-entrypoint.sh
+    ports:
+      - "3000:3000"
+      - "3046:3046"
+      - "5173:5173"
+    volumes:
+      - ./master.key:/app/master.key:ro
+    environment:
+      DATABASE_URL: postgres://postgres:password@postgres:5432/keycast
+      RUST_LOG: info,keycast_signer=debug
+      MASTER_KEY_PATH: /app/master.key
+      USE_GCP_KMS: "false"
+      ALLOWED_ORIGINS: https://peek.verse.app,http://localhost:5173,http://localhost:5174
+      BUNKER_RELAYS: wss://relay.damus.io,wss://relay.nsec.app,wss://nos.lol
+      WEB_BUILD_DIR: /app/web
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_dev_data:

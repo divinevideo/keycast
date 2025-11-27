@@ -4,7 +4,7 @@
 - heading "🔐 Keycast Nostr Client" [level=1]
 - paragraph: OAuth-powered remote signing via NIP-46 bunker URLs
 - heading "⚙️ Configuration" [level=2]
-- textbox "API URL": https://oauth.divine.video
+- textbox "API URL": https://login.divine.video
 - textbox "OAuth Client ID": nostr-web-client
 - textbox "Redirect URI": http://localhost:8000/callback
 - heading "1️⃣ OAuth Authorization" [level=2]

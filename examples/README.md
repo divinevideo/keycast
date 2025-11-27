@@ -73,7 +73,7 @@ Open `examples/test-oauth-client.html` in a web browser.
 3. **Get Bunker URL**: Click "Get Bunker URL" to retrieve your NIP-46 connection string
 
 ### 4. Test Against Production
-Change the API URL field to `https://oauth.divine.video`
+Change the API URL field to `https://login.divine.video`
 
 ## Current API Status
 As of now, the Keycast API only implements team-related endpoints:

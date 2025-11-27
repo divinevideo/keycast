@@ -2,7 +2,7 @@
 // ABOUTME: Defines interfaces for configuration, events, and providers
 
 export interface KeycastProviderInfo {
-  domain: string;          // 'oauth.divine.video'
+  domain: string;          // 'login.divine.video'
   name: string;            // 'Divine'
   description?: string;    // Optional description
   apiBase?: string;        // Custom API path (default: /api)

@@ -1,10 +1,10 @@
 // ABOUTME: Playwright test for OAuth user registration flow
-// ABOUTME: Tests that users can register and obtain a JWT token
+// ABOUTME: Tests that users can register and obtain a UCAN token
 
 import { test, expect } from '@playwright/test';
 
 test.describe('OAuth Registration Flow', () => {
-  test('should allow user to register and get JWT token', async ({ page }) => {
+  test('should allow user to register and get UCAN token', async ({ page }) => {
     // Navigate to the OAuth client page
     await page.goto('/nostr-client-oauth-ndk.html');
 

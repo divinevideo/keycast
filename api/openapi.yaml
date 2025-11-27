@@ -9,7 +9,7 @@ info:
 
     ## Authentication
 
-    Most endpoints require a JWT token obtained from the `/auth/login` or `/auth/register` endpoints. Include the token in the `Authorization` header:
+    Most endpoints require a UCAN token obtained from the `/auth/login` or `/auth/register` endpoints. Include the token in the `Authorization` header:
 
     ```
     Authorization: Bearer <your-jwt-token>
@@ -25,7 +25,7 @@ info:
     ⚠️ **Current Limitations**:
     - No permission validation on HTTP signing endpoint
     - No rate limiting (endpoints can be called unlimited times)
-    - JWT tokens valid for 24 hours
+    - UCAN tokens valid for 24 hours
 
     These limitations are being addressed in upcoming releases.
 
@@ -35,7 +35,7 @@ info:
   license:
     name: MIT
 servers:
-  - url: https://oauth.divine.video/api
+  - url: https://login.divine.video/api
     description: Production server
   - url: http://localhost:3000/api
     description: Local development
@@ -46,7 +46,7 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
-      description: JWT token from /auth/register or /auth/login
+      description: UCAN token from /auth/register or /auth/login
 
   schemas:
     Error:
@@ -91,7 +91,7 @@ components:
           description: User's Nostr public key (hex format)
         token:
           type: string
-          description: JWT authentication token
+          description: UCAN authentication token
       required:
         - user_id
         - email
@@ -116,7 +116,7 @@ components:
       properties:
         token:
           type: string
-          description: JWT authentication token
+          description: UCAN authentication token
         pubkey:
           type: string
           description: User's Nostr public key (hex format)
@@ -263,7 +263,7 @@ paths:
     post:
       summary: Register new user
       description: |
-        Create a new user account with email/password authentication. Automatically generates a Nostr keypair and returns a JWT token for immediate use.
+        Create a new user account with email/password authentication. Automatically generates a Nostr keypair and returns a UCAN token for immediate use.
 
         **BYOK Support**: You can optionally provide your own Nostr secret key via the `nsec` parameter. If not provided, a new key will be generated.
       tags:
@@ -303,7 +303,7 @@ paths:
   /auth/login:
     post:
       summary: Login
-      description: Authenticate with email/password and receive a JWT token valid for 24 hours.
+      description: Authenticate with email/password and receive a UCAN token valid for 24 hours.
       tags:
         - Authentication
       requestBody:

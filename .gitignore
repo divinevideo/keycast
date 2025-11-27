@@ -8,6 +8,7 @@ master.key
 .env
 .env.*
 !.env.example
+.envrc
 
 # Service account credentials
 *service-account*.json
@@ -15,3 +16,17 @@ credentials.json
 
 # Git worktrees
 .worktrees/
+
+# Claude Code local files
+.claude/
+.claude/settings.local.json
+.specify/
+api/oauth-ui/
+specs/
+examples/auth-flows-demo/
+
+# Machine-specific Kamal deployment (Pi homelab only, not for production)
+config/deploy.yml
+.kamal/
+scripts/deploy-to-pi.sh
+.tms-create

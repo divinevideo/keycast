@@ -25,11 +25,11 @@ npm install keycast-login nostr-tools
 
   const auth = new KeycastLogin({
     // Auto-detects provider at current domain
-    // e.g., running on divine.video uses oauth.divine.video
+    // e.g., running on divine.video uses login.divine.video
     defaultProvider: 'auto',
 
     // Or specify custom provider
-    // defaultProvider: 'https://oauth.divine.video',
+    // defaultProvider: 'https://login.divine.video',
 
     // Enable fallback providers
     enableNip07: true,
@@ -71,7 +71,7 @@ const auth = new KeycastLogin({
   keycast: {
     mode: 'auto',  // Auto-detect from domain
     knownProviders: [
-      { domain: 'oauth.divine.video', name: 'Divine' },
+      { domain: 'login.divine.video', name: 'Divine' },
       { domain: 'auth.protest.net', name: 'Protest' }
     ],
     allowCustom: true

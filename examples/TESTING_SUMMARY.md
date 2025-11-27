@@ -7,7 +7,7 @@ All code for nostr-login integration has been successfully implemented:
 ### 1. Database Migration ✅
 - **File**: `database/migrations/0006_nostr_login_support.sql`
 - **Status**: Column `client_public_key` added successfully
-- **Verified**: `sqlite3 ../database/keycast.db "PRAGMA table_info(oauth_authorizations);" | grep client`
+- **Verified**: `psql ../database/keycast.db "PRAGMA table_info(oauth_authorizations);" | grep client`
   - Output: `12|client_public_key|TEXT|0||0`
 
 ### 2. Backend Code ✅

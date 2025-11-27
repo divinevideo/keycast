@@ -1,25 +1,21 @@
 services:
-  keycast-api:
-    container_name: keycast-api
-    build: .
-    command: api
-    ports:
-      - "3000:3000"
+  postgres:
+    image: postgres:16
+    container_name: keycast-postgres
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?error}
+      POSTGRES_DB: keycast
+      POSTGRES_USER: postgres
     volumes:
-      - ./database:/app/database
-      - ./master.key:/app/master.key
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "/usr/local/bin/healthcheck.sh", "api"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
     restart: unless-stopped
     networks:
       - keycast
-    labels:
-      - "caddy=${DOMAIN:?error}"
-      - "caddy.reverse_proxy=/api/* {{upstreams 3000}}"
     logging:
       driver: "json-file"
       options:
@@ -27,37 +23,42 @@ services:
         max-file: "3"
         compress: "true"
 
-  keycast-web:
-    container_name: keycast-web
+  keycast:
+    container_name: keycast-unified
     build:
       context: .
       args:
         - VITE_DOMAIN=${DOMAIN:?error}
         - VITE_ALLOWED_PUBKEYS=${ALLOWED_PUBKEYS}
-    command: web
-    expose:
-      - "5173"
-    depends_on:
-      keycast-api:
-        condition: service_healthy
+    command: unified
+    ports:
+      - "3000:3000"
+      - "5173:5173"
+    volumes:
+      - ./master.key:/app/master.key:ro
     environment:
-      - NODE_ENV=production
-      - WAIT_FOR_API=true
-      - HOST=0.0.0.0
-      - PORT=5173
-      - "VITE_DOMAIN=${DOMAIN:?error}"
-      - "VITE_ALLOWED_PUBKEYS=${ALLOWED_PUBKEYS}"
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:?error}@postgres:5432/keycast
+      RUST_LOG: ${RUST_LOG:-info,keycast_signer=debug}
+      MASTER_KEY_PATH: /app/master.key
+      USE_GCP_KMS: ${USE_GCP_KMS:-false}
+      BUNKER_RELAYS: ${BUNKER_RELAYS:-wss://relay.damus.io,wss://relay.nsec.app,wss://nos.lol}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?error}
+      WEB_BUILD_DIR: /app/web
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "/usr/local/bin/healthcheck.sh", "web"]
+      test: ["CMD", "/usr/local/bin/healthcheck.sh", "unified"]
       interval: 10s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 20s
     restart: unless-stopped
     networks:
       - keycast
     labels:
       - "caddy=${DOMAIN:?error}"
+      - "caddy.reverse_proxy=/api/* {{upstreams 3000}}"
       - "caddy.reverse_proxy=/* {{upstreams 5173}}"
     logging:
       driver: "json-file"
@@ -66,33 +67,8 @@ services:
         max-file: "3"
         compress: "true"
 
-  keycast-signer:
-    container_name: keycast-signer
-    build:
-      context: .
-    command: signer
-    volumes:
-      - ./database:/app/database
-      - ./signer/config.toml:/app/signer/config.toml
-      - ./master.key:/app/master.key
-    environment:
-      - RUST_LOG=debug,keycast_signer=debug
-      - MASTER_KEY_PATH=/app/master.key
-    healthcheck:
-      test: ["CMD", "/usr/local/bin/healthcheck.sh", "signer"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-    restart: unless-stopped
-    networks:
-      - keycast
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-        compress: "true"
+volumes:
+  postgres_data:
 
 networks:
   keycast:

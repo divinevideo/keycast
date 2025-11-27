@@ -12,6 +12,7 @@
 	},
 	"devDependencies": {
 		"@biomejs/biome": "1.9.4",
+		"@sveltejs/adapter-static": "^3.0.10",
 		"@sveltejs/kit": "^2.19.0",
 		"@sveltejs/vite-plugin-svelte": "^5.0.3",
 		"@tailwindcss/postcss": "^4.0.14",

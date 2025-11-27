@@ -2,7 +2,7 @@
 
 import { SimplePool, getPublicKey, generateSecretKey, finalizeEvent, nip44, nip19 } from 'nostr-tools';
 
-const API_URL = "https://oauth.divine.video";
+const API_URL = "https://login.divine.video";
 const EMAIL = `test-${Date.now()}@example.com`;
 const PASSWORD = "testpassword123";
 
@@ -73,7 +73,7 @@ async function main() {
         const registerData = await registerResp.json();
         if (!registerResp.ok) throw new Error(registerData.error || 'Registration failed');
 
-        const jwtToken = registerData.token;
+        const ucanToken = registerData.token;
         console.log(`✅ Registered: ${registerData.pubkey.substring(0, 16)}...`);
         console.log("");
 
@@ -83,7 +83,7 @@ async function main() {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'Authorization': `Bearer ${jwtToken}`
+                'Authorization': `Bearer ${ucanToken}`
             },
             body: JSON.stringify({
                 client_id: 'test-nip46-client',

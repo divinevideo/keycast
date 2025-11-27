@@ -137,7 +137,7 @@ curl http://localhost:3000/.well-known/nostr.json
 curl http://localhost:8000/nostr-login-test.html | head -20
 
 # Check database for authorizations
-sqlite3 ../database/keycast.db "SELECT id, user_public_key, client_public_key FROM oauth_authorizations LIMIT 5;"
+psql ../database/keycast.db "SELECT id, user_public_key, client_public_key FROM oauth_authorizations LIMIT 5;"
 
 # Check signer process
 ps aux | grep signer

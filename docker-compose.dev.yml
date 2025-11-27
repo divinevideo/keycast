@@ -1,51 +1,56 @@
 version: '3.8'
 
 services:
-  keycast-api:
-    build:
-      context: .
-      args:
-        - VITE_DOMAIN=http://localhost:5173
-        - VITE_ALLOWED_PUBKEYS=
-    command: api
-    ports:
-      - "3000:3000"
-    volumes:
-      - ./database:/app/database
-      - ./master.key:/app/master.key
+  postgres:
+    image: postgres:16
+    container_name: keycast-postgres-dev
     environment:
-      - RUST_LOG=debug
-      - CORS_ALLOWED_ORIGIN=http://localhost:5173
-      - APP_URL=http://localhost:3000
-      - USE_GCP_KMS=false
-      - MASTER_KEY_PATH=/app/master.key
-      - FROM_EMAIL=test@localhost
-      - SENDGRID_API_KEY=${SENDGRID_API_KEY:-}
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: keycast
+      POSTGRES_USER: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
       timeout: 3s
-      retries: 3
-      start_period: 5s
+      retries: 5
 
-  keycast-web:
+  keycast:
     build:
       context: .
       args:
         - VITE_DOMAIN=http://localhost:3000
         - VITE_ALLOWED_PUBKEYS=
-    command: web
+    command: unified
     ports:
+      - "3000:3000"
       - "5173:5173"
-    depends_on:
-      keycast-api:
-        condition: service_healthy
+    volumes:
+      - ./master.key:/app/master.key:ro
     environment:
-      - NODE_ENV=development
-      - HOST=0.0.0.0
-      - PORT=5173
+      DATABASE_URL: postgres://postgres:password@postgres:5432/keycast
+      RUST_LOG: debug,keycast_signer=debug
+      MASTER_KEY_PATH: /app/master.key
+      USE_GCP_KMS: "false"
+      ALLOWED_ORIGINS: http://localhost:5173,http://localhost:5174
+      BUNKER_RELAYS: wss://relay.damus.io,wss://relay.nsec.app,wss://nos.lol
+      WEB_BUILD_DIR: /app/web
+      FROM_EMAIL: test@localhost
+      SENDGRID_API_KEY: ${SENDGRID_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck.sh", "unified"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
-  # Test runner service
+  # Test runner service (uses test database)
   test:
     build:
       context: .
@@ -55,7 +60,14 @@ services:
       - ./api:/app/api
       - ./core:/app/core
       - ./signer:/app/signer
+      - ./keycast:/app/keycast
       - ./database:/app/database
     environment:
-      - RUST_LOG=debug
-      - DATABASE_URL=sqlite:../database/keycast_test.db
+      RUST_LOG: debug
+      DATABASE_URL: postgres://postgres:password@postgres:5432/keycast_test
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_dev_data:

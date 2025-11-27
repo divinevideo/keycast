@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-API_URL="https://oauth.divine.video"
+API_URL="https://login.divine.video"
 EMAIL="test-$(date +%s)@example.com"
 PASSWORD="testpassword123"
 
