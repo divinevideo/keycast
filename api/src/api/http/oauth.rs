@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::time::{Duration as StdDuration, Instant};
 
 // Import constants and helpers from auth module
-use super::auth::TOKEN_EXPIRY_HOURS;
+use super::auth::{TOKEN_EXPIRY_HOURS, EMAIL_VERIFICATION_EXPIRY_HOURS, generate_secure_token};
 
 /// Polling cache for iOS PWA OAuth flow
 /// Maps state token → (authorization code, expiry time)
@@ -482,6 +482,12 @@ pub async fn authorize_get(
             font-size: 1.25rem;
             font-weight: 600;
             color: #e7e9ea;
+            margin-bottom: 0.125rem;
+        }}
+        .app_domain {{
+            font-size: 0.85rem;
+            color: #536471;
+            margin-bottom: 0.5rem;
         }}
         .app_info p {{
             font-size: 0.9rem;
@@ -615,7 +621,7 @@ pub async fn authorize_get(
     <div class="layout">
         <div class="sidebar">
             <h1>Authorize</h1>
-            <p>Grant access to your <span class="account_badge" id="account_domain">divine.video</span> account</p>
+            <p>Grant access to your <span class="account_badge" id="account_domain">diVine</span> account</p>
         </div>
         <div class="main">
             <div class="app_header">
@@ -624,6 +630,7 @@ pub async fn authorize_get(
                 </div>
                 <div class="app_info">
                     <h2 id="app_name">{}</h2>
+                    <div class="app_domain" id="app_domain"></div>
                     <p>wants to access <span class="account_badge" id="display_name">your account</span></p>
                 </div>
             </div>
@@ -633,7 +640,7 @@ pub async fn authorize_get(
             </div>
 
             <p class="disclaimer">
-                By clicking <strong>Authorize</strong>, you will grant this application access to your account in accordance with its <a href="/tos">terms of service</a> and <a href="/privacy">privacy policy</a>.
+                By clicking <strong>Authorize</strong>, you will grant this application access to your account in accordance with its <a href="https://divine.video/terms" target="_blank">terms of service</a> and <a href="https://divine.video/privacy" target="_blank">privacy policy</a>.
             </p>
 
             <div class="buttons">
@@ -658,38 +665,38 @@ pub async fn authorize_get(
         const permissionMeta = {{
             'sign_event': {{
                 icon: '✍️',
-                title: 'Nostr',
-                description: 'Sign events and publish to relays on your behalf'
+                title: 'Act on your behalf',
+                description: 'Post and interact as you on <a href="https://nostr.how" target="_blank" class="nostr-link">Nostr</a>'
             }},
             'encrypt': {{
                 icon: '🔒',
-                title: 'Encrypt',
+                title: 'Send private messages',
                 description: 'Encrypt messages to other users'
             }},
             'decrypt': {{
                 icon: '🔓',
-                title: 'Decrypt',
+                title: 'Read private messages',
                 description: 'Decrypt messages sent to you'
             }},
             'nip04_encrypt': {{
                 icon: '🔐',
-                title: 'NIP-04 Encrypt',
-                description: 'Encrypt direct messages (legacy format)'
+                title: 'Send DMs (legacy)',
+                description: 'Encrypt direct messages'
             }},
             'nip04_decrypt': {{
                 icon: '🔑',
-                title: 'NIP-04 Decrypt',
-                description: 'Decrypt direct messages (legacy format)'
+                title: 'Read DMs (legacy)',
+                description: 'Decrypt direct messages'
             }},
             'nip44_encrypt': {{
                 icon: '🛡️',
-                title: 'NIP-44 Encrypt',
-                description: 'Encrypt messages with modern encryption'
+                title: 'Send private messages',
+                description: 'Encrypt messages securely'
             }},
             'nip44_decrypt': {{
                 icon: '🔏',
-                title: 'NIP-44 Decrypt',
-                description: 'Decrypt messages with modern encryption'
+                title: 'Read private messages',
+                description: 'Decrypt messages sent to you'
             }}
         }};
 
@@ -724,6 +731,17 @@ pub async fn authorize_get(
             const name = clientId.replace(/[-_]/g, ' ');
             const firstLetter = name.charAt(0).toUpperCase();
             document.getElementById('app_icon_letter').textContent = firstLetter;
+        }}
+
+        // Extract and display domain from redirect URI
+        function setAppDomain() {{
+            try {{
+                const url = new URL(redirectUri);
+                document.getElementById('app_domain').textContent = url.host;
+            }} catch (e) {{
+                // Invalid URL, hide domain
+                document.getElementById('app_domain').style.display = 'none';
+            }}
         }}
 
         // Load profile from Nostr relays
@@ -782,6 +800,7 @@ pub async fn authorize_get(
         window.addEventListener('load', () => {{
             buildPermissionsList();
             setAppIcon();
+            setAppDomain();
             loadProfile();
         }});
 
@@ -910,6 +929,12 @@ pub async fn authorize_get(
             font-size: 1.25rem;
             font-weight: 600;
             color: #e7e9ea;
+            margin-bottom: 0.125rem;
+        }}
+        .app_domain {{
+            font-size: 0.85rem;
+            color: #536471;
+            margin-bottom: 0.5rem;
         }}
         .app_info p {{
             font-size: 0.9rem;
@@ -1069,7 +1094,7 @@ pub async fn authorize_get(
     <div class="layout">
         <div class="sidebar">
             <h1>Sign in</h1>
-            <p>to continue to <span class="account_badge">divine.video</span></p>
+            <p>to continue to <span class="account_badge" id="app_name_display">diVine</span></p>
         </div>
         <div class="main">
             <div class="app_header">
@@ -1078,6 +1103,7 @@ pub async fn authorize_get(
                 </div>
                 <div class="app_info">
                     <h2 id="app_name">{}</h2>
+                    <div class="app_domain" id="app_domain"></div>
                     <p>wants to access your Nostr account</p>
                 </div>
             </div>
@@ -1159,6 +1185,14 @@ pub async fn authorize_get(
 
         // Set app icon letter
         document.getElementById('app_icon_letter').textContent = clientId.charAt(0).toUpperCase();
+
+        // Set app domain from redirect URI
+        try {{
+            const url = new URL(redirectUri);
+            document.getElementById('app_domain').textContent = url.host;
+        }} catch (e) {{
+            document.getElementById('app_domain').style.display = 'none';
+        }}
 
         function showForm(form) {{
             document.querySelectorAll('.form_view').forEach(v => v.classList.remove('active'));
@@ -1857,19 +1891,57 @@ pub async fn oauth_register(
         (pubkey, Some(keys))  // Keys generated now
     };
 
+    // Check if user with this pubkey already exists
+    let existing_user: Option<(String,)> = sqlx::query_as(
+        "SELECT email FROM users WHERE public_key = $1 AND tenant_id = $2"
+    )
+    .bind(public_key.to_hex())
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(OAuthError::Database)?;
+
+    if existing_user.is_some() {
+        return Err(OAuthError::InvalidRequest(
+            "This Nostr key is already registered. Please sign in instead.".to_string()
+        ));
+    }
+
+    // Check if email is already taken
+    let existing_email: Option<(String,)> = sqlx::query_as(
+        "SELECT public_key FROM users WHERE email = $1 AND tenant_id = $2"
+    )
+    .bind(&req.email)
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(OAuthError::Database)?;
+
+    if existing_email.is_some() {
+        return Err(OAuthError::InvalidRequest(
+            "This email is already registered. Please sign in instead.".to_string()
+        ));
+    }
+
+    // Generate email verification token
+    let verification_token = generate_secure_token();
+    let verification_expires = Utc::now() + Duration::hours(EMAIL_VERIFICATION_EXPIRY_HOURS);
+
     // Start transaction for user + optional keys creation
     let mut tx = pool.begin().await.map_err(OAuthError::Database)?;
 
-    // Insert user
+    // Insert user with email verification token
     sqlx::query(
-        "INSERT INTO users (public_key, tenant_id, email, password_hash, email_verified, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)"
+        "INSERT INTO users (public_key, tenant_id, email, password_hash, email_verified, email_verification_token, email_verification_expires_at, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
     )
     .bind(public_key.to_hex())
     .bind(tenant_id)
     .bind(&req.email)
     .bind(&password_hash)
     .bind(false)
+    .bind(&verification_token)
+    .bind(verification_expires)
     .bind(Utc::now())
     .bind(Utc::now())
     .execute(&mut *tx)
@@ -1901,6 +1973,20 @@ pub async fn oauth_register(
     }
 
     tx.commit().await.map_err(OAuthError::Database)?;
+
+    // Send verification email (optional - don't fail if email service unavailable)
+    match crate::email_service::EmailService::new() {
+        Ok(email_service) => {
+            if let Err(e) = email_service.send_verification_email(&req.email, &verification_token).await {
+                tracing::error!("Failed to send verification email to {}: {}", req.email, e);
+            } else {
+                tracing::info!("Sent verification email to {}", req.email);
+            }
+        },
+        Err(e) => {
+            tracing::warn!("Email service unavailable, skipping verification email: {}", e);
+        }
+    }
 
     // Auto-approve: first-time registration implies consent
     // Generate authorization code immediately

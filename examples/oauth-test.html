@@ -8,8 +8,8 @@
             crossorigin="anonymous"></script>
     <script type="module">
         // Import nip46 separately (not included in bundle)
-        import { BunkerSigner, parseBunkerInput } from 'https://esm.sh/nostr-tools@2.10.2/nip46';
-        import { SimplePool } from 'https://esm.sh/nostr-tools@2.10.2';
+        import { BunkerSigner, parseBunkerInput } from 'https://esm.sh/nostr-tools@2.18.2/nip46';
+        import { SimplePool } from 'https://esm.sh/nostr-tools@2.18.2';
 
         window.BunkerSigner = BunkerSigner;
         window.parseBunkerInput = parseBunkerInput;
@@ -82,6 +82,35 @@
         .button-group button {
             flex: 1;
             min-width: 200px;
+        }
+        .flash {
+            position: fixed;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 16px 32px;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 16px;
+            z-index: 1000;
+            animation: flash-in 0.3s ease-out, flash-out 0.5s ease-in 3.5s forwards;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+        }
+        .flash.success {
+            background: #03dac6;
+            color: #000;
+        }
+        .flash.error {
+            background: #cf6679;
+            color: #000;
+        }
+        @keyframes flash-in {
+            from { opacity: 0; transform: translateX(-50%) translateY(-20px); }
+            to { opacity: 1; transform: translateX(-50%) translateY(0); }
+        }
+        @keyframes flash-out {
+            from { opacity: 1; }
+            to { opacity: 0; }
         }
     </style>
 </head>
@@ -193,6 +222,18 @@
         function showStatus(message, type = 'info') {
             const el = document.getElementById('status');
             el.innerHTML = `<div class="status ${type}">${message}</div>`;
+        }
+
+        function showFlash(message, type = 'success') {
+            const existing = document.querySelector('.flash');
+            if (existing) existing.remove();
+
+            const flash = document.createElement('div');
+            flash.className = `flash ${type}`;
+            flash.textContent = message;
+            document.body.appendChild(flash);
+
+            setTimeout(() => flash.remove(), 4000);
         }
 
         // Wait for nostr-tools to load
@@ -415,29 +456,41 @@
             showStatus('Connecting to bunker via NIP-46...', 'info');
 
             try {
-                const { BunkerSigner, finalizeEvent } = window.NostrTools;
+                // BunkerSigner and helpers loaded from ES module
+                const BunkerSigner = window.BunkerSigner;
+                const parseBunkerInput = window.parseBunkerInput;
+                const SimplePool = window.SimplePool;
+                const { generateSecretKey } = window.NostrTools;
 
-                // Parse bunker URL
-                const url = new URL(bunkerUrl);
-                const remotePubkey = url.hostname || url.pathname.replace('//', '');
-                const relay = url.searchParams.get('relay');
-                const secret = url.searchParams.get('secret');
+                if (!BunkerSigner || !parseBunkerInput) {
+                    throw new Error('NIP-46 modules not loaded yet. Please wait and try again.');
+                }
 
-                console.log('[NIP-46] Connecting to bunker:');
-                console.log('  - Remote pubkey:', remotePubkey);
-                console.log('  - Relay:', relay);
-                console.log('  - Secret:', secret ? secret.substring(0, 8) + '...' : 'none');
+                console.log('[NIP-46] Connecting to bunker:', bunkerUrl);
 
                 // Create BunkerSigner if not already created
                 if (!bunkerSigner) {
-                    signBtn.textContent = 'Establishing connection...';
-                    showStatus(`Connecting to relay: ${relay}...`, 'info');
+                    signBtn.textContent = 'Parsing bunker URL...';
 
-                    bunkerSigner = new BunkerSigner(
-                        remotePubkey,
-                        secret,
-                        { relays: [relay] }
-                    );
+                    // Parse the bunker URL to get BunkerPointer
+                    const bunkerPointer = await parseBunkerInput(bunkerUrl);
+                    if (!bunkerPointer) {
+                        throw new Error('Invalid bunker URL');
+                    }
+
+                    console.log('[NIP-46] Parsed bunker pointer:', bunkerPointer);
+
+                    signBtn.textContent = 'Establishing connection...';
+                    showStatus(`Connecting to relay: ${bunkerPointer.relays?.[0]}...`, 'info');
+
+                    // Generate ephemeral client key for this session
+                    const clientSecretKey = generateSecretKey();
+
+                    // Create pool for relay connections
+                    const pool = new SimplePool();
+
+                    // Use static factory method (latest nostr-tools API)
+                    bunkerSigner = BunkerSigner.fromBunker(clientSecretKey, bunkerPointer, { pool });
 
                     // Wait for connection
                     await bunkerSigner.connect();
@@ -519,7 +572,11 @@
             }
 
             if (code) {
-                showStatus(`OAuth callback received<br><small>Code: ${code.substring(0, 16)}...</small>`, 'info');
+                const storedPubkey = sessionStorage.getItem('test_pubkey');
+                const npub = storedPubkey ? window.NostrTools.nip19.npubEncode(storedPubkey) : null;
+                const shortNpub = npub ? `${npub.slice(0, 12)}...${npub.slice(-4)}` : '';
+                showFlash(shortNpub ? `Connected as ${shortNpub}` : 'Connected!', 'success');
+                showStatus('Completing setup...', 'info');
                 // Clean URL immediately
                 window.history.replaceState({}, document.title, window.location.pathname);
                 // Exchange code for bunker URL

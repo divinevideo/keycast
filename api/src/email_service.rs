@@ -47,7 +47,7 @@ impl EmailService {
             .unwrap_or_else(|_| "noreply@keycast.app".to_string());
 
         let from_name = env::var("FROM_NAME")
-            .unwrap_or_else(|_| "Keycast".to_string());
+            .unwrap_or_else(|_| "diVine".to_string());
 
         let base_url = env::var("BASE_URL")
             .unwrap_or_else(|_| "https://login.divine.video".to_string());
@@ -70,12 +70,12 @@ impl EmailService {
             self.base_url, verification_token
         );
 
-        let subject = "Verify your Keycast email address".to_string();
+        let subject = "Verify your diVine email address".to_string();
         let html_content = format!(
             r#"
             <html>
             <body style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-                <h1 style="color: #bb86fc;">Verify your Keycast email</h1>
+                <h1 style="color: #bb86fc;">Verify your diVine email</h1>
                 <p>Thanks for signing up! Please verify your email address by clicking the button below:</p>
                 <div style="margin: 30px 0;">
                     <a href="{}"
@@ -88,7 +88,7 @@ impl EmailService {
                     <a href="{}" style="color: #bb86fc;">{}</a>
                 </p>
                 <p style="color: #666; font-size: 14px; margin-top: 30px;">
-                    If you didn't sign up for Keycast, you can safely ignore this email.
+                    If you didn't sign up for diVine, you can safely ignore this email.
                 </p>
             </body>
             </html>
@@ -97,7 +97,7 @@ impl EmailService {
         );
 
         let text_content = format!(
-            "Thanks for signing up! Please verify your email address by clicking this link:\n\n{}\n\nIf you didn't sign up for Keycast, you can safely ignore this email.",
+            "Thanks for signing up! Please verify your email address by clicking this link:\n\n{}\n\nIf you didn't sign up for diVine, you can safely ignore this email.",
             verification_url
         );
 
@@ -112,12 +112,12 @@ impl EmailService {
     ) -> Result<(), String> {
         let reset_url = format!("{}/reset-password?token={}", self.base_url, reset_token);
 
-        let subject = "Reset your Keycast password".to_string();
+        let subject = "Reset your diVine password".to_string();
         let html_content = format!(
             r#"
             <html>
             <body style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-                <h1 style="color: #bb86fc;">Reset your Keycast password</h1>
+                <h1 style="color: #bb86fc;">Reset your diVine password</h1>
                 <p>We received a request to reset your password. Click the button below to set a new password:</p>
                 <div style="margin: 30px 0;">
                     <a href="{}"
@@ -152,7 +152,7 @@ impl EmailService {
         to_email: &str,
         code: &str,
     ) -> Result<(), String> {
-        let subject = "Your Keycast key export verification code".to_string();
+        let subject = "Your diVine key export verification code".to_string();
         let html_content = format!(
             r#"
             <html>
