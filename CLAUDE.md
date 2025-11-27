@@ -177,7 +177,7 @@ Required (set in `.env` or docker-compose):
 Optional:
 - `MASTER_KEY_PATH`: Path to master encryption key file (default: `./master.key`)
 - `USE_GCP_KMS`: Use Google Cloud KMS instead of file-based encryption (default: `false`)
-- `BUNKER_RELAYS`: Comma-separated relay URLs for NIP-46 communication (default: `wss://relay.damus.io,wss://relay.nsec.app,wss://nos.lol`)
+- `BUNKER_RELAYS`: Comma-separated relay URLs for NIP-46 communication (default: `wss://relay.divine.video,wss://relay.primal.net,wss://relay.nsec.app,wss://nos.lol`)
 - `RUST_LOG`: Log level configuration (default: `info,keycast_signer=debug`)
 - `VITE_ALLOWED_PUBKEYS`: Comma-separated pubkeys for whitelist access (web frontend)
 - `ENABLE_EXAMPLES`: Enable `/examples` directory serving (default: `false`, set to `true` for development)

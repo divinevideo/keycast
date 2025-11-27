@@ -319,7 +319,7 @@ impl Authorization {
     /// Get the configured bunker relay list from environment
     pub fn get_bunker_relays() -> Vec<String> {
         let relays_str = std::env::var("BUNKER_RELAYS")
-            .unwrap_or_else(|_| "wss://relay.damus.io,wss://relay.nsec.app,wss://nos.lol".to_string());
+            .unwrap_or_else(|_| "wss://relay.divine.video,wss://relay.primal.net,wss://relay.nsec.app,wss://nos.lol".to_string());
 
         relays_str
             .split(',')

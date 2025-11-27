@@ -11,10 +11,10 @@ if (browser) {
 
 export const ndkStore = new NDK({
     explicitRelayUrls: [
+        "wss://relay.divine.video",
         "wss://purplepag.es",
         "wss://relay.nostr.band",
         "wss://relay.snort.social",
-        "wss://relay.damus.io",
         "wss://relay.primal.net",
     ],
     outboxRelayUrls: ["wss://purplepag.es", "wss://relay.primal.net"],
@@ -32,9 +32,9 @@ const ndk = $state(ndkStore);
 
 export const bunkerNDKStore = new NDK({
     explicitRelayUrls: [
+        "wss://relay.divine.video",
         "wss://relay.nsecbunker.com",
         "wss://relay.nsec.app",
-        "wss://relay.damus.io",
         "wss://relay.primal.net",
         "wss://relay.nostr.band",
     ],

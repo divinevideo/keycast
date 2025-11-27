@@ -38,7 +38,7 @@ services:
       MASTER_KEY_PATH: /app/master.key
       USE_GCP_KMS: "false"
       ALLOWED_ORIGINS: https://peek.verse.app,http://localhost:5173,http://localhost:5174
-      BUNKER_RELAYS: wss://relay.damus.io,wss://relay.nsec.app,wss://nos.lol
+      BUNKER_RELAYS: wss://relay.divine.video,wss://relay.primal.net,wss://relay.nsec.app,wss://nos.lol
       WEB_BUILD_DIR: /app/web
     depends_on:
       postgres:

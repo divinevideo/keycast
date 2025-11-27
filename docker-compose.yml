@@ -41,7 +41,7 @@ services:
       RUST_LOG: ${RUST_LOG:-info,keycast_signer=debug}
       MASTER_KEY_PATH: /app/master.key
       USE_GCP_KMS: ${USE_GCP_KMS:-false}
-      BUNKER_RELAYS: ${BUNKER_RELAYS:-wss://relay.damus.io,wss://relay.nsec.app,wss://nos.lol}
+      BUNKER_RELAYS: ${BUNKER_RELAYS:-wss://relay.divine.video,wss://relay.primal.net,wss://relay.nsec.app,wss://nos.lol}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?error}
       WEB_BUILD_DIR: /app/web
     depends_on:

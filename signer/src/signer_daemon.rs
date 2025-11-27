@@ -211,10 +211,10 @@ impl UnifiedSigner {
             let auth = OAuthAuthorization::find(&self.pool, tenant_id, auth_id).await?;
 
             // Decrypt user secret (used for both bunker and signing in OAuth)
-            // OAuth secrets are stored as hex strings (not raw bytes like regular authorizations)
+            // OAuth secrets are stored as raw 32-byte secret keys (same as regular authorizations)
             let decrypted_user_secret = self.key_manager.decrypt(&auth.bunker_secret).await?;
-            let secret_hex = std::str::from_utf8(&decrypted_user_secret)?;
-            let user_keys = Keys::parse(secret_hex)?;
+            let user_secret_key = SecretKey::from_slice(&decrypted_user_secret)?;
+            let user_keys = Keys::new(user_secret_key);
 
             let bunker_pubkey = user_keys.public_key().to_hex();
 
@@ -264,7 +264,7 @@ impl UnifiedSigner {
     /// Get the configured bunker relay list
     pub fn get_bunker_relays() -> Vec<String> {
         let relays_str = std::env::var("BUNKER_RELAYS")
-            .unwrap_or_else(|_| "wss://relay.damus.io,wss://relay.nsec.app,wss://nos.lol".to_string());
+            .unwrap_or_else(|_| "wss://relay.divine.video,wss://relay.primal.net,wss://relay.nsec.app,wss://nos.lol".to_string());
 
         relays_str
             .split(',')

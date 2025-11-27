@@ -20,10 +20,10 @@ use keycast_core::traits::CustomPermission;
 // Registration and login return simple JSON (not OAuth TokenResponse)
 
 pub const TOKEN_EXPIRY_HOURS: i64 = 24;
-const EMAIL_VERIFICATION_EXPIRY_HOURS: i64 = 24;
+pub const EMAIL_VERIFICATION_EXPIRY_HOURS: i64 = 24;
 const PASSWORD_RESET_EXPIRY_HOURS: i64 = 1;
 
-fn generate_secure_token() -> String {
+pub fn generate_secure_token() -> String {
     use rand::distributions::Alphanumeric;
     rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -700,8 +700,9 @@ pub async fn create_bunker(
     .fetch_one(pool)
     .await?;
 
-    let relay_url = req.relay_url.as_deref().unwrap_or("wss://relay.damus.io");
-    let relays_json = serde_json::to_string(&vec![relay_url])
+    // Use deployment-wide relay list (ignore any client-provided relay)
+    let relays = keycast_core::types::authorization::Authorization::get_bunker_relays();
+    let relays_json = serde_json::to_string(&relays)
         .map_err(|e| AuthError::Internal(format!("Failed to serialize relays: {}", e)))?;
 
     // Create OAuth authorization
@@ -738,8 +739,7 @@ pub async fn create_bunker(
         }
     }
 
-    // Build bunker URL with deployment-wide relay list
-    let relays = keycast_core::types::authorization::Authorization::get_bunker_relays();
+    // Build bunker URL using same relay list
     let relay_params: String = relays
         .iter()
         .map(|r| format!("relay={}", urlencoding::encode(r)))
@@ -2206,7 +2206,7 @@ pub async fn change_key(
     };
 
     let new_pubkey = new_keys.public_key().to_hex();
-    let new_secret_hex = new_keys.secret_key().to_secret_hex();
+    let new_secret_bytes = new_keys.secret_key().to_secret_bytes();
 
     // Check if new pubkey already exists in this tenant
     let exists: Option<(String,)> = sqlx::query_as(
@@ -2221,9 +2221,9 @@ pub async fn change_key(
         return Err(AuthError::DuplicateKey);
     }
 
-    // Encrypt new secret key
+    // Encrypt new secret key (as raw 32 bytes, consistent with registration)
     let encrypted_secret = key_manager
-        .encrypt(new_secret_hex.as_bytes())
+        .encrypt(&new_secret_bytes)
         .await
         .map_err(|e| AuthError::Encryption(e.to_string()))?;
 
@@ -2443,10 +2443,10 @@ mod tests {
 
         let user_keys = Keys::generate();
         let user_pubkey = user_keys.public_key().to_hex();
-        let user_secret = user_keys.secret_key().to_secret_hex();
+        let user_secret_bytes = user_keys.secret_key().to_secret_bytes();
 
-        // Encrypt user secret key
-        let encrypted_secret = key_manager.encrypt(user_secret.as_bytes()).await.unwrap();
+        // Encrypt user secret key (raw 32 bytes, consistent with registration)
+        let encrypted_secret = key_manager.encrypt(&user_secret_bytes).await.unwrap();
 
         // Insert test user
         sqlx::query("INSERT INTO users (public_key, tenant_id) VALUES ($1, 1)")
