@@ -811,7 +811,26 @@ impl UnifiedSigner {
             "connect" => {
                 // Validate secret
                 if let Some(provided_secret) = request["params"][1].as_str() {
-                    if provided_secret == handler.secret {
+                    // For OAuth handlers, a user can have multiple bunker connections (for different apps)
+                    // each with a different secret. We need to check if ANY authorization matches.
+                    let is_valid = if handler.is_oauth {
+                        // Query database to check if any OAuth authorization has this secret
+                        let bunker_pubkey = handler.bunker_keys.public_key().to_hex();
+                        let exists: Option<i32> = sqlx::query_scalar(
+                            "SELECT id FROM oauth_authorizations WHERE bunker_public_key = $1 AND secret = $2"
+                        )
+                        .bind(&bunker_pubkey)
+                        .bind(provided_secret)
+                        .fetch_optional(&handler.pool)
+                        .await
+                        .unwrap_or(None);
+                        exists.is_some()
+                    } else {
+                        // For regular (team) authorizations, bunker_public_key is unique per authorization
+                        provided_secret == handler.secret
+                    };
+
+                    if is_valid {
                         serde_json::json!({"id": request_id, "result": "ack"})
                     } else {
                         serde_json::json!({"id": request_id, "error": "Invalid secret"})
