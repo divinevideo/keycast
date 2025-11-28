@@ -104,7 +104,7 @@
 				<!-- Form state: Create bunker -->
 				<div class="modal-body">
 					<p class="description">
-						Generate a connection URL to use your diVine ID with Nostr apps that support
+						Generate a connection URL to use your diVine Login with Nostr apps that support
 						NIP-46 remote signing (Damus, Primal, Amethyst, etc).
 					</p>
 

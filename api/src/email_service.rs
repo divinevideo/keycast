@@ -75,17 +75,17 @@ impl EmailService {
             r#"
             <html>
             <body style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-                <h1 style="color: #bb86fc;">Verify your diVine email</h1>
+                <h1 style="color: #00B488;">Verify your diVine email</h1>
                 <p>Thanks for signing up! Please verify your email address by clicking the button below:</p>
                 <div style="margin: 30px 0;">
                     <a href="{}"
-                       style="background: #bb86fc; color: #000; padding: 12px 24px; text-decoration: none; border-radius: 4px; display: inline-block; font-weight: bold;">
+                       style="background: #00B488; color: #fff; padding: 12px 24px; text-decoration: none; border-radius: 4px; display: inline-block; font-weight: bold;">
                         Verify Email Address
                     </a>
                 </div>
                 <p style="color: #666; font-size: 14px;">
                     Or copy and paste this link into your browser:<br>
-                    <a href="{}" style="color: #bb86fc;">{}</a>
+                    <a href="{}" style="color: #00B488;">{}</a>
                 </p>
                 <p style="color: #666; font-size: 14px; margin-top: 30px;">
                     If you didn't sign up for diVine, you can safely ignore this email.
@@ -117,17 +117,17 @@ impl EmailService {
             r#"
             <html>
             <body style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-                <h1 style="color: #bb86fc;">Reset your diVine password</h1>
+                <h1 style="color: #00B488;">Reset your diVine password</h1>
                 <p>We received a request to reset your password. Click the button below to set a new password:</p>
                 <div style="margin: 30px 0;">
                     <a href="{}"
-                       style="background: #bb86fc; color: #000; padding: 12px 24px; text-decoration: none; border-radius: 4px; display: inline-block; font-weight: bold;">
+                       style="background: #00B488; color: #fff; padding: 12px 24px; text-decoration: none; border-radius: 4px; display: inline-block; font-weight: bold;">
                         Reset Password
                     </a>
                 </div>
                 <p style="color: #666; font-size: 14px;">
                     Or copy and paste this link into your browser:<br>
-                    <a href="{}" style="color: #bb86fc;">{}</a>
+                    <a href="{}" style="color: #00B488;">{}</a>
                 </p>
                 <p style="color: #666; font-size: 14px; margin-top: 30px;">
                     This link will expire in 1 hour. If you didn't request a password reset, you can safely ignore this email.
@@ -157,10 +157,10 @@ impl EmailService {
             r#"
             <html>
             <body style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-                <h1 style="color: #bb86fc;">Key Export Verification Code</h1>
+                <h1 style="color: #00B488;">Key Export Verification Code</h1>
                 <p>You requested to export your private key. Use the verification code below to complete the export:</p>
                 <div style="margin: 30px 0; padding: 20px; background: #1a1a1a; border-radius: 8px; text-align: center;">
-                    <div style="font-size: 32px; font-weight: bold; color: #bb86fc; letter-spacing: 8px; font-family: monospace;">
+                    <div style="font-size: 32px; font-weight: bold; color: #00B488; letter-spacing: 8px; font-family: monospace;">
                         {}
                     </div>
                 </div>

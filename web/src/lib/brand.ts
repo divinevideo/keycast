@@ -1,5 +1,5 @@
 export const BRAND = {
-  name: 'diVine ID',
+  name: 'diVine Login',
   shortName: 'diVine',
-  tagline: 'Your Nostr identity',
+  tagline: 'Manage your Nostr identity',
 } as const;

@@ -633,6 +633,26 @@ pub async fn authorize_get(
         .nostr-link:hover {{
             text-decoration: underline;
         }}
+        /* Mobile: reduce padding for more working area */
+        @media (max-width: 480px) {{
+            body {{
+                padding: 0.5rem;
+            }}
+            .header {{
+                margin-bottom: 1rem;
+            }}
+            .card {{
+                padding: 1rem;
+                border-radius: 0.75rem;
+            }}
+            .app_header {{
+                padding-bottom: 0.75rem;
+                margin-bottom: 0.75rem;
+            }}
+            .logo {{
+                margin-bottom: 0.75rem;
+            }}
+        }}
     </style>
 </head>
 <body>
@@ -642,7 +662,7 @@ pub async fn authorize_get(
                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor">
                     <path d="M216.57,39.43A80,80,0,0,0,83.91,120.78L28.69,176A15.86,15.86,0,0,0,24,187.31V216a16,16,0,0,0,16,16H72a8,8,0,0,0,8-8V208H96a8,8,0,0,0,8-8V184h16a8,8,0,0,0,5.66-2.34l9.56-9.57A79.73,79.73,0,0,0,160,176h.1A80,80,0,0,0,216.57,39.43ZM180,92a16,16,0,1,1,16-16A16,16,0,0,1,180,92Z"></path>
                 </svg>
-                diVine ID
+                diVine Login
             </div>
             <h1>Authorize App</h1>
             <p>Grant access to your account</p>
@@ -664,7 +684,7 @@ pub async fn authorize_get(
             </div>
 
             <p class="disclaimer">
-                By authorizing, you grant this app access per its <a href="https://divine.video/terms" target="_blank">terms</a> and <a href="https://divine.video/privacy" target="_blank">privacy policy</a>.
+                By authorizing, you agree to diVine's <a href="https://divine.video/terms" target="_blank">terms</a> and <a href="https://divine.video/privacy" target="_blank">privacy policy</a>.
             </p>
 
             <div class="buttons">
@@ -884,7 +904,7 @@ pub async fn authorize_get(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Sign in - diVine ID</title>
+    <title>Sign in - diVine Login</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Bricolage+Grotesque:wght@600;700&display=swap" rel="stylesheet">
@@ -1137,6 +1157,29 @@ pub async fn authorize_get(
             margin-top: 0.375rem;
             line-height: 1.4;
         }}
+        /* Mobile: reduce padding for more working area */
+        @media (max-width: 480px) {{
+            body {{
+                padding: 0.5rem;
+            }}
+            .header {{
+                margin-bottom: 1rem;
+            }}
+            .header h1 {{
+                font-size: 1.5rem;
+            }}
+            .card {{
+                padding: 1rem;
+                border-radius: 0.75rem;
+            }}
+            .app_header {{
+                padding-bottom: 0.875rem;
+                margin-bottom: 0.875rem;
+            }}
+            .logo {{
+                margin-bottom: 1rem;
+            }}
+        }}
     </style>
 </head>
 <body>
@@ -1146,7 +1189,7 @@ pub async fn authorize_get(
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color: var(--divine-green)">
                     <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"></path>
                 </svg>
-                <span>diVine ID</span>
+                <span>diVine Login</span>
             </div>
             <h1>Sign in</h1>
             <p>to continue to <strong id="app_name_display">{}</strong></p>
@@ -1246,10 +1289,15 @@ pub async fn authorize_get(
         function showForm(form) {{
             document.querySelectorAll('.form_view').forEach(v => v.classList.remove('active'));
 
+            const headerTitle = document.querySelector('.header h1');
             if (form === 'login') {{
                 document.getElementById('login_view').classList.add('active');
+                if (headerTitle) headerTitle.textContent = 'Sign in';
+                document.title = 'Sign in - diVine Login';
             }} else {{
                 document.getElementById('register_view').classList.add('active');
+                if (headerTitle) headerTitle.textContent = 'Create account';
+                document.title = 'Create account - diVine Login';
             }}
 
             hideError();
@@ -2248,7 +2296,7 @@ pub async fn connect_get(
     // For now, show a simple auth form
 
     let app_name = params.name.as_deref().unwrap_or("Unknown App");
-    let permissions = params.perms.as_deref().unwrap_or("sign_event");
+    let permissions_raw = params.perms.as_deref().unwrap_or("sign_event");
 
     let html = format!(r#"
 <!DOCTYPE html>
@@ -2256,132 +2304,250 @@ pub async fn connect_get(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Authorize Nostr Connection - Keycast</title>
+    <title>Authorize Connection - diVine Login</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Bricolage+Grotesque:wght@600;700&display=swap" rel="stylesheet">
     <style>
+        :root {{
+            --divine-green: #00B488;
+            --divine-green-dark: #009A72;
+            --bg: hsl(222.2 84% 4.9%);
+            --surface: hsl(222.2 84% 4.9%);
+            --border: hsl(217.2 32.6% 17.5%);
+            --text: hsl(210 40% 98%);
+            --text-secondary: hsl(215 20.2% 65.1%);
+            --muted: hsl(217.2 32.6% 17.5%);
+        }}
+        @media (prefers-color-scheme: light) {{
+            :root {{
+                --bg: hsl(0 0% 100%);
+                --surface: hsl(0 0% 100%);
+                --border: hsl(214.3 31.8% 91.4%);
+                --text: hsl(222.2 84% 4.9%);
+                --text-secondary: hsl(215.4 16.3% 46.9%);
+                --muted: hsl(210 40% 96.1%);
+            }}
+        }}
         * {{
             box-sizing: border-box;
+            margin: 0;
+            padding: 0;
         }}
         body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-            background: #1a1a1a;
-            color: #e0e0e0;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
             display: flex;
             flex-direction: column;
             justify-content: center;
             align-items: center;
             min-height: 100vh;
-            margin: 0;
-            padding: 20px;
+            padding: 1rem;
+            -webkit-font-smoothing: antialiased;
         }}
         .container {{
             width: 100%;
-            max-width: 500px;
-            background: transparent;
-            margin: auto; /* Allows scrolling */
+            max-width: 420px;
+        }}
+        .header {{
+            text-align: center;
+            margin-bottom: 1.5rem;
+        }}
+        .logo {{
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            margin-bottom: 1.25rem;
+        }}
+        .logo svg {{
+            width: 32px;
+            height: 32px;
+            color: var(--divine-green);
+        }}
+        .logo span {{
+            font-family: 'Bricolage Grotesque', system-ui, sans-serif;
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--divine-green);
         }}
         h1 {{
-            color: #bb86fc;
-            font-size: 24px;
-            margin-bottom: 16px;
-            text-align: center;
+            font-family: 'Bricolage Grotesque', system-ui, sans-serif;
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--text);
+            margin-bottom: 0.5rem;
         }}
-        p {{
-            text-align: center;
-            margin-bottom: 24px;
-            color: #aaa;
+        .subtitle {{
+            color: var(--text-secondary);
+            font-size: 0.95rem;
         }}
-        .app_info {{
-            background: #2a2a2a;
-            padding: 24px;
-            border-radius: 12px;
-            margin: 20px 0;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        .card {{
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 1rem;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
         }}
-        .info_row {{
-            margin: 12px 0;
+        .app_header {{
             display: flex;
-            justify-content: space-between;
             align-items: center;
-            border-bottom: 1px solid #333;
-            padding-bottom: 12px;
+            gap: 0.875rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 1rem;
         }}
-        .info_row:last-child {{
+        .app_icon {{
+            width: 44px;
+            height: 44px;
+            background: var(--divine-green);
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: white;
+        }}
+        .app_info h2 {{
+            font-size: 1rem;
+            font-weight: 600;
+            color: var(--text);
+            margin-bottom: 0.125rem;
+        }}
+        .app_domain {{
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }}
+        .permissions_list {{
+            margin-bottom: 1rem;
+        }}
+        .permission_item {{
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 0.75rem 0;
+            border-bottom: 1px solid var(--border);
+        }}
+        .permission_item:last-child {{
             border-bottom: none;
-            padding-bottom: 0;
-            margin-bottom: 0;
         }}
-        .label {{
-            color: #888;
-            font-size: 14px;
+        .permission_icon {{
+            font-size: 1.25rem;
+            width: 32px;
+            text-align: center;
         }}
-        .value {{
-            color: #e0e0e0;
+        .permission_content h3 {{
+            font-size: 0.9rem;
             font-weight: 500;
-            text-align: right;
+            color: var(--text);
+            margin-bottom: 0.125rem;
+        }}
+        .permission_content p {{
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            text-align: left;
         }}
         .buttons {{
             display: flex;
-            gap: 12px;
-            margin-top: 24px;
+            gap: 0.75rem;
+            margin-top: 1rem;
         }}
         button {{
             flex: 1;
-            padding: 14px 20px;
-            font-size: 16px;
+            padding: 0.75rem 1.5rem;
+            font-size: 1rem;
             border: none;
-            border-radius: 8px;
+            border-radius: 9999px;
             cursor: pointer;
             font-weight: 600;
-            transition: opacity 0.2s;
+            transition: all 0.2s;
         }}
         .approve {{
-            background: #bb86fc;
-            color: #000;
+            background: var(--divine-green);
+            color: #fff;
         }}
         .approve:hover {{
-            opacity: 0.9;
+            background: var(--divine-green-dark);
         }}
         .deny {{
-            background: #333;
-            color: #e0e0e0;
+            background: transparent;
+            color: var(--text-secondary);
+            border: 1px solid var(--border);
         }}
         .deny:hover {{
-            background: #444;
+            background: var(--muted);
+            color: var(--text);
         }}
         .warning {{
-            background: rgba(255, 179, 0, 0.1);
-            border-left: 4px solid #ffb300;
-            padding: 16px;
-            margin: 24px 0;
-            font-size: 14px;
-            color: #ffb300;
-            border-radius: 0 8px 8px 0;
+            background: rgba(245, 158, 11, 0.1);
+            border: 1px solid rgba(245, 158, 11, 0.3);
+            padding: 1rem;
+            margin-bottom: 1rem;
+            font-size: 0.875rem;
+            color: #f59e0b;
+            border-radius: 0.75rem;
             line-height: 1.5;
+        }}
+        /* Mobile: reduce padding for more working area */
+        @media (max-width: 480px) {{
+            body {{
+                padding: 0.5rem;
+            }}
+            .header {{
+                margin-bottom: 1rem;
+            }}
+            h1 {{
+                font-size: 1.25rem;
+            }}
+            .card {{
+                padding: 1rem;
+                border-radius: 0.75rem;
+            }}
+            .app_header {{
+                padding-bottom: 0.75rem;
+                margin-bottom: 0.75rem;
+            }}
+            .logo {{
+                margin-bottom: 0.75rem;
+            }}
+            .warning {{
+                padding: 0.75rem;
+                font-size: 0.8rem;
+            }}
         }}
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🔑 Authorize Nostr Connection</h1>
-        <p>An application wants to connect to your Keycast account</p>
+        <div class="header">
+            <div class="logo">
+                <svg viewBox="0 0 256 256" fill="currentColor">
+                    <path d="M216.57,39.43A80,80,0,0,0,83.91,120.78L28.69,176A15.86,15.86,0,0,0,24,187.31V216a16,16,0,0,0,16,16H72a8,8,0,0,0,8-8V208H96a8,8,0,0,0,8-8V184h16a8,8,0,0,0,5.66-2.34l9.56-9.57A79.73,79.73,0,0,0,160,176h.1A80,80,0,0,0,216.57,39.43ZM180,92a16,16,0,1,1,16-16A16,16,0,0,1,180,92Z"></path>
+                </svg>
+                <span>diVine Login</span>
+            </div>
+            <h1>Authorize Connection</h1>
+            <p class="subtitle">An app wants to connect to your account</p>
+        </div>
 
-        <div class="app_info">
-            <div class="info_row">
-                <span class="label">Application</span>
-                <span class="value">{app_name}</span>
+        <div class="card">
+            <div class="app_header">
+                <div class="app_icon" id="app_icon">{app_icon}</div>
+                <div class="app_info">
+                    <h2>{app_name}</h2>
+                    <div class="app_domain">{relay}</div>
+                </div>
             </div>
-            <div class="info_row">
-                <span class="label">Permissions</span>
-                <span class="value">{permissions}</span>
-            </div>
-            <div class="info_row">
-                <span class="label">Relay</span>
-                <span class="value">{relay}</span>
+
+            <div class="permissions_list" id="permissions_list">
+                <!-- Populated by JavaScript -->
             </div>
         </div>
 
         <div class="warning">
-            ⚠️ This will allow the application to sign events on your behalf using your Keycast-managed keys.
+            This will allow the app to sign events on your behalf using your diVine-managed keys.
         </div>
 
         <form method="POST" action="/api/oauth/connect">
@@ -2391,15 +2557,83 @@ pub async fn connect_get(
             <input type="hidden" name="perms" value="{perms}">
             <div class="buttons">
                 <button type="submit" name="approved" value="false" class="deny">Deny</button>
-                <button type="submit" name="approved" value="true" class="approve">Approve</button>
+                <button type="submit" name="approved" value="true" class="approve">Authorize</button>
             </div>
         </form>
     </div>
+
+    <script>
+        const permissions = '{permissions_raw}';
+        const permissionMeta = {{
+            'sign_event': {{
+                icon: '✍️',
+                title: 'Act on your behalf',
+                description: 'Post and interact as you on Nostr'
+            }},
+            'encrypt': {{
+                icon: '🔒',
+                title: 'Send private messages',
+                description: 'Encrypt messages to other users'
+            }},
+            'decrypt': {{
+                icon: '🔓',
+                title: 'Read private messages',
+                description: 'Decrypt messages sent to you'
+            }},
+            'nip04_encrypt': {{
+                icon: '🔐',
+                title: 'Send DMs (legacy)',
+                description: 'Encrypt direct messages'
+            }},
+            'nip04_decrypt': {{
+                icon: '🔑',
+                title: 'Read DMs (legacy)',
+                description: 'Decrypt direct messages'
+            }},
+            'nip44_encrypt': {{
+                icon: '🛡️',
+                title: 'Send private messages',
+                description: 'Encrypt messages securely'
+            }},
+            'nip44_decrypt': {{
+                icon: '🔏',
+                title: 'Read private messages',
+                description: 'Decrypt messages sent to you'
+            }}
+        }};
+
+        function buildPermissionsList() {{
+            const scopes = permissions.split(/[\s,]+/).filter(s => s);
+            const container = document.getElementById('permissions_list');
+
+            scopes.forEach(s => {{
+                const meta = permissionMeta[s] || {{
+                    icon: '📋',
+                    title: s.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()),
+                    description: 'Permission: ' + s
+                }};
+
+                const item = document.createElement('div');
+                item.className = 'permission_item';
+                item.innerHTML = `
+                    <div class="permission_icon">${{meta.icon}}</div>
+                    <div class="permission_content">
+                        <h3>${{meta.title}}</h3>
+                        <p>${{meta.description}}</p>
+                    </div>
+                `;
+                container.appendChild(item);
+            }});
+        }}
+
+        buildPermissionsList();
+    </script>
 </body>
 </html>
     "#,
         app_name = app_name,
-        permissions = permissions,
+        app_icon = app_name.chars().next().unwrap_or('A').to_uppercase(),
+        permissions_raw = permissions_raw,
         relay = params.relay,
         client_pubkey = client_pubkey,
         secret = params.secret,

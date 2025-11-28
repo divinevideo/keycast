@@ -170,6 +170,22 @@ onMount(async () => {
 		} catch (err) {
 			console.warn('Failed to check auth status:', err);
 		}
+	} else if (authMethod === 'cookie') {
+		// User is already logged in via cookie, but we still need to fetch email info
+		try {
+			const response = await fetch('/api/oauth/auth-status', {
+				credentials: 'include'
+			});
+			if (response.ok) {
+				const data = await response.json();
+				if (data.email) {
+					userEmail = data.email;
+					emailVerified = data.email_verified || false;
+				}
+			}
+		} catch (err) {
+			console.warn('Failed to fetch email info:', err);
+		}
 	}
 
 	// Auth check complete
@@ -223,7 +239,7 @@ onMount(async () => {
 		{:else}
 			<!-- Your Identity Section -->
 			<section class="identity-section">
-				<h2 class="section-title">Your Identity</h2>
+				<h2 class="section-title">Manage Your Identity</h2>
 				<div class="identity-card">
 					{#if userEmail}
 						<div class="identity-row">
@@ -255,7 +271,7 @@ onMount(async () => {
 									<Copy size={16} />
 								{/if}
 							</button>
-							<a href="https://nostr.how/en/guides/get-verified#nostr-addresses" target="_blank" rel="noopener noreferrer" class="learn-link" title="What's an npub?">
+							<a href="https://nostr.how/en/what-is-nostr/identities" target="_blank" rel="noopener noreferrer" class="learn-link" title="What's an npub?">
 								?
 							</a>
 						</div>
@@ -285,7 +301,7 @@ onMount(async () => {
 					<div class="empty-state">
 						<p>No apps connected yet.</p>
 						<p class="hint">
-							Connect your diVine ID to Nostr apps to sign in without sharing your private key.
+							Connect your diVine Login to Nostr apps to sign in without sharing your private key.
 							<a href="https://nostr.how/en/guides/login-with-remote-signer" target="_blank" rel="noopener noreferrer">Learn more</a>
 						</p>
 					</div>
@@ -298,9 +314,13 @@ onMount(async () => {
 									<div class="app-info">
 										<p class="app-name">{session.application_name}</p>
 										<p class="app-meta">
-											{session.activity_count} signatures
-											{#if session.last_activity}
-												• Last used {new Date(session.last_activity).toLocaleDateString()}
+											{#if session.activity_count > 0}
+												{session.activity_count} {session.activity_count === 1 ? 'signature' : 'signatures'}
+												{#if session.last_activity}
+													• Last used {new Date(session.last_activity).toLocaleDateString()}
+												{/if}
+											{:else}
+												Not used yet
 											{/if}
 										</p>
 									</div>
@@ -444,7 +464,7 @@ onMount(async () => {
 				<span>{BRAND.name}</span>
 			</a>
 
-			<h1 class="landing-title">Your Nostr Identity</h1>
+			<h1 class="landing-title">Manage Your Nostr Identity</h1>
 			<p class="landing-subtitle">Secure your keys. Connect everywhere.</p>
 
 			<!-- CTAs -->
@@ -489,7 +509,7 @@ onMount(async () => {
 						<Gear size={24} weight="fill" />
 					</div>
 					<h3>Secure by Default</h3>
-					<p>Your key never leaves diVine ID. Apps ask permission to sign.</p>
+					<p>Your key never leaves diVine Login. Apps ask permission to sign.</p>
 				</div>
 			</div>
 
@@ -522,9 +542,27 @@ onMount(async () => {
 
 	.section-header {
 		display: flex;
+		flex-wrap: wrap;
 		justify-content: space-between;
 		align-items: center;
+		gap: 0.75rem;
 		margin-bottom: 1rem;
+	}
+
+	@media (max-width: 480px) {
+		.section-header {
+			flex-direction: column;
+			align-items: stretch;
+		}
+
+		.section-header .section-title {
+			margin-bottom: 0;
+		}
+
+		.btn-connect,
+		.btn-link {
+			justify-content: center;
+		}
 	}
 
 	/* Identity Section */

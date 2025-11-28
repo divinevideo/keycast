@@ -48,7 +48,6 @@ onMount(async () => {
             <a class="nav-link {activePage === '/teams' ? 'active' : ''} bordered" href="/teams">Teams</a>
             <button
                 onclick={() => signout(ndk)}
-                ontouchend={() => signout(ndk)}
                 class="button button-secondary button-icon"
                 role="menuitem"
                 tabindex="-1"

@@ -117,41 +117,44 @@
 		display: flex;
 		align-items: center;
 		justify-content: center;
-		padding: 2rem;
+		padding: 1rem;
+		background: var(--color-divine-bg);
 	}
 
 	.verify-container {
-		background: #1a1a1a;
-		border: 1px solid #333;
-		border-radius: 12px;
-		padding: 3rem;
-		max-width: 450px;
+		background: var(--color-divine-surface);
+		border: 1px solid var(--color-divine-border);
+		border-radius: 1rem;
+		padding: 2rem;
+		max-width: 420px;
 		width: 100%;
 		text-align: center;
+		box-shadow: 0 2px 8px rgba(0, 180, 136, 0.08);
 	}
 
 	.verify-branding {
 		display: inline-flex;
 		flex-direction: row;
 		align-items: center;
-		gap: 0.75rem;
+		gap: 0.5rem;
+		font-family: var(--font-heading);
 		font-size: 1.5rem;
 		font-weight: 700;
-		color: #e0e0e0;
+		color: var(--color-divine-green);
 		text-decoration: none;
-		margin-bottom: 2rem;
-	}
-
-	.verify-branding:hover {
-		color: #fff;
-	}
-
-	.status-icon {
 		margin-bottom: 1.5rem;
 	}
 
+	.verify-branding:hover {
+		color: var(--color-divine-green-dark);
+	}
+
+	.status-icon {
+		margin-bottom: 1.25rem;
+	}
+
 	.status-icon.loading {
-		color: var(--color-divine-purple-light);
+		color: var(--color-divine-green);
 	}
 
 	.status-icon.success {
@@ -159,7 +162,7 @@
 	}
 
 	.status-icon.error {
-		color: #cf6679;
+		color: var(--color-divine-error);
 	}
 
 	.spin {
@@ -173,19 +176,22 @@
 
 	h1 {
 		margin: 0 0 0.5rem 0;
-		color: #e0e0e0;
+		color: var(--color-divine-text);
+		font-family: var(--font-heading);
 		font-size: 1.5rem;
+		font-weight: 700;
 	}
 
 	.subtitle {
-		color: #999;
-		margin: 0 0 1.5rem 0;
+		color: var(--color-divine-text-secondary);
+		margin: 0 0 1.25rem 0;
+		font-size: 0.95rem;
 	}
 
 	.redirect-notice {
-		color: #666;
+		color: var(--color-divine-text-tertiary);
 		font-size: 0.85rem;
-		margin-bottom: 1.5rem;
+		margin-bottom: 1.25rem;
 	}
 
 	.actions {
@@ -196,29 +202,30 @@
 
 	.btn-primary {
 		display: block;
-		padding: 0.75rem;
+		padding: 0.75rem 1.5rem;
 		background: var(--color-divine-green);
 		color: #fff;
 		border: none;
-		border-radius: 6px;
+		border-radius: 9999px;
 		font-size: 1rem;
 		font-weight: 600;
 		cursor: pointer;
 		text-decoration: none;
-		transition: background 0.2s;
+		transition: all 0.2s;
 	}
 
 	.btn-primary:hover {
 		background: var(--color-divine-green-dark);
+		box-shadow: 0 2px 8px rgba(0, 180, 136, 0.16);
 	}
 
 	.btn-secondary {
 		display: block;
-		padding: 0.75rem;
+		padding: 0.75rem 1.5rem;
 		background: transparent;
-		color: #e0e0e0;
-		border: 1px solid #444;
-		border-radius: 6px;
+		color: var(--color-divine-text-secondary);
+		border: 1px solid var(--color-divine-border);
+		border-radius: 9999px;
 		font-size: 1rem;
 		font-weight: 600;
 		cursor: pointer;
@@ -227,7 +234,7 @@
 	}
 
 	.btn-secondary:hover {
-		background: #333;
-		border-color: #666;
+		background: var(--color-divine-muted);
+		color: var(--color-divine-text);
 	}
 </style>

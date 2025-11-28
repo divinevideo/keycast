@@ -572,9 +572,19 @@
             }
 
             if (code) {
-                const storedPubkey = sessionStorage.getItem('test_pubkey');
-                const npub = storedPubkey ? window.NostrTools.nip19.npubEncode(storedPubkey) : null;
-                const shortNpub = npub ? `${npub.slice(0, 12)}...${npub.slice(-4)}` : '';
+                // Get stored identity (if BYOK was used)
+                let shortNpub = '';
+                try {
+                    const storedIdentity = sessionStorage.getItem('test_identity');
+                    if (storedIdentity) {
+                        const identity = JSON.parse(storedIdentity);
+                        if (identity.npub) {
+                            shortNpub = `${identity.npub.slice(0, 12)}...${identity.npub.slice(-4)}`;
+                        }
+                    }
+                } catch (e) {
+                    console.warn('Could not parse stored identity:', e);
+                }
                 showFlash(shortNpub ? `Connected as ${shortNpub}` : 'Connected!', 'success');
                 showStatus('Completing setup...', 'info');
                 // Clean URL immediately
