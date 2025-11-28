@@ -1394,6 +1394,55 @@ pub async fn revoke_session(
     }))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DisconnectClientRequest {
+    pub secret: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DisconnectClientResponse {
+    pub success: bool,
+    pub message: String,
+}
+
+/// Disconnect a NIP-46 client from a bunker session
+/// This clears the connected_client_pubkey, requiring the client to reconnect
+/// Useful for forcing a client to re-authenticate without fully revoking the session
+pub async fn disconnect_client(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Json(req): Json<DisconnectClientRequest>,
+) -> Result<Json<DisconnectClientResponse>, AuthError> {
+    let user_pubkey = extract_user_from_token(&headers)?;
+    let tenant_id = tenant.0.id;
+    tracing::info!("Disconnecting NIP-46 client for user: {} in tenant: {}", user_pubkey, tenant_id);
+
+    let result = sqlx::query(
+        "UPDATE oauth_authorizations
+         SET connected_client_pubkey = NULL, connected_at = NULL, updated_at = $1
+         WHERE secret = $2 AND user_public_key = $3 AND revoked_at IS NULL
+         AND user_public_key IN (SELECT public_key FROM users WHERE tenant_id = $4)"
+    )
+    .bind(Utc::now())
+    .bind(&req.secret)
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .execute(&pool)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(AuthError::InvalidToken);
+    }
+
+    tracing::info!("Successfully disconnected NIP-46 client for user: {}", user_pubkey);
+
+    Ok(Json(DisconnectClientResponse {
+        success: true,
+        message: "Client disconnected - must reconnect to continue".to_string(),
+    }))
+}
+
 #[derive(Debug, Serialize)]
 pub struct PermissionDetail {
     pub application_name: String,

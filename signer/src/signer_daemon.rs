@@ -123,6 +123,223 @@ impl AuthorizationHandler {
 
         Ok(())
     }
+
+    /// Process a NIP-46 connect request with client tracking.
+    ///
+    /// Validates the secret and stores the client pubkey for future request validation.
+    /// Per NIP-46, the secret becomes single-use after first successful connect.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if secret is invalid or already used by a different client.
+    pub async fn process_connect(
+        &self,
+        client_pubkey: &str,
+        provided_secret: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        if !self.is_oauth {
+            // For regular authorizations, just validate secret
+            if provided_secret == self.secret {
+                return Ok("ack".to_string());
+            } else {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Invalid secret"
+                )));
+            }
+        }
+
+        // For OAuth authorizations, check if secret exists and if client is already connected
+        let bunker_pubkey = self.bunker_keys.public_key().to_hex();
+
+        let existing: Option<(i32, Option<String>)> = sqlx::query_as(
+            "SELECT id, connected_client_pubkey FROM oauth_authorizations
+             WHERE bunker_public_key = $1 AND secret = $2"
+        )
+        .bind(&bunker_pubkey)
+        .bind(provided_secret)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        match existing {
+            Some((_auth_id, Some(existing_client))) => {
+                // Already connected - verify it's the same client
+                if existing_client == client_pubkey {
+                    tracing::debug!("Same client reconnecting: {}", client_pubkey);
+                    Ok("ack".to_string())
+                } else {
+                    tracing::warn!(
+                        "Secret already used by different client. Existing: {}, Attempting: {}",
+                        existing_client, client_pubkey
+                    );
+                    Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Secret already used by another client"
+                    )))
+                }
+            }
+            Some((auth_id, None)) => {
+                // First connect - store client pubkey
+                tracing::info!(
+                    "First connect for OAuth auth {}, storing client pubkey: {}",
+                    auth_id, client_pubkey
+                );
+                sqlx::query(
+                    "UPDATE oauth_authorizations
+                     SET connected_client_pubkey = $1, connected_at = NOW()
+                     WHERE id = $2"
+                )
+                .bind(client_pubkey)
+                .bind(auth_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+                Ok("ack".to_string())
+            }
+            None => {
+                tracing::warn!("Invalid secret for bunker {}", bunker_pubkey);
+                Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Invalid secret"
+                )))
+            }
+        }
+    }
+
+    /// Validate that a client is authorized to make requests.
+    ///
+    /// Checks if the provided client pubkey matches the stored connected client.
+    /// For non-OAuth authorizations, always succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if client pubkey doesn't match the connected client.
+    pub async fn validate_client(
+        &self,
+        client_pubkey: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !self.is_oauth {
+            // Regular authorizations don't track client pubkey (yet)
+            return Ok(());
+        }
+
+        let bunker_pubkey = self.bunker_keys.public_key().to_hex();
+
+        // Check if this client is the connected client for any authorization with this bunker pubkey
+        let is_valid: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM oauth_authorizations
+             WHERE bunker_public_key = $1 AND connected_client_pubkey = $2)"
+        )
+        .bind(&bunker_pubkey)
+        .bind(client_pubkey)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        if is_valid {
+            Ok(())
+        } else {
+            // Check if there's any authorization with NULL connected_client_pubkey
+            // If so, this client hasn't connected yet
+            let has_unconnected: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM oauth_authorizations
+                 WHERE bunker_public_key = $1 AND connected_client_pubkey IS NULL)"
+            )
+            .bind(&bunker_pubkey)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap_or(false);
+
+            if has_unconnected {
+                Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Unknown client - must connect first"
+                )))
+            } else {
+                Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Unknown client - not connected to any authorization"
+                )))
+            }
+        }
+    }
+
+    /// Validate client and store on first request.
+    ///
+    /// Provides graceful upgrade for existing connections. If no client is connected
+    /// yet, stores this client as the connected client. Subsequent requests must
+    /// come from the same client.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if a different client is already connected.
+    pub async fn validate_and_store_client(
+        &self,
+        client_pubkey: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !self.is_oauth {
+            return Ok(());
+        }
+
+        let bunker_pubkey = self.bunker_keys.public_key().to_hex();
+
+        // Check if this client is already the connected client
+        let is_valid: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM oauth_authorizations
+             WHERE bunker_public_key = $1 AND connected_client_pubkey = $2)"
+        )
+        .bind(&bunker_pubkey)
+        .bind(client_pubkey)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        if is_valid {
+            return Ok(());
+        }
+
+        // Check if there's an unconnected authorization we can claim
+        let unconnected_id: Option<i32> = sqlx::query_scalar(
+            "SELECT id FROM oauth_authorizations
+             WHERE bunker_public_key = $1 AND connected_client_pubkey IS NULL
+             LIMIT 1"
+        )
+        .bind(&bunker_pubkey)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        match unconnected_id {
+            Some(auth_id) => {
+                // First request without connect - store this client (graceful upgrade)
+                tracing::info!(
+                    "Storing client pubkey on first request (graceful upgrade) for auth {}: {}",
+                    auth_id, client_pubkey
+                );
+                sqlx::query(
+                    "UPDATE oauth_authorizations
+                     SET connected_client_pubkey = $1, connected_at = NOW()
+                     WHERE id = $2"
+                )
+                .bind(client_pubkey)
+                .bind(auth_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+                Ok(())
+            }
+            None => {
+                // No unconnected authorization and client not recognized
+                Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Unknown client - not connected to any authorization"
+                )))
+            }
+        }
+    }
 }
 
 pub struct UnifiedSigner {
@@ -795,6 +1012,55 @@ impl UnifiedSigner {
 
         tracing::info!("Processing NIP-46 method: {}", method);
 
+        // For OAuth authorizations, validate client pubkey for sensitive methods
+        // Per NIP-46: after connect, client_pubkey becomes the identifier for security
+        let client_pubkey = event.pubkey.to_hex();
+        let requires_validation = matches!(method, "sign_event" | "nip44_encrypt" | "nip44_decrypt" | "nip04_encrypt" | "nip04_decrypt");
+
+        if handler.is_oauth && requires_validation {
+            // Use validate_and_store_client for graceful upgrade:
+            // - If no client connected yet, stores this client and allows
+            // - If client matches stored, allows
+            // - If client doesn't match stored, rejects
+            if let Err(e) = handler.validate_and_store_client(&client_pubkey).await {
+                tracing::warn!("Client validation failed for {}: {}", client_pubkey, e);
+                let response = serde_json::json!({
+                    "id": request_id,
+                    "error": format!("Client not authorized: {}", e)
+                });
+
+                // Encrypt and send error response
+                let response_str = response.to_string();
+                let encrypted_response = if use_nip44 {
+                    nip44::encrypt(
+                        bunker_secret,
+                        &event.pubkey,
+                        &response_str,
+                        nip44::Version::V2,
+                    )?
+                } else {
+                    nip04::encrypt(
+                        bunker_secret,
+                        &event.pubkey,
+                        &response_str,
+                    )?
+                };
+
+                let response_event = EventBuilder::new(
+                    Kind::NostrConnect,
+                    encrypted_response
+                )
+                .tags(vec![
+                    Tag::public_key(event.pubkey),
+                    Tag::parse(vec!["e".to_string(), event.id.to_hex()])?,
+                ])
+                .sign(&handler.bunker_keys).await?;
+
+                client.send_event(&response_event).await?;
+                return Ok(());
+            }
+        }
+
         // Handle different NIP-46 methods
         let result = match method {
             "sign_event" => {
@@ -809,33 +1075,15 @@ impl UnifiedSigner {
                 })
             }
             "connect" => {
-                // Validate secret
+                // Process connect with client pubkey tracking (NIP-46 security)
+                // client_pubkey already extracted above from event.pubkey
                 if let Some(provided_secret) = request["params"][1].as_str() {
-                    // For OAuth handlers, a user can have multiple bunker connections (for different apps)
-                    // each with a different secret. We need to check if ANY authorization matches.
-                    let is_valid = if handler.is_oauth {
-                        // Query database to check if any OAuth authorization has this secret
-                        let bunker_pubkey = handler.bunker_keys.public_key().to_hex();
-                        let exists: Option<i32> = sqlx::query_scalar(
-                            "SELECT id FROM oauth_authorizations WHERE bunker_public_key = $1 AND secret = $2"
-                        )
-                        .bind(&bunker_pubkey)
-                        .bind(provided_secret)
-                        .fetch_optional(&handler.pool)
-                        .await
-                        .unwrap_or(None);
-                        exists.is_some()
-                    } else {
-                        // For regular (team) authorizations, bunker_public_key is unique per authorization
-                        provided_secret == handler.secret
-                    };
-
-                    if is_valid {
-                        serde_json::json!({"id": request_id, "result": "ack"})
-                    } else {
-                        serde_json::json!({"id": request_id, "error": "Invalid secret"})
+                    match handler.process_connect(&client_pubkey, provided_secret).await {
+                        Ok(result) => serde_json::json!({"id": request_id, "result": result}),
+                        Err(e) => serde_json::json!({"id": request_id, "error": e.to_string()})
                     }
                 } else {
+                    // No secret provided - still track client pubkey for future validation
                     serde_json::json!({"id": request_id, "result": "ack"})
                 }
             }

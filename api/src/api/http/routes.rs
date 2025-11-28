@@ -80,6 +80,7 @@ pub fn api_routes(pool: PgPool, state: Arc<KeycastState>, auth_cors: tower_http:
         .route("/user/sessions/:secret/activity", get(auth::get_session_activity))
         .route("/user/profile", post(auth::update_profile))
         .route("/user/sessions/revoke", post(auth::revoke_session))
+        .route("/user/sessions/disconnect", post(auth::disconnect_client))
         .route("/user/verify-password", post(auth::verify_password_for_export))
         .route("/user/request-key-export", post(auth::request_key_export))
         .route("/user/verify-export-code", post(auth::verify_export_code))

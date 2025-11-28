@@ -31,6 +31,11 @@ pub struct OAuthAuthorization {
     pub policy_id: Option<i32>,
     /// Tenant ID for multi-tenancy isolation
     pub tenant_id: i64,
+    /// The connected NIP-46 client's public key (set after successful connect)
+    /// Per NIP-46: after connect, this becomes the client identifier for security
+    pub connected_client_pubkey: Option<String>,
+    /// When the client connected (for audit purposes)
+    pub connected_at: Option<DateTime<chrono::Utc>>,
     /// The date and time the authorization was created
     pub created_at: DateTime<chrono::Utc>,
     /// The date and time the authorization was last updated
