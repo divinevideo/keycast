@@ -1,11 +1,8 @@
 // ABOUTME: OAuth authorization type for handling OAuth-based remote signing
 // ABOUTME: Unlike regular authorizations, OAuth uses the user's personal key for both NIP-46 encryption and event signing
 
-use crate::traits::AuthorizationValidations;
 use crate::types::authorization::{AuthorizationError, Relays};
 use chrono::DateTime;
-use nostr::nips::nip46::NostrConnectRequest;
-use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
 
@@ -73,20 +70,6 @@ impl OAuthAuthorization {
         Ok(permissions)
     }
 
-    /// Synchronous version for non-async contexts (deprecated, use permissions() instead)
-    #[deprecated(note = "Use async permissions() method instead")]
-    pub fn permissions_sync(
-        &self,
-        pool: &PgPool,
-        tenant_id: i64,
-    ) -> Result<Vec<crate::types::permission::Permission>, AuthorizationError> {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                self.permissions(pool, tenant_id).await
-            })
-        })
-    }
-
     pub async fn find(pool: &PgPool, tenant_id: i64, id: i32) -> Result<Self, AuthorizationError> {
         let authorization = sqlx::query_as::<_, OAuthAuthorization>(
             r#"
@@ -120,100 +103,5 @@ impl OAuthAuthorization {
         .fetch_all(pool)
         .await?;
         Ok(authorizations)
-    }
-}
-
-impl AuthorizationValidations for OAuthAuthorization {
-    fn validate_policy(
-        &self,
-        pool: &PgPool,
-        tenant_id: i64,
-        pubkey: &PublicKey,
-        request: &NostrConnectRequest,
-    ) -> Result<bool, AuthorizationError> {
-        // Load permissions if policy exists
-        let permissions = self.permissions_sync(pool, tenant_id)?;
-
-        // Convert to CustomPermission trait objects
-        let custom_permissions: Result<Vec<Box<dyn crate::traits::CustomPermission>>, _> = permissions
-            .iter()
-            .map(|p| p.to_custom_permission())
-            .collect();
-        let custom_permissions = custom_permissions
-            .map_err(|_| AuthorizationError::Unauthorized)?;
-
-        match request {
-            NostrConnectRequest::Connect { remote_signer_public_key, secret } => {
-                tracing::info!(target: "keycast_signer::signer_daemon", "OAuth Connect request received");
-                // Check the public key matches
-                if remote_signer_public_key.to_hex() != self.bunker_public_key {
-                    return Err(AuthorizationError::Unauthorized);
-                }
-                // Check that secret is correct
-                match secret {
-                    Some(ref s) if s != &self.secret => {
-                        return Err(AuthorizationError::InvalidSecret)
-                    }
-                    _ => {}
-                }
-                Ok(true)
-            }
-            NostrConnectRequest::GetPublicKey => {
-                tracing::info!(target: "keycast_signer::signer_daemon", "OAuth Get public key request");
-                Ok(true)
-            }
-            NostrConnectRequest::SignEvent(event) => {
-                tracing::info!(target: "keycast_signer::signer_daemon", "OAuth Sign event request");
-                // Validate against all permissions (AND logic)
-                for permission in &custom_permissions {
-                    if !permission.can_sign(event) {
-                        tracing::warn!(
-                            "OAuth authorization {} denied by {} permission for kind {}",
-                            self.id,
-                            permission.identifier(),
-                            event.kind.as_u16()
-                        );
-                        return Err(AuthorizationError::Unauthorized);
-                    }
-                }
-                Ok(true)
-            }
-            NostrConnectRequest::Nip04Encrypt { public_key, text }
-            | NostrConnectRequest::Nip44Encrypt { public_key, text } => {
-                tracing::info!(target: "keycast_signer::signer_daemon", "OAuth NIP04/44 encrypt request");
-                // Validate against all permissions
-                for permission in &custom_permissions {
-                    if !permission.can_encrypt(text, pubkey, public_key) {
-                        tracing::warn!(
-                            "OAuth authorization {} denied encryption by {} permission",
-                            self.id,
-                            permission.identifier()
-                        );
-                        return Err(AuthorizationError::Unauthorized);
-                    }
-                }
-                Ok(true)
-            }
-            NostrConnectRequest::Nip04Decrypt { public_key, ciphertext }
-            | NostrConnectRequest::Nip44Decrypt { public_key, ciphertext } => {
-                tracing::info!(target: "keycast_signer::signer_daemon", "OAuth NIP04/44 decrypt request");
-                // Validate against all permissions
-                for permission in &custom_permissions {
-                    if !permission.can_decrypt(ciphertext, public_key, pubkey) {
-                        tracing::warn!(
-                            "OAuth authorization {} denied decryption by {} permission",
-                            self.id,
-                            permission.identifier()
-                        );
-                        return Err(AuthorizationError::Unauthorized);
-                    }
-                }
-                Ok(true)
-            }
-            NostrConnectRequest::Ping => {
-                tracing::info!(target: "keycast_signer::signer_daemon", "OAuth Ping request");
-                Ok(true)
-            }
-        }
     }
 }

@@ -124,10 +124,10 @@
             <strong>Server:</strong> <code id="apiUrlDisplay" style="color: #888;"></code>
         </p>
         <p style="font-size: 12px; margin: 5px 0; color: #666;">
-            <strong>Client ID:</strong> <code style="color: #888;">standalone-test-app</code>
+            <strong>Client ID:</strong> <code style="color: #888;">divine</code>
         </p>
         <input type="hidden" id="apiUrl" value="">
-        <input type="hidden" id="clientId" value="standalone-test-app">
+        <input type="hidden" id="clientId" value="divine">
     </div>
 
     <div class="section">
@@ -178,6 +178,61 @@
         <div id="signResult" style="display: none; margin-top: 20px;">
             <h3 style="color: #03dac6; margin: 0 0 10px 0;">Signed Event</h3>
             <pre id="signedEvent" style="max-height: 300px; overflow-y: auto;"></pre>
+        </div>
+    </div>
+
+    <div class="section" id="rpc-section" style="display: none;">
+        <h2>REST RPC API (Low-Latency Alternative)</h2>
+        <p style="color: #888; font-size: 13px; margin-bottom: 15px;">
+            Use the REST RPC API instead of NIP-46 relay-based signing. Lower latency, simpler integration.
+        </p>
+
+        <div style="background: #2a4a2a; padding: 15px; border-radius: 8px; border-left: 4px solid #03dac6; margin-bottom: 15px;">
+            <p style="font-size: 12px; margin: 5px 0;"><strong>API Endpoint:</strong> <code id="rpc-endpoint" style="color: #03dac6;">-</code></p>
+            <p style="font-size: 12px; margin: 5px 0;"><strong>Access Token:</strong> <code id="rpc-token" style="color: #bb86fc; word-break: break-all;">-</code></p>
+        </div>
+
+        <div style="margin-bottom: 20px;">
+            <h4 style="color: #bb86fc; margin: 0 0 10px 0;">get_public_key</h4>
+            <button onclick="rpcGetPublicKey()">Get Public Key</button>
+        </div>
+
+        <div style="margin-bottom: 20px; padding-top: 15px; border-top: 1px solid #444;">
+            <h4 style="color: #bb86fc; margin: 0 0 10px 0;">sign_event</h4>
+            <textarea id="rpcEventContent" placeholder="Enter message for kind:1 note"
+                style="width: 100%; height: 60px; background: #1a1a1a; border: 1px solid #444; border-radius: 6px; color: #e0e0e0; padding: 10px; font-size: 14px; resize: vertical;">Hello from REST RPC API!</textarea>
+            <button onclick="rpcSignEvent()" style="margin-top: 10px;">Sign Event via RPC</button>
+        </div>
+
+        <div style="margin-bottom: 20px; padding-top: 15px; border-top: 1px solid #444;">
+            <h4 style="color: #bb86fc; margin: 0 0 10px 0;">nip44_encrypt / nip44_decrypt</h4>
+            <input id="rpcNip44Pubkey" placeholder="Recipient pubkey (hex)"
+                style="margin-bottom: 8px;" value="">
+            <textarea id="rpcNip44Plaintext" placeholder="Plaintext to encrypt"
+                style="width: 100%; height: 40px; background: #1a1a1a; border: 1px solid #444; border-radius: 6px; color: #e0e0e0; padding: 10px; font-size: 14px;">Secret message</textarea>
+            <div class="button-group" style="margin-top: 10px;">
+                <button onclick="rpcNip44Encrypt()">NIP-44 Encrypt</button>
+                <button onclick="rpcNip44Decrypt()">NIP-44 Decrypt</button>
+            </div>
+            <pre id="rpcNip44Result" style="margin-top: 10px; display: none;"></pre>
+        </div>
+
+        <div style="margin-bottom: 20px; padding-top: 15px; border-top: 1px solid #444;">
+            <h4 style="color: #bb86fc; margin: 0 0 10px 0;">nip04_encrypt / nip04_decrypt</h4>
+            <input id="rpcNip04Pubkey" placeholder="Recipient pubkey (hex)"
+                style="margin-bottom: 8px;" value="">
+            <textarea id="rpcNip04Plaintext" placeholder="Plaintext to encrypt"
+                style="width: 100%; height: 40px; background: #1a1a1a; border: 1px solid #444; border-radius: 6px; color: #e0e0e0; padding: 10px; font-size: 14px;">Secret message</textarea>
+            <div class="button-group" style="margin-top: 10px;">
+                <button onclick="rpcNip04Encrypt()">NIP-04 Encrypt</button>
+                <button onclick="rpcNip04Decrypt()">NIP-04 Decrypt</button>
+            </div>
+            <pre id="rpcNip04Result" style="margin-top: 10px; display: none;"></pre>
+        </div>
+
+        <div id="rpcResult" style="display: none; margin-top: 20px;">
+            <h3 style="color: #03dac6; margin: 0 0 10px 0;">RPC Response</h3>
+            <pre id="rpcResponse" style="max-height: 300px; overflow-y: auto;"></pre>
         </div>
     </div>
 
@@ -406,6 +461,13 @@
                     // Store bunker URL for later use
                     localStorage.setItem('keycast_bunker_url', data.bunker_url);
 
+                    // Store access_token and nostr_api for RPC (if available)
+                    if (data.access_token && data.nostr_api) {
+                        localStorage.setItem('keycast_access_token', data.access_token);
+                        localStorage.setItem('keycast_nostr_api', data.nostr_api);
+                        showRpcSection(data.nostr_api, data.access_token);
+                    }
+
                     // Verify BYOK pubkey if applicable
                     if (byokUsed && expectedPubkey) {
                         // Extract pubkey from bunker URL
@@ -538,6 +600,8 @@
         // Clear and reset
         function clearAndReset() {
             localStorage.removeItem('keycast_bunker_url');
+            localStorage.removeItem('keycast_access_token');
+            localStorage.removeItem('keycast_nostr_api');
             // Clear OAuth state but regenerate identity
             sessionStorage.removeItem('pkce_verifier');
             sessionStorage.removeItem('oauth_api_url');
@@ -546,11 +610,149 @@
             sessionStorage.removeItem('byok_pubkey');
             document.getElementById('results').style.display = 'none';
             document.getElementById('signResult').style.display = 'none';
+            document.getElementById('rpc-section').style.display = 'none';
+            document.getElementById('rpcResult').style.display = 'none';
             // Reset bunker signer
             bunkerSigner = null;
             // Generate a fresh identity
             generateTestNsec();
             showStatus('Cleared. New identity generated. Ready to start over.', 'info');
+        }
+
+        // ============================================================================
+        // REST RPC API Functions
+        // ============================================================================
+
+        function showRpcSection(nostrApi, accessToken) {
+            document.getElementById('rpc-section').style.display = 'block';
+            document.getElementById('rpc-endpoint').textContent = nostrApi;
+            document.getElementById('rpc-token').textContent = accessToken.substring(0, 50) + '...';
+        }
+
+        async function rpcCall(method, params = []) {
+            const nostrApi = localStorage.getItem('keycast_nostr_api');
+            const accessToken = localStorage.getItem('keycast_access_token');
+
+            if (!nostrApi || !accessToken) {
+                showStatus('No RPC credentials. Please complete OAuth flow first.', 'error');
+                return null;
+            }
+
+            showStatus(`Calling RPC: ${method}...`, 'info');
+
+            try {
+                const response = await fetch(nostrApi, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${accessToken}`
+                    },
+                    body: JSON.stringify({ method, params })
+                });
+
+                const data = await response.json();
+
+                if (data.error) {
+                    showStatus(`RPC Error: ${data.error}`, 'error');
+                    return null;
+                }
+
+                // Show result
+                document.getElementById('rpcResult').style.display = 'block';
+                document.getElementById('rpcResponse').textContent = JSON.stringify(data, null, 2);
+
+                showStatus(`RPC ${method} successful!`, 'success');
+                return data.result;
+            } catch (error) {
+                showStatus(`RPC Error: ${error.message}`, 'error');
+                return null;
+            }
+        }
+
+        async function rpcGetPublicKey() {
+            await rpcCall('get_public_key', []);
+        }
+
+        async function rpcSignEvent() {
+            const content = document.getElementById('rpcEventContent').value.trim();
+            if (!content) {
+                showStatus('Please enter a message to sign.', 'error');
+                return;
+            }
+
+            const unsignedEvent = {
+                kind: 1,
+                created_at: Math.floor(Date.now() / 1000),
+                tags: [],
+                content: content,
+                pubkey: '0000000000000000000000000000000000000000000000000000000000000000' // Will be replaced by server
+            };
+
+            await rpcCall('sign_event', [unsignedEvent]);
+        }
+
+        async function rpcNip44Encrypt() {
+            const pubkey = document.getElementById('rpcNip44Pubkey').value.trim();
+            const plaintext = document.getElementById('rpcNip44Plaintext').value;
+
+            if (!pubkey) {
+                showStatus('Please enter a recipient pubkey.', 'error');
+                return;
+            }
+
+            const result = await rpcCall('nip44_encrypt', [pubkey, plaintext]);
+            if (result) {
+                document.getElementById('rpcNip44Result').style.display = 'block';
+                document.getElementById('rpcNip44Result').textContent = `Ciphertext:\n${result}`;
+            }
+        }
+
+        async function rpcNip44Decrypt() {
+            const pubkey = document.getElementById('rpcNip44Pubkey').value.trim();
+            const ciphertext = document.getElementById('rpcNip44Plaintext').value;
+
+            if (!pubkey) {
+                showStatus('Please enter the sender pubkey.', 'error');
+                return;
+            }
+
+            const result = await rpcCall('nip44_decrypt', [pubkey, ciphertext]);
+            if (result) {
+                document.getElementById('rpcNip44Result').style.display = 'block';
+                document.getElementById('rpcNip44Result').textContent = `Plaintext:\n${result}`;
+            }
+        }
+
+        async function rpcNip04Encrypt() {
+            const pubkey = document.getElementById('rpcNip04Pubkey').value.trim();
+            const plaintext = document.getElementById('rpcNip04Plaintext').value;
+
+            if (!pubkey) {
+                showStatus('Please enter a recipient pubkey.', 'error');
+                return;
+            }
+
+            const result = await rpcCall('nip04_encrypt', [pubkey, plaintext]);
+            if (result) {
+                document.getElementById('rpcNip04Result').style.display = 'block';
+                document.getElementById('rpcNip04Result').textContent = `Ciphertext:\n${result}`;
+            }
+        }
+
+        async function rpcNip04Decrypt() {
+            const pubkey = document.getElementById('rpcNip04Pubkey').value.trim();
+            const ciphertext = document.getElementById('rpcNip04Plaintext').value;
+
+            if (!pubkey) {
+                showStatus('Please enter the sender pubkey.', 'error');
+                return;
+            }
+
+            const result = await rpcCall('nip04_decrypt', [pubkey, ciphertext]);
+            if (result) {
+                document.getElementById('rpcNip04Result').style.display = 'block';
+                document.getElementById('rpcNip04Result').textContent = `Plaintext:\n${result}`;
+            }
         }
 
         // On page load, check for OAuth callback (code in URL)
@@ -600,6 +802,13 @@
                 document.getElementById('results').style.display = 'block';
                 document.getElementById('bunkerUrl').textContent = storedBunkerUrl;
                 showStatus('Found existing bunker URL from previous session.', 'info');
+
+                // Also restore RPC section if credentials are stored
+                const storedAccessToken = localStorage.getItem('keycast_access_token');
+                const storedNostrApi = localStorage.getItem('keycast_nostr_api');
+                if (storedAccessToken && storedNostrApi) {
+                    showRpcSection(storedNostrApi, storedAccessToken);
+                }
             }
         });
     </script>

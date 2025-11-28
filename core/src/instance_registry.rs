@@ -204,7 +204,7 @@ mod tests {
         let registry2 = InstanceRegistry::register(pool.clone()).await.unwrap();
         let registry3 = InstanceRegistry::register(pool.clone()).await.unwrap();
 
-        let ids = vec![
+        let ids = [
             registry1.instance_id(),
             registry2.instance_id(),
             registry3.instance_id(),

@@ -5,7 +5,6 @@ use keycast_core::encryption::{KeyManager, file_key_manager::FileKeyManager};
 use keycast_core::signing_handler::SigningHandler;
 use keycast_core::types::authorization::Authorization;
 use keycast_core::types::oauth_authorization::OAuthAuthorization;
-use keycast_core::types::permission::Permission;
 use keycast_signer::AuthorizationHandler;
 use nostr_sdk::prelude::*;
 use serde_json::json;

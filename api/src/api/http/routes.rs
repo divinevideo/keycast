@@ -6,7 +6,7 @@ use keycast_core::authorization_channel::AuthorizationSender;
 use sqlx::PgPool;
 use std::sync::Arc;
 
-use crate::api::http::{auth, oauth, teams};
+use crate::api::http::{auth, nostr_rpc, oauth, policies, teams};
 use crate::state::KeycastState;
 use axum::response::Json as AxumJson;
 use serde_json::Value as JsonValue;
@@ -67,6 +67,11 @@ pub fn api_routes(pool: PgPool, state: Arc<KeycastState>, auth_cors: tower_http:
         .route("/user/sign", post(auth::sign_event))
         .with_state(auth_state.clone());
 
+    // NIP-46 RPC endpoint (OAuth access token auth, public CORS for third-party apps)
+    let nostr_rpc_routes = Router::new()
+        .route("/nostr", post(nostr_rpc::nostr_rpc))
+        .with_state(auth_state.clone());
+
     // Protected user routes (authentication required via UCAN cookie)
     // Need auth_cors (restricted origins + credentials) since they use cookies
     let user_routes = Router::new()
@@ -111,6 +116,12 @@ pub fn api_routes(pool: PgPool, state: Arc<KeycastState>, auth_cors: tower_http:
         .route("/.well-known/nostr.json", get(nostr_discovery_public))
         .with_state(pool.clone());
 
+    // Policy discovery routes (public, no auth required)
+    let policy_routes = Router::new()
+        .route("/policies", get(policies::list_policies))
+        .route("/policies/:slug", get(policies::get_policy))
+        .with_state(pool.clone());
+
     // API documentation route (public)
     let docs_route = Router::new()
         .route("/docs/openapi.json", get(openapi_spec));
@@ -151,8 +162,10 @@ pub fn api_routes(pool: PgPool, state: Arc<KeycastState>, auth_cors: tower_http:
         .merge(oauth_routes)             // Has public_cors (third-party safe)
         .merge(connect_routes.layer(public_cors.clone()))
         .merge(signing_routes.layer(public_cors.clone()))
+        .merge(nostr_rpc_routes.layer(public_cors.clone()))  // NIP-46 RPC for OAuth apps
         .merge(team_routes.layer(public_cors.clone()))
         .merge(discovery_route.layer(public_cors.clone()))
+        .merge(policy_routes.layer(public_cors.clone()))
         .merge(docs_route.layer(public_cors))
 }
 

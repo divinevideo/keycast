@@ -1,4 +1,5 @@
 use crate::{
+    custom_permissions::PermissionDisplay,
     traits::CustomPermission,
     types::permission::{Permission, PermissionError},
 };
@@ -13,6 +14,13 @@ pub struct ContentFilterConfig {
 
 pub struct ContentFilter {
     config: ContentFilterConfig,
+}
+
+impl ContentFilter {
+    /// Returns the set of blocked words, or None if no filtering
+    pub fn blocked_words(&self) -> Option<&Vec<String>> {
+        self.config.blocked_words.as_ref()
+    }
 }
 
 #[async_trait]
@@ -59,6 +67,26 @@ impl CustomPermission for ContentFilter {
         _recipient_pubkey: &PublicKey,
     ) -> bool {
         true
+    }
+
+    fn display(&self) -> PermissionDisplay {
+        match &self.config.blocked_words {
+            None => PermissionDisplay {
+                icon: "✅",
+                title: "No content restrictions",
+                description: "No blocked words or phrases".to_string(),
+            },
+            Some(words) if words.is_empty() => PermissionDisplay {
+                icon: "✅",
+                title: "No content restrictions",
+                description: "No blocked words or phrases".to_string(),
+            },
+            Some(words) => PermissionDisplay {
+                icon: "🛡️",
+                title: "Content restrictions",
+                description: format!("Cannot post content containing: {}", words.join(", ")),
+            },
+        }
     }
 }
 

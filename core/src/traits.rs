@@ -1,21 +1,7 @@
-use crate::types::authorization::AuthorizationError;
+use crate::custom_permissions::PermissionDisplay;
 use crate::types::permission::{Permission, PermissionError};
 use async_trait::async_trait;
-use nostr::nips::nip46::NostrConnectRequest;
 use nostr_sdk::{PublicKey, UnsignedEvent};
-use sqlx::PgPool;
-
-/// Provides methods for validating an authorization against it's permissions and other properties in the context of a request
-pub trait AuthorizationValidations {
-    /// Check the authorization's policy & permissions
-    fn validate_policy(
-        &self,
-        pool: &PgPool,
-        tenant_id: i64,
-        pubkey: &PublicKey,
-        request: &NostrConnectRequest,
-    ) -> Result<bool, AuthorizationError>;
-}
 
 /// A trait that represents a custom permission
 #[async_trait]
@@ -49,4 +35,7 @@ pub trait CustomPermission: Send + Sync {
         sender_pubkey: &PublicKey,
         recipient_pubkey: &PublicKey,
     ) -> bool;
+
+    /// Returns a user-friendly description of this permission for display on authorization pages
+    fn display(&self) -> PermissionDisplay;
 }

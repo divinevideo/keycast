@@ -22,60 +22,6 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-async fn landing_page() -> Html<&'static str> {
-    Html(r#"
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Keycast - NIP-46 Remote Signing</title>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-               max-width: 800px; margin: 50px auto; padding: 20px; background: #1a1a1a; color: #e0e0e0; }
-        h1 { color: #bb86fc; }
-        h2 { color: #03dac6; margin-top: 30px; }
-        a { color: #03dac6; text-decoration: none; }
-        a:hover { text-decoration: underline; }
-        code { background: #2a2a2a; padding: 2px 6px; border-radius: 3px; }
-        .endpoint { background: #2a2a2a; padding: 10px; margin: 10px 0; border-radius: 5px; }
-        .method { color: #bb86fc; font-weight: bold; }
-    </style>
-</head>
-<body>
-    <h1>🔑 Keycast</h1>
-    <p>NIP-46 remote signing with OAuth 2.0 authorization</p>
-
-    <h2>API Endpoints</h2>
-    <div class="endpoint">
-        <span class="method">POST</span> <code>/api/auth/register</code><br>
-        Register with email/password (ROPC)
-    </div>
-    <div class="endpoint">
-        <span class="method">POST</span> <code>/api/auth/login</code><br>
-        Login and get UCAN token
-    </div>
-    <div class="endpoint">
-        <span class="method">GET</span> <code>/api/user/bunker</code><br>
-        Get NIP-46 bunker URL (requires auth)
-    </div>
-
-    <h2>OAuth 2.0</h2>
-    <div class="endpoint">
-        <span class="method">GET/POST</span> <code>/api/oauth/authorize</code><br>
-        Authorization flow
-    </div>
-    <div class="endpoint">
-        <span class="method">POST</span> <code>/api/oauth/token</code><br>
-        Exchange code for bunker URL
-    </div>
-
-    <p><a href="/examples">View examples</a></p>
-</body>
-</html>
-    "#)
-}
-
 async fn health_check() -> impl IntoResponse {
     StatusCode::OK
 }
@@ -103,10 +49,8 @@ fn validate_environment() -> Result<(), String> {
         errors.push("MASTER_KEY_PATH must be set when USE_GCP_KMS=false");
     }
 
-    if use_gcp_kms {
-        if env::var("GCP_PROJECT_ID").is_err() {
-            errors.push("GCP_PROJECT_ID must be set when USE_GCP_KMS=true");
-        }
+    if use_gcp_kms && env::var("GCP_PROJECT_ID").is_err() {
+        errors.push("GCP_PROJECT_ID must be set when USE_GCP_KMS=true");
     }
 
     // Docker deployment requires additional vars

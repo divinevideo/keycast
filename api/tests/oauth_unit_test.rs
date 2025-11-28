@@ -69,7 +69,7 @@ fn test_bunker_url_format() {
 #[ignore = "Requires Postgres test infrastructure"]
 async fn test_authorization_code_expiration() {
     use sqlx::PgPool;
-    let pool = PgPool::connect("postgres://test").await.unwrap();
+    let _pool = PgPool::connect("postgres://test").await.unwrap();
     // Test code would go here
     // TODO: Re-enable when Postgres test setup available
 }
@@ -79,7 +79,7 @@ async fn test_authorization_code_expiration() {
 #[ignore = "Requires Postgres test infrastructure"]
 async fn test_authorization_code_one_time_use() {
     use sqlx::PgPool;
-    let pool = PgPool::connect("postgres://test").await.unwrap();
+    let _pool = PgPool::connect("postgres://test").await.unwrap();
     // Test code would go here
     // TODO: Re-enable when Postgres test setup available
 }
@@ -89,7 +89,7 @@ async fn test_authorization_code_one_time_use() {
 #[ignore = "Requires Postgres test infrastructure"]
 async fn test_redirect_uri_validation() {
     use sqlx::PgPool;
-    let pool = PgPool::connect("postgres://test").await.unwrap();
+    let _pool = PgPool::connect("postgres://test").await.unwrap();
     // Test code would go here
     // TODO: Re-enable when Postgres test setup available
 }
@@ -99,7 +99,7 @@ async fn test_redirect_uri_validation() {
 #[ignore = "Requires Postgres test infrastructure"]
 async fn test_multiple_authorizations_per_user() {
     use sqlx::PgPool;
-    let pool = PgPool::connect("postgres://test").await.unwrap();
+    let _pool = PgPool::connect("postgres://test").await.unwrap();
     // Test code would go here
     // TODO: Re-enable when Postgres test setup available
 }

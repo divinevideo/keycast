@@ -1,4 +1,5 @@
 use crate::{
+    custom_permissions::PermissionDisplay,
     traits::CustomPermission,
     types::permission::{Permission, PermissionError},
 };
@@ -44,5 +45,13 @@ impl CustomPermission for EncryptToSelf {
         recipient_pubkey: &PublicKey,
     ) -> bool {
         *sender_pubkey == *recipient_pubkey
+    }
+
+    fn display(&self) -> PermissionDisplay {
+        PermissionDisplay {
+            icon: "🔒",
+            title: "Private message restriction",
+            description: "Can only send messages to yourself (for backups or notes)".to_string(),
+        }
     }
 }

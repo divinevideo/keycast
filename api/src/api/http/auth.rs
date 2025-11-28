@@ -1449,7 +1449,17 @@ pub struct PermissionDetail {
     pub application_id: i64,
     pub policy_name: String,
     pub policy_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_slug: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_description: Option<String>,
+    /// User-friendly permission descriptions (new format)
+    pub permissions: Vec<keycast_core::custom_permissions::PermissionDisplay>,
+    /// Legacy: Raw allowed event kinds
     pub allowed_event_kinds: Vec<i16>,
+    /// Legacy: Human-readable event kind names
     pub event_kind_names: Vec<String>,
     pub created_at: String,
     pub last_activity: Option<String>,
@@ -1473,13 +1483,20 @@ pub async fn list_permissions(
     tracing::info!("Listing permissions for user: {} in tenant: {}", user_pubkey, tenant_id);
 
     // Get OAuth authorizations with policy and permission details
-    type AuthDataRow = (i64, String, i64, String, String, String, Option<String>, Option<i64>);
+    type AuthDataRow = (
+        i64, String, i64, String,
+        Option<String>, Option<String>, Option<String>,  // policy slug, display_name, description
+        String, String, Option<String>, Option<i64>
+    );
     let auth_data: Vec<AuthDataRow> = sqlx::query_as(
         "SELECT
             oa.application_id,
             COALESCE(a.name, 'Personal Bunker') as app_name,
             COALESCE(oa.policy_id, a.policy_id) as policy_id,
             COALESCE(p.name, 'No Policy') as policy_name,
+            p.slug as policy_slug,
+            p.display_name as policy_display_name,
+            p.description as policy_description,
             oa.created_at,
             oa.secret,
             (SELECT MAX(created_at) FROM signing_activity WHERE bunker_secret = oa.secret) as last_activity,
@@ -1500,8 +1517,19 @@ pub async fn list_permissions(
 
     let mut permissions = Vec::new();
 
-    for (app_id, app_name, policy_id, policy_name, created_at, secret, last_activity, activity_count) in auth_data {
-        // Get allowed event kinds from policy permissions
+    for (app_id, app_name, policy_id, policy_name, policy_slug, policy_display_name, policy_description, created_at, secret, last_activity, activity_count) in auth_data {
+        // Load permission displays using the Policy model
+        let permission_displays = if policy_id > 0 {
+            use keycast_core::types::policy::Policy;
+            match Policy::find_by_id(&pool, tenant_id, policy_id as i32).await {
+                Ok(policy) => policy.permission_displays(&pool).await.unwrap_or_default(),
+                Err(_) => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+
+        // Get allowed event kinds from policy permissions (legacy)
         let event_kinds: Vec<i16> = if policy_id > 0 {
             let permissions_data: Vec<(String,)> = sqlx::query_as(
                 "SELECT p.config FROM permissions p
@@ -1561,6 +1589,10 @@ pub async fn list_permissions(
             application_id: app_id,
             policy_name,
             policy_id,
+            policy_slug,
+            policy_display_name,
+            policy_description,
+            permissions: permission_displays,
             allowed_event_kinds: event_kinds,
             event_kind_names,
             created_at,
@@ -1585,7 +1617,7 @@ pub struct SignEventResponse {
 
 /// Validate that the user has permission to sign this event
 /// Returns the policy_id if successful, or an error if unauthorized
-async fn validate_signing_permissions(
+pub(crate) async fn validate_signing_permissions(
     pool: &PgPool,
     tenant_id: i64,
     user_pubkey: &str,
@@ -2407,6 +2439,10 @@ mod tests {
 
         fn user_public_key(&self) -> String {
             self.user_keys.public_key().to_hex()
+        }
+
+        fn get_keys(&self) -> Keys {
+            self.user_keys.clone()
         }
     }
 

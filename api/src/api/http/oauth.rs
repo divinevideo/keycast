@@ -40,6 +40,26 @@ pub fn extract_nsec_from_verifier_public(verifier: &str) -> Option<String> {
     None
 }
 
+/// Parse OAuth scope parameter for policy-based authorization.
+/// Accepts either "policy:slug" format (new) or legacy scopes (rejected with error).
+/// Returns the policy slug if valid, or error if invalid format.
+pub fn parse_policy_scope(scope: &str) -> Result<String, OAuthError> {
+    if let Some(policy_slug) = scope.strip_prefix("policy:") {
+        if policy_slug.is_empty() {
+            return Err(OAuthError::InvalidRequest(
+                "Policy scope cannot be empty. Use 'policy:social', 'policy:readonly', etc.".to_string()
+            ));
+        }
+        Ok(policy_slug.to_string())
+    } else {
+        // Legacy scopes are no longer accepted
+        Err(OAuthError::InvalidRequest(format!(
+            "Invalid scope '{}'. Use 'policy:social', 'policy:readonly', etc. See GET /api/policies for available options.",
+            scope
+        )))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AuthorizeRequest {
     pub client_id: String,
@@ -109,16 +129,31 @@ async fn generate_ucan_token(
 
 /// RFC 6749 Section 5.1 - Successful Response (Keycast variant)
 ///
-/// Returns bunker URL for NIP-46 remote signing (no admin access token)
+/// Returns bunker URL for NIP-46 remote signing, plus access_token for REST RPC API
 ///
 /// See: <https://datatracker.ietf.org/doc/html/rfc6749#section-5.1>
+/// Policy info included in token responses
+#[derive(Debug, Serialize)]
+pub struct TokenPolicyInfo {
+    pub slug: String,
+    pub display_name: String,
+    pub description: String,
+    pub permissions: Vec<keycast_core::custom_permissions::PermissionDisplay>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct TokenResponse {
-    pub bunker_url: String,           // Keycast extension - NIP-46 credential
+    pub bunker_url: String,            // Keycast extension - NIP-46 credential
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,  // UCAN token for REST RPC API (/api/nostr)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nostr_api: Option<String>,     // REST RPC API endpoint URL
     pub token_type: String,            // RFC 6749 required - "Bearer"
-    pub expires_in: i64,               // RFC 6749 recommended - bunker doesn't expire (0)
+    pub expires_in: i64,               // RFC 6749 recommended - UCAN expiry in seconds
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,         // RFC 6749 optional - granted permissions
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<TokenPolicyInfo>, // Keycast extension - policy details
 }
 
 #[derive(Debug)]
@@ -209,6 +244,60 @@ fn validate_pkce(
             format!("Unsupported code_challenge_method: {}", code_challenge_method)
         )),
     }
+}
+
+/// Resolve policy ID from scope parameter.
+/// Parses "policy:slug" format and validates against app's default policy.
+async fn resolve_policy_from_scope(
+    pool: &sqlx::PgPool,
+    tenant_id: i64,
+    application_id: i32,
+    scope: &str,
+) -> Result<i32, OAuthError> {
+    use keycast_core::types::policy::{Policy, is_more_restrictive};
+
+    // Parse scope for policy slug
+    let policy_slug = parse_policy_scope(scope)?;
+
+    // Look up the requested policy
+    let requested_policy = Policy::find_by_slug(pool, tenant_id, &policy_slug)
+        .await
+        .map_err(|e| match e {
+            keycast_core::types::policy::PolicyError::NotFound => {
+                OAuthError::InvalidRequest(format!(
+                    "Unknown policy '{}'. See GET /api/policies for available options.",
+                    policy_slug
+                ))
+            }
+            _ => OAuthError::Database(sqlx::Error::Protocol(e.to_string())),
+        })?;
+
+    // Check if app has a default policy constraint
+    let app_default_policy_id: Option<i32> = sqlx::query_scalar(
+        "SELECT policy_id FROM oauth_applications WHERE id = $1"
+    )
+    .bind(application_id)
+    .fetch_one(pool)
+    .await?;
+
+    // If app has a default policy, validate requested is equal or more restrictive
+    if let Some(default_policy_id) = app_default_policy_id {
+        let default_policy = Policy::find_by_id(pool, tenant_id, default_policy_id)
+            .await
+            .map_err(|e| OAuthError::Database(sqlx::Error::Protocol(e.to_string())))?;
+
+        let is_allowed = is_more_restrictive(&requested_policy, &default_policy, pool)
+            .await
+            .map_err(|e| OAuthError::InvalidRequest(format!("Policy comparison failed: {}", e)))?;
+
+        if !is_allowed {
+            return Err(OAuthError::InvalidRequest(
+                "This app cannot request more permissions than its default policy allows.".to_string()
+            ));
+        }
+    }
+
+    Ok(requested_policy.id)
 }
 
 #[derive(Debug, Serialize)]
@@ -410,6 +499,46 @@ pub async fn authorize_get(
             }
         }
     }
+
+    // Load policy info from scope for display
+    // Default to "policy:social" if no scope provided
+    let scope_str = params.scope.as_deref().unwrap_or("policy:social");
+    let policy_info_json = {
+        use keycast_core::types::policy::Policy;
+
+        // Parse policy slug from scope
+        let policy_slug = match parse_policy_scope(scope_str) {
+            Ok(slug) => slug,
+            Err(_) => {
+                // For now, default to "social" for backward compatibility during transition
+                tracing::warn!("Invalid scope '{}', defaulting to 'social' policy", scope_str);
+                "social".to_string()
+            }
+        };
+
+        // Load policy and its permissions
+        match Policy::find_by_slug(pool, tenant_id, &policy_slug).await {
+            Ok(policy) => {
+                let permissions = policy.permission_displays(pool).await.unwrap_or_default();
+                serde_json::json!({
+                    "slug": policy.slug.clone().unwrap_or_else(|| policy.id.to_string()),
+                    "display_name": policy.display_name.clone().unwrap_or_else(|| policy.name.clone()),
+                    "description": policy.description.clone().unwrap_or_default(),
+                    "permissions": permissions
+                }).to_string()
+            }
+            Err(_) => {
+                // Fallback to minimal info if policy not found
+                tracing::warn!("Policy '{}' not found, using fallback", policy_slug);
+                serde_json::json!({
+                    "slug": policy_slug,
+                    "display_name": "App Access",
+                    "description": "Grant access to this application",
+                    "permissions": []
+                }).to_string()
+            }
+        }
+    };
 
     let html = if let Some(pubkey) = user_pubkey {
         // Convert pubkey to npub for display
@@ -704,70 +833,39 @@ pub async fn authorize_get(
         const codeChallengeMethod = '{}';
         const userPubkey = '{}';
         const userRelays = {};
+        const policyInfo = {};
 
-        // Permission descriptions for each scope
-        const permissionMeta = {{
-            'sign_event': {{
-                icon: '✍️',
-                title: 'Act on your behalf',
-                description: 'Post and interact as you on <a href="https://nostr.how" target="_blank" class="nostr-link">Nostr</a>'
-            }},
-            'encrypt': {{
-                icon: '🔒',
-                title: 'Send private messages',
-                description: 'Encrypt messages to other users'
-            }},
-            'decrypt': {{
-                icon: '🔓',
-                title: 'Read private messages',
-                description: 'Decrypt messages sent to you'
-            }},
-            'nip04_encrypt': {{
-                icon: '🔐',
-                title: 'Send DMs (legacy)',
-                description: 'Encrypt direct messages'
-            }},
-            'nip04_decrypt': {{
-                icon: '🔑',
-                title: 'Read DMs (legacy)',
-                description: 'Decrypt direct messages'
-            }},
-            'nip44_encrypt': {{
-                icon: '🛡️',
-                title: 'Send private messages',
-                description: 'Encrypt messages securely'
-            }},
-            'nip44_decrypt': {{
-                icon: '🔏',
-                title: 'Read private messages',
-                description: 'Decrypt messages sent to you'
-            }}
-        }};
-
-        // Build permissions list
+        // Build permissions list from policy info
         function buildPermissionsList() {{
-            const scopes = scope.split(/\\s+/).filter(s => s);
             const container = document.getElementById('permissions_list');
 
-            scopes.forEach(s => {{
-                const meta = permissionMeta[s] || {{
-                    icon: '📋',
-                    title: s.replace(/_/g, ' ').replace(/\\b\\w/g, l => l.toUpperCase()),
-                    description: `Permission: ${{s}}`
-                }};
-
+            // If we have policy permissions from the server, use them
+            if (policyInfo.permissions && policyInfo.permissions.length > 0) {{
+                policyInfo.permissions.forEach(perm => {{
+                    const item = document.createElement('div');
+                    item.className = 'permission_item';
+                    item.innerHTML = `
+                        <div class="permission_icon">${{perm.icon}}</div>
+                        <div class="permission_content">
+                            <h3>${{perm.title}}</h3>
+                            <p>${{perm.description}}</p>
+                        </div>
+                    `;
+                    container.appendChild(item);
+                }});
+            }} else {{
+                // Fallback for policy not found - show generic permission
                 const item = document.createElement('div');
                 item.className = 'permission_item';
                 item.innerHTML = `
-                    <div class="permission_icon">${{meta.icon}}</div>
+                    <div class="permission_icon">🔐</div>
                     <div class="permission_content">
-                        <h3>${{meta.title}}</h3>
-                        <p>${{meta.description}}</p>
+                        <h3>App Access</h3>
+                        <p>Grant this application access to your account</p>
                     </div>
-                    <div class="help_icon">?</div>
                 `;
                 container.appendChild(item);
-            }});
+            }}
         }}
 
         // Extract first letter for app icon
@@ -890,11 +988,12 @@ pub async fn authorize_get(
             npub,  // npub_fallback display (hidden)
             params.client_id,  // JS clientId
             params.redirect_uri,  // JS redirectUri
-            params.scope.as_deref().unwrap_or("sign_event"),  // JS scope
+            scope_str,  // JS scope
             params.code_challenge.as_deref().unwrap_or(""),  // JS codeChallenge
             params.code_challenge_method.as_deref().unwrap_or(""),  // JS codeChallengeMethod
             pubkey,  // JS userPubkey (hex)
             relays_json,  // JS userRelays (JSON array)
+            policy_info_json,  // JS policyInfo (JSON object)
         )
     } else {
         // User not authenticated - show login/register form (divine.video-inspired design)
@@ -1435,7 +1534,7 @@ pub async fn authorize_get(
             params.client_id,  // app name in card
             params.client_id,  // JS clientId
             params.redirect_uri,  // JS redirectUri
-            params.scope.as_deref().unwrap_or("sign_event"),  // JS scope
+            scope_str,  // JS scope
             params.code_challenge.as_deref().unwrap_or(""),  // JS codeChallenge
             params.code_challenge_method.as_deref().unwrap_or(""),  // JS codeChallengeMethod
         )
@@ -1650,7 +1749,7 @@ async fn handle_authorization_code_grant(
 async fn create_oauth_authorization_and_token(
     tenant_id: i64,
     user_public_key: &str,
-    _email: &str,
+    email: &str,
     application_id: i32,
     scope: &str,
     nsec_from_verifier: Option<String>,
@@ -1726,8 +1825,14 @@ async fn create_oauth_authorization_and_token(
         (encrypted_secret, true)
     };
 
-    // OAuth apps don't get UCAN tokens (no admin API access needed)
-    // They only need bunker URL for NIP-46 remote signing
+    // Generate server-signed UCAN for REST RPC API access
+    let access_token = super::auth::generate_server_signed_ucan(
+        &nostr_sdk::PublicKey::from_hex(user_public_key)
+            .map_err(|e| OAuthError::InvalidRequest(format!("Invalid public key: {}", e)))?,
+        tenant_id,
+        email,
+        &auth_state.state.server_keys,
+    ).await.map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?;
 
     // Parse the user's public key to use as bunker public key
     let bunker_public_key = nostr_sdk::PublicKey::from_hex(user_public_key)
@@ -1745,24 +1850,13 @@ async fn create_oauth_authorization_and_token(
     let relays_json = serde_json::to_string(&vec![relay_url])
         .map_err(|e| OAuthError::InvalidRequest(format!("Failed to serialize relays: {}", e)))?;
 
-    // Get default policy if not specified by application
-    let policy_id: Option<i32> = sqlx::query_scalar(
-        "SELECT policy_id FROM oauth_applications WHERE id = $1"
-    )
-    .bind(application_id)
-    .fetch_one(pool)
-    .await?;
-
-    let policy_id = if let Some(pid) = policy_id {
-        pid
-    } else {
-        sqlx::query_scalar::<_, i32>(
-            "SELECT id FROM policies WHERE name = 'Standard Social (Default)' AND tenant_id = $1 LIMIT 1"
-        )
-        .bind(tenant_id)
-        .fetch_one(pool)
-        .await?
-    };
+    // Resolve policy from scope (policy:slug format)
+    let policy_id = resolve_policy_from_scope(
+        pool,
+        tenant_id,
+        application_id,
+        scope,
+    ).await?;
 
     // Use ON CONFLICT to avoid duplicates per user/app combination
     sqlx::query(
@@ -1813,12 +1907,45 @@ async fn create_oauth_authorization_and_token(
         connection_secret
     );
 
-    // Return bunker URL (no cookie - SSO cookie already set during oauth_register/oauth_login)
+    // Build nostr_api URL from request host (derive from deployment)
+    // For production this would be https://login.divine.video/api/nostr
+    let nostr_api = std::env::var("NOSTR_API_URL")
+        .unwrap_or_else(|_| "https://login.divine.video/api/nostr".to_string());
+
+    // Load policy info from scope for response
+    let policy_info = {
+        use keycast_core::types::policy::Policy;
+
+        // Parse policy slug from scope (e.g., "policy:social" -> "social")
+        let policy_slug = parse_policy_scope(scope)
+            .unwrap_or_else(|_| "social".to_string());
+
+        match Policy::find_by_slug(pool, tenant_id, &policy_slug).await {
+            Ok(policy) => {
+                let permissions = policy.permission_displays(pool).await.unwrap_or_default();
+                Some(TokenPolicyInfo {
+                    slug: policy.slug.clone().unwrap_or_else(|| policy.id.to_string()),
+                    display_name: policy.display_name.clone().unwrap_or_else(|| policy.name.clone()),
+                    description: policy.description.clone().unwrap_or_default(),
+                    permissions,
+                })
+            }
+            Err(_) => {
+                tracing::warn!("Policy '{}' not found for token response", policy_slug);
+                None
+            }
+        }
+    };
+
+    // Return bunker URL with access_token for REST RPC API
     Ok(Json(TokenResponse {
         bunker_url,
+        access_token: Some(access_token),
+        nostr_api: Some(nostr_api),
         token_type: "Bearer".to_string(),
-        expires_in: 0,
+        expires_in: super::auth::TOKEN_EXPIRY_HOURS * 3600,  // UCAN expiry in seconds
         scope: Some(scope.to_string()),
+        policy: policy_info,
     }).into_response())
 }
 
@@ -2130,7 +2257,7 @@ pub async fn oauth_register(
     )
     .bind(tenant_id)
     .bind(&code)
-    .bind(&public_key.to_hex())
+    .bind(public_key.to_hex())
     .bind(app_id)
     .bind(&req.redirect_uri)
     .bind(req.scope.as_deref().unwrap_or("sign_event"))

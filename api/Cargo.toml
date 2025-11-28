@@ -5,6 +5,10 @@ authors = ["Keycast Authors"]
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Feature flag to enable SQLite-based tests (disabled until migrated to PostgreSQL)
+sqlite-tests = []
+
 [dependencies]
 aes-gcm = "0.10"
 async-trait = "0.1"

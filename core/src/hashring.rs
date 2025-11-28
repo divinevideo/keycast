@@ -222,7 +222,7 @@ mod tests {
             })
             .collect();
 
-        let mut counts = vec![0; 10];
+        let mut counts = [0; 10];
         let total = 10000;
 
         for i in 0..total {

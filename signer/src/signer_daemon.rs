@@ -18,7 +18,7 @@ use tokio::sync::RwLock;
 #[derive(Clone)]
 pub struct AuthorizationHandler {
     bunker_keys: Keys,
-    user_keys: Keys,
+    pub user_keys: Keys,
     secret: String,
     authorization_id: i32,
     tenant_id: i64,
@@ -1249,6 +1249,10 @@ impl SigningHandler for AuthorizationHandler {
 
     fn user_public_key(&self) -> String {
         self.user_keys.public_key().to_hex()
+    }
+
+    fn get_keys(&self) -> Keys {
+        self.user_keys.clone()
     }
 }
 
