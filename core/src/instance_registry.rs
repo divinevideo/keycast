@@ -87,6 +87,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Requires Postgres test infrastructure"]
     async fn test_register_creates_instance() {
         let pool = get_test_pool().await;
         cleanup_test_instances(&pool).await;
@@ -107,6 +108,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Requires Postgres test infrastructure"]
     async fn test_instance_id_is_valid_uuid() {
         let pool = get_test_pool().await;
         cleanup_test_instances(&pool).await;
@@ -121,6 +123,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Requires Postgres test infrastructure"]
     async fn test_heartbeat_updates_timestamp() {
         let pool = get_test_pool().await;
         cleanup_test_instances(&pool).await;
@@ -157,6 +160,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Requires Postgres test infrastructure"]
     async fn test_get_active_instances_returns_fresh() {
         let pool = get_test_pool().await;
         cleanup_test_instances(&pool).await;
@@ -176,6 +180,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Requires Postgres test infrastructure"]
     async fn test_deregister_removes_instance() {
         let pool = get_test_pool().await;
         cleanup_test_instances(&pool).await;
@@ -196,6 +201,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Requires Postgres test infrastructure"]
     async fn test_multiple_instances_have_unique_ids() {
         let pool = get_test_pool().await;
         cleanup_test_instances(&pool).await;
@@ -220,6 +226,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Requires Postgres test infrastructure"]
     async fn test_cleanup_stale_removes_old_instances() {
         let pool = get_test_pool().await;
         cleanup_test_instances(&pool).await;
@@ -252,6 +259,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Requires Postgres test infrastructure"]
     async fn test_active_instances_ordered_by_id() {
         let pool = get_test_pool().await;
         cleanup_test_instances(&pool).await;

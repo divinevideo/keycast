@@ -2,6 +2,9 @@
 // Tests that the signer properly tracks client pubkeys after connect and validates subsequent requests
 //
 // TDD: These tests are written BEFORE the implementation. They should fail initially.
+//
+// NOTE: All tests in this file are ignored because they require Postgres infrastructure.
+// Run with: cargo test --test client_pubkey_tests -- --ignored
 
 use keycast_core::encryption::{KeyManager, file_key_manager::FileKeyManager};
 use keycast_core::signing_handler::SigningHandler;
@@ -110,6 +113,7 @@ async fn create_oauth_authorization_for_client_test(
 // TEST 1: Successful connect stores client pubkey in database
 // ============================================================================
 #[tokio::test]
+#[ignore = "Requires Postgres test infrastructure"]
 async fn test_connect_stores_client_pubkey() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -156,6 +160,7 @@ async fn test_connect_stores_client_pubkey() {
 // TEST 2: Second connect with same secret from different client is rejected
 // ============================================================================
 #[tokio::test]
+#[ignore = "Requires Postgres test infrastructure"]
 async fn test_connect_rejects_reused_secret() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -197,6 +202,7 @@ async fn test_connect_rejects_reused_secret() {
 // TEST 3: Same client reconnecting with same secret succeeds
 // ============================================================================
 #[tokio::test]
+#[ignore = "Requires Postgres test infrastructure"]
 async fn test_same_client_can_reconnect() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -231,6 +237,7 @@ async fn test_same_client_can_reconnect() {
 // TEST 4: Request from connected client succeeds
 // ============================================================================
 #[tokio::test]
+#[ignore = "Requires Postgres test infrastructure"]
 async fn test_request_from_connected_client_succeeds() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -272,6 +279,7 @@ async fn test_request_from_connected_client_succeeds() {
 // TEST 5: Request from unknown client is rejected
 // ============================================================================
 #[tokio::test]
+#[ignore = "Requires Postgres test infrastructure"]
 async fn test_request_from_unknown_client_rejected() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -311,6 +319,7 @@ async fn test_request_from_unknown_client_rejected() {
 // TEST 6: First request without connect stores client pubkey (graceful upgrade)
 // ============================================================================
 #[tokio::test]
+#[ignore = "Requires Postgres test infrastructure"]
 async fn test_first_request_without_connect_allowed() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -363,6 +372,7 @@ async fn test_first_request_without_connect_allowed() {
 // TEST 7: Revocation clears client pubkey
 // ============================================================================
 #[tokio::test]
+#[ignore = "Requires Postgres test infrastructure"]
 async fn test_revocation_clears_client_pubkey() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -417,6 +427,7 @@ async fn test_revocation_clears_client_pubkey() {
 // TEST 8: connected_at timestamp is set on connect
 // ============================================================================
 #[tokio::test]
+#[ignore = "Requires Postgres test infrastructure"]
 async fn test_connected_at_timestamp_set() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");

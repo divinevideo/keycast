@@ -251,6 +251,7 @@ async fn create_oauth_authorization(
 // ============================================================================
 
 #[tokio::test]
+#[ignore = "Requires Postgres test infrastructure"]
 async fn test_1_no_policy_allows_all() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -285,6 +286,7 @@ async fn test_1_no_policy_allows_all() {
 }
 
 #[tokio::test]
+#[ignore = "Requires Postgres test infrastructure"]
 async fn test_2_allowed_kinds_permits_matching_kind() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -323,6 +325,7 @@ async fn test_2_allowed_kinds_permits_matching_kind() {
 }
 
 #[tokio::test]
+#[ignore = "Requires Postgres test infrastructure"]
 async fn test_3_allowed_kinds_denies_non_matching_kind() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -363,6 +366,7 @@ async fn test_3_allowed_kinds_denies_non_matching_kind() {
 }
 
 #[tokio::test]
+#[ignore = "Requires Postgres test infrastructure"]
 async fn test_4_content_filter_allows_clean_content() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -398,6 +402,7 @@ async fn test_4_content_filter_allows_clean_content() {
 }
 
 #[tokio::test]
+#[ignore = "Requires Postgres test infrastructure"]
 async fn test_5_content_filter_denies_blocked_words() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -433,6 +438,7 @@ async fn test_5_content_filter_denies_blocked_words() {
 }
 
 #[tokio::test]
+#[ignore = "Requires Postgres test infrastructure"]
 async fn test_6_multiple_permissions_all_must_pass() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -481,6 +487,7 @@ async fn test_6_multiple_permissions_all_must_pass() {
 }
 
 #[tokio::test]
+#[ignore = "Requires Postgres test infrastructure"]
 async fn test_7_oauth_no_policy_allows_all() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -510,6 +517,7 @@ async fn test_7_oauth_no_policy_allows_all() {
 }
 
 #[tokio::test]
+#[ignore = "Requires Postgres test infrastructure"]
 async fn test_8_oauth_with_policy_enforces_restrictions() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");

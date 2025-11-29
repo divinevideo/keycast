@@ -171,7 +171,7 @@ onMount(async () => {
 			console.warn('Failed to check auth status:', err);
 		}
 	} else if (authMethod === 'cookie') {
-		// User is already logged in via cookie, but we still need to fetch email info
+		// User is already logged in via cookie, fetch email info
 		try {
 			const response = await fetch('/api/oauth/auth-status', {
 				credentials: 'include'
@@ -187,6 +187,7 @@ onMount(async () => {
 			console.warn('Failed to fetch email info:', err);
 		}
 	}
+	// NIP-07 users don't have email - they never registered, just authenticate via browser extension
 
 	// Auth check complete
 	isCheckingAuth = false;
@@ -271,7 +272,7 @@ onMount(async () => {
 									<Copy size={16} />
 								{/if}
 							</button>
-							<a href="https://nostr.how/en/what-is-nostr/identities" target="_blank" rel="noopener noreferrer" class="learn-link" title="What's an npub?">
+							<a href="https://nostr.how/en/get-started" target="_blank" rel="noopener noreferrer" class="learn-link" title="Your npub is your public identity on Nostr - like a username">
 								?
 							</a>
 						</div>
