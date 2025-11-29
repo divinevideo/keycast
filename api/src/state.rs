@@ -6,7 +6,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 
 #[derive(Error, Debug)]
 pub enum StateError {
@@ -22,9 +22,9 @@ pub type SignerHandlersMap = HashMap<String, Arc<dyn SigningHandler>>;
 pub struct KeycastState {
     pub db: PgPool,
     pub key_manager: Arc<Box<dyn KeyManager>>,
-    /// Optional signer handlers for unified mode
+    /// Optional signer handlers for unified mode (LRU cache snapshot)
     /// Maps bunker_public_key -> SigningHandler trait object
-    pub signer_handlers: Option<Arc<RwLock<SignerHandlersMap>>>,
+    pub signer_handlers: Option<Arc<Mutex<SignerHandlersMap>>>,
     /// Server keys for signing UCANs for users without personal keys
     pub server_keys: Keys,
 }

@@ -2,9 +2,6 @@
 // Tests that the signer properly tracks client pubkeys after connect and validates subsequent requests
 //
 // TDD: These tests are written BEFORE the implementation. They should fail initially.
-//
-// NOTE: All tests in this file are ignored because they require Postgres infrastructure.
-// Run with: cargo test --test client_pubkey_tests -- --ignored
 
 use keycast_core::encryption::{KeyManager, file_key_manager::FileKeyManager};
 use keycast_core::signing_handler::SigningHandler;
@@ -69,14 +66,15 @@ async fn create_oauth_authorization_for_client_test(
 
     // Create OAuth application
     let client_secret = format!("client_secret_{}", Uuid::new_v4());
+    let redirect_origin = format!("https://test-{}.example.com", Uuid::new_v4());
     let app_id: i32 = sqlx::query_scalar(
-        "INSERT INTO oauth_applications (name, client_id, client_secret, redirect_uris, tenant_id, created_at, updated_at)
+        "INSERT INTO oauth_applications (name, redirect_origin, client_secret, redirect_uris, tenant_id, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-         ON CONFLICT (client_id, tenant_id) DO UPDATE SET id = oauth_applications.id
+         ON CONFLICT (redirect_origin, tenant_id) DO UPDATE SET id = oauth_applications.id
          RETURNING id"
     )
     .bind("Client Test App")
-    .bind(format!("test-client-{}", Uuid::new_v4()))
+    .bind(&redirect_origin)
     .bind(&client_secret)
     .bind(json!(["http://localhost/callback"]))
     .bind(tenant_id)
@@ -87,11 +85,12 @@ async fn create_oauth_authorization_for_client_test(
     // Create OAuth authorization
     let oauth_id: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (user_public_key, application_id, bunker_public_key, bunker_secret, secret, relays, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+         (user_public_key, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, tenant_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
          RETURNING id"
     )
     .bind(user_keys.public_key().to_hex())
+    .bind(&redirect_origin)
     .bind(app_id)
     .bind(user_keys.public_key().to_hex())
     .bind(&encrypted_secret)
@@ -113,7 +112,6 @@ async fn create_oauth_authorization_for_client_test(
 // TEST 1: Successful connect stores client pubkey in database
 // ============================================================================
 #[tokio::test]
-#[ignore = "Requires Postgres test infrastructure"]
 async fn test_connect_stores_client_pubkey() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -160,7 +158,6 @@ async fn test_connect_stores_client_pubkey() {
 // TEST 2: Second connect with same secret from different client is rejected
 // ============================================================================
 #[tokio::test]
-#[ignore = "Requires Postgres test infrastructure"]
 async fn test_connect_rejects_reused_secret() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -202,7 +199,6 @@ async fn test_connect_rejects_reused_secret() {
 // TEST 3: Same client reconnecting with same secret succeeds
 // ============================================================================
 #[tokio::test]
-#[ignore = "Requires Postgres test infrastructure"]
 async fn test_same_client_can_reconnect() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -237,7 +233,6 @@ async fn test_same_client_can_reconnect() {
 // TEST 4: Request from connected client succeeds
 // ============================================================================
 #[tokio::test]
-#[ignore = "Requires Postgres test infrastructure"]
 async fn test_request_from_connected_client_succeeds() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -279,7 +274,6 @@ async fn test_request_from_connected_client_succeeds() {
 // TEST 5: Request from unknown client is rejected
 // ============================================================================
 #[tokio::test]
-#[ignore = "Requires Postgres test infrastructure"]
 async fn test_request_from_unknown_client_rejected() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -319,7 +313,6 @@ async fn test_request_from_unknown_client_rejected() {
 // TEST 6: First request without connect stores client pubkey (graceful upgrade)
 // ============================================================================
 #[tokio::test]
-#[ignore = "Requires Postgres test infrastructure"]
 async fn test_first_request_without_connect_allowed() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -372,7 +365,6 @@ async fn test_first_request_without_connect_allowed() {
 // TEST 7: Revocation clears client pubkey
 // ============================================================================
 #[tokio::test]
-#[ignore = "Requires Postgres test infrastructure"]
 async fn test_revocation_clears_client_pubkey() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -427,7 +419,6 @@ async fn test_revocation_clears_client_pubkey() {
 // TEST 8: connected_at timestamp is set on connect
 // ============================================================================
 #[tokio::test]
-#[ignore = "Requires Postgres test infrastructure"]
 async fn test_connected_at_timestamp_set() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");

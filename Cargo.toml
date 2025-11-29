@@ -1,5 +1,6 @@
 [workspace]
 members = ["api", "core", "signer", "keycast"]
+exclude = ["tests/qa"]
 resolver = "2"
 
 [workspace.dependencies]

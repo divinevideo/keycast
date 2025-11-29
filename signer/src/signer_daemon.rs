@@ -9,11 +9,11 @@ use keycast_core::signing_handler::SigningHandler;
 use keycast_core::traits::CustomPermission;
 use keycast_core::types::authorization::Authorization;
 use keycast_core::types::oauth_authorization::OAuthAuthorization;
+use moka::future::Cache;
 use nostr_sdk::prelude::*;
 use sqlx::PgPool;
-use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 
 #[derive(Clone)]
 pub struct AuthorizationHandler {
@@ -342,16 +342,15 @@ impl AuthorizationHandler {
     }
 }
 
+/// Default LRU cache capacity for authorization handlers
+const DEFAULT_HANDLER_CACHE_SIZE: usize = 10_000;
+
 pub struct UnifiedSigner {
-    handlers: Arc<RwLock<HashMap<String, AuthorizationHandler>>>, // bunker_pubkey -> handler
+    handlers: Cache<String, AuthorizationHandler>, // bunker_pubkey -> handler (concurrent LRU cache)
     client: Client,
     pool: PgPool,
     key_manager: Arc<Box<dyn KeyManager>>,
-    hashring: Arc<RwLock<HashRing>>,
-    #[allow(dead_code)]
-    max_loaded_oauth_id: Arc<RwLock<u32>>,
-    #[allow(dead_code)]
-    max_loaded_regular_id: Arc<RwLock<u32>>,
+    hashring: Arc<Mutex<HashRing>>,
     auth_rx: Option<AuthorizationReceiver>,
 }
 
@@ -360,18 +359,28 @@ impl UnifiedSigner {
         pool: PgPool,
         key_manager: Box<dyn KeyManager>,
         auth_rx: AuthorizationReceiver,
-        hashring: Arc<RwLock<HashRing>>,
+        hashring: Arc<Mutex<HashRing>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let client = Client::default();
 
+        // Get cache size from environment or use default
+        let cache_size = std::env::var("HANDLER_CACHE_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_HANDLER_CACHE_SIZE);
+
+        let handlers = Cache::builder()
+            .max_capacity(cache_size as u64)
+            .build();
+
+        tracing::info!("Initialized authorization cache (capacity: {})", cache_size);
+
         Ok(Self {
-            handlers: Arc::new(RwLock::new(HashMap::new())),
+            handlers,
             client,
             pool,
             key_manager: Arc::new(key_manager),
             hashring,
-            max_loaded_oauth_id: Arc::new(RwLock::new(0)),
-            max_loaded_regular_id: Arc::new(RwLock::new(0)),
             auth_rx: Some(auth_rx),
         })
     }
@@ -380,86 +389,11 @@ impl UnifiedSigner {
         self.client.clone()
     }
 
+    /// No-op: authorizations are now loaded on-demand with LRU caching
     pub async fn load_authorizations(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut handlers = self.handlers.write().await;
-        handlers.clear();
-
-        // Load regular authorizations
-        let regular_auths = Authorization::all_ids_for_all_tenants(&self.pool).await?;
-        let regular_auth_count = regular_auths.len();
-        for (tenant_id, auth_id) in regular_auths {
-            let auth = Authorization::find(&self.pool, tenant_id, auth_id).await?;
-
-            // Decrypt bunker secret
-            let decrypted_bunker_secret = self.key_manager.decrypt(&auth.bunker_secret).await?;
-            let bunker_secret_key = SecretKey::from_slice(&decrypted_bunker_secret)?;
-            let bunker_keys = Keys::new(bunker_secret_key);
-
-            // Decrypt user secret
-            let stored_key = auth.stored_key(&self.pool, tenant_id).await?;
-            let decrypted_user_secret = self.key_manager.decrypt(&stored_key.secret_key).await?;
-            let user_secret_key = SecretKey::from_slice(&decrypted_user_secret)?;
-            let user_keys = Keys::new(user_secret_key);
-
-            let bunker_pubkey = bunker_keys.public_key().to_hex();
-
-            tracing::info!(
-                "Loaded regular authorization {} (tenant {}) with bunker pubkey: {}",
-                auth_id,
-                tenant_id,
-                bunker_pubkey
-            );
-
-            handlers.insert(bunker_pubkey, AuthorizationHandler {
-                bunker_keys,
-                user_keys,
-                secret: auth.secret.clone(),
-                authorization_id: auth_id,
-                tenant_id,
-                is_oauth: false,
-                pool: self.pool.clone(),
-            });
-        }
-
-        // Load OAuth authorizations
-        let oauth_auths = OAuthAuthorization::all_ids_for_all_tenants(&self.pool).await?;
-        let oauth_auth_count = oauth_auths.len();
-        for (tenant_id, auth_id) in oauth_auths {
-            let auth = OAuthAuthorization::find(&self.pool, tenant_id, auth_id).await?;
-
-            // Decrypt user secret (used for both bunker and signing in OAuth)
-            // OAuth secrets are stored as raw 32-byte secret keys (same as regular authorizations)
-            let decrypted_user_secret = self.key_manager.decrypt(&auth.bunker_secret).await?;
-            let user_secret_key = SecretKey::from_slice(&decrypted_user_secret)?;
-            let user_keys = Keys::new(user_secret_key);
-
-            let bunker_pubkey = user_keys.public_key().to_hex();
-
-            tracing::info!(
-                "Loaded OAuth authorization {} (tenant {}) with bunker pubkey: {}",
-                auth_id,
-                tenant_id,
-                bunker_pubkey
-            );
-
-            handlers.insert(bunker_pubkey, AuthorizationHandler {
-                bunker_keys: user_keys.clone(),
-                user_keys,
-                secret: auth.secret.clone(),
-                authorization_id: auth_id,
-                tenant_id,
-                is_oauth: true,
-                pool: self.pool.clone(),
-            });
-        }
-
-        tracing::info!(
-            "Loaded {} total authorizations ({} regular + {} OAuth)",
-            handlers.len(),
-            regular_auth_count,
-            oauth_auth_count
-        );
-
+        // Lazy loading: handlers are loaded on-demand when requests arrive
+        // This scales to millions of users without memory issues
+        tracing::info!("Lazy loading enabled - authorizations will be loaded on-demand");
         Ok(())
     }
 
@@ -493,20 +427,6 @@ impl UnifiedSigner {
     pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let handlers = self.handlers.clone();
 
-        let handler_count = {
-            let h = handlers.read().await;
-            h.len()
-        };
-
-        if handler_count == 0 {
-            tracing::info!("Starting with 0 authorizations, will reload when new ones are created");
-        } else {
-            tracing::info!(
-                "Subscribing to ALL kind 24133 events on relay (managing {} bunker pubkeys)",
-                handler_count
-            );
-        }
-
         // OPTIMIZATION: Single subscription for ALL kind 24133 events
         // We'll filter by bunker pubkey in the handler, not at relay level
         // This scales to millions of users with just ONE relay connection
@@ -522,11 +442,11 @@ impl UnifiedSigner {
         // Take ownership of the receiver (we only spawn this once)
         if let Some(mut auth_rx) = self.auth_rx.take() {
             tokio::spawn(async move {
-                tracing::info!("Authorization channel listener started");
+                tracing::debug!("Authorization channel listener started");
                 while let Some(command) = auth_rx.recv().await {
                     match command {
                         AuthorizationCommand::Upsert { bunker_pubkey, tenant_id, is_oauth } => {
-                            tracing::info!("Received Upsert command for bunker: {}", bunker_pubkey);
+                            tracing::debug!("Received Upsert command for bunker: {}", bunker_pubkey);
                             if let Err(e) = Self::load_single_authorization(
                                 &pool_clone,
                                 &key_manager_clone,
@@ -539,21 +459,12 @@ impl UnifiedSigner {
                             }
                         }
                         AuthorizationCommand::Remove { bunker_pubkey } => {
-                            tracing::info!("Received Remove command for bunker: {}", bunker_pubkey);
-                            let mut handlers = handlers_clone.write().await;
-                            if handlers.remove(&bunker_pubkey).is_some() {
-                                tracing::info!("Removed authorization: {}", bunker_pubkey);
-                            }
+                            tracing::debug!("Removing authorization from cache: {}", bunker_pubkey);
+                            handlers_clone.invalidate(&bunker_pubkey).await;
                         }
                         AuthorizationCommand::ReloadAll => {
-                            tracing::info!("Received ReloadAll command");
-                            if let Err(e) = Self::reload_authorizations_if_needed(
-                                &pool_clone,
-                                &key_manager_clone,
-                                &handlers_clone,
-                            ).await {
-                                tracing::error!("Error reloading all authorizations: {}", e);
-                            }
+                            // No-op with lazy loading - cache is populated on-demand
+                            tracing::debug!("ReloadAll is no-op with lazy loading");
                         }
                     }
                 }
@@ -604,11 +515,11 @@ impl UnifiedSigner {
         Ok(())
     }
 
-    /// Load a single authorization by bunker_pubkey (for instant channel updates)
+    /// Load a single authorization into the LRU cache (called via channel for new authorizations)
     async fn load_single_authorization(
         pool: &PgPool,
         key_manager: &Arc<Box<dyn KeyManager>>,
-        handlers: &Arc<RwLock<HashMap<String, AuthorizationHandler>>>,
+        handlers: &Cache<String, AuthorizationHandler>,
         bunker_pubkey: &str,
         tenant_id: i64,
         is_oauth: bool,
@@ -624,45 +535,10 @@ impl UnifiedSigner {
             .await?;
 
             if let Some(auth) = auth {
-                // Decrypt user secret (stored in bunker_secret for OAuth)
-                // The encrypted data is a hex string, so decrypt -> parse hex -> secret key
-                let decrypted_hex = key_manager.decrypt(&auth.bunker_secret).await?;
-
-                // Validate UTF-8 after decryption (detect corruption early)
-                let secret_hex_str = std::str::from_utf8(&decrypted_hex)
-                    .map_err(|e| {
-                        tracing::error!(
-                            "Corrupted secret key for OAuth authorization {} (user_pubkey: {}...): Invalid UTF-8 after decryption: {}",
-                            auth.id,
-                            &auth.user_public_key[..8],
-                            e
-                        );
-                        format!(
-                            "Corrupted secret key in database (invalid UTF-8). This account needs to be deleted and recreated. User pubkey: {}..., error: {}",
-                            &auth.user_public_key[..16],
-                            e
-                        )
-                    })?;
-
-                // Additional validation: check if it's valid hex/nsec format
-                if secret_hex_str.is_empty() {
-                    return Err(format!("Decrypted secret is empty for OAuth authorization {}", auth.id).into());
-                }
-
-                let user_keys = Keys::parse(secret_hex_str)
-                    .map_err(|e| {
-                        tracing::error!(
-                            "Failed to parse secret key for OAuth authorization {} (user_pubkey: {}...): {}",
-                            auth.id,
-                            &auth.user_public_key[..8],
-                            e
-                        );
-                        format!(
-                            "Invalid secret key format in database. This account needs to be deleted and recreated. User pubkey: {}..., error: {}",
-                            &auth.user_public_key[..16],
-                            e
-                        )
-                    })?;
+                let decrypted_user_secret = key_manager.decrypt(&auth.bunker_secret).await?;
+                let user_secret_key = SecretKey::from_slice(&decrypted_user_secret)
+                    .map_err(|e| format!("Invalid secret key: {}", e))?;
+                let user_keys = Keys::new(user_secret_key);
 
                 let handler = AuthorizationHandler {
                     bunker_keys: user_keys.clone(),
@@ -674,15 +550,11 @@ impl UnifiedSigner {
                     pool: pool.clone(),
                 };
 
-                let mut h = handlers.write().await;
-                h.insert(bunker_pubkey.to_string(), handler);
-                tracing::info!("Loaded OAuth authorization {} for bunker: {}", auth.id, bunker_pubkey);
-            } else {
-                tracing::warn!("OAuth authorization not found for bunker: {}", bunker_pubkey);
+                handlers.insert(bunker_pubkey.to_string(), handler).await;
+                tracing::debug!("Cached authorization: {}", bunker_pubkey);
             }
         } else {
             // Load regular authorization
-            // Find authorization by bunker_public_key
             let auth_data: Option<(i32, Vec<u8>, String, i64)> = sqlx::query_as(
                 "SELECT id, bunker_secret, secret, stored_key_id FROM authorizations
                  WHERE tenant_id = $1
@@ -694,12 +566,10 @@ impl UnifiedSigner {
             .await?;
 
             if let Some((auth_id, bunker_secret, connection_secret, stored_key_id)) = auth_data {
-                // Decrypt bunker secret
                 let decrypted_bunker_secret = key_manager.decrypt(&bunker_secret).await?;
                 let bunker_secret_key = SecretKey::from_slice(&decrypted_bunker_secret)?;
                 let bunker_keys = Keys::new(bunker_secret_key);
 
-                // Get and decrypt user secret
                 let stored_key_secret: Vec<u8> = sqlx::query_scalar(
                     "SELECT secret_key FROM stored_keys WHERE id = $1 AND tenant_id = $2"
                 )
@@ -722,152 +592,21 @@ impl UnifiedSigner {
                     pool: pool.clone(),
                 };
 
-                let mut h = handlers.write().await;
-                h.insert(bunker_pubkey.to_string(), handler);
-                tracing::info!("Loaded regular authorization {} for bunker: {}", auth_id, bunker_pubkey);
-            } else {
-                tracing::warn!("Regular authorization not found for bunker: {}", bunker_pubkey);
+                handlers.insert(bunker_pubkey.to_string(), handler).await;
+                tracing::debug!("Cached authorization: {}", bunker_pubkey);
             }
-        }
-
-        Ok(())
-    }
-
-    async fn reload_authorizations_if_needed(
-        pool: &PgPool,
-        key_manager: &Arc<Box<dyn KeyManager>>,
-        handlers: &Arc<RwLock<HashMap<String, AuthorizationHandler>>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        // Get current loaded pubkeys
-        let loaded_pubkeys: std::collections::HashSet<String> = {
-            let h = handlers.read().await;
-            h.keys().cloned().collect()
-        };
-
-        // Load all authorization IDs from database
-        let mut regular_auths = Authorization::all_ids_for_all_tenants(pool).await?;
-        let mut oauth_auths = OAuthAuthorization::all_ids_for_all_tenants(pool).await?;
-
-        // OPTIMIZATION: Only check the LAST 5 authorization IDs since new ones are at the end
-        // This avoids decrypting all 67 authorizations with GCP KMS just to find 1 new one
-        let regular_check_start = regular_auths.len().saturating_sub(5);
-        let oauth_check_start = oauth_auths.len().saturating_sub(5);
-
-        regular_auths = regular_auths.into_iter().skip(regular_check_start).collect();
-        oauth_auths = oauth_auths.into_iter().skip(oauth_check_start).collect();
-
-        tracing::debug!(
-            "Fast reload: checking last {} regular + {} OAuth authorizations",
-            regular_auths.len(),
-            oauth_auths.len()
-        );
-
-        let mut added_count = 0;
-
-        // Check for NEW regular authorizations
-        for (tenant_id, auth_id) in regular_auths {
-            let auth = Authorization::find(pool, tenant_id, auth_id).await?;
-
-            // Decrypt bunker secret to get pubkey
-            let decrypted_bunker_secret = key_manager.decrypt(&auth.bunker_secret).await?;
-            let bunker_secret_key = SecretKey::from_slice(&decrypted_bunker_secret)?;
-            let bunker_keys = Keys::new(bunker_secret_key);
-            let bunker_pubkey = bunker_keys.public_key().to_hex();
-
-            // Only load if not already loaded
-            if !loaded_pubkeys.contains(&bunker_pubkey) {
-                // Decrypt user secret
-                let stored_key = auth.stored_key(pool, tenant_id).await?;
-                let decrypted_user_secret = key_manager.decrypt(&stored_key.secret_key).await?;
-                let user_secret_key = SecretKey::from_slice(&decrypted_user_secret)?;
-                let user_keys = Keys::new(user_secret_key);
-
-                let handler = AuthorizationHandler {
-                    bunker_keys,
-                    user_keys,
-                    secret: auth.secret.clone(),
-                    authorization_id: auth_id,
-                    tenant_id,
-                    is_oauth: false,
-                    pool: pool.clone(),
-                };
-
-                // Add to handlers immediately
-                {
-                    let mut h = handlers.write().await;
-                    h.insert(bunker_pubkey.clone(), handler);
-                }
-
-                added_count += 1;
-
-                tracing::info!(
-                    "Added NEW regular authorization {} (tenant {}) with bunker pubkey: {}",
-                    auth_id,
-                    tenant_id,
-                    bunker_pubkey
-                );
-            }
-        }
-
-        // Check for NEW OAuth authorizations
-        for (tenant_id, auth_id) in oauth_auths {
-            let auth = OAuthAuthorization::find(pool, tenant_id, auth_id).await?;
-
-            // Decrypt user secret to get pubkey
-            let decrypted_user_secret = key_manager.decrypt(&auth.bunker_secret).await?;
-            let user_secret_key = SecretKey::from_slice(&decrypted_user_secret)?;
-            let user_keys = Keys::new(user_secret_key.clone());
-            let bunker_pubkey = user_keys.public_key().to_hex();
-
-            // Only load if not already loaded
-            if !loaded_pubkeys.contains(&bunker_pubkey) {
-                let handler = AuthorizationHandler {
-                    bunker_keys: user_keys.clone(),
-                    user_keys,
-                    secret: auth.secret.clone(),
-                    authorization_id: auth_id,
-                    tenant_id,
-                    is_oauth: true,
-                    pool: pool.clone(),
-                };
-
-                // Add to handlers immediately
-                {
-                    let mut h = handlers.write().await;
-                    h.insert(bunker_pubkey.clone(), handler);
-                }
-
-                added_count += 1;
-
-                tracing::info!(
-                    "Added NEW OAuth authorization {} (tenant {}) with bunker pubkey: {}",
-                    auth_id,
-                    tenant_id,
-                    bunker_pubkey
-                );
-            }
-        }
-
-        // No need to subscribe since we already get ALL kind 24133 events!
-        if added_count > 0 {
-            tracing::info!(
-                "✅ Fast reload complete: Added {} new authorizations (no new subscription needed)",
-                added_count
-            );
-        } else {
-            tracing::debug!("No new authorizations to load");
         }
 
         Ok(())
     }
 
     async fn handle_nip46_request(
-        handlers: Arc<RwLock<HashMap<String, AuthorizationHandler>>>,
+        handlers: Cache<String, AuthorizationHandler>,
         client: Client,
         event: Box<Event>,
         pool: &PgPool,
         key_manager: &Arc<Box<dyn KeyManager>>,
-        hashring: &Arc<RwLock<HashRing>>,
+        hashring: &Arc<Mutex<HashRing>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // SINGLE SUBSCRIPTION ARCHITECTURE:
         // We receive ALL kind 24133 events from the relay (no pubkey filter)
@@ -885,7 +624,7 @@ impl UnifiedSigner {
 
         // HASHRING CHECK: Only process if this instance owns this pubkey
         {
-            let ring = hashring.read().await;
+            let ring = hashring.lock().await;
             if !ring.should_handle(bunker_pubkey) {
                 tracing::trace!(
                     "Hashring: bunker {} assigned to another instance, skipping",
@@ -897,16 +636,13 @@ impl UnifiedSigner {
 
         tracing::trace!("Received NIP-46 request for bunker: {}", bunker_pubkey);
 
-        // Check if this bunker pubkey is one we manage
-        let handler = {
-            let h = handlers.read().await;
-            h.get(bunker_pubkey).cloned()
-        };
+        // Check if this bunker pubkey is in cache (concurrent LRU)
+        let handler = handlers.get(bunker_pubkey).await;
 
         let handler = match handler {
             Some(h) => h,
             None => {
-                // Not in cache - check database (on-demand loading for new users)
+                // Not in cache - check database (on-demand loading)
                 tracing::trace!("Bunker {} not in cache, checking database", bunker_pubkey);
 
                 // Query database for OAuth authorization with this bunker pubkey
@@ -923,8 +659,7 @@ impl UnifiedSigner {
                 match auth_opt {
                     Some(auth) => {
                         // Found in database - load it now
-                        tracing::info!("Loading OAuth authorization {} on-demand for bunker {}",
-                            auth.id, bunker_pubkey);
+                        tracing::debug!("Loading authorization on-demand: {}", bunker_pubkey);
 
                         // Decrypt user secret (stored in bunker_secret for OAuth)
                         let decrypted_user_secret = key_manager.decrypt(&auth.bunker_secret).await?;
@@ -942,11 +677,8 @@ impl UnifiedSigner {
                             pool: pool.clone(),
                         };
 
-                        // Cache it for future requests
-                        {
-                            let mut h = handlers.write().await;
-                            h.insert(bunker_pubkey.to_string(), handler.clone());
-                        }
+                        // Cache it for future requests (LRU will evict old entries automatically)
+                        handlers.insert(bunker_pubkey.to_string(), handler.clone()).await;
 
                         handler
                     },
@@ -1417,9 +1149,8 @@ impl UnifiedSigner {
             "SELECT bunker_public_key FROM oauth_authorizations
              WHERE user_public_key = $1
              AND application_id = (
-                 SELECT id FROM oauth_applications WHERE client_id = 'keycast-login'
+                 SELECT id FROM oauth_applications WHERE redirect_origin = 'app://keycast-login'
              )
-             AND revoked_at IS NULL
              ORDER BY created_at DESC
              LIMIT 1"
         )
@@ -1428,26 +1159,23 @@ impl UnifiedSigner {
         .await?;
 
         if let Some(bunker_key) = bunker_pubkey {
-            let handlers = self.handlers.read().await;
-            Ok(handlers.get(&bunker_key).cloned())
+            Ok(self.handlers.get(&bunker_key).await)
         } else {
             Ok(None)
         }
     }
 
-    /// Get shared reference to handlers HashMap for HTTP signing
-    /// Converts concrete AuthorizationHandler to trait objects for API compatibility
-    /// Used by unified binary to share handlers between API and Signer
-    pub async fn handlers_as_trait_objects(&self) -> Arc<RwLock<HashMap<String, Arc<dyn SigningHandler>>>> {
-        let handlers_read = self.handlers.read().await;
-        let mut trait_map: HashMap<String, Arc<dyn SigningHandler>> = HashMap::new();
+    /// Get snapshot of current cache as trait objects for HTTP signing
+    /// Note: Returns a snapshot - cache may change after this call
+    pub fn handlers_as_trait_objects(&self) -> Arc<Mutex<std::collections::HashMap<String, Arc<dyn SigningHandler>>>> {
+        let mut trait_map: std::collections::HashMap<String, Arc<dyn SigningHandler>> = std::collections::HashMap::new();
 
-        for (key, handler) in handlers_read.iter() {
-            // Clone the handler and wrap in Arc as trait object
-            trait_map.insert(key.clone(), Arc::new(handler.clone()) as Arc<dyn SigningHandler>);
+        // Iterate over concurrent cache (moka provides consistent iteration)
+        for (key, handler) in self.handlers.iter() {
+            trait_map.insert(key.to_string(), Arc::new(handler.clone()) as Arc<dyn SigningHandler>);
         }
 
-        Arc::new(RwLock::new(trait_map))
+        Arc::new(Mutex::new(trait_map))
     }
 }
 
@@ -1455,50 +1183,13 @@ impl UnifiedSigner {
 mod tests {
     use super::*;
 
-    /// Helper to create test database with minimal schema
+    /// Helper to create test database connection
+    /// Note: Requires DATABASE_URL env var or running postgres at localhost
+    /// CI runs migrations automatically, so we just need to connect
     async fn create_test_db() -> PgPool {
-        let pool = PgPool::connect(":memory:").await.unwrap();
-
-        // Create minimal schema needed for tests
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS oauth_applications (
-                id INTEGER PRIMARY KEY,
-                client_id TEXT NOT NULL UNIQUE,
-                name TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE IF NOT EXISTS oauth_authorizations (
-                id INTEGER PRIMARY KEY,
-                user_public_key TEXT NOT NULL,
-                application_id INTEGER,
-                bunker_public_key TEXT NOT NULL,
-                secret TEXT NOT NULL,
-                revoked_at TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (application_id) REFERENCES oauth_applications(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS signing_activity (
-                id INTEGER PRIMARY KEY,
-                tenant_id INTEGER NOT NULL DEFAULT 1,
-                user_public_key TEXT NOT NULL,
-                application_id INTEGER,
-                bunker_secret TEXT NOT NULL,
-                event_kind INTEGER NOT NULL,
-                event_content TEXT,
-                event_id TEXT,
-                client_public_key TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            "#
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        pool
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string());
+        PgPool::connect(&database_url).await.unwrap()
     }
 
     /// Helper to create test keys
@@ -1506,16 +1197,65 @@ mod tests {
         Keys::generate()
     }
 
-    /// Helper to create test authorization handler
-    fn create_test_handler(pool: PgPool) -> AuthorizationHandler {
+    /// Helper to create test authorization handler with database records
+    async fn create_test_handler_with_db(pool: PgPool) -> AuthorizationHandler {
         let user_keys = create_test_keys();
         let bunker_keys = create_test_keys();
+        let user_pubkey = user_keys.public_key().to_hex();
+        let bunker_pubkey = bunker_keys.public_key().to_hex();
+
+        // Ensure tenant exists
+        sqlx::query(
+            "INSERT INTO tenants (id, domain, name, created_at, updated_at)
+             VALUES (1, 'test.example.com', 'Test Tenant', NOW(), NOW())
+             ON CONFLICT (id) DO NOTHING"
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Create user
+        sqlx::query(
+            "INSERT INTO users (public_key, tenant_id, created_at, updated_at)
+             VALUES ($1, 1, NOW(), NOW())
+             ON CONFLICT (public_key) DO NOTHING"
+        )
+        .bind(&user_pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Create personal_keys entry (required FK for oauth_authorizations)
+        // No ON CONFLICT needed since each test generates unique keys
+        sqlx::query(
+            "INSERT INTO personal_keys (user_public_key, encrypted_secret_key, bunker_secret, tenant_id)
+             VALUES ($1, $2, 'test_bunker_secret', 1)"
+        )
+        .bind(&user_pubkey)
+        .bind(vec![0u8; 32]) // Dummy encrypted key
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Create oauth_authorization and get the ID
+        let auth_id: i32 = sqlx::query_scalar(
+            "INSERT INTO oauth_authorizations
+             (user_public_key, redirect_origin, bunker_public_key, bunker_secret, secret, relays, tenant_id, created_at, updated_at)
+             VALUES ($1, 'http://test.example.com', $2, $3, 'test_secret', '[\"wss://relay.test\"]', 1, NOW(), NOW())
+             RETURNING id"
+        )
+        .bind(&user_pubkey)
+        .bind(&bunker_pubkey)
+        .bind(bunker_keys.secret_key().to_secret_bytes().to_vec())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
         AuthorizationHandler {
             bunker_keys,
             user_keys,
             secret: "test_secret".to_string(),
-            authorization_id: 1,
+            authorization_id: auth_id,
             tenant_id: 1,
             is_oauth: true,
             pool,
@@ -1523,11 +1263,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Uses :memory: with PgPool - needs proper test infrastructure"]
     async fn test_sign_event_direct_creates_valid_signature() {
         // Arrange
         let pool = create_test_db().await;
-        let handler = create_test_handler(pool);
+        let handler = create_test_handler_with_db(pool).await;
 
         let unsigned_event = UnsignedEvent::new(
             handler.user_keys.public_key(),
@@ -1550,11 +1289,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Uses :memory: with PgPool - needs proper test infrastructure"]
     async fn test_sign_event_direct_preserves_tags() {
         // Arrange
         let pool = create_test_db().await;
-        let handler = create_test_handler(pool);
+        let handler = create_test_handler_with_db(pool).await;
 
         let tag1 = Tag::parse(vec!["e", "event_id_123"]).unwrap();
         let tag2 = Tag::parse(vec!["p", "pubkey_456"]).unwrap();
@@ -1581,7 +1319,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Uses :memory: with PgPool - needs proper test infrastructure"]
     async fn test_get_handler_for_user_returns_none_when_not_cached() {
         // Arrange
         let pool = create_test_db().await;
@@ -1589,7 +1326,7 @@ mod tests {
             keycast_core::encryption::file_key_manager::FileKeyManager::new().unwrap()
         );
         let (_tx, rx) = tokio::sync::mpsc::channel(100);
-        let hashring = Arc::new(RwLock::new(HashRing::new("test-instance".to_string())));
+        let hashring = Arc::new(Mutex::new(HashRing::new("test-instance".to_string())));
         let signer = UnifiedSigner::new(pool, key_manager, rx, hashring).await.unwrap();
 
         let user_pubkey = Keys::generate().public_key().to_hex();
@@ -1604,26 +1341,36 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Uses :memory: with PgPool - needs proper test infrastructure"]
-    async fn test_handlers_returns_shared_reference() {
+    async fn test_handlers_clone_shares_cache() {
         // Arrange
         let pool = create_test_db().await;
         let key_manager: Box<dyn KeyManager> = Box::new(
             keycast_core::encryption::file_key_manager::FileKeyManager::new().unwrap()
         );
         let (_tx, rx) = tokio::sync::mpsc::channel(100);
-        let hashring = Arc::new(RwLock::new(HashRing::new("test-instance".to_string())));
-        let signer = UnifiedSigner::new(pool, key_manager, rx, hashring).await.unwrap();
+        let hashring = Arc::new(Mutex::new(HashRing::new("test-instance".to_string())));
+        let signer = UnifiedSigner::new(pool.clone(), key_manager, rx, hashring).await.unwrap();
 
-        // Act - access handlers field directly
-        let handlers1 = Arc::clone(&signer.handlers);
-        let handlers2 = Arc::clone(&signer.handlers);
+        // Act - clone handlers (moka Cache uses internal Arc, clones are cheap and share data)
+        let handlers1 = signer.handlers.clone();
+        let handlers2 = signer.handlers.clone();
 
-        // Assert - both should point to same underlying HashMap
-        assert_eq!(
-            Arc::strong_count(&handlers1),
-            Arc::strong_count(&handlers2),
-            "Handlers should share same Arc"
+        // Insert into one clone
+        let test_handler = AuthorizationHandler {
+            bunker_keys: Keys::generate(),
+            user_keys: Keys::generate(),
+            secret: "test".to_string(),
+            authorization_id: 999,
+            tenant_id: 1,
+            is_oauth: true,
+            pool: pool.clone(),
+        };
+        handlers1.insert("test_key".to_string(), test_handler).await;
+
+        // Assert - both clones see the same data (shared underlying cache)
+        assert!(
+            handlers2.get("test_key").await.is_some(),
+            "Cloned cache should share underlying data"
         );
     }
 }

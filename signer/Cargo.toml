@@ -14,6 +14,7 @@ path = "src/lib.rs"
 keycast_core = { path = "../core" }
 keycast_api = { path = "../api" }
 async-trait = "0.1"
+moka = { version = "0.12", features = ["future"] }
 axum = { workspace = true }
 chrono = { workspace = true }
 config = { workspace = true }

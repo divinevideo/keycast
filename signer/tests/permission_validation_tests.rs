@@ -53,29 +53,27 @@ async fn create_policy_with_permissions(
         .expect("Failed to create team");
     }
 
-    // Create policy
+    // Create policy (policies table doesn't have tenant_id)
     let policy_id: i32 = sqlx::query_scalar(
-        "INSERT INTO policies (name, team_id, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, $3, NOW(), NOW())
+        "INSERT INTO policies (name, team_id, created_at, updated_at)
+         VALUES ($1, $2, NOW(), NOW())
          RETURNING id"
     )
-    .bind("Test Policy")
+    .bind(format!("Test Policy {}", Uuid::new_v4()))
     .bind(team_id)
-    .bind(tenant_id)
     .fetch_one(pool)
     .await
     .expect("Failed to create policy");
 
-    // Create and link permissions
+    // Create and link permissions (permissions table doesn't have tenant_id)
     for (identifier, config) in permission_configs {
         let permission_id: i32 = sqlx::query_scalar(
-            "INSERT INTO permissions (identifier, config, tenant_id, created_at, updated_at)
-             VALUES ($1, $2, $3, NOW(), NOW())
+            "INSERT INTO permissions (identifier, config, created_at, updated_at)
+             VALUES ($1, $2, NOW(), NOW())
              RETURNING id"
         )
         .bind(identifier)
         .bind(config)
-        .bind(tenant_id)
         .fetch_one(pool)
         .await
         .expect("Failed to create permission");
@@ -204,17 +202,17 @@ async fn create_oauth_authorization(
 
     // Create OAuth application (required foreign key)
     let client_secret = format!("client_secret_{}", Uuid::new_v4());
+    let redirect_origin = format!("https://test-{}.example.com", Uuid::new_v4());
     let app_id: i32 = sqlx::query_scalar(
-        "INSERT INTO oauth_applications (name, client_id, client_secret, redirect_uris, policy_id, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
-         ON CONFLICT (client_id, tenant_id) DO UPDATE SET id = oauth_applications.id
+        "INSERT INTO oauth_applications (name, redirect_origin, client_secret, redirect_uris, tenant_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+         ON CONFLICT (redirect_origin, tenant_id) DO UPDATE SET id = oauth_applications.id
          RETURNING id"
     )
     .bind("Test App")
-    .bind("test-client")
+    .bind(&redirect_origin)
     .bind(&client_secret)
     .bind(json!(["http://localhost/callback"]))
-    .bind(policy_id)
     .bind(tenant_id)
     .fetch_one(pool)
     .await
@@ -223,11 +221,12 @@ async fn create_oauth_authorization(
     // Create OAuth authorization
     let oauth_id: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (user_public_key, application_id, bunker_public_key, bunker_secret, secret, relays, policy_id, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+         (user_public_key, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, policy_id, tenant_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
          RETURNING id"
     )
     .bind(user_keys.public_key().to_hex())
+    .bind(&redirect_origin)
     .bind(app_id)
     .bind(user_keys.public_key().to_hex())
     .bind(&encrypted_secret)
@@ -251,7 +250,6 @@ async fn create_oauth_authorization(
 // ============================================================================
 
 #[tokio::test]
-#[ignore = "Requires Postgres test infrastructure"]
 async fn test_1_no_policy_allows_all() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -286,7 +284,6 @@ async fn test_1_no_policy_allows_all() {
 }
 
 #[tokio::test]
-#[ignore = "Requires Postgres test infrastructure"]
 async fn test_2_allowed_kinds_permits_matching_kind() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -325,7 +322,6 @@ async fn test_2_allowed_kinds_permits_matching_kind() {
 }
 
 #[tokio::test]
-#[ignore = "Requires Postgres test infrastructure"]
 async fn test_3_allowed_kinds_denies_non_matching_kind() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -366,7 +362,6 @@ async fn test_3_allowed_kinds_denies_non_matching_kind() {
 }
 
 #[tokio::test]
-#[ignore = "Requires Postgres test infrastructure"]
 async fn test_4_content_filter_allows_clean_content() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -402,7 +397,6 @@ async fn test_4_content_filter_allows_clean_content() {
 }
 
 #[tokio::test]
-#[ignore = "Requires Postgres test infrastructure"]
 async fn test_5_content_filter_denies_blocked_words() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -438,7 +432,6 @@ async fn test_5_content_filter_denies_blocked_words() {
 }
 
 #[tokio::test]
-#[ignore = "Requires Postgres test infrastructure"]
 async fn test_6_multiple_permissions_all_must_pass() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -487,7 +480,6 @@ async fn test_6_multiple_permissions_all_must_pass() {
 }
 
 #[tokio::test]
-#[ignore = "Requires Postgres test infrastructure"]
 async fn test_7_oauth_no_policy_allows_all() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
@@ -517,7 +509,6 @@ async fn test_7_oauth_no_policy_allows_all() {
 }
 
 #[tokio::test]
-#[ignore = "Requires Postgres test infrastructure"]
 async fn test_8_oauth_with_policy_enforces_restrictions() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
