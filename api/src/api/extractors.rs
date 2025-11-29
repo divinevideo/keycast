@@ -76,7 +76,7 @@ where
             if let Ok(auth_str) = auth_header.to_str() {
                 if auth_str.starts_with("Bearer ") {
                     // Use tenant_id = 0 for now (will validate in endpoint if needed)
-                    let (pubkey, _ucan) = crate::ucan_auth::validate_ucan_token(auth_str, 0)
+                    let (pubkey, _redirect_origin, _ucan) = crate::ucan_auth::validate_ucan_token(auth_str, 0)
                         .map_err(|e| (StatusCode::UNAUTHORIZED, format!("Invalid UCAN token: {}", e)))?;
 
                     tracing::debug!("DualAuth: Authenticated via UCAN Bearer token for pubkey: {}", pubkey);
@@ -93,7 +93,7 @@ where
                     let cookie = cookie.trim();
                     if let Some(value) = cookie.strip_prefix("keycast_session=") {
                         // Validate UCAN token from cookie
-                        let (pubkey, _ucan) = crate::ucan_auth::validate_ucan_token(
+                        let (pubkey, _redirect_origin, _ucan) = crate::ucan_auth::validate_ucan_token(
                             &format!("Bearer {}", value),
                             0
                         ).map_err(|e| (StatusCode::UNAUTHORIZED, format!("Invalid UCAN cookie: {}", e)))?;

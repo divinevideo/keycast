@@ -121,25 +121,24 @@ impl Team {
 
     pub async fn get_policies_with_permissions(
         pool: &PgPool,
-        tenant_id: i64,
+        _tenant_id: i64,
         team_id: i32,
     ) -> Result<Vec<PolicyWithPermissions>, TeamError> {
-        // First fetch policies
-        let policies = sqlx::query_as::<_, Policy>("SELECT * FROM policies WHERE tenant_id = $1 AND team_id = $2")
-            .bind(tenant_id)
+        // First fetch policies (tenant isolation via team ownership)
+        let policies = sqlx::query_as::<_, Policy>("SELECT * FROM policies WHERE team_id = $1")
             .bind(team_id)
             .fetch_all(pool)
             .await?;
 
         // Then fetch permissions for each policy
+        // Tenant isolation is already enforced at policy level via team ownership
         let mut policies_with_permissions = Vec::new();
         for policy in policies {
             let permissions = sqlx::query_as::<_, Permission>(
                 "SELECT p.* FROM permissions p
                  JOIN policy_permissions pp ON pp.permission_id = p.id
-                 WHERE pp.tenant_id = $1 AND pp.policy_id = $2",
+                 WHERE pp.policy_id = $1",
             )
-            .bind(tenant_id)
             .bind(policy.id)
             .fetch_all(pool)
             .await?;

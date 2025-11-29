@@ -146,9 +146,7 @@ async function userFromNip07(ndk: NDK): Promise<NDKUser | null> {
 export async function signout(ndk: NDK) {
     // Call API logout endpoint to clear server-side session cookie
     try {
-        const apiDomain = import.meta.env.VITE_DOMAIN || "http://localhost:3000";
-        const domain = apiDomain.startsWith("http") ? apiDomain : `https://${apiDomain}`;
-        const response = await fetch(`${domain}/api/auth/logout`, {
+        const response = await fetch(`${import.meta.env.VITE_DOMAIN ? `https://${import.meta.env.VITE_DOMAIN}` : 'http://localhost:3000'}/api/auth/logout`, {
             method: 'POST',
             credentials: 'include',
         });

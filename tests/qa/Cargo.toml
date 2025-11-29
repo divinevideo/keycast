@@ -1,0 +1,65 @@
+[package]
+name = "keycast-qa-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[test]]
+name = "api_oauth_test"
+path = "tests/api_oauth_test.rs"
+
+[[test]]
+name = "api_rpc_test"
+path = "tests/api_rpc_test.rs"
+
+[[test]]
+name = "nip46_relay_test"
+path = "tests/nip46_relay_test.rs"
+
+[[test]]
+name = "security_test"
+path = "tests/security_test.rs"
+
+[[test]]
+name = "user_journey_test"
+path = "tests/user_journey_test.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full", "time", "process"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "cookies"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Nostr (same versions as main project)
+nostr = { version = "0.44", features = ["nip04", "nip44", "nip46", "nip49", "nip59"] }
+nostr-sdk = { version = "0.44", features = ["nip04", "nip44", "nip49", "nip59"] }
+nostr-connect = "0.44"
+
+# Cryptography for PKCE
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+
+# Database (for direct assertions)
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
+
+# Utilities
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5"
+urlencoding = "2.1"
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+
+[dev-dependencies]
+test-log = { version = "0.2", features = ["trace"] }

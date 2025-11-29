@@ -20,11 +20,12 @@ static SERVER_PUBKEY: Lazy<String> = Lazy::new(|| {
 
 /// Validate UCAN token from Authorization header
 ///
-/// Returns: (user_pubkey_hex, ucan)
+/// Returns: (user_pubkey_hex, redirect_origin, ucan)
+/// redirect_origin identifies which app/authorization this token is for
 pub fn validate_ucan_token(
     auth_header: &str,
     expected_tenant_id: i64,
-) -> Result<(String, Ucan)> {
+) -> Result<(String, String, Ucan)> {
     // Extract token from "Bearer <token>"
     let token = auth_header
         .strip_prefix("Bearer ")
@@ -38,10 +39,16 @@ pub fn validate_ucan_token(
         return Err(anyhow!("Token expired"));
     }
 
+    let facts: &Vec<serde_json::Value> = ucan.facts();
+
+    // Extract redirect_origin from facts (required)
+    let redirect_origin = facts.iter()
+        .find_map(|fact| fact.get("redirect_origin").and_then(|v| v.as_str()))
+        .map(String::from)
+        .ok_or_else(|| anyhow!("UCAN missing required redirect_origin fact"))?;
+
     // Validate tenant_id from facts (if expected_tenant_id != 0)
     if expected_tenant_id != 0 {
-        let facts: &Vec<serde_json::Value> = ucan.facts();
-
         // Look for tenant_id in facts array
         let mut found_tenant = false;
         for fact in facts {
@@ -79,23 +86,23 @@ pub fn validate_ucan_token(
         ));
     }
 
-    Ok((user_pubkey_hex, ucan))
+    Ok((user_pubkey_hex, redirect_origin, ucan))
 }
 
-/// Extract user pubkey from UCAN in Authorization header
+/// Extract user pubkey and redirect_origin from UCAN in Authorization header
 pub fn extract_user_from_ucan(
     headers: &HeaderMap,
     expected_tenant_id: i64,
-) -> Result<String> {
+) -> Result<(String, String)> {
     let auth_header = headers
         .get("Authorization")
         .ok_or_else(|| anyhow!("Missing Authorization header"))?
         .to_str()
         .map_err(|_| anyhow!("Invalid Authorization header"))?;
 
-    let (pubkey, _ucan) = validate_ucan_token(auth_header, expected_tenant_id)?;
+    let (pubkey, redirect_origin, _ucan) = validate_ucan_token(auth_header, expected_tenant_id)?;
 
-    Ok(pubkey)
+    Ok((pubkey, redirect_origin))
 }
 
 #[cfg(test)]
@@ -115,10 +122,11 @@ mod tests {
         // Create key material
         let key_material = NostrKeyMaterial::from_keys(keys.clone());
 
-        // Build UCAN with tenant_id fact
+        // Build UCAN with required facts including redirect_origin
         let facts = serde_json::json!({
             "tenant_id": 1,
-            "email": "test@example.com"
+            "email": "test@example.com",
+            "redirect_origin": "https://test.example.com"
         });
 
         let ucan = UcanBuilder::default()
@@ -136,9 +144,10 @@ mod tests {
 
         // Validate the token
         let auth_header = format!("Bearer {}", token);
-        let (extracted_pubkey, _) = validate_ucan_token(&auth_header, 1).unwrap();
+        let (extracted_pubkey, redirect_origin, _) = validate_ucan_token(&auth_header, 1).unwrap();
 
         assert_eq!(extracted_pubkey, pubkey.to_hex());
+        assert_eq!(redirect_origin, "https://test.example.com");
     }
 
     #[tokio::test]
@@ -177,10 +186,11 @@ mod tests {
         let user_did = nostr_pubkey_to_did(&pubkey);
         let key_material = NostrKeyMaterial::from_keys(keys);
 
-        // Create token with tenant_id = 1
+        // Create token with tenant_id = 1 and redirect_origin
         let facts = serde_json::json!({
             "tenant_id": 1,
-            "email": "test@example.com"
+            "email": "test@example.com",
+            "redirect_origin": "https://test.example.com"
         });
 
         let ucan = UcanBuilder::default()
@@ -213,10 +223,15 @@ mod tests {
         let user_did = nostr_pubkey_to_did(&pubkey);
         let key_material = NostrKeyMaterial::from_keys(keys);
 
+        let facts = serde_json::json!({
+            "redirect_origin": "https://test.example.com"
+        });
+
         let ucan = UcanBuilder::default()
             .issued_by(&key_material)
             .for_audience(&user_did)
             .with_lifetime(3600)
+            .with_fact(facts)
             .build()
             .unwrap()
             .sign()

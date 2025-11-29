@@ -32,11 +32,13 @@ pub fn generate_secure_token() -> String {
         .collect()
 }
 
-/// Generate UCAN token signed by user's key (server signs on behalf of user)
+/// Generate UCAN token signed by user's key (self-signed)
+/// redirect_origin identifies which app/authorization this token is for
 pub(crate) async fn generate_ucan_token(
     user_keys: &Keys,
     tenant_id: i64,
     email: &str,
+    redirect_origin: &str,
     relays: Option<&[String]>,
 ) -> Result<String, AuthError> {
     use crate::ucan_auth::{NostrKeyMaterial, nostr_pubkey_to_did};
@@ -46,10 +48,11 @@ pub(crate) async fn generate_ucan_token(
     let key_material = NostrKeyMaterial::from_keys(user_keys.clone());
     let user_did = nostr_pubkey_to_did(&user_keys.public_key());
 
-    // Create facts with optional relays
+    // Create facts - redirect_origin is required to identify the authorization
     let mut facts_obj = json!({
         "tenant_id": tenant_id,
         "email": email,
+        "redirect_origin": redirect_origin,
     });
 
     if let Some(relays) = relays {
@@ -75,10 +78,12 @@ pub(crate) async fn generate_ucan_token(
 
 /// Generate server-signed UCAN for users without personal keys yet
 /// Used during OAuth registration before keys are created
+/// redirect_origin identifies which app/authorization this token is for
 pub(crate) async fn generate_server_signed_ucan(
     user_pubkey: &nostr_sdk::PublicKey,
     tenant_id: i64,
     email: &str,
+    redirect_origin: &str,
     server_keys: &Keys,
 ) -> Result<String, AuthError> {
     use crate::ucan_auth::{NostrKeyMaterial, nostr_pubkey_to_did};
@@ -91,6 +96,7 @@ pub(crate) async fn generate_server_signed_ucan(
     let facts = json!({
         "tenant_id": tenant_id,
         "email": email,
+        "redirect_origin": redirect_origin,
     });
 
     let ucan = UcanBuilder::default()
@@ -212,6 +218,7 @@ pub enum AuthError {
     EmailSendFailed(String),
     DuplicateKey,  // Nostr pubkey already registered (BYOK case)
     BadRequest(String),
+    Forbidden(String),  // User has no authorization for this origin
 }
 
 impl IntoResponse for AuthError {
@@ -293,6 +300,10 @@ impl IntoResponse for AuthError {
                 StatusCode::BAD_REQUEST,
                 msg,
             ),
+            AuthError::Forbidden(msg) => (
+                StatusCode::FORBIDDEN,
+                msg,
+            ),
         };
 
         (status, Json(serde_json::json!({ "error": message }))).into_response()
@@ -313,12 +324,19 @@ impl From<bcrypt::BcryptError> for AuthError {
 
 /// Extract user public key from UCAN token in Authorization header or cookie
 pub(crate) fn extract_user_from_token(headers: &HeaderMap) -> Result<String, AuthError> {
+    let (pubkey, _redirect_origin) = extract_user_and_origin_from_token(headers)?;
+    Ok(pubkey)
+}
+
+/// Extract user public key AND redirect_origin from UCAN token in Authorization header or cookie
+/// redirect_origin identifies which app/authorization this token is for
+pub(crate) fn extract_user_and_origin_from_token(headers: &HeaderMap) -> Result<(String, String), AuthError> {
     // Try Bearer token first
     if let Some(auth_header) = headers.get("Authorization") {
         let auth_str = auth_header.to_str().map_err(|_| AuthError::InvalidToken)?;
 
         if auth_str.starts_with("Bearer ") {
-            // Validate UCAN token and extract user pubkey
+            // Validate UCAN token and extract user pubkey and redirect_origin
             return crate::ucan_auth::extract_user_from_ucan(headers, 0)
                 .map_err(|_| AuthError::InvalidToken);
         }
@@ -327,13 +345,13 @@ pub(crate) fn extract_user_from_token(headers: &HeaderMap) -> Result<String, Aut
     // Fall back to cookie-based UCAN
     if let Some(token) = extract_ucan_from_cookie(headers) {
         // Parse UCAN from string using ucan_auth helper (tenant validation done by caller)
-        let (pubkey, _ucan) = crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), 0)
+        let (pubkey, redirect_origin, _ucan) = crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), 0)
             .map_err(|e| {
                 tracing::warn!("UCAN parse error from cookie: {}", e);
                 AuthError::InvalidToken
             })?;
 
-        Ok(pubkey)
+        Ok((pubkey, redirect_origin))
     } else {
         Err(AuthError::MissingToken)
     }
@@ -353,18 +371,129 @@ pub(crate) fn extract_ucan_from_cookie(headers: &HeaderMap) -> Option<String> {
     None
 }
 
+/// Extract redirect_origin from HTTP Origin header
+/// Required for first-party login/register to identify which app the UCAN is for
+pub(crate) fn extract_origin_from_headers(headers: &HeaderMap) -> Result<String, AuthError> {
+    headers.get("origin")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .ok_or(AuthError::BadRequest("Origin header required".to_string()))
+}
+
+/// Create oauth_authorization for first-party login/register.
+/// This ensures first-party apps (web admin, etc.) have authorization records
+/// that can be looked up via (user_pubkey, redirect_origin).
+/// policy_id is null for first-party apps (full access).
+pub(crate) async fn create_first_party_authorization(
+    auth_state: &super::routes::AuthState,
+    tenant_id: i64,
+    user_pubkey: &str,
+    redirect_origin: &str,
+    encrypted_secret: &[u8],
+) -> Result<(), AuthError> {
+    let pool = &auth_state.state.db;
+
+    // Generate connection secret for NIP-46
+    let connection_secret: String = rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(48)
+        .map(char::from)
+        .collect();
+
+    // Get or create OAuth application for this first-party origin
+    let app_display_name = format!("First-party: {}", redirect_origin);
+    sqlx::query(
+        "INSERT INTO oauth_applications (tenant_id, name, display_name, redirect_origin, client_secret, redirect_uris, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'first-party', '[]', $5, $6)
+         ON CONFLICT (tenant_id, redirect_origin) DO NOTHING"
+    )
+    .bind(tenant_id)
+    .bind(&app_display_name)
+    .bind(&app_display_name)
+    .bind(redirect_origin)
+    .bind(Utc::now())
+    .bind(Utc::now())
+    .execute(pool)
+    .await?;
+
+    // Get application ID
+    let app_id: i32 = sqlx::query_scalar(
+        "SELECT id FROM oauth_applications WHERE redirect_origin = $1 AND tenant_id = $2"
+    )
+    .bind(redirect_origin)
+    .bind(tenant_id)
+    .fetch_one(pool)
+    .await?;
+
+    // Get deployment-wide relay list
+    let relays = keycast_core::types::authorization::Authorization::get_bunker_relays();
+    let relays_json = serde_json::to_string(&relays)
+        .map_err(|e| AuthError::Internal(format!("Failed to serialize relays: {}", e)))?;
+
+    // Create authorization with null policy_id (full access for first-party)
+    let created_at = Utc::now();
+    sqlx::query(
+        "INSERT INTO oauth_authorizations
+         (tenant_id, user_public_key, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, policy_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, $9, $10)
+         ON CONFLICT (tenant_id, user_public_key, redirect_origin)
+         DO UPDATE SET secret = EXCLUDED.secret, updated_at = EXCLUDED.updated_at"
+    )
+    .bind(tenant_id)
+    .bind(user_pubkey)
+    .bind(redirect_origin)
+    .bind(app_id)
+    .bind(user_pubkey)  // bunker pubkey = user's pubkey
+    .bind(encrypted_secret)
+    .bind(&connection_secret)
+    .bind(&relays_json)
+    .bind(created_at)
+    .bind(created_at)
+    .execute(pool)
+    .await?;
+
+    // Signal signer daemon to reload
+    if let Some(tx) = &auth_state.auth_tx {
+        use keycast_core::authorization_channel::AuthorizationCommand;
+        if let Err(e) = tx.send(AuthorizationCommand::Upsert {
+            bunker_pubkey: user_pubkey.to_string(),
+            tenant_id,
+            is_oauth: true,
+        }).await {
+            tracing::error!("Failed to send authorization upsert command: {}", e);
+        } else {
+            tracing::debug!("Signaled signer daemon for first-party authorization: {}", redirect_origin);
+        }
+    }
+
+    tracing::info!(
+        event = "first_party_authorization_created",
+        user_pubkey = &user_pubkey[..8],
+        redirect_origin = redirect_origin,
+        "Created first-party authorization"
+    );
+
+    Ok(())
+}
+
 /// Register a new user with email and password, sets session cookie
 pub async fn register(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
+    headers: HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> Result<impl axum::response::IntoResponse, AuthError> {
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
     let tenant_id = tenant.0.id;
+
+    // Extract redirect_origin from HTTP Origin header (required for UCAN)
+    let redirect_origin = extract_origin_from_headers(&headers)?;
+
     tracing::info!(
         event = "registration_attempt",
         tenant_id = tenant_id,
+        redirect_origin = %redirect_origin,
         "Registration attempt for email"
     );
 
@@ -463,6 +592,15 @@ pub async fn register(
 
     tx.commit().await?;
 
+    // Create first-party authorization for this origin (enables bunker URL access)
+    create_first_party_authorization(
+        &auth_state,
+        tenant_id,
+        &public_key.to_hex(),
+        &redirect_origin,
+        &encrypted_secret,
+    ).await?;
+
     // Send verification email (optional - don't fail if email service unavailable)
     match crate::email_service::EmailService::new() {
         Ok(email_service) => {
@@ -477,8 +615,8 @@ pub async fn register(
         }
     }
 
-    // Generate UCAN token for session cookie with optional relays
-    let ucan_token = generate_ucan_token(&keys, tenant_id, &req.email, req.relays.as_deref()).await?;
+    // Generate UCAN token for session cookie with redirect_origin and optional relays
+    let ucan_token = generate_ucan_token(&keys, tenant_id, &req.email, &redirect_origin, req.relays.as_deref()).await?;
 
     tracing::info!(
         event = "registration",
@@ -511,13 +649,19 @@ pub async fn register(
 pub async fn login(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
+    headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<impl axum::response::IntoResponse, AuthError> {
     let pool = &auth_state.state.db;
     let tenant_id = tenant.0.id;
+
+    // Extract redirect_origin from HTTP Origin header (required for UCAN)
+    let redirect_origin = extract_origin_from_headers(&headers)?;
+
     tracing::info!(
         event = "login_attempt",
         tenant_id = tenant_id,
+        redirect_origin = %redirect_origin,
         "Login attempt"
     );
 
@@ -575,8 +719,17 @@ pub async fn login(
         .map_err(|e| AuthError::Internal(format!("Invalid secret key bytes: {}", e)))?;
     let keys = Keys::new(secret_key.into());
 
-    // Generate UCAN token for session cookie (login doesn't set relays, uses registration defaults)
-    let ucan_token = generate_ucan_token(&keys, tenant_id, &req.email, None).await?;
+    // Create/update first-party authorization for this origin (enables bunker URL access)
+    create_first_party_authorization(
+        &auth_state,
+        tenant_id,
+        &public_key,
+        &redirect_origin,
+        &encrypted_secret,
+    ).await?;
+
+    // Generate UCAN token for session cookie with redirect_origin
+    let ucan_token = generate_ucan_token(&keys, tenant_id, &req.email, &redirect_origin, None).await?;
 
     tracing::info!(
         event = "login",
@@ -625,16 +778,35 @@ pub async fn logout(
 
 #[derive(Debug, Deserialize)]
 pub struct CreateBunkerRequest {
-    pub app_name: String,
-    pub relay_url: Option<String>,
+    pub origin: String,              // Required: the app's origin URL (must be HTTPS)
+    pub app_name: Option<String>,    // Optional: friendly display name
+    pub policy_slug: Option<String>, // Optional: null = full access
 }
 
 #[derive(Debug, Serialize)]
 pub struct CreateBunkerResponse {
     pub bunker_url: String,
-    pub app_name: String,
+    pub origin: String,
+    pub app_name: Option<String>,
     pub bunker_pubkey: String,
     pub created_at: String,
+}
+
+/// Validate origin is a valid URL (HTTPS required, except localhost for development)
+fn validate_origin(origin: &str) -> Result<(), AuthError> {
+    let url = nostr::Url::parse(origin)
+        .map_err(|_| AuthError::BadRequest("Invalid origin URL".to_string()))?;
+
+    let host = url.host_str()
+        .ok_or_else(|| AuthError::BadRequest("Origin must have a host".to_string()))?;
+
+    // Allow http:// only for localhost (development)
+    let is_localhost = host == "localhost" || host == "127.0.0.1";
+    if url.scheme() != "https" && !is_localhost {
+        return Err(AuthError::BadRequest("Origin must be HTTPS".to_string()));
+    }
+
+    Ok(())
 }
 
 /// POST /user/bunker/create
@@ -650,7 +822,15 @@ pub async fn create_bunker(
     let pool = &auth_state.state.db;
     let tenant_id = tenant.0.id;
 
-    tracing::info!("Creating manual bunker for user: {} in tenant: {}, app: {}", user_pubkey, tenant_id, req.app_name);
+    // Validate origin is HTTPS
+    validate_origin(&req.origin)?;
+
+    // redirect_origin is the ONLY secure app identifier (cannot be spoofed)
+    // display_name is just cosmetic, from user input or defaulting to origin
+    let redirect_origin = &req.origin;
+    let display_name = req.app_name.as_deref().unwrap_or(&req.origin);
+
+    tracing::info!("Creating manual bunker for user: {} in tenant: {}, origin: {}", user_pubkey, tenant_id, req.origin);
 
     // Get user's encrypted secret key
     let encrypted_secret: Vec<u8> = sqlx::query_scalar(
@@ -667,38 +847,42 @@ pub async fn create_bunker(
         .map(char::from)
         .collect();
 
-    // Create a dummy OAuth application for this manual bunker (if not exists)
-    let app_name_slug = req.app_name.to_lowercase().replace(' ', "-");
-    let client_id = format!("manual-{}", app_name_slug);
-
+    // Create OAuth application for this origin (if not exists)
+    // redirect_origin is the unique key, display_name can be updated
     sqlx::query(
-        "INSERT INTO oauth_applications (tenant_id, name, client_id, client_secret, redirect_uris, created_at, updated_at)
-         VALUES ($1, $2, $3, 'manual', '[]', $4, $5)
-         ON CONFLICT (client_id, tenant_id) DO NOTHING"
+        "INSERT INTO oauth_applications (tenant_id, name, display_name, redirect_origin, client_secret, redirect_uris, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'manual', '[]', $5, $6)
+         ON CONFLICT (tenant_id, redirect_origin) DO UPDATE SET name = EXCLUDED.name, display_name = EXCLUDED.display_name, updated_at = EXCLUDED.updated_at"
     )
     .bind(tenant_id)
-    .bind(&req.app_name)
-    .bind(&client_id)
+    .bind(display_name)
+    .bind(display_name)
+    .bind(redirect_origin)
     .bind(Utc::now())
     .bind(Utc::now())
     .execute(pool)
     .await?;
 
-    // Get application ID and default policy
+    // Get application ID by redirect_origin (the secure identifier)
     let app_id: i32 = sqlx::query_scalar(
-        "SELECT id FROM oauth_applications WHERE client_id = $1 AND tenant_id = $2"
+        "SELECT id FROM oauth_applications WHERE redirect_origin = $1 AND tenant_id = $2"
     )
-    .bind(&client_id)
+    .bind(redirect_origin)
     .bind(tenant_id)
     .fetch_one(pool)
     .await?;
 
-    let policy_id: i32 = sqlx::query_scalar(
-        "SELECT id FROM policies WHERE name = 'Standard Social (Default)' AND tenant_id = $1 LIMIT 1"
-    )
-    .bind(tenant_id)
-    .fetch_one(pool)
-    .await?;
+    // Look up policy_id from slug if provided
+    let policy_id: Option<i32> = if let Some(ref slug) = req.policy_slug {
+        sqlx::query_scalar(
+            "SELECT id FROM policies WHERE slug = $1"
+        )
+        .bind(slug)
+        .fetch_optional(pool)
+        .await?
+    } else {
+        None
+    };
 
     // Use deployment-wide relay list (ignore any client-provided relay)
     let relays = keycast_core::types::authorization::Authorization::get_bunker_relays();
@@ -709,11 +893,14 @@ pub async fn create_bunker(
     let created_at = Utc::now();
     sqlx::query(
         "INSERT INTO oauth_authorizations
-         (tenant_id, user_public_key, application_id, bunker_public_key, bunker_secret, secret, relays, policy_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
+         (tenant_id, user_public_key, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, policy_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT (tenant_id, user_public_key, redirect_origin)
+         DO UPDATE SET secret = EXCLUDED.secret, policy_id = EXCLUDED.policy_id, updated_at = EXCLUDED.updated_at"
     )
     .bind(tenant_id)
     .bind(&user_pubkey)
+    .bind(&req.origin)  // redirect_origin = the app's origin
     .bind(app_id)
     .bind(&user_pubkey)  // bunker pubkey = user's pubkey
     .bind(&encrypted_secret)
@@ -753,10 +940,11 @@ pub async fn create_bunker(
         connection_secret
     );
 
-    tracing::info!("Created manual bunker connection for user: {}, app: {}", user_pubkey, req.app_name);
+    tracing::info!("Created manual bunker connection for user: {}, origin: {}", user_pubkey, req.origin);
 
     Ok(Json(CreateBunkerResponse {
         bunker_url,
+        origin: req.origin,
         app_name: req.app_name,
         bunker_pubkey: user_pubkey.clone(),
         created_at: created_at.to_rfc3339(),
@@ -764,31 +952,34 @@ pub async fn create_bunker(
 }
 
 /// Get bunker URL for the authenticated user
+/// The redirect_origin in the UCAN determines which authorization's bunker URL to return
 pub async fn get_bunker_url(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
     headers: HeaderMap,
 ) -> Result<Json<BunkerUrlResponse>, AuthError> {
-    // Extract user pubkey from UCAN token
-    let user_pubkey = extract_user_from_token(&headers)?;
+    // Extract user pubkey AND redirect_origin from UCAN token
+    let (user_pubkey, redirect_origin) = extract_user_and_origin_from_token(&headers)?;
     let tenant_id = tenant.0.id;
-    tracing::info!("Fetching bunker URL for user: {} in tenant: {}", user_pubkey, tenant_id);
+    tracing::info!("Fetching bunker URL for user: {} origin: {} in tenant: {}", user_pubkey, redirect_origin, tenant_id);
 
-    // Get the user's OAuth authorization bunker URL for keycast-ropc
+    // Get the authorization for this specific origin
     let result: Option<(String, String)> = sqlx::query_as(
         "SELECT oa.bunker_public_key, oa.secret FROM oauth_authorizations oa
-         JOIN users u ON oa.user_public_key = u.public_key
          WHERE oa.user_public_key = $1
-         AND u.tenant_id = $2
-         AND oa.application_id = (SELECT id FROM oauth_applications WHERE client_id = 'keycast-ropc' AND tenant_id = $2)
-         ORDER BY oa.created_at DESC LIMIT 1"
+         AND oa.redirect_origin = $2
+         AND oa.tenant_id = $3"
     )
     .bind(&user_pubkey)
+    .bind(&redirect_origin)
     .bind(tenant_id)
     .fetch_optional(&pool)
     .await?;
 
-    let (bunker_pubkey, connection_secret) = result.ok_or(AuthError::UserNotFound)?;
+    let (bunker_pubkey, connection_secret) = result.ok_or_else(|| {
+        tracing::warn!("No authorization found for user {} origin {} in tenant {}", user_pubkey, redirect_origin, tenant_id);
+        AuthError::Forbidden("No authorization for this origin. Create one via OAuth or /user/bunker/create".to_string())
+    })?;
 
     // Build bunker URL with deployment-wide relay list
     let relays = keycast_core::types::authorization::Authorization::get_bunker_relays();
@@ -805,7 +996,7 @@ pub async fn get_bunker_url(
         connection_secret
     );
 
-    tracing::info!("Returning bunker URL with pubkey: {}", bunker_pubkey);
+    tracing::info!("Returning bunker URL for origin: {} with pubkey: {}", redirect_origin, bunker_pubkey);
 
     Ok(Json(BunkerUrlResponse { bunker_url }))
 }
@@ -1215,6 +1406,7 @@ pub async fn update_profile(
 pub struct BunkerSession {
     pub application_name: String,
     pub application_id: Option<i32>,
+    pub redirect_origin: String,
     pub bunker_pubkey: String,
     pub secret: String,
     pub client_pubkey: Option<String>,
@@ -1240,14 +1432,16 @@ pub async fn list_sessions(
     tracing::info!("Listing bunker sessions for user: {} in tenant: {}", user_pubkey, tenant_id);
 
     // Get OAuth authorizations with application details and activity stats
-    type OAuthSessionRow = (String, i32, String, String, String, Option<String>, Option<i64>);
+    type OAuthSessionRow = (String, Option<i32>, String, String, String, String, Option<String>, Option<String>, Option<i64>);
     let oauth_sessions: Vec<OAuthSessionRow> = sqlx::query_as(
         "SELECT
-            COALESCE(a.name, 'Personal Bunker') as name,
+            COALESCE(a.name, oa.redirect_origin) as name,
             oa.application_id,
+            oa.redirect_origin,
             oa.bunker_public_key,
             oa.secret,
             oa.created_at::text,
+            oa.client_public_key,
             (SELECT MAX(created_at)::text FROM signing_activity WHERE bunker_secret = oa.secret) as last_activity,
             (SELECT COUNT(*) FROM signing_activity WHERE bunker_secret = oa.secret) as activity_count
          FROM oauth_authorizations oa
@@ -1255,7 +1449,6 @@ pub async fn list_sessions(
          JOIN users u ON oa.user_public_key = u.public_key
          WHERE oa.user_public_key = $1
            AND u.tenant_id = $2
-           AND oa.revoked_at IS NULL
          ORDER BY oa.created_at DESC"
     )
     .bind(&user_pubkey)
@@ -1265,12 +1458,13 @@ pub async fn list_sessions(
 
     let sessions = oauth_sessions
         .into_iter()
-        .map(|(name, app_id, bunker_pubkey, secret, created_at, last_activity, activity_count)| BunkerSession {
+        .map(|(name, app_id, redirect_origin, bunker_pubkey, secret, created_at, client_pubkey, last_activity, activity_count)| BunkerSession {
             application_name: name,
-            application_id: Some(app_id),
+            application_id: app_id,
+            redirect_origin,
             bunker_pubkey,
             secret,
-            client_pubkey: None,  // client_public_key column doesn't exist
+            client_pubkey,
             created_at,
             last_activity,
             activity_count: activity_count.unwrap_or(0),
@@ -1358,32 +1552,54 @@ pub struct RevokeSessionResponse {
 /// Revoke a bunker session
 pub async fn revoke_session(
     tenant: crate::api::tenant::TenantExtractor,
-    State(pool): State<PgPool>,
+    State(auth_state): State<super::routes::AuthState>,
     headers: HeaderMap,
     Json(req): Json<RevokeSessionRequest>,
 ) -> Result<Json<RevokeSessionResponse>, AuthError> {
+    let pool = &auth_state.state.db;
     // Extract user from UCAN (supports both cookie and Bearer token)
     let user_pubkey = extract_user_from_token(&headers)?;
     let tenant_id = tenant.0.id;
     tracing::info!("Revoking bunker session for user: {} in tenant: {}", user_pubkey, tenant_id);
 
-    // Verify this bunker session belongs to the user in this tenant and revoke it
-    let result = sqlx::query(
-        "UPDATE oauth_authorizations
-         SET revoked_at = $1, updated_at = $2
-         WHERE secret = $3 AND user_public_key = $4 AND revoked_at IS NULL
-         AND user_public_key IN (SELECT public_key FROM users WHERE tenant_id = $5)"
+    // Get bunker_pubkey before deleting (needed for cache invalidation)
+    let bunker_pubkey: Option<String> = sqlx::query_scalar(
+        "SELECT bunker_public_key FROM oauth_authorizations
+         WHERE secret = $1 AND user_public_key = $2
+         AND user_public_key IN (SELECT public_key FROM users WHERE tenant_id = $3)"
     )
-    .bind(Utc::now())
-    .bind(Utc::now())
     .bind(&req.secret)
     .bind(&user_pubkey)
     .bind(tenant_id)
-    .execute(&pool)
+    .fetch_optional(pool)
     .await?;
 
-    if result.rows_affected() == 0 {
+    if bunker_pubkey.is_none() {
         return Err(AuthError::InvalidToken);
+    }
+
+    // Delete the authorization
+    sqlx::query(
+        "DELETE FROM oauth_authorizations
+         WHERE secret = $1 AND user_public_key = $2
+         AND user_public_key IN (SELECT public_key FROM users WHERE tenant_id = $3)"
+    )
+    .bind(&req.secret)
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .execute(pool)
+    .await?;
+
+    // Signal signer daemon to remove from cache
+    if let Some(tx) = &auth_state.auth_tx {
+        use keycast_core::authorization_channel::AuthorizationCommand;
+        if let Err(e) = tx.send(AuthorizationCommand::Remove {
+            bunker_pubkey: bunker_pubkey.unwrap(),
+        }).await {
+            tracing::error!("Failed to send authorization remove command: {}", e);
+        } else {
+            tracing::debug!("Signaled signer daemon to remove authorization");
+        }
     }
 
     tracing::info!("Successfully revoked bunker session for user: {}", user_pubkey);
@@ -1421,7 +1637,7 @@ pub async fn disconnect_client(
     let result = sqlx::query(
         "UPDATE oauth_authorizations
          SET connected_client_pubkey = NULL, connected_at = NULL, updated_at = $1
-         WHERE secret = $2 AND user_public_key = $3 AND revoked_at IS NULL
+         WHERE secret = $2 AND user_public_key = $3
          AND user_public_key IN (SELECT public_key FROM users WHERE tenant_id = $4)"
     )
     .bind(Utc::now())
@@ -1507,7 +1723,6 @@ pub async fn list_permissions(
          JOIN users u ON oa.user_public_key = u.public_key
          WHERE oa.user_public_key = $1
            AND u.tenant_id = $2
-           AND oa.revoked_at IS NULL
          ORDER BY oa.created_at DESC"
     )
     .bind(&user_pubkey)
@@ -1518,10 +1733,10 @@ pub async fn list_permissions(
     let mut permissions = Vec::new();
 
     for (app_id, app_name, policy_id, policy_name, policy_slug, policy_display_name, policy_description, created_at, secret, last_activity, activity_count) in auth_data {
-        // Load permission displays using the Policy model
+        // Load permission displays using the Policy model (policies are now global)
         let permission_displays = if policy_id > 0 {
             use keycast_core::types::policy::Policy;
-            match Policy::find_by_id(&pool, tenant_id, policy_id as i32).await {
+            match Policy::find_by_id(&pool, policy_id as i32).await {
                 Ok(policy) => policy.permission_displays(&pool).await.unwrap_or_default(),
                 Err(_) => Vec::new(),
             }
@@ -1615,39 +1830,71 @@ pub struct SignEventResponse {
     pub signed_event: serde_json::Value,
 }
 
-/// Validate that the user has permission to sign this event
-/// Returns the policy_id if successful, or an error if unauthorized
-pub(crate) async fn validate_signing_permissions(
+/// Look up authorization by (user_pubkey, redirect_origin, tenant_id)
+/// Returns the OAuth authorization if found, None otherwise
+pub async fn get_authorization_for_origin(
     pool: &PgPool,
-    tenant_id: i64,
     user_pubkey: &str,
-    event: &UnsignedEvent,
-) -> Result<i64, AuthError> {
-    // Get the policy_id from the keycast-login OAuth app for this tenant
-    let policy_id: Option<i64> = sqlx::query_scalar(
-        "SELECT app.policy_id
-         FROM oauth_applications app
-         WHERE app.client_id = 'keycast-login'
-         AND app.tenant_id = $1
-         LIMIT 1"
+    redirect_origin: &str,
+    tenant_id: i64,
+) -> Result<Option<i32>, AuthError> {
+    // Returns policy_id (or None if full access)
+    let policy_id: Option<Option<i32>> = sqlx::query_scalar(
+        "SELECT policy_id
+         FROM oauth_authorizations
+         WHERE user_public_key = $1
+         AND redirect_origin = $2
+         AND tenant_id = $3
+         AND (expires_at IS NULL OR expires_at > NOW())"
     )
+    .bind(user_pubkey)
+    .bind(redirect_origin)
     .bind(tenant_id)
     .fetch_optional(pool)
     .await?;
 
-    let policy_id = policy_id.ok_or_else(|| {
-        tracing::warn!("No policy found for user {} in tenant {}", user_pubkey, tenant_id);
-        AuthError::InvalidCredentials
-    })?;
+    match policy_id {
+        Some(pid) => Ok(pid),  // Authorization exists, returns Option<i32> (None = full access)
+        None => Err(AuthError::Forbidden(
+            "No authorization for this origin. Create one via OAuth or /user/bunker/create".to_string()
+        )),
+    }
+}
+
+/// Validate that the user has permission to sign this event
+/// Returns () if successful, or an error if unauthorized
+pub async fn validate_signing_permissions(
+    pool: &PgPool,
+    tenant_id: i64,
+    user_pubkey: &str,
+    redirect_origin: &str,
+    event: &UnsignedEvent,
+) -> Result<(), AuthError> {
+    // Get the policy_id from the user's OAuth authorization for this origin
+    // NULL policy_id means "full power" - no restrictions
+    let policy_id = get_authorization_for_origin(pool, user_pubkey, redirect_origin, tenant_id).await?;
+
+    // NULL policy_id means full power - allow everything
+    let policy_id = match policy_id {
+        Some(id) => id,
+        None => {
+            tracing::info!(
+                "✅ Permission validated for user {} to sign event kind {} in tenant {} (full access - no policy)",
+                user_pubkey,
+                event.kind.as_u16(),
+                tenant_id
+            );
+            return Ok(());
+        }
+    };
 
     // Load permissions for this policy
     let permissions: Vec<Permission> = sqlx::query_as(
         "SELECT p.*
          FROM permissions p
          JOIN policy_permissions pp ON pp.permission_id = p.id
-         WHERE pp.tenant_id = $1 AND pp.policy_id = $2"
+         WHERE pp.policy_id = $1"
     )
-    .bind(tenant_id)
     .bind(policy_id)
     .fetch_all(pool)
     .await?;
@@ -1661,19 +1908,31 @@ pub(crate) async fn validate_signing_permissions(
     let custom_permissions = custom_permissions
         .map_err(|e| AuthError::Internal(format!("Failed to convert permissions: {}", e)))?;
 
-    // Validate event against all permissions
+    // Validate event against permissions (OR logic: if ANY permission allows, it's permitted)
     let event_kind = event.kind.as_u16();
 
-    for permission in custom_permissions {
-        if !permission.can_sign(event) {
-            tracing::warn!(
-                "Permission denied for user {} to sign event kind {} in tenant {}",
-                user_pubkey,
-                event_kind,
-                tenant_id
-            );
-            return Err(AuthError::InvalidCredentials);
-        }
+    // If there are no permissions, default to allow
+    if custom_permissions.is_empty() {
+        tracing::info!(
+            "✅ Permission validated for user {} to sign event kind {} in tenant {} (no permission restrictions)",
+            user_pubkey,
+            event_kind,
+            tenant_id
+        );
+        return Ok(());
+    }
+
+    // Check if ANY permission allows this event
+    let allowed = custom_permissions.iter().any(|p| p.can_sign(event));
+
+    if !allowed {
+        tracing::warn!(
+            "Permission denied for user {} to sign event kind {} in tenant {}",
+            user_pubkey,
+            event_kind,
+            tenant_id
+        );
+        return Err(AuthError::InvalidCredentials);
     }
 
     tracing::info!(
@@ -1683,7 +1942,173 @@ pub(crate) async fn validate_signing_permissions(
         tenant_id
     );
 
-    Ok(policy_id)
+    Ok(())
+}
+
+/// Validate that the user has permission to encrypt for the given pubkey
+/// Returns () if successful, or an error if unauthorized
+pub async fn validate_encrypt_permissions(
+    pool: &PgPool,
+    tenant_id: i64,
+    user_pubkey: &str,
+    redirect_origin: &str,
+    plaintext: &str,
+    recipient_pubkey: &PublicKey,
+) -> Result<(), AuthError> {
+    let policy_id = get_authorization_for_origin(pool, user_pubkey, redirect_origin, tenant_id).await?;
+
+    // Parse sender pubkey
+    let sender_pubkey = PublicKey::from_hex(user_pubkey)
+        .map_err(|e| AuthError::Internal(format!("Invalid user pubkey: {}", e)))?;
+
+    // NULL policy_id means full power - allow everything
+    let policy_id = match policy_id {
+        Some(id) => id,
+        None => {
+            tracing::info!(
+                "✅ Encrypt permission validated for user {} to {} in tenant {} (full access - no policy)",
+                user_pubkey,
+                &recipient_pubkey.to_hex()[..8],
+                tenant_id
+            );
+            return Ok(());
+        }
+    };
+
+    // Load permissions for this policy
+    let permissions: Vec<Permission> = sqlx::query_as(
+        "SELECT p.*
+         FROM permissions p
+         JOIN policy_permissions pp ON pp.permission_id = p.id
+         WHERE pp.policy_id = $1"
+    )
+    .bind(policy_id)
+    .fetch_all(pool)
+    .await?;
+
+    let custom_permissions: Result<Vec<Box<dyn CustomPermission>>, _> = permissions
+        .iter()
+        .map(|p| p.to_custom_permission())
+        .collect();
+
+    let custom_permissions = custom_permissions
+        .map_err(|e| AuthError::Internal(format!("Failed to convert permissions: {}", e)))?;
+
+    // If there are no permissions, default to allow
+    if custom_permissions.is_empty() {
+        tracing::info!(
+            "✅ Encrypt permission validated for user {} to {} in tenant {} (no permission restrictions)",
+            user_pubkey,
+            &recipient_pubkey.to_hex()[..8],
+            tenant_id
+        );
+        return Ok(());
+    }
+
+    // Check if ANY permission allows this encryption
+    let allowed = custom_permissions.iter().any(|p| p.can_encrypt(plaintext, &sender_pubkey, recipient_pubkey));
+
+    if !allowed {
+        tracing::warn!(
+            "Permission denied for user {} to encrypt to {} in tenant {}",
+            user_pubkey,
+            &recipient_pubkey.to_hex()[..8],
+            tenant_id
+        );
+        return Err(AuthError::Forbidden("Encryption not permitted by policy".to_string()));
+    }
+
+    tracing::info!(
+        "✅ Encrypt permission validated for user {} to {} in tenant {}",
+        user_pubkey,
+        &recipient_pubkey.to_hex()[..8],
+        tenant_id
+    );
+
+    Ok(())
+}
+
+/// Validate that the user has permission to decrypt from the given pubkey
+/// Returns () if successful, or an error if unauthorized
+pub async fn validate_decrypt_permissions(
+    pool: &PgPool,
+    tenant_id: i64,
+    user_pubkey: &str,
+    redirect_origin: &str,
+    ciphertext: &str,
+    sender_pubkey: &PublicKey,
+) -> Result<(), AuthError> {
+    let policy_id = get_authorization_for_origin(pool, user_pubkey, redirect_origin, tenant_id).await?;
+
+    // Parse recipient pubkey
+    let recipient_pubkey = PublicKey::from_hex(user_pubkey)
+        .map_err(|e| AuthError::Internal(format!("Invalid user pubkey: {}", e)))?;
+
+    // NULL policy_id means full power - allow everything
+    let policy_id = match policy_id {
+        Some(id) => id,
+        None => {
+            tracing::info!(
+                "✅ Decrypt permission validated for user {} from {} in tenant {} (full access - no policy)",
+                user_pubkey,
+                &sender_pubkey.to_hex()[..8],
+                tenant_id
+            );
+            return Ok(());
+        }
+    };
+
+    // Load permissions for this policy
+    let permissions: Vec<Permission> = sqlx::query_as(
+        "SELECT p.*
+         FROM permissions p
+         JOIN policy_permissions pp ON pp.permission_id = p.id
+         WHERE pp.policy_id = $1"
+    )
+    .bind(policy_id)
+    .fetch_all(pool)
+    .await?;
+
+    let custom_permissions: Result<Vec<Box<dyn CustomPermission>>, _> = permissions
+        .iter()
+        .map(|p| p.to_custom_permission())
+        .collect();
+
+    let custom_permissions = custom_permissions
+        .map_err(|e| AuthError::Internal(format!("Failed to convert permissions: {}", e)))?;
+
+    // If there are no permissions, default to allow
+    if custom_permissions.is_empty() {
+        tracing::info!(
+            "✅ Decrypt permission validated for user {} from {} in tenant {} (no permission restrictions)",
+            user_pubkey,
+            &sender_pubkey.to_hex()[..8],
+            tenant_id
+        );
+        return Ok(());
+    }
+
+    // Check if ANY permission allows this decryption
+    let allowed = custom_permissions.iter().any(|p| p.can_decrypt(ciphertext, sender_pubkey, &recipient_pubkey));
+
+    if !allowed {
+        tracing::warn!(
+            "Permission denied for user {} to decrypt from {} in tenant {}",
+            user_pubkey,
+            &sender_pubkey.to_hex()[..8],
+            tenant_id
+        );
+        return Err(AuthError::Forbidden("Decryption not permitted by policy".to_string()));
+    }
+
+    tracing::info!(
+        "✅ Decrypt permission validated for user {} from {} in tenant {}",
+        user_pubkey,
+        &sender_pubkey.to_hex()[..8],
+        tenant_id
+    );
+
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -1700,7 +2125,7 @@ pub async fn sign_event(
     headers: HeaderMap,
     Json(req): Json<SignEventRequest>,
 ) -> Result<Json<SignEventResponse>, AuthError> {
-    let user_pubkey = extract_user_from_token(&headers)?;
+    let (user_pubkey, redirect_origin) = extract_user_and_origin_from_token(&headers)?;
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
     let tenant_id = tenant.0.id;
@@ -1710,20 +2135,18 @@ pub async fn sign_event(
         .map_err(|e| AuthError::Internal(format!("Invalid event format: {}", e)))?;
 
     // 🔒 VALIDATE PERMISSIONS BEFORE SIGNING
-    validate_signing_permissions(pool, tenant_id, &user_pubkey, &unsigned_event).await?;
+    validate_signing_permissions(pool, tenant_id, &user_pubkey, &redirect_origin, &unsigned_event).await?;
 
     // FAST PATH: Try to use cached signer handler if in unified mode
     if let Some(ref handlers) = auth_state.state.signer_handlers {
         tracing::info!("Attempting fast path signing for user: {} in tenant: {}", user_pubkey, tenant_id);
 
-        // Query for user's bunker public key from OAuth authorization
+        // Query for user's bunker public key from any OAuth authorization
         let bunker_pubkey: Option<String> = sqlx::query_scalar(
             "SELECT oa.bunker_public_key
              FROM oauth_authorizations oa
              JOIN users u ON oa.user_public_key = u.public_key
              WHERE oa.user_public_key = $1 AND u.tenant_id = $2
-             AND oa.application_id = (SELECT id FROM oauth_applications WHERE client_id = 'keycast-login')
-             AND oa.revoked_at IS NULL
              ORDER BY oa.created_at DESC
              LIMIT 1"
         )
@@ -1733,7 +2156,7 @@ pub async fn sign_event(
         .await?;
 
         if let Some(bunker_key) = bunker_pubkey {
-            let handlers_read = handlers.read().await;
+            let handlers_read = handlers.lock().await;
             if let Some(handler) = handlers_read.get(&bunker_key) {
                 tracing::info!("✅ Using cached handler for user {}", user_pubkey);
 
@@ -2409,10 +2832,12 @@ mod tests {
     use nostr_sdk::{Keys, UnsignedEvent, Kind, Timestamp};
     use sqlx::PgPool;
 
-    /// Helper to create test database with schema
-    /// Uses the existing test database which already has migrations applied
+    /// Helper to create test database connection
+    /// Uses DATABASE_URL env var or defaults to localhost
     async fn create_test_db() -> PgPool {
-        PgPool::connect("postgres://postgres:password@localhost/keycast_test").await.unwrap()
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string());
+        PgPool::connect(&database_url).await.unwrap()
     }
 
     /// Mock signing handler for testing
@@ -2447,48 +2872,55 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // TODO: Needs database isolation for PostgreSQL
     async fn test_fast_path_components() {
         // Test that all fast path components work correctly
         let pool = create_test_db().await;
         let user_keys = Keys::generate();
         let user_pubkey = user_keys.public_key().to_hex();
 
+        // Use unique redirect_origin for this test
+        let redirect_origin = format!("https://test-{}.app", uuid::Uuid::new_v4());
+
         // Insert test user
-        sqlx::query("INSERT INTO users (public_key, tenant_id) VALUES ($1, 1)")
+        sqlx::query("INSERT INTO users (public_key, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())")
             .bind(&user_pubkey)
             .execute(&pool)
             .await
             .unwrap();
 
-        // Insert OAuth application
-        sqlx::query("INSERT INTO oauth_applications (id, tenant_id, client_id, client_secret, redirect_uris, name) VALUES (1, 1, 'keycast-login', 'test-secret', '[]', 'Keycast Login')")
-            .execute(&pool)
-            .await
-            .unwrap();
+        // Insert OAuth application with unique redirect_origin
+        let app_id: i32 = sqlx::query_scalar(
+            "INSERT INTO oauth_applications (tenant_id, redirect_origin, client_secret, redirect_uris, name, created_at, updated_at)
+             VALUES (1, $1, 'test-secret', '[]', 'Test App', NOW(), NOW())
+             RETURNING id"
+        )
+        .bind(&redirect_origin)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
         // Insert OAuth authorization
         let bunker_keys = Keys::generate();
         let bunker_pubkey = bunker_keys.public_key().to_hex();
 
         sqlx::query(
-            "INSERT INTO oauth_authorizations (user_public_key, application_id, bunker_public_key, bunker_secret, secret)
-             VALUES ($1, 1, ?, X'00', 'test-secret')"
+            "INSERT INTO oauth_authorizations (user_public_key, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, tenant_id, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, E'\\\\x00', 'test-secret', '[]', 1, NOW(), NOW())"
         )
         .bind(&user_pubkey)
+        .bind(&redirect_origin)
+        .bind(app_id)
         .bind(&bunker_pubkey)
         .execute(&pool)
         .await
         .unwrap();
 
-        // Verify we can query bunker_public_key (fast path lookup)
+        // Verify we can query bunker_public_key (fast path lookup - finds any valid authorization)
         let result: Option<String> = sqlx::query_scalar(
             "SELECT oa.bunker_public_key
              FROM oauth_authorizations oa
              JOIN users u ON oa.user_public_key = u.public_key
              WHERE oa.user_public_key = $1 AND u.tenant_id = 1
-             AND oa.application_id = (SELECT id FROM oauth_applications WHERE client_id = 'keycast-login')
-             AND oa.revoked_at IS NULL
              ORDER BY oa.created_at DESC
              LIMIT 1"
         )
@@ -2520,7 +2952,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // TODO: Needs database isolation for PostgreSQL
     async fn test_slow_path_components() {
         // Test that slow path (DB + KMS) works correctly
         let pool = create_test_db().await;
@@ -2534,14 +2965,14 @@ mod tests {
         let encrypted_secret = key_manager.encrypt(&user_secret_bytes).await.unwrap();
 
         // Insert test user
-        sqlx::query("INSERT INTO users (public_key, tenant_id) VALUES ($1, 1)")
+        sqlx::query("INSERT INTO users (public_key, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())")
             .bind(&user_pubkey)
             .execute(&pool)
             .await
             .unwrap();
 
         // Insert personal keys
-        sqlx::query("INSERT INTO personal_keys (user_public_key, encrypted_secret_key) VALUES ($1, ?)")
+        sqlx::query("INSERT INTO personal_keys (user_public_key, encrypted_secret_key, tenant_id) VALUES ($1, $2, 1)")
             .bind(&user_pubkey)
             .bind(&encrypted_secret)
             .execute(&pool)
@@ -2585,7 +3016,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // TODO: Needs database isolation for PostgreSQL
     async fn test_fallback_when_handler_not_cached() {
         // Test that system falls back to slow path when handler not in cache
         let pool = create_test_db().await;
@@ -2593,7 +3023,7 @@ mod tests {
         let user_pubkey = user_keys.public_key().to_hex();
 
         // Insert user but NO OAuth authorization
-        sqlx::query("INSERT INTO users (public_key, tenant_id) VALUES ($1, 1)")
+        sqlx::query("INSERT INTO users (public_key, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())")
             .bind(&user_pubkey)
             .execute(&pool)
             .await

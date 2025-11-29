@@ -12,7 +12,7 @@ use nostr_sdk::{Keys, PublicKey, UnsignedEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use super::auth::{extract_user_from_token, AuthError};
+use super::auth::{extract_user_and_origin_from_token, AuthError};
 use super::routes::AuthState;
 
 /// RPC request format (mirrors NIP-46)
@@ -67,9 +67,9 @@ impl IntoResponse for RpcError {
             RpcError::UnsupportedMethod(method) => {
                 (StatusCode::BAD_REQUEST, format!("Unsupported method: {}", method))
             }
-            RpcError::SigningFailed(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
-            RpcError::EncryptionFailed(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
-            RpcError::DecryptionFailed(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            RpcError::SigningFailed(msg) => (StatusCode::BAD_REQUEST, msg),
+            RpcError::EncryptionFailed(msg) => (StatusCode::BAD_REQUEST, msg),
+            RpcError::DecryptionFailed(msg) => (StatusCode::BAD_REQUEST, msg),
             RpcError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
 
@@ -98,14 +98,14 @@ pub async fn nostr_rpc(
     headers: HeaderMap,
     Json(req): Json<NostrRpcRequest>,
 ) -> Result<Json<NostrRpcResponse>, RpcError> {
-    let user_pubkey = extract_user_from_token(&headers)?;
+    let (user_pubkey, redirect_origin) = extract_user_and_origin_from_token(&headers)?;
     let pool = &auth_state.state.db;
     let tenant_id = tenant.0.id;
 
-    tracing::info!("RPC request: method={} from user={}", req.method, &user_pubkey[..8]);
+    tracing::info!("RPC request: method={} from user={} origin={}", req.method, &user_pubkey[..8], &redirect_origin);
 
     // Get user keys (try fast path first, then slow path)
-    let keys = get_user_keys(&auth_state, pool, tenant_id, &user_pubkey).await?;
+    let keys = get_user_keys(&auth_state, pool, tenant_id, &user_pubkey, &redirect_origin).await?;
 
     // Dispatch based on method
     let result = match req.method.as_str() {
@@ -117,7 +117,7 @@ pub async fn nostr_rpc(
             let unsigned_event = parse_unsigned_event(&req.params)?;
 
             // Validate permissions before signing
-            super::auth::validate_signing_permissions(pool, tenant_id, &user_pubkey, &unsigned_event).await
+            super::auth::validate_signing_permissions(pool, tenant_id, &user_pubkey, &redirect_origin, &unsigned_event).await
                 .map_err(RpcError::Auth)?;
 
             // Sign the event
@@ -133,6 +133,10 @@ pub async fn nostr_rpc(
         "nip44_encrypt" => {
             let (recipient_pubkey, plaintext) = parse_encrypt_params(&req.params)?;
 
+            // Validate permissions before encrypting
+            super::auth::validate_encrypt_permissions(pool, tenant_id, &user_pubkey, &redirect_origin, &plaintext, &recipient_pubkey).await
+                .map_err(RpcError::Auth)?;
+
             let ciphertext = nip44::encrypt(
                 keys.secret_key(),
                 &recipient_pubkey,
@@ -146,6 +150,10 @@ pub async fn nostr_rpc(
         "nip44_decrypt" => {
             let (sender_pubkey, ciphertext) = parse_decrypt_params(&req.params)?;
 
+            // Validate permissions before decrypting
+            super::auth::validate_decrypt_permissions(pool, tenant_id, &user_pubkey, &redirect_origin, &ciphertext, &sender_pubkey).await
+                .map_err(RpcError::Auth)?;
+
             let plaintext = nip44::decrypt(
                 keys.secret_key(),
                 &sender_pubkey,
@@ -158,6 +166,10 @@ pub async fn nostr_rpc(
         "nip04_encrypt" => {
             let (recipient_pubkey, plaintext) = parse_encrypt_params(&req.params)?;
 
+            // Validate permissions before encrypting
+            super::auth::validate_encrypt_permissions(pool, tenant_id, &user_pubkey, &redirect_origin, &plaintext, &recipient_pubkey).await
+                .map_err(RpcError::Auth)?;
+
             let ciphertext = nip04::encrypt(
                 keys.secret_key(),
                 &recipient_pubkey,
@@ -169,6 +181,10 @@ pub async fn nostr_rpc(
 
         "nip04_decrypt" => {
             let (sender_pubkey, ciphertext) = parse_decrypt_params(&req.params)?;
+
+            // Validate permissions before decrypting
+            super::auth::validate_decrypt_permissions(pool, tenant_id, &user_pubkey, &redirect_origin, &ciphertext, &sender_pubkey).await
+                .map_err(RpcError::Auth)?;
 
             let plaintext = nip04::decrypt(
                 keys.secret_key(),
@@ -193,28 +209,28 @@ async fn get_user_keys(
     pool: &sqlx::PgPool,
     tenant_id: i64,
     user_pubkey: &str,
+    redirect_origin: &str,
 ) -> Result<Keys, RpcError> {
     // FAST PATH: Try to use cached signer handler if in unified mode
     if let Some(ref handlers) = auth_state.state.signer_handlers {
-        // Query for user's bunker public key from OAuth authorization
+        // Query for user's bunker public key for this specific origin
         let bunker_pubkey: Option<String> = sqlx::query_scalar(
             "SELECT oa.bunker_public_key
              FROM oauth_authorizations oa
              JOIN users u ON oa.user_public_key = u.public_key
-             WHERE oa.user_public_key = $1 AND u.tenant_id = $2
-             AND oa.application_id = (SELECT id FROM oauth_applications WHERE client_id = 'keycast-login')
-             AND oa.revoked_at IS NULL
+             WHERE oa.user_public_key = $1 AND u.tenant_id = $2 AND oa.redirect_origin = $3
              ORDER BY oa.created_at DESC
              LIMIT 1"
         )
         .bind(user_pubkey)
         .bind(tenant_id)
+        .bind(redirect_origin)
         .fetch_optional(pool)
         .await
         .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?;
 
         if let Some(bunker_key) = bunker_pubkey {
-            let handlers_read = handlers.read().await;
+            let handlers_read = handlers.lock().await;
             if let Some(handler) = handlers_read.get(&bunker_key) {
                 tracing::debug!("RPC: Using cached keys for user {}", &user_pubkey[..8]);
                 return Ok(handler.get_keys());
@@ -226,6 +242,26 @@ async fn get_user_keys(
     tracing::warn!("RPC: Using slow path (DB+KMS) for user {}", &user_pubkey[..8]);
 
     let key_manager = auth_state.state.key_manager.as_ref();
+
+    // First verify an oauth_authorization exists for this user+origin combination
+    // (protects against using revoked/deleted authorizations)
+    let auth_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM oauth_authorizations oa
+            JOIN users u ON oa.user_public_key = u.public_key
+            WHERE oa.user_public_key = $1 AND u.tenant_id = $2 AND oa.redirect_origin = $3
+         )"
+    )
+    .bind(user_pubkey)
+    .bind(tenant_id)
+    .bind(redirect_origin)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?;
+
+    if !auth_exists {
+        return Err(RpcError::Auth(AuthError::InvalidToken));
+    }
 
     // Get user's encrypted secret key
     let result: Option<(Vec<u8>,)> = sqlx::query_as(

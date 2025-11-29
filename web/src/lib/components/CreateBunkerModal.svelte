@@ -1,8 +1,15 @@
 <script lang="ts">
 	import { toast } from 'svelte-hot-french-toast';
 	import { KeycastApi } from '$lib/keycast_api.svelte';
+	import { onMount } from 'svelte';
 
 	const api = new KeycastApi();
+
+	interface Policy {
+		slug: string;
+		display_name: string;
+		description?: string;
+	}
 
 	interface Props {
 		show: boolean;
@@ -12,14 +19,34 @@
 
 	let { show = $bindable(false), onClose, onSuccess }: Props = $props();
 
+	let origin = $state('');
 	let appName = $state('');
+	let selectedPolicySlug = $state('full');
+	let policies = $state<Policy[]>([]);
 	let isCreating = $state(false);
 	let bunkerUrl = $state('');
 	let showCopySuccess = $state(false);
 
+	onMount(async () => {
+		try {
+			// Public endpoint - no credentials needed
+			const res = await api.get<{ policies: Policy[] }>('/policies', { credentials: 'omit' });
+			policies = res.policies;
+		} catch (err) {
+			console.error('Failed to fetch policies:', err);
+		}
+	});
+
 	async function handleCreate() {
-		if (!appName.trim()) {
-			toast.error('App name is required');
+		if (!origin.trim()) {
+			toast.error('App origin is required');
+			return;
+		}
+
+		// Basic URL validation - allow http://localhost for development
+		const isLocalhost = origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1');
+		if (!origin.startsWith('https://') && !isLocalhost) {
+			toast.error('Origin must be HTTPS');
 			return;
 		}
 
@@ -28,16 +55,22 @@
 
 			const response = await api.post<{
 				bunker_url: string;
-				app_name: string;
+				origin: string;
+				app_name: string | null;
 				bunker_pubkey: string;
 				created_at: string;
 			}>(
 				'/user/bunker/create',
-				{ app_name: appName }
+				{
+					origin: origin.trim(),
+					app_name: appName.trim() || null,
+					policy_slug: selectedPolicySlug
+				}
 			);
 
 			bunkerUrl = response.bunker_url;
-			toast.success(`Bunker connection created for ${response.app_name}`);
+			const displayName = response.app_name || response.origin;
+			toast.success(`Bunker connection created for ${displayName}`);
 		} catch (err: any) {
 			console.error('Create bunker error:', err);
 			toast.error(err.message || 'Failed to create bunker connection');
@@ -63,7 +96,9 @@
 			onSuccess();
 		}
 		// Reset form
+		origin = '';
 		appName = '';
+		selectedPolicySlug = 'full';
 		bunkerUrl = '';
 		showCopySuccess = false;
 		onClose();
@@ -109,16 +144,42 @@
 					</p>
 
 					<div class="form-group">
-						<label for="appName">App Name</label>
+						<label for="origin">App Origin</label>
+						<input
+							id="origin"
+							type="url"
+							bind:value={origin}
+							placeholder="e.g. https://primal.net, https://damus.io"
+							required
+							disabled={isCreating}
+						/>
+						<p class="input-hint">The website URL of the app you're connecting to</p>
+					</div>
+
+					<div class="form-group">
+						<label for="appName">App Name <span class="optional">(optional)</span></label>
 						<input
 							id="appName"
 							type="text"
 							bind:value={appName}
-							placeholder="e.g. Damus, Primal, Amethyst"
-							required
+							placeholder="e.g. Primal, Damus"
 							disabled={isCreating}
 						/>
-						<p class="input-hint">Name of the app you're connecting to</p>
+						<p class="input-hint">Friendly name for your reference</p>
+					</div>
+
+					<div class="form-group">
+						<label for="policy">Permissions</label>
+						<select
+							id="policy"
+							bind:value={selectedPolicySlug}
+							disabled={isCreating}
+						>
+							{#each policies as policy}
+								<option value={policy.slug}>{policy.display_name}</option>
+							{/each}
+						</select>
+						<p class="input-hint">What this app is allowed to do with your identity</p>
 					</div>
 
 					<div class="modal-actions">
@@ -236,6 +297,35 @@
 	input:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
+	}
+
+	select {
+		width: 100%;
+		padding: 0.625rem 0.75rem;
+		background: var(--color-divine-bg);
+		border: 1px solid var(--color-divine-border);
+		border-radius: var(--radius-md);
+		color: var(--color-divine-text);
+		font-size: 0.9rem;
+		box-sizing: border-box;
+		transition: border-color 0.2s;
+		cursor: pointer;
+	}
+
+	select:focus {
+		outline: none;
+		border-color: var(--color-divine-green);
+	}
+
+	select:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
+	.optional {
+		font-weight: 400;
+		color: var(--color-divine-text-secondary);
+		font-size: 0.75rem;
 	}
 
 	.input-hint {

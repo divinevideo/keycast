@@ -59,12 +59,13 @@ export class KeycastApi {
         options: {
             headers?: HeadersInit;
             params?: Record<string, string>;
+            credentials?: RequestCredentials;
         } = {},
     ): Promise<T> {
         const url = options.params
             ? `${endpoint}?${new URLSearchParams(options.params)}`
             : endpoint;
-        return this.request<T>(url, { headers: options.headers });
+        return this.request<T>(url, { headers: options.headers, credentials: options.credentials });
     }
 
     async post<T>(

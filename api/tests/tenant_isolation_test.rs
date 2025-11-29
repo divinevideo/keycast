@@ -121,28 +121,30 @@ async fn test_tenant_isolation_oauth_applications() {
 
     // Create OAuth app in tenant 1
     sqlx::query(
-        "INSERT INTO oauth_applications (tenant_id, client_id, client_secret, name, redirect_uris, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        "INSERT INTO oauth_applications (tenant_id, display_name, redirect_origin, client_secret, name, redirect_uris, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
     )
     .bind(tenant1_id)
     .bind("client1")
+    .bind("https://app1.test")  // redirect_origin is the secure identifier
     .bind("secret1")
     .bind("App 1")
-    .bind(r#"["https://tenant1.test/callback"]"#)
+    .bind(r#"["https://app1.test/callback"]"#)
     .execute(&pool)
     .await
     .expect("Failed to create OAuth app in tenant 1");
 
-    // Create OAuth app in tenant 2 with SAME client_id (should work due to tenant scoping)
+    // Create OAuth app in tenant 2 with SAME redirect_origin (should work due to tenant scoping)
     sqlx::query(
-        "INSERT INTO oauth_applications (tenant_id, client_id, client_secret, name, redirect_uris, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        "INSERT INTO oauth_applications (tenant_id, display_name, redirect_origin, client_secret, name, redirect_uris, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
     )
     .bind(tenant2_id)
-    .bind("client1")  // Same client_id as tenant 1
+    .bind("client1")
+    .bind("https://app1.test")  // Same redirect_origin as tenant 1 - allowed because different tenant
     .bind("secret2")
     .bind("App 2")
-    .bind(r#"["https://tenant2.test/callback"]"#)
+    .bind(r#"["https://app1.test/callback"]"#)
     .execute(&pool)
     .await
     .expect("Failed to create OAuth app in tenant 2");

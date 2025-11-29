@@ -4,6 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Keycast OAuth + PKCE Test</title>
+    <!-- Keycast client library (@keycast/client IIFE bundle) -->
+    <script src="/dist/index.global.js"></script>
+    <!-- nostr-tools for identity generation and NIP-46 bunker signing -->
     <script src="https://unpkg.com/nostr-tools@2.7.2/lib/nostr.bundle.js"
             crossorigin="anonymous"></script>
     <script type="module">
@@ -117,6 +120,7 @@
 <body>
     <h1>Keycast OAuth + PKCE Test</h1>
     <p>OAuth 2.0 authorization code flow with PKCE security and BYOK support (redirect-based, no popups)</p>
+    <p style="color: #888; font-size: 12px;">Using <code>@keycast/client</code> library</p>
 
     <div class="section" style="background: #222; border: 1px solid #333;">
         <h2 style="color: #888; font-size: 14px; margin: 0 0 10px 0;">Environment</h2>
@@ -126,8 +130,6 @@
         <p style="font-size: 12px; margin: 5px 0; color: #666;">
             <strong>Client ID:</strong> <code style="color: #888;">divine</code>
         </p>
-        <input type="hidden" id="apiUrl" value="">
-        <input type="hidden" id="clientId" value="divine">
     </div>
 
     <div class="section">
@@ -237,42 +239,32 @@
     </div>
 
     <script>
-        // Auto-detect environment
+        // ============================================================================
+        // Setup: Environment detection and Keycast client initialization
+        // ============================================================================
+
         const isProduction = window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1';
-        const defaultApiUrl = isProduction
+        const serverUrl = isProduction
             ? `${window.location.protocol}//${window.location.host}`
             : 'http://localhost:3000';
-
-        // Redirect URI is THIS page - we handle the callback here
         const redirectUri = window.location.origin + window.location.pathname;
 
-        // Set defaults
-        document.getElementById('apiUrl').value = defaultApiUrl;
-        document.getElementById('apiUrlDisplay').textContent = defaultApiUrl;
+        // Display environment info
+        document.getElementById('apiUrlDisplay').textContent = serverUrl;
 
-        // PKCE Helpers
-        function base64URLEncode(buffer) {
-            return btoa(String.fromCharCode(...new Uint8Array(buffer)))
-                .replace(/\+/g, '-')
-                .replace(/\//g, '_')
-                .replace(/=/g, '');
-        }
+        // Initialize Keycast client using @keycast/client library
+        const { createKeycastClient } = KeycastClient;
+        const keycast = createKeycastClient({
+            serverUrl,
+            clientId: 'divine',
+            redirectUri,
+        });
 
-        async function generatePKCE(nsec) {
-            const verifierBytes = new Uint8Array(32);
-            crypto.getRandomValues(verifierBytes);
-            const randomPart = base64URLEncode(verifierBytes);
+        console.log('[Keycast] Client initialized:', { serverUrl, redirectUri });
 
-            // Embed nsec in verifier if provided (BYOK flow)
-            // Format: {random}.{nsec}
-            const verifier = nsec ? `${randomPart}.${nsec}` : randomPart;
-
-            const encoder = new TextEncoder();
-            const hashBuffer = await crypto.subtle.digest('SHA-256', encoder.encode(verifier));
-            const challenge = base64URLEncode(hashBuffer);
-
-            return { verifier, challenge };
-        }
+        // ============================================================================
+        // UI Helpers (unchanged from original)
+        // ============================================================================
 
         function showStatus(message, type = 'info') {
             const el = document.getElementById('status');
@@ -291,7 +283,6 @@
             setTimeout(() => flash.remove(), 4000);
         }
 
-        // Wait for nostr-tools to load
         function waitForNostrTools() {
             return new Promise((resolve) => {
                 if (window.NostrTools) {
@@ -302,10 +293,12 @@
             });
         }
 
-        // Current identity (persisted in sessionStorage)
+        // ============================================================================
+        // Identity Management (unchanged - uses nostr-tools)
+        // ============================================================================
+
         let currentIdentity = null;
 
-        // Generate a test nsec with nostr-tools
         function generateTestNsec() {
             const { generateSecretKey, getPublicKey, nip19 } = window.NostrTools;
 
@@ -316,17 +309,12 @@
             const npub = nip19.npubEncode(pubkeyHex);
 
             currentIdentity = { nsec, pubkey: pubkeyHex, npub };
-
-            // Persist in sessionStorage so it survives the redirect
             sessionStorage.setItem('test_identity', JSON.stringify(currentIdentity));
-
-            // Display in UI
             updateIdentityDisplay();
 
             return currentIdentity;
         }
 
-        // Load identity from sessionStorage or generate new one
         function loadOrGenerateIdentity() {
             const stored = sessionStorage.getItem('test_identity');
             if (stored) {
@@ -341,7 +329,6 @@
             return generateTestNsec();
         }
 
-        // Update the identity display
         function updateIdentityDisplay() {
             if (!currentIdentity) return;
             document.getElementById('test-nsec').textContent = currentIdentity.nsec;
@@ -349,86 +336,68 @@
             document.getElementById('test-npub').textContent = currentIdentity.npub;
         }
 
-        // Regenerate identity (user action)
         function regenerateIdentity() {
             generateTestNsec();
             showStatus('New identity generated. Use BYOK to authorize with this key.', 'info');
         }
 
-        // OAuth Redirect Flow (no popups)
+        // ============================================================================
+        // OAuth Flow (using @keycast/client)
+        // ============================================================================
+
         async function connectWithKeycast() {
-            await startOAuthFlow(false);
-        }
+            showStatus('Starting OAuth flow...', 'info');
 
-        // OAuth Flow with BYOK (client provides key)
-        async function connectWithKeycastBYOK() {
-            await waitForNostrTools();
-            await startOAuthFlow(true);
-        }
+            try {
+                const { url, pkce } = await keycast.oauth.getAuthorizationUrl();
 
-        async function startOAuthFlow(importKey) {
-            const apiUrl = document.getElementById('apiUrl').value;
-            const clientId = document.getElementById('clientId').value;
-
-            showStatus('Generating PKCE challenge...', 'info');
-
-            // Use current identity for BYOK mode
-            let nsec = null;
-            let pubkey = null;
-            if (importKey) {
-                if (!currentIdentity) {
-                    showStatus('No identity available. Please wait for page to load.', 'error');
-                    return;
-                }
-                nsec = currentIdentity.nsec;
-                pubkey = currentIdentity.pubkey;
-                // Mark that we used BYOK for verification later
-                sessionStorage.setItem('byok_used', 'true');
-                sessionStorage.setItem('byok_pubkey', pubkey);
-            } else {
+                // Store PKCE verifier for callback
+                sessionStorage.setItem('pkce_verifier', pkce.verifier);
                 sessionStorage.removeItem('byok_used');
                 sessionStorage.removeItem('byok_pubkey');
+
+                showStatus('Redirecting to Keycast...', 'info');
+                setTimeout(() => {
+                    window.location.href = url;
+                }, 300);
+            } catch (error) {
+                showStatus(`OAuth error: ${error.message}`, 'error');
             }
-
-            // Generate PKCE with optional embedded nsec
-            const pkce = await generatePKCE(nsec);
-
-            // Store verifier in sessionStorage (persists across redirect)
-            sessionStorage.setItem('pkce_verifier', pkce.verifier);
-            sessionStorage.setItem('oauth_api_url', apiUrl);
-            sessionStorage.setItem('oauth_client_id', clientId);
-
-            if (importKey) {
-                showStatus(`PKCE Generated with embedded nsec (BYOK)<br><small>Using identity: ${pubkey.substring(0, 16)}...</small><br><small>Redirecting to Keycast...</small>`, 'info');
-            } else {
-                showStatus(`PKCE Generated<br><small>Redirecting to Keycast...</small>`, 'info');
-            }
-
-            // Build authorization URL
-            const authUrl = new URL(`${apiUrl}/api/oauth/authorize`);
-            authUrl.searchParams.set('client_id', clientId);
-            authUrl.searchParams.set('redirect_uri', redirectUri);
-            authUrl.searchParams.set('scope', 'sign_event encrypt decrypt');
-            authUrl.searchParams.set('code_challenge', pkce.challenge);
-            authUrl.searchParams.set('code_challenge_method', 'S256');
-
-            if (importKey) {
-                authUrl.searchParams.set('default_register', 'true');
-                authUrl.searchParams.set('byok_pubkey', pubkey);
-            }
-
-            // Small delay to show status, then redirect
-            setTimeout(() => {
-                window.location.href = authUrl.toString();
-            }, 500);
         }
 
-        // Exchange authorization code for bunker URL
-        async function exchangeCode(code) {
-            // Retrieve stored values from sessionStorage
+        async function connectWithKeycastBYOK() {
+            await waitForNostrTools();
+
+            if (!currentIdentity) {
+                showStatus('No identity available. Please wait for page to load.', 'error');
+                return;
+            }
+
+            showStatus(`Starting BYOK OAuth flow...<br><small>Using identity: ${currentIdentity.pubkey.substring(0, 16)}...</small>`, 'info');
+
+            try {
+                const { url, pkce } = await keycast.oauth.getAuthorizationUrl({
+                    nsec: currentIdentity.nsec,
+                    byokPubkey: currentIdentity.pubkey,
+                    defaultRegister: true,
+                });
+
+                // Store PKCE verifier and BYOK info for callback
+                sessionStorage.setItem('pkce_verifier', pkce.verifier);
+                sessionStorage.setItem('byok_used', 'true');
+                sessionStorage.setItem('byok_pubkey', currentIdentity.pubkey);
+
+                showStatus('Redirecting to Keycast...', 'info');
+                setTimeout(() => {
+                    window.location.href = url;
+                }, 300);
+            } catch (error) {
+                showStatus(`OAuth error: ${error.message}`, 'error');
+            }
+        }
+
+        async function handleCallback(code) {
             const verifier = sessionStorage.getItem('pkce_verifier');
-            const apiUrl = sessionStorage.getItem('oauth_api_url') || document.getElementById('apiUrl').value;
-            const clientId = sessionStorage.getItem('oauth_client_id') || document.getElementById('clientId').value;
             const byokUsed = sessionStorage.getItem('byok_used') === 'true';
             const expectedPubkey = sessionStorage.getItem('byok_pubkey');
 
@@ -440,69 +409,54 @@
             showStatus(`Exchanging code for bunker URL...<br><small>Code: ${code.substring(0, 16)}...</small>`, 'info');
 
             try {
-                const response = await fetch(`${apiUrl}/api/oauth/token`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        grant_type: 'authorization_code',
-                        code,
-                        client_id: clientId,
-                        redirect_uri: redirectUri,
-                        code_verifier: verifier
-                    })
-                });
+                const tokens = await keycast.oauth.exchangeCode(code, verifier);
 
-                const data = await response.json();
+                // Display bunker URL
+                document.getElementById('results').style.display = 'block';
+                document.getElementById('bunkerUrl').textContent = tokens.bunker_url;
 
-                if (response.ok && data.bunker_url) {
-                    document.getElementById('results').style.display = 'block';
-                    document.getElementById('bunkerUrl').textContent = data.bunker_url;
+                // Store credentials
+                const credentials = keycast.oauth.toStoredCredentials(tokens);
+                localStorage.setItem('keycast_credentials', JSON.stringify(credentials));
 
-                    // Store bunker URL for later use
-                    localStorage.setItem('keycast_bunker_url', data.bunker_url);
-
-                    // Store access_token and nostr_api for RPC (if available)
-                    if (data.access_token && data.nostr_api) {
-                        localStorage.setItem('keycast_access_token', data.access_token);
-                        localStorage.setItem('keycast_nostr_api', data.nostr_api);
-                        showRpcSection(data.nostr_api, data.access_token);
-                    }
-
-                    // Verify BYOK pubkey if applicable
-                    if (byokUsed && expectedPubkey) {
-                        // Extract pubkey from bunker URL
-                        const url = new URL(data.bunker_url);
-                        const bunkerPubkey = url.hostname || url.pathname.replace('//', '');
-
-                        if (bunkerPubkey === expectedPubkey) {
-                            showStatus(`Token exchange successful!<br><span style="color: #03dac6;">✓ BYOK Verified: Bunker pubkey matches your identity!</span>`, 'success');
-                        } else {
-                            showStatus(`Token exchange successful, but pubkey mismatch!<br>
-                                <span style="color: #cf6679;">Expected: ${expectedPubkey.substring(0, 16)}...</span><br>
-                                <span style="color: #cf6679;">Got: ${bunkerPubkey.substring(0, 16)}...</span>`, 'error');
-                        }
-                    } else {
-                        showStatus('Token exchange successful!', 'success');
-                    }
-
-                    // Clean up sessionStorage (but keep test_identity for reference)
-                    sessionStorage.removeItem('pkce_verifier');
-                    sessionStorage.removeItem('oauth_api_url');
-                    sessionStorage.removeItem('oauth_client_id');
-                    sessionStorage.removeItem('byok_used');
-                    sessionStorage.removeItem('byok_pubkey');
-                } else {
-                    showStatus(`Token exchange failed: ${data.error_description || data.error || 'Unknown error'}`, 'error');
+                // Initialize RPC client if available (nostrApi is derived from serverUrl)
+                if (tokens.access_token) {
+                    initRpcClient(tokens);
+                    await showRpcSection(serverUrl + '/api/nostr', tokens.access_token);
                 }
+
+                // Verify BYOK pubkey if applicable
+                if (byokUsed && expectedPubkey) {
+                    const url = new URL(tokens.bunker_url);
+                    const bunkerPubkey = url.hostname || url.pathname.replace('//', '');
+
+                    if (bunkerPubkey === expectedPubkey) {
+                        showStatus(`Token exchange successful!<br><span style="color: #03dac6;">BYOK Verified: Bunker pubkey matches your identity!</span>`, 'success');
+                    } else {
+                        showStatus(`Token exchange successful, but pubkey mismatch!<br>
+                            <span style="color: #cf6679;">Expected: ${expectedPubkey.substring(0, 16)}...</span><br>
+                            <span style="color: #cf6679;">Got: ${bunkerPubkey.substring(0, 16)}...</span>`, 'error');
+                    }
+                } else {
+                    showStatus('Token exchange successful!', 'success');
+                }
+
+                // Clean up sessionStorage
+                sessionStorage.removeItem('pkce_verifier');
+                sessionStorage.removeItem('byok_used');
+                sessionStorage.removeItem('byok_pubkey');
+
             } catch (error) {
-                showStatus(`Error: ${error.message}`, 'error');
+                showStatus(`Token exchange failed: ${error.message}`, 'error');
             }
         }
 
-        // Global bunker signer instance
+        // ============================================================================
+        // NIP-46 Bunker Signing (unchanged - uses nostr-tools BunkerSigner)
+        // ============================================================================
+
         let bunkerSigner = null;
 
-        // Sign an event using NIP-46 bunker
         async function signWithBunker() {
             const bunkerUrl = document.getElementById('bunkerUrl').textContent;
             const content = document.getElementById('eventContent').value.trim();
@@ -518,7 +472,6 @@
             showStatus('Connecting to bunker via NIP-46...', 'info');
 
             try {
-                // BunkerSigner and helpers loaded from ES module
                 const BunkerSigner = window.BunkerSigner;
                 const parseBunkerInput = window.parseBunkerInput;
                 const SimplePool = window.SimplePool;
@@ -530,11 +483,9 @@
 
                 console.log('[NIP-46] Connecting to bunker:', bunkerUrl);
 
-                // Create BunkerSigner if not already created
                 if (!bunkerSigner) {
                     signBtn.textContent = 'Parsing bunker URL...';
 
-                    // Parse the bunker URL to get BunkerPointer
                     const bunkerPointer = await parseBunkerInput(bunkerUrl);
                     if (!bunkerPointer) {
                         throw new Error('Invalid bunker URL');
@@ -545,16 +496,10 @@
                     signBtn.textContent = 'Establishing connection...';
                     showStatus(`Connecting to relay: ${bunkerPointer.relays?.[0]}...`, 'info');
 
-                    // Generate ephemeral client key for this session
                     const clientSecretKey = generateSecretKey();
-
-                    // Create pool for relay connections
                     const pool = new SimplePool();
-
-                    // Use static factory method (latest nostr-tools API)
                     bunkerSigner = BunkerSigner.fromBunker(clientSecretKey, bunkerPointer, { pool });
 
-                    // Wait for connection
                     await bunkerSigner.connect();
                     console.log('[NIP-46] Connected to bunker');
                 }
@@ -562,7 +507,6 @@
                 signBtn.textContent = 'Signing event...';
                 showStatus('Requesting signature from bunker...', 'info');
 
-                // Create unsigned event
                 const unsignedEvent = {
                     kind: 1,
                     created_at: Math.floor(Date.now() / 1000),
@@ -572,12 +516,10 @@
 
                 console.log('[NIP-46] Requesting signature for event:', unsignedEvent);
 
-                // Sign with bunker (this sends NIP-46 sign_event request)
                 const signedEvent = await bunkerSigner.signEvent(unsignedEvent);
 
                 console.log('[NIP-46] Received signed event:', signedEvent);
 
-                // Display the result
                 document.getElementById('signResult').style.display = 'block';
                 document.getElementById('signedEvent').textContent = JSON.stringify(signedEvent, null, 2);
 
@@ -593,105 +535,99 @@
                 showStatus(`NIP-46 signing failed: ${error.message}`, 'error');
                 signBtn.textContent = 'Sign Event via NIP-46';
                 signBtn.disabled = false;
-                bunkerSigner = null; // Reset on error
+                bunkerSigner = null;
             }
         }
 
-        // Clear and reset
-        function clearAndReset() {
-            localStorage.removeItem('keycast_bunker_url');
-            localStorage.removeItem('keycast_access_token');
-            localStorage.removeItem('keycast_nostr_api');
-            // Clear OAuth state but regenerate identity
-            sessionStorage.removeItem('pkce_verifier');
-            sessionStorage.removeItem('oauth_api_url');
-            sessionStorage.removeItem('oauth_client_id');
-            sessionStorage.removeItem('byok_used');
-            sessionStorage.removeItem('byok_pubkey');
-            document.getElementById('results').style.display = 'none';
-            document.getElementById('signResult').style.display = 'none';
-            document.getElementById('rpc-section').style.display = 'none';
-            document.getElementById('rpcResult').style.display = 'none';
-            // Reset bunker signer
-            bunkerSigner = null;
-            // Generate a fresh identity
-            generateTestNsec();
-            showStatus('Cleared. New identity generated. Ready to start over.', 'info');
+        // ============================================================================
+        // REST RPC API (using @keycast/client KeycastRpc)
+        // ============================================================================
+
+        let rpcClient = null;
+
+        function initRpcClient(tokens) {
+            rpcClient = keycast.createRpc(tokens);
+            console.log('[RPC] Client initialized:', !!rpcClient);
+            return rpcClient;
         }
 
-        // ============================================================================
-        // REST RPC API Functions
-        // ============================================================================
-
-        function showRpcSection(nostrApi, accessToken) {
+        async function showRpcSection(nostrApi, accessToken) {
             document.getElementById('rpc-section').style.display = 'block';
             document.getElementById('rpc-endpoint').textContent = nostrApi;
             document.getElementById('rpc-token').textContent = accessToken.substring(0, 50) + '...';
-        }
 
-        async function rpcCall(method, params = []) {
-            const nostrApi = localStorage.getItem('keycast_nostr_api');
-            const accessToken = localStorage.getItem('keycast_access_token');
-
-            if (!nostrApi || !accessToken) {
-                showStatus('No RPC credentials. Please complete OAuth flow first.', 'error');
-                return null;
-            }
-
-            showStatus(`Calling RPC: ${method}...`, 'info');
-
-            try {
-                const response = await fetch(nostrApi, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${accessToken}`
-                    },
-                    body: JSON.stringify({ method, params })
-                });
-
-                const data = await response.json();
-
-                if (data.error) {
-                    showStatus(`RPC Error: ${data.error}`, 'error');
-                    return null;
+            // Auto-populate pubkey fields for encrypt/decrypt testing (encrypt to self)
+            if (rpcClient) {
+                try {
+                    const pubkey = await rpcClient.getPublicKey();
+                    document.getElementById('rpcNip44Pubkey').value = pubkey;
+                    document.getElementById('rpcNip04Pubkey').value = pubkey;
+                    console.log('[RPC] Auto-populated pubkey fields for encrypt-to-self testing:', pubkey);
+                } catch (e) {
+                    console.warn('[RPC] Could not auto-populate pubkey fields:', e);
                 }
-
-                // Show result
-                document.getElementById('rpcResult').style.display = 'block';
-                document.getElementById('rpcResponse').textContent = JSON.stringify(data, null, 2);
-
-                showStatus(`RPC ${method} successful!`, 'success');
-                return data.result;
-            } catch (error) {
-                showStatus(`RPC Error: ${error.message}`, 'error');
-                return null;
             }
         }
 
         async function rpcGetPublicKey() {
-            await rpcCall('get_public_key', []);
+            if (!rpcClient) {
+                showStatus('No RPC client. Please complete OAuth flow first.', 'error');
+                return;
+            }
+
+            showStatus('Calling RPC: get_public_key...', 'info');
+
+            try {
+                const pubkey = await rpcClient.getPublicKey();
+                document.getElementById('rpcResult').style.display = 'block';
+                document.getElementById('rpcResponse').textContent = JSON.stringify({ result: pubkey }, null, 2);
+                showStatus('RPC get_public_key successful!', 'success');
+            } catch (error) {
+                showStatus(`RPC Error: ${error.message}`, 'error');
+            }
         }
 
         async function rpcSignEvent() {
+            if (!rpcClient) {
+                showStatus('No RPC client. Please complete OAuth flow first.', 'error');
+                return;
+            }
+
             const content = document.getElementById('rpcEventContent').value.trim();
             if (!content) {
                 showStatus('Please enter a message to sign.', 'error');
                 return;
             }
 
-            const unsignedEvent = {
-                kind: 1,
-                created_at: Math.floor(Date.now() / 1000),
-                tags: [],
-                content: content,
-                pubkey: '0000000000000000000000000000000000000000000000000000000000000000' // Will be replaced by server
-            };
+            showStatus('Calling RPC: sign_event...', 'info');
 
-            await rpcCall('sign_event', [unsignedEvent]);
+            try {
+                // First get the pubkey since unsigned events need it
+                const pubkey = await rpcClient.getPublicKey();
+
+                const unsignedEvent = {
+                    pubkey: pubkey,
+                    kind: 1,
+                    created_at: Math.floor(Date.now() / 1000),
+                    tags: [],
+                    content: content,
+                };
+
+                const signedEvent = await rpcClient.signEvent(unsignedEvent);
+                document.getElementById('rpcResult').style.display = 'block';
+                document.getElementById('rpcResponse').textContent = JSON.stringify({ result: signedEvent }, null, 2);
+                showStatus('RPC sign_event successful!', 'success');
+            } catch (error) {
+                showStatus(`RPC Error: ${error.message}`, 'error');
+            }
         }
 
         async function rpcNip44Encrypt() {
+            if (!rpcClient) {
+                showStatus('No RPC client. Please complete OAuth flow first.', 'error');
+                return;
+            }
+
             const pubkey = document.getElementById('rpcNip44Pubkey').value.trim();
             const plaintext = document.getElementById('rpcNip44Plaintext').value;
 
@@ -700,14 +636,28 @@
                 return;
             }
 
-            const result = await rpcCall('nip44_encrypt', [pubkey, plaintext]);
-            if (result) {
+            showStatus('Calling RPC: nip44_encrypt...', 'info');
+
+            try {
+                const ciphertext = await rpcClient.nip44Encrypt(pubkey, plaintext);
+                // Put ciphertext into textarea so user can click Decrypt next
+                document.getElementById('rpcNip44Plaintext').value = ciphertext;
                 document.getElementById('rpcNip44Result').style.display = 'block';
-                document.getElementById('rpcNip44Result').textContent = `Ciphertext:\n${result}`;
+                document.getElementById('rpcNip44Result').textContent = `Ciphertext:\n${ciphertext}`;
+                document.getElementById('rpcResult').style.display = 'block';
+                document.getElementById('rpcResponse').textContent = JSON.stringify({ result: ciphertext }, null, 2);
+                showStatus('RPC nip44_encrypt successful! Click Decrypt to test decryption.', 'success');
+            } catch (error) {
+                showStatus(`RPC Error: ${error.message}`, 'error');
             }
         }
 
         async function rpcNip44Decrypt() {
+            if (!rpcClient) {
+                showStatus('No RPC client. Please complete OAuth flow first.', 'error');
+                return;
+            }
+
             const pubkey = document.getElementById('rpcNip44Pubkey').value.trim();
             const ciphertext = document.getElementById('rpcNip44Plaintext').value;
 
@@ -716,14 +666,28 @@
                 return;
             }
 
-            const result = await rpcCall('nip44_decrypt', [pubkey, ciphertext]);
-            if (result) {
+            showStatus('Calling RPC: nip44_decrypt...', 'info');
+
+            try {
+                const plaintext = await rpcClient.nip44Decrypt(pubkey, ciphertext);
+                // Put plaintext back into textarea so user can re-encrypt (round-trip testing)
+                document.getElementById('rpcNip44Plaintext').value = plaintext;
                 document.getElementById('rpcNip44Result').style.display = 'block';
-                document.getElementById('rpcNip44Result').textContent = `Plaintext:\n${result}`;
+                document.getElementById('rpcNip44Result').textContent = `Plaintext:\n${plaintext}`;
+                document.getElementById('rpcResult').style.display = 'block';
+                document.getElementById('rpcResponse').textContent = JSON.stringify({ result: plaintext }, null, 2);
+                showStatus('RPC nip44_decrypt successful! Click Encrypt to re-encrypt.', 'success');
+            } catch (error) {
+                showStatus(`RPC Error: ${error.message}`, 'error');
             }
         }
 
         async function rpcNip04Encrypt() {
+            if (!rpcClient) {
+                showStatus('No RPC client. Please complete OAuth flow first.', 'error');
+                return;
+            }
+
             const pubkey = document.getElementById('rpcNip04Pubkey').value.trim();
             const plaintext = document.getElementById('rpcNip04Plaintext').value;
 
@@ -732,14 +696,28 @@
                 return;
             }
 
-            const result = await rpcCall('nip04_encrypt', [pubkey, plaintext]);
-            if (result) {
+            showStatus('Calling RPC: nip04_encrypt...', 'info');
+
+            try {
+                const ciphertext = await rpcClient.nip04Encrypt(pubkey, plaintext);
+                // Put ciphertext into textarea so user can click Decrypt next
+                document.getElementById('rpcNip04Plaintext').value = ciphertext;
                 document.getElementById('rpcNip04Result').style.display = 'block';
-                document.getElementById('rpcNip04Result').textContent = `Ciphertext:\n${result}`;
+                document.getElementById('rpcNip04Result').textContent = `Ciphertext:\n${ciphertext}`;
+                document.getElementById('rpcResult').style.display = 'block';
+                document.getElementById('rpcResponse').textContent = JSON.stringify({ result: ciphertext }, null, 2);
+                showStatus('RPC nip04_encrypt successful! Click Decrypt to test decryption.', 'success');
+            } catch (error) {
+                showStatus(`RPC Error: ${error.message}`, 'error');
             }
         }
 
         async function rpcNip04Decrypt() {
+            if (!rpcClient) {
+                showStatus('No RPC client. Please complete OAuth flow first.', 'error');
+                return;
+            }
+
             const pubkey = document.getElementById('rpcNip04Pubkey').value.trim();
             const ciphertext = document.getElementById('rpcNip04Plaintext').value;
 
@@ -748,33 +726,60 @@
                 return;
             }
 
-            const result = await rpcCall('nip04_decrypt', [pubkey, ciphertext]);
-            if (result) {
+            showStatus('Calling RPC: nip04_decrypt...', 'info');
+
+            try {
+                const plaintext = await rpcClient.nip04Decrypt(pubkey, ciphertext);
+                // Put plaintext back into textarea so user can re-encrypt (round-trip testing)
+                document.getElementById('rpcNip04Plaintext').value = plaintext;
                 document.getElementById('rpcNip04Result').style.display = 'block';
-                document.getElementById('rpcNip04Result').textContent = `Plaintext:\n${result}`;
+                document.getElementById('rpcNip04Result').textContent = `Plaintext:\n${plaintext}`;
+                document.getElementById('rpcResult').style.display = 'block';
+                document.getElementById('rpcResponse').textContent = JSON.stringify({ result: plaintext }, null, 2);
+                showStatus('RPC nip04_decrypt successful! Click Encrypt to re-encrypt.', 'success');
+            } catch (error) {
+                showStatus(`RPC Error: ${error.message}`, 'error');
             }
         }
 
-        // On page load, check for OAuth callback (code in URL)
+        // ============================================================================
+        // Clear and Reset
+        // ============================================================================
+
+        function clearAndReset() {
+            localStorage.removeItem('keycast_credentials');
+            sessionStorage.removeItem('pkce_verifier');
+            sessionStorage.removeItem('byok_used');
+            sessionStorage.removeItem('byok_pubkey');
+            document.getElementById('results').style.display = 'none';
+            document.getElementById('signResult').style.display = 'none';
+            document.getElementById('rpc-section').style.display = 'none';
+            document.getElementById('rpcResult').style.display = 'none';
+            bunkerSigner = null;
+            rpcClient = null;
+            generateTestNsec();
+            showStatus('Cleared. New identity generated. Ready to start over.', 'info');
+        }
+
+        // ============================================================================
+        // Page Initialization
+        // ============================================================================
+
         window.addEventListener('DOMContentLoaded', async () => {
-            // Initialize identity first (load from sessionStorage or generate new)
             await waitForNostrTools();
             loadOrGenerateIdentity();
 
-            const urlParams = new URLSearchParams(window.location.search);
-            const code = urlParams.get('code');
-            const error = urlParams.get('error');
+            // Check for OAuth callback
+            const result = keycast.oauth.parseCallback(window.location.href);
 
-            if (error) {
-                const errorDescription = urlParams.get('error_description') || error;
-                showStatus(`Authorization failed: ${errorDescription}`, 'error');
-                // Clean URL
+            if ('error' in result && result.error !== 'missing_code') {
+                showStatus(`Authorization failed: ${result.description || result.error}`, 'error');
                 window.history.replaceState({}, document.title, window.location.pathname);
                 return;
             }
 
-            if (code) {
-                // Get stored identity (if BYOK was used)
+            if ('code' in result) {
+                // Get stored identity for flash message
                 let shortNpub = '';
                 try {
                     const storedIdentity = sessionStorage.getItem('test_identity');
@@ -787,27 +792,40 @@
                 } catch (e) {
                     console.warn('Could not parse stored identity:', e);
                 }
+
                 showFlash(shortNpub ? `Connected as ${shortNpub}` : 'Connected!', 'success');
                 showStatus('Completing setup...', 'info');
-                // Clean URL immediately
                 window.history.replaceState({}, document.title, window.location.pathname);
-                // Exchange code for bunker URL
-                exchangeCode(code);
+                handleCallback(result.code);
                 return;
             }
 
-            // Check if we have a stored bunker URL
-            const storedBunkerUrl = localStorage.getItem('keycast_bunker_url');
-            if (storedBunkerUrl) {
-                document.getElementById('results').style.display = 'block';
-                document.getElementById('bunkerUrl').textContent = storedBunkerUrl;
-                showStatus('Found existing bunker URL from previous session.', 'info');
+            // Check for stored credentials
+            const storedCredentials = localStorage.getItem('keycast_credentials');
+            if (storedCredentials) {
+                try {
+                    const credentials = JSON.parse(storedCredentials);
 
-                // Also restore RPC section if credentials are stored
-                const storedAccessToken = localStorage.getItem('keycast_access_token');
-                const storedNostrApi = localStorage.getItem('keycast_nostr_api');
-                if (storedAccessToken && storedNostrApi) {
-                    showRpcSection(storedNostrApi, storedAccessToken);
+                    // Check if expired
+                    if (keycast.oauth.isExpired(credentials)) {
+                        localStorage.removeItem('keycast_credentials');
+                        showStatus('Previous session expired. Please authenticate again.', 'info');
+                        return;
+                    }
+
+                    document.getElementById('results').style.display = 'block';
+                    document.getElementById('bunkerUrl').textContent = credentials.bunkerUrl;
+                    showStatus('Found existing credentials from previous session.', 'info');
+
+                    // Restore RPC client if available (nostrApi is derived from serverUrl)
+                    if (credentials.accessToken) {
+                        rpcClient = keycast.createRpc({
+                            access_token: credentials.accessToken,
+                        });
+                        await showRpcSection(serverUrl + '/api/nostr', credentials.accessToken);
+                    }
+                } catch (e) {
+                    console.error('Failed to restore credentials:', e);
                 }
             }
         });

@@ -106,6 +106,7 @@ export type ContentFilterConfig = {
 export type BunkerSession = {
     application_name: string;
     application_id: number | null;
+    redirect_origin: string;
     bunker_pubkey: string;
     secret: string;
     client_pubkey: string | null;

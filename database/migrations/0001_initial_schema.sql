@@ -19,7 +19,9 @@ CREATE TABLE public.authorizations (
     expires_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    tenant_id bigint DEFAULT 1 NOT NULL
+    tenant_id bigint DEFAULT 1 NOT NULL,
+    connected_client_pubkey text,
+    connected_at timestamp with time zone
 );
 
 CREATE SEQUENCE public.authorizations_id_seq
@@ -97,10 +99,11 @@ ALTER SEQUENCE public.key_export_tokens_id_seq OWNED BY public.key_export_tokens
 
 CREATE TABLE public.oauth_applications (
     id integer NOT NULL,
-    client_id text NOT NULL,
-    client_secret text NOT NULL,
+    redirect_origin text NOT NULL,
+    display_name text,
     name text NOT NULL,
     redirect_uris text NOT NULL,
+    client_secret text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     tenant_id bigint DEFAULT 1 NOT NULL,
@@ -120,7 +123,8 @@ ALTER SEQUENCE public.oauth_applications_id_seq OWNED BY public.oauth_applicatio
 CREATE TABLE public.oauth_authorizations (
     id integer NOT NULL,
     user_public_key character(64) NOT NULL,
-    application_id integer NOT NULL,
+    redirect_origin text NOT NULL,
+    application_id integer,
     bunker_public_key character(64) NOT NULL,
     bunker_secret bytea NOT NULL,
     secret text NOT NULL,
@@ -129,8 +133,10 @@ CREATE TABLE public.oauth_authorizations (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     policy_id integer,
     expires_at timestamp with time zone,
-    revoked_at timestamp with time zone,
-    tenant_id bigint DEFAULT 1 NOT NULL
+    tenant_id bigint DEFAULT 1 NOT NULL,
+    client_public_key character(64),
+    connected_client_pubkey text,
+    connected_at timestamp with time zone
 );
 
 CREATE SEQUENCE public.oauth_authorizations_id_seq
@@ -170,8 +176,7 @@ CREATE TABLE public.permissions (
     identifier text NOT NULL,
     config text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    tenant_id bigint DEFAULT 1 NOT NULL
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 CREATE SEQUENCE public.permissions_id_seq
@@ -210,9 +215,11 @@ CREATE TABLE public.policies (
     id integer NOT NULL,
     name text NOT NULL,
     team_id integer,
+    slug VARCHAR(50),
+    display_name VARCHAR(100),
+    description TEXT,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    tenant_id bigint DEFAULT 1 NOT NULL
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 CREATE SEQUENCE public.policies_id_seq
@@ -343,6 +350,15 @@ CREATE SEQUENCE public.tenants_id_seq
 
 ALTER SEQUENCE public.tenants_id_seq OWNED BY public.tenants.id;
 
+-- Signer instances registry for hashring-based NIP-46 event distribution
+CREATE TABLE signer_instances (
+    instance_id UUID PRIMARY KEY,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_heartbeat TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_signer_instances_heartbeat ON signer_instances(last_heartbeat);
+
 CREATE TABLE public.user_authorizations (
     id integer NOT NULL,
     user_public_key character(64),
@@ -440,7 +456,7 @@ ALTER TABLE ONLY public.oauth_applications
     ADD CONSTRAINT oauth_applications_pkey PRIMARY KEY (id);
 
 ALTER TABLE ONLY public.oauth_authorizations
-    ADD CONSTRAINT oauth_auth_user_app_unique UNIQUE (user_public_key, application_id);
+    ADD CONSTRAINT oauth_auth_user_origin_unique UNIQUE (tenant_id, user_public_key, redirect_origin);
 
 ALTER TABLE ONLY public.oauth_authorizations
     ADD CONSTRAINT oauth_authorizations_pkey PRIMARY KEY (id);
@@ -499,6 +515,8 @@ CREATE UNIQUE INDEX idx_authorizations_secret_tenant ON public.authorizations US
 
 CREATE INDEX idx_authorizations_tenant_id ON public.authorizations USING btree (tenant_id);
 
+CREATE INDEX idx_auth_connected_client_pubkey ON public.authorizations USING btree (connected_client_pubkey) WHERE (connected_client_pubkey IS NOT NULL);
+
 CREATE INDEX idx_email_verification_tokens_expires_at ON public.email_verification_tokens USING btree (expires_at);
 
 CREATE INDEX idx_email_verification_tokens_token_hash ON public.email_verification_tokens USING btree (token_hash);
@@ -519,11 +537,12 @@ CREATE INDEX idx_key_export_tokens_token ON public.key_export_tokens USING btree
 
 CREATE INDEX idx_key_export_tokens_user ON public.key_export_tokens USING btree (user_public_key);
 
-CREATE UNIQUE INDEX idx_oauth_applications_client_id_tenant ON public.oauth_applications USING btree (tenant_id, client_id);
+CREATE UNIQUE INDEX idx_oauth_applications_redirect_origin_tenant ON public.oauth_applications USING btree (tenant_id, redirect_origin);
 
-CREATE INDEX idx_oauth_applications_policy_id ON public.oauth_applications USING btree (policy_id);
 
 CREATE INDEX idx_oauth_applications_tenant_id ON public.oauth_applications USING btree (tenant_id);
+
+CREATE INDEX idx_oauth_applications_policy_id ON public.oauth_applications USING btree (policy_id);
 
 CREATE INDEX idx_oauth_auth_app ON public.oauth_authorizations USING btree (application_id);
 
@@ -534,6 +553,8 @@ CREATE INDEX idx_oauth_authorizations_bunker_tenant ON public.oauth_authorizatio
 CREATE INDEX idx_oauth_authorizations_policy_id ON public.oauth_authorizations USING btree (policy_id);
 
 CREATE INDEX idx_oauth_authorizations_tenant_id ON public.oauth_authorizations USING btree (tenant_id);
+
+CREATE INDEX idx_oauth_auth_connected_client_pubkey ON public.oauth_authorizations USING btree (connected_client_pubkey) WHERE (connected_client_pubkey IS NOT NULL);
 
 CREATE INDEX idx_oauth_codes_challenge ON public.oauth_codes USING btree (code_challenge) WHERE (code_challenge IS NOT NULL);
 
@@ -549,13 +570,11 @@ CREATE INDEX idx_password_reset_tokens_token_hash ON public.password_reset_token
 
 CREATE INDEX idx_password_reset_tokens_user_id ON public.password_reset_tokens USING btree (user_public_key);
 
-CREATE INDEX idx_permissions_tenant_id ON public.permissions USING btree (tenant_id);
 
 CREATE INDEX idx_personal_keys_tenant_id ON public.personal_keys USING btree (tenant_id);
 
 CREATE INDEX idx_personal_keys_user_public_key ON public.personal_keys USING btree (user_public_key);
 
-CREATE INDEX idx_policies_tenant_id ON public.policies USING btree (tenant_id);
 
 CREATE INDEX idx_signing_activity_app ON public.signing_activity USING btree (application_id);
 
@@ -592,6 +611,8 @@ CREATE INDEX permissions_identifier_idx ON public.permissions USING btree (ident
 CREATE INDEX policies_name_idx ON public.policies USING btree (name);
 
 CREATE INDEX policies_team_id_idx ON public.policies USING btree (team_id);
+
+CREATE UNIQUE INDEX policies_slug_unique ON policies (slug) WHERE slug IS NOT NULL;
 
 CREATE INDEX policy_permissions_permission_id_idx ON public.policy_permissions USING btree (permission_id);
 
@@ -667,10 +688,10 @@ ALTER TABLE ONLY public.key_export_tokens
     ADD CONSTRAINT key_export_tokens_user_public_key_fkey FOREIGN KEY (user_public_key) REFERENCES public.users(public_key) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.oauth_applications
-    ADD CONSTRAINT oauth_applications_policy_id_fkey FOREIGN KEY (policy_id) REFERENCES public.policies(id);
+    ADD CONSTRAINT oauth_applications_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
 
 ALTER TABLE ONLY public.oauth_applications
-    ADD CONSTRAINT oauth_applications_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
+    ADD CONSTRAINT oauth_applications_policy_id_fkey FOREIGN KEY (policy_id) REFERENCES public.policies(id);
 
 ALTER TABLE ONLY public.oauth_authorizations
     ADD CONSTRAINT oauth_authorizations_application_id_fkey FOREIGN KEY (application_id) REFERENCES public.oauth_applications(id);
@@ -693,8 +714,6 @@ ALTER TABLE ONLY public.oauth_codes
 ALTER TABLE ONLY public.password_reset_tokens
     ADD CONSTRAINT password_reset_tokens_user_public_key_fkey FOREIGN KEY (user_public_key) REFERENCES public.users(public_key) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.permissions
-    ADD CONSTRAINT permissions_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
 
 ALTER TABLE ONLY public.personal_keys
     ADD CONSTRAINT personal_keys_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
@@ -705,8 +724,6 @@ ALTER TABLE ONLY public.personal_keys
 ALTER TABLE ONLY public.policies
     ADD CONSTRAINT policies_team_id_fkey FOREIGN KEY (team_id) REFERENCES public.teams(id);
 
-ALTER TABLE ONLY public.policies
-    ADD CONSTRAINT policies_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
 
 ALTER TABLE ONLY public.policy_permissions
     ADD CONSTRAINT policy_permissions_permission_id_fkey FOREIGN KEY (permission_id) REFERENCES public.permissions(id);
@@ -753,6 +770,9 @@ ALTER TABLE ONLY public.users
 INSERT INTO tenants (id, domain, name, created_at, updated_at)
 VALUES (1, 'default', 'Default Tenant', NOW(), NOW())
 ON CONFLICT DO NOTHING;
+
+-- Fix sequence after explicit ID insert
+SELECT setval('tenants_id_seq', (SELECT COALESCE(MAX(id), 0) + 1 FROM tenants), false);
 
 INSERT INTO permissions (identifier, config, created_at, updated_at)
 VALUES (
@@ -835,13 +855,35 @@ VALUES (
 )
 ON CONFLICT DO NOTHING;
 
-INSERT INTO policies (name, team_id, created_at, updated_at, tenant_id)
+-- Decrypt only permission (true read-only: decrypt + NIP-42 auth only)
+INSERT INTO permissions (identifier, config, created_at, updated_at)
+VALUES (
+    'decrypt_only',
+    '{}',
+    NOW(),
+    NOW()
+)
+ON CONFLICT DO NOTHING;
+
+-- Full access permission (no restrictions)
+INSERT INTO permissions (identifier, config, created_at, updated_at)
+VALUES (
+    'full_access',
+    '{}',
+    NOW(),
+    NOW()
+)
+ON CONFLICT DO NOTHING;
+
+INSERT INTO policies (name, team_id, slug, display_name, description, created_at, updated_at)
 VALUES (
     'Standard Social (Default)',
     NULL,
+    'social',
+    'Social App',
+    'Post notes, reactions, and private messages',
     NOW(),
-    NOW(),
-    1
+    NOW()
 )
 ON CONFLICT DO NOTHING;
 
@@ -854,20 +896,21 @@ SELECT
 FROM policies p
 CROSS JOIN permissions perm
 WHERE p.name = 'Standard Social (Default)'
-  AND p.tenant_id = 1
   AND perm.identifier = 'allowed_kinds_social_messaging'
   AND NOT EXISTS (
     SELECT 1 FROM policy_permissions pp
     WHERE pp.policy_id = p.id AND pp.permission_id = perm.id
   );
 
-INSERT INTO policies (name, team_id, created_at, updated_at, tenant_id)
+INSERT INTO policies (name, team_id, slug, display_name, description, created_at, updated_at)
 VALUES (
     'Read Only',
     NULL,
+    'readonly',
+    'Read Only',
+    'Can only read encrypted messages and authenticate with relays. Cannot post, react, or send messages.',
     NOW(),
-    NOW(),
-    1
+    NOW()
 )
 ON CONFLICT DO NOTHING;
 
@@ -880,20 +923,21 @@ SELECT
 FROM policies p
 CROSS JOIN permissions perm
 WHERE p.name = 'Read Only'
-  AND p.tenant_id = 1
-  AND perm.identifier = 'allowed_kinds_social'
+  AND perm.identifier = 'decrypt_only'
   AND NOT EXISTS (
     SELECT 1 FROM policy_permissions pp
     WHERE pp.policy_id = p.id AND pp.permission_id = perm.id
   );
 
-INSERT INTO policies (name, team_id, created_at, updated_at, tenant_id)
+INSERT INTO policies (name, team_id, slug, display_name, description, created_at, updated_at)
 VALUES (
     'Wallet Only',
     NULL,
+    'wallet',
+    'Wallet Only',
+    'Wallet and payment operations only',
     NOW(),
-    NOW(),
-    1
+    NOW()
 )
 ON CONFLICT DO NOTHING;
 
@@ -906,37 +950,93 @@ SELECT
 FROM policies p
 CROSS JOIN permissions perm
 WHERE p.name = 'Wallet Only'
-  AND p.tenant_id = 1
   AND perm.identifier = 'allowed_kinds_zaps'
   AND NOT EXISTS (
     SELECT 1 FROM policy_permissions pp
     WHERE pp.policy_id = p.id AND pp.permission_id = perm.id
   );
 
+-- Full access policy (sign, encrypt, decrypt anything)
+INSERT INTO policies (name, team_id, slug, display_name, description, created_at, updated_at)
+VALUES (
+    'Full Access',
+    NULL,
+    'full',
+    'Full Access',
+    'Sign, encrypt, and decrypt anything without restrictions',
+    NOW(),
+    NOW()
+)
+ON CONFLICT DO NOTHING;
+
+INSERT INTO policy_permissions (policy_id, permission_id, created_at, updated_at)
+SELECT
+    p.id,
+    perm.id,
+    NOW(),
+    NOW()
+FROM policies p
+CROSS JOIN permissions perm
+WHERE p.name = 'Full Access'
+  AND perm.identifier = 'full_access'
+  AND NOT EXISTS (
+    SELECT 1 FROM policy_permissions pp
+    WHERE pp.policy_id = p.id AND pp.permission_id = perm.id
+  );
+
+-- Note: policy is on oauth_authorizations, not oauth_applications
+-- redirect_origin is the secure identifier (cannot be spoofed)
 INSERT INTO oauth_applications (
-    client_id,
+    redirect_origin,
+    display_name,
     client_secret,
     name,
     redirect_uris,
-    policy_id,
     tenant_id,
     created_at,
     updated_at
 )
 VALUES (
+    'app://keycast-login',
     'keycast-login',
     'not-used-for-personal-auth',
     'Personal Keycast Bunker',
     'http://localhost:3000/api/connect,https://login.divine.video/api/connect',
-    (SELECT id FROM policies WHERE name = 'Standard Social (Default)' AND tenant_id = 1 LIMIT 1),
     1,
     NOW(),
     NOW()
 )
-ON CONFLICT (tenant_id, client_id)
+ON CONFLICT (tenant_id, redirect_origin)
 DO UPDATE SET
     client_secret = EXCLUDED.client_secret,
     name = EXCLUDED.name,
     redirect_uris = EXCLUDED.redirect_uris,
-    policy_id = EXCLUDED.policy_id,
+    updated_at = NOW();
+
+-- Divine OAuth application (third-party app)
+INSERT INTO oauth_applications (
+    redirect_origin,
+    display_name,
+    client_secret,
+    name,
+    redirect_uris,
+    tenant_id,
+    created_at,
+    updated_at
+)
+VALUES (
+    'https://divine.video',
+    'divine',
+    'public-client',
+    'Divine Video',
+    'https://divine.video/callback,http://localhost:5173/callback,http://localhost:3000/callback,divine://callback',
+    1,
+    NOW(),
+    NOW()
+)
+ON CONFLICT (tenant_id, redirect_origin)
+DO UPDATE SET
+    client_secret = EXCLUDED.client_secret,
+    name = EXCLUDED.name,
+    redirect_uris = EXCLUDED.redirect_uris,
     updated_at = NOW();

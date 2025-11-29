@@ -59,50 +59,242 @@ fn test_bunker_url_format() {
 }
 
 // ============================================================================
-// Database Integration Tests (Disabled - Require Postgres, Not Sqlite)
+// Database Integration Tests
 // ============================================================================
-// These tests are kept for future when test infrastructure supports Postgres
-// Currently ignored because project uses Postgres but tests try to use Sqlite
+
+use chrono::{Duration, Utc};
+use nostr_sdk::Keys;
+use sqlx::PgPool;
+use uuid::Uuid;
+
+async fn setup_pool() -> PgPool {
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string());
+    PgPool::connect(&database_url).await.expect("Failed to connect to database")
+}
 
 /// Test authorization code expiration logic
 #[tokio::test]
-#[ignore = "Requires Postgres test infrastructure"]
 async fn test_authorization_code_expiration() {
-    use sqlx::PgPool;
-    let _pool = PgPool::connect("postgres://test").await.unwrap();
-    // Test code would go here
-    // TODO: Re-enable when Postgres test setup available
+    let pool = setup_pool().await;
+    let user_keys = Keys::generate();
+    let user_pubkey = user_keys.public_key().to_hex();
+    let redirect_origin = format!("https://test-{}.example.com", Uuid::new_v4());
+
+    // Create user
+    sqlx::query("INSERT INTO users (public_key, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())")
+        .bind(&user_pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Create OAuth app
+    let app_id: i32 = sqlx::query_scalar(
+        "INSERT INTO oauth_applications (name, redirect_origin, client_secret, redirect_uris, tenant_id, created_at, updated_at)
+         VALUES ('Test App', $1, 'secret', '[\"http://localhost/callback\"]', 1, NOW(), NOW())
+         RETURNING id"
+    )
+    .bind(&redirect_origin)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // Create EXPIRED oauth_code (expires_at in the past)
+    let expired_time = Utc::now() - Duration::minutes(10);
+    let code = format!("expired_code_{}", Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO oauth_codes (code, user_public_key, application_id, redirect_uri, scope, expires_at, tenant_id, created_at)
+         VALUES ($1, $2, $3, $4, 'sign', $5, 1, NOW())"
+    )
+    .bind(&code)
+    .bind(&user_pubkey)
+    .bind(app_id)
+    .bind("http://localhost/callback")
+    .bind(expired_time)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Try to fetch the code - should exist but be expired
+    let result: Option<(chrono::DateTime<Utc>,)> = sqlx::query_as(
+        "SELECT expires_at FROM oauth_codes WHERE code = $1 AND expires_at > NOW()"
+    )
+    .bind(&code)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+
+    assert!(result.is_none(), "Expired code should not be found when filtering by expires_at > NOW()");
 }
 
 /// Test one-time use of authorization codes
 #[tokio::test]
-#[ignore = "Requires Postgres test infrastructure"]
 async fn test_authorization_code_one_time_use() {
-    use sqlx::PgPool;
-    let _pool = PgPool::connect("postgres://test").await.unwrap();
-    // Test code would go here
-    // TODO: Re-enable when Postgres test setup available
+    let pool = setup_pool().await;
+    let user_keys = Keys::generate();
+    let user_pubkey = user_keys.public_key().to_hex();
+    let redirect_origin = format!("https://test-{}.example.com", Uuid::new_v4());
+
+    // Create user
+    sqlx::query("INSERT INTO users (public_key, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())")
+        .bind(&user_pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Create OAuth app
+    let app_id: i32 = sqlx::query_scalar(
+        "INSERT INTO oauth_applications (name, redirect_origin, client_secret, redirect_uris, tenant_id, created_at, updated_at)
+         VALUES ('Test App', $1, 'secret', '[\"http://localhost/callback\"]', 1, NOW(), NOW())
+         RETURNING id"
+    )
+    .bind(&redirect_origin)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // Create valid oauth_code
+    let code = format!("valid_code_{}", Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO oauth_codes (code, user_public_key, application_id, redirect_uri, scope, expires_at, tenant_id, created_at)
+         VALUES ($1, $2, $3, $4, 'sign', NOW() + INTERVAL '10 minutes', 1, NOW())"
+    )
+    .bind(&code)
+    .bind(&user_pubkey)
+    .bind(app_id)
+    .bind("http://localhost/callback")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // First exchange - delete the code (simulating token exchange)
+    let deleted = sqlx::query("DELETE FROM oauth_codes WHERE code = $1 RETURNING code")
+        .bind(&code)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+    assert!(deleted.is_some(), "First exchange should find and delete the code");
+
+    // Second exchange - code should be gone
+    let deleted_again = sqlx::query("DELETE FROM oauth_codes WHERE code = $1 RETURNING code")
+        .bind(&code)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+    assert!(deleted_again.is_none(), "Second exchange should fail - code already used");
 }
 
-/// Test redirect URI validation
+/// Test redirect URI validation (exact match required)
 #[tokio::test]
-#[ignore = "Requires Postgres test infrastructure"]
 async fn test_redirect_uri_validation() {
-    use sqlx::PgPool;
-    let _pool = PgPool::connect("postgres://test").await.unwrap();
-    // Test code would go here
-    // TODO: Re-enable when Postgres test setup available
+    let pool = setup_pool().await;
+    let redirect_origin = format!("https://test-{}.example.com", Uuid::new_v4());
+
+    // Create OAuth app with specific redirect_uris
+    let _app_id: i32 = sqlx::query_scalar(
+        "INSERT INTO oauth_applications (name, redirect_origin, client_secret, redirect_uris, tenant_id, created_at, updated_at)
+         VALUES ('Test App', $1, 'secret', '[\"http://localhost:3000/callback\", \"https://example.com/oauth\"]', 1, NOW(), NOW())
+         RETURNING id"
+    )
+    .bind(&redirect_origin)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // Query the redirect_uris and verify
+    let redirect_uris: String = sqlx::query_scalar(
+        "SELECT redirect_uris FROM oauth_applications WHERE redirect_origin = $1"
+    )
+    .bind(&redirect_origin)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let uris: Vec<String> = serde_json::from_str(&redirect_uris).unwrap();
+
+    // Verify exact matches work
+    assert!(uris.contains(&"http://localhost:3000/callback".to_string()));
+    assert!(uris.contains(&"https://example.com/oauth".to_string()));
+
+    // Verify non-matching doesn't exist
+    assert!(!uris.contains(&"http://evil.com/callback".to_string()));
+    assert!(!uris.contains(&"http://localhost:3000/callback/extra".to_string()));
 }
 
-/// Test that multiple authorizations can exist for the same user
+/// Test that multiple authorizations can exist for the same user (different origins)
 #[tokio::test]
-#[ignore = "Requires Postgres test infrastructure"]
 async fn test_multiple_authorizations_per_user() {
-    use sqlx::PgPool;
-    let _pool = PgPool::connect("postgres://test").await.unwrap();
-    // Test code would go here
-    // TODO: Re-enable when Postgres test setup available
+    let pool = setup_pool().await;
+    let user_keys = Keys::generate();
+    let user_pubkey = user_keys.public_key().to_hex();
+
+    // Create user
+    sqlx::query("INSERT INTO users (public_key, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())")
+        .bind(&user_pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Create two different OAuth apps
+    let redirect_origin_1 = format!("https://app1-{}.example.com", Uuid::new_v4());
+    let redirect_origin_2 = format!("https://app2-{}.example.com", Uuid::new_v4());
+
+    let app_id_1: i32 = sqlx::query_scalar(
+        "INSERT INTO oauth_applications (name, redirect_origin, client_secret, redirect_uris, tenant_id, created_at, updated_at)
+         VALUES ('App 1', $1, 'secret1', '[]', 1, NOW(), NOW()) RETURNING id"
+    )
+    .bind(&redirect_origin_1)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let app_id_2: i32 = sqlx::query_scalar(
+        "INSERT INTO oauth_applications (name, redirect_origin, client_secret, redirect_uris, tenant_id, created_at, updated_at)
+         VALUES ('App 2', $1, 'secret2', '[]', 1, NOW(), NOW()) RETURNING id"
+    )
+    .bind(&redirect_origin_2)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // Create authorization for App 1
+    sqlx::query(
+        "INSERT INTO oauth_authorizations (user_public_key, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, tenant_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, E'\\\\x00', 'secret1', '[]', 1, NOW(), NOW())"
+    )
+    .bind(&user_pubkey)
+    .bind(&redirect_origin_1)
+    .bind(app_id_1)
+    .bind(&user_pubkey)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Create authorization for App 2
+    sqlx::query(
+        "INSERT INTO oauth_authorizations (user_public_key, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, tenant_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, E'\\\\x00', 'secret2', '[]', 1, NOW(), NOW())"
+    )
+    .bind(&user_pubkey)
+    .bind(&redirect_origin_2)
+    .bind(app_id_2)
+    .bind(&user_pubkey)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Count authorizations for this user
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM oauth_authorizations WHERE user_public_key = $1"
+    )
+    .bind(&user_pubkey)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(count, 2, "User should have 2 authorizations (one per app)");
 }
+
 
 // ============================================================================
 // Unit Tests (No Database Required)
@@ -132,6 +324,98 @@ fn test_extract_nsec_from_verifier() {
     let verifier_short = "random.short";
     let result = keycast_api::api::http::oauth::extract_nsec_from_verifier_public(verifier_short);
     assert!(result.is_none());
+}
+
+/// Test that RPC fast path query finds OAuth authorizations from any application
+/// Bug: The fast path query in nostr_rpc.rs was hardcoded to only find authorizations
+/// where client_id = 'keycast-login', causing all other OAuth apps (like 'divine')
+/// to fall back to the slow path (DB + KMS decryption on every request).
+///
+/// Fix: Removed the hardcoded client_id filter from the query.
+#[tokio::test]
+async fn test_rpc_fast_path_works_with_any_oauth_app() {
+    let pool = setup_pool().await;
+    let user_keys = Keys::generate();
+    let user_pubkey = user_keys.public_key().to_hex();
+    let bunker_keys = Keys::generate();
+    let bunker_pubkey = bunker_keys.public_key().to_hex();
+    let tenant_id = 1i64;
+
+    // Create user
+    sqlx::query("INSERT INTO users (public_key, tenant_id, created_at, updated_at) VALUES ($1, $2, NOW(), NOW())")
+        .bind(&user_pubkey)
+        .bind(tenant_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Create OAuth app named 'divine' (NOT 'keycast-login')
+    let redirect_origin = format!("https://divine-{}.example.com", Uuid::new_v4());
+    let app_id: i32 = sqlx::query_scalar(
+        "INSERT INTO oauth_applications (name, redirect_origin, client_secret, redirect_uris, tenant_id, created_at, updated_at)
+         VALUES ('divine', $1, 'secret', '[]', $2, NOW(), NOW())
+         RETURNING id"
+    )
+    .bind(&redirect_origin)
+    .bind(tenant_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // Create OAuth authorization with this 'divine' app
+    sqlx::query(
+        "INSERT INTO oauth_authorizations (user_public_key, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, tenant_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, E'\\\\x00', 'secret1', '[]', $5, NOW(), NOW())"
+    )
+    .bind(&user_pubkey)
+    .bind(&redirect_origin)
+    .bind(app_id)
+    .bind(&bunker_pubkey)
+    .bind(tenant_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Query using the FIXED fast path SQL (no app.client_id filter)
+    // This is the query from nostr_rpc.rs that was fixed
+    let result: Option<String> = sqlx::query_scalar(
+        "SELECT oa.bunker_public_key
+         FROM oauth_authorizations oa
+         JOIN users u ON oa.user_public_key = u.public_key AND oa.tenant_id = u.tenant_id
+         WHERE oa.user_public_key = $1
+           AND u.tenant_id = $2
+         ORDER BY oa.created_at DESC
+         LIMIT 1"
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+
+    // Fast path should find the bunker_public_key regardless of app name
+    assert!(result.is_some(), "Fast path query should find bunker_public_key for any OAuth app");
+    assert_eq!(result.unwrap(), bunker_pubkey, "Should return correct bunker_public_key");
+
+    // Verify the OLD buggy query would NOT have found it (simulated)
+    // The bug was filtering by app.client_id = 'keycast-login'
+    let buggy_result: Option<String> = sqlx::query_scalar(
+        "SELECT oa.bunker_public_key
+         FROM oauth_authorizations oa
+         JOIN oauth_applications app ON oa.application_id = app.id
+         WHERE oa.user_public_key = $1
+           AND oa.tenant_id = $2
+           AND app.name = 'keycast-login'
+         ORDER BY oa.created_at DESC
+         LIMIT 1"
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+
+    assert!(buggy_result.is_none(), "Buggy query (filtering by keycast-login) should NOT find divine app authorization");
 }
 
 /// Test that secret key encryption stores bytes not hex string

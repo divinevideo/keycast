@@ -110,15 +110,14 @@ pub async fn create_team(
     .fetch_one(&mut *tx)
     .await?;
 
-    // Finally, create the default policy, default permission (all permissions allowed), and join them
+    // Create a default policy for the team (all permissions allowed)
     let policy = sqlx::query_as::<_, Policy>(
         r#"
-            INSERT INTO policies (tenant_id, team_id, name, created_at, updated_at)
-            VALUES ($1, $2, 'All Access', NOW(), NOW())
+            INSERT INTO policies (team_id, name, created_at, updated_at)
+            VALUES ($1, 'All Access', NOW(), NOW())
             RETURNING *
             "#,
     )
-    .bind(tenant_id)
     .bind(team.id)
     .fetch_one(&mut *tx)
     .await?;
@@ -128,24 +127,22 @@ pub async fn create_team(
 
     let permission = sqlx::query_as::<_, Permission>(
         r#"
-            INSERT INTO permissions (tenant_id, identifier, config, created_at, updated_at)
-            VALUES ($1, 'allowed_kinds', $2, NOW(), NOW())
+            INSERT INTO permissions (identifier, config, created_at, updated_at)
+            VALUES ('allowed_kinds', $1, NOW(), NOW())
             RETURNING *
             "#,
     )
-    .bind(tenant_id)
     .bind(allowed_kinds_config)
     .fetch_one(&mut *tx)
     .await?;
 
     sqlx::query_as::<_, PolicyPermission>(
         r#"
-            INSERT INTO policy_permissions (tenant_id, policy_id, permission_id, created_at, updated_at)
-            VALUES ($1, $2, $3, NOW(), NOW())
+            INSERT INTO policy_permissions (policy_id, permission_id, created_at, updated_at)
+            VALUES ($1, $2, NOW(), NOW())
             RETURNING *
             "#,
     )
-    .bind(tenant_id)
     .bind(policy.id)
     .bind(permission.id)
     .fetch_one(&mut *tx)
@@ -723,9 +720,8 @@ pub async fn add_policy(
         }
 
         let permission = sqlx::query_as::<_, Permission>(
-            "INSERT INTO permissions (tenant_id, identifier, config, created_at, updated_at) VALUES ($1, $2, $3, NOW(), NOW()) RETURNING *",
+            "INSERT INTO permissions (identifier, config, created_at, updated_at) VALUES ($1, $2, NOW(), NOW()) RETURNING *",
         )
-        .bind(tenant_id)
         .bind(permission.identifier)
         .bind(permission.config)
         .fetch_one(&mut *tx)
@@ -736,9 +732,8 @@ pub async fn add_policy(
 
     // Create the policy
     let policy = sqlx::query_as::<_, Policy>(
-        "INSERT INTO policies (tenant_id, team_id, name, created_at, updated_at) VALUES ($1, $2, $3, NOW(), NOW()) RETURNING *",
+        "INSERT INTO policies (team_id, name, created_at, updated_at) VALUES ($1, $2, NOW(), NOW()) RETURNING *",
     )
-    .bind(tenant_id)
     .bind(team_id)
     .bind(request.name)
     .fetch_one(&mut *tx)
@@ -747,9 +742,8 @@ pub async fn add_policy(
     // create the policy permissions
     for permission in &permissions {
         sqlx::query(
-            "INSERT INTO policy_permissions (tenant_id, policy_id, permission_id, created_at, updated_at) VALUES ($1, $2, $3, NOW(), NOW())",
+            "INSERT INTO policy_permissions (policy_id, permission_id, created_at, updated_at) VALUES ($1, $2, NOW(), NOW())",
         )
-        .bind(tenant_id)
         .bind(policy.id)
         .bind(permission.id)
         .execute(&mut *tx)

@@ -149,10 +149,10 @@
 </svelte:head>
 
 <div class="security-page">
-	<section class="page-header">
-		<h2 class="section-title">Security Settings</h2>
-		<p class="section-subtitle">Manage your private key and account security</p>
-	</section>
+	<div class="header">
+		<h1>Security Settings</h1>
+		<p class="subtitle">Manage your private key and account security</p>
+	</div>
 
 	{#if !emailVerified}
 		<!-- Email Not Verified Message -->
@@ -330,18 +330,18 @@
 		padding: 2rem 1rem;
 	}
 
-	.page-header {
+	.header {
 		margin-bottom: 2rem;
 	}
 
-	.section-title {
-		font-size: 1.25rem;
+	.header h1 {
+		font-size: 1.5rem;
 		font-weight: 600;
+		margin: 0 0 0.5rem 0;
 		color: var(--color-divine-text);
-		margin-bottom: 0.5rem;
 	}
 
-	.section-subtitle {
+	.subtitle {
 		color: var(--color-divine-text-secondary);
 		font-size: 0.95rem;
 		margin: 0;

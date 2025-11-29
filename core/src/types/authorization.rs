@@ -154,10 +154,11 @@ impl Authorization {
     }
 
     /// Get the permissions for this authorization (async version)
+    /// Tenant isolation is enforced at authorization lookup level, not at permission level
     pub async fn permissions(
         &self,
         pool: &PgPool,
-        tenant_id: i64,
+        _tenant_id: i64,
     ) -> Result<Vec<Permission>, AuthorizationError> {
         let permissions = sqlx::query_as::<_, Permission>(
             r#"
@@ -165,10 +166,9 @@ impl Authorization {
             FROM permissions p
             JOIN policy_permissions pp ON pp.permission_id = p.id
             JOIN policies pol ON pol.id = pp.policy_id
-            WHERE p.tenant_id = $1 AND pol.id = $2
+            WHERE pol.id = $1
             "#,
         )
-        .bind(tenant_id)
         .bind(self.policy_id)
         .fetch_all(pool)
         .await?;
@@ -211,153 +211,4 @@ impl Authorization {
             .filter(|s| !s.is_empty())
             .collect()
     }
-}
-
-// TODO: Migrate tests from SQLite to PostgreSQL - tests temporarily disabled
-#[cfg(all(test, feature = "sqlite-tests"))]
-mod tests {
-    use super::*;
-    use chrono::{Duration, Utc};
-    use nostr::nips::nip46::NostrConnectRequest;
-    use nostr_sdk::{Keys, PublicKey};
-    // Helper function to create a test database connection
-    async fn setup_test_db() -> PgPool {
-        PgPool::connect("sqlite::memory:").await.unwrap()
-    }
-
-    // Helper function to create a test authorization
-    async fn create_test_authorization(
-        pool: &PgPool,
-        max_uses: Option<i16>,
-        expires_at: Option<DateTime<Utc>>,
-    ) -> Authorization {
-        // Create policies table
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS policies (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                description TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            "#,
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-
-        // Insert test policy
-        sqlx::query(
-            r#"
-            INSERT INTO policies (name, description, created_at, updated_at)
-            VALUES (?, ?, ?, ?)
-            "#,
-        )
-        .bind("test_policy")
-        .bind("A test policy")
-        .bind(Utc::now())
-        .bind(Utc::now())
-        .execute(pool)
-        .await
-        .unwrap();
-
-        // First create necessary tables
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS authorizations (
-                id INTEGER PRIMARY KEY,
-                stored_key_id INTEGER,
-                secret TEXT,
-                bunker_public_key TEXT,
-                bunker_secret BLOB,
-                relays TEXT,
-                policy_id INTEGER,
-                max_uses INTEGER,
-                expires_at TEXT,
-                created_at TEXT,
-                updated_at TEXT
-            )
-            "#,
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS user_authorizations (
-                authorization_id INTEGER,
-                user_public_key TEXT,
-                created_at TEXT,
-                updated_at TEXT
-            )
-            "#,
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-
-        // Insert test authorization
-        let keys = Keys::generate();
-        let auth = Authorization {
-            id: 0,
-            stored_key_id: 1,
-            secret: "test_secret".to_string(),
-            bunker_public_key: keys.public_key().to_hex(),
-            bunker_secret: keys.secret_key().to_secret_bytes().to_vec(), // normally this would be encrypted
-            relays: Relays(vec!["wss://test.relay".to_string()]),
-            policy_id: 1,
-            max_uses,
-            expires_at,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-
-        sqlx::query(
-            r#"
-            INSERT INTO authorizations 
-            (stored_key_id, secret, bunker_public_key, bunker_secret, relays, policy_id, max_uses, expires_at, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(auth.stored_key_id)
-        .bind(&auth.secret)
-        .bind(&auth.bunker_public_key)
-        .bind(&auth.bunker_secret)
-        .bind(serde_json::to_string(&auth.relays.0).unwrap())
-        .bind(auth.policy_id)
-        .bind(auth.max_uses)
-        .bind(auth.expires_at)
-        .bind(auth.created_at)
-        .bind(auth.updated_at)
-        .execute(pool)
-        .await
-        .unwrap();
-
-        auth
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_expired() {
-        let pool = setup_test_db().await;
-
-        // Test non-expired authorization
-        let future_date = Utc::now() + Duration::hours(24);
-        let auth = create_test_authorization(&pool, None, Some(future_date)).await;
-        assert!(!auth.expired().unwrap());
-
-        // Test expired authorization
-        let past_date = Utc::now() - Duration::hours(24);
-        let auth = create_test_authorization(&pool, None, Some(past_date)).await;
-        assert!(auth.expired().unwrap());
-
-        // Test never-expiring authorization
-        let auth = create_test_authorization(&pool, None, None).await;
-        assert!(!auth.expired().unwrap());
-    }
-
-    // NOTE: test_fully_redeemed and test_validate_policy were removed
-    // because they referenced methods that no longer exist on Authorization.
-    // These tests need to be rewritten when those methods are reimplemented.
 }

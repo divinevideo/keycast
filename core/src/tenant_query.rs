@@ -85,18 +85,25 @@ where
 
     /// Inject tenant_id filter into SQL
     fn inject_tenant_filter(&self) -> String {
-        let sql_upper = self.sql.to_uppercase();
+        inject_tenant_filter_sql(&self.sql)
+    }
+}
 
-        if sql_upper.contains("WHERE") {
-            // Add AND tenant_id = ?
-            format!("{} AND tenant_id = ?", self.sql)
-        } else if sql_upper.contains("FROM") {
-            // Add WHERE tenant_id = ?
-            format!("{} WHERE tenant_id = ?", self.sql)
-        } else {
-            // Fallback: just append
-            format!("{} WHERE tenant_id = ?", self.sql)
-        }
+/// Inject tenant_id filter into a SQL query string
+/// If query has WHERE clause, adds "AND tenant_id = ?"
+/// Otherwise adds "WHERE tenant_id = ?"
+pub fn inject_tenant_filter_sql(sql: &str) -> String {
+    let sql_upper = sql.to_uppercase();
+
+    if sql_upper.contains("WHERE") {
+        // Add AND tenant_id = ?
+        format!("{} AND tenant_id = ?", sql)
+    } else if sql_upper.contains("FROM") {
+        // Add WHERE tenant_id = ?
+        format!("{} WHERE tenant_id = ?", sql)
+    } else {
+        // Fallback: just append
+        format!("{} WHERE tenant_id = ?", sql)
     }
 }
 
@@ -142,30 +149,18 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Uses sqlite with PgPool - needs fix"]
     fn test_inject_tenant_filter_with_where() {
-        let pool = PgPool::connect_lazy("sqlite::memory:").unwrap();
-        let select = TenantSelect::<()>::new(
-            &pool,
-            TenantId(1),
-            "SELECT * FROM users WHERE email = ?"
-        );
-
-        let result = select.inject_tenant_filter();
+        let sql = "SELECT * FROM users WHERE email = ?";
+        let result = inject_tenant_filter_sql(sql);
         assert!(result.contains("AND tenant_id = ?"));
+        assert_eq!(result, "SELECT * FROM users WHERE email = ? AND tenant_id = ?");
     }
 
     #[test]
-    #[ignore = "Uses sqlite with PgPool - needs fix"]
     fn test_inject_tenant_filter_without_where() {
-        let pool = PgPool::connect_lazy("sqlite::memory:").unwrap();
-        let select = TenantSelect::<()>::new(
-            &pool,
-            TenantId(1),
-            "SELECT * FROM users"
-        );
-
-        let result = select.inject_tenant_filter();
+        let sql = "SELECT * FROM users";
+        let result = inject_tenant_filter_sql(sql);
         assert!(result.contains("WHERE tenant_id = ?"));
+        assert_eq!(result, "SELECT * FROM users WHERE tenant_id = ?");
     }
 }

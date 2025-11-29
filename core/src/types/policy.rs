@@ -18,20 +18,20 @@ pub enum PolicyError {
     Permission(String),
 }
 
-/// A policy is a set of permissions. Teams have many policies, and policies have many permissions.
+/// A policy is a set of permissions. Policies are global (team_id = NULL) or team-specific.
 #[derive(Debug, FromRow, Serialize, Deserialize, Clone)]
 pub struct Policy {
     /// The id of the policy
     pub id: i32,
     /// The name of the policy
     pub name: String,
-    /// The id of the team the policy belongs to
-    pub team_id: i32,
+    /// The id of the team the policy belongs to (None for global policies)
+    pub team_id: Option<i32>,
     /// The date and time the policy was created
     pub created_at: DateTime<chrono::Utc>,
     /// The date and time the policy was last updated
     pub updated_at: DateTime<chrono::Utc>,
-    /// URL-friendly identifier (e.g., "social", "readonly")
+    /// URL-friendly identifier (e.g., "social", "readonly", "full")
     pub slug: Option<String>,
     /// User-friendly name (e.g., "Social App")
     pub display_name: Option<String>,
@@ -49,43 +49,28 @@ pub struct PolicyInfo {
 
 impl Policy {
     /// Find a policy by its slug
-    pub async fn find_by_slug(
-        pool: &PgPool,
-        tenant_id: i64,
-        slug: &str,
-    ) -> Result<Policy, PolicyError> {
-        sqlx::query_as::<_, Policy>(
-            "SELECT * FROM policies WHERE tenant_id = $1 AND slug = $2",
-        )
-        .bind(tenant_id)
-        .bind(slug)
-        .fetch_optional(pool)
-        .await?
-        .ok_or(PolicyError::NotFound)
+    pub async fn find_by_slug(pool: &PgPool, slug: &str) -> Result<Policy, PolicyError> {
+        sqlx::query_as::<_, Policy>("SELECT * FROM policies WHERE slug = $1")
+            .bind(slug)
+            .fetch_optional(pool)
+            .await?
+            .ok_or(PolicyError::NotFound)
     }
 
     /// Find a policy by its ID
-    pub async fn find_by_id(
-        pool: &PgPool,
-        tenant_id: i64,
-        id: i32,
-    ) -> Result<Policy, PolicyError> {
-        sqlx::query_as::<_, Policy>(
-            "SELECT * FROM policies WHERE tenant_id = $1 AND id = $2",
-        )
-        .bind(tenant_id)
-        .bind(id)
-        .fetch_optional(pool)
-        .await?
-        .ok_or(PolicyError::NotFound)
+    pub async fn find_by_id(pool: &PgPool, id: i32) -> Result<Policy, PolicyError> {
+        sqlx::query_as::<_, Policy>("SELECT * FROM policies WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?
+            .ok_or(PolicyError::NotFound)
     }
 
-    /// Get all policies with slugs (for discovery endpoint)
-    pub async fn list_public(pool: &PgPool, tenant_id: i64) -> Result<Vec<Policy>, PolicyError> {
+    /// Get all global policies with slugs (for discovery endpoint)
+    pub async fn list_public(pool: &PgPool) -> Result<Vec<Policy>, PolicyError> {
         let policies = sqlx::query_as::<_, Policy>(
-            "SELECT * FROM policies WHERE tenant_id = $1 AND slug IS NOT NULL ORDER BY name",
+            "SELECT * FROM policies WHERE slug IS NOT NULL AND team_id IS NULL ORDER BY name",
         )
-        .bind(tenant_id)
         .fetch_all(pool)
         .await?;
         Ok(policies)

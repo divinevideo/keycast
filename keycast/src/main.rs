@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{Notify, Mutex};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -142,9 +142,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("✔︎ Registered signer instance: {}", instance_id);
 
     // Initialize hashring with just this instance for now
-    let hashring = Arc::new(RwLock::new(HashRing::new(instance_id.clone())));
+    let hashring = Arc::new(Mutex::new(HashRing::new(instance_id.clone())));
     {
-        let mut ring = hashring.write().await;
+        let mut ring = hashring.lock().await;
         ring.rebuild(vec![instance_id.clone()]);
     }
 
@@ -187,7 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("✔︎ Signer daemon initialized and connected to relays");
 
     // Get shared handlers for API (converted to trait objects)
-    let signer_handlers = signer.handlers_as_trait_objects().await;
+    let signer_handlers = signer.handlers_as_trait_objects();
 
     // Create API state with shared signer handlers and server keys
     let api_state = Arc::new(keycast_api::state::KeycastState {
@@ -282,6 +282,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         tracing::info!("✔︎ Examples directory enabled at /examples (serving from {:?})", examples_path);
         app = app.nest_service("/examples", ServeDir::new(&examples_path));
+
+        // Serve keycast-client dist for examples (IIFE bundle)
+        let client_dist_path = if PathBuf::from("/app/packages/keycast-client/dist").exists() {
+            PathBuf::from("/app/packages/keycast-client/dist")
+        } else {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("packages/keycast-client/dist")
+        };
+        if client_dist_path.exists() {
+            tracing::info!("✔︎ Keycast client served at /dist (from {:?})", client_dist_path);
+            app = app.nest_service("/dist", ServeDir::new(&client_dist_path));
+        }
     }
 
     // SvelteKit frontend (fallback - catches all other routes)
@@ -349,7 +363,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Get active instances and rebuild hashring
             match heartbeat_registry.get_active_instances().await {
                 Ok(instances) => {
-                    let mut ring = heartbeat_hashring.write().await;
+                    let mut ring = heartbeat_hashring.lock().await;
                     ring.rebuild(instances.clone());
                     tracing::debug!("Hashring rebuilt with {} instances", instances.len());
                 }

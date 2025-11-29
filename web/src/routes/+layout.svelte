@@ -19,12 +19,11 @@ $effect(() => {
     }
 });
 
-// Fetch account status when user is authenticated
+// Clear account status when user logs out
+// Note: fetchAccountStatus() is called by +page.svelte after verifying auth
 $effect(() => {
     const currentUser = getCurrentUser();
-    if (currentUser?.authMethod === 'cookie') {
-        fetchAccountStatus();
-    } else {
+    if (!currentUser) {
         clearAccountStatus();
     }
 });

@@ -1,5 +1,6 @@
 use crate::custom_permissions::{
-    allowed_kinds::AllowedKinds, content_filter::ContentFilter, encrypt_to_self::EncryptToSelf,
+    allowed_kinds::AllowedKinds, content_filter::ContentFilter, decrypt_only::DecryptOnly,
+    encrypt_to_self::EncryptToSelf, full_access::FullAccess,
 };
 use crate::traits::CustomPermission;
 use chrono::DateTime;
@@ -38,8 +39,6 @@ pub struct Permission {
     /// The configuration of the permission
     #[sqlx(try_from = "String")]
     pub config: JsonConfig,
-    /// Tenant ID for multi-tenancy
-    pub tenant_id: i64,
     /// The date and time the permission was created
     pub created_at: DateTime<chrono::Utc>,
     /// The date and time the permission was last updated
@@ -57,7 +56,9 @@ impl Permission {
         match self.identifier.as_str() {
             id if id.starts_with("allowed_kinds") => AllowedKinds::from_permission(self),
             "content_filter" => ContentFilter::from_permission(self),
+            "decrypt_only" => DecryptOnly::from_permission(self),
             "encrypt_to_self" => EncryptToSelf::from_permission(self),
+            "full_access" => FullAccess::from_permission(self),
             _ => Err(PermissionError::UnknownPermission(self.identifier.clone())),
         }
     }

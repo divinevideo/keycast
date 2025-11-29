@@ -207,45 +207,6 @@ pub async fn list_tenants(pool: &PgPool) -> Result<Vec<Tenant>, sqlx::Error> {
     .await
 }
 
-/// Create default policies for a new tenant
-/// Mirrors the policy structure from migration 0011
-async fn create_default_policies(pool: &PgPool, tenant_id: i64) -> Result<(), sqlx::Error> {
-    // Create the three default policies
-    sqlx::query(
-        "INSERT INTO policies (tenant_id, name, created_at, updated_at)
-         VALUES
-            ($1, 'Standard Social (Default)', NOW(), NOW()),
-            ($1, 'Read Only', NOW(), NOW()),
-            ($1, 'Wallet Only', NOW(), NOW())"
-    )
-    .bind(tenant_id)
-    .execute(pool)
-    .await?;
-
-    // Get the policy IDs we just created
-    let standard_social_id: i32 = sqlx::query_scalar(
-        "SELECT id FROM policies WHERE tenant_id = $1 AND name = 'Standard Social (Default)'"
-    )
-    .bind(tenant_id)
-    .fetch_one(pool)
-    .await?;
-
-    // Link permissions to "Standard Social" policy
-    // These permission IDs are global (no tenant_id) from migration 0011
-    // Social events (1), Messaging (2), Lists (4)
-    sqlx::query(
-        "INSERT INTO policy_permissions (policy_id, permission_id)
-         SELECT $1, id FROM permissions
-         WHERE identifier IN ('allowed_kinds_social', 'allowed_kinds_messaging', 'allowed_kinds_lists')"
-    )
-    .bind(standard_social_id)
-    .execute(pool)
-    .await?;
-
-    tracing::info!("Created default policies for tenant {}", tenant_id);
-    Ok(())
-}
-
 /// Validate domain format to prevent abuse
 fn validate_domain(domain: &str) -> Result<(), TenantError> {
     // Basic validation rules
@@ -351,45 +312,37 @@ pub async fn get_or_create_tenant(
     // 1. Validate domain format
     validate_domain(domain)?;
 
-    // 2. Try to fetch existing tenant
-    match get_tenant_by_domain(pool, domain).await {
-        Ok(tenant) => {
-            tracing::debug!("Found existing tenant for domain: {}", domain);
-            Ok(tenant)
-        }
-        Err(sqlx::Error::RowNotFound) => {
-            // 3. Create new tenant with defaults
-            tracing::info!("Auto-provisioning new tenant for domain: {}", domain);
+    let default_settings = get_default_settings(domain);
+    let name = generate_tenant_name(domain);
 
-            let default_settings = get_default_settings(domain);
-            let name = generate_tenant_name(domain);
+    // 2. Use INSERT ... ON CONFLICT to handle race conditions atomically
+    let tenant = sqlx::query_as::<_, Tenant>(
+        "INSERT INTO tenants (domain, name, settings, created_at, updated_at)
+         VALUES ($1, $2, $3, NOW(), NOW())
+         ON CONFLICT (domain) DO UPDATE SET updated_at = tenants.updated_at
+         RETURNING id, domain, name, settings, created_at, updated_at",
+    )
+    .bind(domain)
+    .bind(&name)
+    .bind(&default_settings)
+    .fetch_one(pool)
+    .await?;
 
-            let tenant = create_tenant(
-                pool,
-                domain,
-                &name,
-                Some(&default_settings),
-            )
-            .await?;
-
-            // 4. Create default policies for new tenant
-            create_default_policies(pool, tenant.id).await
-                .map_err(TenantError::DatabaseError)?;
-
-            // 5. Log provisioning event for monitoring
-            tracing::info!(
-                target: "tenant_auto_provision",
-                domain = %domain,
-                tenant_id = tenant.id,
-                tenant_name = %name,
-                settings = %default_settings,
-                "Auto-provisioned new tenant with default policies"
-            );
-
-            Ok(tenant)
-        }
-        Err(e) => Err(TenantError::DatabaseError(e)),
+    // 3. Log if this was a new tenant (created_at == updated_at approximately)
+    let is_new = (tenant.updated_at - tenant.created_at).num_seconds().abs() < 2;
+    if is_new {
+        tracing::info!(
+            target: "tenant_auto_provision",
+            domain = %domain,
+            tenant_id = tenant.id,
+            tenant_name = %name,
+            "Auto-provisioned new tenant"
+        );
+    } else {
+        tracing::debug!("Found existing tenant for domain: {}", domain);
     }
+
+    Ok(tenant)
 }
 
 #[cfg(test)]

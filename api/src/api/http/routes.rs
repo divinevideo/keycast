@@ -84,7 +84,6 @@ pub fn api_routes(pool: PgPool, state: Arc<KeycastState>, auth_cors: tower_http:
         .route("/user/permissions", get(auth::list_permissions))
         .route("/user/sessions/:secret/activity", get(auth::get_session_activity))
         .route("/user/profile", post(auth::update_profile))
-        .route("/user/sessions/revoke", post(auth::revoke_session))
         .route("/user/sessions/disconnect", post(auth::disconnect_client))
         .route("/user/verify-password", post(auth::verify_password_for_export))
         .route("/user/request-key-export", post(auth::request_key_export))
@@ -92,9 +91,10 @@ pub fn api_routes(pool: PgPool, state: Arc<KeycastState>, auth_cors: tower_http:
         .layer(auth_cors.clone())
         .with_state(pool.clone());
 
-    // Bunker creation route (needs AuthState for key_manager)
+    // Bunker routes (need AuthState for key_manager and auth_tx)
     let bunker_routes = Router::new()
         .route("/user/bunker/create", post(auth::create_bunker))
+        .route("/user/sessions/revoke", post(auth::revoke_session))
         .layer(auth_cors.clone())
         .with_state(auth_state.clone());
 
@@ -163,9 +163,9 @@ pub fn api_routes(pool: PgPool, state: Arc<KeycastState>, auth_cors: tower_http:
         .merge(connect_routes.layer(public_cors.clone()))
         .merge(signing_routes.layer(public_cors.clone()))
         .merge(nostr_rpc_routes.layer(public_cors.clone()))  // NIP-46 RPC for OAuth apps
-        .merge(team_routes.layer(public_cors.clone()))
+        .merge(team_routes.layer(auth_cors.clone()))       // Team routes need credentials
         .merge(discovery_route.layer(public_cors.clone()))
-        .merge(policy_routes.layer(public_cors.clone()))
+        .merge(policy_routes.layer(public_cors.clone()))   // Public - available to third-party OAuth apps
         .merge(docs_route.layer(public_cors))
 }
 

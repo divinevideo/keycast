@@ -1,14 +1,18 @@
 // Unit test for password reset -> login flow
 // This tests the bcrypt password hashing and verification logic directly
 
-use bcrypt::{hash, verify, DEFAULT_COST};
+use bcrypt::{hash, verify};
+
+// Use minimum bcrypt cost for tests (production uses TEST_BCRYPT_COST=12)
+// This reduces test time from ~35s to ~0.2s while still verifying correctness
+const TEST_BCRYPT_COST: u32 = 4;
 
 #[test]
 fn test_password_hash_and_verify_basic() {
     let password = "test_password_123";
 
     // Hash the password (like reset_password does)
-    let password_hash = hash(password, DEFAULT_COST).unwrap();
+    let password_hash = hash(password, TEST_BCRYPT_COST).unwrap();
     println!("Password hash: {}", &password_hash[..20]);
 
     // Verify the password (like login does)
@@ -36,7 +40,7 @@ fn test_password_with_special_characters() {
     for password in passwords {
         println!("\nTesting password: {:?}", password);
 
-        let password_hash = hash(password, DEFAULT_COST).unwrap();
+        let password_hash = hash(password, TEST_BCRYPT_COST).unwrap();
         println!("  Hash (first 20): {}", &password_hash[..20]);
 
         let is_valid = verify(password, &password_hash).unwrap();
@@ -63,14 +67,14 @@ fn test_password_reset_flow_simulation() {
     let new_password = "new_password_456";
 
     println!("Step 1: Hash initial password");
-    let initial_hash = hash(initial_password, DEFAULT_COST).unwrap();
+    let initial_hash = hash(initial_password, TEST_BCRYPT_COST).unwrap();
     println!("  Initial hash: {}", &initial_hash[..30]);
 
     // Verify initial password works
     assert!(verify(initial_password, &initial_hash).unwrap(), "Initial password should work");
 
     println!("\nStep 2: Simulate password reset - hash new password");
-    let new_hash = hash(new_password, DEFAULT_COST).unwrap();
+    let new_hash = hash(new_password, TEST_BCRYPT_COST).unwrap();
     println!("  New hash: {}", &new_hash[..30]);
 
     // This is key: the database would now have new_hash stored
@@ -117,8 +121,8 @@ fn test_password_with_json_encoding() {
     assert_eq!(original_password, recovered_password, "Password should survive JSON round-trip");
 
     // Now test the hash/verify with the recovered password
-    let hash1 = hash(original_password, DEFAULT_COST).unwrap();
-    let hash2 = hash(recovered_password, DEFAULT_COST).unwrap();
+    let hash1 = hash(original_password, TEST_BCRYPT_COST).unwrap();
+    let hash2 = hash(recovered_password, TEST_BCRYPT_COST).unwrap();
 
     // Both should verify against each other's hashes
     assert!(verify(original_password, &hash1).unwrap());
@@ -137,7 +141,7 @@ fn test_password_bytes_vs_string() {
     let password_bytes = password_str.as_bytes();
 
     // Hash using &str
-    let hash_from_str = hash(password_str, DEFAULT_COST).unwrap();
+    let hash_from_str = hash(password_str, TEST_BCRYPT_COST).unwrap();
 
     // Verify using String
     assert!(verify(&password_string, &hash_from_str).unwrap(), "String should verify against &str hash");

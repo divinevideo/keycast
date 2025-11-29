@@ -40,6 +40,25 @@ pub fn extract_nsec_from_verifier_public(verifier: &str) -> Option<String> {
     None
 }
 
+/// Extract origin (scheme + host + optional port) from a redirect_uri
+/// Examples: "https://example.com/callback" -> "https://example.com"
+///           "http://localhost:3000/auth" -> "http://localhost:3000"
+pub fn extract_origin(redirect_uri: &str) -> Result<String, OAuthError> {
+    use nostr_sdk::Url;
+    let url = Url::parse(redirect_uri)
+        .map_err(|_| OAuthError::InvalidRequest("Invalid redirect_uri".to_string()))?;
+
+    let host = url.host_str()
+        .ok_or(OAuthError::InvalidRequest("redirect_uri missing host".to_string()))?;
+
+    let origin = match url.port() {
+        Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
+        None => format!("{}://{}", url.scheme(), host),
+    };
+
+    Ok(origin)
+}
+
 /// Parse OAuth scope parameter for policy-based authorization.
 /// Accepts either "policy:slug" format (new) or legacy scopes (rejected with error).
 /// Returns the policy slug if valid, or error if invalid format.
@@ -98,6 +117,7 @@ async fn generate_ucan_token(
     user_keys: &Keys,
     tenant_id: i64,
     email: &str,
+    redirect_origin: &str,
 ) -> Result<String, OAuthError> {
     use crate::ucan_auth::{NostrKeyMaterial, nostr_pubkey_to_did};
     use ucan::builder::UcanBuilder;
@@ -106,10 +126,11 @@ async fn generate_ucan_token(
     let key_material = NostrKeyMaterial::from_keys(user_keys.clone());
     let user_did = nostr_pubkey_to_did(&user_keys.public_key());
 
-    // Create facts as a single JSON object
+    // Create facts as a single JSON object - redirect_origin identifies the authorization
     let facts = json!({
         "tenant_id": tenant_id,
         "email": email,
+        "redirect_origin": redirect_origin,
     });
 
     let ucan = UcanBuilder::default()
@@ -146,8 +167,6 @@ pub struct TokenResponse {
     pub bunker_url: String,            // Keycast extension - NIP-46 credential
     #[serde(skip_serializing_if = "Option::is_none")]
     pub access_token: Option<String>,  // UCAN token for REST RPC API (/api/nostr)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub nostr_api: Option<String>,     // REST RPC API endpoint URL
     pub token_type: String,            // RFC 6749 required - "Bearer"
     pub expires_in: i64,               // RFC 6749 recommended - UCAN expiry in seconds
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -250,17 +269,16 @@ fn validate_pkce(
 /// Parses "policy:slug" format and validates against app's default policy.
 async fn resolve_policy_from_scope(
     pool: &sqlx::PgPool,
-    tenant_id: i64,
     application_id: i32,
     scope: &str,
 ) -> Result<i32, OAuthError> {
-    use keycast_core::types::policy::{Policy, is_more_restrictive};
+    use keycast_core::types::policy::{is_more_restrictive, Policy};
 
     // Parse scope for policy slug
     let policy_slug = parse_policy_scope(scope)?;
 
-    // Look up the requested policy
-    let requested_policy = Policy::find_by_slug(pool, tenant_id, &policy_slug)
+    // Look up the requested policy (policies are now global)
+    let requested_policy = Policy::find_by_slug(pool, &policy_slug)
         .await
         .map_err(|e| match e {
             keycast_core::types::policy::PolicyError::NotFound => {
@@ -273,16 +291,15 @@ async fn resolve_policy_from_scope(
         })?;
 
     // Check if app has a default policy constraint
-    let app_default_policy_id: Option<i32> = sqlx::query_scalar(
-        "SELECT policy_id FROM oauth_applications WHERE id = $1"
-    )
-    .bind(application_id)
-    .fetch_one(pool)
-    .await?;
+    let app_default_policy_id: Option<i32> =
+        sqlx::query_scalar("SELECT policy_id FROM oauth_applications WHERE id = $1")
+            .bind(application_id)
+            .fetch_one(pool)
+            .await?;
 
     // If app has a default policy, validate requested is equal or more restrictive
     if let Some(default_policy_id) = app_default_policy_id {
-        let default_policy = Policy::find_by_id(pool, tenant_id, default_policy_id)
+        let default_policy = Policy::find_by_id(pool, default_policy_id)
             .await
             .map_err(|e| OAuthError::Database(sqlx::Error::Protocol(e.to_string())))?;
 
@@ -292,7 +309,8 @@ async fn resolve_policy_from_scope(
 
         if !is_allowed {
             return Err(OAuthError::InvalidRequest(
-                "This app cannot request more permissions than its default policy allows.".to_string()
+                "This app cannot request more permissions than its default policy allows."
+                    .to_string(),
             ));
         }
     }
@@ -323,9 +341,9 @@ pub async fn auth_status(
 
     if let Some(user_pubkey) = super::auth::extract_ucan_from_cookie(&headers).and_then(|token| {
         // Parse UCAN from string using ucan_auth helper
-        crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), tenant_id).ok().map(|(pubkey, _)| pubkey)
+        crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), tenant_id).ok().map(|(pubkey, _, _)| pubkey)
     }) {
-        // Query user email info from database
+        // Query user from database - user must exist for session to be valid
         let user_info: Option<(Option<String>, Option<bool>)> = sqlx::query_as(
             "SELECT email, email_verified FROM users WHERE tenant_id = $1 AND public_key = $2"
         )
@@ -336,14 +354,23 @@ pub async fn auth_status(
         .ok()
         .flatten();
 
-        let (email, email_verified) = user_info.unwrap_or((None, None));
-
-        Ok(Json(AuthStatusResponse {
-            authenticated: true,
-            pubkey: Some(user_pubkey),
-            email,
-            email_verified,
-        }))
+        // If user doesn't exist in DB, the session is invalid (stale cookie)
+        if let Some((email, email_verified)) = user_info {
+            Ok(Json(AuthStatusResponse {
+                authenticated: true,
+                pubkey: Some(user_pubkey),
+                email,
+                email_verified,
+            }))
+        } else {
+            // User was deleted or DB was reset - treat as not authenticated
+            Ok(Json(AuthStatusResponse {
+                authenticated: false,
+                pubkey: None,
+                email: None,
+                email_verified: None,
+            }))
+        }
     } else {
         Ok(Json(AuthStatusResponse {
             authenticated: false,
@@ -373,7 +400,7 @@ pub async fn authorize_get(
             // Parse UCAN from string using ucan_auth helper (tenant validation done later)
             crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), tenant_id)
                 .ok()
-                .map(|(pubkey, ucan)| {
+                .map(|(pubkey, _redirect_origin, ucan)| {
                     // Extract relays from UCAN facts
                     let relays: Vec<String> = ucan.facts()
                         .iter()
@@ -431,72 +458,97 @@ pub async fn authorize_get(
         (None, false)
     };
 
-    // If authenticated, check if they've already authorized this app
+    // If authenticated, check if they've already authorized this origin
     if let Some(ref pubkey) = user_pubkey {
-        // Get application ID
-        let app_id: Option<i32> = sqlx::query_scalar(
-            "SELECT id FROM oauth_applications WHERE tenant_id = $1 AND client_id = $2"
+        // Extract origin from redirect_uri - this is the primary identifier
+        let redirect_origin = extract_origin(&params.redirect_uri)?;
+
+        tracing::info!("Auto-approve check: redirect_origin={}, client_id={}, user_pubkey={}",
+            redirect_origin, params.client_id, pubkey);
+
+        // Check if user has already authorized this origin (not application_id)
+        let existing_auth: Option<(i32,)> = sqlx::query_as(
+            "SELECT id FROM oauth_authorizations
+             WHERE tenant_id = $1 AND user_public_key = $2 AND redirect_origin = $3"
         )
         .bind(tenant_id)
-        .bind(&params.client_id)
+        .bind(pubkey)
+        .bind(&redirect_origin)
         .fetch_optional(pool)
         .await?;
 
-        tracing::info!("Auto-approve check: client_id={}, app_id={:?}, user_pubkey={}",
-            params.client_id, app_id, pubkey);
+        tracing::info!("Existing authorization check: found={}", existing_auth.is_some());
 
-        if let Some(app_id) = app_id {
-            // Check if user has already authorized this app
-            let existing_auth: Option<(i32,)> = sqlx::query_as(
-                "SELECT id FROM oauth_authorizations
-                 WHERE tenant_id = $1 AND user_public_key = $2 AND application_id = $3"
-            )
-            .bind(tenant_id)
-            .bind(pubkey)
-            .bind(app_id)
-            .fetch_optional(pool)
-            .await?;
+        // Skip auto-approve if prompt=consent (always show approval screen)
+        if existing_auth.is_some() && !force_consent {
+            tracing::info!("Auto-approving: user has already authorized origin {}", redirect_origin);
 
-            tracing::info!("Existing authorization check: found={}", existing_auth.is_some());
-
-            // Skip auto-approve if prompt=consent (always show approval screen)
-            if existing_auth.is_some() && !force_consent {
-                tracing::info!("Auto-approving: user has already authorized this app");
-                // Auto-approve: generate code and send directly to parent window
-                let code: String = rand::thread_rng()
-                    .sample_iter(&rand::distributions::Alphanumeric)
-                    .take(32)
-                    .map(char::from)
-                    .collect();
-
-                let expires_at = Utc::now() + Duration::minutes(10);
-
-                sqlx::query(
-                    "INSERT INTO oauth_codes (tenant_id, code, user_public_key, application_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
+            // Get or create application by redirect_origin (the ONLY secure identifier)
+            // client_id from params is just a display name hint, not trusted for security
+            let app_id: i32 = {
+                let existing: Option<i32> = sqlx::query_scalar(
+                    "SELECT id FROM oauth_applications WHERE tenant_id = $1 AND redirect_origin = $2"
                 )
                 .bind(tenant_id)
-                .bind(&code)
-                .bind(pubkey)
-                .bind(app_id)
-                .bind(&params.redirect_uri)
-                .bind(params.scope.as_deref().unwrap_or("sign_event"))
-                .bind(&params.code_challenge)
-                .bind(&params.code_challenge_method)
-                .bind(expires_at)
-                .bind(Utc::now())
-                .execute(pool)
+                .bind(&redirect_origin)
+                .fetch_optional(pool)
                 .await?;
 
-                // Auto-approve: redirect to redirect_uri with code (standard OAuth pattern)
-                return Ok(Redirect::to(&format!(
+                match existing {
+                    Some(id) => id,
+                    None => {
+                        // Create application for this origin, using client_id as display_name
+                        sqlx::query_scalar(
+                            "INSERT INTO oauth_applications (tenant_id, name, display_name, redirect_origin, client_secret, redirect_uris, created_at, updated_at)
+                             VALUES ($1, $2, $3, $4, 'auto', '[]', $5, $6)
+                             RETURNING id"
+                        )
+                        .bind(tenant_id)
+                        .bind(&params.client_id)  // name
+                        .bind(&params.client_id)  // display_name (cosmetic only)
+                        .bind(&redirect_origin)   // the secure identifier
+                        .bind(Utc::now())
+                        .bind(Utc::now())
+                        .fetch_one(pool)
+                        .await?
+                    }
+                }
+            };
+
+            // Auto-approve: generate code and send directly to parent window
+            let code: String = rand::thread_rng()
+                .sample_iter(&rand::distributions::Alphanumeric)
+                .take(32)
+                .map(char::from)
+                .collect();
+
+            let expires_at = Utc::now() + Duration::minutes(10);
+
+            sqlx::query(
+                "INSERT INTO oauth_codes (tenant_id, code, user_public_key, application_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
+            )
+            .bind(tenant_id)
+            .bind(&code)
+            .bind(pubkey)
+            .bind(app_id)
+            .bind(&params.redirect_uri)
+            .bind(params.scope.as_deref().unwrap_or("sign_event"))
+            .bind(&params.code_challenge)
+            .bind(&params.code_challenge_method)
+            .bind(expires_at)
+            .bind(Utc::now())
+            .execute(pool)
+            .await?;
+
+            // Auto-approve: redirect to redirect_uri with code (standard OAuth pattern)
+            return Ok(Redirect::to(&format!(
                     "{}?code={}",
                     params.redirect_uri,
                     code
                 )).into_response());
-            } else if existing_auth.is_some() && force_consent {
-                tracing::info!("prompt=consent: skipping auto-approve, showing approval screen");
-            }
+        } else if existing_auth.is_some() && force_consent {
+            tracing::info!("prompt=consent: skipping auto-approve, showing approval screen");
         }
     }
 
@@ -516,8 +568,8 @@ pub async fn authorize_get(
             }
         };
 
-        // Load policy and its permissions
-        match Policy::find_by_slug(pool, tenant_id, &policy_slug).await {
+        // Load policy and its permissions (policies are now global)
+        match Policy::find_by_slug(pool, &policy_slug).await {
             Ok(policy) => {
                 let permissions = policy.permission_displays(pool).await.unwrap_or_default();
                 serde_json::json!({
@@ -525,7 +577,8 @@ pub async fn authorize_get(
                     "display_name": policy.display_name.clone().unwrap_or_else(|| policy.name.clone()),
                     "description": policy.description.clone().unwrap_or_default(),
                     "permissions": permissions
-                }).to_string()
+                })
+                .to_string()
             }
             Err(_) => {
                 // Fallback to minimal info if policy not found
@@ -535,7 +588,8 @@ pub async fn authorize_get(
                     "display_name": "App Access",
                     "description": "Grant access to this application",
                     "permissions": []
-                }).to_string()
+                })
+                .to_string()
             }
         }
     };
@@ -666,14 +720,15 @@ pub async fn authorize_get(
             flex-shrink: 0;
         }}
         .app_info h2 {{
-            font-size: 1rem;
-            font-weight: 600;
-            color: var(--text);
+            font-size: 0.8rem;
+            font-weight: 500;
+            color: var(--text-secondary);
             margin-bottom: 0.125rem;
         }}
         .app_domain {{
-            font-size: 0.8rem;
-            color: var(--text-secondary);
+            font-size: 1rem;
+            font-weight: 600;
+            color: var(--text);
         }}
         .permissions_list {{
             margin-bottom: 1rem;
@@ -803,8 +858,8 @@ pub async fn authorize_get(
                     <span id="app_icon_letter">{}</span>
                 </div>
                 <div class="app_info">
-                    <h2 id="app_name">{}</h2>
                     <div class="app_domain" id="app_domain"></div>
+                    <h2 id="app_name">{}</h2>
                 </div>
             </div>
 
@@ -1118,14 +1173,15 @@ pub async fn authorize_get(
             flex-shrink: 0;
         }}
         .app_info h2 {{
-            font-size: 1rem;
-            font-weight: 600;
-            color: var(--text);
+            font-size: 0.8rem;
+            font-weight: 500;
+            color: var(--text-secondary);
             margin-bottom: 0.125rem;
         }}
         .app_domain {{
-            font-size: 0.8rem;
-            color: var(--text-secondary);
+            font-size: 1rem;
+            font-weight: 600;
+            color: var(--text);
         }}
         .form_group {{
             margin-bottom: 1rem;
@@ -1300,8 +1356,8 @@ pub async fn authorize_get(
                     <span id="app_icon_letter">{}</span>
                 </div>
                 <div class="app_info">
-                    <h2 id="app_name">{}</h2>
                     <div class="app_domain" id="app_domain"></div>
+                    <h2 id="app_name">{}</h2>
                 </div>
             </div>
 
@@ -1573,9 +1629,12 @@ pub async fn authorize_post(
     // Extract user public key from UCAN cookie
     let user_public_key = super::auth::extract_ucan_from_cookie(&headers).and_then(|token| {
         // Parse UCAN from string using ucan_auth helper
-        crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), tenant_id).ok().map(|(pubkey, _)| pubkey)
+        crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), tenant_id).ok().map(|(pubkey, _, _)| pubkey)
     })
         .ok_or(OAuthError::Unauthorized)?;
+
+    // Extract redirect_origin - this is the ONLY secure app identifier
+    let redirect_origin = extract_origin(&req.redirect_uri)?;
 
     // Generate authorization code
     let code: String = rand::thread_rng()
@@ -1587,26 +1646,26 @@ pub async fn authorize_post(
     // Store authorization code (expires in 10 minutes)
     let expires_at = Utc::now() + Duration::minutes(10);
 
-    // Get or create application
+    // Get or create application by redirect_origin (the secure identifier)
     let app_id: Option<i32> =
-        sqlx::query_scalar("SELECT id FROM oauth_applications WHERE tenant_id = $1 AND client_id = $2")
+        sqlx::query_scalar("SELECT id FROM oauth_applications WHERE tenant_id = $1 AND redirect_origin = $2")
             .bind(tenant_id)
-            .bind(&req.client_id)
+            .bind(&redirect_origin)
             .fetch_optional(&auth_state.state.db)
             .await?;
 
     let app_id = if let Some(id) = app_id {
         id
     } else {
-        // Create test application
+        // Auto-create application, using client_id as display_name (cosmetic only)
         sqlx::query_scalar(
-            "INSERT INTO oauth_applications (tenant_id, client_id, client_secret, name, redirect_uris, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id"
+            "INSERT INTO oauth_applications (tenant_id, name, display_name, redirect_origin, client_secret, redirect_uris, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, 'auto', $5, $6, $7) RETURNING id"
         )
         .bind(tenant_id)
-        .bind(&req.client_id)
-        .bind("test_secret")
-        .bind(&req.client_id)
+        .bind(&req.client_id)  // name
+        .bind(&req.client_id)  // display_name (cosmetic only)
+        .bind(&redirect_origin)  // the secure identifier
         .bind(format!("[\"{}\"]", req.redirect_uri))
         .bind(Utc::now())
         .bind(Utc::now())
@@ -1732,29 +1791,48 @@ async fn handle_authorization_code_grant(
 
     // Create OAuth authorization and generate token response
     create_oauth_authorization_and_token(
-        tenant_id,
-        &user_public_key,
-        &email,
-        application_id,
-        &scope,
-        nsec_from_verifier,
+        CreateAuthorizationParams {
+            tenant_id,
+            user_public_key: &user_public_key,
+            email: &email,
+            application_id,
+            scope: &scope,
+            redirect_uri: &stored_redirect_uri,
+            nsec_from_verifier,
+        },
         auth_state,
     ).await
 }
 
 // handle_password_grant() removed - ROPC grant type deprecated and removed
 
+/// Parameters for creating OAuth authorization and generating token
+struct CreateAuthorizationParams<'a> {
+    tenant_id: i64,
+    user_public_key: &'a str,
+    email: &'a str,
+    application_id: i32,
+    scope: &'a str,
+    redirect_uri: &'a str,
+    nsec_from_verifier: Option<String>,
+}
+
 /// Common function to create OAuth authorization and generate TokenResponse
 /// Creates personal_keys if missing (first token exchange with optional nsec from code_verifier)
+#[allow(clippy::too_many_arguments)]
 async fn create_oauth_authorization_and_token(
-    tenant_id: i64,
-    user_public_key: &str,
-    email: &str,
-    application_id: i32,
-    scope: &str,
-    nsec_from_verifier: Option<String>,
+    params: CreateAuthorizationParams<'_>,
     auth_state: super::routes::AuthState,
 ) -> Result<Response, OAuthError> {
+    let CreateAuthorizationParams {
+        tenant_id,
+        user_public_key,
+        email,
+        application_id,
+        scope,
+        redirect_uri,
+        nsec_from_verifier,
+    } = params;
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
 
@@ -1825,12 +1903,16 @@ async fn create_oauth_authorization_and_token(
         (encrypted_secret, true)
     };
 
+    // Extract origin from redirect_uri - this is the primary identifier
+    let redirect_origin = extract_origin(redirect_uri)?;
+
     // Generate server-signed UCAN for REST RPC API access
     let access_token = super::auth::generate_server_signed_ucan(
         &nostr_sdk::PublicKey::from_hex(user_public_key)
             .map_err(|e| OAuthError::InvalidRequest(format!("Invalid public key: {}", e)))?,
         tenant_id,
         email,
+        &redirect_origin,
         &auth_state.state.server_keys,
     ).await.map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?;
 
@@ -1851,22 +1933,19 @@ async fn create_oauth_authorization_and_token(
         .map_err(|e| OAuthError::InvalidRequest(format!("Failed to serialize relays: {}", e)))?;
 
     // Resolve policy from scope (policy:slug format)
-    let policy_id = resolve_policy_from_scope(
-        pool,
-        tenant_id,
-        application_id,
-        scope,
-    ).await?;
+    let policy_id = resolve_policy_from_scope(pool, application_id, scope).await?;
 
-    // Use ON CONFLICT to avoid duplicates per user/app combination
+    // Use ON CONFLICT to avoid duplicates per user/origin combination
+    // Re-authorization creates new bunker keys and secrets for same user+app combination
     sqlx::query(
-        "INSERT INTO oauth_authorizations (tenant_id, user_public_key, application_id, bunker_public_key, bunker_secret, secret, relays, policy_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-         ON CONFLICT (user_public_key, application_id)
-         DO UPDATE SET secret = $6, relays = $7, policy_id = $8, updated_at = $10"
+        "INSERT INTO oauth_authorizations (tenant_id, user_public_key, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, policy_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT (tenant_id, user_public_key, redirect_origin)
+         DO UPDATE SET bunker_public_key = $5, bunker_secret = $6, secret = $7, relays = $8, policy_id = $9, updated_at = $11"
     )
     .bind(tenant_id)
     .bind(user_public_key)
+    .bind(&redirect_origin)
     .bind(application_id)
     .bind(bunker_public_key.to_hex())
     .bind(&encrypted_user_key)      // bunker_secret = encrypted user key (BLOB)
@@ -1907,25 +1986,22 @@ async fn create_oauth_authorization_and_token(
         connection_secret
     );
 
-    // Build nostr_api URL from request host (derive from deployment)
-    // For production this would be https://login.divine.video/api/nostr
-    let nostr_api = std::env::var("NOSTR_API_URL")
-        .unwrap_or_else(|_| "https://login.divine.video/api/nostr".to_string());
-
-    // Load policy info from scope for response
+    // Load policy info from scope for response (policies are now global)
     let policy_info = {
         use keycast_core::types::policy::Policy;
 
         // Parse policy slug from scope (e.g., "policy:social" -> "social")
-        let policy_slug = parse_policy_scope(scope)
-            .unwrap_or_else(|_| "social".to_string());
+        let policy_slug = parse_policy_scope(scope).unwrap_or_else(|_| "social".to_string());
 
-        match Policy::find_by_slug(pool, tenant_id, &policy_slug).await {
+        match Policy::find_by_slug(pool, &policy_slug).await {
             Ok(policy) => {
                 let permissions = policy.permission_displays(pool).await.unwrap_or_default();
                 Some(TokenPolicyInfo {
                     slug: policy.slug.clone().unwrap_or_else(|| policy.id.to_string()),
-                    display_name: policy.display_name.clone().unwrap_or_else(|| policy.name.clone()),
+                    display_name: policy
+                        .display_name
+                        .clone()
+                        .unwrap_or_else(|| policy.name.clone()),
                     description: policy.description.clone().unwrap_or_default(),
                     permissions,
                 })
@@ -1941,7 +2017,6 @@ async fn create_oauth_authorization_and_token(
     Ok(Json(TokenResponse {
         bunker_url,
         access_token: Some(access_token),
-        nostr_api: Some(nostr_api),
         token_type: "Bearer".to_string(),
         expires_in: super::auth::TOKEN_EXPIRY_HOURS * 3600,  // UCAN expiry in seconds
         scope: Some(scope.to_string()),
@@ -2020,8 +2095,11 @@ pub async fn oauth_login(
         .map_err(|e| OAuthError::InvalidRequest(format!("Invalid secret key bytes: {}", e)))?;
     let keys = Keys::new(secret_key.into());
 
-    // Generate UCAN token (OAuth popup doesn't set relays, uses defaults)
-    let ucan_token = generate_ucan_token(&keys, tenant_id, &req.email, None).await
+    // Extract redirect_origin from redirect_uri for UCAN
+    let redirect_origin = extract_origin(&req.redirect_uri)?;
+
+    // Generate UCAN token with redirect_origin
+    let ucan_token = generate_ucan_token(&keys, tenant_id, &req.email, &redirect_origin, None).await
         .map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?;
 
     // OAuth popup login: bunker authorization will be created manually by user if needed
@@ -2223,26 +2301,29 @@ pub async fn oauth_register(
 
     let expires_at = Utc::now() + Duration::minutes(10);
 
-    // Get or create application
+    // Extract redirect_origin - the ONLY secure app identifier
+    let redirect_origin = extract_origin(&req.redirect_uri)?;
+
+    // Get or create application by redirect_origin (the secure identifier)
     let app_id: Option<i32> =
-        sqlx::query_scalar("SELECT id FROM oauth_applications WHERE tenant_id = $1 AND client_id = $2")
+        sqlx::query_scalar("SELECT id FROM oauth_applications WHERE tenant_id = $1 AND redirect_origin = $2")
             .bind(tenant_id)
-            .bind(&req.client_id)
+            .bind(&redirect_origin)
             .fetch_optional(pool)
             .await?;
 
     let app_id = if let Some(id) = app_id {
         id
     } else {
-        // Create application
+        // Auto-create application, using client_id as display_name (cosmetic only)
         sqlx::query_scalar(
-            "INSERT INTO oauth_applications (tenant_id, client_id, client_secret, name, redirect_uris, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id"
+            "INSERT INTO oauth_applications (tenant_id, name, display_name, redirect_origin, client_secret, redirect_uris, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, 'auto', $5, $6, $7) RETURNING id"
         )
         .bind(tenant_id)
-        .bind(&req.client_id)
-        .bind("test_secret")
-        .bind(&req.client_id)
+        .bind(&req.client_id)  // name
+        .bind(&req.client_id)  // display_name (cosmetic only)
+        .bind(&redirect_origin)  // the secure identifier
         .bind(format!("[\"{}\"]", req.redirect_uri))
         .bind(Utc::now())
         .bind(Utc::now())
@@ -2268,16 +2349,16 @@ pub async fn oauth_register(
     .execute(pool)
     .await?;
 
-    tracing::info!("OAuth auto-approve for new registration: user {}, app {}", public_key.to_hex(), req.client_id);
+    tracing::info!("OAuth auto-approve for new registration: user {}, origin {}", public_key.to_hex(), redirect_origin);
 
-    // Generate UCAN for SSO
+    // Generate UCAN for SSO (includes redirect_origin for authorization lookup)
     let ucan_token = if let Some(ref keys) = generated_keys {
         // Auto-generate flow: user-signed UCAN (user has keys)
-        super::auth::generate_ucan_token(keys, tenant_id, &req.email, req.relays.as_deref()).await
+        super::auth::generate_ucan_token(keys, tenant_id, &req.email, &redirect_origin, req.relays.as_deref()).await
             .map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?
     } else {
         // BYOK flow: server-signed UCAN (user doesn't have keys yet)
-        super::auth::generate_server_signed_ucan(&public_key, tenant_id, &req.email, &auth_state.state.server_keys).await
+        super::auth::generate_server_signed_ucan(&public_key, tenant_id, &req.email, &redirect_origin, &auth_state.state.server_keys).await
             .map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?
     };
 
@@ -2538,14 +2619,15 @@ pub async fn connect_get(
             color: white;
         }}
         .app_info h2 {{
-            font-size: 1rem;
-            font-weight: 600;
-            color: var(--text);
+            font-size: 0.8rem;
+            font-weight: 500;
+            color: var(--text-secondary);
             margin-bottom: 0.125rem;
         }}
         .app_domain {{
-            font-size: 0.8rem;
-            color: var(--text-secondary);
+            font-size: 1rem;
+            font-weight: 600;
+            color: var(--text);
         }}
         .permissions_list {{
             margin-bottom: 1rem;
@@ -2663,8 +2745,8 @@ pub async fn connect_get(
             <div class="app_header">
                 <div class="app_icon" id="app_icon">{app_icon}</div>
                 <div class="app_info">
-                    <h2>{app_name}</h2>
                     <div class="app_domain">{relay}</div>
+                    <h2>{app_name}</h2>
                 </div>
             </div>
 
@@ -2830,26 +2912,29 @@ pub async fn connect_post(
     let bunker_public_key = nostr_sdk::PublicKey::from_hex(&user_public_key)
         .map_err(|e| OAuthError::InvalidRequest(format!("Invalid public key: {}", e)))?;
 
-    // Create or get application - use client pubkey as identifier
+    // For nostr-login, redirect_origin is "nostrconnect://{client_pubkey}" (the secure identifier)
+    let redirect_origin = format!("nostrconnect://{}", &form.client_pubkey);
     let app_name = format!("nostr-login-{}", &form.client_pubkey[..12]);
 
+    // Get or create application by redirect_origin (the secure identifier)
     let app_id: i32 = match sqlx::query_scalar::<_, i32>(
-        "SELECT id FROM oauth_applications WHERE tenant_id = $1 AND client_id = $2"
+        "SELECT id FROM oauth_applications WHERE tenant_id = $1 AND redirect_origin = $2"
     )
     .bind(tenant_id)
-    .bind(&form.client_pubkey)
+    .bind(&redirect_origin)
     .fetch_optional(&auth_state.state.db)
     .await? {
         Some(id) => id,
         None => {
+            // Auto-create application
             sqlx::query_scalar(
-                "INSERT INTO oauth_applications (tenant_id, client_id, client_secret, name, redirect_uris, created_at, updated_at)
-                 VALUES ($1, $2, $3, $4, '[]', $5, $6) RETURNING id"
+                "INSERT INTO oauth_applications (tenant_id, name, display_name, redirect_origin, client_secret, redirect_uris, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, '', '[]', $5, $6) RETURNING id"
             )
             .bind(tenant_id)
-            .bind(&form.client_pubkey)
-            .bind("") // No client secret for nostr-login
-            .bind(&app_name)
+            .bind(&app_name)  // name
+            .bind(&app_name)  // display_name (cosmetic)
+            .bind(&redirect_origin)  // the secure identifier
             .bind(Utc::now())
             .bind(Utc::now())
             .fetch_one(&auth_state.state.db)
@@ -2863,11 +2948,14 @@ pub async fn connect_post(
 
     sqlx::query(
         "INSERT INTO oauth_authorizations
-         (tenant_id, user_public_key, application_id, bunker_public_key, bunker_secret, secret, relays, client_public_key, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
+         (tenant_id, user_public_key, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, client_public_key, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT (tenant_id, user_public_key, redirect_origin)
+         DO UPDATE SET bunker_public_key = $5, bunker_secret = $6, secret = $7, relays = $8, client_public_key = $9, updated_at = $11"
     )
     .bind(tenant_id)
     .bind(&user_public_key)
+    .bind(&redirect_origin)
     .bind(app_id)
     .bind(bunker_public_key.to_hex())
     .bind(&encrypted_user_key)

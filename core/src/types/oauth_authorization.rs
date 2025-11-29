@@ -13,8 +13,10 @@ pub struct OAuthAuthorization {
     pub id: i32,
     /// The user's public key (also used as bunker public key)
     pub user_public_key: String,
-    /// The OAuth application id
-    pub application_id: i32,
+    /// The redirect_uri origin (scheme + host + port) - primary identifier for the app
+    pub redirect_origin: String,
+    /// The OAuth application id (optional metadata, origin is primary)
+    pub application_id: Option<i32>,
     /// The bunker public key (same as user_public_key)
     pub bunker_public_key: String,
     /// The encrypted user private key (used for both NIP-46 decryption and event signing)
@@ -28,6 +30,9 @@ pub struct OAuthAuthorization {
     pub policy_id: Option<i32>,
     /// Tenant ID for multi-tenancy isolation
     pub tenant_id: i64,
+    /// The client's public key from nostr-login (nostrconnect:// URI)
+    /// This is set at authorization creation time for nostr-login flow
+    pub client_public_key: Option<String>,
     /// The connected NIP-46 client's public key (set after successful connect)
     /// Per NIP-46: after connect, this becomes the client identifier for security
     pub connected_client_pubkey: Option<String>,
@@ -44,7 +49,7 @@ impl OAuthAuthorization {
     pub async fn permissions(
         &self,
         pool: &PgPool,
-        tenant_id: i64,
+        _tenant_id: i64,
     ) -> Result<Vec<crate::types::permission::Permission>, AuthorizationError> {
         // If no policy, return empty vec (allow all)
         let policy_id = match self.policy_id {
@@ -52,16 +57,16 @@ impl OAuthAuthorization {
             None => return Ok(vec![]),
         };
 
-        // Load permissions from database with tenant isolation
+        // Load permissions from database
+        // Tenant isolation is enforced at authorization lookup level
         let permissions = sqlx::query_as::<_, crate::types::permission::Permission>(
             r#"
             SELECT p.*
             FROM permissions p
             JOIN policy_permissions pp ON pp.permission_id = p.id
-            WHERE p.tenant_id = $1 AND pp.policy_id = $2
+            WHERE pp.policy_id = $1
             "#,
         )
-        .bind(tenant_id)
         .bind(policy_id)
         .fetch_all(pool)
         .await
@@ -73,7 +78,8 @@ impl OAuthAuthorization {
     pub async fn find(pool: &PgPool, tenant_id: i64, id: i32) -> Result<Self, AuthorizationError> {
         let authorization = sqlx::query_as::<_, OAuthAuthorization>(
             r#"
-            SELECT * FROM oauth_authorizations WHERE tenant_id = $1 AND id = $2
+            SELECT * FROM oauth_authorizations
+            WHERE tenant_id = $1 AND id = $2
             "#,
         )
         .bind(tenant_id)
