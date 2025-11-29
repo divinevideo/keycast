@@ -1,204 +1,122 @@
 # keycast-login
 
-Drop-in Nostr authentication library with Keycast server-side signing and multiple provider support.
-
-## Features
-
-- 🔑 **Keycast Provider** - Default server-based authentication with KMS-backed signing
-- 🦊 **NIP-07 Provider** - Browser extension support (Alby, nos2x, etc.)
-- 🔗 **Bunker URL Provider** - Bring your own NIP-46 bunker
-- 🎨 **Customizable UI** - Built-in modal or headless mode
-- ⚡ **Auto-detection** - Automatically defaults to same-domain Keycast instance
-- 🔒 **Zero keys in browser** - Server-side signing with policy enforcement
+TypeScript client for Keycast OAuth authentication and Nostr signing via REST RPC.
 
 ## Installation
 
 ```bash
-npm install keycast-login nostr-tools
+npm install keycast-login
+# or
+bun add keycast-login
 ```
 
 ## Quick Start
 
-```html
-<script type="module">
-  import KeycastLogin from 'keycast-login';
+```typescript
+import { createKeycastClient } from 'keycast-login';
 
-  const auth = new KeycastLogin({
-    // Auto-detects provider at current domain
-    // e.g., running on divine.video uses login.divine.video
-    defaultProvider: 'auto',
-
-    // Or specify custom provider
-    // defaultProvider: 'https://login.divine.video',
-
-    // Enable fallback providers
-    enableNip07: true,
-    enableBunkerUrl: true
-  });
-
-  // Get user's public key
-  const pubkey = await auth.getPublicKey();
-
-  // Sign an event
-  const event = {
-    kind: 1,
-    content: 'Hello Nostr!',
-    tags: [],
-    created_at: Math.floor(Date.now() / 1000)
-  };
-
-  const signedEvent = await auth.signEvent(event);
-</script>
-```
-
-## Usage
-
-### Default Keycast Auth (Golden Path)
-
-```javascript
-const auth = new KeycastLogin();
-
-// Shows modal with Keycast auth form
-// If user doesn't exist, creates account
-// If user exists, logs them in
-const pubkey = await auth.getPublicKey();
-```
-
-### With Provider Options
-
-```javascript
-const auth = new KeycastLogin({
-  keycast: {
-    mode: 'auto',  // Auto-detect from domain
-    knownProviders: [
-      { domain: 'login.divine.video', name: 'Divine' },
-      { domain: 'auth.protest.net', name: 'Protest' }
-    ],
-    allowCustom: true
-  },
-  enableNip07: true,
-  enableCustomBunker: true
+// Create client
+const client = createKeycastClient({
+  serverUrl: 'https://login.divine.video',
+  clientId: 'divine',
+  redirectUri: window.location.origin + '/callback',
 });
 
-// Modal shows:
-// 1. Primary: "Sign in to [detected domain]" form
-// 2. Link: "or sign in with:"
-//    - Different Keycast server (shows list)
-//    - Browser extension (NIP-07)
-//    - Custom bunker URL
+// Start OAuth flow
+const { url, pkce } = await client.oauth.getAuthorizationUrl();
+
+// Store PKCE verifier for later
+sessionStorage.setItem('pkce_verifier', pkce.verifier);
+
+// Redirect to Keycast
+window.location.href = url;
 ```
 
-### Headless Mode
+After the user authorizes, handle the callback:
 
-```javascript
-const auth = new KeycastLogin({ headless: true });
+```typescript
+// Parse callback URL
+const result = client.oauth.parseCallback(window.location.href);
 
-// Handle auth yourself
-auth.on('auth-required', async () => {
-  // Show your own UI
-  const email = await promptForEmail();
-  const password = await promptForPassword();
+if ('code' in result) {
+  // Exchange code for tokens
+  const verifier = sessionStorage.getItem('pkce_verifier');
+  const tokens = await client.oauth.exchangeCode(result.code, verifier);
 
-  await auth.authenticate({ email, password });
+  // tokens.bunker_url - NIP-46 bunker URL for nostr-tools
+  // tokens.access_token - UCAN token for REST RPC API
+  // tokens.nostr_api - REST RPC API endpoint
+}
+```
+
+## REST RPC API (Low-Latency)
+
+The REST RPC API provides a low-latency alternative to NIP-46 relay-based signing:
+
+```typescript
+import { KeycastRpc } from 'keycast-login';
+
+const rpc = new KeycastRpc({
+  nostrApi: tokens.nostr_api,
+  accessToken: tokens.access_token,
 });
 
-const pubkey = await auth.getPublicKey();
+// Get public key
+const pubkey = await rpc.getPublicKey();
+
+// Sign an event
+const signed = await rpc.signEvent({
+  kind: 1,
+  content: 'Hello, Nostr!',
+  tags: [],
+  created_at: Math.floor(Date.now() / 1000),
+  pubkey: pubkey,
+});
+
+// NIP-44 encryption/decryption
+const ciphertext = await rpc.nip44Encrypt(recipientPubkey, 'secret message');
+const plaintext = await rpc.nip44Decrypt(senderPubkey, ciphertext);
+
+// NIP-04 encryption/decryption (legacy)
+const encrypted = await rpc.nip04Encrypt(recipientPubkey, 'secret message');
+const decrypted = await rpc.nip04Decrypt(senderPubkey, encrypted);
 ```
 
-## Configuration
+## BYOK (Bring Your Own Key)
 
-```javascript
-new KeycastLogin({
-  // Keycast provider settings
-  keycast: {
-    mode: 'auto' | 'select' | 'custom',
-    defaultDomain: string,
-    knownProviders: [
-      { domain: string, name: string, description?: string }
-    ],
-    allowCustom: boolean
-  },
+Import an existing Nostr identity during OAuth:
 
-  // Alternative auth methods
-  enableNip07: boolean,
-  enableCustomBunker: boolean,
-
-  // UI settings
-  headless: boolean,
-  theme: 'dark' | 'light',
-  brandColor: string,
-
-  // Behavior
-  autoConnect: boolean,
-  rememberChoice: boolean,
-  cacheTimeout: number
+```typescript
+const { url, pkce } = await client.oauth.getAuthorizationUrl({
+  nsec: 'nsec1...', // User's existing key
+  byokPubkey: 'hex_pubkey',
+  defaultRegister: true,
 });
 ```
 
-## API
+## API Reference
 
-### Methods
+### KeycastOAuth
 
-- `getPublicKey(): Promise<string>` - Get authenticated user's public key
-- `signEvent(event): Promise<SignedEvent>` - Sign a Nostr event
-- `nip04Encrypt(pubkey, plaintext): Promise<string>` - NIP-04 encryption
-- `nip04Decrypt(pubkey, ciphertext): Promise<string>` - NIP-04 decryption
-- `nip44Encrypt(pubkey, plaintext): Promise<string>` - NIP-44 encryption
-- `nip44Decrypt(pubkey, ciphertext): Promise<string>` - NIP-44 decryption
-- `disconnect()` - Clear session and disconnect
-- `getProvider(): string` - Get current provider name
+- `getAuthorizationUrl(options?)` - Generate OAuth authorization URL
+- `exchangeCode(code, verifier?)` - Exchange authorization code for tokens
+- `parseCallback(url)` - Parse callback URL for code or error
+- `toStoredCredentials(response)` - Convert token response to storable format
+- `isExpired(credentials)` - Check if credentials are expired
 
-### Events
+### KeycastRpc
 
-```javascript
-auth.on('connected', (pubkey) => {});
-auth.on('disconnected', () => {});
-auth.on('error', (error) => {});
-auth.on('provider-changed', (provider) => {});
-```
+- `getPublicKey()` - Get user's public key (hex)
+- `signEvent(event)` - Sign an unsigned Nostr event
+- `nip44Encrypt(pubkey, plaintext)` - Encrypt with NIP-44
+- `nip44Decrypt(pubkey, ciphertext)` - Decrypt with NIP-44
+- `nip04Encrypt(pubkey, plaintext)` - Encrypt with NIP-04 (legacy)
+- `nip04Decrypt(pubkey, ciphertext)` - Decrypt with NIP-04 (legacy)
 
-## Architecture
+### Utilities
 
-### Keycast Provider Flow
-
-1. User enters email/password in modal
-2. Try register → if exists, try login
-3. Server creates/retrieves KMS-encrypted key
-4. Returns JWT token
-5. Get bunker URL from API
-6. Connect via NIP-46 to signer daemon
-7. All signing happens server-side with zero user prompts
-
-### Provider Priority
-
-1. **Keycast (Default)** - Server-based auth at same domain
-2. **NIP-07** - Browser extension if available
-3. **Bunker URL** - User provides their own
-4. **Other Keycast** - List of known instances
-
-## Comparison
-
-| Feature | Keycast | nsec.app | Extension |
-|---------|---------|----------|-----------|
-| Key storage | Server KMS | Browser | Browser |
-| Signing | Server-side | Push notification | Extension popup |
-| Always available | ✅ | ❌ | ❌ |
-| Zero prompts | ✅ | ❌ | ❌ |
-| Team keys | ✅ | ❌ | ❌ |
-| Policy enforcement | ✅ | ❌ | ❌ |
-
-## Development
-
-```bash
-# Install dependencies
-npm install
-
-# Build
-npm run build
-
-# Watch mode
-npm run dev
-```
+- `generatePkce(nsec?)` - Generate PKCE challenge/verifier pair
+- `validatePkce(verifier, challenge, method?)` - Validate PKCE challenge
 
 ## License
 

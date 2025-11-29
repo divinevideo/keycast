@@ -1,96 +1,92 @@
-// ABOUTME: TypeScript type definitions for keycast-login
-// ABOUTME: Defines interfaces for configuration, events, and providers
+// ABOUTME: Type definitions for Keycast client library
+// ABOUTME: Includes OAuth response types and RPC request/response formats
 
-export interface KeycastProviderInfo {
-  domain: string;          // 'login.divine.video'
-  name: string;            // 'Divine'
-  description?: string;    // Optional description
-  apiBase?: string;        // Custom API path (default: /api)
-  logo?: string;           // Optional logo URL
+/**
+ * OAuth token response from Keycast server
+ */
+export interface TokenResponse {
+  /** NIP-46 bunker URL for remote signing */
+  bunker_url: string;
+  /** UCAN access token for REST RPC API */
+  access_token?: string;
+  /** Token type, always "Bearer" */
+  token_type: string;
+  /** Token expiry in seconds */
+  expires_in: number;
+  /** Granted OAuth scopes */
+  scope?: string;
 }
 
-export interface KeycastLoginConfig {
-  // Keycast provider settings
-  keycast?: {
-    mode?: 'auto' | 'select' | 'custom';  // How to handle provider selection
-    defaultDomain?: string;                // Override auto-detection
-    knownProviders?: KeycastProviderInfo[]; // List of Keycast servers
-    allowCustom?: boolean;                 // Allow users to enter any URL
-  };
-
-  // Alternative authentication methods
-  enableNip07?: boolean;        // Browser extensions (Alby, nos2x, etc.)
-  enableCustomBunker?: boolean; // Allow users to paste bunker:// URLs
-
-  // UI settings
-  headless?: boolean;           // Disable built-in modal
-  theme?: 'dark' | 'light';     // Modal theme
-  brandColor?: string;          // Primary color override
-
-  // Behavior
-  autoConnect?: boolean;        // Try to connect on initialization
-  rememberChoice?: boolean;     // Remember user's provider choice
-  cacheTimeout?: number;        // Session cache duration (ms)
+/**
+ * OAuth error response
+ */
+export interface OAuthError {
+  error: string;
+  error_description?: string;
 }
 
-export interface NostrEvent {
+/**
+ * RPC request format (mirrors NIP-46)
+ */
+export interface RpcRequest {
+  method: string;
+  params: unknown[];
+}
+
+/**
+ * RPC response format
+ */
+export interface RpcResponse<T = unknown> {
+  result?: T;
+  error?: string;
+}
+
+/**
+ * Unsigned Nostr event for signing
+ */
+export interface UnsignedEvent {
   kind: number;
-  created_at: number;
-  tags: string[][];
   content: string;
-  pubkey?: string;
+  tags: string[][];
+  created_at: number;
+  pubkey: string;
 }
 
-export interface SignedNostrEvent extends NostrEvent {
+/**
+ * Signed Nostr event
+ */
+export interface SignedEvent extends UnsignedEvent {
   id: string;
-  pubkey: string;
   sig: string;
 }
 
-export interface AuthCredentials {
-  email: string;
-  password: string;
+/**
+ * PKCE challenge and verifier pair
+ */
+export interface PkceChallenge {
+  verifier: string;
+  challenge: string;
 }
 
-export type ProviderType = 'keycast' | 'nip07' | 'bunker';
-
-export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'error';
-
-export interface Provider {
-  name: string;
-  type: ProviderType;
-  state: ConnectionState;
-
-  connect(): Promise<void>;
-  disconnect(): Promise<void>;  // Changed to async for cleanup
-  getPublicKey(): Promise<string>;
-  signEvent(event: NostrEvent): Promise<SignedNostrEvent>;
-
-  // Optional NIP-04/44 encryption (not all providers support)
-  nip04Encrypt?(pubkey: string, plaintext: string): Promise<string>;
-  nip04Decrypt?(pubkey: string, ciphertext: string): Promise<string>;
-  nip44Encrypt?(pubkey: string, plaintext: string): Promise<string>;
-  nip44Decrypt?(pubkey: string, ciphertext: string): Promise<string>;
+/**
+ * Keycast client configuration
+ */
+export interface KeycastClientConfig {
+  /** Keycast server URL (e.g., "https://login.divine.video") */
+  serverUrl: string;
+  /** OAuth client ID */
+  clientId: string;
+  /** OAuth redirect URI */
+  redirectUri: string;
+  /** Optional custom fetch implementation */
+  fetch?: typeof fetch;
 }
 
-// Event types with proper typing
-export type KeycastEvent =
-  | { type: 'connected'; pubkey: string }
-  | { type: 'disconnected' }
-  | { type: 'error'; error: Error }
-  | { type: 'provider-changed'; provider: ProviderType; name: string }
-  | { type: 'state-changed'; state: ConnectionState };
-
-export type EventHandler<T extends KeycastEvent = KeycastEvent> = (event: T) => void;
-
-export interface EventEmitter {
-  on<T extends KeycastEvent['type']>(
-    event: T,
-    handler: EventHandler<Extract<KeycastEvent, { type: T }>>
-  ): void;
-  off<T extends KeycastEvent['type']>(
-    event: T,
-    handler: EventHandler<Extract<KeycastEvent, { type: T }>>
-  ): void;
-  emit(event: KeycastEvent): void;
+/**
+ * Stored OAuth credentials
+ */
+export interface StoredCredentials {
+  bunkerUrl: string;
+  accessToken?: string;
+  expiresAt?: number;
 }

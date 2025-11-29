@@ -1,35 +1,53 @@
 {
   "name": "keycast-login",
   "version": "0.1.0",
-  "description": "Drop-in Nostr authentication library with Keycast server-side signing and multiple provider support",
+  "description": "TypeScript client for Keycast OAuth authentication and Nostr signing via REST RPC",
   "main": "dist/index.js",
-  "module": "dist/index.esm.js",
+  "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    },
+    "./browser": "./dist/index.global.js"
+  },
+  "unpkg": "dist/index.global.js",
+  "jsdelivr": "dist/index.global.js",
   "files": [
-    "dist"
+    "dist",
+    "README.md"
   ],
   "scripts": {
-    "build": "rollup -c",
-    "dev": "rollup -c -w",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "tsup src/index.ts --format cjs,esm,iife --dts --global-name KeycastLogin",
+    "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
+    "lint": "biome check src/",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run build"
   },
   "keywords": [
-    "nostr",
     "keycast",
-    "authentication",
+    "nostr",
     "nip-46",
-    "nip-07",
-    "remote-signer"
+    "oauth",
+    "remote-signing"
   ],
-  "author": "",
+  "author": "Divine",
   "license": "MIT",
-  "peerDependencies": {
-    "nostr-tools": "^2.0.0"
-  },
   "devDependencies": {
-    "@rollup/plugin-node-resolve": "^15.2.3",
-    "@rollup/plugin-typescript": "^11.1.5",
-    "rollup": "^4.9.0",
-    "typescript": "^5.3.3"
+    "@biomejs/biome": "^1.9.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^2.0.0"
+  },
+  "peerDependencies": {
+    "nostr-tools": ">=2.0.0"
+  },
+  "peerDependenciesMeta": {
+    "nostr-tools": {
+      "optional": true
+    }
   }
 }

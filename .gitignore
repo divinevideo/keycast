@@ -1,6 +1,6 @@
 .DS_Store
 /target
-/node_modules
+node_modules/
 master.key
 *.db
 *.db-shm
@@ -30,3 +30,5 @@ config/deploy.yml
 .kamal/
 scripts/deploy-to-pi.sh
 .tms-create
+tests/qa/target/
+keycast-login/dist/

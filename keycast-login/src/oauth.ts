@@ -41,7 +41,7 @@ export class KeycastOAuth {
     const url = new URL(`${this.config.serverUrl}/api/oauth/authorize`);
     url.searchParams.set('client_id', this.config.clientId);
     url.searchParams.set('redirect_uri', this.config.redirectUri);
-    url.searchParams.set('scope', options.scopes?.join(' ') ?? 'sign_event encrypt decrypt');
+    url.searchParams.set('scope', options.scopes?.join(' ') ?? 'policy:social');
     url.searchParams.set('code_challenge', pkce.challenge);
     url.searchParams.set('code_challenge_method', 'S256');
 
@@ -131,7 +131,6 @@ export class KeycastOAuth {
     return {
       bunkerUrl: response.bunker_url,
       accessToken: response.access_token,
-      nostrApi: response.nostr_api,
       expiresAt,
     };
   }

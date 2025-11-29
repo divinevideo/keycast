@@ -101,8 +101,8 @@ COPY ./database/migrations ./database/migrations
 # Copy example HTML files for testing
 COPY ./examples ./examples
 
-# Copy keycast-login library that test files import from
-COPY ./keycast-login ./keycast-login
+# Copy keycast-login IIFE bundle for examples
+COPY ./keycast-login/dist ./keycast-login/dist
 
 # Set environment variables
 ENV NODE_ENV=production \

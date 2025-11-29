@@ -124,18 +124,15 @@ export class KeycastRpc {
   }
 
   /**
-   * Create a new RPC client from stored credentials
+   * Create a new RPC client from stored credentials and server URL
+   *
+   * @param serverUrl - The Keycast server URL (e.g., "https://login.divine.video")
+   * @param accessToken - The UCAN access token from OAuth flow
    */
-  static fromCredentials(credentials: {
-    nostrApi?: string;
-    accessToken?: string;
-  }): KeycastRpc | null {
-    if (!credentials.nostrApi || !credentials.accessToken) {
-      return null;
-    }
+  static fromServerUrl(serverUrl: string, accessToken: string): KeycastRpc {
     return new KeycastRpc({
-      nostrApi: credentials.nostrApi,
-      accessToken: credentials.accessToken,
+      nostrApi: `${serverUrl}/api/nostr`,
+      accessToken,
     });
   }
 }
