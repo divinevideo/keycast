@@ -45,6 +45,12 @@ ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 
 WORKDIR /app
+
+# Copy keycast-login library (local dependency for web)
+COPY ./keycast-login ./keycast-login
+
+# Copy web app
+WORKDIR /app/web
 COPY ./web .
 COPY ./scripts ./scripts
 
@@ -91,9 +97,9 @@ RUN mkdir -p /app/database /data
 
 # Copy built artifacts - only keycast binary (unified)
 COPY --from=rust-builder /app/target/release/keycast ./
-COPY --from=web-builder /app/build ./web
-COPY --from=web-builder /app/package.json ./
-COPY --from=web-builder /app/node_modules ./node_modules
+COPY --from=web-builder /app/web/build ./web
+COPY --from=web-builder /app/web/package.json ./
+COPY --from=web-builder /app/web/node_modules ./node_modules
 
 # Copy ONLY database migrations (not the .db files)
 COPY ./database/migrations ./database/migrations
@@ -102,7 +108,7 @@ COPY ./database/migrations ./database/migrations
 COPY ./examples ./examples
 
 # Copy keycast-login IIFE bundle for examples
-COPY ./keycast-login/dist ./keycast-login/dist
+COPY --from=web-builder /app/keycast-login/dist ./keycast-login/dist
 
 # Set environment variables
 ENV NODE_ENV=production \

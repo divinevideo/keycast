@@ -32,3 +32,4 @@ scripts/deploy-to-pi.sh
 .tms-create
 tests/qa/target/
 keycast-login/dist/
+.claude/settings.local.json
