@@ -109,7 +109,7 @@ Client                              Keycast
    │◄── ["OK", event_id, true, ""] ────│  Acknowledge
    │◄── ["EVENT", "sub1", response] ───│  Immediate response
    │                                   │
-   │     ... idle for 4 minutes ...    │
+   │     ... idle for 1 minute ...     │
    │                                   │
    │◄── ["CLOSED", "sub1", "idle"] ────│  Server closes idle connection
    │                                   │
@@ -315,7 +315,8 @@ use axum::{
 };
 use std::time::Duration;
 
-const IDLE_TIMEOUT: Duration = Duration::from_secs(240); // 4 minutes
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60); // 1 minute
+const PING_INTERVAL: Duration = Duration::from_secs(30);
 
 struct Nip46Connection {
     sub_id: Option<String>,
@@ -334,20 +335,32 @@ pub async fn nip46_handler(
 
 async fn handle_connection(mut socket: WebSocket, state: AppState) {
     let mut conn = Nip46Connection { sub_id: None };
+    let mut last_activity = Instant::now();
+    let mut ping_interval = tokio::time::interval(PING_INTERVAL);
 
     loop {
         tokio::select! {
             msg = socket.recv() => {
                 match msg {
-                    Some(Ok(msg)) => handle_message(&mut socket, &mut conn, &state, msg).await,
+                    Some(Ok(msg)) => {
+                        last_activity = Instant::now();
+                        handle_message(&mut socket, &mut conn, &state, msg).await;
+                    }
                     _ => break,
                 }
             }
-            _ = tokio::time::sleep(IDLE_TIMEOUT) => {
-                if let Some(sub_id) = &conn.sub_id {
-                    send(&mut socket, json!(["CLOSED", sub_id, "idle timeout"])).await;
+            _ = ping_interval.tick() => {
+                // Check idle timeout
+                if last_activity.elapsed() > IDLE_TIMEOUT {
+                    if let Some(sub_id) = &conn.sub_id {
+                        send(&mut socket, json!(["CLOSED", sub_id, "idle timeout"])).await;
+                    }
+                    break;
                 }
-                break;
+                // Send ping to detect dead connections
+                if socket.send(Message::Ping(vec![])).await.is_err() {
+                    break;
+                }
             }
         }
     }
@@ -400,6 +413,8 @@ The `AuthorizationHandler` struct and its `SigningHandler` implementation move f
 
 ## Cloud Run & Scaling
 
+The NIP-46 request-response pattern is well-suited to Cloud Run. Each signing request arrives, gets processed, and returns a response — no stateful pub/sub relationships or Redis synchronization needed.
+
 ### Why Hashring Is No Longer Needed
 
 **Current architecture (relay-based):**
@@ -433,22 +448,122 @@ The `AuthorizationHandler` struct and its `SigningHandler` implementation move f
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-### Idle Timeout Strategy
+### Cloud Run Configuration
 
-**Problem:** WebSocket connections count toward Cloud Run concurrency even when idle.
+```yaml
+apiVersion: serving.knative.dev/v1
+kind: Service
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "1"       # Eliminate cold starts
+        autoscaling.knative.dev/maxScale: "10"      # Cost control
+        run.googleapis.com/cpu-throttling: "false"  # Keep CPU for responsive WebSocket
+    spec:
+      containerConcurrency: 500   # NIP-46 requests are lightweight
+      timeoutSeconds: 300         # 5 minutes (default is fine)
+```
 
-**Solution:** Server-side idle timeout before Cloud Run's request timeout.
+| Setting | Value | Rationale |
+|---------|-------|-----------|
+| `timeout` | 300s (5 min) | Default is sufficient; we close idle at 1 min |
+| `concurrency` | 500 | NIP-46 RPC is lightweight; many concurrent OK |
+| `min-instances` | 1 | Eliminates cold starts |
+| `max-instances` | 10 | Cost control; adjust based on traffic |
+| `cpu` | 1 vCPU | Sufficient for WebSocket + signing |
+| `memory` | 256-512 MB | Rust is memory-efficient |
+| `cpu-throttling` | false | Responsive WebSocket handling |
+| HTTP/2 e2e | **Disabled** | Required for WebSocket (Google recommendation) |
+
+### Connection Lifecycle: 1-Minute Idle Timeout
+
+**Problem:** WebSocket connections count toward Cloud Run concurrency even when idle. An instance with open WebSockets is billed continuously.
+
+**Solution:** Aggressive 1-minute idle timeout encourages "connect, sign, disconnect" pattern.
 
 | Timeout | Value | Purpose |
 |---------|-------|---------|
-| Cloud Run request timeout | 5 minutes (default) | Hard limit |
-| Pseudo-relay idle timeout | **4 minutes** | Graceful close |
+| Cloud Run request timeout | 5 minutes | Hard limit (plenty of headroom) |
+| Server idle timeout | **1 minute** | Graceful close before waste |
+| Ping interval | 30 seconds | Detect dead connections |
 
 **Flow:**
-1. Client connects, signs events
-2. After 4 minutes idle, server sends `["CLOSED", sub_id, "idle timeout"]`
-3. Connection closes gracefully
-4. Client reconnects on next signing request (nostr-tools handles this automatically)
+```
+t=0s    Client connects, sends REQ
+t=0.1s  Client sends EVENT (sign request)
+t=0.2s  Server responds with signed event
+t=30s   Server sends ping, client responds pong
+t=60s   No activity → server sends CLOSED, disconnects
+t=70s   Client needs to sign → reconnects (transparent via nostr-tools)
+```
+
+**Why 1 minute, not longer?**
+- NIP-46 signing is bursty: sign a few events, then idle
+- Idle connections waste money (billed continuously)
+- Reconnection is cheap (~100ms) and automatic
+- Encourages stateless "one connection per session" pattern
+
+### Graceful Shutdown (SIGTERM Handling)
+
+Cloud Run sends **SIGTERM** before terminating instances, with a 10-second grace period before SIGKILL. Critical requirements:
+
+1. **Application must run as PID 1** — or signals won't be forwarded
+2. **Drain connections within 5 seconds** — leave buffer before SIGKILL
+
+**Dockerfile (exec form required):**
+```dockerfile
+# Correct - receives SIGTERM directly
+CMD ["./keycast"]
+
+# Wrong - shell doesn't forward signals
+CMD ./keycast
+```
+
+**Rust shutdown handler:**
+```rust
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c().await.expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    tracing::info!("Shutdown signal received, draining connections (5s max)");
+}
+```
+
+### Ping/Pong Keepalive
+
+Application-level ping/pong detects dead connections and keeps NAT tables alive:
+
+```rust
+let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+
+loop {
+    tokio::select! {
+        msg = socket.recv() => { /* handle */ }
+        _ = ping_interval.tick() => {
+            if socket.send(Message::Ping(vec![])).await.is_err() {
+                break; // Connection dead
+            }
+        }
+    }
+}
+```
+
+30-second interval: aggressive enough to detect failures, not so frequent as to waste bandwidth.
 
 ### Client Reconnection
 
@@ -471,16 +586,43 @@ This means idle timeout is **transparent to applications** — the library handl
 
 Cloud Run scales based on **concurrent connections** (targeting 60% of max):
 
-| containerConcurrency | Scale-up trigger | Recommendation |
-|---------------------|------------------|----------------|
-| 80 (default) | ~48 connections | Too low |
-| 250 | ~150 connections | Good balance |
-| 500 | ~300 connections | High throughput |
+| containerConcurrency | Scale-up trigger | At limit |
+|---------------------|------------------|----------|
+| 80 (default) | ~48 connections | Too low for WebSocket |
+| 500 | ~300 connections | Good balance |
+| 1000 (max) | ~600 connections | High throughput |
 
-**With 4-minute idle timeout:**
-- Idle connections are cleaned up before accumulating
-- Concurrency reflects actual load, not stale connections
-- Autoscaling responds accurately
+**With 1-minute idle timeout:**
+- Connections don't accumulate (closed quickly)
+- Concurrency reflects actual signing load
+- Autoscaling responds to real demand
+- Cost stays proportional to usage
+
+### Session Affinity Caveat
+
+Session affinity is **"best effort" only**. Even with affinity enabled, Cloud Run may route reconnecting clients to different instances during scale events. This is fine for pseudo-relay because:
+
+- Each request is self-contained (RPC pattern)
+- Any instance can handle any bunker pubkey
+- No session state needed between requests
+
+### Cost Considerations
+
+Cloud Run bills continuously for instances with open WebSocket connections:
+
+| Scenario | Instances | Monthly Cost (approx) |
+|----------|-----------|----------------------|
+| Low traffic, min=1 | 1 | ~$63 |
+| Moderate (1000 concurrent) | 2-3 | ~$150-200 |
+| High (10,000 concurrent) | 10-20 | ~$600-1,200 |
+| Very high (100,000+) | Consider dedicated infra | — |
+
+The break-even point for dedicated Kubernetes is roughly **10,000+ sustained concurrent connections**. For typical NIP-46 relay traffic, Cloud Run is cost-effective.
+
+**Cost optimization via 1-minute idle timeout:**
+- Connections close quickly when idle
+- Only actively-signing clients hold resources
+- Scales down faster when traffic drops
 
 ### HTTP RPC Alternative
 
@@ -579,3 +721,7 @@ That argument (from nostr-protocol/nips#1207) applies to general-purpose NIP-46 
 - [Cloud Run Request Timeout](https://cloud.google.com/run/docs/configuring/request-timeout) — Default 5 min, max 60 min
 - [Cloud Run Concurrency](https://cloud.google.com/run/docs/about-concurrency) — Max 1000 per instance
 - [Cloud Run Autoscaling](https://cloud.google.com/run/docs/about-instance-autoscaling) — 60% concurrency target
+
+### Community Resources
+- [nostr-rs-relay](https://github.com/scsibug/nostr-rs-relay) — Rust Nostr relay implementation
+- [gabihodoroaga/http-grpc-websocket](https://github.com/gabihodoroaga/http-grpc-websocket) — Cloud Run WebSocket patterns
