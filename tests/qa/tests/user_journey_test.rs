@@ -80,9 +80,9 @@ async fn journey_001_third_party_app_integration() {
     }
 
     // Step 7: User revokes in dashboard (simulate via DB)
-    // Note: nip46.user_pubkey() returns the bunker_public_key from bunker URL
+    // Note: nip46.bunker_pubkey() returns the bunker_public_key from bunker URL
     let pool = server.db_pool().await.expect("Should connect to DB");
-    let bunker_pubkey = nip46.user_pubkey();
+    let bunker_pubkey = nip46.bunker_pubkey();
 
     sqlx::query(
         "DELETE FROM oauth_authorizations
@@ -125,20 +125,20 @@ async fn journey_002_reauthorization_after_revoke() {
     )
     .expect("Should create NIP-46 client");
 
-    // Verify it works
-    nip46_1
+    // Verify it works and save the user pubkey for later comparison
+    let pubkey_initial = nip46_1
         .get_public_key()
         .await
         .expect("Initial authorization should work");
 
     // Step 2: User revokes
-    // Note: nip46_1.user_pubkey() returns the bunker_public_key from bunker URL
+    // Note: nip46_1.bunker_pubkey() returns the bunker_public_key from bunker URL
     let pool = server.db_pool().await.expect("Should connect to DB");
     sqlx::query(
         "DELETE FROM oauth_authorizations
          WHERE bunker_public_key = $1",
     )
-    .bind(nip46_1.user_pubkey())
+    .bind(nip46_1.bunker_pubkey())
     .execute(&pool)
     .await
     .expect("Should revoke");
@@ -167,10 +167,11 @@ async fn journey_002_reauthorization_after_revoke() {
         .await
         .expect("Re-authorized client should work");
 
+    // Compare actual user pubkeys (not bunker pubkeys)
     assert_eq!(
-        nip46_1.user_pubkey(),
+        pubkey_initial,
         pubkey_after_reauth,
-        "Same user, same pubkey"
+        "Same user, same pubkey after re-authorization"
     );
 
     // Verify new bunker URL is different

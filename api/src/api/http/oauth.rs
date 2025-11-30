@@ -1887,13 +1887,14 @@ async fn create_oauth_authorization_and_token(
             .await
             .map_err(|e| OAuthError::Encryption(e.to_string()))?;
 
-        // Insert personal_keys
+        // Insert personal_keys (must include tenant_id for multi-tenant isolation)
         sqlx::query(
-            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, created_at, updated_at)
-             VALUES ($1, $2, $3, $4)"
+            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5)"
         )
         .bind(user_pubkey)
         .bind(&encrypted_secret)
+        .bind(tenant_id)
         .bind(Utc::now())
         .bind(Utc::now())
         .execute(pool)
@@ -1916,9 +1917,18 @@ async fn create_oauth_authorization_and_token(
         &auth_state.state.server_keys,
     ).await.map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?;
 
-    // Parse the user's public key to use as bunker public key
-    let bunker_public_key = nostr_sdk::PublicKey::from_hex(user_pubkey)
-        .map_err(|e| OAuthError::InvalidRequest(format!("Invalid public key: {}", e)))?;
+    // Derive bunker keys from user secret using HKDF (privacy: bunker_pubkey ≠ user_pubkey)
+    let decrypted_user_secret = key_manager
+        .decrypt(&encrypted_user_key)
+        .await
+        .map_err(|e| OAuthError::Encryption(format!("Failed to decrypt user key: {}", e)))?;
+    let user_secret_key = nostr_sdk::SecretKey::from_slice(&decrypted_user_secret)
+        .map_err(|e| OAuthError::InvalidRequest(format!("Invalid secret key: {}", e)))?;
+
+    let derivation_input = format!("{}-{}", user_pubkey, redirect_origin);
+    let derivation_id = keycast_core::bunker_key::hash_to_i32(&derivation_input);
+    let bunker_keys = keycast_core::bunker_key::derive_bunker_keys(&user_secret_key, derivation_id);
+    let bunker_public_key = bunker_keys.public_key();
 
     // Generate connection secret for NIP-46 authentication
     let connection_secret: String = rand::thread_rng()
@@ -1937,19 +1947,19 @@ async fn create_oauth_authorization_and_token(
 
     // Use ON CONFLICT to avoid duplicates per user/origin combination
     // Re-authorization creates new bunker keys and secrets for same user+app combination
+    // Note: bunker key is derived via HKDF from user secret, not stored
     sqlx::query(
-        "INSERT INTO oauth_authorizations (tenant_id, user_pubkey, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, policy_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        "INSERT INTO oauth_authorizations (tenant_id, user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, policy_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          ON CONFLICT (tenant_id, user_pubkey, redirect_origin)
-         DO UPDATE SET bunker_public_key = $5, bunker_secret = $6, secret = $7, relays = $8, policy_id = $9, updated_at = $11"
+         DO UPDATE SET bunker_public_key = $5, secret = $6, relays = $7, policy_id = $8, updated_at = $10"
     )
     .bind(tenant_id)
     .bind(user_pubkey)
     .bind(&redirect_origin)
     .bind(application_id)
     .bind(bunker_public_key.to_hex())
-    .bind(&encrypted_user_key)      // bunker_secret = encrypted user key (BLOB)
-    .bind(&connection_secret)        // secret = connection secret (TEXT)
+    .bind(&connection_secret)
     .bind(&relays_json)
     .bind(policy_id)
     .bind(Utc::now())
@@ -2258,12 +2268,14 @@ pub async fn oauth_register(
             .await
             .map_err(|e| OAuthError::Encryption(e.to_string()))?;
 
+        // Must include tenant_id for multi-tenant isolation
         sqlx::query(
-            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, created_at, updated_at)
-             VALUES ($1, $2, $3, $4)"
+            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5)"
         )
         .bind(public_key.to_hex())
         .bind(&encrypted_secret)
+        .bind(tenant_id)
         .bind(Utc::now())
         .bind(Utc::now())
         .execute(&mut *tx)
@@ -2908,12 +2920,23 @@ pub async fn connect_post(
     .fetch_one(&auth_state.state.db)
     .await?;
 
-    // Parse user's public key
-    let bunker_public_key = nostr_sdk::PublicKey::from_hex(&user_pubkey)
-        .map_err(|e| OAuthError::InvalidRequest(format!("Invalid public key: {}", e)))?;
-
     // For nostr-login, redirect_origin is "nostrconnect://{client_pubkey}" (the secure identifier)
     let redirect_origin = format!("nostrconnect://{}", &form.client_pubkey);
+
+    // Derive bunker keys from user secret using HKDF (privacy: bunker_pubkey ≠ user_pubkey)
+    let key_manager = auth_state.state.key_manager.as_ref();
+    let decrypted_user_secret = key_manager
+        .decrypt(&encrypted_user_key)
+        .await
+        .map_err(|e| OAuthError::Encryption(format!("Failed to decrypt user key: {}", e)))?;
+    let user_secret_key = nostr_sdk::SecretKey::from_slice(&decrypted_user_secret)
+        .map_err(|e| OAuthError::InvalidRequest(format!("Invalid secret key: {}", e)))?;
+
+    let derivation_input = format!("{}-{}", user_pubkey, redirect_origin);
+    let derivation_id = keycast_core::bunker_key::hash_to_i32(&derivation_input);
+    let bunker_keys = keycast_core::bunker_key::derive_bunker_keys(&user_secret_key, derivation_id);
+    let bunker_public_key = bunker_keys.public_key();
+
     let app_name = format!("nostr-login-{}", &form.client_pubkey[..12]);
 
     // Get or create application by redirect_origin (the secure identifier)
@@ -2943,22 +2966,22 @@ pub async fn connect_post(
     };
 
     // Create authorization
+    // Note: bunker key is derived via HKDF from user secret, not stored
     let relays_json = serde_json::to_string(&vec![form.relay.clone()])
         .map_err(|e| OAuthError::InvalidRequest(format!("Failed to serialize relays: {}", e)))?;
 
     sqlx::query(
         "INSERT INTO oauth_authorizations
-         (tenant_id, user_pubkey, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, client_pubkey, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         (tenant_id, user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, client_pubkey, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          ON CONFLICT (tenant_id, user_pubkey, redirect_origin)
-         DO UPDATE SET bunker_public_key = $5, bunker_secret = $6, secret = $7, relays = $8, client_pubkey = $9, updated_at = $11"
+         DO UPDATE SET bunker_public_key = $5, secret = $6, relays = $7, client_pubkey = $8, updated_at = $10"
     )
     .bind(tenant_id)
     .bind(&user_pubkey)
     .bind(&redirect_origin)
     .bind(app_id)
     .bind(bunker_public_key.to_hex())
-    .bind(&encrypted_user_key)
     .bind(&form.secret)
     .bind(&relays_json)
     .bind(&form.client_pubkey)

@@ -36,9 +36,9 @@ async fn sec_revoked_authorization_rejected() {
     assert!(pubkey.is_ok(), "Initial request should succeed");
 
     // Revoke by deleting from database (simulates revocation)
-    // Note: nip46.user_pubkey() returns the bunker_public_key from bunker URL
+    // Note: nip46.bunker_pubkey() returns the bunker_public_key from bunker URL
     let pool = server.db_pool().await.expect("Should connect to database");
-    let bunker_pubkey = nip46.user_pubkey();
+    let bunker_pubkey = nip46.bunker_pubkey();
 
     sqlx::query(
         "DELETE FROM oauth_authorizations
@@ -157,7 +157,7 @@ async fn sec_reauthorization_after_revoke_works() {
 
     sqlx::query(
         "DELETE FROM oauth_authorizations
-         WHERE user_public_key = $1 AND redirect_origin = $2",
+         WHERE user_pubkey = $1 AND redirect_origin = $2",
     )
     .bind(&pubkey1)
     .bind(&redirect_origin)

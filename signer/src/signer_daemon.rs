@@ -549,13 +549,40 @@ impl UnifiedSigner {
             .await?;
 
             if let Some(auth) = auth {
-                let decrypted_user_secret = key_manager.decrypt(&auth.bunker_secret).await?;
+                // Get user's key from personal_keys (single source of truth)
+                let encrypted_user_key: Vec<u8> = sqlx::query_scalar(
+                    "SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1 AND tenant_id = $2"
+                )
+                .bind(&auth.user_pubkey)
+                .bind(tenant_id)
+                .fetch_one(pool)
+                .await?;
+
+                let decrypted_user_secret = key_manager.decrypt(&encrypted_user_key).await?;
                 let user_secret_key = SecretKey::from_slice(&decrypted_user_secret)
                     .map_err(|e| format!("Invalid secret key: {}", e))?;
-                let user_keys = Keys::new(user_secret_key);
+                let user_keys = Keys::new(user_secret_key.clone());
+
+                // Derive bunker keys using HKDF (privacy: bunker_pubkey ≠ user_pubkey)
+                let derivation_input = format!("{}-{}", auth.user_pubkey, auth.redirect_origin);
+                let derivation_id = keycast_core::bunker_key::hash_to_i32(&derivation_input);
+                let bunker_keys = keycast_core::bunker_key::derive_bunker_keys(&user_secret_key, derivation_id);
+
+                // Validate derived key matches stored bunker_public_key
+                if bunker_keys.public_key().to_hex() != auth.bunker_public_key {
+                    tracing::error!(
+                        "Derived bunker key mismatch for auth {}: expected {}, got {}",
+                        auth.id,
+                        auth.bunker_public_key,
+                        bunker_keys.public_key().to_hex()
+                    );
+                    return Err(format!(
+                        "Derived bunker key mismatch - possible data corruption or migration issue"
+                    ).into());
+                }
 
                 let handler = AuthorizationHandler {
-                    bunker_keys: user_keys.clone(),
+                    bunker_keys,
                     user_keys,
                     secret: auth.secret.clone(),
                     authorization_id: auth.id,
@@ -680,14 +707,35 @@ impl UnifiedSigner {
                         // Found in database - load it now
                         tracing::debug!("Loading authorization on-demand: {}", bunker_pubkey);
 
-                        // Decrypt user secret (stored in bunker_secret for OAuth)
-                        let decrypted_user_secret = key_manager.decrypt(&auth.bunker_secret).await?;
+                        // Get user's key from personal_keys table (single source of truth)
+                        let encrypted_user_key: Vec<u8> = sqlx::query_scalar(
+                            "SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1 AND tenant_id = $2"
+                        )
+                        .bind(&auth.user_pubkey)
+                        .bind(auth.tenant_id)
+                        .fetch_one(pool)
+                        .await
+                        .map_err(|e| format!("Failed to fetch user key: {}", e))?;
+
+                        let decrypted_user_secret = key_manager.decrypt(&encrypted_user_key).await?;
                         let user_secret_key = SecretKey::from_slice(&decrypted_user_secret)?;
                         let user_keys = Keys::new(user_secret_key.clone());
 
-                        // For OAuth, bunker keys and user keys are the same
+                        // Derive bunker keys using HKDF (privacy: bunker_pubkey ≠ user_pubkey)
+                        let derivation_input = format!("{}-{}", auth.user_pubkey, auth.redirect_origin);
+                        let derivation_id = keycast_core::bunker_key::hash_to_i32(&derivation_input);
+                        let bunker_keys = keycast_core::bunker_key::derive_bunker_keys(&user_secret_key, derivation_id);
+
+                        // Validate derived key matches stored bunker_public_key
+                        if bunker_keys.public_key().to_hex() != auth.bunker_public_key {
+                            return Err(format!(
+                                "Derived bunker key mismatch for auth {} - possible data corruption",
+                                auth.id
+                            ).into());
+                        }
+
                         let handler = AuthorizationHandler {
-                            bunker_keys: user_keys.clone(),
+                            bunker_keys,
                             user_keys,
                             secret: auth.secret.clone(),
                             authorization_id: auth.id,
@@ -1242,8 +1290,8 @@ mod tests {
         // Create personal_keys entry (required FK for oauth_authorizations)
         // No ON CONFLICT needed since each test generates unique keys
         sqlx::query(
-            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, bunker_secret, tenant_id)
-             VALUES ($1, $2, 'test_bunker_secret', 1)"
+            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id)
+             VALUES ($1, $2, 1)"
         )
         .bind(&user_pubkey)
         .bind(vec![0u8; 32]) // Dummy encrypted key
@@ -1252,15 +1300,15 @@ mod tests {
         .unwrap();
 
         // Create oauth_authorization and get the ID
+        // Note: bunker_secret is no longer stored (derived via HKDF on demand)
         let auth_id: i32 = sqlx::query_scalar(
             "INSERT INTO oauth_authorizations
-             (user_pubkey, redirect_origin, bunker_public_key, bunker_secret, secret, relays, tenant_id, created_at, updated_at)
-             VALUES ($1, 'http://test.example.com', $2, $3, 'test_secret', '[\"wss://relay.test\"]', 1, NOW(), NOW())
+             (user_pubkey, redirect_origin, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
+             VALUES ($1, 'http://test.example.com', $2, 'test_secret', '[\"wss://relay.test\"]', 1, NOW(), NOW())
              RETURNING id"
         )
         .bind(&user_pubkey)
         .bind(&bunker_pubkey)
-        .bind(bunker_keys.secret_key().to_secret_bytes().to_vec())
         .fetch_one(&pool)
         .await
         .unwrap();

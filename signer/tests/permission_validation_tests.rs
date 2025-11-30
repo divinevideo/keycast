@@ -189,12 +189,11 @@ async fn create_oauth_authorization(
         .expect("Failed to encrypt user secret");
 
     sqlx::query(
-        "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, bunker_secret, tenant_id)
-         VALUES ($1, $2, $3, $4)"
+        "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id)
+         VALUES ($1, $2, $3)"
     )
     .bind(user_keys.public_key().to_hex())
     .bind(&encrypted_secret)
-    .bind(&unique_secret)
     .bind(tenant_id)
     .execute(pool)
     .await
@@ -218,18 +217,17 @@ async fn create_oauth_authorization(
     .await
     .expect("Failed to create OAuth application");
 
-    // Create OAuth authorization
+    // Create OAuth authorization (bunker key derived via HKDF, not stored)
     let oauth_id: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, policy_id, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+         (user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, policy_id, tenant_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
          RETURNING id"
     )
     .bind(user_keys.public_key().to_hex())
     .bind(&redirect_origin)
     .bind(app_id)
     .bind(user_keys.public_key().to_hex())
-    .bind(&encrypted_secret)
     .bind(&unique_secret)
     .bind(json!(["wss://relay.damus.io"]))
     .bind(policy_id)

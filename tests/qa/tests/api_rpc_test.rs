@@ -42,9 +42,13 @@ async fn api_rpc_006_get_public_key() {
         "Public key should be valid hex"
     );
 
-    // Should match the pubkey from bunker URL
-    let expected_pubkey = nip46.user_pubkey();
-    assert_eq!(pubkey, expected_pubkey, "Public key should match bunker URL");
+    // Note: user pubkey (from get_public_key) differs from bunker_pubkey (from bunker URL)
+    // due to HKDF derivation for privacy. This is by design.
+    let bunker_pubkey = nip46.bunker_pubkey();
+    assert_ne!(
+        pubkey, bunker_pubkey,
+        "User pubkey should differ from bunker pubkey (privacy via HKDF)"
+    );
 }
 
 #[tokio::test]
@@ -75,6 +79,9 @@ async fn api_rpc_007_sign_event() {
         .await
         .expect("sign_event should succeed");
 
+    // Get the actual user pubkey (different from bunker_pubkey after HKDF derivation)
+    let user_pubkey = nip46.get_public_key().await.expect("Should get user pubkey");
+
     // Verify event properties
     assert_eq!(signed_event.kind.as_u16(), 1, "Event kind should be 1");
     assert_eq!(
@@ -84,8 +91,8 @@ async fn api_rpc_007_sign_event() {
     );
     assert_eq!(
         signed_event.pubkey.to_hex(),
-        nip46.user_pubkey(),
-        "Pubkey should match user"
+        user_pubkey,
+        "Signed event pubkey should match user's actual pubkey"
     );
 
     // Verify signature is present and valid format

@@ -17,10 +17,8 @@ pub struct OAuthAuthorization {
     pub redirect_origin: String,
     /// The OAuth application id (optional metadata, origin is primary)
     pub application_id: Option<i32>,
-    /// The bunker public key (same as user_public_key)
+    /// The bunker public key (derived from user key via HKDF, different from user_pubkey for privacy)
     pub bunker_public_key: String,
-    /// The encrypted user private key (used for both NIP-46 decryption and event signing)
-    pub bunker_secret: Vec<u8>,
     /// The connection secret for NIP-46 authentication
     pub secret: String,
     #[sqlx(try_from = "String")]

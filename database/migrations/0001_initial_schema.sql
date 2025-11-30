@@ -126,7 +126,6 @@ CREATE TABLE public.oauth_authorizations (
     redirect_origin text NOT NULL,
     application_id integer,
     bunker_public_key character(64) NOT NULL,
-    bunker_secret bytea NOT NULL,
     secret text NOT NULL,
     relays text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,

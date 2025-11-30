@@ -259,8 +259,8 @@ async fn test_multiple_authorizations_per_user() {
 
     // Create authorization for App 1
     sqlx::query(
-        "INSERT INTO oauth_authorizations (user_pubkey, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, E'\\\\x00', 'secret1', '[]', 1, NOW(), NOW())"
+        "INSERT INTO oauth_authorizations (user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'secret1', '[]', 1, NOW(), NOW())"
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin_1)
@@ -272,8 +272,8 @@ async fn test_multiple_authorizations_per_user() {
 
     // Create authorization for App 2
     sqlx::query(
-        "INSERT INTO oauth_authorizations (user_pubkey, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, E'\\\\x00', 'secret2', '[]', 1, NOW(), NOW())"
+        "INSERT INTO oauth_authorizations (user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'secret2', '[]', 1, NOW(), NOW())"
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin_2)
@@ -364,8 +364,8 @@ async fn test_rpc_fast_path_works_with_any_oauth_app() {
 
     // Create OAuth authorization with this 'divine' app
     sqlx::query(
-        "INSERT INTO oauth_authorizations (user_pubkey, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, E'\\\\x00', 'secret1', '[]', $5, NOW(), NOW())"
+        "INSERT INTO oauth_authorizations (user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'secret1', '[]', $5, NOW(), NOW())"
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin)

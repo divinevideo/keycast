@@ -40,12 +40,21 @@ async fn nip46_001_connect_via_bunker_url() {
         .expect("Should connect via relay");
 
     // Get public key to verify connection
-    let signer_pubkey = signer
+    let user_pubkey = signer
         .get_public_key()
         .await
         .expect("Should get signer pubkey");
 
-    assert_eq!(signer_pubkey.to_hex(), pubkey, "Pubkey should match bunker URL");
+    // Note: With HKDF-derived bunker keys, the user_pubkey (signing key) differs
+    // from bunker_pubkey (bunker URL key) for privacy. This is by design.
+    assert_ne!(
+        user_pubkey.to_hex(),
+        pubkey,
+        "User pubkey should differ from bunker pubkey (privacy via HKDF)"
+    );
+
+    // User pubkey should be a valid hex string
+    assert_eq!(user_pubkey.to_hex().len(), 64, "User pubkey should be 64 hex chars");
 }
 
 #[tokio::test]
@@ -62,7 +71,7 @@ async fn nip46_002_get_public_key_over_relay() {
         .await
         .expect("OAuth flow should complete");
 
-    let (expected_pubkey, _, _) = parse_bunker_url(&token_resp.bunker_url)
+    let (bunker_pubkey, _, _) = parse_bunker_url(&token_resp.bunker_url)
         .expect("Should parse bunker URL");
 
     // Connect via relay
@@ -70,13 +79,26 @@ async fn nip46_002_get_public_key_over_relay() {
         .await
         .expect("Should connect via relay");
 
-    // Get public key
-    let pubkey = signer
+    // Get public key (the user's signing key, NOT the bunker identity key)
+    let user_pubkey = signer
         .get_public_key()
         .await
         .expect("get_public_key should succeed");
 
-    assert_eq!(pubkey.to_hex(), expected_pubkey, "Public key should match");
+    // Note: With HKDF-derived bunker keys, user_pubkey differs from bunker_pubkey
+    // for privacy (prevents relay traffic correlation). This is by design.
+    assert_ne!(
+        user_pubkey.to_hex(),
+        bunker_pubkey,
+        "User pubkey should differ from bunker pubkey (privacy via HKDF)"
+    );
+
+    // User pubkey should be a valid 64-char hex string
+    assert_eq!(user_pubkey.to_hex().len(), 64, "User pubkey should be 64 hex chars");
+    assert!(
+        user_pubkey.to_hex().chars().all(|c| c.is_ascii_hexdigit()),
+        "User pubkey should be valid hex"
+    );
 }
 
 #[tokio::test]

@@ -75,15 +75,12 @@ async fn create_personal_key(
         .await
         .expect("Failed to encrypt user secret");
 
-    let bunker_secret = format!("bunker_secret_{}", Uuid::new_v4());
-
     sqlx::query(
-        "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, bunker_secret, tenant_id)
-         VALUES ($1, $2, $3, $4)"
+        "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id)
+         VALUES ($1, $2, $3)"
     )
     .bind(user_pubkey)
     .bind(&encrypted_secret)
-    .bind(&bunker_secret)
     .bind(tenant_id)
     .execute(pool)
     .await
@@ -99,28 +96,22 @@ async fn create_test_authorization(
     redirect_origin: &str,
     policy_id: Option<i32>,
     expires_at: Option<chrono::DateTime<Utc>>,
-    key_manager: &dyn KeyManager,
+    _key_manager: &dyn KeyManager,
 ) -> i32 {
-    // Generate bunker keys
+    // Generate bunker keys (bunker secret is derived via HKDF, not stored)
     let bunker_keys = Keys::generate();
-    let bunker_secret = bunker_keys.secret_key().secret_bytes();
-    let encrypted_bunker_secret = key_manager
-        .encrypt(&bunker_secret)
-        .await
-        .expect("Failed to encrypt bunker secret");
 
     let secret = format!("auth_secret_{}", Uuid::new_v4());
 
     sqlx::query_scalar::<_, i32>(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, bunker_public_key, bunker_secret, secret, relays, policy_id, tenant_id, expires_at, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+         (user_pubkey, redirect_origin, bunker_public_key, secret, relays, policy_id, tenant_id, expires_at, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
          RETURNING id"
     )
     .bind(user_pubkey)
     .bind(redirect_origin)
     .bind(bunker_keys.public_key().to_hex())
-    .bind(&encrypted_bunker_secret)
     .bind(&secret)
     .bind(json!(["wss://relay.damus.io"]).to_string())
     .bind(policy_id)

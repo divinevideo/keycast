@@ -22,7 +22,8 @@ pub struct RpcResponse {
 /// NIP-46 client for testing remote signing
 pub struct Nip46Client {
     bunker_url: String,
-    user_pubkey: String,
+    /// The bunker pubkey (from bunker URL). Note: This may differ from user_pubkey after HKDF derivation.
+    bunker_pubkey: String,
     access_token: Option<String>,
     api_base_url: String,
 }
@@ -34,18 +35,18 @@ impl Nip46Client {
         access_token: Option<String>,
         api_base_url: String,
     ) -> Result<Self, String> {
-        // Parse bunker URL to extract pubkey
+        // Parse bunker URL to extract bunker pubkey
         let uri = NostrConnectURI::parse(&bunker_url)
             .map_err(|e| format!("Failed to parse bunker URL: {}", e))?;
 
-        let user_pubkey = uri
+        let bunker_pubkey = uri
             .remote_signer_public_key()
             .ok_or("No remote signer public key in bunker URL")?
             .to_hex();
 
         Ok(Self {
             bunker_url,
-            user_pubkey,
+            bunker_pubkey,
             access_token,
             api_base_url,
         })
@@ -55,8 +56,10 @@ impl Nip46Client {
         &self.bunker_url
     }
 
-    pub fn user_pubkey(&self) -> &str {
-        &self.user_pubkey
+    /// Returns the bunker pubkey (from the bunker URL).
+    /// Note: This is different from the user's signing pubkey (use get_public_key() for that).
+    pub fn bunker_pubkey(&self) -> &str {
+        &self.bunker_pubkey
     }
 
     /// Make an RPC call to the REST API endpoint
@@ -131,12 +134,15 @@ impl Nip46Client {
 
     /// Sign a simple text note (kind 1)
     pub async fn sign_text_note(&self, content: &str) -> Result<Event, String> {
+        // Fetch the actual user pubkey (different from bunker_pubkey after HKDF derivation)
+        let user_pubkey = self.get_public_key().await?;
+
         let unsigned = serde_json::json!({
             "kind": 1,
             "content": content,
             "tags": [],
             "created_at": chrono::Utc::now().timestamp(),
-            "pubkey": self.user_pubkey
+            "pubkey": user_pubkey
         });
 
         self.sign_event(unsigned).await
