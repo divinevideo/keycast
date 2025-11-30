@@ -14,6 +14,7 @@ use serde_json::Value as JsonValue;
 
 use super::auth::{extract_user_and_origin_from_token, AuthError};
 use super::routes::AuthState;
+use sqlx::PgPool;
 
 /// RPC request format (mirrors NIP-46)
 #[derive(Debug, Deserialize)]
@@ -125,6 +126,17 @@ pub async fn nostr_rpc(
                 .map_err(|e| RpcError::SigningFailed(format!("Signing failed: {}", e)))?;
 
             tracing::info!("RPC: Signed event {} kind={}", signed.id, signed.kind.as_u16());
+
+            // Log signing activity (don't block on failure)
+            log_signing_activity(
+                pool,
+                tenant_id,
+                &user_pubkey,
+                &redirect_origin,
+                signed.kind.as_u16(),
+                &signed.content,
+                &signed.id.to_hex(),
+            ).await;
 
             serde_json::to_value(&signed)
                 .map_err(|e| RpcError::Internal(format!("JSON serialization failed: {}", e)))?
@@ -336,6 +348,58 @@ fn parse_decrypt_params(params: &[JsonValue]) -> Result<(PublicKey, String), Rpc
         .map_err(|e| RpcError::InvalidParams(format!("Invalid pubkey: {}", e)))?;
 
     Ok((pubkey, ciphertext.to_string()))
+}
+
+/// Log signing activity to database for RPC-based signing
+async fn log_signing_activity(
+    pool: &PgPool,
+    tenant_id: i64,
+    user_pubkey: &str,
+    redirect_origin: &str,
+    event_kind: u16,
+    event_content: &str,
+    event_id: &str,
+) {
+    // Look up application_id from redirect_origin
+    let application_id: Option<i32> = sqlx::query_scalar(
+        "SELECT id FROM oauth_applications WHERE redirect_origin = $1"
+    )
+    .bind(redirect_origin)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+
+    // Truncate content for storage
+    let truncated_content = if event_content.len() > 500 {
+        format!("{}... (truncated)", &event_content[..500])
+    } else {
+        event_content.to_string()
+    };
+
+    // Use rpc:<origin> as bunker_secret identifier for RPC requests
+    let bunker_secret = format!("rpc:{}", redirect_origin);
+
+    let result = sqlx::query(
+        "INSERT INTO signing_activity
+         (user_pubkey, application_id, bunker_secret, event_kind, event_content, event_id, tenant_id, source, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'rpc', NOW())"
+    )
+    .bind(user_pubkey)
+    .bind(application_id)
+    .bind(&bunker_secret)
+    .bind(event_kind as i32)
+    .bind(&truncated_content)
+    .bind(event_id)
+    .bind(tenant_id)
+    .execute(pool)
+    .await;
+
+    if let Err(e) = result {
+        tracing::error!("Failed to log RPC signing activity: {}", e);
+    } else {
+        tracing::debug!("Logged RPC signing activity for user {} kind {}", &user_pubkey[..8], event_kind);
+    }
 }
 
 #[cfg(test)]

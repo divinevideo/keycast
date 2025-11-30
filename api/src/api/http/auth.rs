@@ -380,116 +380,6 @@ pub(crate) fn extract_origin_from_headers(headers: &HeaderMap) -> Result<String,
         .ok_or(AuthError::BadRequest("Origin header required".to_string()))
 }
 
-/// Create oauth_authorization for first-party login/register.
-/// This ensures first-party apps (web admin, etc.) have authorization records
-/// that can be looked up via (user_pubkey, redirect_origin).
-/// policy_id is null for first-party apps (full access).
-pub(crate) async fn create_first_party_authorization(
-    auth_state: &super::routes::AuthState,
-    tenant_id: i64,
-    user_pubkey: &str,
-    redirect_origin: &str,
-    encrypted_secret: &[u8],
-) -> Result<(), AuthError> {
-    let pool = &auth_state.state.db;
-    let key_manager = auth_state.state.key_manager.as_ref();
-
-    // Generate connection secret for NIP-46
-    let connection_secret: String = rand::thread_rng()
-        .sample_iter(&rand::distributions::Alphanumeric)
-        .take(48)
-        .map(char::from)
-        .collect();
-
-    // Derive bunker key using HKDF (privacy: bunker_pubkey ≠ user_pubkey)
-    let decrypted_user_secret = key_manager
-        .decrypt(encrypted_secret)
-        .await
-        .map_err(|e| AuthError::Internal(format!("Failed to decrypt user key: {}", e)))?;
-    let user_secret_key = nostr_sdk::SecretKey::from_slice(&decrypted_user_secret)
-        .map_err(|e| AuthError::Internal(format!("Invalid secret key: {}", e)))?;
-
-    let derivation_input = format!("{}-{}", user_pubkey, redirect_origin);
-    let derivation_id = keycast_core::bunker_key::hash_to_i32(&derivation_input);
-    let bunker_keys = keycast_core::bunker_key::derive_bunker_keys(&user_secret_key, derivation_id);
-    let bunker_public_key = bunker_keys.public_key();
-
-    // Get or create OAuth application for this first-party origin
-    let app_display_name = format!("First-party: {}", redirect_origin);
-    sqlx::query(
-        "INSERT INTO oauth_applications (tenant_id, name, display_name, redirect_origin, client_secret, redirect_uris, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'first-party', '[]', $5, $6)
-         ON CONFLICT (tenant_id, redirect_origin) DO NOTHING"
-    )
-    .bind(tenant_id)
-    .bind(&app_display_name)
-    .bind(&app_display_name)
-    .bind(redirect_origin)
-    .bind(Utc::now())
-    .bind(Utc::now())
-    .execute(pool)
-    .await?;
-
-    // Get application ID
-    let app_id: i32 = sqlx::query_scalar(
-        "SELECT id FROM oauth_applications WHERE redirect_origin = $1 AND tenant_id = $2"
-    )
-    .bind(redirect_origin)
-    .bind(tenant_id)
-    .fetch_one(pool)
-    .await?;
-
-    // Get deployment-wide relay list
-    let relays = keycast_core::types::authorization::Authorization::get_bunker_relays();
-    let relays_json = serde_json::to_string(&relays)
-        .map_err(|e| AuthError::Internal(format!("Failed to serialize relays: {}", e)))?;
-
-    // Create authorization with null policy_id (full access for first-party)
-    // Note: bunker key is derived via HKDF from user secret, not stored
-    let created_at = Utc::now();
-    sqlx::query(
-        "INSERT INTO oauth_authorizations
-         (tenant_id, user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, policy_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, $9)
-         ON CONFLICT (tenant_id, user_pubkey, redirect_origin)
-         DO UPDATE SET bunker_public_key = EXCLUDED.bunker_public_key, secret = EXCLUDED.secret, updated_at = EXCLUDED.updated_at"
-    )
-    .bind(tenant_id)
-    .bind(user_pubkey)
-    .bind(redirect_origin)
-    .bind(app_id)
-    .bind(bunker_public_key.to_hex())
-    .bind(&connection_secret)
-    .bind(&relays_json)
-    .bind(created_at)
-    .bind(created_at)
-    .execute(pool)
-    .await?;
-
-    // Signal signer daemon to reload
-    if let Some(tx) = &auth_state.auth_tx {
-        use keycast_core::authorization_channel::AuthorizationCommand;
-        if let Err(e) = tx.send(AuthorizationCommand::Upsert {
-            bunker_pubkey: bunker_public_key.to_hex(),
-            tenant_id,
-            is_oauth: true,
-        }).await {
-            tracing::error!("Failed to send authorization upsert command: {}", e);
-        } else {
-            tracing::debug!("Signaled signer daemon for first-party authorization: {}", redirect_origin);
-        }
-    }
-
-    tracing::info!(
-        event = "first_party_authorization_created",
-        user_pubkey = &user_pubkey[..8],
-        redirect_origin = redirect_origin,
-        "Created first-party authorization"
-    );
-
-    Ok(())
-}
-
 /// Register a new user with email and password, sets session cookie
 pub async fn register(
     tenant: crate::api::tenant::TenantExtractor,
@@ -599,15 +489,6 @@ pub async fn register(
     .await?;
 
     tx.commit().await?;
-
-    // Create first-party authorization for this origin (enables bunker URL access)
-    create_first_party_authorization(
-        &auth_state,
-        tenant_id,
-        &public_key.to_hex(),
-        &redirect_origin,
-        &encrypted_secret,
-    ).await?;
 
     // Send verification email (optional - don't fail if email service unavailable)
     match crate::email_service::EmailService::new() {
@@ -727,15 +608,6 @@ pub async fn login(
         .map_err(|e| AuthError::Internal(format!("Invalid secret key bytes: {}", e)))?;
     let keys = Keys::new(secret_key.into());
 
-    // Create/update first-party authorization for this origin (enables bunker URL access)
-    create_first_party_authorization(
-        &auth_state,
-        tenant_id,
-        &public_key,
-        &redirect_origin,
-        &encrypted_secret,
-    ).await?;
-
     // Generate UCAN token for session cookie with redirect_origin
     let ucan_token = generate_ucan_token(&keys, tenant_id, &req.email, &redirect_origin, None).await?;
 
@@ -786,16 +658,16 @@ pub async fn logout(
 
 #[derive(Debug, Deserialize)]
 pub struct CreateBunkerRequest {
-    pub origin: String,              // Required: the app's origin URL (must be HTTPS)
-    pub app_name: Option<String>,    // Optional: friendly display name
+    pub app_name: String,            // Required: friendly display name
+    pub origin: Option<String>,      // Optional: the app's origin URL (must be HTTPS if provided)
     pub policy_slug: Option<String>, // Optional: null = full access
 }
 
 #[derive(Debug, Serialize)]
 pub struct CreateBunkerResponse {
     pub bunker_url: String,
-    pub origin: String,
-    pub app_name: Option<String>,
+    pub origin: Option<String>,
+    pub app_name: String,
     pub bunker_pubkey: String,
     pub created_at: String,
 }
@@ -830,15 +702,29 @@ pub async fn create_bunker(
     let pool = &auth_state.state.db;
     let tenant_id = tenant.0.id;
 
-    // Validate origin is HTTPS
-    validate_origin(&req.origin)?;
+    // Validate origin if provided (must be HTTPS)
+    if let Some(ref origin) = req.origin {
+        validate_origin(origin)?;
+    }
 
-    // redirect_origin is the ONLY secure app identifier (cannot be spoofed)
-    // display_name is just cosmetic, from user input or defaulting to origin
-    let redirect_origin = &req.origin;
-    let display_name = req.app_name.as_deref().unwrap_or(&req.origin);
+    // Generate synthetic redirect_origin when no web origin provided
+    // Format: app://{sanitized_app_name}_{short_uuid}
+    let redirect_origin = match &req.origin {
+        Some(origin) => origin.clone(),
+        None => {
+            let sanitized_name: String = req.app_name
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+                .take(32)
+                .collect::<String>()
+                .to_lowercase();
+            let short_id = &uuid::Uuid::new_v4().to_string()[..8];
+            format!("app://{}-{}", if sanitized_name.is_empty() { "manual" } else { &sanitized_name }, short_id)
+        }
+    };
+    let display_name = &req.app_name;
 
-    tracing::info!("Creating manual bunker for user: {} in tenant: {}, origin: {}", user_pubkey, tenant_id, req.origin);
+    tracing::info!("Creating manual bunker for user: {} in tenant: {}, redirect_origin: {}", user_pubkey, tenant_id, redirect_origin);
 
     // Get user's encrypted secret key
     let encrypted_secret: Vec<u8> = sqlx::query_scalar(
@@ -865,7 +751,7 @@ pub async fn create_bunker(
     .bind(tenant_id)
     .bind(display_name)
     .bind(display_name)
-    .bind(redirect_origin)
+    .bind(&redirect_origin)
     .bind(Utc::now())
     .bind(Utc::now())
     .execute(pool)
@@ -875,7 +761,7 @@ pub async fn create_bunker(
     let app_id: i32 = sqlx::query_scalar(
         "SELECT id FROM oauth_applications WHERE redirect_origin = $1 AND tenant_id = $2"
     )
-    .bind(redirect_origin)
+    .bind(&redirect_origin)
     .bind(tenant_id)
     .fetch_one(pool)
     .await?;
@@ -892,7 +778,7 @@ pub async fn create_bunker(
         None
     };
 
-    // Derive bunker key using HKDF (privacy: bunker_pubkey ≠ user_pubkey)
+    // Derive bunker key using HKDF with connection secret (privacy: bunker_pubkey ≠ user_pubkey)
     let key_manager = auth_state.state.key_manager.as_ref();
     let decrypted_user_secret = key_manager
         .decrypt(&encrypted_secret)
@@ -901,9 +787,7 @@ pub async fn create_bunker(
     let user_secret_key = nostr_sdk::SecretKey::from_slice(&decrypted_user_secret)
         .map_err(|e| AuthError::Internal(format!("Invalid secret key: {}", e)))?;
 
-    let derivation_input = format!("{}-{}", user_pubkey, redirect_origin);
-    let derivation_id = keycast_core::bunker_key::hash_to_i32(&derivation_input);
-    let bunker_keys = keycast_core::bunker_key::derive_bunker_keys(&user_secret_key, derivation_id);
+    let bunker_keys = keycast_core::bunker_key::derive_bunker_keys(&user_secret_key, &connection_secret);
     let bunker_public_key = bunker_keys.public_key();
 
     // Use deployment-wide relay list (ignore any client-provided relay)
@@ -923,7 +807,7 @@ pub async fn create_bunker(
     )
     .bind(tenant_id)
     .bind(&user_pubkey)
-    .bind(&req.origin)  // redirect_origin = the app's origin
+    .bind(&redirect_origin)
     .bind(app_id)
     .bind(bunker_public_key.to_hex())
     .bind(&connection_secret)
@@ -962,7 +846,7 @@ pub async fn create_bunker(
         connection_secret
     );
 
-    tracing::info!("Created manual bunker connection for user: {}, origin: {}", user_pubkey, req.origin);
+    tracing::info!("Created manual bunker connection for user: {}, redirect_origin: {}", user_pubkey, redirect_origin);
 
     Ok(Json(CreateBunkerResponse {
         bunker_url,
@@ -1432,6 +1316,7 @@ pub struct BunkerSession {
     pub redirect_origin: String,
     pub bunker_pubkey: String,
     pub secret: String,
+    pub bunker_url: String,
     pub client_pubkey: Option<String>,
     pub created_at: String,
     pub last_activity: Option<String>,
@@ -1455,7 +1340,8 @@ pub async fn list_sessions(
     tracing::info!("Listing bunker sessions for user: {} in tenant: {}", user_pubkey, tenant_id);
 
     // Get OAuth authorizations with application details and activity stats
-    type OAuthSessionRow = (String, Option<i32>, String, String, String, String, Option<String>, Option<String>, Option<i64>);
+    // last_activity and activity_count are now columns on oauth_authorizations (updated on every NIP-46 method)
+    type OAuthSessionRow = (String, Option<i32>, String, String, String, String, String, Option<String>, Option<String>, i32);
     let oauth_sessions: Vec<OAuthSessionRow> = sqlx::query_as(
         "SELECT
             COALESCE(a.name, oa.redirect_origin) as name,
@@ -1463,10 +1349,11 @@ pub async fn list_sessions(
             oa.redirect_origin,
             oa.bunker_public_key,
             oa.secret,
+            oa.relays,
             oa.created_at::text,
             oa.client_pubkey,
-            (SELECT MAX(created_at)::text FROM signing_activity WHERE bunker_secret = oa.secret) as last_activity,
-            (SELECT COUNT(*) FROM signing_activity WHERE bunker_secret = oa.secret) as activity_count
+            oa.last_activity::text,
+            oa.activity_count
          FROM oauth_authorizations oa
          LEFT JOIN oauth_applications a ON oa.application_id = a.id
          JOIN users u ON oa.user_pubkey = u.pubkey
@@ -1481,16 +1368,28 @@ pub async fn list_sessions(
 
     let sessions = oauth_sessions
         .into_iter()
-        .map(|(name, app_id, redirect_origin, bunker_pubkey, secret, created_at, client_pubkey, last_activity, activity_count)| BunkerSession {
-            application_name: name,
-            application_id: app_id,
-            redirect_origin,
-            bunker_pubkey,
-            secret,
-            client_pubkey,
-            created_at,
-            last_activity,
-            activity_count: activity_count.unwrap_or(0),
+        .map(|(name, app_id, redirect_origin, bunker_pubkey, secret, relays_json, created_at, client_pubkey, last_activity, activity_count)| {
+            // Parse relays JSON and construct bunker URL
+            let relays: Vec<String> = serde_json::from_str(&relays_json).unwrap_or_default();
+            let relay_params: String = relays
+                .iter()
+                .map(|r| format!("relay={}", urlencoding::encode(r)))
+                .collect::<Vec<_>>()
+                .join("&");
+            let bunker_url = format!("bunker://{}?{}&secret={}", bunker_pubkey, relay_params, secret);
+
+            BunkerSession {
+                application_name: name,
+                application_id: app_id,
+                redirect_origin,
+                bunker_pubkey,
+                secret,
+                bunker_url,
+                client_pubkey,
+                created_at,
+                last_activity,
+                activity_count: activity_count as i64,
+            }
         })
         .collect();
 
@@ -1737,8 +1636,8 @@ pub async fn list_permissions(
             p.description as policy_description,
             oa.created_at,
             oa.secret,
-            (SELECT MAX(created_at) FROM signing_activity WHERE bunker_secret = oa.secret) as last_activity,
-            (SELECT COUNT(*) FROM signing_activity WHERE bunker_secret = oa.secret) as activity_count
+            oa.last_activity,
+            oa.activity_count::bigint
          FROM oauth_authorizations oa
          LEFT JOIN oauth_applications a ON oa.application_id = a.id
          LEFT JOIN policies p ON COALESCE(oa.policy_id, a.policy_id) = p.id

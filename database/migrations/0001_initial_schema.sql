@@ -123,7 +123,7 @@ ALTER SEQUENCE public.oauth_applications_id_seq OWNED BY public.oauth_applicatio
 CREATE TABLE public.oauth_authorizations (
     id integer NOT NULL,
     user_pubkey character(64) NOT NULL,
-    redirect_origin text NOT NULL,
+    redirect_origin text,  -- nullable for bunker-only apps (no OAuth flow)
     application_id integer,
     bunker_public_key character(64) NOT NULL,
     secret text NOT NULL,
@@ -135,7 +135,9 @@ CREATE TABLE public.oauth_authorizations (
     tenant_id bigint DEFAULT 1 NOT NULL,
     client_pubkey character(64),
     connected_client_pubkey text,
-    connected_at timestamp with time zone
+    connected_at timestamp with time zone,
+    last_activity timestamp with time zone,
+    activity_count integer DEFAULT 0 NOT NULL
 );
 
 CREATE SEQUENCE public.oauth_authorizations_id_seq
@@ -192,13 +194,10 @@ CREATE TABLE public.personal_keys (
     id integer NOT NULL,
     user_pubkey character(64) NOT NULL,
     encrypted_secret_key bytea NOT NULL,
-    bunker_secret text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     tenant_id bigint DEFAULT 1 NOT NULL
 );
-
-COMMENT ON COLUMN public.personal_keys.bunker_secret IS 'Deprecated: Was used for auto-bunker creation. Now bunker connections are created manually via oauth_authorizations.';
 
 CREATE SEQUENCE public.personal_keys_id_seq
     AS integer
@@ -259,8 +258,11 @@ CREATE TABLE public.signing_activity (
     event_id character(64),
     client_pubkey character(64),
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    tenant_id bigint DEFAULT 1 NOT NULL
+    tenant_id bigint DEFAULT 1 NOT NULL,
+    source text NOT NULL DEFAULT 'relay'
 );
+
+COMMENT ON COLUMN public.signing_activity.source IS 'Source of signing request: relay (NIP-46) or rpc (HTTP REST)';
 
 CREATE SEQUENCE public.signing_activity_id_seq
     AS integer
@@ -584,6 +586,8 @@ CREATE INDEX idx_signing_activity_created_at ON public.signing_activity USING bt
 CREATE INDEX idx_signing_activity_tenant_id ON public.signing_activity USING btree (tenant_id);
 
 CREATE INDEX idx_signing_activity_user ON public.signing_activity USING btree (user_pubkey);
+
+CREATE INDEX idx_signing_activity_source ON public.signing_activity USING btree (source);
 
 CREATE INDEX idx_stored_keys_tenant_id ON public.stored_keys USING btree (tenant_id);
 

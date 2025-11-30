@@ -7,7 +7,7 @@ import { KeycastApi } from "$lib/keycast_api.svelte";
 import { BRAND } from "$lib/brand";
 import type { TeamWithRelations, BunkerSession } from "$lib/types";
 import { NDKNip07Signer } from "@nostr-dev-kit/ndk";
-import { Users, Key, ArrowRight, PlusCircle, Gear, Copy, Check, EnvelopeSimple, CaretDown, CaretUp } from "phosphor-svelte";
+import { Users, Key, ArrowRight, PlusCircle, Gear, Copy, Check, EnvelopeSimple, CaretDown, CaretUp, Question, ArrowSquareOut, ShieldCheck, Export } from "phosphor-svelte";
 import Loader from "$lib/components/Loader.svelte";
 import CreateBunkerModal from "$lib/components/CreateBunkerModal.svelte";
 import { onMount } from "svelte";
@@ -36,6 +36,33 @@ let copiedNpub = $state(false);
 let expandedSessions = $state<Set<string>>(new Set());
 let showRevokeModal = $state(false);
 let sessionToRevoke = $state<BunkerSession | null>(null);
+let copiedBunkerUrl = $state<string | null>(null);
+let showLearnMore = $state(false);
+let pubkeyFormat = $state<'hex' | 'npub'>('npub');
+let copiedPubkey = $state<string | null>(null);
+
+function formatPubkey(hexPubkey: string): string {
+	if (pubkeyFormat === 'npub') {
+		try {
+			return nip19.npubEncode(hexPubkey);
+		} catch {
+			return hexPubkey;
+		}
+	}
+	return hexPubkey;
+}
+
+async function copyPubkey(hexPubkey: string) {
+	try {
+		const formatted = formatPubkey(hexPubkey);
+		await navigator.clipboard.writeText(formatted);
+		copiedPubkey = hexPubkey;
+		toast.success(`${pubkeyFormat === 'npub' ? 'npub' : 'Hex pubkey'} copied!`);
+		setTimeout(() => (copiedPubkey = null), 2000);
+	} catch (err) {
+		toast.error('Failed to copy');
+	}
+}
 
 // Check if user is whitelisted for team creation
 const isWhitelisted = $derived(
@@ -102,6 +129,17 @@ async function copyNpub() {
 		copiedNpub = true;
 		toast.success('Copied to clipboard');
 		setTimeout(() => (copiedNpub = false), 2000);
+	} catch (err) {
+		toast.error('Failed to copy');
+	}
+}
+
+async function copyBunkerUrl(bunkerUrl: string) {
+	try {
+		await navigator.clipboard.writeText(bunkerUrl);
+		copiedBunkerUrl = bunkerUrl;
+		toast.success('Bunker URL copied!');
+		setTimeout(() => (copiedBunkerUrl = null), 2000);
 	} catch (err) {
 		toast.error('Failed to copy');
 	}
@@ -271,7 +309,7 @@ onMount(async () => {
 									<Copy size={16} />
 								{/if}
 							</button>
-							<a href="https://nostr.how/en/what-is-nostr/identities" target="_blank" rel="noopener noreferrer" class="learn-link" title="What's an npub?">
+							<a href="https://nostr.how/en/get-started" target="_blank" rel="noopener noreferrer" class="learn-link" title="What's an npub?">
 								?
 							</a>
 						</div>
@@ -285,6 +323,46 @@ onMount(async () => {
 						</div>
 					{/if}
 				</div>
+			</section>
+
+			<!-- Learn More Section -->
+			<section class="learn-section">
+				<button class="learn-toggle" onclick={() => (showLearnMore = !showLearnMore)}>
+					<Question size={18} weight="fill" />
+					<span>Understanding Your Nostr Identity</span>
+					{#if showLearnMore}
+						<CaretUp size={16} />
+					{:else}
+						<CaretDown size={16} />
+					{/if}
+				</button>
+
+				{#if showLearnMore}
+					<div class="learn-content">
+						<div class="learn-block">
+							<h4><Key size={16} weight="fill" /> Your Keys Explained</h4>
+							<p><strong>Your npub</strong> (public key) is like a username — share it so others can find you across any Nostr app.</p>
+							<p><strong>Your nsec</strong> (private key) proves you own this identity. Keep it safe! Find it in <a href="/settings/security">Security Settings</a> if you need to export it.</p>
+						</div>
+
+						<div class="learn-block">
+							<h4><ShieldCheck size={16} weight="fill" /> Where Is Your Key?</h4>
+							<p>diVine stores your encrypted key and signs on your behalf — similar to trusting Google or Apple with your data. This makes getting started easy.</p>
+							<p class="learn-subtle">Want more control? You can:</p>
+							<ul class="learn-list">
+								<li><a href="https://getalby.com" target="_blank" rel="noopener noreferrer">Alby <ArrowSquareOut size={12} /></a> or <a href="https://github.com/fiatjaf/nos2x" target="_blank" rel="noopener noreferrer">nos2x <ArrowSquareOut size={12} /></a> — browser extensions where your key never leaves your device</li>
+								<li><a href="https://nsec.app" target="_blank" rel="noopener noreferrer">nsec.app <ArrowSquareOut size={12} /></a> — non-custodial signer, encrypted with your password</li>
+								<li><a href="https://nsecbunker.com" target="_blank" rel="noopener noreferrer">nsecBunker <ArrowSquareOut size={12} /></a> — self-host for full control</li>
+							</ul>
+						</div>
+
+						<div class="learn-block highlight">
+							<h4><Export size={16} weight="fill" /> Why This Matters</h4>
+							<p>Unlike Twitter or Facebook, <strong>no company owns your Nostr identity</strong>. Even if diVine disappeared tomorrow, your identity and content would still exist on the network. Export your key and continue anywhere.</p>
+							<p class="learn-cta">That's the power of Nostr.</p>
+						</div>
+					</div>
+				{/if}
 			</section>
 
 			<!-- Connected Apps Section -->
@@ -302,7 +380,7 @@ onMount(async () => {
 						<p>No apps connected yet.</p>
 						<p class="hint">
 							Connect your diVine Login to Nostr apps to sign in without sharing your private key.
-							<a href="https://nostr.how/en/guides/login-with-remote-signer" target="_blank" rel="noopener noreferrer">Learn more</a>
+							<a href="https://nostr.how/en/get-started" target="_blank" rel="noopener noreferrer">Learn more</a>
 						</p>
 					</div>
 				{:else}
@@ -315,7 +393,7 @@ onMount(async () => {
 										<p class="app-name">{session.application_name}</p>
 										<p class="app-meta">
 											{#if session.activity_count > 0}
-												{session.activity_count} {session.activity_count === 1 ? 'signature' : 'signatures'}
+												{session.activity_count} {session.activity_count === 1 ? 'request' : 'requests'}
 												{#if session.last_activity}
 													• Last used {new Date(session.last_activity).toLocaleDateString()}
 												{/if}
@@ -351,21 +429,75 @@ onMount(async () => {
 												</span>
 											</div>
 											<div class="detail-item">
-												<span class="detail-label">Total Signatures</span>
+												<span class="detail-label">Total Requests</span>
 												<span class="detail-value">{session.activity_count}</span>
 											</div>
 											{#if session.client_pubkey}
-												<div class="detail-item full-width">
-													<span class="detail-label">Client Pubkey</span>
-													<span class="detail-value mono">{session.client_pubkey.substring(0, 24)}...</span>
+												<div class="detail-item full-width pubkey-row">
+													<div class="detail-header">
+														<span class="detail-label">Client Pubkey</span>
+														<button
+															class="format-toggle"
+															onclick={(e) => { e.stopPropagation(); pubkeyFormat = pubkeyFormat === 'hex' ? 'npub' : 'hex'; }}
+														>
+															{pubkeyFormat === 'hex' ? 'npub' : 'hex'}
+														</button>
+													</div>
+													<div class="pubkey-value">
+														<span class="detail-value mono">{formatPubkey(session.client_pubkey)}</span>
+														<button
+															class="copy-btn-inline"
+															onclick={(e) => { e.stopPropagation(); copyPubkey(session.client_pubkey); }}
+														>
+															{#if copiedPubkey === session.client_pubkey}
+																<Check size={14} />
+															{:else}
+																<Copy size={14} />
+															{/if}
+														</button>
+													</div>
 												</div>
 											{/if}
-											<div class="detail-item full-width">
-												<span class="detail-label">Bunker Pubkey</span>
-												<span class="detail-value mono">{session.bunker_pubkey.substring(0, 24)}...</span>
+											<div class="detail-item full-width pubkey-row">
+												<div class="detail-header">
+													<span class="detail-label">Bunker Pubkey</span>
+													{#if !session.client_pubkey}
+														<button
+															class="format-toggle"
+															onclick={(e) => { e.stopPropagation(); pubkeyFormat = pubkeyFormat === 'hex' ? 'npub' : 'hex'; }}
+														>
+															{pubkeyFormat === 'hex' ? 'npub' : 'hex'}
+														</button>
+													{/if}
+												</div>
+												<div class="pubkey-value">
+													<span class="detail-value mono">{formatPubkey(session.bunker_pubkey)}</span>
+													<button
+														class="copy-btn-inline"
+														onclick={(e) => { e.stopPropagation(); copyPubkey(session.bunker_pubkey); }}
+													>
+														{#if copiedPubkey === session.bunker_pubkey}
+															<Check size={14} />
+														{:else}
+															<Copy size={14} />
+														{/if}
+													</button>
+												</div>
 											</div>
 										</div>
 										<div class="app-actions">
+											<button
+												class="btn-copy-bunker"
+												onclick={(e) => { e.stopPropagation(); copyBunkerUrl(session.bunker_url); }}
+											>
+												{#if copiedBunkerUrl === session.bunker_url}
+													<Check size={16} />
+													Copied!
+												{:else}
+													<Copy size={16} />
+													Copy Bunker URL
+												{/if}
+											</button>
 											<button
 												class="btn-revoke"
 												onclick={(e) => { e.stopPropagation(); confirmRevoke(session); }}
@@ -496,24 +628,24 @@ onMount(async () => {
 					<div class="feature-icon">
 						<Key size={24} weight="fill" />
 					</div>
-					<h3>One Identity, Many Apps</h3>
-					<p>Sign in to any Nostr app without sharing your private key.</p>
+					<h3>One Identity, Every App</h3>
+					<p>Use one account across all Nostr apps. No more creating accounts everywhere.</p>
 				</div>
 
 				<div class="feature-card">
 					<div class="feature-icon">
 						<Users size={24} weight="fill" />
 					</div>
-					<h3>Stay in Control</h3>
-					<p>See which apps you've connected and revoke access anytime.</p>
+					<h3>You Own Your Account</h3>
+					<p>Your identity belongs to you, not any company. Take it anywhere, keep it forever.</p>
 				</div>
 
 				<div class="feature-card">
 					<div class="feature-icon">
 						<Gear size={24} weight="fill" />
 					</div>
-					<h3>Secure by Default</h3>
-					<p>Your key never leaves diVine Login. Apps ask permission to sign.</p>
+					<h3>Easy to Start</h3>
+					<p>No extensions needed. Get started quickly, then export your key anytime to take full control.</p>
 				</div>
 			</div>
 
@@ -684,6 +816,125 @@ onMount(async () => {
 		color: var(--color-divine-green-dark);
 	}
 
+	/* Learn More Section */
+	.learn-section {
+		margin-bottom: 2rem;
+	}
+
+	.learn-toggle {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		width: 100%;
+		padding: 0.875rem 1rem;
+		background: var(--color-divine-surface);
+		border: 1px solid var(--color-divine-border);
+		border-radius: 10px;
+		color: var(--color-divine-text-secondary);
+		font-size: 0.9rem;
+		font-weight: 500;
+		cursor: pointer;
+		transition: all 0.2s;
+	}
+
+	.learn-toggle:hover {
+		background: var(--color-divine-muted);
+		color: var(--color-divine-text);
+	}
+
+	.learn-toggle span {
+		flex: 1;
+		text-align: left;
+	}
+
+	.learn-content {
+		margin-top: 0.75rem;
+		padding: 1.25rem;
+		background: var(--color-divine-surface);
+		border: 1px solid var(--color-divine-border);
+		border-radius: 10px;
+	}
+
+	.learn-block {
+		padding-bottom: 1rem;
+		margin-bottom: 1rem;
+		border-bottom: 1px solid var(--color-divine-border);
+	}
+
+	.learn-block:last-child {
+		padding-bottom: 0;
+		margin-bottom: 0;
+		border-bottom: none;
+	}
+
+	.learn-block h4 {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		margin: 0 0 0.75rem 0;
+		color: var(--color-divine-text);
+		font-size: 0.95rem;
+		font-weight: 600;
+	}
+
+	.learn-block p {
+		margin: 0 0 0.5rem 0;
+		color: var(--color-divine-text-secondary);
+		font-size: 0.875rem;
+		line-height: 1.6;
+	}
+
+	.learn-block p:last-child {
+		margin-bottom: 0;
+	}
+
+	.learn-block a {
+		color: var(--color-divine-green);
+		text-decoration: none;
+	}
+
+	.learn-block a:hover {
+		text-decoration: underline;
+	}
+
+	.learn-subtle {
+		color: var(--color-divine-text-tertiary) !important;
+		font-size: 0.8rem !important;
+		margin-top: 0.75rem !important;
+	}
+
+	.learn-list {
+		margin: 0.5rem 0 0 0;
+		padding-left: 1.25rem;
+		color: var(--color-divine-text-secondary);
+		font-size: 0.85rem;
+		line-height: 1.8;
+	}
+
+	.learn-list li {
+		margin-bottom: 0.25rem;
+	}
+
+	.learn-list a {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.25rem;
+	}
+
+	.learn-block.highlight {
+		background: color-mix(in srgb, var(--color-divine-green) 8%, transparent);
+		border-radius: 8px;
+		padding: 1rem;
+		border-bottom: none;
+		margin-bottom: 0;
+	}
+
+	.learn-cta {
+		color: var(--color-divine-green) !important;
+		font-weight: 500;
+		margin-top: 0.5rem !important;
+	}
+
 	/* Connected Apps Section */
 	.btn-connect {
 		display: inline-flex;
@@ -845,12 +1096,87 @@ onMount(async () => {
 		word-break: break-all;
 	}
 
+	.pubkey-row {
+		gap: 0.5rem;
+	}
+
+	.detail-header {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+	}
+
+	.format-toggle {
+		font-size: 0.65rem;
+		padding: 0.125rem 0.375rem;
+		background: var(--color-divine-muted);
+		border: 1px solid var(--color-divine-border);
+		border-radius: 4px;
+		color: var(--color-divine-text-tertiary);
+		cursor: pointer;
+		transition: all 0.2s;
+		text-transform: lowercase;
+	}
+
+	.format-toggle:hover {
+		color: var(--color-divine-green);
+		border-color: var(--color-divine-green);
+	}
+
+	.pubkey-value {
+		display: flex;
+		align-items: flex-start;
+		gap: 0.5rem;
+	}
+
+	.pubkey-value .detail-value {
+		flex: 1;
+		font-size: 0.75rem;
+		line-height: 1.4;
+	}
+
+	.copy-btn-inline {
+		flex-shrink: 0;
+		padding: 0.25rem;
+		background: transparent;
+		border: none;
+		color: var(--color-divine-text-tertiary);
+		cursor: pointer;
+		border-radius: 4px;
+		transition: all 0.2s;
+	}
+
+	.copy-btn-inline:hover {
+		color: var(--color-divine-green);
+		background: var(--color-divine-muted);
+	}
+
 	.app-actions {
 		margin-top: 1rem;
 		padding-top: 1rem;
 		border-top: 1px solid var(--color-divine-border);
 		display: flex;
 		justify-content: flex-end;
+		gap: 0.5rem;
+	}
+
+	.btn-copy-bunker {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.375rem;
+		padding: 0.375rem 0.75rem;
+		background: transparent;
+		color: var(--color-divine-green);
+		border: 1px solid var(--color-divine-green);
+		border-radius: 9999px;
+		font-size: 0.8rem;
+		cursor: pointer;
+		transition: all 0.2s;
+	}
+
+	.btn-copy-bunker:hover {
+		background: var(--color-divine-green);
+		color: #fff;
 	}
 
 	.btn-revoke {

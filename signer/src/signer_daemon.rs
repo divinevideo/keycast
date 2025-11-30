@@ -552,10 +552,8 @@ impl UnifiedSigner {
                     .map_err(|e| SignerError::invalid_key(format!("Invalid user secret key: {}", e)))?;
                 let user_keys = Keys::new(user_secret_key.clone());
 
-                // Derive bunker keys using HKDF (privacy: bunker_pubkey ≠ user_pubkey)
-                let derivation_input = format!("{}-{}", auth.user_pubkey, auth.redirect_origin);
-                let derivation_id = keycast_core::bunker_key::hash_to_i32(&derivation_input);
-                let bunker_keys = keycast_core::bunker_key::derive_bunker_keys(&user_secret_key, derivation_id);
+                // Derive bunker keys using HKDF with connection secret (privacy: bunker_pubkey ≠ user_pubkey)
+                let bunker_keys = keycast_core::bunker_key::derive_bunker_keys(&user_secret_key, &auth.secret);
 
                 // Validate derived key matches stored bunker_public_key
                 if bunker_keys.public_key().to_hex() != auth.bunker_public_key {
@@ -715,10 +713,8 @@ impl UnifiedSigner {
                             .map_err(|e| SignerError::invalid_key(format!("Invalid user key: {}", e)))?;
                         let user_keys = Keys::new(user_secret_key.clone());
 
-                        // Derive bunker keys using HKDF (privacy: bunker_pubkey ≠ user_pubkey)
-                        let derivation_input = format!("{}-{}", auth.user_pubkey, auth.redirect_origin);
-                        let derivation_id = keycast_core::bunker_key::hash_to_i32(&derivation_input);
-                        let bunker_keys = keycast_core::bunker_key::derive_bunker_keys(&user_secret_key, derivation_id);
+                        // Derive bunker keys using HKDF with connection secret (privacy: bunker_pubkey ≠ user_pubkey)
+                        let bunker_keys = keycast_core::bunker_key::derive_bunker_keys(&user_secret_key, &auth.secret);
 
                         // Validate derived key matches stored bunker_public_key
                         if bunker_keys.public_key().to_hex() != auth.bunker_public_key {
@@ -970,6 +966,15 @@ impl UnifiedSigner {
             }
         };
 
+        // Update activity tracking for all successful methods (not just signing)
+        // Check if this was a successful response (has "result" key, not "error")
+        if result.get("result").is_some() {
+            if let Err(e) = handler.update_activity().await {
+                tracing::warn!("Failed to update activity: {}", e);
+                // Don't fail the request if activity tracking fails
+            }
+        }
+
         let response = result;
 
         // Encrypt response using the same method as the request
@@ -1043,7 +1048,7 @@ impl SigningHandler for AuthorizationHandler {
         tracing::debug!("Successfully signed event: {}", signed_event.id);
 
         // Log signing activity to database
-        if let Err(e) = self.log_signing_activity(kind, &content, &signed_event.id.to_hex()).await {
+        if let Err(e) = self.log_signing_activity(kind, &content, &signed_event.id.to_hex(), "relay").await {
             tracing::error!("Failed to log signing activity: {}", e);
             // Don't fail the signing request if activity logging fails
         }
@@ -1129,7 +1134,7 @@ impl AuthorizationHandler {
         tracing::debug!("Successfully signed event: {}", signed_event.id);
 
         // Log signing activity to database
-        if let Err(e) = self.log_signing_activity(kind, content, &signed_event.id.to_hex()).await {
+        if let Err(e) = self.log_signing_activity(kind, content, &signed_event.id.to_hex(), "relay").await {
             tracing::error!("Failed to log signing activity: {}", e);
             // Don't fail the signing request if activity logging fails
         }
@@ -1148,6 +1153,7 @@ impl AuthorizationHandler {
         event_kind: u16,
         event_content: &str,
         event_id: &str,
+        source: &str,
     ) -> SignerResult<()> {
         // Get user public key and application ID
         let (user_pubkey, application_id, client_pubkey, bunker_secret) = if self.is_oauth {
@@ -1197,8 +1203,8 @@ impl AuthorizationHandler {
         // Insert signing activity
         sqlx::query(
             "INSERT INTO signing_activity
-             (user_pubkey, application_id, bunker_secret, event_kind, event_content, event_id, client_pubkey, tenant_id, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())"
+             (user_pubkey, application_id, bunker_secret, event_kind, event_content, event_id, client_pubkey, tenant_id, source, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())"
         )
         .bind(&user_pubkey)
         .bind(application_id)
@@ -1208,10 +1214,36 @@ impl AuthorizationHandler {
         .bind(event_id)
         .bind(&client_pubkey)
         .bind(self.tenant_id)
+        .bind(source)
         .execute(&self.pool)
         .await?;
 
         tracing::debug!("Logged signing activity for tenant {} user {} kind {}", self.tenant_id, user_pubkey, event_kind);
+
+        Ok(())
+    }
+
+    /// Update last_activity timestamp and increment activity_count for this authorization
+    /// Called on every successful NIP-46 method (connect, get_public_key, sign_event, etc.)
+    async fn update_activity(&self) -> SignerResult<()> {
+        if self.is_oauth {
+            sqlx::query(
+                "UPDATE oauth_authorizations
+                 SET last_activity = NOW(), activity_count = activity_count + 1
+                 WHERE tenant_id = $1 AND id = $2"
+            )
+            .bind(self.tenant_id)
+            .bind(self.authorization_id as i64)
+            .execute(&self.pool)
+            .await?;
+
+            tracing::debug!(
+                "Updated activity for OAuth authorization {} (tenant {})",
+                self.authorization_id,
+                self.tenant_id
+            );
+        }
+        // For regular authorizations, we could add similar tracking if needed
 
         Ok(())
     }

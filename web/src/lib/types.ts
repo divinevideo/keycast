@@ -108,6 +108,7 @@ export type BunkerSession = {
     application_id: number | null;
     redirect_origin: string;
     bunker_pubkey: string;
+    bunker_url: string;
     secret: string;
     client_pubkey: string | null;
     created_at: string;

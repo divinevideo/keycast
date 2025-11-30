@@ -1948,7 +1948,15 @@ async fn create_oauth_authorization_and_token(
         &auth_state.state.server_keys,
     ).await.map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?;
 
-    // Derive bunker keys from user secret using HKDF (privacy: bunker_pubkey ≠ user_pubkey)
+    // Generate connection secret for NIP-46 authentication (must be generated first for HKDF)
+    let connection_secret: String = rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(48)
+        .map(char::from)
+        .collect();
+
+    // Derive bunker keys from user secret using HKDF with connection secret
+    // (privacy: bunker_pubkey ≠ user_pubkey, avoids extra KMS call)
     let decrypted_user_secret = key_manager
         .decrypt(&encrypted_user_key)
         .await
@@ -1956,17 +1964,8 @@ async fn create_oauth_authorization_and_token(
     let user_secret_key = nostr_sdk::SecretKey::from_slice(&decrypted_user_secret)
         .map_err(|e| OAuthError::InvalidRequest(format!("Invalid secret key: {}", e)))?;
 
-    let derivation_input = format!("{}-{}", user_pubkey, redirect_origin);
-    let derivation_id = keycast_core::bunker_key::hash_to_i32(&derivation_input);
-    let bunker_keys = keycast_core::bunker_key::derive_bunker_keys(&user_secret_key, derivation_id);
+    let bunker_keys = keycast_core::bunker_key::derive_bunker_keys(&user_secret_key, &connection_secret);
     let bunker_public_key = bunker_keys.public_key();
-
-    // Generate connection secret for NIP-46 authentication
-    let connection_secret: String = rand::thread_rng()
-        .sample_iter(&rand::distributions::Alphanumeric)
-        .take(48)
-        .map(char::from)
-        .collect();
 
     // Create authorization in database - use relay that supports NIP-46
     let relay_url = "wss://relay.damus.io";
@@ -2933,7 +2932,7 @@ pub async fn connect_post(
     // For nostr-login, redirect_origin is "nostrconnect://{client_pubkey}" (the secure identifier)
     let redirect_origin = format!("nostrconnect://{}", &form.client_pubkey);
 
-    // Derive bunker keys from user secret using HKDF (privacy: bunker_pubkey ≠ user_pubkey)
+    // Derive bunker keys from user secret using HKDF with connection secret (privacy: bunker_pubkey ≠ user_pubkey)
     let key_manager = auth_state.state.key_manager.as_ref();
     let decrypted_user_secret = key_manager
         .decrypt(&encrypted_user_key)
@@ -2942,9 +2941,7 @@ pub async fn connect_post(
     let user_secret_key = nostr_sdk::SecretKey::from_slice(&decrypted_user_secret)
         .map_err(|e| OAuthError::InvalidRequest(format!("Invalid secret key: {}", e)))?;
 
-    let derivation_input = format!("{}-{}", user_pubkey, redirect_origin);
-    let derivation_id = keycast_core::bunker_key::hash_to_i32(&derivation_input);
-    let bunker_keys = keycast_core::bunker_key::derive_bunker_keys(&user_secret_key, derivation_id);
+    let bunker_keys = keycast_core::bunker_key::derive_bunker_keys(&user_secret_key, &form.secret);
     let bunker_public_key = bunker_keys.public_key();
 
     let app_name = format!("nostr-login-{}", &form.client_pubkey[..12]);

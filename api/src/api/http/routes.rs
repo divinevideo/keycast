@@ -6,7 +6,7 @@ use keycast_core::authorization_channel::AuthorizationSender;
 use sqlx::PgPool;
 use std::sync::Arc;
 
-use crate::api::http::{auth, nostr_rpc, oauth, policies, teams};
+use crate::api::http::{auth, metrics, nostr_rpc, oauth, policies, teams};
 use crate::state::KeycastState;
 use axum::response::Json as AxumJson;
 use serde_json::Value as JsonValue;
@@ -122,6 +122,11 @@ pub fn api_routes(pool: PgPool, state: Arc<KeycastState>, auth_cors: tower_http:
         .route("/policies/:slug", get(policies::get_policy))
         .with_state(pool.clone());
 
+    // Prometheus metrics endpoint (public, no auth required)
+    let metrics_route = Router::new()
+        .route("/metrics", get(metrics::metrics))
+        .with_state(pool.clone());
+
     // API documentation route (public)
     let docs_route = Router::new()
         .route("/docs/openapi.json", get(openapi_spec));
@@ -166,6 +171,7 @@ pub fn api_routes(pool: PgPool, state: Arc<KeycastState>, auth_cors: tower_http:
         .merge(team_routes.layer(auth_cors.clone()))       // Team routes need credentials
         .merge(discovery_route.layer(public_cors.clone()))
         .merge(policy_routes.layer(public_cors.clone()))   // Public - available to third-party OAuth apps
+        .merge(metrics_route.layer(public_cors.clone()))   // Public - Prometheus metrics
         .merge(docs_route.layer(public_cors))
 }
 

@@ -1,24 +1,13 @@
 // ABOUTME: Tests for tenant auto-provisioning race condition fix
 // ABOUTME: Verifies that concurrent get_or_create_tenant calls don't fail
 
+mod common;
+
 use sqlx::PgPool;
 use std::sync::Arc;
 
 async fn setup_pool() -> PgPool {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string());
-
-    let pool = PgPool::connect(&database_url)
-        .await
-        .expect("Failed to connect to database");
-
-    // Run migrations
-    sqlx::migrate!("../database/migrations")
-        .run(&pool)
-        .await
-        .expect("Failed to run migrations");
-
-    pool
+    common::setup_test_db().await
 }
 
 /// Test that concurrent tenant creation requests don't cause duplicate key errors

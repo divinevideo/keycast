@@ -1,6 +1,8 @@
 // ABOUTME: Tests for RPC permission validation edge cases
 // ABOUTME: Covers UCAN validation, authorization lookup, and policy enforcement
 
+mod common;
+
 use chrono::{Duration, Utc};
 use keycast_api::ucan_auth::{NostrKeyMaterial, nostr_pubkey_to_did, validate_ucan_token};
 use keycast_core::encryption::file_key_manager::FileKeyManager;
@@ -15,8 +17,12 @@ use uuid::Uuid;
 // Test Helpers
 // ============================================================================
 
-/// Connect to test database
+/// Connect to test database with safety checks
 async fn setup_db() -> PgPool {
+    // Note: We don't run migrations here because these tests
+    // expect an existing database. Just validate the URL.
+    common::assert_test_database_url();
+
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string());
 

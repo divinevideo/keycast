@@ -19,7 +19,6 @@
 
 	let { show = $bindable(false), onClose, onSuccess }: Props = $props();
 
-	let origin = $state('');
 	let appName = $state('');
 	let selectedPolicySlug = $state('full');
 	let policies = $state<Policy[]>([]);
@@ -38,15 +37,8 @@
 	});
 
 	async function handleCreate() {
-		if (!origin.trim()) {
-			toast.error('App origin is required');
-			return;
-		}
-
-		// Basic URL validation - allow http://localhost for development
-		const isLocalhost = origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1');
-		if (!origin.startsWith('https://') && !isLocalhost) {
-			toast.error('Origin must be HTTPS');
+		if (!appName.trim()) {
+			toast.error('App name is required');
 			return;
 		}
 
@@ -55,22 +47,20 @@
 
 			const response = await api.post<{
 				bunker_url: string;
-				origin: string;
-				app_name: string | null;
+				origin: string | null;
+				app_name: string;
 				bunker_pubkey: string;
 				created_at: string;
 			}>(
 				'/user/bunker/create',
 				{
-					origin: origin.trim(),
-					app_name: appName.trim() || null,
+					app_name: appName.trim(),
 					policy_slug: selectedPolicySlug
 				}
 			);
 
 			bunkerUrl = response.bunker_url;
-			const displayName = response.app_name || response.origin;
-			toast.success(`Bunker connection created for ${displayName}`);
+			toast.success(`Bunker connection created for ${response.app_name}`);
 		} catch (err: any) {
 			console.error('Create bunker error:', err);
 			toast.error(err.message || 'Failed to create bunker connection');
@@ -96,7 +86,6 @@
 			onSuccess();
 		}
 		// Reset form
-		origin = '';
 		appName = '';
 		selectedPolicySlug = 'full';
 		bunkerUrl = '';
@@ -144,28 +133,16 @@
 					</p>
 
 					<div class="form-group">
-						<label for="origin">App Origin</label>
-						<input
-							id="origin"
-							type="url"
-							bind:value={origin}
-							placeholder="e.g. https://primal.net, https://damus.io"
-							required
-							disabled={isCreating}
-						/>
-						<p class="input-hint">The website URL of the app you're connecting to</p>
-					</div>
-
-					<div class="form-group">
-						<label for="appName">App Name <span class="optional">(optional)</span></label>
+						<label for="appName">App Name</label>
 						<input
 							id="appName"
 							type="text"
 							bind:value={appName}
-							placeholder="e.g. Primal, Damus"
+							placeholder="e.g. Primal, Damus, Amethyst"
+							required
 							disabled={isCreating}
 						/>
-						<p class="input-hint">Friendly name for your reference</p>
+						<p class="input-hint">Name of the app you're connecting to</p>
 					</div>
 
 					<div class="form-group">
@@ -320,12 +297,6 @@
 	select:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
-	}
-
-	.optional {
-		font-weight: 400;
-		color: var(--color-divine-text-secondary);
-		font-size: 0.75rem;
 	}
 
 	.input-hint {
