@@ -1,8 +1,5 @@
 <script lang="ts">
-import { browser } from "$app/environment";
 import { getCurrentUser, setCurrentUser } from "$lib/current_user.svelte";
-import ndk from "$lib/ndk.svelte";
-import { SigninMethod, signin } from "$lib/utils/auth";
 import { KeycastApi } from "$lib/keycast_api.svelte";
 import { BRAND } from "$lib/brand";
 import type { TeamWithRelations, BunkerSession } from "$lib/types";
@@ -13,9 +10,6 @@ import CreateBunkerModal from "$lib/components/CreateBunkerModal.svelte";
 import { onMount } from "svelte";
 import { nip19 } from "nostr-tools";
 import { toast } from "svelte-hot-french-toast";
-
-// Detect iOS - no browser extension support for NIP-07
-const isIOS = $derived(browser ? /iPad|iPhone|iPod/.test(navigator.userAgent) : false);
 
 const api = new KeycastApi();
 const currentUser = $derived(getCurrentUser());
@@ -68,10 +62,6 @@ async function copyPubkey(hexPubkey: string) {
 const isWhitelisted = $derived(
 	user?.pubkey ? JSON.stringify(import.meta.env.VITE_ALLOWED_PUBKEYS).includes(user.pubkey) : false
 );
-
-function handleNip07Signin() {
-	signin(ndk, undefined, SigninMethod.Nip07);
-}
 
 async function loadTeams() {
 	if (!user?.pubkey) return;
@@ -609,19 +599,6 @@ onMount(async () => {
 				<a href="/login" class="button button-secondary">Sign In</a>
 			</div>
 
-			<!-- NIP-07 option - hidden on iOS -->
-			{#if !isIOS}
-				<div class="landing-divider">
-					<span>or sign in with</span>
-				</div>
-				<button onclick={handleNip07Signin} class="nip07-button">
-					<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" viewBox="0 0 256 256">
-						<path d="M160,16A80.07,80.07,0,0,0,83.91,120.78L26.34,178.34A8,8,0,0,0,24,184v40a8,8,0,0,0,8,8H72a8,8,0,0,0,8-8V208H96a8,8,0,0,0,8-8V184h16a8,8,0,0,0,5.66-2.34l9.56-9.57A80,80,0,1,0,160,16Zm20,76a16,16,0,1,1,16-16A16,16,0,0,1,180,92Z"></path>
-					</svg>
-					Browser Extension (NIP-07)
-				</button>
-			{/if}
-
 			<!-- Feature sections -->
 			<div class="features-grid">
 				<div class="feature-card">
@@ -636,8 +613,8 @@ onMount(async () => {
 					<div class="feature-icon">
 						<Users size={24} weight="fill" />
 					</div>
-					<h3>Portable Identity</h3>
-					<p>Your Nostr identity works everywhere. Export your key anytime to use with other apps.</p>
+					<h3>Use Any Nostr App</h3>
+					<p>Connect to apps across the Nostr ecosystem through diVine. Your key stays safe with us.</p>
 				</div>
 
 				<div class="feature-card">
@@ -1296,45 +1273,6 @@ onMount(async () => {
 		gap: 1rem;
 		justify-content: center;
 		margin-bottom: 1.5rem;
-	}
-
-	.landing-divider {
-		display: flex;
-		align-items: center;
-		gap: 1rem;
-		color: var(--color-divine-text-tertiary);
-		font-size: 0.875rem;
-		margin-bottom: 1.5rem;
-	}
-
-	.landing-divider::before,
-	.landing-divider::after {
-		content: '';
-		flex: 1;
-		height: 1px;
-		background: var(--color-divine-border);
-	}
-
-	.nip07-button {
-		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-		gap: 0.5rem;
-		width: 100%;
-		max-width: 280px;
-		padding: 0.75rem 1.25rem;
-		background: var(--color-divine-muted);
-		color: var(--color-divine-text);
-		border: 1px solid var(--color-divine-border);
-		border-radius: 9999px;
-		font-size: 0.9rem;
-		font-weight: 500;
-		cursor: pointer;
-		transition: all 0.2s;
-	}
-
-	.nip07-button:hover {
-		background: var(--color-divine-border);
 	}
 
 	.features-grid {
