@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { getCurrentUser, setCurrentUser } from '$lib/current_user.svelte';
-	import { getAccountStatus, isEmailVerified } from '$lib/account_status.svelte';
+	import { getAccountStatus, isEmailVerified, fetchAccountStatus } from '$lib/account_status.svelte';
 	import { KeycastApi } from '$lib/keycast_api.svelte';
 	import { BRAND } from '$lib/brand';
 	import { toast } from 'svelte-hot-french-toast';
@@ -12,6 +12,15 @@
 	const authMethod = $derived(currentUser?.authMethod);
 	const accountStatus = $derived(getAccountStatus());
 	const emailVerified = $derived(isEmailVerified());
+
+	// Fetch account status when auth method is confirmed as cookie
+	let accountStatusFetched = $state(false);
+	$effect(() => {
+		if (authMethod === 'cookie' && !accountStatusFetched) {
+			accountStatusFetched = true;
+			fetchAccountStatus();
+		}
+	});
 
 	// Password verification state (shared)
 	let mainPassword = $state('');
