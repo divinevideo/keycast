@@ -2,6 +2,7 @@
 import "../app.css";
 import Header from "$lib/components/Header.svelte";
 import VerificationBanner from "$lib/components/VerificationBanner.svelte";
+import BetaBanner from "$lib/components/BetaBanner.svelte";
 import { getCurrentUser, setCurrentUser } from "$lib/current_user.svelte";
 import { fetchAccountStatus, clearAccountStatus } from "$lib/account_status.svelte";
 import { initApi } from "$lib/keycast_api.svelte";
@@ -40,6 +41,7 @@ const showHeader = $derived(
 );
 </script>
 
+<BetaBanner />
 <Toaster />
 {#if showHeader}
 <Header />
