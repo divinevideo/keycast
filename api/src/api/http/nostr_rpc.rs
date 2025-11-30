@@ -230,8 +230,7 @@ async fn get_user_keys(
         .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?;
 
         if let Some(bunker_key) = bunker_pubkey {
-            let handlers_read = handlers.lock().await;
-            if let Some(handler) = handlers_read.get(&bunker_key) {
+            if let Some(handler) = handlers.get(&bunker_key).await {
                 tracing::debug!("RPC: Using cached keys for user {}", &user_pubkey[..8]);
                 return Ok(handler.get_keys());
             }

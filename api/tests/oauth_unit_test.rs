@@ -447,3 +447,127 @@ fn test_secret_key_encryption_format() {
         "Reconstructed key should match original"
     );
 }
+
+// ============================================================================
+// Handler Cache Tests (Verifies fix for stale snapshot bug)
+// ============================================================================
+
+use keycast_core::signing_handler::{SignerHandlersCache, SigningHandler};
+use std::sync::Arc;
+
+/// Mock handler for testing cache behavior
+struct MockHandler {
+    id: i64,
+    pubkey: String,
+}
+
+#[async_trait::async_trait]
+impl SigningHandler for MockHandler {
+    async fn sign_event_direct(
+        &self,
+        _unsigned_event: nostr_sdk::UnsignedEvent,
+    ) -> Result<nostr_sdk::Event, Box<dyn std::error::Error + Send + Sync>> {
+        unimplemented!("mock handler - not used in cache tests")
+    }
+
+    fn authorization_id(&self) -> i64 {
+        self.id
+    }
+
+    fn user_public_key(&self) -> String {
+        self.pubkey.clone()
+    }
+
+    fn get_keys(&self) -> nostr_sdk::Keys {
+        nostr_sdk::Keys::generate()
+    }
+}
+
+/// Test that moka cache clone shares underlying data (not a snapshot).
+/// This verifies the fix for the stale cache bug where API received
+/// a snapshot HashMap at startup instead of a live cache reference.
+#[tokio::test]
+async fn test_moka_cache_is_live_not_snapshot() {
+    // Create moka cache (same type used by signer)
+    let cache: SignerHandlersCache = moka::future::Cache::builder().build();
+
+    // Clone it (should share same underlying data)
+    let cache_clone = cache.clone();
+
+    // Insert via original cache
+    let handler = Arc::new(MockHandler {
+        id: 1,
+        pubkey: "test_pubkey_1".to_string(),
+    }) as Arc<dyn SigningHandler>;
+    cache.insert("key1".to_string(), handler).await;
+
+    // Verify immediately visible via clone (no snapshot issue!)
+    let found = cache_clone.get("key1").await;
+    assert!(found.is_some(), "Handler inserted via original should be immediately visible via clone");
+    assert_eq!(found.unwrap().authorization_id(), 1);
+
+    // Verify the reverse: insert via clone, visible via original
+    let handler2 = Arc::new(MockHandler {
+        id: 2,
+        pubkey: "test_pubkey_2".to_string(),
+    }) as Arc<dyn SigningHandler>;
+    cache_clone.insert("key2".to_string(), handler2).await;
+
+    let found2 = cache.get("key2").await;
+    assert!(found2.is_some(), "Handler inserted via clone should be visible via original");
+    assert_eq!(found2.unwrap().authorization_id(), 2);
+}
+
+/// Test that cache invalidation removes handlers correctly.
+/// Verifies the Remove command in authorization_channel works.
+#[tokio::test]
+async fn test_cache_invalidation_removes_handler() {
+    let cache: SignerHandlersCache = moka::future::Cache::builder().build();
+    let cache_clone = cache.clone();
+
+    // Insert a handler
+    let user_pubkey = "user123";
+    let handler = Arc::new(MockHandler {
+        id: 42,
+        pubkey: user_pubkey.to_string(),
+    }) as Arc<dyn SigningHandler>;
+    cache.insert(user_pubkey.to_string(), handler).await;
+
+    // Verify it exists in both
+    assert!(cache.get(user_pubkey).await.is_some());
+    assert!(cache_clone.get(user_pubkey).await.is_some());
+
+    // Invalidate via original
+    cache.invalidate(user_pubkey).await;
+
+    // Verify removed from both (invalidation is also live!)
+    assert!(cache.get(user_pubkey).await.is_none(), "Handler should be removed from original");
+    assert!(cache_clone.get(user_pubkey).await.is_none(), "Handler should be removed from clone");
+}
+
+/// Test that multiple handlers can coexist (one per user pubkey)
+#[tokio::test]
+async fn test_multiple_handlers_by_user_pubkey() {
+    let cache: SignerHandlersCache = moka::future::Cache::builder().build();
+
+    // Add handlers for different users
+    for i in 0..5 {
+        let pubkey = format!("user_{}", i);
+        let handler = Arc::new(MockHandler {
+            id: i as i64,
+            pubkey: pubkey.clone(),
+        }) as Arc<dyn SigningHandler>;
+        cache.insert(pubkey, handler).await;
+    }
+
+    // Verify all exist
+    for i in 0..5 {
+        let pubkey = format!("user_{}", i);
+        let found = cache.get(&pubkey).await;
+        assert!(found.is_some(), "Handler for {} should exist", pubkey);
+        assert_eq!(found.unwrap().authorization_id(), i as i64);
+    }
+
+    // Verify non-existent doesn't exist
+    assert!(cache.get("nonexistent").await.is_none());
+}

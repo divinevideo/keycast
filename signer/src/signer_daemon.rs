@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use keycast_core::authorization_channel::{AuthorizationReceiver, AuthorizationCommand};
 use keycast_core::encryption::KeyManager;
 use keycast_core::hashring::HashRing;
-use keycast_core::signing_handler::SigningHandler;
+use keycast_core::signing_handler::{SigningHandler, SignerHandlersCache};
 use keycast_core::traits::CustomPermission;
 use keycast_core::types::authorization::Authorization;
 use keycast_core::types::oauth_authorization::OAuthAuthorization;
@@ -346,7 +346,8 @@ impl AuthorizationHandler {
 const DEFAULT_HANDLER_CACHE_SIZE: usize = 10_000;
 
 pub struct UnifiedSigner {
-    handlers: Cache<String, AuthorizationHandler>, // bunker_pubkey -> handler (concurrent LRU cache)
+    handlers: Cache<String, AuthorizationHandler>, // bunker_pubkey -> handler (concurrent LRU cache, internal use)
+    shared_handlers: SignerHandlersCache,          // Same data as trait objects (shared with API)
     client: Client,
     pool: PgPool,
     key_manager: Arc<Box<dyn KeyManager>>,
@@ -373,10 +374,16 @@ impl UnifiedSigner {
             .max_capacity(cache_size as u64)
             .build();
 
+        // Shared cache for API access (same data as trait objects)
+        let shared_handlers: SignerHandlersCache = Cache::builder()
+            .max_capacity(cache_size as u64)
+            .build();
+
         tracing::info!("Initialized authorization cache (capacity: {})", cache_size);
 
         Ok(Self {
             handlers,
+            shared_handlers,
             client,
             pool,
             key_manager: Arc::new(key_manager),
@@ -438,6 +445,7 @@ impl UnifiedSigner {
         let pool_clone = self.pool.clone();
         let key_manager_clone = self.key_manager.clone();
         let handlers_clone = self.handlers.clone();
+        let shared_handlers_clone = self.shared_handlers.clone();
 
         // Take ownership of the receiver (we only spawn this once)
         if let Some(mut auth_rx) = self.auth_rx.take() {
@@ -451,6 +459,7 @@ impl UnifiedSigner {
                                 &pool_clone,
                                 &key_manager_clone,
                                 &handlers_clone,
+                                &shared_handlers_clone,
                                 &bunker_pubkey,
                                 tenant_id,
                                 is_oauth,
@@ -461,6 +470,7 @@ impl UnifiedSigner {
                         AuthorizationCommand::Remove { bunker_pubkey } => {
                             tracing::debug!("Removing authorization from cache: {}", bunker_pubkey);
                             handlers_clone.invalidate(&bunker_pubkey).await;
+                            shared_handlers_clone.invalidate(&bunker_pubkey).await;
                         }
                         AuthorizationCommand::ReloadAll => {
                             // No-op with lazy loading - cache is populated on-demand
@@ -479,11 +489,13 @@ impl UnifiedSigner {
         let pool = self.pool.clone();
         let key_manager = self.key_manager.clone();
         let hashring = self.hashring.clone();
+        let shared_handlers = self.shared_handlers.clone();
         self.client
             .handle_notifications(|notification| async {
                 if let RelayPoolNotification::Event { event, .. } = notification {
                     if event.kind == Kind::NostrConnect {
                         let handlers_lock = handlers.clone();
+                        let shared_handlers_clone = shared_handlers.clone();
                         let client_clone = client.clone();
                         let pool_clone = pool.clone();
                         let key_manager_clone = key_manager.clone();
@@ -491,6 +503,7 @@ impl UnifiedSigner {
                         tokio::spawn(async move {
                             if let Err(e) = Self::handle_nip46_request(
                                 handlers_lock,
+                                shared_handlers_clone,
                                 client_clone,
                                 event,
                                 &pool_clone,
@@ -515,11 +528,12 @@ impl UnifiedSigner {
         Ok(())
     }
 
-    /// Load a single authorization into the LRU cache (called via channel for new authorizations)
+    /// Load a single authorization into both caches (called via channel for new authorizations)
     async fn load_single_authorization(
         pool: &PgPool,
         key_manager: &Arc<Box<dyn KeyManager>>,
         handlers: &Cache<String, AuthorizationHandler>,
+        shared_handlers: &SignerHandlersCache,
         bunker_pubkey: &str,
         tenant_id: i64,
         is_oauth: bool,
@@ -550,7 +564,9 @@ impl UnifiedSigner {
                     pool: pool.clone(),
                 };
 
-                handlers.insert(bunker_pubkey.to_string(), handler).await;
+                // Insert into both caches (internal + shared for API)
+                handlers.insert(bunker_pubkey.to_string(), handler.clone()).await;
+                shared_handlers.insert(bunker_pubkey.to_string(), Arc::new(handler) as Arc<dyn SigningHandler>).await;
                 tracing::debug!("Cached authorization: {}", bunker_pubkey);
             }
         } else {
@@ -592,7 +608,9 @@ impl UnifiedSigner {
                     pool: pool.clone(),
                 };
 
-                handlers.insert(bunker_pubkey.to_string(), handler).await;
+                // Insert into both caches (internal + shared for API)
+                handlers.insert(bunker_pubkey.to_string(), handler.clone()).await;
+                shared_handlers.insert(bunker_pubkey.to_string(), Arc::new(handler) as Arc<dyn SigningHandler>).await;
                 tracing::debug!("Cached authorization: {}", bunker_pubkey);
             }
         }
@@ -602,6 +620,7 @@ impl UnifiedSigner {
 
     async fn handle_nip46_request(
         handlers: Cache<String, AuthorizationHandler>,
+        shared_handlers: SignerHandlersCache,
         client: Client,
         event: Box<Event>,
         pool: &PgPool,
@@ -678,7 +697,9 @@ impl UnifiedSigner {
                         };
 
                         // Cache it for future requests (LRU will evict old entries automatically)
+                        // Insert into both caches (internal + shared for API)
                         handlers.insert(bunker_pubkey.to_string(), handler.clone()).await;
+                        shared_handlers.insert(bunker_pubkey.to_string(), Arc::new(handler.clone()) as Arc<dyn SigningHandler>).await;
 
                         handler
                     },
@@ -1165,17 +1186,10 @@ impl UnifiedSigner {
         }
     }
 
-    /// Get snapshot of current cache as trait objects for HTTP signing
-    /// Note: Returns a snapshot - cache may change after this call
-    pub fn handlers_as_trait_objects(&self) -> Arc<Mutex<std::collections::HashMap<String, Arc<dyn SigningHandler>>>> {
-        let mut trait_map: std::collections::HashMap<String, Arc<dyn SigningHandler>> = std::collections::HashMap::new();
-
-        // Iterate over concurrent cache (moka provides consistent iteration)
-        for (key, handler) in self.handlers.iter() {
-            trait_map.insert(key.to_string(), Arc::new(handler.clone()) as Arc<dyn SigningHandler>);
-        }
-
-        Arc::new(Mutex::new(trait_map))
+    /// Get the shared handlers cache for API access
+    /// Returns a clone of the cache Arc (not the data) - changes are immediately visible
+    pub fn handlers(&self) -> SignerHandlersCache {
+        self.shared_handlers.clone()
     }
 }
 

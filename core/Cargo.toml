@@ -13,6 +13,7 @@ dotenv = { workspace = true }
 gcp_auth = "0.12"
 google-cloud-kms = "0.6"
 lazy_static = "1.5.0"
+moka = { version = "0.12", features = ["future"] }
 nostr = { workspace = true }
 nostr-sdk = {workspace = true}
 once_cell = "1.2"

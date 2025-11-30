@@ -186,8 +186,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     signer.connect_to_relays().await?;
     tracing::info!("✔︎ Signer daemon initialized and connected to relays");
 
-    // Get shared handlers for API (converted to trait objects)
-    let signer_handlers = signer.handlers_as_trait_objects();
+    // Get shared handlers for API (live moka cache, not a snapshot)
+    let signer_handlers = signer.handlers();
 
     // Create API state with shared signer handlers and server keys
     let api_state = Arc::new(keycast_api::state::KeycastState {

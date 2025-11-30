@@ -56,3 +56,4 @@ aes-gcm = "0.10"
 async-trait = "0.1"
 md5 = "0.7"
 bcrypt = "0.15"
+moka = { version = "0.12", features = ["future"] }

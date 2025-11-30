@@ -2156,8 +2156,7 @@ pub async fn sign_event(
         .await?;
 
         if let Some(bunker_key) = bunker_pubkey {
-            let handlers_read = handlers.lock().await;
-            if let Some(handler) = handlers_read.get(&bunker_key) {
+            if let Some(handler) = handlers.get(&bunker_key).await {
                 tracing::info!("✅ Using cached handler for user {}", user_pubkey);
 
                 let signed_event = handler.sign_event_direct(unsigned_event).await

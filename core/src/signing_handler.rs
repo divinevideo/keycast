@@ -4,6 +4,11 @@
 use async_trait::async_trait;
 use nostr_sdk::{Keys, UnsignedEvent};
 use std::error::Error;
+use std::sync::Arc;
+
+/// Type alias for the shared cache of signing handlers
+/// Moka is a concurrent cache with lock-free reads - no external Mutex needed
+pub type SignerHandlersCache = moka::future::Cache<String, Arc<dyn SigningHandler>>;
 
 /// Trait for handlers that can sign Nostr events
 /// Implemented by AuthorizationHandler in the signer crate
