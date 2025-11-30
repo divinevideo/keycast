@@ -73,6 +73,7 @@ pub fn assert_test_database_url() {
 ///
 /// # Panics
 /// Panics if DATABASE_URL is not a localhost database.
+#[allow(dead_code)]
 pub async fn setup_test_db() -> PgPool {
     // CRITICAL: Check database URL before connecting
     assert_test_database_url();

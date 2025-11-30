@@ -628,24 +628,24 @@ onMount(async () => {
 					<div class="feature-icon">
 						<Key size={24} weight="fill" />
 					</div>
-					<h3>One Identity, Every App</h3>
-					<p>Use one account across all Nostr apps. No more creating accounts everywhere.</p>
+					<h3>No Extensions Needed</h3>
+					<p>Sign in without browser extensions. We manage your Nostr key so you can focus on the apps.</p>
 				</div>
 
 				<div class="feature-card">
 					<div class="feature-icon">
 						<Users size={24} weight="fill" />
 					</div>
-					<h3>You Own Your Account</h3>
-					<p>Your identity belongs to you, not any company. Take it anywhere, keep it forever.</p>
+					<h3>Portable Identity</h3>
+					<p>Your Nostr identity works everywhere. Export your key anytime to use with other apps.</p>
 				</div>
 
 				<div class="feature-card">
 					<div class="feature-icon">
 						<Gear size={24} weight="fill" />
 					</div>
-					<h3>Easy to Start</h3>
-					<p>No extensions needed. Get started quickly, then export your key anytime to take full control.</p>
+					<h3>Familiar Security</h3>
+					<p>Like iCloud or Google, we store your credentials securely. Your key is encrypted at rest.</p>
 				</div>
 			</div>
 
