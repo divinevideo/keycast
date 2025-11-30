@@ -49,6 +49,11 @@ WORKDIR /app
 # Copy keycast-login library (local dependency for web)
 COPY ./keycast-login ./keycast-login
 
+# Build keycast-login (dist/ is gitignored so we build it here)
+WORKDIR /app/keycast-login
+RUN bun install
+RUN bun run build
+
 # Copy web app
 WORKDIR /app/web
 COPY ./web .
