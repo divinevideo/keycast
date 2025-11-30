@@ -57,7 +57,7 @@ async fn test_tenant_isolation_users() {
 
     // Create user in tenant 1
     sqlx::query(
-        "INSERT INTO users (tenant_id, public_key, created_at, updated_at)
+        "INSERT INTO users (tenant_id, pubkey, created_at, updated_at)
          VALUES (?1, ?2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
     )
     .bind(tenant1_id)
@@ -68,7 +68,7 @@ async fn test_tenant_isolation_users() {
 
     // Create user in tenant 2
     sqlx::query(
-        "INSERT INTO users (tenant_id, public_key, created_at, updated_at)
+        "INSERT INTO users (tenant_id, pubkey, created_at, updated_at)
          VALUES (?1, ?2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
     )
     .bind(tenant2_id)
@@ -79,7 +79,7 @@ async fn test_tenant_isolation_users() {
 
     // Test: Query for tenant 1 users should ONLY return tenant 1 users
     let tenant1_users: Vec<String> = sqlx::query_scalar(
-        "SELECT public_key FROM users WHERE tenant_id = ?"
+        "SELECT pubkey FROM users WHERE tenant_id = ?"
     )
     .bind(tenant1_id)
     .fetch_all(&pool)
@@ -91,7 +91,7 @@ async fn test_tenant_isolation_users() {
 
     // Test: Query for tenant 2 users should ONLY return tenant 2 users
     let tenant2_users: Vec<String> = sqlx::query_scalar(
-        "SELECT public_key FROM users WHERE tenant_id = ?"
+        "SELECT pubkey FROM users WHERE tenant_id = ?"
     )
     .bind(tenant2_id)
     .fetch_all(&pool)
@@ -103,7 +103,7 @@ async fn test_tenant_isolation_users() {
 
     // Test: Query without tenant_id filtering should return BOTH users
     let all_users: Vec<String> = sqlx::query_scalar(
-        "SELECT public_key FROM users ORDER BY public_key"
+        "SELECT pubkey FROM users ORDER BY pubkey"
     )
     .fetch_all(&pool)
     .await
@@ -183,7 +183,7 @@ async fn test_email_uniqueness_per_tenant() {
 
     // Create user with email alice@example.com in tenant 1
     sqlx::query(
-        "INSERT INTO users (tenant_id, public_key, email, created_at, updated_at)
+        "INSERT INTO users (tenant_id, pubkey, email, created_at, updated_at)
          VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
     )
     .bind(tenant1_id)
@@ -195,7 +195,7 @@ async fn test_email_uniqueness_per_tenant() {
 
     // Create user with SAME email in tenant 2 (should succeed due to tenant scoping)
     let result = sqlx::query(
-        "INSERT INTO users (tenant_id, public_key, email, created_at, updated_at)
+        "INSERT INTO users (tenant_id, pubkey, email, created_at, updated_at)
          VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
     )
     .bind(tenant2_id)
@@ -227,7 +227,7 @@ async fn test_username_uniqueness_per_tenant() {
 
     // Create user with username "alice" in tenant 1
     sqlx::query(
-        "INSERT INTO users (tenant_id, public_key, username, created_at, updated_at)
+        "INSERT INTO users (tenant_id, pubkey, username, created_at, updated_at)
          VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
     )
     .bind(tenant1_id)
@@ -239,7 +239,7 @@ async fn test_username_uniqueness_per_tenant() {
 
     // Create user with SAME username in tenant 2 (should succeed)
     let result = sqlx::query(
-        "INSERT INTO users (tenant_id, public_key, username, created_at, updated_at)
+        "INSERT INTO users (tenant_id, pubkey, username, created_at, updated_at)
          VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
     )
     .bind(tenant2_id)
@@ -271,7 +271,7 @@ async fn test_cross_tenant_data_leakage_prevention() {
 
     // Create user in tenant 1
     sqlx::query(
-        "INSERT INTO users (tenant_id, public_key, email, password_hash, created_at, updated_at)
+        "INSERT INTO users (tenant_id, pubkey, email, password_hash, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
     )
     .bind(tenant1_id)

@@ -24,8 +24,8 @@ pub trait SigningHandler: Send + Sync {
     /// Get the authorization ID for this handler
     fn authorization_id(&self) -> i64;
 
-    /// Get the user public key for this handler
-    fn user_public_key(&self) -> String;
+    /// Get the user's Nostr pubkey (NIP-46: `user-pubkey`)
+    fn user_pubkey(&self) -> String;
 
     /// Get the user's signing keys for RPC operations
     /// Used by the REST RPC API for encryption/decryption

@@ -194,7 +194,7 @@ pub async fn nostr_discovery_public(
     if let Some(name) = params.get("name") {
         // Look up user by username in this tenant
         let result: Option<(String,)> = sqlx::query_as(
-            "SELECT public_key FROM users WHERE username = $1 AND tenant_id = $2"
+            "SELECT pubkey FROM users WHERE username = $1 AND tenant_id = $2"
         )
         .bind(name)
         .bind(tenant_id)

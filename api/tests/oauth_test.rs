@@ -327,7 +327,7 @@ async fn test_oauth_bunker_uses_personal_key() {
 
     // Get the user's actual public key from database
     let user_pubkey: String = sqlx::query_scalar(
-        "SELECT user_public_key FROM personal_keys WHERE user_public_key IN (SELECT public_key FROM users WHERE email = 'test@example.com')"
+        "SELECT pubkey FROM users WHERE email = 'test@example.com')"
     )
     .fetch_one(&pool)
     .await
@@ -406,7 +406,7 @@ async fn test_oauth_bunker_uses_personal_key() {
 
     // Step 5: Verify oauth_authorizations table has user's key
     let (bunker_pubkey_in_db, ): (String, ) = sqlx::query_as(
-        "SELECT bunker_public_key FROM oauth_authorizations WHERE user_public_key = ?1"
+        "SELECT bunker_public_key FROM oauth_authorizations WHERE user_pubkey = ?1"
     )
     .bind(&user_pubkey)
     .fetch_one(&pool)
@@ -513,7 +513,7 @@ async fn test_oauth_authorize_uses_authenticated_user_not_most_recent() {
 
     // Verify the authorization code was created for ALICE, not Bob
     let (code_user_pubkey,): (String,) = sqlx::query_as(
-        "SELECT user_public_key FROM oauth_codes WHERE code = ?1"
+        "SELECT user_pubkey FROM oauth_codes WHERE code = ?1"
     )
     .bind(code)
     .fetch_one(&pool)
@@ -613,8 +613,8 @@ async fn test_nostr_connect_uses_authenticated_user_not_most_recent() {
 
     // Verify OAuth authorization was created for ALICE, not Bob
     let (auth_user_pubkey,): (String,) = sqlx::query_as(
-        "SELECT user_public_key FROM oauth_authorizations
-         WHERE client_public_key = 'abcd1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab'
+        "SELECT user_pubkey FROM oauth_authorizations
+         WHERE client_pubkey = 'abcd1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab'
          ORDER BY created_at DESC LIMIT 1"
     )
     .fetch_one(&pool)

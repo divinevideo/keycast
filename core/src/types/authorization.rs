@@ -97,7 +97,8 @@ pub struct AuthorizationWithRelations {
 
 #[derive(Debug, FromRow, Serialize, Deserialize)]
 pub struct UserAuthorization {
-    pub user_public_key: String,
+    /// User's Nostr pubkey (NIP-46: `user-pubkey`)
+    pub user_pubkey: String,
     pub created_at: DateTime<chrono::Utc>,
     pub updated_at: DateTime<chrono::Utc>,
 }

@@ -11,8 +11,8 @@ use sqlx::{FromRow, PgPool};
 pub struct OAuthAuthorization {
     /// The id of the authorization
     pub id: i32,
-    /// The user's public key (also used as bunker public key)
-    pub user_public_key: String,
+    /// The user's Nostr pubkey (NIP-46: `user-pubkey`)
+    pub user_pubkey: String,
     /// The redirect_uri origin (scheme + host + port) - primary identifier for the app
     pub redirect_origin: String,
     /// The OAuth application id (optional metadata, origin is primary)
@@ -30,9 +30,9 @@ pub struct OAuthAuthorization {
     pub policy_id: Option<i32>,
     /// Tenant ID for multi-tenancy isolation
     pub tenant_id: i64,
-    /// The client's public key from nostr-login (nostrconnect:// URI)
-    /// This is set at authorization creation time for nostr-login flow
-    pub client_public_key: Option<String>,
+    /// App's ephemeral pubkey for NIP-46 communication (NIP-46: `client-pubkey`)
+    /// Set at authorization creation time for nostr-login flow
+    pub client_pubkey: Option<String>,
     /// The connected NIP-46 client's public key (set after successful connect)
     /// Per NIP-46: after connect, this becomes the client identifier for security
     pub connected_client_pubkey: Option<String>,

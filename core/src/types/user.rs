@@ -19,8 +19,8 @@ pub enum UserError {
 /// A user is a representation of a Nostr user (based solely on a pubkey value)
 #[derive(Debug, FromRow, Serialize, Deserialize)]
 pub struct User {
-    /// The user's public key, in hex format
-    pub public_key: String,
+    /// The user's Nostr pubkey in hex format (NIP-46: `user-pubkey`)
+    pub pubkey: String,
     /// The date and time the user was created
     pub created_at: DateTime<chrono::Utc>,
     /// The date and time the user was last updated
@@ -30,8 +30,8 @@ pub struct User {
 /// A team user is a representation of a user's membership in a team, this is a join table
 #[derive(Debug, FromRow, Serialize, Deserialize)]
 pub struct TeamUser {
-    /// The user's public key, in hex format
-    pub user_public_key: String,
+    /// The user's Nostr pubkey in hex format (NIP-46: `user-pubkey`)
+    pub user_pubkey: String,
     /// The team id
     pub team_id: i32,
     /// The user's role in the team
@@ -52,7 +52,7 @@ pub enum TeamUserRole {
 
 impl User {
     pub async fn find_by_pubkey(pool: &PgPool, tenant_id: i64, pubkey: &PublicKey) -> Result<Self, UserError> {
-        match sqlx::query_as::<_, User>("SELECT * FROM users WHERE tenant_id = $1 AND public_key = $2")
+        match sqlx::query_as::<_, User>("SELECT * FROM users WHERE tenant_id = $1 AND pubkey = $2")
             .bind(tenant_id)
             .bind(pubkey.to_hex())
             .fetch_one(pool)
@@ -69,10 +69,10 @@ impl User {
 
     pub async fn teams(&self, pool: &PgPool, tenant_id: i64) -> Result<Vec<TeamWithRelations>, UserError> {
         let teams = sqlx::query_as::<_, Team>(
-            "SELECT * FROM teams WHERE tenant_id = $1 AND id IN (SELECT team_id FROM team_users WHERE tenant_id = $1 AND user_public_key = $2)",
+            "SELECT * FROM teams WHERE tenant_id = $1 AND id IN (SELECT team_id FROM team_users WHERE tenant_id = $1 AND user_pubkey = $2)",
         )
         .bind(tenant_id)
-        .bind(self.public_key.clone())
+        .bind(self.pubkey.clone())
         .fetch_all(pool)
         .await?;
 
@@ -126,7 +126,7 @@ impl User {
         pubkey: &PublicKey,
         team_id: i32,
     ) -> Result<bool, UserError> {
-        let query = "SELECT COUNT(*) FROM team_users WHERE tenant_id = $1 AND user_public_key = $2 AND team_id = $3 AND role = 'admin'";
+        let query = "SELECT COUNT(*) FROM team_users WHERE tenant_id = $1 AND user_pubkey = $2 AND team_id = $3 AND role = 'admin'";
         let count = sqlx::query_scalar::<_, i64>(query)
             .bind(tenant_id)
             .bind(pubkey.to_hex())
@@ -143,7 +143,7 @@ impl User {
         pubkey: &PublicKey,
         team_id: i32,
     ) -> Result<bool, UserError> {
-        let query = "SELECT COUNT(*) FROM team_users WHERE tenant_id = $1 AND user_public_key = $2 AND team_id = $3 AND role = 'member'";
+        let query = "SELECT COUNT(*) FROM team_users WHERE tenant_id = $1 AND user_pubkey = $2 AND team_id = $3 AND role = 'member'";
         let count = sqlx::query_scalar::<_, i64>(query)
             .bind(tenant_id)
             .bind(pubkey.to_hex())
@@ -160,7 +160,7 @@ impl User {
         pubkey: &PublicKey,
         team_id: i32,
     ) -> Result<bool, UserError> {
-        let query = "SELECT COUNT(*) FROM team_users WHERE tenant_id = $1 AND user_public_key = $2 AND team_id = $3";
+        let query = "SELECT COUNT(*) FROM team_users WHERE tenant_id = $1 AND user_pubkey = $2 AND team_id = $3";
         let count = sqlx::query_scalar::<_, i64>(query)
             .bind(tenant_id)
             .bind(pubkey.to_hex())

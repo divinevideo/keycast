@@ -82,7 +82,7 @@ async fn test_authorization_code_expiration() {
     let redirect_origin = format!("https://test-{}.example.com", Uuid::new_v4());
 
     // Create user
-    sqlx::query("INSERT INTO users (public_key, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())")
+    sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())")
         .bind(&user_pubkey)
         .execute(&pool)
         .await
@@ -103,7 +103,7 @@ async fn test_authorization_code_expiration() {
     let expired_time = Utc::now() - Duration::minutes(10);
     let code = format!("expired_code_{}", Uuid::new_v4());
     sqlx::query(
-        "INSERT INTO oauth_codes (code, user_public_key, application_id, redirect_uri, scope, expires_at, tenant_id, created_at)
+        "INSERT INTO oauth_codes (code, user_pubkey, application_id, redirect_uri, scope, expires_at, tenant_id, created_at)
          VALUES ($1, $2, $3, $4, 'sign', $5, 1, NOW())"
     )
     .bind(&code)
@@ -136,7 +136,7 @@ async fn test_authorization_code_one_time_use() {
     let redirect_origin = format!("https://test-{}.example.com", Uuid::new_v4());
 
     // Create user
-    sqlx::query("INSERT INTO users (public_key, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())")
+    sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())")
         .bind(&user_pubkey)
         .execute(&pool)
         .await
@@ -156,7 +156,7 @@ async fn test_authorization_code_one_time_use() {
     // Create valid oauth_code
     let code = format!("valid_code_{}", Uuid::new_v4());
     sqlx::query(
-        "INSERT INTO oauth_codes (code, user_public_key, application_id, redirect_uri, scope, expires_at, tenant_id, created_at)
+        "INSERT INTO oauth_codes (code, user_pubkey, application_id, redirect_uri, scope, expires_at, tenant_id, created_at)
          VALUES ($1, $2, $3, $4, 'sign', NOW() + INTERVAL '10 minutes', 1, NOW())"
     )
     .bind(&code)
@@ -229,7 +229,7 @@ async fn test_multiple_authorizations_per_user() {
     let user_pubkey = user_keys.public_key().to_hex();
 
     // Create user
-    sqlx::query("INSERT INTO users (public_key, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())")
+    sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())")
         .bind(&user_pubkey)
         .execute(&pool)
         .await
@@ -259,7 +259,7 @@ async fn test_multiple_authorizations_per_user() {
 
     // Create authorization for App 1
     sqlx::query(
-        "INSERT INTO oauth_authorizations (user_public_key, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, tenant_id, created_at, updated_at)
+        "INSERT INTO oauth_authorizations (user_pubkey, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, tenant_id, created_at, updated_at)
          VALUES ($1, $2, $3, $4, E'\\\\x00', 'secret1', '[]', 1, NOW(), NOW())"
     )
     .bind(&user_pubkey)
@@ -272,7 +272,7 @@ async fn test_multiple_authorizations_per_user() {
 
     // Create authorization for App 2
     sqlx::query(
-        "INSERT INTO oauth_authorizations (user_public_key, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, tenant_id, created_at, updated_at)
+        "INSERT INTO oauth_authorizations (user_pubkey, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, tenant_id, created_at, updated_at)
          VALUES ($1, $2, $3, $4, E'\\\\x00', 'secret2', '[]', 1, NOW(), NOW())"
     )
     .bind(&user_pubkey)
@@ -285,7 +285,7 @@ async fn test_multiple_authorizations_per_user() {
 
     // Count authorizations for this user
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM oauth_authorizations WHERE user_public_key = $1"
+        "SELECT COUNT(*) FROM oauth_authorizations WHERE user_pubkey = $1"
     )
     .bind(&user_pubkey)
     .fetch_one(&pool)
@@ -342,7 +342,7 @@ async fn test_rpc_fast_path_works_with_any_oauth_app() {
     let tenant_id = 1i64;
 
     // Create user
-    sqlx::query("INSERT INTO users (public_key, tenant_id, created_at, updated_at) VALUES ($1, $2, NOW(), NOW())")
+    sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, $2, NOW(), NOW())")
         .bind(&user_pubkey)
         .bind(tenant_id)
         .execute(&pool)
@@ -364,7 +364,7 @@ async fn test_rpc_fast_path_works_with_any_oauth_app() {
 
     // Create OAuth authorization with this 'divine' app
     sqlx::query(
-        "INSERT INTO oauth_authorizations (user_public_key, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, tenant_id, created_at, updated_at)
+        "INSERT INTO oauth_authorizations (user_pubkey, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, tenant_id, created_at, updated_at)
          VALUES ($1, $2, $3, $4, E'\\\\x00', 'secret1', '[]', $5, NOW(), NOW())"
     )
     .bind(&user_pubkey)
@@ -381,8 +381,8 @@ async fn test_rpc_fast_path_works_with_any_oauth_app() {
     let result: Option<String> = sqlx::query_scalar(
         "SELECT oa.bunker_public_key
          FROM oauth_authorizations oa
-         JOIN users u ON oa.user_public_key = u.public_key AND oa.tenant_id = u.tenant_id
-         WHERE oa.user_public_key = $1
+         JOIN users u ON oa.user_pubkey = u.pubkey AND oa.tenant_id = u.tenant_id
+         WHERE oa.user_pubkey = $1
            AND u.tenant_id = $2
          ORDER BY oa.created_at DESC
          LIMIT 1"
@@ -403,7 +403,7 @@ async fn test_rpc_fast_path_works_with_any_oauth_app() {
         "SELECT oa.bunker_public_key
          FROM oauth_authorizations oa
          JOIN oauth_applications app ON oa.application_id = app.id
-         WHERE oa.user_public_key = $1
+         WHERE oa.user_pubkey = $1
            AND oa.tenant_id = $2
            AND app.name = 'keycast-login'
          ORDER BY oa.created_at DESC
@@ -474,7 +474,7 @@ impl SigningHandler for MockHandler {
         self.id
     }
 
-    fn user_public_key(&self) -> String {
+    fn user_pubkey(&self) -> String {
         self.pubkey.clone()
     }
 

@@ -302,7 +302,7 @@ async fn test_register_creates_oauth_authorization() {
     // Verify OAuth authorization was created in database
     let result: Option<(String,)> = sqlx::query_as(
         "SELECT bunker_public_key FROM oauth_authorizations
-         WHERE user_public_key = ?1
+         WHERE user_pubkey = ?1
          AND application_id = (SELECT id FROM oauth_applications WHERE client_id = 'keycast-login')"
     )
     .bind(user_pubkey)

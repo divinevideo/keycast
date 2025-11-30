@@ -345,7 +345,7 @@ pub async fn auth_status(
     }) {
         // Query user from database - user must exist for session to be valid
         let user_info: Option<(Option<String>, Option<bool>)> = sqlx::query_as(
-            "SELECT email, email_verified FROM users WHERE tenant_id = $1 AND public_key = $2"
+            "SELECT email, email_verified FROM users WHERE tenant_id = $1 AND pubkey = $2"
         )
         .bind(tenant_id)
         .bind(&user_pubkey)
@@ -440,7 +440,7 @@ pub async fn authorize_get(
         } else {
             // Check if user exists
             let exists: Option<(String,)> = sqlx::query_as(
-                "SELECT public_key FROM users WHERE public_key = $1 AND tenant_id = $2"
+                "SELECT pubkey FROM users WHERE pubkey = $1 AND tenant_id = $2"
             )
             .bind(pubkey)
             .bind(tenant_id)
@@ -469,7 +469,7 @@ pub async fn authorize_get(
         // Check if user has already authorized this origin (not application_id)
         let existing_auth: Option<(i32,)> = sqlx::query_as(
             "SELECT id FROM oauth_authorizations
-             WHERE tenant_id = $1 AND user_public_key = $2 AND redirect_origin = $3"
+             WHERE tenant_id = $1 AND user_pubkey = $2 AND redirect_origin = $3"
         )
         .bind(tenant_id)
         .bind(pubkey)
@@ -525,7 +525,7 @@ pub async fn authorize_get(
             let expires_at = Utc::now() + Duration::minutes(10);
 
             sqlx::query(
-                "INSERT INTO oauth_codes (tenant_id, code, user_public_key, application_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at)
+                "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, application_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
             )
             .bind(tenant_id)
@@ -1627,7 +1627,7 @@ pub async fn authorize_post(
     let tenant_id = tenant.0.id;
 
     // Extract user public key from UCAN cookie
-    let user_public_key = super::auth::extract_ucan_from_cookie(&headers).and_then(|token| {
+    let user_pubkey = super::auth::extract_ucan_from_cookie(&headers).and_then(|token| {
         // Parse UCAN from string using ucan_auth helper
         crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), tenant_id).ok().map(|(pubkey, _, _)| pubkey)
     })
@@ -1675,12 +1675,12 @@ pub async fn authorize_post(
 
     // Store authorization code with PKCE support
     sqlx::query(
-        "INSERT INTO oauth_codes (tenant_id, code, user_public_key, application_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at)
+        "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, application_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
     )
     .bind(tenant_id)
     .bind(&code)
-    .bind(&user_public_key)
+    .bind(&user_pubkey)
     .bind(app_id)
     .bind(&req.redirect_uri)
     .bind(&req.scope)
@@ -1733,7 +1733,7 @@ async fn handle_authorization_code_grant(
     // Fetch and validate authorization code with PKCE fields
     type AuthCodeRow = (String, i32, String, String, Option<String>, Option<String>);
     let auth_code: Option<AuthCodeRow> = sqlx::query_as(
-        "SELECT user_public_key, application_id, redirect_uri, scope, code_challenge, code_challenge_method
+        "SELECT user_pubkey, application_id, redirect_uri, scope, code_challenge, code_challenge_method
          FROM oauth_codes
          WHERE tenant_id = $1 AND code = $2 AND expires_at > $3"
     )
@@ -1743,7 +1743,7 @@ async fn handle_authorization_code_grant(
     .fetch_optional(pool)
     .await?;
 
-    let (user_public_key, application_id, stored_redirect_uri, scope, code_challenge, code_challenge_method) =
+    let (user_pubkey, application_id, stored_redirect_uri, scope, code_challenge, code_challenge_method) =
         auth_code.ok_or(OAuthError::Unauthorized)?;
 
     // Validate redirect_uri matches
@@ -1771,9 +1771,9 @@ async fn handle_authorization_code_grant(
 
     // Get user's email for UCAN
     let email: String = sqlx::query_scalar(
-        "SELECT email FROM users WHERE public_key = $1 AND tenant_id = $2"
+        "SELECT email FROM users WHERE pubkey = $1 AND tenant_id = $2"
     )
-    .bind(&user_public_key)
+    .bind(&user_pubkey)
     .bind(tenant_id)
     .fetch_one(pool)
     .await?;
@@ -1784,7 +1784,7 @@ async fn handle_authorization_code_grant(
 
     tracing::info!(
         "Token exchange for user {}: has code_verifier: {}, has nsec in verifier: {}",
-        user_public_key,
+        user_pubkey,
         req.code_verifier.is_some(),
         nsec_from_verifier.is_some()
     );
@@ -1793,7 +1793,7 @@ async fn handle_authorization_code_grant(
     create_oauth_authorization_and_token(
         CreateAuthorizationParams {
             tenant_id,
-            user_public_key: &user_public_key,
+            user_pubkey: &user_pubkey,
             email: &email,
             application_id,
             scope: &scope,
@@ -1809,7 +1809,7 @@ async fn handle_authorization_code_grant(
 /// Parameters for creating OAuth authorization and generating token
 struct CreateAuthorizationParams<'a> {
     tenant_id: i64,
-    user_public_key: &'a str,
+    user_pubkey: &'a str,
     email: &'a str,
     application_id: i32,
     scope: &'a str,
@@ -1826,7 +1826,7 @@ async fn create_oauth_authorization_and_token(
 ) -> Result<Response, OAuthError> {
     let CreateAuthorizationParams {
         tenant_id,
-        user_public_key,
+        user_pubkey,
         email,
         application_id,
         scope,
@@ -1838,9 +1838,9 @@ async fn create_oauth_authorization_and_token(
 
     // Check if personal_keys exist
     let encrypted_user_key: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT encrypted_secret_key FROM personal_keys WHERE user_public_key = $1"
+        "SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1"
     )
-    .bind(user_public_key)
+    .bind(user_pubkey)
     .fetch_optional(pool)
     .await
     .map_err(OAuthError::Database)?;
@@ -1848,12 +1848,12 @@ async fn create_oauth_authorization_and_token(
     let (encrypted_user_key, _keys_just_created) = if let Some(existing_key) = encrypted_user_key {
         // Keys already exist
         if nsec_from_verifier.is_some() {
-            tracing::warn!("User {} already has personal_keys, ignoring nsec from code_verifier", user_public_key);
+            tracing::warn!("User {} already has personal_keys, ignoring nsec from code_verifier", user_pubkey);
         }
         (existing_key, false)
     } else {
         // Create personal_keys from code_verifier nsec or auto-generate
-        tracing::info!("Creating personal_keys for user {} during token exchange", user_public_key);
+        tracing::info!("Creating personal_keys for user {} during token exchange", user_pubkey);
 
         let keys = if let Some(nsec_str) = nsec_from_verifier {
             tracing::info!("Using nsec from code_verifier (BYOK)");
@@ -1861,10 +1861,10 @@ async fn create_oauth_authorization_and_token(
                 .map_err(|e| OAuthError::InvalidRequest(format!("Invalid nsec in code_verifier: {}", e)))?;
 
             // Verify nsec matches user's registered pubkey
-            if keys.public_key().to_hex() != user_public_key {
+            if keys.public_key().to_hex() != user_pubkey {
                 return Err(OAuthError::InvalidRequest(format!(
                     "nsec in code_verifier doesn't match registered pubkey. Expected: {}, got: {}",
-                    user_public_key,
+                    user_pubkey,
                     keys.public_key().to_hex()
                 )));
             }
@@ -1873,7 +1873,7 @@ async fn create_oauth_authorization_and_token(
         } else {
             // No nsec provided - check if user expects BYOK (has no keys) or auto-generate
             // If user was registered without keys, they MUST provide nsec
-            tracing::error!("User {} has no personal_keys but no nsec in code_verifier", user_public_key);
+            tracing::error!("User {} has no personal_keys but no nsec in code_verifier", user_pubkey);
             return Err(OAuthError::InvalidRequest(
                 "Missing nsec in code_verifier. BYOK flow requires nsec to be embedded.".to_string()
             ));
@@ -1889,10 +1889,10 @@ async fn create_oauth_authorization_and_token(
 
         // Insert personal_keys
         sqlx::query(
-            "INSERT INTO personal_keys (user_public_key, encrypted_secret_key, created_at, updated_at)
+            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, created_at, updated_at)
              VALUES ($1, $2, $3, $4)"
         )
-        .bind(user_public_key)
+        .bind(user_pubkey)
         .bind(&encrypted_secret)
         .bind(Utc::now())
         .bind(Utc::now())
@@ -1908,7 +1908,7 @@ async fn create_oauth_authorization_and_token(
 
     // Generate server-signed UCAN for REST RPC API access
     let access_token = super::auth::generate_server_signed_ucan(
-        &nostr_sdk::PublicKey::from_hex(user_public_key)
+        &nostr_sdk::PublicKey::from_hex(user_pubkey)
             .map_err(|e| OAuthError::InvalidRequest(format!("Invalid public key: {}", e)))?,
         tenant_id,
         email,
@@ -1917,7 +1917,7 @@ async fn create_oauth_authorization_and_token(
     ).await.map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?;
 
     // Parse the user's public key to use as bunker public key
-    let bunker_public_key = nostr_sdk::PublicKey::from_hex(user_public_key)
+    let bunker_public_key = nostr_sdk::PublicKey::from_hex(user_pubkey)
         .map_err(|e| OAuthError::InvalidRequest(format!("Invalid public key: {}", e)))?;
 
     // Generate connection secret for NIP-46 authentication
@@ -1938,13 +1938,13 @@ async fn create_oauth_authorization_and_token(
     // Use ON CONFLICT to avoid duplicates per user/origin combination
     // Re-authorization creates new bunker keys and secrets for same user+app combination
     sqlx::query(
-        "INSERT INTO oauth_authorizations (tenant_id, user_public_key, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, policy_id, created_at, updated_at)
+        "INSERT INTO oauth_authorizations (tenant_id, user_pubkey, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, policy_id, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-         ON CONFLICT (tenant_id, user_public_key, redirect_origin)
+         ON CONFLICT (tenant_id, user_pubkey, redirect_origin)
          DO UPDATE SET bunker_public_key = $5, bunker_secret = $6, secret = $7, relays = $8, policy_id = $9, updated_at = $11"
     )
     .bind(tenant_id)
-    .bind(user_public_key)
+    .bind(user_pubkey)
     .bind(&redirect_origin)
     .bind(application_id)
     .bind(bunker_public_key.to_hex())
@@ -2056,7 +2056,7 @@ pub async fn oauth_login(
 
     // Validate credentials
     let user: Option<(String, String)> = sqlx::query_as(
-        "SELECT public_key, password_hash FROM users WHERE email = $1 AND tenant_id = $2 AND password_hash IS NOT NULL"
+        "SELECT pubkey, password_hash FROM users WHERE email = $1 AND tenant_id = $2 AND password_hash IS NOT NULL"
     )
     .bind(&req.email)
     .bind(tenant_id)
@@ -2074,7 +2074,7 @@ pub async fn oauth_login(
 
     // Get user's keys for UCAN generation
     let encrypted_secret: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT encrypted_secret_key FROM personal_keys WHERE user_public_key = $1"
+        "SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1"
     )
     .bind(&public_key)
     .fetch_optional(pool)
@@ -2157,7 +2157,7 @@ pub async fn oauth_register(
     );
 
     // Check if email already exists
-    let existing: Option<(String,)> = sqlx::query_as("SELECT public_key FROM users WHERE email = $1 AND tenant_id = $2")
+    let existing: Option<(String,)> = sqlx::query_as("SELECT pubkey FROM users WHERE email = $1 AND tenant_id = $2")
         .bind(&req.email)
         .bind(tenant_id)
         .fetch_optional(pool)
@@ -2196,7 +2196,7 @@ pub async fn oauth_register(
 
     // Check if user with this pubkey already exists
     let existing_user: Option<(String,)> = sqlx::query_as(
-        "SELECT email FROM users WHERE public_key = $1 AND tenant_id = $2"
+        "SELECT email FROM users WHERE pubkey = $1 AND tenant_id = $2"
     )
     .bind(public_key.to_hex())
     .bind(tenant_id)
@@ -2212,7 +2212,7 @@ pub async fn oauth_register(
 
     // Check if email is already taken
     let existing_email: Option<(String,)> = sqlx::query_as(
-        "SELECT public_key FROM users WHERE email = $1 AND tenant_id = $2"
+        "SELECT pubkey FROM users WHERE email = $1 AND tenant_id = $2"
     )
     .bind(&req.email)
     .bind(tenant_id)
@@ -2235,7 +2235,7 @@ pub async fn oauth_register(
 
     // Insert user with email verification token
     sqlx::query(
-        "INSERT INTO users (public_key, tenant_id, email, password_hash, email_verified, email_verification_token, email_verification_expires_at, created_at, updated_at)
+        "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, email_verification_token, email_verification_expires_at, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
     )
     .bind(public_key.to_hex())
@@ -2259,7 +2259,7 @@ pub async fn oauth_register(
             .map_err(|e| OAuthError::Encryption(e.to_string()))?;
 
         sqlx::query(
-            "INSERT INTO personal_keys (user_public_key, encrypted_secret_key, created_at, updated_at)
+            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, created_at, updated_at)
              VALUES ($1, $2, $3, $4)"
         )
         .bind(public_key.to_hex())
@@ -2333,7 +2333,7 @@ pub async fn oauth_register(
 
     // Store authorization code with PKCE support
     sqlx::query(
-        "INSERT INTO oauth_codes (tenant_id, code, user_public_key, application_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at)
+        "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, application_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
     )
     .bind(tenant_id)
@@ -2896,20 +2896,20 @@ pub async fn connect_post(
     }
 
     // Extract user public key from JWT token in Authorization header
-    let user_public_key = super::auth::extract_user_from_token(&headers)
+    let user_pubkey = super::auth::extract_user_from_token(&headers)
         .map_err(|_| OAuthError::Unauthorized)?;
 
     // Get user's encrypted key
     let encrypted_user_key: Vec<u8> = sqlx::query_scalar(
-        "SELECT encrypted_secret_key FROM personal_keys WHERE tenant_id = $1 AND user_public_key = $2"
+        "SELECT encrypted_secret_key FROM personal_keys WHERE tenant_id = $1 AND user_pubkey = $2"
     )
     .bind(tenant_id)
-    .bind(&user_public_key)
+    .bind(&user_pubkey)
     .fetch_one(&auth_state.state.db)
     .await?;
 
     // Parse user's public key
-    let bunker_public_key = nostr_sdk::PublicKey::from_hex(&user_public_key)
+    let bunker_public_key = nostr_sdk::PublicKey::from_hex(&user_pubkey)
         .map_err(|e| OAuthError::InvalidRequest(format!("Invalid public key: {}", e)))?;
 
     // For nostr-login, redirect_origin is "nostrconnect://{client_pubkey}" (the secure identifier)
@@ -2948,13 +2948,13 @@ pub async fn connect_post(
 
     sqlx::query(
         "INSERT INTO oauth_authorizations
-         (tenant_id, user_public_key, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, client_public_key, created_at, updated_at)
+         (tenant_id, user_pubkey, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, client_pubkey, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-         ON CONFLICT (tenant_id, user_public_key, redirect_origin)
-         DO UPDATE SET bunker_public_key = $5, bunker_secret = $6, secret = $7, relays = $8, client_public_key = $9, updated_at = $11"
+         ON CONFLICT (tenant_id, user_pubkey, redirect_origin)
+         DO UPDATE SET bunker_public_key = $5, bunker_secret = $6, secret = $7, relays = $8, client_pubkey = $9, updated_at = $11"
     )
     .bind(tenant_id)
-    .bind(&user_public_key)
+    .bind(&user_pubkey)
     .bind(&redirect_origin)
     .bind(app_id)
     .bind(bunker_public_key.to_hex())

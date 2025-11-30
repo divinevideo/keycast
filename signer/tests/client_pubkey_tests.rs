@@ -37,9 +37,9 @@ async fn create_oauth_authorization_for_client_test(
 
     // Create user first
     sqlx::query(
-        "INSERT INTO users (public_key, tenant_id, created_at, updated_at)
+        "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
          VALUES ($1, $2, NOW(), NOW())
-         ON CONFLICT (public_key) DO NOTHING"
+         ON CONFLICT (pubkey) DO NOTHING"
     )
     .bind(user_keys.public_key().to_hex())
     .bind(tenant_id)
@@ -53,7 +53,7 @@ async fn create_oauth_authorization_for_client_test(
         .expect("Failed to encrypt user secret");
 
     sqlx::query(
-        "INSERT INTO personal_keys (user_public_key, encrypted_secret_key, bunker_secret, tenant_id)
+        "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, bunker_secret, tenant_id)
          VALUES ($1, $2, $3, $4)"
     )
     .bind(user_keys.public_key().to_hex())
@@ -85,7 +85,7 @@ async fn create_oauth_authorization_for_client_test(
     // Create OAuth authorization
     let oauth_id: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (user_public_key, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, tenant_id, created_at, updated_at)
+         (user_pubkey, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, tenant_id, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
          RETURNING id"
     )

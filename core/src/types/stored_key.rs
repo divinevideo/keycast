@@ -35,8 +35,8 @@ pub struct StoredKey {
     pub team_id: i32,
     /// The name of the key
     pub name: String,
-    /// The public key of the key, in hex format
-    pub public_key: String,
+    /// The Nostr pubkey of the key in hex format
+    pub pubkey: String,
     /// The secret key of the key, in bytes, encrypted
     pub secret_key: Vec<u8>,
     /// The date and time the key was created
@@ -51,7 +51,7 @@ pub struct PublicStoredKey {
     pub id: i32,
     pub team_id: i32,
     pub name: String,
-    pub public_key: String,
+    pub pubkey: String,
     pub created_at: DateTime<chrono::Utc>,
     pub updated_at: DateTime<chrono::Utc>,
 }
@@ -62,7 +62,7 @@ impl From<StoredKey> for PublicStoredKey {
             id: key.id,
             team_id: key.team_id,
             name: key.name,
-            public_key: key.public_key,
+            pubkey: key.pubkey,
             created_at: key.created_at,
             updated_at: key.updated_at,
         }

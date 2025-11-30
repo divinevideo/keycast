@@ -434,9 +434,9 @@ pub(crate) async fn create_first_party_authorization(
     let created_at = Utc::now();
     sqlx::query(
         "INSERT INTO oauth_authorizations
-         (tenant_id, user_public_key, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, policy_id, created_at, updated_at)
+         (tenant_id, user_pubkey, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, policy_id, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, $9, $10)
-         ON CONFLICT (tenant_id, user_public_key, redirect_origin)
+         ON CONFLICT (tenant_id, user_pubkey, redirect_origin)
          DO UPDATE SET secret = EXCLUDED.secret, updated_at = EXCLUDED.updated_at"
     )
     .bind(tenant_id)
@@ -498,7 +498,7 @@ pub async fn register(
     );
 
     // Check if email already exists in this tenant
-    let existing: Option<(String,)> = sqlx::query_as("SELECT public_key FROM users WHERE email = $1 AND tenant_id = $2")
+    let existing: Option<(String,)> = sqlx::query_as("SELECT pubkey FROM users WHERE email = $1 AND tenant_id = $2")
         .bind(&req.email)
         .bind(tenant_id)
         .fetch_optional(pool)
@@ -532,7 +532,7 @@ pub async fn register(
     // Check if this public key is already registered in this tenant (for BYOK case)
     if req.nsec.is_some() {
         let existing_pubkey: Option<(String,)> = sqlx::query_as(
-            "SELECT public_key FROM users WHERE public_key = $1 AND tenant_id = $2"
+            "SELECT pubkey FROM users WHERE pubkey = $1 AND tenant_id = $2"
         )
         .bind(public_key.to_hex())
         .bind(tenant_id)
@@ -563,7 +563,7 @@ pub async fn register(
 
     // Insert user with email verification token
     sqlx::query(
-        "INSERT INTO users (public_key, tenant_id, email, password_hash, email_verified, email_verification_token, email_verification_expires_at, created_at, updated_at)
+        "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, email_verification_token, email_verification_expires_at, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
     )
     .bind(public_key.to_hex())
@@ -580,7 +580,7 @@ pub async fn register(
 
     // Insert personal key
     sqlx::query(
-        "INSERT INTO personal_keys (user_public_key, encrypted_secret_key, created_at, updated_at)
+        "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, created_at, updated_at)
          VALUES ($1, $2, $3, $4)"
     )
     .bind(public_key.to_hex())
@@ -667,7 +667,7 @@ pub async fn login(
 
     // Fetch user with password hash from this tenant
     let user: Option<(String, String)> = sqlx::query_as(
-        "SELECT public_key, password_hash FROM users WHERE email = $1 AND tenant_id = $2 AND password_hash IS NOT NULL"
+        "SELECT pubkey, password_hash FROM users WHERE email = $1 AND tenant_id = $2 AND password_hash IS NOT NULL"
     )
     .bind(&req.email)
     .bind(tenant_id)
@@ -703,7 +703,7 @@ pub async fn login(
 
     // Get user's Nostr keys from personal_keys
     let encrypted_secret: Vec<u8> = sqlx::query_scalar(
-        "SELECT encrypted_secret_key FROM personal_keys WHERE user_public_key = $1"
+        "SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1"
     )
     .bind(&public_key)
     .fetch_one(pool)
@@ -834,7 +834,7 @@ pub async fn create_bunker(
 
     // Get user's encrypted secret key
     let encrypted_secret: Vec<u8> = sqlx::query_scalar(
-        "SELECT encrypted_secret_key FROM personal_keys WHERE user_public_key = $1"
+        "SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1"
     )
     .bind(&user_pubkey)
     .fetch_one(pool)
@@ -893,9 +893,9 @@ pub async fn create_bunker(
     let created_at = Utc::now();
     sqlx::query(
         "INSERT INTO oauth_authorizations
-         (tenant_id, user_public_key, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, policy_id, created_at, updated_at)
+         (tenant_id, user_pubkey, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, policy_id, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-         ON CONFLICT (tenant_id, user_public_key, redirect_origin)
+         ON CONFLICT (tenant_id, user_pubkey, redirect_origin)
          DO UPDATE SET secret = EXCLUDED.secret, policy_id = EXCLUDED.policy_id, updated_at = EXCLUDED.updated_at"
     )
     .bind(tenant_id)
@@ -966,7 +966,7 @@ pub async fn get_bunker_url(
     // Get the authorization for this specific origin
     let result: Option<(String, String)> = sqlx::query_as(
         "SELECT oa.bunker_public_key, oa.secret FROM oauth_authorizations oa
-         WHERE oa.user_public_key = $1
+         WHERE oa.user_pubkey = $1
          AND oa.redirect_origin = $2
          AND oa.tenant_id = $3"
     )
@@ -1012,7 +1012,7 @@ pub async fn verify_email(
 
     // Find user with this verification token in this tenant
     let user: Option<(String, Option<chrono::DateTime<Utc>>)> = sqlx::query_as(
-        "SELECT public_key, email_verification_expires_at FROM users
+        "SELECT pubkey, email_verification_expires_at FROM users
          WHERE email_verification_token = $1 AND tenant_id = $2"
     )
     .bind(&req.token)
@@ -1039,7 +1039,7 @@ pub async fn verify_email(
              email_verification_token = NULL,
              email_verification_expires_at = NULL,
              updated_at = $2
-         WHERE public_key = $3"
+         WHERE pubkey = $3"
     )
     .bind(true)
     .bind(Utc::now())
@@ -1078,7 +1078,7 @@ pub async fn resend_verification(
 
     // Get user's email and verification status
     let user: Option<(String, bool, Option<chrono::DateTime<Utc>>)> = sqlx::query_as(
-        "SELECT email, email_verified, email_verification_sent_at FROM users WHERE public_key = $1 AND tenant_id = $2"
+        "SELECT email, email_verified, email_verification_sent_at FROM users WHERE pubkey = $1 AND tenant_id = $2"
     )
     .bind(&user_pubkey)
     .bind(tenant_id)
@@ -1119,7 +1119,7 @@ pub async fn resend_verification(
              email_verification_expires_at = $2,
              email_verification_sent_at = $3,
              updated_at = $4
-         WHERE public_key = $5"
+         WHERE pubkey = $5"
     )
     .bind(&verification_token)
     .bind(verification_expires)
@@ -1161,7 +1161,7 @@ pub async fn forgot_password(
 
     // Check if user exists in this tenant
     let user: Option<(String,)> = sqlx::query_as(
-        "SELECT public_key FROM users WHERE email = $1 AND tenant_id = $2"
+        "SELECT pubkey FROM users WHERE email = $1 AND tenant_id = $2"
     )
     .bind(&req.email)
     .bind(tenant_id)
@@ -1189,7 +1189,7 @@ pub async fn forgot_password(
          SET password_reset_token = $1,
              password_reset_expires_at = $2,
              updated_at = $3
-         WHERE public_key = $4"
+         WHERE pubkey = $4"
     )
     .bind(&reset_token)
     .bind(reset_expires)
@@ -1229,7 +1229,7 @@ pub async fn reset_password(
 
     // Find user with this reset token in this tenant
     let user: Option<(String, Option<chrono::DateTime<Utc>>)> = sqlx::query_as(
-        "SELECT public_key, password_reset_expires_at FROM users
+        "SELECT pubkey, password_reset_expires_at FROM users
          WHERE password_reset_token = $1 AND tenant_id = $2"
     )
     .bind(&req.token)
@@ -1263,7 +1263,7 @@ pub async fn reset_password(
              email_verification_token = NULL,
              email_verification_expires_at = NULL,
              updated_at = $2
-         WHERE public_key = $3"
+         WHERE pubkey = $3"
     )
     .bind(&password_hash)
     .bind(Utc::now())
@@ -1297,7 +1297,7 @@ pub async fn get_profile(
     // Get username from users table - this is the ONLY thing we store
     // The client should fetch actual kind 0 profile data from Nostr relays via bunker
     let username: Option<(Option<String>,)> = sqlx::query_as(
-        "SELECT username FROM users WHERE public_key = $1 AND tenant_id = $2"
+        "SELECT username FROM users WHERE pubkey = $1 AND tenant_id = $2"
     )
     .bind(&user_pubkey)
     .bind(tenant_id)
@@ -1330,7 +1330,7 @@ pub async fn get_account_status(
     tracing::debug!("Fetching account status for user: {} in tenant: {}", user_pubkey, tenant_id);
 
     let user: Option<(String, bool)> = sqlx::query_as(
-        "SELECT email, email_verified FROM users WHERE public_key = $1 AND tenant_id = $2"
+        "SELECT email, email_verified FROM users WHERE pubkey = $1 AND tenant_id = $2"
     )
     .bind(&user_pubkey)
     .bind(tenant_id)
@@ -1369,7 +1369,7 @@ pub async fn update_profile(
 
         // Check if username is already taken in this tenant
         let existing: Option<(String,)> = sqlx::query_as(
-            "SELECT public_key FROM users WHERE username = $1 AND public_key != $2 AND tenant_id = $3"
+            "SELECT pubkey FROM users WHERE username = $1 AND pubkey != $2 AND tenant_id = $3"
         )
         .bind(username)
         .bind(&user_pubkey)
@@ -1383,7 +1383,7 @@ pub async fn update_profile(
 
         // Update username in users table
         sqlx::query(
-            "UPDATE users SET username = $1, updated_at = $2 WHERE public_key = $3 AND tenant_id = $4"
+            "UPDATE users SET username = $1, updated_at = $2 WHERE pubkey = $3 AND tenant_id = $4"
         )
         .bind(username)
         .bind(Utc::now())
@@ -1441,13 +1441,13 @@ pub async fn list_sessions(
             oa.bunker_public_key,
             oa.secret,
             oa.created_at::text,
-            oa.client_public_key,
+            oa.client_pubkey,
             (SELECT MAX(created_at)::text FROM signing_activity WHERE bunker_secret = oa.secret) as last_activity,
             (SELECT COUNT(*) FROM signing_activity WHERE bunker_secret = oa.secret) as activity_count
          FROM oauth_authorizations oa
          LEFT JOIN oauth_applications a ON oa.application_id = a.id
-         JOIN users u ON oa.user_public_key = u.public_key
-         WHERE oa.user_public_key = $1
+         JOIN users u ON oa.user_pubkey = u.pubkey
+         WHERE oa.user_pubkey = $1
            AND u.tenant_id = $2
          ORDER BY oa.created_at DESC"
     )
@@ -1500,8 +1500,8 @@ pub async fn get_session_activity(
 
     // Verify this bunker session belongs to the user in this tenant
     let session: Option<(String,)> = sqlx::query_as(
-        "SELECT oa.user_public_key FROM oauth_authorizations oa
-         JOIN users u ON oa.user_public_key = u.public_key
+        "SELECT oa.user_pubkey FROM oauth_authorizations oa
+         JOIN users u ON oa.user_pubkey = u.pubkey
          WHERE oa.secret = $1 AND u.tenant_id = $2"
     )
     .bind(&secret)
@@ -1565,8 +1565,8 @@ pub async fn revoke_session(
     // Get bunker_pubkey before deleting (needed for cache invalidation)
     let bunker_pubkey: Option<String> = sqlx::query_scalar(
         "SELECT bunker_public_key FROM oauth_authorizations
-         WHERE secret = $1 AND user_public_key = $2
-         AND user_public_key IN (SELECT public_key FROM users WHERE tenant_id = $3)"
+         WHERE secret = $1 AND user_pubkey = $2
+         AND user_pubkey IN (SELECT pubkey FROM users WHERE tenant_id = $3)"
     )
     .bind(&req.secret)
     .bind(&user_pubkey)
@@ -1581,8 +1581,8 @@ pub async fn revoke_session(
     // Delete the authorization
     sqlx::query(
         "DELETE FROM oauth_authorizations
-         WHERE secret = $1 AND user_public_key = $2
-         AND user_public_key IN (SELECT public_key FROM users WHERE tenant_id = $3)"
+         WHERE secret = $1 AND user_pubkey = $2
+         AND user_pubkey IN (SELECT pubkey FROM users WHERE tenant_id = $3)"
     )
     .bind(&req.secret)
     .bind(&user_pubkey)
@@ -1637,8 +1637,8 @@ pub async fn disconnect_client(
     let result = sqlx::query(
         "UPDATE oauth_authorizations
          SET connected_client_pubkey = NULL, connected_at = NULL, updated_at = $1
-         WHERE secret = $2 AND user_public_key = $3
-         AND user_public_key IN (SELECT public_key FROM users WHERE tenant_id = $4)"
+         WHERE secret = $2 AND user_pubkey = $3
+         AND user_pubkey IN (SELECT pubkey FROM users WHERE tenant_id = $4)"
     )
     .bind(Utc::now())
     .bind(&req.secret)
@@ -1720,8 +1720,8 @@ pub async fn list_permissions(
          FROM oauth_authorizations oa
          LEFT JOIN oauth_applications a ON oa.application_id = a.id
          LEFT JOIN policies p ON COALESCE(oa.policy_id, a.policy_id) = p.id
-         JOIN users u ON oa.user_public_key = u.public_key
-         WHERE oa.user_public_key = $1
+         JOIN users u ON oa.user_pubkey = u.pubkey
+         WHERE oa.user_pubkey = $1
            AND u.tenant_id = $2
          ORDER BY oa.created_at DESC"
     )
@@ -1842,7 +1842,7 @@ pub async fn get_authorization_for_origin(
     let policy_id: Option<Option<i32>> = sqlx::query_scalar(
         "SELECT policy_id
          FROM oauth_authorizations
-         WHERE user_public_key = $1
+         WHERE user_pubkey = $1
          AND redirect_origin = $2
          AND tenant_id = $3
          AND (expires_at IS NULL OR expires_at > NOW())"
@@ -2145,8 +2145,8 @@ pub async fn sign_event(
         let bunker_pubkey: Option<String> = sqlx::query_scalar(
             "SELECT oa.bunker_public_key
              FROM oauth_authorizations oa
-             JOIN users u ON oa.user_public_key = u.public_key
-             WHERE oa.user_public_key = $1 AND u.tenant_id = $2
+             JOIN users u ON oa.user_pubkey = u.pubkey
+             WHERE oa.user_pubkey = $1 AND u.tenant_id = $2
              ORDER BY oa.created_at DESC
              LIMIT 1"
         )
@@ -2181,8 +2181,8 @@ pub async fn sign_event(
     let result: Option<(Vec<u8>,)> = sqlx::query_as(
         "SELECT pk.encrypted_secret_key
          FROM personal_keys pk
-         JOIN users u ON pk.user_public_key = u.public_key
-         WHERE pk.user_public_key = $1 AND u.tenant_id = $2"
+         JOIN users u ON pk.user_pubkey = u.pubkey
+         WHERE pk.user_pubkey = $1 AND u.tenant_id = $2"
     )
     .bind(&user_pubkey)
     .bind(tenant_id)
@@ -2230,7 +2230,7 @@ pub async fn get_pubkey(
 
     // Verify user exists in this tenant
     let exists: Option<(String,)> = sqlx::query_as(
-        "SELECT public_key FROM users WHERE public_key = $1 AND tenant_id = $2"
+        "SELECT pubkey FROM users WHERE pubkey = $1 AND tenant_id = $2"
     )
     .bind(&user_pubkey)
     .bind(tenant_id)
@@ -2308,7 +2308,7 @@ pub async fn verify_password_for_export(
 
     // Get user's email and password hash
     let result: Option<(String, String)> = sqlx::query_as(
-        "SELECT email, password_hash FROM users WHERE public_key = $1 AND tenant_id = $2"
+        "SELECT email, password_hash FROM users WHERE pubkey = $1 AND tenant_id = $2"
     )
     .bind(&user_pubkey)
     .bind(tenant_id)
@@ -2339,7 +2339,7 @@ pub async fn request_key_export(
 
     // Get user's email and verification status
     let user: Option<(String, bool)> = sqlx::query_as(
-        "SELECT email, email_verified FROM users WHERE public_key = $1 AND tenant_id = $2"
+        "SELECT email, email_verified FROM users WHERE pubkey = $1 AND tenant_id = $2"
     )
     .bind(&user_pubkey)
     .bind(tenant_id)
@@ -2359,7 +2359,7 @@ pub async fn request_key_export(
 
     // Store code in database
     sqlx::query(
-        "INSERT INTO key_export_codes (user_public_key, code, expires_at, created_at)
+        "INSERT INTO key_export_codes (user_pubkey, code, expires_at, created_at)
          VALUES ($1, $2, $3, $4)"
     )
     .bind(&user_pubkey)
@@ -2393,7 +2393,7 @@ pub async fn verify_export_code(
     // Verify code and check expiration
     let result: Option<(String, chrono::DateTime<Utc>)> = sqlx::query_as(
         "SELECT code, expires_at FROM key_export_codes
-         WHERE user_public_key = $1 AND code = $2 AND used_at IS NULL
+         WHERE user_pubkey = $1 AND code = $2 AND used_at IS NULL
          ORDER BY created_at DESC LIMIT 1"
     )
     .bind(&user_pubkey)
@@ -2409,7 +2409,7 @@ pub async fn verify_export_code(
 
     // Mark code as used
     sqlx::query(
-        "UPDATE key_export_codes SET used_at = $1 WHERE user_public_key = $2 AND code = $3"
+        "UPDATE key_export_codes SET used_at = $1 WHERE user_pubkey = $2 AND code = $3"
     )
     .bind(Utc::now())
     .bind(&user_pubkey)
@@ -2422,7 +2422,7 @@ pub async fn verify_export_code(
     let token_expires = Utc::now() + Duration::minutes(5);
 
     sqlx::query(
-        "INSERT INTO key_export_tokens (user_public_key, token, expires_at, created_at)
+        "INSERT INTO key_export_tokens (user_pubkey, token, expires_at, created_at)
          VALUES ($1, $2, $3, $4)"
     )
     .bind(&user_pubkey)
@@ -2449,7 +2449,7 @@ pub async fn export_key(
 
     // Require email verification
     let email_verified: Option<bool> = sqlx::query_scalar(
-        "SELECT email_verified FROM users WHERE public_key = $1 AND tenant_id = $2"
+        "SELECT email_verified FROM users WHERE pubkey = $1 AND tenant_id = $2"
     )
     .bind(&user_pubkey)
     .bind(tenant_id)
@@ -2463,7 +2463,7 @@ pub async fn export_key(
     // Verify export token
     let token_result: Option<(chrono::DateTime<Utc>,)> = sqlx::query_as(
         "SELECT expires_at FROM key_export_tokens
-         WHERE user_public_key = $1 AND token = $2 AND used_at IS NULL"
+         WHERE user_pubkey = $1 AND token = $2 AND used_at IS NULL"
     )
     .bind(&user_pubkey)
     .bind(&req.export_token)
@@ -2478,7 +2478,7 @@ pub async fn export_key(
 
     // Mark token as used
     sqlx::query(
-        "UPDATE key_export_tokens SET used_at = $1 WHERE user_public_key = $2 AND token = $3"
+        "UPDATE key_export_tokens SET used_at = $1 WHERE user_pubkey = $2 AND token = $3"
     )
     .bind(Utc::now())
     .bind(&user_pubkey)
@@ -2490,8 +2490,8 @@ pub async fn export_key(
     let encrypted_key: Option<Vec<u8>> = sqlx::query_scalar(
         "SELECT pk.encrypted_secret_key
          FROM personal_keys pk
-         JOIN users u ON pk.user_public_key = u.public_key
-         WHERE pk.user_public_key = $1 AND u.tenant_id = $2"
+         JOIN users u ON pk.user_pubkey = u.pubkey
+         WHERE pk.user_pubkey = $1 AND u.tenant_id = $2"
     )
     .bind(&user_pubkey)
     .bind(tenant_id)
@@ -2554,7 +2554,7 @@ pub async fn export_key(
 
     // Log the export for security audit
     sqlx::query(
-        "INSERT INTO key_export_log (user_public_key, format, exported_at) VALUES ($1, $2, $3)"
+        "INSERT INTO key_export_log (user_pubkey, format, exported_at) VALUES ($1, $2, $3)"
     )
     .bind(&user_pubkey)
     .bind(&req.format)
@@ -2601,7 +2601,7 @@ pub async fn export_key_simple(
 
     // Verify password and email verification status
     let result: Option<(String, String, bool)> = sqlx::query_as(
-        "SELECT email, password_hash, email_verified FROM users WHERE public_key = $1 AND tenant_id = $2"
+        "SELECT email, password_hash, email_verified FROM users WHERE pubkey = $1 AND tenant_id = $2"
     )
     .bind(&user_pubkey)
     .bind(tenant_id)
@@ -2626,8 +2626,8 @@ pub async fn export_key_simple(
     let encrypted_key: Option<Vec<u8>> = sqlx::query_scalar(
         "SELECT pk.encrypted_secret_key
          FROM personal_keys pk
-         JOIN users u ON pk.user_public_key = u.public_key
-         WHERE pk.user_public_key = $1 AND u.tenant_id = $2"
+         JOIN users u ON pk.user_pubkey = u.pubkey
+         WHERE pk.user_pubkey = $1 AND u.tenant_id = $2"
     )
     .bind(&user_pubkey)
     .bind(tenant_id)
@@ -2655,7 +2655,7 @@ pub async fn export_key_simple(
 
     // Log the export for security audit
     sqlx::query(
-        "INSERT INTO key_export_log (user_public_key, format, exported_at) VALUES ($1, $2, $3)"
+        "INSERT INTO key_export_log (user_pubkey, format, exported_at) VALUES ($1, $2, $3)"
     )
     .bind(&user_pubkey)
     .bind(format)
@@ -2681,7 +2681,7 @@ pub async fn change_key(
 
     // Get user's email and verify password
     let result: Option<(String, String)> = sqlx::query_as(
-        "SELECT email, password_hash FROM users WHERE public_key = $1 AND tenant_id = $2"
+        "SELECT email, password_hash FROM users WHERE pubkey = $1 AND tenant_id = $2"
     )
     .bind(&old_pubkey)
     .bind(tenant_id)
@@ -2713,7 +2713,7 @@ pub async fn change_key(
 
     // Check if new pubkey already exists in this tenant
     let exists: Option<(String,)> = sqlx::query_as(
-        "SELECT public_key FROM users WHERE public_key = $1 AND tenant_id = $2"
+        "SELECT pubkey FROM users WHERE pubkey = $1 AND tenant_id = $2"
     )
     .bind(&new_pubkey)
     .bind(tenant_id)
@@ -2735,7 +2735,7 @@ pub async fn change_key(
 
     // Count OAuth authorizations that will be deleted (for response message)
     let oauth_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM oauth_authorizations WHERE user_public_key = $1"
+        "SELECT COUNT(*) FROM oauth_authorizations WHERE user_pubkey = $1"
     )
     .bind(&old_pubkey)
     .fetch_one(&mut *tx)
@@ -2743,7 +2743,7 @@ pub async fn change_key(
 
     // Delete OAuth authorizations (we can't sign with old nsec anymore)
     sqlx::query(
-        "DELETE FROM oauth_authorizations WHERE user_public_key = $1"
+        "DELETE FROM oauth_authorizations WHERE user_pubkey = $1"
     )
     .bind(&old_pubkey)
     .execute(&mut *tx)
@@ -2751,7 +2751,7 @@ pub async fn change_key(
 
     // Delete old personal_keys (we no longer hold old nsec)
     sqlx::query(
-        "DELETE FROM personal_keys WHERE user_public_key = $1"
+        "DELETE FROM personal_keys WHERE user_pubkey = $1"
     )
     .bind(&old_pubkey)
     .execute(&mut *tx)
@@ -2760,7 +2760,7 @@ pub async fn change_key(
     // Transfer email/password to NULL on old identity (orphan it)
     sqlx::query(
         "UPDATE users SET email = NULL, password_hash = NULL, updated_at = $1
-         WHERE public_key = $2 AND tenant_id = $3"
+         WHERE pubkey = $2 AND tenant_id = $3"
     )
     .bind(Utc::now())
     .bind(&old_pubkey)
@@ -2770,7 +2770,7 @@ pub async fn change_key(
 
     // Create new user identity with email/password
     sqlx::query(
-        "INSERT INTO users (public_key, tenant_id, email, password_hash, email_verified, created_at, updated_at)
+        "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7)"
     )
     .bind(&new_pubkey)
@@ -2785,7 +2785,7 @@ pub async fn change_key(
 
     // Create personal_keys for new identity
     sqlx::query(
-        "INSERT INTO personal_keys (user_public_key, encrypted_secret_key, created_at, updated_at)
+        "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, created_at, updated_at)
          VALUES ($1, $2, $3, $4)"
     )
     .bind(&new_pubkey)
@@ -2861,7 +2861,7 @@ mod tests {
             self.auth_id
         }
 
-        fn user_public_key(&self) -> String {
+        fn user_pubkey(&self) -> String {
             self.user_keys.public_key().to_hex()
         }
 
@@ -2881,7 +2881,7 @@ mod tests {
         let redirect_origin = format!("https://test-{}.app", uuid::Uuid::new_v4());
 
         // Insert test user
-        sqlx::query("INSERT INTO users (public_key, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())")
+        sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())")
             .bind(&user_pubkey)
             .execute(&pool)
             .await
@@ -2903,7 +2903,7 @@ mod tests {
         let bunker_pubkey = bunker_keys.public_key().to_hex();
 
         sqlx::query(
-            "INSERT INTO oauth_authorizations (user_public_key, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, tenant_id, created_at, updated_at)
+            "INSERT INTO oauth_authorizations (user_pubkey, redirect_origin, application_id, bunker_public_key, bunker_secret, secret, relays, tenant_id, created_at, updated_at)
              VALUES ($1, $2, $3, $4, E'\\\\x00', 'test-secret', '[]', 1, NOW(), NOW())"
         )
         .bind(&user_pubkey)
@@ -2918,8 +2918,8 @@ mod tests {
         let result: Option<String> = sqlx::query_scalar(
             "SELECT oa.bunker_public_key
              FROM oauth_authorizations oa
-             JOIN users u ON oa.user_public_key = u.public_key
-             WHERE oa.user_public_key = $1 AND u.tenant_id = 1
+             JOIN users u ON oa.user_pubkey = u.pubkey
+             WHERE oa.user_pubkey = $1 AND u.tenant_id = 1
              ORDER BY oa.created_at DESC
              LIMIT 1"
         )
@@ -2964,14 +2964,14 @@ mod tests {
         let encrypted_secret = key_manager.encrypt(&user_secret_bytes).await.unwrap();
 
         // Insert test user
-        sqlx::query("INSERT INTO users (public_key, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())")
+        sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())")
             .bind(&user_pubkey)
             .execute(&pool)
             .await
             .unwrap();
 
         // Insert personal keys
-        sqlx::query("INSERT INTO personal_keys (user_public_key, encrypted_secret_key, tenant_id) VALUES ($1, $2, 1)")
+        sqlx::query("INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id) VALUES ($1, $2, 1)")
             .bind(&user_pubkey)
             .bind(&encrypted_secret)
             .execute(&pool)
@@ -2982,8 +2982,8 @@ mod tests {
         let result: Option<(Vec<u8>,)> = sqlx::query_as(
             "SELECT pk.encrypted_secret_key
              FROM personal_keys pk
-             JOIN users u ON pk.user_public_key = u.public_key
-             WHERE pk.user_public_key = $1 AND u.tenant_id = 1"
+             JOIN users u ON pk.user_pubkey = u.pubkey
+             WHERE pk.user_pubkey = $1 AND u.tenant_id = 1"
         )
         .bind(&user_pubkey)
         .fetch_optional(&pool)
@@ -3022,7 +3022,7 @@ mod tests {
         let user_pubkey = user_keys.public_key().to_hex();
 
         // Insert user but NO OAuth authorization
-        sqlx::query("INSERT INTO users (public_key, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())")
+        sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())")
             .bind(&user_pubkey)
             .execute(&pool)
             .await
@@ -3032,8 +3032,8 @@ mod tests {
         let bunker_pubkey: Option<String> = sqlx::query_scalar(
             "SELECT oa.bunker_public_key
              FROM oauth_authorizations oa
-             JOIN users u ON oa.user_public_key = u.public_key
-             WHERE oa.user_public_key = $1 AND u.tenant_id = 1"
+             JOIN users u ON oa.user_pubkey = u.pubkey
+             WHERE oa.user_pubkey = $1 AND u.tenant_id = 1"
         )
         .bind(&user_pubkey)
         .fetch_optional(&pool)

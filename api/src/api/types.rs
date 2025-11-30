@@ -25,7 +25,7 @@ pub struct UpdateTeamRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct AddTeammateRequest {
-    pub user_public_key: String,
+    pub user_pubkey: String,
     pub role: TeamUserRole,
 }
 

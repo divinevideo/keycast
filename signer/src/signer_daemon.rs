@@ -574,7 +574,7 @@ impl UnifiedSigner {
             let auth_data: Option<(i32, Vec<u8>, String, i64)> = sqlx::query_as(
                 "SELECT id, bunker_secret, secret, stored_key_id FROM authorizations
                  WHERE tenant_id = $1
-                 AND bunker_public_key = (SELECT public_key FROM stored_keys WHERE public_key = $2 AND tenant_id = $1)"
+                 AND bunker_public_key = (SELECT pubkey FROM stored_keys WHERE pubkey = $2 AND tenant_id = $1)"
             )
             .bind(tenant_id)
             .bind(bunker_pubkey)
@@ -1000,7 +1000,7 @@ impl SigningHandler for AuthorizationHandler {
         self.authorization_id as i64
     }
 
-    fn user_public_key(&self) -> String {
+    fn user_pubkey(&self) -> String {
         self.user_keys.public_key().to_hex()
     }
 
@@ -1094,7 +1094,7 @@ impl AuthorizationHandler {
         let (user_pubkey, application_id, client_pubkey, bunker_secret) = if self.is_oauth {
             // For OAuth, look up the oauth_authorization
             let oauth_auth: (String, Option<i64>, Option<String>, String) = sqlx::query_as(
-                "SELECT user_public_key, application_id, client_public_key, secret
+                "SELECT user_pubkey, application_id, client_pubkey, secret
                  FROM oauth_authorizations
                  WHERE tenant_id = $1 AND id = $2"
             )
@@ -1118,7 +1118,7 @@ impl AuthorizationHandler {
 
             // Get public_key from stored_keys
             let stored_key: (String,) = sqlx::query_as(
-                "SELECT public_key FROM stored_keys WHERE tenant_id = $1 AND id = $2"
+                "SELECT pubkey FROM stored_keys WHERE tenant_id = $1 AND id = $2"
             )
             .bind(self.tenant_id)
             .bind(stored_key_id)
@@ -1138,7 +1138,7 @@ impl AuthorizationHandler {
         // Insert signing activity
         sqlx::query(
             "INSERT INTO signing_activity
-             (user_public_key, application_id, bunker_secret, event_kind, event_content, event_id, client_public_key, tenant_id, created_at)
+             (user_pubkey, application_id, bunker_secret, event_kind, event_content, event_id, client_pubkey, tenant_id, created_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())"
         )
         .bind(&user_pubkey)
@@ -1168,7 +1168,7 @@ impl UnifiedSigner {
         // Find user's keycast-login OAuth authorization
         let bunker_pubkey: Option<String> = sqlx::query_scalar(
             "SELECT bunker_public_key FROM oauth_authorizations
-             WHERE user_public_key = $1
+             WHERE user_pubkey = $1
              AND application_id = (
                  SELECT id FROM oauth_applications WHERE redirect_origin = 'app://keycast-login'
              )
@@ -1230,9 +1230,9 @@ mod tests {
 
         // Create user
         sqlx::query(
-            "INSERT INTO users (public_key, tenant_id, created_at, updated_at)
+            "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
              VALUES ($1, 1, NOW(), NOW())
-             ON CONFLICT (public_key) DO NOTHING"
+             ON CONFLICT (pubkey) DO NOTHING"
         )
         .bind(&user_pubkey)
         .execute(&pool)
@@ -1242,7 +1242,7 @@ mod tests {
         // Create personal_keys entry (required FK for oauth_authorizations)
         // No ON CONFLICT needed since each test generates unique keys
         sqlx::query(
-            "INSERT INTO personal_keys (user_public_key, encrypted_secret_key, bunker_secret, tenant_id)
+            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, bunker_secret, tenant_id)
              VALUES ($1, $2, 'test_bunker_secret', 1)"
         )
         .bind(&user_pubkey)
@@ -1254,7 +1254,7 @@ mod tests {
         // Create oauth_authorization and get the ID
         let auth_id: i32 = sqlx::query_scalar(
             "INSERT INTO oauth_authorizations
-             (user_public_key, redirect_origin, bunker_public_key, bunker_secret, secret, relays, tenant_id, created_at, updated_at)
+             (user_pubkey, redirect_origin, bunker_public_key, bunker_secret, secret, relays, tenant_id, created_at, updated_at)
              VALUES ($1, 'http://test.example.com', $2, $3, 'test_secret', '[\"wss://relay.test\"]', 1, NOW(), NOW())
              RETURNING id"
         )

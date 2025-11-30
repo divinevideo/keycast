@@ -217,8 +217,8 @@ async fn get_user_keys(
         let bunker_pubkey: Option<String> = sqlx::query_scalar(
             "SELECT oa.bunker_public_key
              FROM oauth_authorizations oa
-             JOIN users u ON oa.user_public_key = u.public_key
-             WHERE oa.user_public_key = $1 AND u.tenant_id = $2 AND oa.redirect_origin = $3
+             JOIN users u ON oa.user_pubkey = u.pubkey
+             WHERE oa.user_pubkey = $1 AND u.tenant_id = $2 AND oa.redirect_origin = $3
              ORDER BY oa.created_at DESC
              LIMIT 1"
         )
@@ -247,8 +247,8 @@ async fn get_user_keys(
     let auth_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(
             SELECT 1 FROM oauth_authorizations oa
-            JOIN users u ON oa.user_public_key = u.public_key
-            WHERE oa.user_public_key = $1 AND u.tenant_id = $2 AND oa.redirect_origin = $3
+            JOIN users u ON oa.user_pubkey = u.pubkey
+            WHERE oa.user_pubkey = $1 AND u.tenant_id = $2 AND oa.redirect_origin = $3
          )"
     )
     .bind(user_pubkey)
@@ -266,8 +266,8 @@ async fn get_user_keys(
     let result: Option<(Vec<u8>,)> = sqlx::query_as(
         "SELECT pk.encrypted_secret_key
          FROM personal_keys pk
-         JOIN users u ON pk.user_public_key = u.public_key
-         WHERE pk.user_public_key = $1 AND u.tenant_id = $2"
+         JOIN users u ON pk.user_pubkey = u.pubkey
+         WHERE pk.user_pubkey = $1 AND u.tenant_id = $2"
     )
     .bind(user_pubkey)
     .bind(tenant_id)

@@ -193,14 +193,14 @@ async fn test_sign_event_endpoint_slow_path() {
     let encrypted_secret = key_manager.encrypt(user_secret.as_bytes()).await.unwrap();
 
     // Insert user into database with current timestamp
-    sqlx::query("INSERT INTO users (public_key, tenant_id, created_at, updated_at) VALUES (?, ?, datetime('now'), datetime('now'))")
+    sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES (?, ?, datetime('now'), datetime('now'))")
         .bind(&user_pubkey)
         .bind(tenant_id)
         .execute(&database.pool)
         .await
         .unwrap();
 
-    sqlx::query("INSERT INTO personal_keys (user_public_key, encrypted_secret_key, bunker_secret, tenant_id) VALUES (?, ?, ?, ?)")
+    sqlx::query("INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, bunker_secret, tenant_id) VALUES (?, ?, ?, ?)")
         .bind(&user_pubkey)
         .bind(&encrypted_secret)
         .bind(generate_test_bunker_secret())
@@ -330,14 +330,14 @@ async fn test_nostr_discovery_endpoint() {
     let user_pubkey = user_keys.public_key().to_hex();
 
     // Insert user with username
-    sqlx::query("INSERT INTO users (public_key, tenant_id, created_at, updated_at) VALUES (?, ?, datetime('now'), datetime('now'))")
+    sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES (?, ?, datetime('now'), datetime('now'))")
         .bind(&user_pubkey)
         .bind(tenant_id)
         .execute(&database.pool)
         .await
         .unwrap();
 
-    sqlx::query("UPDATE users SET username = 'testuser' WHERE public_key = ?")
+    sqlx::query("UPDATE users SET username = 'testuser' WHERE pubkey = ?")
         .bind(&user_pubkey)
         .execute(&database.pool)
         .await
@@ -391,14 +391,14 @@ async fn test_concurrent_signing_requests() {
         let user_secret = user_keys.secret_key().to_secret_hex();
         let encrypted_secret = key_manager.encrypt(user_secret.as_bytes()).await.unwrap();
 
-        sqlx::query("INSERT INTO users (public_key, tenant_id, created_at, updated_at) VALUES (?, ?, datetime('now'), datetime('now'))")
+        sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES (?, ?, datetime('now'), datetime('now'))")
             .bind(&user_pubkey)
             .bind(tenant_id)
             .execute(&database.pool)
             .await
             .unwrap();
 
-        sqlx::query("INSERT INTO personal_keys (user_public_key, encrypted_secret_key, bunker_secret, tenant_id) VALUES (?, ?, ?, ?)")
+        sqlx::query("INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, bunker_secret, tenant_id) VALUES (?, ?, ?, ?)")
             .bind(&user_pubkey)
             .bind(&encrypted_secret)
             .bind(generate_test_bunker_secret())

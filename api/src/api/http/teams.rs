@@ -73,9 +73,9 @@ pub async fn create_team(
     // First, try to insert the user if they don't exist
     sqlx::query(
         r#"
-            INSERT INTO users (tenant_id, public_key, created_at, updated_at)
+            INSERT INTO users (tenant_id, pubkey, created_at, updated_at)
             VALUES ($1, $2, NOW(), NOW())
-            ON CONFLICT (tenant_id, public_key) DO NOTHING
+            ON CONFLICT (tenant_id, pubkey) DO NOTHING
             "#,
     )
     .bind(tenant_id)
@@ -99,7 +99,7 @@ pub async fn create_team(
     // Then, create the team_user relationship with admin role
     let team_user = sqlx::query_as::<_, TeamUser>(
         r#"
-            INSERT INTO team_users (tenant_id, team_id, user_public_key, role, created_at, updated_at)
+            INSERT INTO team_users (tenant_id, team_id, user_pubkey, role, created_at, updated_at)
             VALUES ($1, $2, $3, 'admin', NOW(), NOW())
             RETURNING *
             "#,
@@ -328,18 +328,18 @@ pub async fn add_user(
 
     let mut tx = pool.begin().await?;
 
-    let new_user_public_key = PublicKey::from_hex(&request.user_public_key)
+    let new_user_pubkey = PublicKey::from_hex(&request.user_pubkey)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
 
     // Verify the user isn't already a member of the team
     if sqlx::query_as::<_, TeamUser>(
         r#"
-        SELECT * FROM team_users WHERE tenant_id = $1 AND team_id = $2 AND user_public_key = $3
+        SELECT * FROM team_users WHERE tenant_id = $1 AND team_id = $2 AND user_pubkey = $3
         "#,
     )
     .bind(tenant_id)
     .bind(team_id)
-    .bind(new_user_public_key.to_hex())
+    .bind(new_user_pubkey.to_hex())
     .fetch_optional(&mut *tx)
     .await?
     .is_some()
@@ -352,27 +352,27 @@ pub async fn add_user(
     // First, try to insert the user if they don't exist
     sqlx::query(
         r#"
-        INSERT INTO users (tenant_id, public_key, created_at, updated_at)
+        INSERT INTO users (tenant_id, pubkey, created_at, updated_at)
         VALUES ($1, $2, NOW(), NOW())
-        ON CONFLICT (tenant_id, public_key) DO NOTHING
+        ON CONFLICT (tenant_id, pubkey) DO NOTHING
         "#,
     )
     .bind(tenant_id)
-    .bind(new_user_public_key.to_hex())
+    .bind(new_user_pubkey.to_hex())
     .execute(&mut *tx)
     .await?;
 
     // Then, insert the team_user relationship
     let team_user = sqlx::query_as::<_, TeamUser>(
         r#"
-        INSERT INTO team_users (tenant_id, team_id, user_public_key, role, created_at, updated_at)
+        INSERT INTO team_users (tenant_id, team_id, user_pubkey, role, created_at, updated_at)
         VALUES ($1, $2, $3, $4, NOW(), NOW())
         RETURNING *
         "#,
     )
     .bind(tenant_id)
     .bind(team_id)
-    .bind(new_user_public_key.to_hex())
+    .bind(new_user_pubkey.to_hex())
     .bind(request.role)
     .fetch_one(&mut *tx)
     .await?;
@@ -386,23 +386,23 @@ pub async fn remove_user(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
     DualAuthEvent(user_pubkey_hex): DualAuthEvent,
-    Path((team_id, user_public_key)): Path<(i32, String)>,
+    Path((team_id, user_pubkey)): Path<(i32, String)>,
 ) -> ApiResult<StatusCode> {
     let tenant_id = tenant.0.id;
     verify_admin(&pool, &user_pubkey_hex, team_id, tenant_id).await?;
 
     let mut tx = pool.begin().await?;
 
-    let removed_user_public_key =
-        PublicKey::from_hex(&user_public_key).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let removed_user_pubkey =
+        PublicKey::from_hex(&user_pubkey).map_err(|e| ApiError::bad_request(e.to_string()))?;
 
     // Check if the user is deleting themselves
-    if user_pubkey_hex == removed_user_public_key.to_hex() {
+    if user_pubkey_hex == removed_user_pubkey.to_hex() {
         // At least one admin has to remain in the team
-        let remaining_admin_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_users WHERE tenant_id = $1 AND team_id = $2 AND user_public_key != $3 AND role = 'admin'")
+        let remaining_admin_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_users WHERE tenant_id = $1 AND team_id = $2 AND user_pubkey != $3 AND role = 'admin'")
             .bind(tenant_id)
             .bind(team_id)
-            .bind(removed_user_public_key.to_hex())
+            .bind(removed_user_pubkey.to_hex())
             .fetch_one(&mut *tx)
             .await?;
 
@@ -414,10 +414,10 @@ pub async fn remove_user(
     }
 
     // Delete the team_user relationship
-    sqlx::query("DELETE FROM team_users WHERE tenant_id = $1 AND team_id = $2 AND user_public_key = $3")
+    sqlx::query("DELETE FROM team_users WHERE tenant_id = $1 AND team_id = $2 AND user_pubkey = $3")
         .bind(tenant_id)
         .bind(team_id)
-        .bind(removed_user_public_key.to_hex())
+        .bind(removed_user_pubkey.to_hex())
         .execute(&mut *tx)
         .await?;
 
@@ -451,7 +451,7 @@ pub async fn add_key(
     // Insert the key
     let key = sqlx::query_as::<_, StoredKey>(
         r#"
-         INSERT INTO stored_keys (tenant_id, team_id, name, public_key, secret_key, created_at, updated_at)
+         INSERT INTO stored_keys (tenant_id, team_id, name, pubkey, secret_key, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
          RETURNING *
          "#,
@@ -486,7 +486,7 @@ pub async fn remove_key(
 
     // First get the stored key ID
     let stored_key = sqlx::query_as::<_, StoredKey>(
-        "SELECT * FROM stored_keys WHERE tenant_id = $1 AND team_id = $2 AND public_key = $3",
+        "SELECT * FROM stored_keys WHERE tenant_id = $1 AND team_id = $2 AND pubkey = $3",
     )
     .bind(tenant_id)
     .bind(team_id)
@@ -511,7 +511,7 @@ pub async fn remove_key(
         .await?;
 
     // Finally delete the key itself
-    sqlx::query("DELETE FROM stored_keys WHERE tenant_id = $1 AND team_id = $2 AND public_key = $3")
+    sqlx::query("DELETE FROM stored_keys WHERE tenant_id = $1 AND team_id = $2 AND pubkey = $3")
         .bind(tenant_id)
         .bind(team_id)
         .bind(removed_stored_key_public_key.to_hex())
@@ -549,7 +549,7 @@ pub async fn get_key(
 
     let stored_key = sqlx::query_as::<_, StoredKey>(
         r#"
-            SELECT * FROM stored_keys WHERE tenant_id = $1 AND team_id = $2 AND public_key = $3
+            SELECT * FROM stored_keys WHERE tenant_id = $1 AND team_id = $2 AND pubkey = $3
             "#,
     )
     .bind(tenant_id)
@@ -589,7 +589,7 @@ pub async fn get_key(
 
         let users = sqlx::query_as::<_, UserAuthorization>(
             r#"
-                SELECT user_public_key, created_at, updated_at
+                SELECT user_pubkey, created_at, updated_at
                 FROM user_authorizations
                 WHERE tenant_id = $1 AND authorization_id = $2
                 "#,
@@ -634,7 +634,7 @@ pub async fn add_authorization(
 
     let stored_key = sqlx::query_as::<_, StoredKey>(
         r#"
-            SELECT * FROM stored_keys WHERE tenant_id = $1 AND team_id = $2 AND public_key = $3
+            SELECT * FROM stored_keys WHERE tenant_id = $1 AND team_id = $2 AND pubkey = $3
             "#,
     )
     .bind(tenant_id)

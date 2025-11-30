@@ -50,9 +50,9 @@ fn create_test_user() -> (Keys, String) {
 /// Insert user into database
 async fn insert_user(pool: &PgPool, tenant_id: i64, pubkey: &str) {
     sqlx::query(
-        "INSERT INTO users (public_key, tenant_id, created_at, updated_at)
+        "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
          VALUES ($1, $2, NOW(), NOW())
-         ON CONFLICT (public_key) DO NOTHING"
+         ON CONFLICT (pubkey) DO NOTHING"
     )
     .bind(pubkey)
     .bind(tenant_id)
@@ -78,7 +78,7 @@ async fn create_personal_key(
     let bunker_secret = format!("bunker_secret_{}", Uuid::new_v4());
 
     sqlx::query(
-        "INSERT INTO personal_keys (user_public_key, encrypted_secret_key, bunker_secret, tenant_id)
+        "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, bunker_secret, tenant_id)
          VALUES ($1, $2, $3, $4)"
     )
     .bind(user_pubkey)
@@ -113,7 +113,7 @@ async fn create_test_authorization(
 
     sqlx::query_scalar::<_, i32>(
         "INSERT INTO oauth_authorizations
-         (user_public_key, redirect_origin, bunker_public_key, bunker_secret, secret, relays, policy_id, tenant_id, expires_at, created_at, updated_at)
+         (user_pubkey, redirect_origin, bunker_public_key, bunker_secret, secret, relays, policy_id, tenant_id, expires_at, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
          RETURNING id"
     )
