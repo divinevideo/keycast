@@ -576,9 +576,7 @@ impl UnifiedSigner {
                         auth.bunker_public_key,
                         bunker_keys.public_key().to_hex()
                     );
-                    return Err(format!(
-                        "Derived bunker key mismatch - possible data corruption or migration issue"
-                    ).into());
+                    return Err("Derived bunker key mismatch - possible data corruption or migration issue".into());
                 }
 
                 let handler = AuthorizationHandler {
