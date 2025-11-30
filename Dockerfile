@@ -49,6 +49,10 @@ WORKDIR /app
 # Copy keycast-login library (local dependency for web)
 COPY ./keycast-login ./keycast-login
 
+# Build keycast-login first (required for web typecheck)
+WORKDIR /app/keycast-login
+RUN bun install && bun run build
+
 # Copy web app
 WORKDIR /app/web
 COPY ./web .
