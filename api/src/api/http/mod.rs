@@ -178,7 +178,11 @@ pub fn validate_auth_event(
 
         let full_url = format!("{}://{}{}{}", scheme, host, prefix, request.uri());
 
-        if u_tag.content().unwrap() != full_url {
+        let tag_content = u_tag.content().ok_or_else(|| {
+            tracing::debug!("Token validation failed: u tag has no content");
+            AuthenticationError::InvalidEvent("u tag has no content".to_string())
+        })?;
+        if tag_content != full_url {
             tracing::debug!("Token validation failed: Invalid u tag");
             return Err(AuthenticationError::InvalidEvent(
                 "Invalid u tag".to_string(),
@@ -187,7 +191,11 @@ pub fn validate_auth_event(
     }
 
     if let Some(method_tag) = event.tags.find(TagKind::Method) {
-        if method_tag.content().unwrap() != request.method() {
+        let tag_content = method_tag.content().ok_or_else(|| {
+            tracing::debug!("Token validation failed: method tag has no content");
+            AuthenticationError::InvalidEvent("method tag has no content".to_string())
+        })?;
+        if tag_content != request.method().as_str() {
             tracing::debug!("Token validation failed: Invalid method tag");
             return Err(AuthenticationError::InvalidEvent(
                 "Invalid method tag".to_string(),

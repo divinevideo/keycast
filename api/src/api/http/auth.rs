@@ -1191,15 +1191,16 @@ pub async fn forgot_password(
     .await?;
 
     // Always return success even if email doesn't exist (security best practice)
-    if user.is_none() {
-        tracing::info!("Password reset requested for non-existent email: {}", req.email);
-        return Ok(Json(ForgotPasswordResponse {
-            success: true,
-            message: "If an account exists with that email, a password reset link has been sent.".to_string(),
-        }));
-    }
-
-    let (public_key,) = user.unwrap();
+    let public_key = match user {
+        Some((pubkey,)) => pubkey,
+        None => {
+            tracing::info!("Password reset requested for non-existent email: {}", req.email);
+            return Ok(Json(ForgotPasswordResponse {
+                success: true,
+                message: "If an account exists with that email, a password reset link has been sent.".to_string(),
+            }));
+        }
+    };
 
     // Generate reset token
     let reset_token = generate_secure_token();
@@ -1531,8 +1532,9 @@ pub async fn get_session_activity(
     .fetch_optional(&pool)
     .await?;
 
-    if session.is_none() || session.unwrap().0 != user_pubkey {
-        return Err(AuthError::InvalidToken);
+    match session {
+        Some((session_pubkey,)) if session_pubkey == user_pubkey => {}
+        _ => return Err(AuthError::InvalidToken),
     }
 
     // Get activity log
@@ -1596,9 +1598,7 @@ pub async fn revoke_session(
     .fetch_optional(pool)
     .await?;
 
-    if bunker_pubkey.is_none() {
-        return Err(AuthError::InvalidToken);
-    }
+    let bunker_pubkey = bunker_pubkey.ok_or(AuthError::InvalidToken)?;
 
     // Delete the authorization
     sqlx::query(
@@ -1616,7 +1616,7 @@ pub async fn revoke_session(
     if let Some(tx) = &auth_state.auth_tx {
         use keycast_core::authorization_channel::AuthorizationCommand;
         if let Err(e) = tx.send(AuthorizationCommand::Remove {
-            bunker_pubkey: bunker_pubkey.unwrap(),
+            bunker_pubkey,
         }).await {
             tracing::error!("Failed to send authorization remove command: {}", e);
         } else {
@@ -1930,10 +1930,10 @@ pub async fn validate_signing_permissions(
     let custom_permissions = custom_permissions
         .map_err(|e| AuthError::Internal(format!("Failed to convert permissions: {}", e)))?;
 
-    // Validate event against permissions (OR logic: if ANY permission allows, it's permitted)
+    // Validate event against permissions (AND logic: ALL permissions must allow)
     let event_kind = event.kind.as_u16();
 
-    // If there are no permissions, default to allow
+    // If there are no permissions, default to allow (permissive default)
     if custom_permissions.is_empty() {
         tracing::info!(
             "✅ Permission validated for user {} to sign event kind {} in tenant {} (no permission restrictions)",
@@ -1944,8 +1944,8 @@ pub async fn validate_signing_permissions(
         return Ok(());
     }
 
-    // Check if ANY permission allows this event
-    let allowed = custom_permissions.iter().any(|p| p.can_sign(event));
+    // Check that ALL permissions allow this event (defense-in-depth)
+    let allowed = custom_permissions.iter().all(|p| p.can_sign(event));
 
     if !allowed {
         tracing::warn!(
@@ -2016,7 +2016,7 @@ pub async fn validate_encrypt_permissions(
     let custom_permissions = custom_permissions
         .map_err(|e| AuthError::Internal(format!("Failed to convert permissions: {}", e)))?;
 
-    // If there are no permissions, default to allow
+    // If there are no permissions, default to allow (permissive default)
     if custom_permissions.is_empty() {
         tracing::info!(
             "✅ Encrypt permission validated for user {} to {} in tenant {} (no permission restrictions)",
@@ -2027,8 +2027,8 @@ pub async fn validate_encrypt_permissions(
         return Ok(());
     }
 
-    // Check if ANY permission allows this encryption
-    let allowed = custom_permissions.iter().any(|p| p.can_encrypt(plaintext, &sender_pubkey, recipient_pubkey));
+    // Check that ALL permissions allow this encryption (defense-in-depth)
+    let allowed = custom_permissions.iter().all(|p| p.can_encrypt(plaintext, &sender_pubkey, recipient_pubkey));
 
     if !allowed {
         tracing::warn!(
@@ -2099,7 +2099,7 @@ pub async fn validate_decrypt_permissions(
     let custom_permissions = custom_permissions
         .map_err(|e| AuthError::Internal(format!("Failed to convert permissions: {}", e)))?;
 
-    // If there are no permissions, default to allow
+    // If there are no permissions, default to allow (permissive default)
     if custom_permissions.is_empty() {
         tracing::info!(
             "✅ Decrypt permission validated for user {} from {} in tenant {} (no permission restrictions)",
@@ -2110,8 +2110,8 @@ pub async fn validate_decrypt_permissions(
         return Ok(());
     }
 
-    // Check if ANY permission allows this decryption
-    let allowed = custom_permissions.iter().any(|p| p.can_decrypt(ciphertext, sender_pubkey, &recipient_pubkey));
+    // Check that ALL permissions allow this decryption (defense-in-depth)
+    let allowed = custom_permissions.iter().all(|p| p.can_decrypt(ciphertext, sender_pubkey, &recipient_pubkey));
 
     if !allowed {
         tracing::warn!(

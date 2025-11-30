@@ -79,6 +79,85 @@ pub fn parse_policy_scope(scope: &str) -> Result<String, OAuthError> {
     }
 }
 
+/// Get or create an OAuth application by redirect origin.
+///
+/// The redirect_origin is the security identifier - client_id is only used as a display name.
+/// If `redirect_uri` is provided, it's stored in the redirect_uris array; otherwise uses `[]`.
+/// Returns the application ID.
+async fn get_or_create_oauth_application(
+    pool: &sqlx::PgPool,
+    tenant_id: i64,
+    redirect_origin: &str,
+    display_name: &str,
+    redirect_uri: Option<&str>,
+) -> Result<i32, OAuthError> {
+    let existing: Option<i32> = sqlx::query_scalar(
+        "SELECT id FROM oauth_applications WHERE tenant_id = $1 AND redirect_origin = $2"
+    )
+    .bind(tenant_id)
+    .bind(redirect_origin)
+    .fetch_optional(pool)
+    .await?;
+
+    match existing {
+        Some(id) => Ok(id),
+        None => {
+            let redirect_uris = redirect_uri
+                .map(|uri| format!("[\"{}\"]", uri))
+                .unwrap_or_else(|| "[]".to_string());
+
+            sqlx::query_scalar(
+                "INSERT INTO oauth_applications (tenant_id, name, display_name, redirect_origin, client_secret, redirect_uris, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, 'auto', $5, $6, $7)
+                 RETURNING id"
+            )
+            .bind(tenant_id)
+            .bind(display_name)
+            .bind(display_name)
+            .bind(redirect_origin)
+            .bind(redirect_uris)
+            .bind(Utc::now())
+            .bind(Utc::now())
+            .fetch_one(pool)
+            .await
+            .map_err(OAuthError::Database)
+        }
+    }
+}
+
+/// Store an OAuth authorization code with PKCE support.
+#[allow(clippy::too_many_arguments)]
+async fn store_oauth_code(
+    pool: &sqlx::PgPool,
+    tenant_id: i64,
+    code: &str,
+    user_pubkey: &str,
+    app_id: i32,
+    redirect_uri: &str,
+    scope: &str,
+    code_challenge: Option<&str>,
+    code_challenge_method: Option<&str>,
+    expires_at: chrono::DateTime<Utc>,
+) -> Result<(), OAuthError> {
+    sqlx::query(
+        "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, application_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
+    )
+    .bind(tenant_id)
+    .bind(code)
+    .bind(user_pubkey)
+    .bind(app_id)
+    .bind(redirect_uri)
+    .bind(scope)
+    .bind(code_challenge)
+    .bind(code_challenge_method)
+    .bind(expires_at)
+    .bind(Utc::now())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AuthorizeRequest {
     pub client_id: String,
@@ -483,37 +562,14 @@ pub async fn authorize_get(
         if existing_auth.is_some() && !force_consent {
             tracing::info!("Auto-approving: user has already authorized origin {}", redirect_origin);
 
-            // Get or create application by redirect_origin (the ONLY secure identifier)
-            // client_id from params is just a display name hint, not trusted for security
-            let app_id: i32 = {
-                let existing: Option<i32> = sqlx::query_scalar(
-                    "SELECT id FROM oauth_applications WHERE tenant_id = $1 AND redirect_origin = $2"
-                )
-                .bind(tenant_id)
-                .bind(&redirect_origin)
-                .fetch_optional(pool)
-                .await?;
-
-                match existing {
-                    Some(id) => id,
-                    None => {
-                        // Create application for this origin, using client_id as display_name
-                        sqlx::query_scalar(
-                            "INSERT INTO oauth_applications (tenant_id, name, display_name, redirect_origin, client_secret, redirect_uris, created_at, updated_at)
-                             VALUES ($1, $2, $3, $4, 'auto', '[]', $5, $6)
-                             RETURNING id"
-                        )
-                        .bind(tenant_id)
-                        .bind(&params.client_id)  // name
-                        .bind(&params.client_id)  // display_name (cosmetic only)
-                        .bind(&redirect_origin)   // the secure identifier
-                        .bind(Utc::now())
-                        .bind(Utc::now())
-                        .fetch_one(pool)
-                        .await?
-                    }
-                }
-            };
+            // Get or create application by redirect_origin (client_id is just a display name hint)
+            let app_id = get_or_create_oauth_application(
+                pool,
+                tenant_id,
+                &redirect_origin,
+                &params.client_id,
+                None,
+            ).await?;
 
             // Auto-approve: generate code and send directly to parent window
             let code: String = rand::thread_rng()
@@ -523,23 +579,20 @@ pub async fn authorize_get(
                 .collect();
 
             let expires_at = Utc::now() + Duration::minutes(10);
+            let scope = params.scope.as_deref().unwrap_or("sign_event");
 
-            sqlx::query(
-                "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, application_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
-            )
-            .bind(tenant_id)
-            .bind(&code)
-            .bind(pubkey)
-            .bind(app_id)
-            .bind(&params.redirect_uri)
-            .bind(params.scope.as_deref().unwrap_or("sign_event"))
-            .bind(&params.code_challenge)
-            .bind(&params.code_challenge_method)
-            .bind(expires_at)
-            .bind(Utc::now())
-            .execute(pool)
-            .await?;
+            store_oauth_code(
+                pool,
+                tenant_id,
+                &code,
+                pubkey,
+                app_id,
+                &params.redirect_uri,
+                scope,
+                params.code_challenge.as_deref(),
+                params.code_challenge_method.as_deref(),
+                expires_at,
+            ).await?;
 
             // Auto-approve: redirect to redirect_uri with code (standard OAuth pattern)
             return Ok(Redirect::to(&format!(
@@ -1646,50 +1699,28 @@ pub async fn authorize_post(
     // Store authorization code (expires in 10 minutes)
     let expires_at = Utc::now() + Duration::minutes(10);
 
-    // Get or create application by redirect_origin (the secure identifier)
-    let app_id: Option<i32> =
-        sqlx::query_scalar("SELECT id FROM oauth_applications WHERE tenant_id = $1 AND redirect_origin = $2")
-            .bind(tenant_id)
-            .bind(&redirect_origin)
-            .fetch_optional(&auth_state.state.db)
-            .await?;
-
-    let app_id = if let Some(id) = app_id {
-        id
-    } else {
-        // Auto-create application, using client_id as display_name (cosmetic only)
-        sqlx::query_scalar(
-            "INSERT INTO oauth_applications (tenant_id, name, display_name, redirect_origin, client_secret, redirect_uris, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, 'auto', $5, $6, $7) RETURNING id"
-        )
-        .bind(tenant_id)
-        .bind(&req.client_id)  // name
-        .bind(&req.client_id)  // display_name (cosmetic only)
-        .bind(&redirect_origin)  // the secure identifier
-        .bind(format!("[\"{}\"]", req.redirect_uri))
-        .bind(Utc::now())
-        .bind(Utc::now())
-        .fetch_one(&auth_state.state.db)
-        .await?
-    };
+    // Get or create application by redirect_origin
+    let app_id = get_or_create_oauth_application(
+        &auth_state.state.db,
+        tenant_id,
+        &redirect_origin,
+        &req.client_id,
+        Some(&req.redirect_uri),
+    ).await?;
 
     // Store authorization code with PKCE support
-    sqlx::query(
-        "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, application_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
-    )
-    .bind(tenant_id)
-    .bind(&code)
-    .bind(&user_pubkey)
-    .bind(app_id)
-    .bind(&req.redirect_uri)
-    .bind(&req.scope)
-    .bind(&req.code_challenge)
-    .bind(&req.code_challenge_method)
-    .bind(expires_at)
-    .bind(Utc::now())
-    .execute(&auth_state.state.db)
-    .await?;
+    store_oauth_code(
+        &auth_state.state.db,
+        tenant_id,
+        &code,
+        &user_pubkey,
+        app_id,
+        &req.redirect_uri,
+        &req.scope,
+        req.code_challenge.as_deref(),
+        req.code_challenge_method.as_deref(),
+        expires_at,
+    ).await?;
 
     // For JavaScript clients, return code directly instead of redirecting
     // Check if this is an XHR/fetch request by looking for Accept: application/json
@@ -2316,50 +2347,29 @@ pub async fn oauth_register(
     // Extract redirect_origin - the ONLY secure app identifier
     let redirect_origin = extract_origin(&req.redirect_uri)?;
 
-    // Get or create application by redirect_origin (the secure identifier)
-    let app_id: Option<i32> =
-        sqlx::query_scalar("SELECT id FROM oauth_applications WHERE tenant_id = $1 AND redirect_origin = $2")
-            .bind(tenant_id)
-            .bind(&redirect_origin)
-            .fetch_optional(pool)
-            .await?;
-
-    let app_id = if let Some(id) = app_id {
-        id
-    } else {
-        // Auto-create application, using client_id as display_name (cosmetic only)
-        sqlx::query_scalar(
-            "INSERT INTO oauth_applications (tenant_id, name, display_name, redirect_origin, client_secret, redirect_uris, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, 'auto', $5, $6, $7) RETURNING id"
-        )
-        .bind(tenant_id)
-        .bind(&req.client_id)  // name
-        .bind(&req.client_id)  // display_name (cosmetic only)
-        .bind(&redirect_origin)  // the secure identifier
-        .bind(format!("[\"{}\"]", req.redirect_uri))
-        .bind(Utc::now())
-        .bind(Utc::now())
-        .fetch_one(pool)
-        .await?
-    };
+    // Get or create application by redirect_origin
+    let app_id = get_or_create_oauth_application(
+        pool,
+        tenant_id,
+        &redirect_origin,
+        &req.client_id,
+        Some(&req.redirect_uri),
+    ).await?;
 
     // Store authorization code with PKCE support
-    sqlx::query(
-        "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, application_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
-    )
-    .bind(tenant_id)
-    .bind(&code)
-    .bind(public_key.to_hex())
-    .bind(app_id)
-    .bind(&req.redirect_uri)
-    .bind(req.scope.as_deref().unwrap_or("sign_event"))
-    .bind(&req.code_challenge)
-    .bind(&req.code_challenge_method)
-    .bind(expires_at)
-    .bind(Utc::now())
-    .execute(pool)
-    .await?;
+    let scope = req.scope.as_deref().unwrap_or("sign_event");
+    store_oauth_code(
+        pool,
+        tenant_id,
+        &code,
+        &public_key.to_hex(),
+        app_id,
+        &req.redirect_uri,
+        scope,
+        req.code_challenge.as_deref(),
+        req.code_challenge_method.as_deref(),
+        expires_at,
+    ).await?;
 
     tracing::info!("OAuth auto-approve for new registration: user {}, origin {}", public_key.to_hex(), redirect_origin);
 

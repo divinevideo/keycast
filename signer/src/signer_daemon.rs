@@ -1,19 +1,23 @@
 // ABOUTME: Unified signer daemon that handles multiple NIP-46 bunker connections in a single process
 // ABOUTME: Listens for NIP-46 requests and routes them to the appropriate authorization/key
 
+use crate::error::{SignerError, SignerResult};
 use async_trait::async_trait;
 use keycast_core::authorization_channel::{AuthorizationReceiver, AuthorizationCommand};
 use keycast_core::encryption::KeyManager;
 use keycast_core::hashring::HashRing;
 use keycast_core::signing_handler::{SigningHandler, SignerHandlersCache};
-use keycast_core::traits::CustomPermission;
 use keycast_core::types::authorization::Authorization;
 use keycast_core::types::oauth_authorization::OAuthAuthorization;
 use moka::future::Cache;
 use nostr_sdk::prelude::*;
 use sqlx::PgPool;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
+
+/// Default timeout for relay connection operations
+const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct AuthorizationHandler {
@@ -49,75 +53,41 @@ impl AuthorizationHandler {
         }
     }
 
-    /// Validate permissions before signing an event
+    /// Validate permissions before signing an event.
+    ///
+    /// Loads the policy permissions for this authorization and checks each one.
+    /// Uses AND logic: ALL permissions must allow the operation.
     async fn validate_permissions_for_sign(
         &self,
         unsigned_event: &UnsignedEvent,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> SignerResult<()> {
         // Load permissions based on authorization type
-        if self.is_oauth {
-            // Load OAuth authorization
+        let permissions = if self.is_oauth {
             let oauth_auth = OAuthAuthorization::find(&self.pool, self.tenant_id, self.authorization_id).await?;
-
-            // Load permissions (empty vec if no policy)
-            let permissions = oauth_auth.permissions(&self.pool, self.tenant_id).await?;
-
-            // If no permissions, allow all (backward compatibility)
-            if permissions.is_empty() {
-                return Ok(());
-            }
-
-            // Convert to CustomPermission traits
-            let custom_permissions: Result<Vec<Box<dyn CustomPermission>>, _> = permissions
-                .iter()
-                .map(|p| p.to_custom_permission())
-                .collect();
-            let custom_permissions = custom_permissions
-                .map_err(|e| Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Failed to convert permissions: {}", e)
-                )) as Box<dyn std::error::Error + Send + Sync>)?;
-
-            // Validate - ALL permissions must pass (AND logic)
-            for permission in custom_permissions {
-                if !permission.can_sign(unsigned_event) {
-                    return Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        format!("Permission denied by {} policy", permission.identifier())
-                    )));
-                }
-            }
+            oauth_auth.permissions(&self.pool, self.tenant_id).await?
         } else {
-            // Load regular authorization
             let auth = Authorization::find(&self.pool, self.tenant_id, self.authorization_id).await?;
+            auth.permissions(&self.pool, self.tenant_id).await?
+        };
 
-            // Load permissions (regular auths always have a policy)
-            let permissions = auth.permissions(&self.pool, self.tenant_id).await?;
+        // If no permissions configured, allow all (backward compatibility)
+        if permissions.is_empty() {
+            return Ok(());
+        }
 
-            // If no permissions, allow all
-            if permissions.is_empty() {
-                return Ok(());
-            }
+        // Convert and validate - ALL permissions must pass (AND logic)
+        for permission in &permissions {
+            let custom_permission = permission.to_custom_permission()
+                .map_err(|e| SignerError::invalid_permission(format!(
+                    "Failed to convert permission '{}': {}",
+                    permission.identifier, e
+                )))?;
 
-            // Convert to CustomPermission traits
-            let custom_permissions: Result<Vec<Box<dyn CustomPermission>>, _> = permissions
-                .iter()
-                .map(|p| p.to_custom_permission())
-                .collect();
-            let custom_permissions = custom_permissions
-                .map_err(|e| Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Failed to convert permissions: {}", e)
-                )) as Box<dyn std::error::Error + Send + Sync>)?;
-
-            // Validate all permissions
-            for permission in custom_permissions {
-                if !permission.can_sign(unsigned_event) {
-                    return Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        format!("Permission denied by {} policy", permission.identifier())
-                    )));
-                }
+            if !custom_permission.can_sign(unsigned_event) {
+                return Err(SignerError::permission_denied(format!(
+                    "Blocked by '{}' policy",
+                    custom_permission.identifier()
+                )));
             }
         }
 
@@ -136,16 +106,13 @@ impl AuthorizationHandler {
         &self,
         client_pubkey: &str,
         provided_secret: &str,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> SignerResult<String> {
         if !self.is_oauth {
             // For regular authorizations, just validate secret
             if provided_secret == self.secret {
                 return Ok("ack".to_string());
             } else {
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "Invalid secret"
-                )));
+                return Err(SignerError::permission_denied("Invalid secret"));
             }
         }
 
@@ -159,8 +126,7 @@ impl AuthorizationHandler {
         .bind(&bunker_pubkey)
         .bind(provided_secret)
         .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        .await?;
 
         match existing {
             Some((_auth_id, Some(existing_client))) => {
@@ -173,10 +139,7 @@ impl AuthorizationHandler {
                         "Secret already used by different client. Existing: {}, Attempting: {}",
                         existing_client, client_pubkey
                     );
-                    Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "Secret already used by another client"
-                    )))
+                    Err(SignerError::permission_denied("Secret already used by another client"))
                 }
             }
             Some((auth_id, None)) => {
@@ -193,17 +156,13 @@ impl AuthorizationHandler {
                 .bind(client_pubkey)
                 .bind(auth_id)
                 .execute(&self.pool)
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                .await?;
 
                 Ok("ack".to_string())
             }
             None => {
                 tracing::warn!("Invalid secret for bunker {}", bunker_pubkey);
-                Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "Invalid secret"
-                )))
+                Err(SignerError::permission_denied("Invalid secret"))
             }
         }
     }
@@ -219,7 +178,7 @@ impl AuthorizationHandler {
     pub async fn validate_client(
         &self,
         client_pubkey: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> SignerResult<()> {
         if !self.is_oauth {
             // Regular authorizations don't track client pubkey (yet)
             return Ok(());
@@ -235,8 +194,7 @@ impl AuthorizationHandler {
         .bind(&bunker_pubkey)
         .bind(client_pubkey)
         .fetch_one(&self.pool)
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        .await?;
 
         if is_valid {
             Ok(())
@@ -253,15 +211,9 @@ impl AuthorizationHandler {
             .unwrap_or(false);
 
             if has_unconnected {
-                Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "Unknown client - must connect first"
-                )))
+                Err(SignerError::permission_denied("Unknown client - must connect first"))
             } else {
-                Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "Unknown client - not connected to any authorization"
-                )))
+                Err(SignerError::permission_denied("Unknown client - not connected to any authorization"))
             }
         }
     }
@@ -278,7 +230,7 @@ impl AuthorizationHandler {
     pub async fn validate_and_store_client(
         &self,
         client_pubkey: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> SignerResult<()> {
         if !self.is_oauth {
             return Ok(());
         }
@@ -293,8 +245,7 @@ impl AuthorizationHandler {
         .bind(&bunker_pubkey)
         .bind(client_pubkey)
         .fetch_one(&self.pool)
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        .await?;
 
         if is_valid {
             return Ok(());
@@ -308,8 +259,7 @@ impl AuthorizationHandler {
         )
         .bind(&bunker_pubkey)
         .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        .await?;
 
         match unconnected_id {
             Some(auth_id) => {
@@ -326,17 +276,13 @@ impl AuthorizationHandler {
                 .bind(client_pubkey)
                 .bind(auth_id)
                 .execute(&self.pool)
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                .await?;
 
                 Ok(())
             }
             None => {
                 // No unconnected authorization and client not recognized
-                Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "Unknown client - not connected to any authorization"
-                )))
+                Err(SignerError::permission_denied("Unknown client - not connected to any authorization"))
             }
         }
     }
@@ -356,12 +302,13 @@ pub struct UnifiedSigner {
 }
 
 impl UnifiedSigner {
+    /// Create a new UnifiedSigner with the given database pool and key manager.
     pub async fn new(
         pool: PgPool,
         key_manager: Box<dyn KeyManager>,
         auth_rx: AuthorizationReceiver,
         hashring: Arc<Mutex<HashRing>>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> SignerResult<Self> {
         let client = Client::default();
 
         // Get cache size from environment or use default
@@ -397,25 +344,59 @@ impl UnifiedSigner {
     }
 
     /// No-op: authorizations are now loaded on-demand with LRU caching
-    pub async fn load_authorizations(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn load_authorizations(&mut self) -> SignerResult<()> {
         // Lazy loading: handlers are loaded on-demand when requests arrive
         // This scales to millions of users without memory issues
         tracing::info!("Lazy loading enabled - authorizations will be loaded on-demand");
         Ok(())
     }
 
-    pub async fn connect_to_relays(&self) -> Result<(), Box<dyn std::error::Error>> {
+    /// Connect to all configured bunker relays.
+    ///
+    /// Adds all relays to the client and initiates connections with a timeout
+    /// to prevent indefinite blocking if relays are unreachable.
+    pub async fn connect_to_relays(&self) -> SignerResult<()> {
         // Get relay list from environment variable (comma-separated)
         let relay_urls = Self::get_bunker_relays();
 
-        // Connect to all relays
+        // Add all relays with individual timeouts
         for relay_url in &relay_urls {
-            self.client.add_relay(relay_url.as_str()).await?;
+            match tokio::time::timeout(
+                RELAY_CONNECT_TIMEOUT,
+                self.client.add_relay(relay_url.as_str())
+            ).await {
+                Ok(Ok(_)) => {
+                    tracing::debug!("Added relay: {}", relay_url);
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Failed to add relay {}: {}", relay_url, e);
+                    // Continue with other relays instead of failing entirely
+                }
+                Err(_) => {
+                    tracing::warn!("Timeout adding relay {}", relay_url);
+                    // Continue with other relays
+                }
+            }
         }
 
-        self.client.connect().await;
+        // Connect to all added relays with a timeout
+        match tokio::time::timeout(RELAY_CONNECT_TIMEOUT, self.client.connect()).await {
+            Ok(_) => {
+                tracing::info!(
+                    "Connected to {} relay(s) for NIP-46 communication: {:?}",
+                    relay_urls.len(),
+                    relay_urls
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "Timeout connecting to relays ({}s) - continuing in background",
+                    RELAY_CONNECT_TIMEOUT.as_secs()
+                );
+                // Connection will continue in background; don't fail startup
+            }
+        }
 
-        tracing::info!("Connected to {} relay(s) for NIP-46 communication: {:?}", relay_urls.len(), relay_urls);
         Ok(())
     }
 
@@ -431,7 +412,10 @@ impl UnifiedSigner {
             .collect()
     }
 
-    pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    /// Run the signer daemon event loop.
+    ///
+    /// Subscribes to NIP-46 events and processes incoming signing requests.
+    pub async fn run(&mut self) -> SignerResult<()> {
         let handlers = self.handlers.clone();
 
         // OPTIMIZATION: Single subscription for ALL kind 24133 events
@@ -439,7 +423,8 @@ impl UnifiedSigner {
         // This scales to millions of users with just ONE relay connection
         let filter = Filter::new().kind(Kind::NostrConnect);
 
-        self.client.subscribe(filter, None).await?;
+        self.client.subscribe(filter, None).await
+            .map_err(|e| SignerError::relay(format!("Failed to subscribe: {}", e)))?;
 
         // Spawn background task to handle authorization commands via channel
         let pool_clone = self.pool.clone();
@@ -510,12 +495,14 @@ impl UnifiedSigner {
                                 &key_manager_clone,
                                 &hashring_clone,
                             ).await {
-                                // "No p-tag found" is just noise from malformed external requests
-                                let err_str = e.to_string();
-                                if err_str.contains("No p-tag found") {
-                                    tracing::trace!("Ignoring malformed NIP-46 request: {}", err_str);
-                                } else {
-                                    tracing::error!("Error handling NIP-46 request: {}", err_str);
+                                // Filter out expected noise from malformed external requests
+                                match &e {
+                                    SignerError::MissingParameter("p-tag") => {
+                                        tracing::trace!("Ignoring malformed NIP-46 request: {}", e);
+                                    }
+                                    _ => {
+                                        tracing::error!("Error handling NIP-46 request: {}", e);
+                                    }
                                 }
                             }
                         });
@@ -523,7 +510,8 @@ impl UnifiedSigner {
                 }
                 Ok(false) // Continue listening
             })
-            .await?;
+            .await
+            .map_err(|e| SignerError::relay(format!("Notification handler failed: {}", e)))?;
 
         Ok(())
     }
@@ -537,7 +525,7 @@ impl UnifiedSigner {
         bunker_pubkey: &str,
         tenant_id: i64,
         is_oauth: bool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> SignerResult<()> {
         if is_oauth {
             // Load OAuth authorization
             let auth: Option<OAuthAuthorization> = sqlx::query_as(
@@ -558,9 +546,10 @@ impl UnifiedSigner {
                 .fetch_one(pool)
                 .await?;
 
-                let decrypted_user_secret = key_manager.decrypt(&encrypted_user_key).await?;
+                let decrypted_user_secret = key_manager.decrypt(&encrypted_user_key).await
+                    .map_err(|e| SignerError::encryption(e.to_string()))?;
                 let user_secret_key = SecretKey::from_slice(&decrypted_user_secret)
-                    .map_err(|e| format!("Invalid secret key: {}", e))?;
+                    .map_err(|e| SignerError::invalid_key(format!("Invalid user secret key: {}", e)))?;
                 let user_keys = Keys::new(user_secret_key.clone());
 
                 // Derive bunker keys using HKDF (privacy: bunker_pubkey ≠ user_pubkey)
@@ -576,7 +565,9 @@ impl UnifiedSigner {
                         auth.bunker_public_key,
                         bunker_keys.public_key().to_hex()
                     );
-                    return Err("Derived bunker key mismatch - possible data corruption or migration issue".into());
+                    return Err(SignerError::data_corruption(
+                        "Derived bunker key mismatch - possible data corruption or migration issue"
+                    ));
                 }
 
                 let handler = AuthorizationHandler {
@@ -607,8 +598,10 @@ impl UnifiedSigner {
             .await?;
 
             if let Some((auth_id, bunker_secret, connection_secret, stored_key_id)) = auth_data {
-                let decrypted_bunker_secret = key_manager.decrypt(&bunker_secret).await?;
-                let bunker_secret_key = SecretKey::from_slice(&decrypted_bunker_secret)?;
+                let decrypted_bunker_secret = key_manager.decrypt(&bunker_secret).await
+                    .map_err(|e| SignerError::encryption(e.to_string()))?;
+                let bunker_secret_key = SecretKey::from_slice(&decrypted_bunker_secret)
+                    .map_err(|e| SignerError::invalid_key(format!("Invalid bunker secret key: {}", e)))?;
                 let bunker_keys = Keys::new(bunker_secret_key);
 
                 let stored_key_secret: Vec<u8> = sqlx::query_scalar(
@@ -619,8 +612,10 @@ impl UnifiedSigner {
                 .fetch_one(pool)
                 .await?;
 
-                let decrypted_user_secret = key_manager.decrypt(&stored_key_secret).await?;
-                let user_secret_key = SecretKey::from_slice(&decrypted_user_secret)?;
+                let decrypted_user_secret = key_manager.decrypt(&stored_key_secret).await
+                    .map_err(|e| SignerError::encryption(e.to_string()))?;
+                let user_secret_key = SecretKey::from_slice(&decrypted_user_secret)
+                    .map_err(|e| SignerError::invalid_key(format!("Invalid user secret key: {}", e)))?;
                 let user_keys = Keys::new(user_secret_key);
 
                 let handler = AuthorizationHandler {
@@ -651,7 +646,7 @@ impl UnifiedSigner {
         pool: &PgPool,
         key_manager: &Arc<Box<dyn KeyManager>>,
         hashring: &Arc<Mutex<HashRing>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> SignerResult<()> {
         // SINGLE SUBSCRIPTION ARCHITECTURE:
         // We receive ALL kind 24133 events from the relay (no pubkey filter)
         // Now we check if the target bunker pubkey (in #p tag) is one we manage
@@ -664,7 +659,7 @@ impl UnifiedSigner {
             .iter()
             .find(|tag| tag.kind() == TagKind::p())
             .and_then(|tag| tag.content())
-            .ok_or("No p-tag found")?;
+            .ok_or(SignerError::MissingParameter("p-tag"))?;
 
         // HASHRING CHECK: Only process if this instance owns this pubkey
         {
@@ -712,11 +707,12 @@ impl UnifiedSigner {
                         .bind(&auth.user_pubkey)
                         .bind(auth.tenant_id)
                         .fetch_one(pool)
-                        .await
-                        .map_err(|e| format!("Failed to fetch user key: {}", e))?;
+                        .await?;
 
-                        let decrypted_user_secret = key_manager.decrypt(&encrypted_user_key).await?;
-                        let user_secret_key = SecretKey::from_slice(&decrypted_user_secret)?;
+                        let decrypted_user_secret = key_manager.decrypt(&encrypted_user_key).await
+                            .map_err(|e| SignerError::encryption(e.to_string()))?;
+                        let user_secret_key = SecretKey::from_slice(&decrypted_user_secret)
+                            .map_err(|e| SignerError::invalid_key(format!("Invalid user key: {}", e)))?;
                         let user_keys = Keys::new(user_secret_key.clone());
 
                         // Derive bunker keys using HKDF (privacy: bunker_pubkey ≠ user_pubkey)
@@ -726,10 +722,10 @@ impl UnifiedSigner {
 
                         // Validate derived key matches stored bunker_public_key
                         if bunker_keys.public_key().to_hex() != auth.bunker_public_key {
-                            return Err(format!(
+                            return Err(SignerError::data_corruption(format!(
                                 "Derived bunker key mismatch for auth {} - possible data corruption",
                                 auth.id
-                            ).into());
+                            )));
                         }
 
                         let handler = AuthorizationHandler {
@@ -806,7 +802,8 @@ impl UnifiedSigner {
 
         // Parse the JSON-RPC request
         let request: serde_json::Value = serde_json::from_str(&decrypted)?;
-        let method = request["method"].as_str().ok_or("No method")?;
+        let method = request["method"].as_str()
+            .ok_or(SignerError::MissingParameter("method"))?;
         let request_id = request["id"].clone(); // Extract request ID for response
 
         tracing::info!("Processing NIP-46 method: {}", method);
@@ -888,10 +885,13 @@ impl UnifiedSigner {
             }
             "nip44_encrypt" => {
                 // params: [third_party_pubkey, plaintext]
-                let third_party_hex = request["params"][0].as_str().ok_or("Missing pubkey param")?;
-                let plaintext = request["params"][1].as_str().ok_or("Missing plaintext param")?;
+                let third_party_hex = request["params"][0].as_str()
+                    .ok_or(SignerError::MissingParameter("pubkey"))?;
+                let plaintext = request["params"][1].as_str()
+                    .ok_or(SignerError::MissingParameter("plaintext"))?;
 
-                let third_party_pubkey = PublicKey::from_hex(third_party_hex)?;
+                let third_party_pubkey = PublicKey::from_hex(third_party_hex)
+                    .map_err(|e| SignerError::invalid_key(e.to_string()))?;
                 let ciphertext = nip44::encrypt(
                     handler.user_keys.secret_key(),
                     &third_party_pubkey,
@@ -906,10 +906,13 @@ impl UnifiedSigner {
             }
             "nip44_decrypt" => {
                 // params: [third_party_pubkey, ciphertext]
-                let third_party_hex = request["params"][0].as_str().ok_or("Missing pubkey param")?;
-                let ciphertext = request["params"][1].as_str().ok_or("Missing ciphertext param")?;
+                let third_party_hex = request["params"][0].as_str()
+                    .ok_or(SignerError::MissingParameter("pubkey"))?;
+                let ciphertext = request["params"][1].as_str()
+                    .ok_or(SignerError::MissingParameter("ciphertext"))?;
 
-                let third_party_pubkey = PublicKey::from_hex(third_party_hex)?;
+                let third_party_pubkey = PublicKey::from_hex(third_party_hex)
+                    .map_err(|e| SignerError::invalid_key(e.to_string()))?;
                 let plaintext = nip44::decrypt(
                     handler.user_keys.secret_key(),
                     &third_party_pubkey,
@@ -923,10 +926,13 @@ impl UnifiedSigner {
             }
             "nip04_encrypt" => {
                 // params: [third_party_pubkey, plaintext]
-                let third_party_hex = request["params"][0].as_str().ok_or("Missing pubkey param")?;
-                let plaintext = request["params"][1].as_str().ok_or("Missing plaintext param")?;
+                let third_party_hex = request["params"][0].as_str()
+                    .ok_or(SignerError::MissingParameter("pubkey"))?;
+                let plaintext = request["params"][1].as_str()
+                    .ok_or(SignerError::MissingParameter("plaintext"))?;
 
-                let third_party_pubkey = PublicKey::from_hex(third_party_hex)?;
+                let third_party_pubkey = PublicKey::from_hex(third_party_hex)
+                    .map_err(|e| SignerError::invalid_key(e.to_string()))?;
                 let ciphertext = nip04::encrypt(
                     handler.user_keys.secret_key(),
                     &third_party_pubkey,
@@ -940,10 +946,13 @@ impl UnifiedSigner {
             }
             "nip04_decrypt" => {
                 // params: [third_party_pubkey, ciphertext]
-                let third_party_hex = request["params"][0].as_str().ok_or("Missing pubkey param")?;
-                let ciphertext = request["params"][1].as_str().ok_or("Missing ciphertext param")?;
+                let third_party_hex = request["params"][0].as_str()
+                    .ok_or(SignerError::MissingParameter("pubkey"))?;
+                let ciphertext = request["params"][1].as_str()
+                    .ok_or(SignerError::MissingParameter("ciphertext"))?;
 
-                let third_party_pubkey = PublicKey::from_hex(third_party_hex)?;
+                let third_party_pubkey = PublicKey::from_hex(third_party_hex)
+                    .map_err(|e| SignerError::invalid_key(e.to_string()))?;
                 let plaintext = nip04::decrypt(
                     handler.user_keys.secret_key(),
                     &third_party_pubkey,
@@ -1056,16 +1065,21 @@ impl SigningHandler for AuthorizationHandler {
 }
 
 impl AuthorizationHandler {
-    async fn handle_sign_event(&self, request: &serde_json::Value) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    async fn handle_sign_event(&self, request: &serde_json::Value) -> SignerResult<serde_json::Value> {
         // Parse the unsigned event from params
-        let event_json = request["params"][0].as_str().ok_or("No event in params")?;
+        let event_json = request["params"][0].as_str()
+            .ok_or(SignerError::MissingParameter("event"))?;
         let unsigned_event: serde_json::Value = serde_json::from_str(event_json)?;
 
         // Extract fields from unsigned event
-        let kind = unsigned_event["kind"].as_u64().ok_or("Missing kind")? as u16;
-        let content = unsigned_event["content"].as_str().ok_or("Missing content")?;
-        let created_at = unsigned_event["created_at"].as_u64().ok_or("Missing created_at")?;
-        let tags_json = unsigned_event["tags"].as_array().ok_or("Missing tags")?;
+        let kind = unsigned_event["kind"].as_u64()
+            .ok_or(SignerError::MissingParameter("kind"))? as u16;
+        let content = unsigned_event["content"].as_str()
+            .ok_or(SignerError::MissingParameter("content"))?;
+        let created_at = unsigned_event["created_at"].as_u64()
+            .ok_or(SignerError::MissingParameter("created_at"))?;
+        let tags_json = unsigned_event["tags"].as_array()
+            .ok_or(SignerError::MissingParameter("tags"))?;
 
         // Parse tags
         let mut tags = Vec::new();
@@ -1098,8 +1112,7 @@ impl AuthorizationHandler {
         );
 
         // VALIDATE PERMISSIONS BEFORE SIGNING
-        self.validate_permissions_for_sign(&unsigned_event).await
-            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string())) as Box<dyn std::error::Error>)?;
+        self.validate_permissions_for_sign(&unsigned_event).await?;
 
         // Sign the event with user keys
         let signed_event = EventBuilder::new(
@@ -1135,7 +1148,7 @@ impl AuthorizationHandler {
         event_kind: u16,
         event_content: &str,
         event_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> SignerResult<()> {
         // Get user public key and application ID
         let (user_pubkey, application_id, client_pubkey, bunker_secret) = if self.is_oauth {
             // For OAuth, look up the oauth_authorization
@@ -1210,7 +1223,7 @@ impl UnifiedSigner {
     pub async fn get_handler_for_user(
         &self,
         user_pubkey: &str,
-    ) -> Result<Option<AuthorizationHandler>, Box<dyn std::error::Error>> {
+    ) -> SignerResult<Option<AuthorizationHandler>> {
         // Find user's keycast-login OAuth authorization
         let bunker_pubkey: Option<String> = sqlx::query_scalar(
             "SELECT bunker_public_key FROM oauth_authorizations

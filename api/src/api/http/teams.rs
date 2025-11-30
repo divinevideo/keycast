@@ -442,7 +442,8 @@ pub async fn add_key(
         Keys::parse(&request.secret_key).map_err(|e| ApiError::bad_request(e.to_string()))?;
 
     // Encrypt the secret key
-    let key_manager = get_key_manager().unwrap();
+    let key_manager = get_key_manager()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     let encrypted_secret = key_manager
         .encrypt(keys.secret_key().as_secret_bytes())
         .await
