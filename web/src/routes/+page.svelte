@@ -1,5 +1,6 @@
 <script lang="ts">
 import { getCurrentUser, setCurrentUser } from "$lib/current_user.svelte";
+import ndk from "$lib/ndk.svelte";
 import { KeycastApi } from "$lib/keycast_api.svelte";
 import { BRAND } from "$lib/brand";
 import type { TeamWithRelations, BunkerSession } from "$lib/types";
@@ -437,7 +438,7 @@ onMount(async () => {
 														<span class="detail-value mono">{formatPubkey(session.client_pubkey)}</span>
 														<button
 															class="copy-btn-inline"
-															onclick={(e) => { e.stopPropagation(); copyPubkey(session.client_pubkey); }}
+															onclick={(e) => { e.stopPropagation(); if (session.client_pubkey) copyPubkey(session.client_pubkey); }}
 														>
 															{#if copiedPubkey === session.client_pubkey}
 																<Check size={14} />
