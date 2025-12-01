@@ -400,7 +400,7 @@ onMount(async () => {
             </div>
 
             <p class="hint-text">
-                To test the OAuth approval flow again, first <a href="/dashboard" class="text-link">revoke the "Divine Video" authorization</a> in your dashboard, then click Disconnect above.
+                To test the OAuth approval flow again, first <a href="/dashboard" class="text-link">revoke the "diVine Login Demo" authorization</a> in your dashboard, then click Disconnect above.
             </p>
 
             {#if credentials?.bunkerUrl}

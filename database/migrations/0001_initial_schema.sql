@@ -1031,7 +1031,7 @@ VALUES (
     'https://divine.video',
     'divine',
     'public-client',
-    'Divine Video',
+    'diVine Login Demo',
     'https://divine.video/callback,http://localhost:5173/callback,http://localhost:3000/callback,divine://callback',
     1,
     NOW(),
