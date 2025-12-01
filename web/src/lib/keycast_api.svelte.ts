@@ -13,7 +13,6 @@ export class KeycastApi {
             ? apiDomain
             : `https://${apiDomain}`;
         this.baseUrl = `${domain}/api`;
-        console.log("Constructor baseUrl:", this.baseUrl);
         this.defaultHeaders = {
             "Content-Type": "application/json",
             Accept: "application/json",
@@ -25,7 +24,6 @@ export class KeycastApi {
         options: RequestInit = {},
     ): Promise<T> {
         const url = `${this.baseUrl}${endpoint}`;
-        console.log("Making request to:", url);
         const headers = { ...this.defaultHeaders, ...options.headers };
 
         const response = await fetch(url, {

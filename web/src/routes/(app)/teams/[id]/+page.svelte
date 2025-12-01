@@ -116,7 +116,7 @@ async function deleteTeam() {
 }
 
 async function showUserMenu(user: User) {
-    const menu = document.getElementById(`user-menu-${user.user_public_key}`);
+    const menu = document.getElementById(`user-menu-${user.user_pubkey}`);
     if (menu) {
         menu.classList.toggle("hidden");
     }
@@ -131,7 +131,7 @@ async function removeUser(userToRemove: User) {
 
     if (authMethod === 'nip07') {
         const authEvent = await api.buildUnsignedAuthEvent(
-            `/teams/${id}/users/${userToRemove.user_public_key}`,
+            `/teams/${id}/users/${userToRemove.user_pubkey}`,
             "DELETE",
             user?.pubkey,
         );
@@ -143,13 +143,13 @@ async function removeUser(userToRemove: User) {
     }
     // Otherwise cookie auth (sent automatically via credentials: 'include')
 
-    api.delete(`/teams/${id}/users/${userToRemove.user_public_key}`, {
+    api.delete(`/teams/${id}/users/${userToRemove.user_pubkey}`, {
         headers: authHeaders,
     })
         .then(() => {
             toast.success("User removed successfully");
             users = users.filter(
-                (user) => user.user_public_key !== userToRemove.user_public_key,
+                (user) => user.user_pubkey !== userToRemove.user_pubkey,
             );
         })
         .catch((error) => {
@@ -167,18 +167,18 @@ async function removeUser(userToRemove: User) {
         <div class="card-grid mb-4">
             {#each users as user}
                 <div class="card flex flex-row! gap-4 relative">
-                    <Avatar user={ndk.getUser({ pubkey: user.user_public_key })} extraClasses="w-12 h-12" />
+                    <Avatar user={ndk.getUser({ pubkey: user.user_pubkey })} extraClasses="w-12 h-12" />
                     <div class="flex flex-col gap-1">
                         <span class="font-semibold">
-                            <Name user={ndk.getUser({ pubkey: user.user_public_key })} />
+                            <Name user={ndk.getUser({ pubkey: user.user_pubkey })} />
                         </span>
                         <span class="font-mono text-xs text-gray-500">
-                            {truncatedNpubForPubkey(user.user_public_key)}&hellip;
+                            {truncatedNpubForPubkey(user.user_pubkey)}&hellip;
                         </span>
                     </div>
                     <AdminPill {user} />
                     <button onclick={() => showUserMenu(user)} class="absolute top-1.5 right-1"><DotsThreeVertical size={20} weight="bold" class="text-gray-500 hover:text-gray-200" /></button>
-                    <div id={`user-menu-${user.user_public_key}`} class="hidden absolute top-8 right-1 bg-gray-700 ring-1 ring-gray-600 shadow-lg rounded-md p-2 text-sm">
+                    <div id={`user-menu-${user.user_pubkey}`} class="hidden absolute top-8 right-1 bg-gray-700 ring-1 ring-gray-600 shadow-lg rounded-md p-2 text-sm">
                         <button onclick={() => removeUser(user)} class="text-gray-200 hover:text-white">Remove User</button>
                     </div>
                 </div>
@@ -195,18 +195,18 @@ async function removeUser(userToRemove: User) {
             {:else}
                 <div class="card-grid">
                     {#each storedKeys as key}
-                        <a href={`/teams/${id}/keys/${key.public_key}`} class="card hover-card flex flex-row! gap-4 ">
-                            <Avatar user={ndk.getUser({ pubkey: key.public_key })} extraClasses="w-12 h-12" />
+                        <a href={`/teams/${id}/keys/${key.pubkey}`} class="card hover-card flex flex-row! gap-4 ">
+                            <Avatar user={ndk.getUser({ pubkey: key.pubkey })} extraClasses="w-12 h-12" />
                             <div class="flex flex-col gap-1">
                                 <span class="font-semibold">
                                     {key.name}
                                 </span>
                                 <div class="flex flex-row gap-1">
                                     <span class="text-xs text-gray-500">
-                                        <Name user={ndk.getUser({ pubkey: key.public_key })} />
+                                        <Name user={ndk.getUser({ pubkey: key.pubkey })} />
                                     </span>
                                     <span class="font-mono text-xs text-gray-500">
-                                        ({truncatedNpubForPubkey(key.public_key)}&hellip;)
+                                        ({truncatedNpubForPubkey(key.pubkey)}&hellip;)
                                     </span>
                                 </div>
                             </div>
@@ -233,7 +233,7 @@ async function removeUser(userToRemove: User) {
         </div>
     </PageSection>
 
-    {#if users && users.some((team_user) => team_user.user_public_key === user?.pubkey && team_user.role === "Admin")}
+    {#if users && users.some((team_user) => team_user.user_pubkey === user?.pubkey && team_user.role === "Admin")}
         <PageSection title="Danger Zone">
             <button onclick={deleteTeam} class="button button-danger">Delete Team</button>
         </PageSection>

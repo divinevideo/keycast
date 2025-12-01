@@ -69,7 +69,7 @@ impl User {
 
     pub async fn teams(&self, pool: &PgPool, tenant_id: i64) -> Result<Vec<TeamWithRelations>, UserError> {
         let teams = sqlx::query_as::<_, Team>(
-            "SELECT * FROM teams WHERE tenant_id = $1 AND id IN (SELECT team_id FROM team_users WHERE tenant_id = $1 AND user_pubkey = $2)",
+            "SELECT * FROM teams WHERE tenant_id = $1 AND id IN (SELECT team_id FROM team_users WHERE user_pubkey = $2)",
         )
         .bind(tenant_id)
         .bind(self.pubkey.clone())
@@ -84,10 +84,9 @@ impl User {
                 r#"
                 SELECT tu.*
                 FROM team_users tu
-                WHERE tu.tenant_id = $1 AND tu.team_id = $2
+                WHERE tu.team_id = $1
                 "#,
             )
-            .bind(tenant_id)
             .bind(team.id)
             .fetch_all(pool)
             .await?;
@@ -122,13 +121,12 @@ impl User {
     /// Check if a user is an admin of a team
     pub async fn is_team_admin(
         pool: &PgPool,
-        tenant_id: i64,
+        _tenant_id: i64,
         pubkey: &PublicKey,
         team_id: i32,
     ) -> Result<bool, UserError> {
-        let query = "SELECT COUNT(*) FROM team_users WHERE tenant_id = $1 AND user_pubkey = $2 AND team_id = $3 AND role = 'admin'";
+        let query = "SELECT COUNT(*) FROM team_users WHERE user_pubkey = $1 AND team_id = $2 AND role = 'admin'";
         let count = sqlx::query_scalar::<_, i64>(query)
-            .bind(tenant_id)
             .bind(pubkey.to_hex())
             .bind(team_id)
             .fetch_one(pool)
@@ -139,13 +137,12 @@ impl User {
     /// Check if a user is a member of a team
     pub async fn is_team_member(
         pool: &PgPool,
-        tenant_id: i64,
+        _tenant_id: i64,
         pubkey: &PublicKey,
         team_id: i32,
     ) -> Result<bool, UserError> {
-        let query = "SELECT COUNT(*) FROM team_users WHERE tenant_id = $1 AND user_pubkey = $2 AND team_id = $3 AND role = 'member'";
+        let query = "SELECT COUNT(*) FROM team_users WHERE user_pubkey = $1 AND team_id = $2 AND role = 'member'";
         let count = sqlx::query_scalar::<_, i64>(query)
-            .bind(tenant_id)
             .bind(pubkey.to_hex())
             .bind(team_id)
             .fetch_one(pool)
@@ -156,13 +153,12 @@ impl User {
     /// Check if a user is part of a team (admin or member)
     pub async fn is_team_teammate(
         pool: &PgPool,
-        tenant_id: i64,
+        _tenant_id: i64,
         pubkey: &PublicKey,
         team_id: i32,
     ) -> Result<bool, UserError> {
-        let query = "SELECT COUNT(*) FROM team_users WHERE tenant_id = $1 AND user_pubkey = $2 AND team_id = $3";
+        let query = "SELECT COUNT(*) FROM team_users WHERE user_pubkey = $1 AND team_id = $2";
         let count = sqlx::query_scalar::<_, i64>(query)
-            .bind(tenant_id)
             .bind(pubkey.to_hex())
             .bind(team_id)
             .fetch_one(pool)

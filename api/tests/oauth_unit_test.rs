@@ -67,7 +67,10 @@ use nostr_sdk::Keys;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+mod common;
+
 async fn setup_pool() -> PgPool {
+    common::assert_test_database_url();
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string());
     PgPool::connect(&database_url).await.expect("Failed to connect to database")
@@ -88,28 +91,16 @@ async fn test_authorization_code_expiration() {
         .await
         .unwrap();
 
-    // Create OAuth app
-    let app_id: i32 = sqlx::query_scalar(
-        "INSERT INTO oauth_applications (name, redirect_origin, client_secret, redirect_uris, tenant_id, created_at, updated_at)
-         VALUES ('Test App', $1, 'secret', '[\"http://localhost/callback\"]', 1, NOW(), NOW())
-         RETURNING id"
-    )
-    .bind(&redirect_origin)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-
     // Create EXPIRED oauth_code (expires_at in the past)
     let expired_time = Utc::now() - Duration::minutes(10);
     let code = format!("expired_code_{}", Uuid::new_v4());
     sqlx::query(
-        "INSERT INTO oauth_codes (code, user_pubkey, application_id, redirect_uri, scope, expires_at, tenant_id, created_at)
-         VALUES ($1, $2, $3, $4, 'sign', $5, 1, NOW())"
+        "INSERT INTO oauth_codes (code, user_pubkey, client_id, redirect_uri, scope, expires_at, tenant_id, created_at)
+         VALUES ($1, $2, 'Test App', $3, 'sign', $4, 1, NOW())"
     )
     .bind(&code)
     .bind(&user_pubkey)
-    .bind(app_id)
-    .bind("http://localhost/callback")
+    .bind(format!("{}/callback", redirect_origin))
     .bind(expired_time)
     .execute(&pool)
     .await
@@ -142,27 +133,15 @@ async fn test_authorization_code_one_time_use() {
         .await
         .unwrap();
 
-    // Create OAuth app
-    let app_id: i32 = sqlx::query_scalar(
-        "INSERT INTO oauth_applications (name, redirect_origin, client_secret, redirect_uris, tenant_id, created_at, updated_at)
-         VALUES ('Test App', $1, 'secret', '[\"http://localhost/callback\"]', 1, NOW(), NOW())
-         RETURNING id"
-    )
-    .bind(&redirect_origin)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-
     // Create valid oauth_code
     let code = format!("valid_code_{}", Uuid::new_v4());
     sqlx::query(
-        "INSERT INTO oauth_codes (code, user_pubkey, application_id, redirect_uri, scope, expires_at, tenant_id, created_at)
-         VALUES ($1, $2, $3, $4, 'sign', NOW() + INTERVAL '10 minutes', 1, NOW())"
+        "INSERT INTO oauth_codes (code, user_pubkey, client_id, redirect_uri, scope, expires_at, tenant_id, created_at)
+         VALUES ($1, $2, 'Test App', $3, 'sign', NOW() + INTERVAL '10 minutes', 1, NOW())"
     )
     .bind(&code)
     .bind(&user_pubkey)
-    .bind(app_id)
-    .bind("http://localhost/callback")
+    .bind(format!("{}/callback", redirect_origin))
     .execute(&pool)
     .await
     .unwrap();
@@ -184,43 +163,6 @@ async fn test_authorization_code_one_time_use() {
     assert!(deleted_again.is_none(), "Second exchange should fail - code already used");
 }
 
-/// Test redirect URI validation (exact match required)
-#[tokio::test]
-async fn test_redirect_uri_validation() {
-    let pool = setup_pool().await;
-    let redirect_origin = format!("https://test-{}.example.com", Uuid::new_v4());
-
-    // Create OAuth app with specific redirect_uris
-    let _app_id: i32 = sqlx::query_scalar(
-        "INSERT INTO oauth_applications (name, redirect_origin, client_secret, redirect_uris, tenant_id, created_at, updated_at)
-         VALUES ('Test App', $1, 'secret', '[\"http://localhost:3000/callback\", \"https://example.com/oauth\"]', 1, NOW(), NOW())
-         RETURNING id"
-    )
-    .bind(&redirect_origin)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-
-    // Query the redirect_uris and verify
-    let redirect_uris: String = sqlx::query_scalar(
-        "SELECT redirect_uris FROM oauth_applications WHERE redirect_origin = $1"
-    )
-    .bind(&redirect_origin)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-
-    let uris: Vec<String> = serde_json::from_str(&redirect_uris).unwrap();
-
-    // Verify exact matches work
-    assert!(uris.contains(&"http://localhost:3000/callback".to_string()));
-    assert!(uris.contains(&"https://example.com/oauth".to_string()));
-
-    // Verify non-matching doesn't exist
-    assert!(!uris.contains(&"http://evil.com/callback".to_string()));
-    assert!(!uris.contains(&"http://localhost:3000/callback/extra".to_string()));
-}
-
 /// Test that multiple authorizations can exist for the same user (different origins)
 #[tokio::test]
 async fn test_multiple_authorizations_per_user() {
@@ -235,50 +177,32 @@ async fn test_multiple_authorizations_per_user() {
         .await
         .unwrap();
 
-    // Create two different OAuth apps
+    // Create two different origins
     let redirect_origin_1 = format!("https://app1-{}.example.com", Uuid::new_v4());
     let redirect_origin_2 = format!("https://app2-{}.example.com", Uuid::new_v4());
 
-    let app_id_1: i32 = sqlx::query_scalar(
-        "INSERT INTO oauth_applications (name, redirect_origin, client_secret, redirect_uris, tenant_id, created_at, updated_at)
-         VALUES ('App 1', $1, 'secret1', '[]', 1, NOW(), NOW()) RETURNING id"
-    )
-    .bind(&redirect_origin_1)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-
-    let app_id_2: i32 = sqlx::query_scalar(
-        "INSERT INTO oauth_applications (name, redirect_origin, client_secret, redirect_uris, tenant_id, created_at, updated_at)
-         VALUES ('App 2', $1, 'secret2', '[]', 1, NOW(), NOW()) RETURNING id"
-    )
-    .bind(&redirect_origin_2)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-
     // Create authorization for App 1
+    let bunker_keys_1 = Keys::generate();
     sqlx::query(
-        "INSERT INTO oauth_authorizations (user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'secret1', '[]', 1, NOW(), NOW())"
+        "INSERT INTO oauth_authorizations (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
+         VALUES ($1, $2, 'App 1', $3, 'secret1', '[]', 1, NOW(), NOW())"
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin_1)
-    .bind(app_id_1)
-    .bind(&user_pubkey)
+    .bind(bunker_keys_1.public_key().to_hex())
     .execute(&pool)
     .await
     .unwrap();
 
     // Create authorization for App 2
+    let bunker_keys_2 = Keys::generate();
     sqlx::query(
-        "INSERT INTO oauth_authorizations (user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'secret2', '[]', 1, NOW(), NOW())"
+        "INSERT INTO oauth_authorizations (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
+         VALUES ($1, $2, 'App 2', $3, 'secret2', '[]', 1, NOW(), NOW())"
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin_2)
-    .bind(app_id_2)
-    .bind(&user_pubkey)
+    .bind(bunker_keys_2.public_key().to_hex())
     .execute(&pool)
     .await
     .unwrap();
@@ -326,98 +250,6 @@ fn test_extract_nsec_from_verifier() {
     assert!(result.is_none());
 }
 
-/// Test that RPC fast path query finds OAuth authorizations from any application
-/// Bug: The fast path query in nostr_rpc.rs was hardcoded to only find authorizations
-/// where client_id = 'keycast-login', causing all other OAuth apps (like 'divine')
-/// to fall back to the slow path (DB + KMS decryption on every request).
-///
-/// Fix: Removed the hardcoded client_id filter from the query.
-#[tokio::test]
-async fn test_rpc_fast_path_works_with_any_oauth_app() {
-    let pool = setup_pool().await;
-    let user_keys = Keys::generate();
-    let user_pubkey = user_keys.public_key().to_hex();
-    let bunker_keys = Keys::generate();
-    let bunker_pubkey = bunker_keys.public_key().to_hex();
-    let tenant_id = 1i64;
-
-    // Create user
-    sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, $2, NOW(), NOW()) ON CONFLICT (pubkey) DO NOTHING")
-        .bind(&user_pubkey)
-        .bind(tenant_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    // Create OAuth app named 'divine' (NOT 'keycast-login')
-    let redirect_origin = format!("https://divine-{}.example.com", Uuid::new_v4());
-    let app_id: i32 = sqlx::query_scalar(
-        "INSERT INTO oauth_applications (name, redirect_origin, client_secret, redirect_uris, tenant_id, created_at, updated_at)
-         VALUES ('divine', $1, 'secret', '[]', $2, NOW(), NOW())
-         RETURNING id"
-    )
-    .bind(&redirect_origin)
-    .bind(tenant_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-
-    // Create OAuth authorization with this 'divine' app
-    sqlx::query(
-        "INSERT INTO oauth_authorizations (user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'secret1', '[]', $5, NOW(), NOW())"
-    )
-    .bind(&user_pubkey)
-    .bind(&redirect_origin)
-    .bind(app_id)
-    .bind(&bunker_pubkey)
-    .bind(tenant_id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    // Query using the FIXED fast path SQL (no app.client_id filter)
-    // This is the query from nostr_rpc.rs that was fixed
-    let result: Option<String> = sqlx::query_scalar(
-        "SELECT oa.bunker_public_key
-         FROM oauth_authorizations oa
-         JOIN users u ON oa.user_pubkey = u.pubkey AND oa.tenant_id = u.tenant_id
-         WHERE oa.user_pubkey = $1
-           AND u.tenant_id = $2
-         ORDER BY oa.created_at DESC
-         LIMIT 1"
-    )
-    .bind(&user_pubkey)
-    .bind(tenant_id)
-    .fetch_optional(&pool)
-    .await
-    .unwrap();
-
-    // Fast path should find the bunker_public_key regardless of app name
-    assert!(result.is_some(), "Fast path query should find bunker_public_key for any OAuth app");
-    assert_eq!(result.unwrap(), bunker_pubkey, "Should return correct bunker_public_key");
-
-    // Verify the OLD buggy query would NOT have found it (simulated)
-    // The bug was filtering by app.client_id = 'keycast-login'
-    let buggy_result: Option<String> = sqlx::query_scalar(
-        "SELECT oa.bunker_public_key
-         FROM oauth_authorizations oa
-         JOIN oauth_applications app ON oa.application_id = app.id
-         WHERE oa.user_pubkey = $1
-           AND oa.tenant_id = $2
-           AND app.name = 'keycast-login'
-         ORDER BY oa.created_at DESC
-         LIMIT 1"
-    )
-    .bind(&user_pubkey)
-    .bind(tenant_id)
-    .fetch_optional(&pool)
-    .await
-    .unwrap();
-
-    assert!(buggy_result.is_none(), "Buggy query (filtering by keycast-login) should NOT find divine app authorization");
-}
-
 /// Test that secret key encryption stores bytes not hex string
 #[test]
 fn test_secret_key_encryption_format() {
@@ -459,6 +291,7 @@ use std::sync::Arc;
 struct MockHandler {
     id: i64,
     pubkey: String,
+    keys: Keys,
 }
 
 #[async_trait::async_trait]
@@ -478,96 +311,73 @@ impl SigningHandler for MockHandler {
         self.pubkey.clone()
     }
 
-    fn get_keys(&self) -> nostr_sdk::Keys {
-        nostr_sdk::Keys::generate()
+    fn get_keys(&self) -> Keys {
+        self.keys.clone()
     }
 }
 
-/// Test that moka cache clone shares underlying data (not a snapshot).
-/// This verifies the fix for the stale cache bug where API received
-/// a snapshot HashMap at startup instead of a live cache reference.
+/// Test that SignerHandlersCache properly stores and retrieves handlers by bunker pubkey
 #[tokio::test]
-async fn test_moka_cache_is_live_not_snapshot() {
-    // Create moka cache (same type used by signer)
-    let cache: SignerHandlersCache = moka::future::Cache::builder().build();
+async fn test_handler_cache_stores_by_bunker_pubkey() {
+    let cache = SignerHandlersCache::new(100);
 
-    // Clone it (should share same underlying data)
-    let cache_clone = cache.clone();
-
-    // Insert via original cache
+    let bunker_pubkey = "test_bunker_pubkey_123";
     let handler = Arc::new(MockHandler {
         id: 1,
-        pubkey: "test_pubkey_1".to_string(),
-    }) as Arc<dyn SigningHandler>;
-    cache.insert("key1".to_string(), handler).await;
+        pubkey: "user_pubkey_abc".to_string(),
+        keys: Keys::generate(),
+    }) as Arc<dyn SigningHandler + Send + Sync>;
 
-    // Verify immediately visible via clone (no snapshot issue!)
-    let found = cache_clone.get("key1").await;
-    assert!(found.is_some(), "Handler inserted via original should be immediately visible via clone");
-    assert_eq!(found.unwrap().authorization_id(), 1);
+    // Insert handler
+    cache.insert(bunker_pubkey.to_string(), handler.clone()).await;
 
-    // Verify the reverse: insert via clone, visible via original
+    // Retrieve by bunker pubkey
+    let retrieved = cache.get(bunker_pubkey).await;
+    assert!(retrieved.is_some(), "Should find handler by bunker pubkey");
+    assert_eq!(retrieved.unwrap().authorization_id(), 1);
+}
+
+/// Test that cache can hold multiple handlers with different bunker pubkeys
+#[tokio::test]
+async fn test_handler_cache_multiple_handlers() {
+    let cache = SignerHandlersCache::new(100);
+
+    // Insert two handlers with different bunker pubkeys
+    let handler1 = Arc::new(MockHandler {
+        id: 1,
+        pubkey: "user1".to_string(),
+        keys: Keys::generate(),
+    }) as Arc<dyn SigningHandler + Send + Sync>;
+
     let handler2 = Arc::new(MockHandler {
         id: 2,
-        pubkey: "test_pubkey_2".to_string(),
-    }) as Arc<dyn SigningHandler>;
-    cache_clone.insert("key2".to_string(), handler2).await;
+        pubkey: "user2".to_string(),
+        keys: Keys::generate(),
+    }) as Arc<dyn SigningHandler + Send + Sync>;
 
-    let found2 = cache.get("key2").await;
-    assert!(found2.is_some(), "Handler inserted via clone should be visible via original");
-    assert_eq!(found2.unwrap().authorization_id(), 2);
+    cache.insert("bunker1".to_string(), handler1).await;
+    cache.insert("bunker2".to_string(), handler2).await;
+
+    // Verify both can be retrieved
+    assert!(cache.get("bunker1").await.is_some());
+    assert!(cache.get("bunker2").await.is_some());
+    assert!(cache.get("bunker3").await.is_none());
 }
 
-/// Test that cache invalidation removes handlers correctly.
-/// Verifies the Remove command in authorization_channel works.
+/// Test that cache remove works
 #[tokio::test]
-async fn test_cache_invalidation_removes_handler() {
-    let cache: SignerHandlersCache = moka::future::Cache::builder().build();
-    let cache_clone = cache.clone();
+async fn test_handler_cache_remove() {
+    let cache = SignerHandlersCache::new(100);
 
-    // Insert a handler
-    let user_pubkey = "user123";
     let handler = Arc::new(MockHandler {
-        id: 42,
-        pubkey: user_pubkey.to_string(),
-    }) as Arc<dyn SigningHandler>;
-    cache.insert(user_pubkey.to_string(), handler).await;
+        id: 1,
+        pubkey: "user".to_string(),
+        keys: Keys::generate(),
+    }) as Arc<dyn SigningHandler + Send + Sync>;
 
-    // Verify it exists in both
-    assert!(cache.get(user_pubkey).await.is_some());
-    assert!(cache_clone.get(user_pubkey).await.is_some());
+    cache.insert("bunker_key".to_string(), handler).await;
+    assert!(cache.get("bunker_key").await.is_some());
 
-    // Invalidate via original
-    cache.invalidate(user_pubkey).await;
-
-    // Verify removed from both (invalidation is also live!)
-    assert!(cache.get(user_pubkey).await.is_none(), "Handler should be removed from original");
-    assert!(cache_clone.get(user_pubkey).await.is_none(), "Handler should be removed from clone");
-}
-
-/// Test that multiple handlers can coexist (one per user pubkey)
-#[tokio::test]
-async fn test_multiple_handlers_by_user_pubkey() {
-    let cache: SignerHandlersCache = moka::future::Cache::builder().build();
-
-    // Add handlers for different users
-    for i in 0..5 {
-        let pubkey = format!("user_{}", i);
-        let handler = Arc::new(MockHandler {
-            id: i as i64,
-            pubkey: pubkey.clone(),
-        }) as Arc<dyn SigningHandler>;
-        cache.insert(pubkey, handler).await;
-    }
-
-    // Verify all exist
-    for i in 0..5 {
-        let pubkey = format!("user_{}", i);
-        let found = cache.get(&pubkey).await;
-        assert!(found.is_some(), "Handler for {} should exist", pubkey);
-        assert_eq!(found.unwrap().authorization_id(), i as i64);
-    }
-
-    // Verify non-existent doesn't exist
-    assert!(cache.get("nonexistent").await.is_none());
+    cache.remove("bunker_key").await;
+    assert!(cache.get("bunker_key").await.is_none());
 }

@@ -63,34 +63,16 @@ async fn create_oauth_authorization_for_client_test(
     .await
     .expect("Failed to create personal key");
 
-    // Create OAuth application
-    let client_secret = format!("client_secret_{}", Uuid::new_v4());
-    let redirect_origin = format!("https://test-{}.example.com", Uuid::new_v4());
-    let app_id: i32 = sqlx::query_scalar(
-        "INSERT INTO oauth_applications (name, redirect_origin, client_secret, redirect_uris, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-         ON CONFLICT (redirect_origin, tenant_id) DO UPDATE SET id = oauth_applications.id
-         RETURNING id"
-    )
-    .bind("Client Test App")
-    .bind(&redirect_origin)
-    .bind(&client_secret)
-    .bind(json!(["http://localhost/callback"]))
-    .bind(tenant_id)
-    .fetch_one(pool)
-    .await
-    .expect("Failed to create OAuth application");
-
     // Create OAuth authorization (bunker key derived via HKDF, not stored)
+    let redirect_origin = format!("https://test-{}.example.com", Uuid::new_v4());
     let oauth_id: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
+         VALUES ($1, $2, 'Client Test App', $3, $4, $5, $6, NOW(), NOW())
          RETURNING id"
     )
     .bind(user_keys.public_key().to_hex())
     .bind(&redirect_origin)
-    .bind(app_id)
     .bind(user_keys.public_key().to_hex())
     .bind(&unique_secret)
     .bind(json!(["wss://relay.damus.io"]))

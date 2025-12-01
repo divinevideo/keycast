@@ -360,16 +360,6 @@ async fn log_signing_activity(
     event_content: &str,
     event_id: &str,
 ) {
-    // Look up application_id from redirect_origin
-    let application_id: Option<i32> = sqlx::query_scalar(
-        "SELECT id FROM oauth_applications WHERE redirect_origin = $1"
-    )
-    .bind(redirect_origin)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
-
     // Truncate content for storage
     let truncated_content = if event_content.len() > 500 {
         format!("{}... (truncated)", &event_content[..500])
@@ -382,11 +372,10 @@ async fn log_signing_activity(
 
     let result = sqlx::query(
         "INSERT INTO signing_activity
-         (user_pubkey, application_id, bunker_secret, event_kind, event_content, event_id, tenant_id, source, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'rpc', NOW())"
+         (user_pubkey, bunker_secret, event_kind, event_content, event_id, tenant_id, source, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, 'rpc', NOW())"
     )
     .bind(user_pubkey)
-    .bind(application_id)
     .bind(&bunker_secret)
     .bind(event_kind as i32)
     .bind(&truncated_content)

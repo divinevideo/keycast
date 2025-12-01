@@ -79,52 +79,6 @@ pub fn parse_policy_scope(scope: &str) -> Result<String, OAuthError> {
     }
 }
 
-/// Get or create an OAuth application by redirect origin.
-///
-/// The redirect_origin is the security identifier - client_id is only used as a display name.
-/// If `redirect_uri` is provided, it's stored in the redirect_uris array; otherwise uses `[]`.
-/// Returns the application ID.
-async fn get_or_create_oauth_application(
-    pool: &sqlx::PgPool,
-    tenant_id: i64,
-    redirect_origin: &str,
-    display_name: &str,
-    redirect_uri: Option<&str>,
-) -> Result<i32, OAuthError> {
-    let existing: Option<i32> = sqlx::query_scalar(
-        "SELECT id FROM oauth_applications WHERE tenant_id = $1 AND redirect_origin = $2"
-    )
-    .bind(tenant_id)
-    .bind(redirect_origin)
-    .fetch_optional(pool)
-    .await?;
-
-    match existing {
-        Some(id) => Ok(id),
-        None => {
-            let redirect_uris = redirect_uri
-                .map(|uri| format!("[\"{}\"]", uri))
-                .unwrap_or_else(|| "[]".to_string());
-
-            sqlx::query_scalar(
-                "INSERT INTO oauth_applications (tenant_id, name, display_name, redirect_origin, client_secret, redirect_uris, created_at, updated_at)
-                 VALUES ($1, $2, $3, $4, 'auto', $5, $6, $7)
-                 RETURNING id"
-            )
-            .bind(tenant_id)
-            .bind(display_name)
-            .bind(display_name)
-            .bind(redirect_origin)
-            .bind(redirect_uris)
-            .bind(Utc::now())
-            .bind(Utc::now())
-            .fetch_one(pool)
-            .await
-            .map_err(OAuthError::Database)
-        }
-    }
-}
-
 /// Store an OAuth authorization code with PKCE support.
 #[allow(clippy::too_many_arguments)]
 async fn store_oauth_code(
@@ -132,7 +86,7 @@ async fn store_oauth_code(
     tenant_id: i64,
     code: &str,
     user_pubkey: &str,
-    app_id: i32,
+    client_id: &str,
     redirect_uri: &str,
     scope: &str,
     code_challenge: Option<&str>,
@@ -140,13 +94,13 @@ async fn store_oauth_code(
     expires_at: chrono::DateTime<Utc>,
 ) -> Result<(), OAuthError> {
     sqlx::query(
-        "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, application_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at)
+        "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
     )
     .bind(tenant_id)
     .bind(code)
     .bind(user_pubkey)
-    .bind(app_id)
+    .bind(client_id)
     .bind(redirect_uri)
     .bind(scope)
     .bind(code_challenge)
@@ -346,12 +300,12 @@ fn validate_pkce(
 
 /// Resolve policy ID from scope parameter.
 /// Parses "policy:slug" format and validates against app's default policy.
+/// Resolve policy ID from scope string (e.g., "policy:social" -> policy.id)
 async fn resolve_policy_from_scope(
     pool: &sqlx::PgPool,
-    application_id: i32,
     scope: &str,
 ) -> Result<i32, OAuthError> {
-    use keycast_core::types::policy::{is_more_restrictive, Policy};
+    use keycast_core::types::policy::Policy;
 
     // Parse scope for policy slug
     let policy_slug = parse_policy_scope(scope)?;
@@ -368,31 +322,6 @@ async fn resolve_policy_from_scope(
             }
             _ => OAuthError::Database(sqlx::Error::Protocol(e.to_string())),
         })?;
-
-    // Check if app has a default policy constraint
-    let app_default_policy_id: Option<i32> =
-        sqlx::query_scalar("SELECT policy_id FROM oauth_applications WHERE id = $1")
-            .bind(application_id)
-            .fetch_one(pool)
-            .await?;
-
-    // If app has a default policy, validate requested is equal or more restrictive
-    if let Some(default_policy_id) = app_default_policy_id {
-        let default_policy = Policy::find_by_id(pool, default_policy_id)
-            .await
-            .map_err(|e| OAuthError::Database(sqlx::Error::Protocol(e.to_string())))?;
-
-        let is_allowed = is_more_restrictive(&requested_policy, &default_policy, pool)
-            .await
-            .map_err(|e| OAuthError::InvalidRequest(format!("Policy comparison failed: {}", e)))?;
-
-        if !is_allowed {
-            return Err(OAuthError::InvalidRequest(
-                "This app cannot request more permissions than its default policy allows."
-                    .to_string(),
-            ));
-        }
-    }
 
     Ok(requested_policy.id)
 }
@@ -562,15 +491,6 @@ pub async fn authorize_get(
         if existing_auth.is_some() && !force_consent {
             tracing::info!("Auto-approving: user has already authorized origin {}", redirect_origin);
 
-            // Get or create application by redirect_origin (client_id is just a display name hint)
-            let app_id = get_or_create_oauth_application(
-                pool,
-                tenant_id,
-                &redirect_origin,
-                &params.client_id,
-                None,
-            ).await?;
-
             // Auto-approve: generate code and send directly to parent window
             let code: String = rand::thread_rng()
                 .sample_iter(&rand::distributions::Alphanumeric)
@@ -586,7 +506,7 @@ pub async fn authorize_get(
                 tenant_id,
                 &code,
                 pubkey,
-                app_id,
+                &params.client_id,
                 &params.redirect_uri,
                 scope,
                 params.code_challenge.as_deref(),
@@ -1686,9 +1606,6 @@ pub async fn authorize_post(
     })
         .ok_or(OAuthError::Unauthorized)?;
 
-    // Extract redirect_origin - this is the ONLY secure app identifier
-    let redirect_origin = extract_origin(&req.redirect_uri)?;
-
     // Generate authorization code
     let code: String = rand::thread_rng()
         .sample_iter(&rand::distributions::Alphanumeric)
@@ -1699,22 +1616,13 @@ pub async fn authorize_post(
     // Store authorization code (expires in 10 minutes)
     let expires_at = Utc::now() + Duration::minutes(10);
 
-    // Get or create application by redirect_origin
-    let app_id = get_or_create_oauth_application(
-        &auth_state.state.db,
-        tenant_id,
-        &redirect_origin,
-        &req.client_id,
-        Some(&req.redirect_uri),
-    ).await?;
-
     // Store authorization code with PKCE support
     store_oauth_code(
         &auth_state.state.db,
         tenant_id,
         &code,
         &user_pubkey,
-        app_id,
+        &req.client_id,
         &req.redirect_uri,
         &req.scope,
         req.code_challenge.as_deref(),
@@ -1762,9 +1670,9 @@ async fn handle_authorization_code_grant(
     let pool = &auth_state.state.db;
 
     // Fetch and validate authorization code with PKCE fields
-    type AuthCodeRow = (String, i32, String, String, Option<String>, Option<String>);
+    type AuthCodeRow = (String, String, String, String, Option<String>, Option<String>);
     let auth_code: Option<AuthCodeRow> = sqlx::query_as(
-        "SELECT user_pubkey, application_id, redirect_uri, scope, code_challenge, code_challenge_method
+        "SELECT user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method
          FROM oauth_codes
          WHERE tenant_id = $1 AND code = $2 AND expires_at > $3"
     )
@@ -1774,7 +1682,7 @@ async fn handle_authorization_code_grant(
     .fetch_optional(pool)
     .await?;
 
-    let (user_pubkey, application_id, stored_redirect_uri, scope, code_challenge, code_challenge_method) =
+    let (user_pubkey, client_id, stored_redirect_uri, scope, code_challenge, code_challenge_method) =
         auth_code.ok_or(OAuthError::Unauthorized)?;
 
     // Validate redirect_uri matches
@@ -1826,7 +1734,7 @@ async fn handle_authorization_code_grant(
             tenant_id,
             user_pubkey: &user_pubkey,
             email: &email,
-            application_id,
+            client_id: &client_id,
             scope: &scope,
             redirect_uri: &stored_redirect_uri,
             nsec_from_verifier,
@@ -1842,7 +1750,7 @@ struct CreateAuthorizationParams<'a> {
     tenant_id: i64,
     user_pubkey: &'a str,
     email: &'a str,
-    application_id: i32,
+    client_id: &'a str,
     scope: &'a str,
     redirect_uri: &'a str,
     nsec_from_verifier: Option<String>,
@@ -1859,7 +1767,7 @@ async fn create_oauth_authorization_and_token(
         tenant_id,
         user_pubkey,
         email,
-        application_id,
+        client_id,
         scope,
         redirect_uri,
         nsec_from_verifier,
@@ -1973,21 +1881,21 @@ async fn create_oauth_authorization_and_token(
         .map_err(|e| OAuthError::InvalidRequest(format!("Failed to serialize relays: {}", e)))?;
 
     // Resolve policy from scope (policy:slug format)
-    let policy_id = resolve_policy_from_scope(pool, application_id, scope).await?;
+    let policy_id = resolve_policy_from_scope(pool, scope).await?;
 
     // Create new OAuth authorization - always INSERT (multi-device support)
     // Each authorization is a separate "ticket" for one client/device
     // Old authorizations remain valid until explicitly revoked
     // Note: bunker key is derived via HKDF from user secret, not stored
     let auth_id: i32 = sqlx::query_scalar(
-        "INSERT INTO oauth_authorizations (tenant_id, user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, policy_id, created_at, updated_at)
+        "INSERT INTO oauth_authorizations (tenant_id, user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, policy_id, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          RETURNING id"
     )
     .bind(tenant_id)
     .bind(user_pubkey)
     .bind(&redirect_origin)
-    .bind(application_id)
+    .bind(client_id)
     .bind(bunker_public_key.to_hex())
     .bind(&connection_secret)
     .bind(&relays_json)
@@ -2348,15 +2256,6 @@ pub async fn oauth_register(
     // Extract redirect_origin - the ONLY secure app identifier
     let redirect_origin = extract_origin(&req.redirect_uri)?;
 
-    // Get or create application by redirect_origin
-    let app_id = get_or_create_oauth_application(
-        pool,
-        tenant_id,
-        &redirect_origin,
-        &req.client_id,
-        Some(&req.redirect_uri),
-    ).await?;
-
     // Store authorization code with PKCE support
     let scope = req.scope.as_deref().unwrap_or("sign_event");
     store_oauth_code(
@@ -2364,7 +2263,7 @@ pub async fn oauth_register(
         tenant_id,
         &code,
         &public_key.to_hex(),
-        app_id,
+        &req.client_id,
         &req.redirect_uri,
         scope,
         req.code_challenge.as_deref(),
@@ -2946,33 +2845,8 @@ pub async fn connect_post(
     let bunker_keys = keycast_core::bunker_key::derive_bunker_keys(&user_secret_key, &form.secret);
     let bunker_public_key = bunker_keys.public_key();
 
-    let app_name = format!("nostr-login-{}", &form.client_pubkey[..12]);
-
-    // Get or create application by redirect_origin (the secure identifier)
-    let app_id: i32 = match sqlx::query_scalar::<_, i32>(
-        "SELECT id FROM oauth_applications WHERE tenant_id = $1 AND redirect_origin = $2"
-    )
-    .bind(tenant_id)
-    .bind(&redirect_origin)
-    .fetch_optional(&auth_state.state.db)
-    .await? {
-        Some(id) => id,
-        None => {
-            // Auto-create application
-            sqlx::query_scalar(
-                "INSERT INTO oauth_applications (tenant_id, name, display_name, redirect_origin, client_secret, redirect_uris, created_at, updated_at)
-                 VALUES ($1, $2, $3, $4, '', '[]', $5, $6) RETURNING id"
-            )
-            .bind(tenant_id)
-            .bind(&app_name)  // name
-            .bind(&app_name)  // display_name (cosmetic)
-            .bind(&redirect_origin)  // the secure identifier
-            .bind(Utc::now())
-            .bind(Utc::now())
-            .fetch_one(&auth_state.state.db)
-            .await?
-        }
-    };
+    // Use a descriptive name for nostr-login connections
+    let client_id = format!("nostr-login-{}", &form.client_pubkey[..12]);
 
     // Create authorization
     // Note: bunker key is derived via HKDF from user secret, not stored
@@ -2983,14 +2857,14 @@ pub async fn connect_post(
     // Each nostr-login creates a NEW authorization for that client
     let auth_id: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (tenant_id, user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, client_pubkey, created_at, updated_at)
+         (tenant_id, user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, client_pubkey, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          RETURNING id"
     )
     .bind(tenant_id)
     .bind(&user_pubkey)
     .bind(&redirect_origin)
-    .bind(app_id)
+    .bind(&client_id)
     .bind(bunker_public_key.to_hex())
     .bind(&form.secret)
     .bind(&relays_json)

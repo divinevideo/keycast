@@ -15,8 +15,8 @@ pub struct OAuthAuthorization {
     pub user_pubkey: String,
     /// The redirect_uri origin (scheme + host + port) - primary identifier for the app
     pub redirect_origin: String,
-    /// The OAuth application id (optional metadata, origin is primary)
-    pub application_id: Option<i32>,
+    /// The OAuth client_id (untrusted app display name from OAuth request)
+    pub client_id: Option<String>,
     /// The bunker public key (derived from user key via HKDF, different from user_pubkey for privacy)
     pub bunker_public_key: String,
     /// The connection secret for NIP-46 authentication

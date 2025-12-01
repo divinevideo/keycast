@@ -156,7 +156,7 @@
 								<option value={policy.slug}>{policy.display_name}</option>
 							{/each}
 						</select>
-						<p class="input-hint">What this app is allowed to do with your identity</p>
+						<p class="input-hint">What this connection is allowed to do with your identity</p>
 					</div>
 
 					<div class="modal-actions">

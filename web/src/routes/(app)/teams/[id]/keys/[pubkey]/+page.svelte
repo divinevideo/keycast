@@ -181,8 +181,17 @@ async function removeKey() {
                 <p class="text-gray-500">No authorizations found</p>
             {:else}
                 <div class="card-grid">
-                    {#each authorizations as authorization}
-                        <AuthorizationCard {authorization} />
+                    {#each authorizations as authorization (authorization.authorization.id)}
+                        <AuthorizationCard
+                            {authorization}
+                            teamId={id}
+                            keyPubkey={pubkey}
+                            onDelete={() => {
+                                authorizations = authorizations.filter(
+                                    a => a.authorization.id !== authorization.authorization.id
+                                );
+                            }}
+                        />
                     {/each}
                 </div>
             {/if}

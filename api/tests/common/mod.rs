@@ -3,13 +3,13 @@
 
 use sqlx::PgPool;
 
-/// CRITICAL: Validates that DATABASE_URL points to localhost only.
+/// CRITICAL: Validates that DATABASE_URL points to a local/dev database only.
 /// This prevents accidental execution of tests against production databases.
 ///
 /// # Panics
 /// Panics if DATABASE_URL:
-/// - Does not contain "localhost" or "127.0.0.1"
-/// - Contains known production identifiers like "keycast-db", "cloud", or IP addresses
+/// - Does not match any known local pattern (localhost, 127.0.0.1, Docker hostnames)
+/// - Contains known production identifiers like "keycast-db", "cloud", or GCP IP addresses
 pub fn assert_test_database_url() {
     let url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string());
@@ -23,37 +23,27 @@ pub fn assert_test_database_url() {
         .next()
         .unwrap_or("unknown");
 
-    // Must be localhost or 127.0.0.1
-    let is_localhost = url.contains("localhost") || url.contains("127.0.0.1");
-    assert!(
-        is_localhost,
-        "\n\n\
-        ╔══════════════════════════════════════════════════════════════════╗\n\
-        ║  REFUSING TO RUN: DATABASE_URL must point to localhost           ║\n\
-        ║                                                                  ║\n\
-        ║  Tests detected a non-localhost database connection:             ║\n\
-        ║  Host: {:<55} ║\n\
-        ║                                                                  ║\n\
-        ║  To fix:                                                         ║\n\
-        ║  1. Start local postgres: docker run -p 5432:5432 postgres:16    ║\n\
-        ║  2. Set DATABASE_URL=postgres://postgres:password@localhost/test ║\n\
-        ╚══════════════════════════════════════════════════════════════════╝\n\n",
-        host_info
-    );
-
-    // Additional check: must NOT contain known production identifiers
+    // Known production indicators - check these FIRST
     let production_indicators = [
         "keycast-db",      // Cloud SQL instance name
-        "cloud",           // Generic cloud indicator
+        "cloudsql",        // Cloud SQL indicator
         "prod",            // Production indicator
         "130.211.",        // GCP IP range
         "35.192.",         // GCP IP range
+        "35.188.",         // GCP IP range
+        "35.193.",         // GCP IP range
         "34.66.",          // GCP IP range
+        "34.67.",          // GCP IP range
+        ".gcp.",           // GCP indicator
+        ".cloud.",         // Cloud indicator
+        "rds.amazonaws",   // AWS RDS
+        "azure",           // Azure
     ];
 
+    let url_lower = url.to_lowercase();
     for indicator in production_indicators {
         assert!(
-            !url.to_lowercase().contains(indicator),
+            !url_lower.contains(indicator),
             "\n\n\
             ╔══════════════════════════════════════════════════════════════════╗\n\
             ║  REFUSING TO RUN: DATABASE_URL appears to be a production DB     ║\n\
@@ -66,6 +56,33 @@ pub fn assert_test_database_url() {
             indicator
         );
     }
+
+    // Allowed local patterns:
+    // - localhost / 127.0.0.1 (direct local)
+    // - Docker Compose hostnames (contain "postgres" but not production indicators)
+    // - host.docker.internal (Docker Desktop)
+    let is_local = url_lower.contains("localhost")
+        || url_lower.contains("127.0.0.1")
+        || url_lower.contains("host.docker.internal")
+        || (host_info.contains("postgres") && !host_info.contains(".")); // Docker hostname like "keycast-postgres"
+
+    assert!(
+        is_local,
+        "\n\n\
+        ╔══════════════════════════════════════════════════════════════════╗\n\
+        ║  REFUSING TO RUN: DATABASE_URL must point to local database      ║\n\
+        ║                                                                  ║\n\
+        ║  Tests detected a non-local database connection:                 ║\n\
+        ║  Host: {:<55} ║\n\
+        ║                                                                  ║\n\
+        ║  Allowed: localhost, 127.0.0.1, Docker hostnames (e.g. postgres) ║\n\
+        ║                                                                  ║\n\
+        ║  To fix:                                                         ║\n\
+        ║  1. Use local postgres or Docker Compose                         ║\n\
+        ║  2. Set DATABASE_URL=postgres://user:pass@localhost/test         ║\n\
+        ╚══════════════════════════════════════════════════════════════════╝\n\n",
+        host_info
+    );
 }
 
 /// Connect to test database with safety checks.

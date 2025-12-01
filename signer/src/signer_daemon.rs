@@ -600,8 +600,7 @@ impl UnifiedSigner {
             // Load regular authorization
             let auth_data: Option<(i32, Vec<u8>, String, i64)> = sqlx::query_as(
                 "SELECT id, bunker_secret, secret, stored_key_id FROM authorizations
-                 WHERE tenant_id = $1
-                 AND bunker_public_key = (SELECT pubkey FROM stored_keys WHERE pubkey = $2 AND tenant_id = $1)"
+                 WHERE tenant_id = $1 AND bunker_public_key = $2"
             )
             .bind(tenant_id)
             .bind(bunker_pubkey)
@@ -757,9 +756,66 @@ impl UnifiedSigner {
                         handler
                     },
                     None => {
-                        // Not in database either - not our bunker
-                        tracing::trace!("Bunker {} not found in database, ignoring", bunker_pubkey);
-                        return Ok(());
+                        // Not in oauth_authorizations - check regular authorizations table
+                        tracing::trace!("Bunker {} not in oauth_authorizations, checking authorizations table", bunker_pubkey);
+
+                        // Query regular authorizations table (team bunkers)
+                        let auth_data: Option<(i32, Vec<u8>, String, i32, i64)> = sqlx::query_as(
+                            r#"SELECT id, bunker_secret, secret, stored_key_id, tenant_id
+                               FROM authorizations
+                               WHERE bunker_public_key = $1
+                                 AND (expires_at IS NULL OR expires_at > NOW())"#
+                        )
+                        .bind(bunker_pubkey)
+                        .fetch_optional(pool)
+                        .await?;
+
+                        match auth_data {
+                            Some((auth_id, bunker_secret, connection_secret, stored_key_id, tenant_id)) => {
+                                tracing::debug!("Loading team authorization on-demand: {}", bunker_pubkey);
+
+                                let decrypted_bunker_secret = key_manager.decrypt(&bunker_secret).await
+                                    .map_err(|e| SignerError::encryption(e.to_string()))?;
+                                let bunker_secret_key = SecretKey::from_slice(&decrypted_bunker_secret)
+                                    .map_err(|e| SignerError::invalid_key(format!("Invalid bunker secret key: {}", e)))?;
+                                let bunker_keys = Keys::new(bunker_secret_key);
+
+                                let stored_key_secret: Vec<u8> = sqlx::query_scalar(
+                                    "SELECT secret_key FROM stored_keys WHERE id = $1 AND tenant_id = $2"
+                                )
+                                .bind(stored_key_id)
+                                .bind(tenant_id)
+                                .fetch_one(pool)
+                                .await?;
+
+                                let decrypted_user_secret = key_manager.decrypt(&stored_key_secret).await
+                                    .map_err(|e| SignerError::encryption(e.to_string()))?;
+                                let user_secret_key = SecretKey::from_slice(&decrypted_user_secret)
+                                    .map_err(|e| SignerError::invalid_key(format!("Invalid user secret key: {}", e)))?;
+                                let user_keys = Keys::new(user_secret_key);
+
+                                let handler = AuthorizationHandler {
+                                    bunker_keys,
+                                    user_keys,
+                                    secret: connection_secret,
+                                    authorization_id: auth_id,
+                                    tenant_id,
+                                    is_oauth: false,
+                                    pool: pool.clone(),
+                                };
+
+                                // Cache it for future requests
+                                handlers.insert(bunker_pubkey.to_string(), handler.clone()).await;
+                                shared_handlers.insert(bunker_pubkey.to_string(), Arc::new(handler.clone()) as Arc<dyn SigningHandler>).await;
+
+                                handler
+                            },
+                            None => {
+                                // Not in any database table - not our bunker
+                                tracing::trace!("Bunker {} not found in any database, ignoring", bunker_pubkey);
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             }

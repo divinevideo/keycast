@@ -87,10 +87,9 @@ impl Team {
             r#"
             SELECT tu.*
             FROM team_users tu
-            WHERE tu.tenant_id = $1 AND tu.team_id = $2
+            WHERE tu.team_id = $1
             "#,
         )
-        .bind(tenant_id)
         .bind(team_id)
         .fetch_all(pool)
         .await?;

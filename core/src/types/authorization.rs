@@ -62,6 +62,8 @@ impl TryFrom<String> for Relays {
 pub struct Authorization {
     /// The id of the authorization
     pub id: i32,
+    /// The tenant id for multi-tenancy isolation
+    pub tenant_id: i64,
     /// The id of the stored key the authorization belongs to
     pub stored_key_id: i32,
     /// The generated secret connection uuid

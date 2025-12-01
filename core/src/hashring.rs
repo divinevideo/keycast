@@ -133,8 +133,8 @@ mod tests {
         }
 
         assert_eq!(handled_by_1 + handled_by_2, 100);
-        assert!(handled_by_1 > 30 && handled_by_1 < 70);
-        assert!(handled_by_2 > 30 && handled_by_2 < 70);
+        assert!(handled_by_1 > 45 && handled_by_1 < 55);
+        assert!(handled_by_2 > 45 && handled_by_2 < 55);
     }
 
     #[test]
@@ -178,7 +178,11 @@ mod tests {
                 ring3.should_handle(&pubkey),
             ];
             let owner_count = owners.iter().filter(|&&x| x).count();
-            assert_eq!(owner_count, 1, "Key {} should have exactly 1 owner, got {}", pubkey, owner_count);
+            assert_eq!(
+                owner_count, 1,
+                "Key {} should have exactly 1 owner, got {}",
+                pubkey, owner_count
+            );
         }
     }
 
@@ -325,7 +329,10 @@ mod tests {
             );
 
             // Config 2: exactly one of instance-1 or instance-X
-            let owners_after = [ring1_after.should_handle(&pubkey), ringx.should_handle(&pubkey)];
+            let owners_after = [
+                ring1_after.should_handle(&pubkey),
+                ringx.should_handle(&pubkey),
+            ];
             assert_eq!(
                 owners_after.iter().filter(|&&x| x).count(),
                 1,
@@ -349,7 +356,10 @@ mod tests {
             .map(|i| format!("pubkey-{}", i))
             .filter(|k| ring.should_handle(k))
             .count();
-        assert!(handled < 100, "With 2 instances, should handle ~50% not 100%");
+        assert!(
+            handled < 100,
+            "With 2 instances, should handle ~50% not 100%"
+        );
     }
 
     #[test]
@@ -383,7 +393,11 @@ mod tests {
                 ring3.should_handle(pubkey),
             ];
             let owner_count = owners.iter().filter(|&&x| x).count();
-            assert_eq!(owner_count, 1, "Pubkey {} should have exactly 1 owner", pubkey);
+            assert_eq!(
+                owner_count, 1,
+                "Pubkey {} should have exactly 1 owner",
+                pubkey
+            );
         }
     }
 
@@ -406,6 +420,9 @@ mod tests {
             .map(|i| ring.should_handle(&format!("key-{}", i)))
             .collect();
 
-        assert_eq!(handled_before, handled_after, "No-op rebuild should preserve assignments");
+        assert_eq!(
+            handled_before, handled_after,
+            "No-op rebuild should preserve assignments"
+        );
     }
 }

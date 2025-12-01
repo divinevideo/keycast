@@ -708,21 +708,9 @@ pub async fn create_bunker(
         validate_origin(origin)?;
     }
 
-    // Generate synthetic redirect_origin when no web origin provided
-    // Format: app://{sanitized_app_name}_{short_uuid}
-    let redirect_origin = match &req.origin {
-        Some(origin) => origin.clone(),
-        None => {
-            let sanitized_name: String = req.app_name
-                .chars()
-                .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
-                .take(32)
-                .collect::<String>()
-                .to_lowercase();
-            let short_id = &uuid::Uuid::new_v4().to_string()[..8];
-            format!("app://{}-{}", if sanitized_name.is_empty() { "manual" } else { &sanitized_name }, short_id)
-        }
-    };
+    // Use provided origin if given, otherwise empty string for manual bunkers
+    // Manual bunkers don't need redirect_origin since they're not actually OAuth
+    let redirect_origin = req.origin.clone().unwrap_or_default();
     let display_name = &req.app_name;
 
     tracing::info!("Creating manual bunker for user: {} in tenant: {}, redirect_origin: {}", user_pubkey, tenant_id, redirect_origin);
@@ -741,31 +729,6 @@ pub async fn create_bunker(
         .take(48)
         .map(char::from)
         .collect();
-
-    // Create OAuth application for this origin (if not exists)
-    // redirect_origin is the unique key, display_name can be updated
-    sqlx::query(
-        "INSERT INTO oauth_applications (tenant_id, name, display_name, redirect_origin, client_secret, redirect_uris, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'manual', '[]', $5, $6)
-         ON CONFLICT (tenant_id, redirect_origin) DO UPDATE SET name = EXCLUDED.name, display_name = EXCLUDED.display_name, updated_at = EXCLUDED.updated_at"
-    )
-    .bind(tenant_id)
-    .bind(display_name)
-    .bind(display_name)
-    .bind(&redirect_origin)
-    .bind(Utc::now())
-    .bind(Utc::now())
-    .execute(pool)
-    .await?;
-
-    // Get application ID by redirect_origin (the secure identifier)
-    let app_id: i32 = sqlx::query_scalar(
-        "SELECT id FROM oauth_applications WHERE redirect_origin = $1 AND tenant_id = $2"
-    )
-    .bind(&redirect_origin)
-    .bind(tenant_id)
-    .fetch_one(pool)
-    .await?;
 
     // Look up policy_id from slug if provided
     let policy_id: Option<i32> = if let Some(ref slug) = req.policy_slug {
@@ -802,14 +765,14 @@ pub async fn create_bunker(
     let created_at = Utc::now();
     let auth_id: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (tenant_id, user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, policy_id, created_at, updated_at)
+         (tenant_id, user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, policy_id, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          RETURNING id"
     )
     .bind(tenant_id)
     .bind(&user_pubkey)
     .bind(&redirect_origin)
-    .bind(app_id)
+    .bind(display_name)
     .bind(bunker_public_key.to_hex())
     .bind(&connection_secret)
     .bind(&relays_json)
@@ -1315,7 +1278,6 @@ pub async fn update_profile(
 #[derive(Debug, Serialize)]
 pub struct BunkerSession {
     pub application_name: String,
-    pub application_id: Option<i32>,
     pub redirect_origin: String,
     pub bunker_pubkey: String,
     pub client_pubkey: Option<String>,
@@ -1340,13 +1302,11 @@ pub async fn list_sessions(
     let tenant_id = tenant.0.id;
     tracing::info!("Listing bunker sessions for user: {} in tenant: {}", user_pubkey, tenant_id);
 
-    // Get OAuth authorizations with application details and activity stats
-    // last_activity and activity_count are now columns on oauth_authorizations (updated on every NIP-46 method)
-    type OAuthSessionRow = (String, Option<i32>, String, String, Option<String>, String, Option<String>, i32);
+    // Get OAuth authorizations - client_id is the display name
+    type OAuthSessionRow = (String, String, String, Option<String>, String, Option<String>, i32);
     let oauth_sessions: Vec<OAuthSessionRow> = sqlx::query_as(
         "SELECT
-            COALESCE(a.name, oa.redirect_origin) as name,
-            oa.application_id,
+            COALESCE(oa.client_id, oa.redirect_origin) as name,
             oa.redirect_origin,
             oa.bunker_public_key,
             oa.client_pubkey,
@@ -1354,7 +1314,6 @@ pub async fn list_sessions(
             oa.last_activity::text,
             oa.activity_count
          FROM oauth_authorizations oa
-         LEFT JOIN oauth_applications a ON oa.application_id = a.id
          JOIN users u ON oa.user_pubkey = u.pubkey
          WHERE oa.user_pubkey = $1
            AND u.tenant_id = $2
@@ -1368,10 +1327,9 @@ pub async fn list_sessions(
 
     let sessions = oauth_sessions
         .into_iter()
-        .map(|(name, app_id, redirect_origin, bunker_pubkey, client_pubkey, created_at, last_activity, activity_count)| {
+        .map(|(name, redirect_origin, bunker_pubkey, client_pubkey, created_at, last_activity, activity_count)| {
             BunkerSession {
                 application_name: name,
-                application_id: app_id,
                 redirect_origin,
                 bunker_pubkey,
                 client_pubkey,
@@ -1578,7 +1536,6 @@ pub async fn disconnect_client(
 #[derive(Debug, Serialize)]
 pub struct PermissionDetail {
     pub application_name: String,
-    pub application_id: i64,
     pub policy_name: String,
     pub policy_id: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1616,29 +1573,28 @@ pub async fn list_permissions(
 
     // Get OAuth authorizations with policy and permission details
     type AuthDataRow = (
-        i64, String, i64, String,
+        String, i64, String,
         Option<String>, Option<String>, Option<String>,  // policy slug, display_name, description
         String, String, Option<String>, Option<i64>
     );
     let auth_data: Vec<AuthDataRow> = sqlx::query_as(
         "SELECT
-            oa.application_id,
-            COALESCE(a.name, 'Personal Bunker') as app_name,
-            COALESCE(oa.policy_id, a.policy_id) as policy_id,
+            COALESCE(oa.client_id, oa.redirect_origin, 'Personal Bunker') as app_name,
+            COALESCE(oa.policy_id, 0) as policy_id,
             COALESCE(p.name, 'No Policy') as policy_name,
             p.slug as policy_slug,
             p.display_name as policy_display_name,
             p.description as policy_description,
-            oa.created_at,
+            oa.created_at::text,
             oa.secret,
-            oa.last_activity,
+            oa.last_activity::text,
             oa.activity_count::bigint
          FROM oauth_authorizations oa
-         LEFT JOIN oauth_applications a ON oa.application_id = a.id
-         LEFT JOIN policies p ON COALESCE(oa.policy_id, a.policy_id) = p.id
+         LEFT JOIN policies p ON oa.policy_id = p.id
          JOIN users u ON oa.user_pubkey = u.pubkey
          WHERE oa.user_pubkey = $1
            AND u.tenant_id = $2
+           AND oa.revoked_at IS NULL
          ORDER BY oa.created_at DESC"
     )
     .bind(&user_pubkey)
@@ -1648,7 +1604,7 @@ pub async fn list_permissions(
 
     let mut permissions = Vec::new();
 
-    for (app_id, app_name, policy_id, policy_name, policy_slug, policy_display_name, policy_description, created_at, secret, last_activity, activity_count) in auth_data {
+    for (app_name, policy_id, policy_name, policy_slug, policy_display_name, policy_description, created_at, secret, last_activity, activity_count) in auth_data {
         // Load permission displays using the Policy model (policies are now global)
         let permission_displays = if policy_id > 0 {
             use keycast_core::types::policy::Policy;
@@ -1717,7 +1673,6 @@ pub async fn list_permissions(
 
         permissions.push(PermissionDetail {
             application_name: app_name,
-            application_id: app_id,
             policy_name,
             policy_id,
             policy_slug,
@@ -2804,28 +2759,16 @@ mod tests {
             .await
             .unwrap();
 
-        // Insert OAuth application with unique redirect_origin
-        let app_id: i32 = sqlx::query_scalar(
-            "INSERT INTO oauth_applications (tenant_id, redirect_origin, client_secret, redirect_uris, name, created_at, updated_at)
-             VALUES (1, $1, 'test-secret', '[]', 'Test App', NOW(), NOW())
-             RETURNING id"
-        )
-        .bind(&redirect_origin)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-        // Insert OAuth authorization
+        // Insert OAuth authorization (client_id stored directly on oauth_authorizations)
         let bunker_keys = Keys::generate();
         let bunker_pubkey = bunker_keys.public_key().to_hex();
 
         sqlx::query(
-            "INSERT INTO oauth_authorizations (user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, 'test-secret', '[]', 1, NOW(), NOW())"
+            "INSERT INTO oauth_authorizations (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
+             VALUES ($1, $2, 'Test App', $3, 'test-secret', '[]', 1, NOW(), NOW())"
         )
         .bind(&user_pubkey)
         .bind(&redirect_origin)
-        .bind(app_id)
         .bind(&bunker_pubkey)
         .execute(&pool)
         .await

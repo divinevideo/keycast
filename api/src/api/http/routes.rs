@@ -150,6 +150,10 @@ pub fn api_routes(pool: PgPool, state: Arc<KeycastState>, auth_cors: tower_http:
             "/teams/:id/keys/:pubkey/authorizations",
             post(teams::add_authorization),
         )
+        .route(
+            "/teams/:id/keys/:pubkey/authorizations/:auth_id",
+            delete(teams::delete_authorization),
+        )
         .route("/teams/:id/policies", post(teams::add_policy))
         .with_state(pool);
 

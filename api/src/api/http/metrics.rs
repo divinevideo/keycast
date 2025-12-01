@@ -111,17 +111,17 @@ async fn collect_metrics(pool: &PgPool) -> Result<String, sqlx::Error> {
 
     output.push_str(&format!("keycast_signing_24h {}\n", recent_signing.0));
 
-    // Applications count
-    output.push_str("\n# HELP keycast_applications_total Total OAuth applications\n");
-    output.push_str("# TYPE keycast_applications_total gauge\n");
+    // Active authorizations count
+    output.push_str("\n# HELP keycast_authorizations_total Total active OAuth authorizations\n");
+    output.push_str("# TYPE keycast_authorizations_total gauge\n");
 
-    let apps_count: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM oauth_applications"
+    let auth_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM oauth_authorizations WHERE revoked_at IS NULL"
     )
     .fetch_one(pool)
     .await?;
 
-    output.push_str(&format!("keycast_applications_total {}\n", apps_count.0));
+    output.push_str(&format!("keycast_authorizations_total {}\n", auth_count.0));
 
     Ok(output)
 }

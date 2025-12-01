@@ -42,7 +42,7 @@ async function addTeammate() {
             "POST",
             user.pubkey,
             JSON.stringify({
-                user_public_key: ndkUser.pubkey,
+                user_pubkey: ndkUser.pubkey,
                 role,
             }),
         ).then(async (event) => {
@@ -58,7 +58,7 @@ async function addTeammate() {
                 api.post<User>(
                     `/teams/${id}/users`,
                     {
-                        user_public_key: ndkUser.pubkey,
+                        user_pubkey: ndkUser.pubkey,
                         role,
                     },
                     {
@@ -80,7 +80,7 @@ async function addTeammate() {
         api.post<User>(
             `/teams/${id}/users`,
             {
-                user_public_key: ndkUser.pubkey,
+                user_pubkey: ndkUser.pubkey,
                 role,
             },
             {

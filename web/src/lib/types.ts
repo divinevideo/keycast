@@ -2,13 +2,13 @@ export type StoredKey = {
     id: number;
     name: string;
     team_id: number;
-    public_key: string;
+    pubkey: string;
     created_at: Date;
     updated_at: Date;
 };
 
 export type User = {
-    user_public_key: string;
+    user_pubkey: string;
     role: "Admin" | "Member";
     created_at: Date;
     updated_at: Date;

@@ -35,22 +35,10 @@ async fn create_test_user(pool: &PgPool) -> String {
     user_pubkey
 }
 
-/// Helper to create a test OAuth app
-async fn create_test_app(pool: &PgPool, name: &str) -> (i32, String) {
+/// Helper to create a test app (returns client_id and redirect_origin)
+fn create_test_app_info(name: &str) -> (String, String) {
     let redirect_origin = format!("https://{}-{}.example.com", name, Uuid::new_v4());
-
-    let app_id: i32 = sqlx::query_scalar(
-        "INSERT INTO oauth_applications (name, redirect_origin, client_secret, redirect_uris, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, 'secret', '[]', 1, NOW(), NOW())
-         RETURNING id",
-    )
-    .bind(name)
-    .bind(&redirect_origin)
-    .fetch_one(pool)
-    .await
-    .unwrap();
-
-    (app_id, redirect_origin)
+    (name.to_string(), redirect_origin)
 }
 
 /// Test that multiple authorizations can exist for the same user+app combination.
@@ -59,7 +47,7 @@ async fn create_test_app(pool: &PgPool, name: &str) -> (i32, String) {
 async fn test_multiple_authorizations_per_app_allowed() {
     let pool = setup_pool().await;
     let user_pubkey = create_test_user(&pool).await;
-    let (app_id, redirect_origin) = create_test_app(&pool, "multi-device-test").await;
+    let (client_id, redirect_origin) = create_test_app_info("multi-device-test");
 
     // Create first authorization (Device A)
     let bunker_keys_1 = Keys::generate();
@@ -67,12 +55,12 @@ async fn test_multiple_authorizations_per_app_allowed() {
 
     sqlx::query(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
          VALUES ($1, $2, $3, $4, 'secret1', '[]', 1, NOW(), NOW())",
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin)
-    .bind(app_id)
+    .bind(&client_id)
     .bind(&bunker_pubkey_1)
     .execute(&pool)
     .await
@@ -85,12 +73,12 @@ async fn test_multiple_authorizations_per_app_allowed() {
 
     let result = sqlx::query(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
          VALUES ($1, $2, $3, $4, 'secret2', '[]', 1, NOW(), NOW())",
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin)
-    .bind(app_id)
+    .bind(&client_id)
     .bind(&bunker_pubkey_2)
     .execute(&pool)
     .await;
@@ -122,7 +110,7 @@ async fn test_multiple_authorizations_per_app_allowed() {
 async fn test_revoked_at_filtering() {
     let pool = setup_pool().await;
     let user_pubkey = create_test_user(&pool).await;
-    let (app_id, redirect_origin) = create_test_app(&pool, "revoke-test").await;
+    let (client_id, redirect_origin) = create_test_app_info("revoke-test");
 
     // Create two authorizations
     let bunker_keys_1 = Keys::generate();
@@ -133,13 +121,13 @@ async fn test_revoked_at_filtering() {
     // First auth - will be revoked
     let auth_id_1: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
          VALUES ($1, $2, $3, $4, 'secret1', '[]', 1, NOW(), NOW())
          RETURNING id",
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin)
-    .bind(app_id)
+    .bind(&client_id)
     .bind(&bunker_pubkey_1)
     .fetch_one(&pool)
     .await
@@ -148,12 +136,12 @@ async fn test_revoked_at_filtering() {
     // Second auth - will remain active
     sqlx::query(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
          VALUES ($1, $2, $3, $4, 'secret2', '[]', 1, NOW(), NOW())",
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin)
-    .bind(app_id)
+    .bind(&client_id)
     .bind(&bunker_pubkey_2)
     .execute(&pool)
     .await
@@ -204,7 +192,7 @@ async fn test_revoked_at_filtering() {
 async fn test_signer_daemon_filters_revoked() {
     let pool = setup_pool().await;
     let user_pubkey = create_test_user(&pool).await;
-    let (app_id, redirect_origin) = create_test_app(&pool, "signer-filter-test").await;
+    let (client_id, redirect_origin) = create_test_app_info("signer-filter-test");
 
     let bunker_keys = Keys::generate();
     let bunker_pubkey = bunker_keys.public_key().to_hex();
@@ -212,13 +200,13 @@ async fn test_signer_daemon_filters_revoked() {
     // Create and immediately revoke an authorization
     let auth_id: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at, revoked_at)
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at, revoked_at)
          VALUES ($1, $2, $3, $4, 'secret1', '[]', 1, NOW(), NOW(), NOW())
          RETURNING id",
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin)
-    .bind(app_id)
+    .bind(&client_id)
     .bind(&bunker_pubkey)
     .fetch_one(&pool)
     .await
@@ -303,7 +291,7 @@ async fn test_unique_constraint_removed() {
 async fn test_soft_delete_revoke() {
     let pool = setup_pool().await;
     let user_pubkey = create_test_user(&pool).await;
-    let (app_id, redirect_origin) = create_test_app(&pool, "soft-delete-test").await;
+    let (client_id, redirect_origin) = create_test_app_info("soft-delete-test");
 
     let bunker_keys = Keys::generate();
     let bunker_pubkey = bunker_keys.public_key().to_hex();
@@ -311,13 +299,13 @@ async fn test_soft_delete_revoke() {
     // Create authorization
     let auth_id: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
          VALUES ($1, $2, $3, $4, 'secret1', '[]', 1, NOW(), NOW())
          RETURNING id",
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin)
-    .bind(app_id)
+    .bind(&client_id)
     .bind(&bunker_pubkey)
     .fetch_one(&pool)
     .await
@@ -357,7 +345,7 @@ async fn test_soft_delete_revoke() {
 async fn test_auto_revoke_specific_auth_from_ucan() {
     let pool = setup_pool().await;
     let user_pubkey = create_test_user(&pool).await;
-    let (app_id, redirect_origin) = create_test_app(&pool, "auto-revoke-test").await;
+    let (client_id, redirect_origin) = create_test_app_info("auto-revoke-test");
 
     // Create first authorization (Device A)
     let bunker_keys_1 = Keys::generate();
@@ -365,13 +353,13 @@ async fn test_auto_revoke_specific_auth_from_ucan() {
 
     let auth_id_1: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
          VALUES ($1, $2, $3, $4, 'secret1', '[]', 1, NOW(), NOW())
          RETURNING id",
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin)
-    .bind(app_id)
+    .bind(&client_id)
     .bind(&bunker_pubkey_1)
     .fetch_one(&pool)
     .await
@@ -383,13 +371,13 @@ async fn test_auto_revoke_specific_auth_from_ucan() {
 
     let auth_id_2: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
          VALUES ($1, $2, $3, $4, 'secret2', '[]', 1, NOW(), NOW())
          RETURNING id",
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin)
-    .bind(app_id)
+    .bind(&client_id)
     .bind(&bunker_pubkey_2)
     .fetch_one(&pool)
     .await
@@ -413,13 +401,13 @@ async fn test_auto_revoke_specific_auth_from_ucan() {
 
     let _auth_id_3: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
          VALUES ($1, $2, $3, $4, 'secret3', '[]', 1, NOW(), NOW())
          RETURNING id",
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin)
-    .bind(app_id)
+    .bind(&client_id)
     .bind(&bunker_pubkey_3)
     .fetch_one(&pool)
     .await

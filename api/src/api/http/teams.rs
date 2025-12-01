@@ -75,7 +75,7 @@ pub async fn create_team(
         r#"
             INSERT INTO users (tenant_id, pubkey, created_at, updated_at)
             VALUES ($1, $2, NOW(), NOW())
-            ON CONFLICT (tenant_id, pubkey) DO NOTHING
+            ON CONFLICT (pubkey) DO NOTHING
             "#,
     )
     .bind(tenant_id)
@@ -99,12 +99,11 @@ pub async fn create_team(
     // Then, create the team_user relationship with admin role
     let team_user = sqlx::query_as::<_, TeamUser>(
         r#"
-            INSERT INTO team_users (tenant_id, team_id, user_pubkey, role, created_at, updated_at)
-            VALUES ($1, $2, $3, 'admin', NOW(), NOW())
+            INSERT INTO team_users (team_id, user_pubkey, role, created_at, updated_at)
+            VALUES ($1, $2, 'admin', NOW(), NOW())
             RETURNING *
             "#,
     )
-    .bind(tenant_id)
     .bind(team.id)
     .bind(&user_pubkey_hex)
     .fetch_one(&mut *tx)
@@ -223,7 +222,7 @@ pub async fn delete_team(
     sqlx::query(
         r#"
             DELETE FROM user_authorizations
-            WHERE tenant_id = $1 AND authorization_id IN (
+            WHERE authorization_id IN (
                 SELECT a.id
                 FROM authorizations a
                 JOIN stored_keys sk ON a.stored_key_id = sk.id
@@ -261,12 +260,11 @@ pub async fn delete_team(
     sqlx::query(
         r#"
             DELETE FROM policy_permissions
-            WHERE tenant_id = $1 AND policy_id IN (
-                SELECT id FROM policies WHERE tenant_id = $1 AND team_id = $2
+            WHERE policy_id IN (
+                SELECT id FROM policies WHERE team_id = $1
             )
             "#,
     )
-    .bind(tenant_id)
     .bind(team_id)
     .execute(&mut *tx)
     .await?;
@@ -275,30 +273,27 @@ pub async fn delete_team(
     sqlx::query(
         r#"
             DELETE FROM permissions
-            WHERE tenant_id = $1 AND id IN (
+            WHERE id IN (
                 SELECT permission_id
                 FROM policy_permissions
-                WHERE tenant_id = $1 AND policy_id IN (
-                    SELECT id FROM policies WHERE tenant_id = $1 AND team_id = $2
+                WHERE policy_id IN (
+                    SELECT id FROM policies WHERE team_id = $1
                 )
             )
             "#,
     )
-    .bind(tenant_id)
     .bind(team_id)
     .execute(&mut *tx)
     .await?;
 
     // Delete policies for this team
-    sqlx::query("DELETE FROM policies WHERE tenant_id = $1 AND team_id = $2")
-        .bind(tenant_id)
+    sqlx::query("DELETE FROM policies WHERE team_id = $1")
         .bind(team_id)
         .execute(&mut *tx)
         .await?;
 
     // Delete team_users
-    sqlx::query("DELETE FROM team_users WHERE tenant_id = $1 AND team_id = $2")
-        .bind(tenant_id)
+    sqlx::query("DELETE FROM team_users WHERE team_id = $1")
         .bind(team_id)
         .execute(&mut *tx)
         .await?;
@@ -334,10 +329,9 @@ pub async fn add_user(
     // Verify the user isn't already a member of the team
     if sqlx::query_as::<_, TeamUser>(
         r#"
-        SELECT * FROM team_users WHERE tenant_id = $1 AND team_id = $2 AND user_pubkey = $3
+        SELECT * FROM team_users WHERE team_id = $1 AND user_pubkey = $2
         "#,
     )
-    .bind(tenant_id)
     .bind(team_id)
     .bind(new_user_pubkey.to_hex())
     .fetch_optional(&mut *tx)
@@ -354,7 +348,7 @@ pub async fn add_user(
         r#"
         INSERT INTO users (tenant_id, pubkey, created_at, updated_at)
         VALUES ($1, $2, NOW(), NOW())
-        ON CONFLICT (tenant_id, pubkey) DO NOTHING
+        ON CONFLICT (pubkey) DO NOTHING
         "#,
     )
     .bind(tenant_id)
@@ -365,12 +359,11 @@ pub async fn add_user(
     // Then, insert the team_user relationship
     let team_user = sqlx::query_as::<_, TeamUser>(
         r#"
-        INSERT INTO team_users (tenant_id, team_id, user_pubkey, role, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, NOW(), NOW())
+        INSERT INTO team_users (team_id, user_pubkey, role, created_at, updated_at)
+        VALUES ($1, $2, $3, NOW(), NOW())
         RETURNING *
         "#,
     )
-    .bind(tenant_id)
     .bind(team_id)
     .bind(new_user_pubkey.to_hex())
     .bind(request.role)
@@ -399,8 +392,7 @@ pub async fn remove_user(
     // Check if the user is deleting themselves
     if user_pubkey_hex == removed_user_pubkey.to_hex() {
         // At least one admin has to remain in the team
-        let remaining_admin_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_users WHERE tenant_id = $1 AND team_id = $2 AND user_pubkey != $3 AND role = 'admin'")
-            .bind(tenant_id)
+        let remaining_admin_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_users WHERE team_id = $1 AND user_pubkey != $2 AND role = 'admin'")
             .bind(team_id)
             .bind(removed_user_pubkey.to_hex())
             .fetch_one(&mut *tx)
@@ -414,8 +406,7 @@ pub async fn remove_user(
     }
 
     // Delete the team_user relationship
-    sqlx::query("DELETE FROM team_users WHERE tenant_id = $1 AND team_id = $2 AND user_pubkey = $3")
-        .bind(tenant_id)
+    sqlx::query("DELETE FROM team_users WHERE team_id = $1 AND user_pubkey = $2")
         .bind(team_id)
         .bind(removed_user_pubkey.to_hex())
         .execute(&mut *tx)
@@ -497,7 +488,7 @@ pub async fn remove_key(
 
     // Delete all user_authorizations for this key using the correct stored_key_id
     sqlx::query(
-        "DELETE FROM user_authorizations WHERE tenant_id = $1 AND authorization_id IN (SELECT id FROM authorizations WHERE tenant_id = $1 AND stored_key_id = $2)"
+        "DELETE FROM user_authorizations WHERE authorization_id IN (SELECT id FROM authorizations WHERE tenant_id = $1 AND stored_key_id = $2)"
     )
     .bind(tenant_id)
     .bind(stored_key.id)
@@ -580,10 +571,9 @@ pub async fn get_key(
             r#"
                 SELECT *
                 FROM policies
-                WHERE tenant_id = $1 AND id = $2
+                WHERE id = $1
                 "#,
         )
-        .bind(tenant_id)
         .bind(auth.policy_id)
         .fetch_one(&mut *tx)
         .await?;
@@ -592,10 +582,9 @@ pub async fn get_key(
             r#"
                 SELECT user_pubkey, created_at, updated_at
                 FROM user_authorizations
-                WHERE tenant_id = $1 AND authorization_id = $2
+                WHERE authorization_id = $1
                 "#,
         )
-        .bind(tenant_id)
         .bind(auth.id)
         .fetch_all(&mut *tx)
         .await?;
@@ -644,10 +633,10 @@ pub async fn add_authorization(
     .fetch_one(&mut *tx)
     .await?;
 
-    // Verify policy exists
+    // Verify policy exists and belongs to this team
     let policy_exists =
-        sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM policies WHERE tenant_id = $1 AND id = $2)")
-            .bind(tenant_id)
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM policies WHERE team_id = $1 AND id = $2)")
+            .bind(team_id)
             .bind(request.policy_id)
             .fetch_one(&mut *tx)
             .await?;
@@ -695,6 +684,56 @@ pub async fn add_authorization(
     tx.commit().await?;
 
     Ok(Json(authorization))
+}
+
+pub async fn delete_authorization(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(pool): State<PgPool>,
+    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
+    Path((team_id, pubkey, auth_id)): Path<(i32, String, i32)>,
+) -> ApiResult<StatusCode> {
+    let tenant_id = tenant.0.id;
+    verify_admin(&pool, &user_pubkey_hex, team_id, tenant_id).await?;
+
+    let stored_key_public_key =
+        PublicKey::from_hex(&pubkey).map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+    let mut tx = pool.begin().await?;
+
+    // Verify stored key exists and belongs to this team
+    let stored_key = sqlx::query_as::<_, StoredKey>(
+        r#"SELECT * FROM stored_keys WHERE tenant_id = $1 AND team_id = $2 AND pubkey = $3"#,
+    )
+    .bind(tenant_id)
+    .bind(team_id)
+    .bind(stored_key_public_key.to_hex())
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::not_found("Stored key not found"))?;
+
+    // Delete user_authorizations first (foreign key constraint)
+    sqlx::query("DELETE FROM user_authorizations WHERE authorization_id = $1")
+        .bind(auth_id)
+        .execute(&mut *tx)
+        .await?;
+
+    // Delete the authorization (verify it belongs to the right stored key)
+    let result = sqlx::query(
+        r#"DELETE FROM authorizations WHERE tenant_id = $1 AND id = $2 AND stored_key_id = $3"#,
+    )
+    .bind(tenant_id)
+    .bind(auth_id)
+    .bind(stored_key.id)
+    .execute(&mut *tx)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found("Authorization not found"));
+    }
+
+    tx.commit().await?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn add_policy(

@@ -280,9 +280,8 @@ onMount(async () => {
 							<Key size={20} weight="fill" />
 						</div>
 						<div class="identity-info">
-							{@const displayPubkey = user ? formatPubkey(user.pubkey) : userNpub}
-							<span class="identity-value mono" title={displayPubkey}>
-								{displayPubkey.slice(0, 12)}...{displayPubkey.slice(-8)}
+							<span class="identity-value mono" title={formatPubkey(user.pubkey)}>
+								{formatPubkey(user.pubkey).slice(0, 12)}...{formatPubkey(user.pubkey).slice(-8)}
 							</span>
 							<button class="copy-btn" onclick={copyUserPubkey} title="Copy pubkey">
 								{#if copiedNpub}
@@ -339,9 +338,9 @@ onMount(async () => {
 							<p>diVine stores your encrypted key and signs on your behalf — similar to trusting Google or Apple with your data. This makes getting started easy.</p>
 							<p class="learn-subtle">Want more control? You can:</p>
 							<ul class="learn-list">
-								<li><a href="https://getalby.com" target="_blank" rel="noopener noreferrer">Alby <ArrowSquareOut size={12} /></a> or <a href="https://github.com/fiatjaf/nos2x" target="_blank" rel="noopener noreferrer">nos2x <ArrowSquareOut size={12} /></a> — browser extensions where your key never leaves your device</li>
+								<li><a href="https://getalby.com" target="_blank" rel="noopener noreferrer">Alby <ArrowSquareOut size={12} /></a>, <a href="https://chromewebstore.google.com/detail/soapboxpub-signer/nnodjkgakfpkckcnbacpcjbpmlmbihdd" target="_blank" rel="noopener noreferrer">Soapbox Signer (Chrome) <ArrowSquareOut size={12} /></a>, or <a href="https://addons.mozilla.org/en-US/firefox/addon/soapbox-pub-signer/" target="_blank" rel="noopener noreferrer">Soapbox Signer (Firefox) <ArrowSquareOut size={12} /></a> — browser extensions where your key never leaves your device</li>
+								<li><a href="https://apps.apple.com/app/nostash/id6499558903" target="_blank" rel="noopener noreferrer">Nostash <ArrowSquareOut size={12} /></a> — Safari extension for iOS users</li>
 								<li><a href="https://nsec.app" target="_blank" rel="noopener noreferrer">nsec.app <ArrowSquareOut size={12} /></a> — non-custodial signer, encrypted with your password</li>
-								<li><a href="https://nsecbunker.com" target="_blank" rel="noopener noreferrer">nsecBunker <ArrowSquareOut size={12} /></a> — self-host for full control</li>
 							</ul>
 						</div>
 
@@ -354,10 +353,10 @@ onMount(async () => {
 				{/if}
 			</section>
 
-			<!-- Connected Apps Section -->
+			<!-- App Connections Section -->
 			<section class="apps-section">
 				<div class="section-header">
-					<h2 class="section-title">Connected Apps</h2>
+					<h2 class="section-title">App Connections</h2>
 					<button class="btn-connect" onclick={() => (showCreateModal = true)}>
 						<PlusCircle size={18} />
 						<span>Connect to Nostr App</span>
@@ -366,7 +365,7 @@ onMount(async () => {
 
 				{#if sessions.length === 0}
 					<div class="empty-state">
-						<p>No apps connected yet.</p>
+						<p>No app connections yet.</p>
 						<p class="hint">
 							Connect your diVine Login to Nostr apps to sign in without sharing your private key.
 							<a href="https://nostr.how/en/get-started" target="_blank" rel="noopener noreferrer">Learn more</a>
@@ -917,7 +916,7 @@ onMount(async () => {
 		margin-top: 0.5rem !important;
 	}
 
-	/* Connected Apps Section */
+	/* App Connections Section */
 	.btn-connect {
 		display: inline-flex;
 		align-items: center;

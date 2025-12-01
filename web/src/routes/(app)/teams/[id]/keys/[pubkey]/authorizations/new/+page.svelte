@@ -69,7 +69,7 @@ $effect(() => {
                                     teamResponse as TeamWithRelations;
                                 team = teamWithRelations.team;
                                 key = teamWithRelations.stored_keys.find(
-                                    (key) => key.public_key === pubkey,
+                                    (key) => key.pubkey === pubkey,
                                 );
                                 policies = teamWithRelations.policies;
                             })
@@ -89,7 +89,7 @@ $effect(() => {
                         teamResponse as TeamWithRelations;
                     team = teamWithRelations.team;
                     key = teamWithRelations.stored_keys.find(
-                        (key) => key.public_key === pubkey,
+                        (key) => key.pubkey === pubkey,
                     );
                     policies = teamWithRelations.policies;
                 })
