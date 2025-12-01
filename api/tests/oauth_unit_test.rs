@@ -82,7 +82,7 @@ async fn test_authorization_code_expiration() {
     let redirect_origin = format!("https://test-{}.example.com", Uuid::new_v4());
 
     // Create user
-    sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())")
+    sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW()) ON CONFLICT (pubkey) DO NOTHING")
         .bind(&user_pubkey)
         .execute(&pool)
         .await
@@ -136,7 +136,7 @@ async fn test_authorization_code_one_time_use() {
     let redirect_origin = format!("https://test-{}.example.com", Uuid::new_v4());
 
     // Create user
-    sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())")
+    sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW()) ON CONFLICT (pubkey) DO NOTHING")
         .bind(&user_pubkey)
         .execute(&pool)
         .await
@@ -229,7 +229,7 @@ async fn test_multiple_authorizations_per_user() {
     let user_pubkey = user_keys.public_key().to_hex();
 
     // Create user
-    sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())")
+    sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW()) ON CONFLICT (pubkey) DO NOTHING")
         .bind(&user_pubkey)
         .execute(&pool)
         .await
@@ -342,7 +342,7 @@ async fn test_rpc_fast_path_works_with_any_oauth_app() {
     let tenant_id = 1i64;
 
     // Create user
-    sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, $2, NOW(), NOW())")
+    sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, $2, NOW(), NOW()) ON CONFLICT (pubkey) DO NOTHING")
         .bind(&user_pubkey)
         .bind(tenant_id)
         .execute(&pool)

@@ -1975,14 +1975,14 @@ async fn create_oauth_authorization_and_token(
     // Resolve policy from scope (policy:slug format)
     let policy_id = resolve_policy_from_scope(pool, application_id, scope).await?;
 
-    // Use ON CONFLICT to avoid duplicates per user/origin combination
-    // Re-authorization creates new bunker keys and secrets for same user+app combination
+    // Create new OAuth authorization - always INSERT (multi-device support)
+    // Each authorization is a separate "ticket" for one client/device
+    // Old authorizations remain valid until explicitly revoked
     // Note: bunker key is derived via HKDF from user secret, not stored
-    sqlx::query(
+    let auth_id: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations (tenant_id, user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, policy_id, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-         ON CONFLICT (tenant_id, user_pubkey, redirect_origin)
-         DO UPDATE SET bunker_public_key = $5, secret = $6, relays = $7, policy_id = $8, updated_at = $10"
+         RETURNING id"
     )
     .bind(tenant_id)
     .bind(user_pubkey)
@@ -1994,8 +1994,10 @@ async fn create_oauth_authorization_and_token(
     .bind(policy_id)
     .bind(Utc::now())
     .bind(Utc::now())
-    .execute(pool)
+    .fetch_one(pool)
     .await?;
+
+    tracing::info!("Created OAuth authorization {} for user {} app {}", auth_id, user_pubkey, redirect_origin);
 
     // Signal signer daemon to reload via channel (instant notification)
     if let Some(tx) = &auth_state.auth_tx {
@@ -2977,12 +2979,13 @@ pub async fn connect_post(
     let relays_json = serde_json::to_string(&vec![form.relay.clone()])
         .map_err(|e| OAuthError::InvalidRequest(format!("Failed to serialize relays: {}", e)))?;
 
-    sqlx::query(
+    // Create new OAuth authorization - always INSERT (multi-device support)
+    // Each nostr-login creates a NEW authorization for that client
+    let auth_id: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
          (tenant_id, user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, client_pubkey, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-         ON CONFLICT (tenant_id, user_pubkey, redirect_origin)
-         DO UPDATE SET bunker_public_key = $5, secret = $6, relays = $7, client_pubkey = $8, updated_at = $10"
+         RETURNING id"
     )
     .bind(tenant_id)
     .bind(&user_pubkey)
@@ -2994,8 +2997,10 @@ pub async fn connect_post(
     .bind(&form.client_pubkey)
     .bind(Utc::now())
     .bind(Utc::now())
-    .execute(&auth_state.state.db)
+    .fetch_one(&auth_state.state.db)
     .await?;
+
+    tracing::info!("Created nostr-login authorization {} for user {} app {}", auth_id, user_pubkey, redirect_origin);
 
     // Signal signer daemon to reload via channel (instant notification)
     if let Some(tx) = &auth_state.auth_tx {

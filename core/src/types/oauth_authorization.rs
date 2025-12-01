@@ -40,6 +40,9 @@ pub struct OAuthAuthorization {
     pub created_at: DateTime<chrono::Utc>,
     /// The date and time the authorization was last updated
     pub updated_at: DateTime<chrono::Utc>,
+    /// When the authorization was revoked (soft-delete for audit trail)
+    /// NULL means active, set timestamp means revoked
+    pub revoked_at: Option<DateTime<chrono::Utc>>,
 }
 
 impl OAuthAuthorization {
@@ -91,6 +94,8 @@ impl OAuthAuthorization {
         let authorizations = sqlx::query_scalar::<_, i32>(
             r#"
             SELECT id FROM oauth_authorizations
+            WHERE revoked_at IS NULL
+              AND (expires_at IS NULL OR expires_at > NOW())
             "#,
         )
         .fetch_all(pool)
@@ -102,6 +107,8 @@ impl OAuthAuthorization {
         let authorizations = sqlx::query_as::<_, (i64, i32)>(
             r#"
             SELECT tenant_id, id FROM oauth_authorizations
+            WHERE revoked_at IS NULL
+              AND (expires_at IS NULL OR expires_at > NOW())
             "#,
         )
         .fetch_all(pool)

@@ -120,8 +120,8 @@
 					</button>
 
 					<div class="warning-box">
-						<strong>Keep this URL secret!</strong>
-						<p>This bunker URL acts like a password. Only share it with the app you're connecting to. Anyone with this URL can request signatures from your identity.</p>
+						<strong>Save this URL now!</strong>
+						<p>This bunker URL acts like a password and is shown only once. Copy it now and paste it into your Nostr app. If you lose it, you can revoke this connection and create a new one.</p>
 					</div>
 				</div>
 			{:else}

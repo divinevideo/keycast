@@ -14,18 +14,18 @@ Production automatically uses JSON-formatted logs compatible with Cloud Logging:
 ### Viewing Logs
 ```bash
 # View recent logs
-gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=keycast-oauth" \
+gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=keycast" \
   --project=openvine-co \
   --limit=50 \
-  --format=json
+  --format='value(jsonPayload.fields.message)'
 
 # View error logs only
-gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=keycast-oauth AND severity>=ERROR" \
+gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=keycast AND severity>=ERROR" \
   --project=openvine-co \
   --limit=50
 
 # Tail logs in real-time
-gcloud alpha logging tail "resource.type=cloud_run_revision AND resource.labels.service_name=keycast-oauth" \
+gcloud alpha logging tail "resource.type=cloud_run_revision AND resource.labels.service_name=keycast" \
   --project=openvine-co
 ```
 
@@ -121,7 +121,7 @@ gcloud alpha monitoring uptime create \
 ## Dashboards
 
 ### Cloud Console Dashboards
-1. **Service Dashboard**: https://console.cloud.google.com/run/detail/us-central1/keycast-oauth
+1. **Service Dashboard**: https://console.cloud.google.com/run/detail/us-central1/keycast
 2. **Logs Explorer**: https://console.cloud.google.com/logs/query
 3. **Error Reporting**: https://console.cloud.google.com/errors
 4. **Metrics**: https://console.cloud.google.com/monitoring

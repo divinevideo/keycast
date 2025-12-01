@@ -692,6 +692,7 @@ fn validate_origin(origin: &str) -> Result<(), AuthError> {
 /// POST /user/bunker/create
 /// Manually create a new bunker connection for NIP-46 clients
 /// User can create multiple bunker connections for different apps
+/// If UCAN contains auth_id for the same redirect_origin, that authorization is auto-revoked
 pub async fn create_bunker(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
@@ -795,15 +796,15 @@ pub async fn create_bunker(
     let relays_json = serde_json::to_string(&relays)
         .map_err(|e| AuthError::Internal(format!("Failed to serialize relays: {}", e)))?;
 
-    // Create OAuth authorization
+    // Create OAuth authorization - always INSERT (multi-device support)
+    // Each "Accept" creates a NEW authorization, old ones remain valid until revoked
     // Note: bunker key is derived via HKDF from user secret, not stored
     let created_at = Utc::now();
-    sqlx::query(
+    let auth_id: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
          (tenant_id, user_pubkey, redirect_origin, application_id, bunker_public_key, secret, relays, policy_id, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-         ON CONFLICT (tenant_id, user_pubkey, redirect_origin)
-         DO UPDATE SET bunker_public_key = EXCLUDED.bunker_public_key, secret = EXCLUDED.secret, policy_id = EXCLUDED.policy_id, updated_at = EXCLUDED.updated_at"
+         RETURNING id"
     )
     .bind(tenant_id)
     .bind(&user_pubkey)
@@ -815,8 +816,10 @@ pub async fn create_bunker(
     .bind(policy_id)
     .bind(created_at)
     .bind(created_at)
-    .execute(pool)
+    .fetch_one(pool)
     .await?;
+
+    tracing::info!("Created new OAuth authorization {} for user {} app {}", auth_id, user_pubkey, redirect_origin);
 
     // Signal signer daemon to reload via channel (instant notification)
     if let Some(tx) = &auth_state.auth_tx {
@@ -1315,8 +1318,6 @@ pub struct BunkerSession {
     pub application_id: Option<i32>,
     pub redirect_origin: String,
     pub bunker_pubkey: String,
-    pub secret: String,
-    pub bunker_url: String,
     pub client_pubkey: Option<String>,
     pub created_at: String,
     pub last_activity: Option<String>,
@@ -1341,17 +1342,15 @@ pub async fn list_sessions(
 
     // Get OAuth authorizations with application details and activity stats
     // last_activity and activity_count are now columns on oauth_authorizations (updated on every NIP-46 method)
-    type OAuthSessionRow = (String, Option<i32>, String, String, String, String, String, Option<String>, Option<String>, i32);
+    type OAuthSessionRow = (String, Option<i32>, String, String, Option<String>, String, Option<String>, i32);
     let oauth_sessions: Vec<OAuthSessionRow> = sqlx::query_as(
         "SELECT
             COALESCE(a.name, oa.redirect_origin) as name,
             oa.application_id,
             oa.redirect_origin,
             oa.bunker_public_key,
-            oa.secret,
-            oa.relays,
-            oa.created_at::text,
             oa.client_pubkey,
+            oa.created_at::text,
             oa.last_activity::text,
             oa.activity_count
          FROM oauth_authorizations oa
@@ -1359,6 +1358,7 @@ pub async fn list_sessions(
          JOIN users u ON oa.user_pubkey = u.pubkey
          WHERE oa.user_pubkey = $1
            AND u.tenant_id = $2
+           AND oa.revoked_at IS NULL
          ORDER BY oa.created_at DESC"
     )
     .bind(&user_pubkey)
@@ -1368,23 +1368,12 @@ pub async fn list_sessions(
 
     let sessions = oauth_sessions
         .into_iter()
-        .map(|(name, app_id, redirect_origin, bunker_pubkey, secret, relays_json, created_at, client_pubkey, last_activity, activity_count)| {
-            // Parse relays JSON and construct bunker URL
-            let relays: Vec<String> = serde_json::from_str(&relays_json).unwrap_or_default();
-            let relay_params: String = relays
-                .iter()
-                .map(|r| format!("relay={}", urlencoding::encode(r)))
-                .collect::<Vec<_>>()
-                .join("&");
-            let bunker_url = format!("bunker://{}?{}&secret={}", bunker_pubkey, relay_params, secret);
-
+        .map(|(name, app_id, redirect_origin, bunker_pubkey, client_pubkey, created_at, last_activity, activity_count)| {
             BunkerSession {
                 application_name: name,
                 application_id: app_id,
                 redirect_origin,
                 bunker_pubkey,
-                secret,
-                bunker_url,
                 client_pubkey,
                 created_at,
                 last_activity,
@@ -1463,7 +1452,7 @@ pub async fn get_session_activity(
 
 #[derive(Debug, Deserialize)]
 pub struct RevokeSessionRequest {
-    pub secret: String,
+    pub bunker_pubkey: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1485,27 +1474,32 @@ pub async fn revoke_session(
     let tenant_id = tenant.0.id;
     tracing::info!("Revoking bunker session for user: {} in tenant: {}", user_pubkey, tenant_id);
 
-    // Get bunker_pubkey before deleting (needed for cache invalidation)
-    let bunker_pubkey: Option<String> = sqlx::query_scalar(
-        "SELECT bunker_public_key FROM oauth_authorizations
-         WHERE secret = $1 AND user_pubkey = $2
-         AND user_pubkey IN (SELECT pubkey FROM users WHERE tenant_id = $3)"
+    // Verify the authorization exists and belongs to this user
+    let exists: Option<(i32,)> = sqlx::query_as(
+        "SELECT 1 FROM oauth_authorizations
+         WHERE bunker_public_key = $1 AND user_pubkey = $2
+           AND revoked_at IS NULL
+           AND user_pubkey IN (SELECT pubkey FROM users WHERE tenant_id = $3)"
     )
-    .bind(&req.secret)
+    .bind(&req.bunker_pubkey)
     .bind(&user_pubkey)
     .bind(tenant_id)
     .fetch_optional(pool)
     .await?;
 
-    let bunker_pubkey = bunker_pubkey.ok_or(AuthError::InvalidToken)?;
+    if exists.is_none() {
+        return Err(AuthError::InvalidToken);
+    }
 
-    // Delete the authorization
+    // Soft-delete the authorization (set revoked_at for audit trail)
     sqlx::query(
-        "DELETE FROM oauth_authorizations
-         WHERE secret = $1 AND user_pubkey = $2
-         AND user_pubkey IN (SELECT pubkey FROM users WHERE tenant_id = $3)"
+        "UPDATE oauth_authorizations
+         SET revoked_at = NOW(), updated_at = NOW()
+         WHERE bunker_public_key = $1 AND user_pubkey = $2
+           AND revoked_at IS NULL
+           AND user_pubkey IN (SELECT pubkey FROM users WHERE tenant_id = $3)"
     )
-    .bind(&req.secret)
+    .bind(&req.bunker_pubkey)
     .bind(&user_pubkey)
     .bind(tenant_id)
     .execute(pool)
@@ -1515,7 +1509,7 @@ pub async fn revoke_session(
     if let Some(tx) = &auth_state.auth_tx {
         use keycast_core::authorization_channel::AuthorizationCommand;
         if let Err(e) = tx.send(AuthorizationCommand::Remove {
-            bunker_pubkey,
+            bunker_pubkey: req.bunker_pubkey.clone(),
         }).await {
             tracing::error!("Failed to send authorization remove command: {}", e);
         } else {
@@ -1533,7 +1527,7 @@ pub async fn revoke_session(
 
 #[derive(Debug, Deserialize)]
 pub struct DisconnectClientRequest {
-    pub secret: String,
+    pub bunker_pubkey: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1558,11 +1552,12 @@ pub async fn disconnect_client(
     let result = sqlx::query(
         "UPDATE oauth_authorizations
          SET connected_client_pubkey = NULL, connected_at = NULL, updated_at = $1
-         WHERE secret = $2 AND user_pubkey = $3
-         AND user_pubkey IN (SELECT pubkey FROM users WHERE tenant_id = $4)"
+         WHERE bunker_public_key = $2 AND user_pubkey = $3
+           AND revoked_at IS NULL
+           AND user_pubkey IN (SELECT pubkey FROM users WHERE tenant_id = $4)"
     )
     .bind(Utc::now())
-    .bind(&req.secret)
+    .bind(&req.bunker_pubkey)
     .bind(&user_pubkey)
     .bind(tenant_id)
     .execute(&pool)
@@ -2803,7 +2798,7 @@ mod tests {
         let redirect_origin = format!("https://test-{}.app", uuid::Uuid::new_v4());
 
         // Insert test user
-        sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())")
+        sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW()) ON CONFLICT (pubkey) DO NOTHING")
             .bind(&user_pubkey)
             .execute(&pool)
             .await
@@ -2886,7 +2881,7 @@ mod tests {
         let encrypted_secret = key_manager.encrypt(&user_secret_bytes).await.unwrap();
 
         // Insert test user
-        sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())")
+        sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW()) ON CONFLICT (pubkey) DO NOTHING")
             .bind(&user_pubkey)
             .execute(&pool)
             .await
@@ -2944,7 +2939,7 @@ mod tests {
         let user_pubkey = user_keys.public_key().to_hex();
 
         // Insert user but NO OAuth authorization
-        sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())")
+        sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW()) ON CONFLICT (pubkey) DO NOTHING")
             .bind(&user_pubkey)
             .execute(&pool)
             .await

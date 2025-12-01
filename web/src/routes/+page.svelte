@@ -31,7 +31,6 @@ let copiedNpub = $state(false);
 let expandedSessions = $state<Set<string>>(new Set());
 let showRevokeModal = $state(false);
 let sessionToRevoke = $state<BunkerSession | null>(null);
-let copiedBunkerUrl = $state<string | null>(null);
 let showLearnMore = $state(false);
 let pubkeyFormat = $state<'hex' | 'npub'>('npub');
 let copiedPubkey = $state<string | null>(null);
@@ -114,34 +113,25 @@ async function loadSessions() {
 	}
 }
 
-async function copyNpub() {
+async function copyUserPubkey() {
+	if (!user) return;
 	try {
-		await navigator.clipboard.writeText(userNpub);
+		const formatted = formatPubkey(user.pubkey);
+		await navigator.clipboard.writeText(formatted);
 		copiedNpub = true;
-		toast.success('Copied to clipboard');
+		toast.success(`${pubkeyFormat === 'npub' ? 'npub' : 'Hex pubkey'} copied!`);
 		setTimeout(() => (copiedNpub = false), 2000);
 	} catch (err) {
 		toast.error('Failed to copy');
 	}
 }
 
-async function copyBunkerUrl(bunkerUrl: string) {
-	try {
-		await navigator.clipboard.writeText(bunkerUrl);
-		copiedBunkerUrl = bunkerUrl;
-		toast.success('Bunker URL copied!');
-		setTimeout(() => (copiedBunkerUrl = null), 2000);
-	} catch (err) {
-		toast.error('Failed to copy');
-	}
-}
-
-function toggleSession(secret: string) {
+function toggleSession(bunkerPubkey: string) {
 	const newSet = new Set(expandedSessions);
-	if (newSet.has(secret)) {
-		newSet.delete(secret);
+	if (newSet.has(bunkerPubkey)) {
+		newSet.delete(bunkerPubkey);
 	} else {
-		newSet.add(secret);
+		newSet.add(bunkerPubkey);
 	}
 	expandedSessions = newSet;
 }
@@ -156,18 +146,18 @@ function confirmRevoke(session: BunkerSession) {
 	showRevokeModal = true;
 }
 
-async function revokeSession(secret: string, appName: string) {
+async function revokeSession(bunkerPubkey: string, appName: string) {
 	try {
 		let authHeaders: Record<string, string> = {};
 
 		if (authMethod === 'nip07' && ndk.signer) {
-			const body = JSON.stringify({ secret });
+			const body = JSON.stringify({ bunker_pubkey: bunkerPubkey });
 			const authEvent = await api.buildUnsignedAuthEvent('/user/sessions/revoke', 'POST', user!.pubkey, body);
 			await authEvent?.sign();
 			authHeaders.Authorization = `Nostr ${btoa(JSON.stringify(authEvent))}`;
 		}
 
-		await api.post('/user/sessions/revoke', { secret }, { headers: authHeaders });
+		await api.post('/user/sessions/revoke', { bunker_pubkey: bunkerPubkey }, { headers: authHeaders });
 		toast.success(`Revoked access for ${appName}`);
 		showRevokeModal = false;
 		sessionToRevoke = null;
@@ -290,15 +280,23 @@ onMount(async () => {
 							<Key size={20} weight="fill" />
 						</div>
 						<div class="identity-info">
-							<span class="identity-value mono" title={userNpub}>
-								{userNpub.slice(0, 12)}...{userNpub.slice(-8)}
+							{@const displayPubkey = user ? formatPubkey(user.pubkey) : userNpub}
+							<span class="identity-value mono" title={displayPubkey}>
+								{displayPubkey.slice(0, 12)}...{displayPubkey.slice(-8)}
 							</span>
-							<button class="copy-btn" onclick={copyNpub} title="Copy full npub">
+							<button class="copy-btn" onclick={copyUserPubkey} title="Copy pubkey">
 								{#if copiedNpub}
 									<Check size={16} />
 								{:else}
 									<Copy size={16} />
 								{/if}
+							</button>
+							<button
+								class="format-toggle-identity"
+								onclick={() => pubkeyFormat = pubkeyFormat === 'hex' ? 'npub' : 'hex'}
+								title="Switch between npub and hex format"
+							>
+								{pubkeyFormat === 'hex' ? 'npub' : 'hex'}
 							</button>
 							<a href="https://nostr.how/en/get-started" target="_blank" rel="noopener noreferrer" class="learn-link" title="What's an npub?">
 								?
@@ -377,9 +375,9 @@ onMount(async () => {
 				{:else}
 					<div class="apps-list">
 						{#each sessions as session}
-							{@const isExpanded = expandedSessions.has(session.secret)}
+							{@const isExpanded = expandedSessions.has(session.bunker_pubkey)}
 							<div class="app-card" class:expanded={isExpanded}>
-								<button class="app-header" onclick={() => toggleSession(session.secret)}>
+								<button class="app-header" onclick={() => toggleSession(session.bunker_pubkey)}>
 									<div class="app-info">
 										<p class="app-name">{session.application_name}</p>
 										<p class="app-meta">
@@ -478,18 +476,6 @@ onMount(async () => {
 										</div>
 										<div class="app-actions">
 											<button
-												class="btn-copy-bunker"
-												onclick={(e) => { e.stopPropagation(); copyBunkerUrl(session.bunker_url); }}
-											>
-												{#if copiedBunkerUrl === session.bunker_url}
-													<Check size={16} />
-													Copied!
-												{:else}
-													<Copy size={16} />
-													Copy Bunker URL
-												{/if}
-											</button>
-											<button
 												class="btn-revoke"
 												onclick={(e) => { e.stopPropagation(); confirmRevoke(session); }}
 											>
@@ -570,7 +556,7 @@ onMount(async () => {
 					</button>
 					<button
 						class="btn-confirm-revoke"
-						onclick={() => sessionToRevoke && revokeSession(sessionToRevoke.secret, sessionToRevoke.application_name)}
+						onclick={() => sessionToRevoke && revokeSession(sessionToRevoke.bunker_pubkey, sessionToRevoke.application_name)}
 					>
 						Revoke Access
 					</button>
@@ -752,6 +738,24 @@ onMount(async () => {
 	.copy-btn:hover {
 		color: var(--color-divine-green);
 		background: var(--color-divine-muted);
+	}
+
+	.format-toggle-identity {
+		font-size: 0.65rem;
+		padding: 0.125rem 0.375rem;
+		background: var(--color-divine-muted);
+		border: 1px solid var(--color-divine-border);
+		border-radius: 4px;
+		color: var(--color-divine-text-tertiary);
+		cursor: pointer;
+		transition: all 0.2s;
+		text-transform: lowercase;
+	}
+
+	.format-toggle-identity:hover {
+		background: var(--color-divine-green-muted);
+		color: var(--color-divine-green);
+		border-color: var(--color-divine-green);
 	}
 
 	.learn-link {
@@ -1136,25 +1140,6 @@ onMount(async () => {
 		display: flex;
 		justify-content: flex-end;
 		gap: 0.5rem;
-	}
-
-	.btn-copy-bunker {
-		display: inline-flex;
-		align-items: center;
-		gap: 0.375rem;
-		padding: 0.375rem 0.75rem;
-		background: transparent;
-		color: var(--color-divine-green);
-		border: 1px solid var(--color-divine-green);
-		border-radius: 9999px;
-		font-size: 0.8rem;
-		cursor: pointer;
-		transition: all 0.2s;
-	}
-
-	.btn-copy-bunker:hover {
-		background: var(--color-divine-green);
-		color: #fff;
 	}
 
 	.btn-revoke {

@@ -121,7 +121,9 @@ impl AuthorizationHandler {
 
         let existing: Option<(i32, Option<String>)> = sqlx::query_as(
             "SELECT id, connected_client_pubkey FROM oauth_authorizations
-             WHERE bunker_public_key = $1 AND secret = $2"
+             WHERE bunker_public_key = $1 AND secret = $2
+               AND revoked_at IS NULL
+               AND (expires_at IS NULL OR expires_at > NOW())"
         )
         .bind(&bunker_pubkey)
         .bind(provided_secret)
@@ -186,10 +188,12 @@ impl AuthorizationHandler {
 
         let bunker_pubkey = self.bunker_keys.public_key().to_hex();
 
-        // Check if this client is the connected client for any authorization with this bunker pubkey
+        // Check if this client is the connected client for any active authorization with this bunker pubkey
         let is_valid: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM oauth_authorizations
-             WHERE bunker_public_key = $1 AND connected_client_pubkey = $2)"
+             WHERE bunker_public_key = $1 AND connected_client_pubkey = $2
+               AND revoked_at IS NULL
+               AND (expires_at IS NULL OR expires_at > NOW()))"
         )
         .bind(&bunker_pubkey)
         .bind(client_pubkey)
@@ -199,11 +203,13 @@ impl AuthorizationHandler {
         if is_valid {
             Ok(())
         } else {
-            // Check if there's any authorization with NULL connected_client_pubkey
+            // Check if there's any active authorization with NULL connected_client_pubkey
             // If so, this client hasn't connected yet
             let has_unconnected: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM oauth_authorizations
-                 WHERE bunker_public_key = $1 AND connected_client_pubkey IS NULL)"
+                 WHERE bunker_public_key = $1 AND connected_client_pubkey IS NULL
+                   AND revoked_at IS NULL
+                   AND (expires_at IS NULL OR expires_at > NOW()))"
             )
             .bind(&bunker_pubkey)
             .fetch_one(&self.pool)
@@ -237,10 +243,12 @@ impl AuthorizationHandler {
 
         let bunker_pubkey = self.bunker_keys.public_key().to_hex();
 
-        // Check if this client is already the connected client
+        // Check if this client is already the connected client for an active auth
         let is_valid: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM oauth_authorizations
-             WHERE bunker_public_key = $1 AND connected_client_pubkey = $2)"
+             WHERE bunker_public_key = $1 AND connected_client_pubkey = $2
+               AND revoked_at IS NULL
+               AND (expires_at IS NULL OR expires_at > NOW()))"
         )
         .bind(&bunker_pubkey)
         .bind(client_pubkey)
@@ -251,10 +259,12 @@ impl AuthorizationHandler {
             return Ok(());
         }
 
-        // Check if there's an unconnected authorization we can claim
+        // Check if there's an unconnected active authorization we can claim
         let unconnected_id: Option<i32> = sqlx::query_scalar(
             "SELECT id FROM oauth_authorizations
              WHERE bunker_public_key = $1 AND connected_client_pubkey IS NULL
+               AND revoked_at IS NULL
+               AND (expires_at IS NULL OR expires_at > NOW())
              LIMIT 1"
         )
         .bind(&bunker_pubkey)
@@ -527,9 +537,12 @@ impl UnifiedSigner {
         is_oauth: bool,
     ) -> SignerResult<()> {
         if is_oauth {
-            // Load OAuth authorization
+            // Load active OAuth authorization (filter out revoked/expired)
             let auth: Option<OAuthAuthorization> = sqlx::query_as(
-                "SELECT * FROM oauth_authorizations WHERE bunker_public_key = $1 AND tenant_id = $2"
+                "SELECT * FROM oauth_authorizations
+                 WHERE bunker_public_key = $1 AND tenant_id = $2
+                   AND revoked_at IS NULL
+                   AND (expires_at IS NULL OR expires_at > NOW())"
             )
             .bind(bunker_pubkey)
             .bind(tenant_id)
@@ -687,6 +700,8 @@ impl UnifiedSigner {
                     r#"
                     SELECT * FROM oauth_authorizations
                     WHERE bunker_public_key = $1
+                      AND revoked_at IS NULL
+                      AND (expires_at IS NULL OR expires_at > NOW())
                     "#
                 )
                 .bind(bunker_pubkey)
@@ -1260,9 +1275,11 @@ impl UnifiedSigner {
         let bunker_pubkey: Option<String> = sqlx::query_scalar(
             "SELECT bunker_public_key FROM oauth_authorizations
              WHERE user_pubkey = $1
-             AND application_id = (
-                 SELECT id FROM oauth_applications WHERE redirect_origin = 'app://keycast-login'
-             )
+               AND revoked_at IS NULL
+               AND (expires_at IS NULL OR expires_at > NOW())
+               AND application_id = (
+                   SELECT id FROM oauth_applications WHERE redirect_origin = 'app://keycast-login'
+               )
              ORDER BY created_at DESC
              LIMIT 1"
         )

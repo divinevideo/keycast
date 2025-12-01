@@ -262,17 +262,17 @@ gcloud run services replace signer-service-deploy.yaml \
 **Monitor:**
 ```bash
 # View logs
-gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=keycast-signer" \
+gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=keycast" \
   --project=openvine-co \
   --limit=50 \
-  --format=json
+  --format='value(jsonPayload.fields.message)'
 
 # Tail logs
-gcloud alpha logging tail "resource.type=cloud_run_revision AND resource.labels.service_name=keycast-signer" \
+gcloud alpha logging tail "resource.type=cloud_run_revision AND resource.labels.service_name=keycast" \
   --project=openvine-co
 
 # Check service status
-gcloud run services describe keycast-signer \
+gcloud run services describe keycast \
   --region=us-central1 \
   --project=openvine-co
 ```

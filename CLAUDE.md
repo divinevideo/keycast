@@ -74,14 +74,19 @@ cd api && cargo test --test oauth_unit_test
 The web admin supports three authentication methods, all converging to unified NIP-98 request signing:
 
 1. **NIP-07 Browser Extension**: For whitelisted team admins with browser extension (nos2x, Alby, etc.)
-2. **Email/Password**: For personal users, returns bunker URL stored in localStorage
+2. **Email/Password**: For personal users, sets UCAN session cookie (bunker created separately)
 3. **NIP-46 Bunker URL**: For power users with existing bunker URLs (dogfooding)
 
 **Unified Flow**: All methods → Bunker URL credential → BunkerSigner → NIP-98 signed requests
 
 **Authentication Architecture**:
-- Email login creates `oauth_authorization` for app="keycast-web-admin"
-- Returns bunker URL: `bunker://<user_pubkey>?relay=<relay>&secret=<secret>`
+- Email login/register creates user in `users` table and stores encrypted keys in `personal_keys`
+- Returns UCAN session token (set as `keycast_session` HttpOnly cookie)
+- UCAN contains: tenant_id, email, redirect_origin (no oauth_authorization created yet)
+- OAuth authorizations (`oauth_authorizations`) are created later via:
+  - Third-party OAuth flow: `/api/oauth/token` creates authorization when app exchanges code
+  - Manual bunker creation: User explicitly creates bunker via `/user/bunker/create`
+- Each authorization has its own bunker keypair (derived via HKDF) and connection secret
 - Frontend uses nostr-tools BunkerSigner to sign NIP-98 auth headers
 - All authenticated API requests include NIP-98 signature in Authorization header
 - Backend extracts pubkey from NIP-98 event, validates signature
@@ -111,7 +116,7 @@ Key tables:
 - `permissions`: Custom permission configurations (JSON)
 - `policy_permissions`: Links policies to permissions
 - `authorizations`: NIP-46 remote signing credentials for team keys
-- `oauth_authorizations`: OAuth-based personal auth with NIP-46 support
+- `oauth_authorizations`: OAuth-based personal auth with NIP-46 support (supports multi-device: each approval creates new authorization, uses `revoked_at` for soft-delete)
 
 ### Custom Permissions System
 
@@ -146,8 +151,9 @@ The `keycast_signer` binary (`signer/src/main.rs`) is a unified NIP-46 signer da
 Key endpoints (see `api/src/api/http/routes.rs`):
 
 **Authentication (First-Party)**:
-- `/api/auth/register`: Register with email/password, optional nsec import, returns bunker URL
-- `/api/auth/login`: Login with email/password, returns bunker URL for NIP-98 signing
+- `/api/auth/register`: Register with email/password, optional nsec import, sets UCAN session cookie
+- `/api/auth/login`: Login with email/password, sets UCAN session cookie
+- `/api/auth/logout`: Clears session cookie
 - CORS: Restrictive (ALLOWED_ORIGINS env var)
 
 **OAuth (Third-Party)**:
@@ -193,7 +199,7 @@ Development (`.env` in `/web`):
 
 ## Deployment
 
-Production runs on a GCP Compute Engine VM (`keycast-oauth-vm`) to ensure the NIP-46 signer runs as a singleton (avoiding race conditions with multiple instances).
+Production runs on Google Cloud Run as service `keycast` with `min-instances=1` to ensure the NIP-46 signer runs continuously.
 
 ### Deploy to Production
 
@@ -204,35 +210,29 @@ bun run deploy  # or: pnpm run deploy:gcp
 This runs Cloud Build which:
 1. Builds Docker image
 2. Pushes to Artifact Registry
-3. SSHs to VM and restarts container
+3. Deploys to Cloud Run
 4. Runs smoke tests
 
 ### Architecture
 
-- **VM:** `keycast-oauth-vm` (us-central1-a, e2-standard-2)
+- **Service:** `keycast` (Cloud Run, us-central1)
 - **URL:** https://login.divine.video
-- **SSL:** Cloudflare proxy → Caddy (Origin CA cert) → Docker (localhost:3000)
 - **Database:** Cloud SQL PostgreSQL (`keycast-db`)
 - **Secrets:** GCP Secret Manager
 
-### Manual VM Access
+### View Logs
 
 ```bash
-gcloud compute ssh keycast-oauth-vm --zone=us-central1-a --project=openvine-co
+# View recent logs
+pnpm run logs
 
-# View logs
-docker logs keycast -f
+# Stream logs continuously
+pnpm run logs:watch
 
-# Restart container
-docker restart keycast
+# Or via gcloud directly
+gcloud logging read 'resource.type=cloud_run_revision AND resource.labels.service_name=keycast' \
+  --limit=50 --project=openvine-co --format='value(jsonPayload.fields.message)'
 ```
-
-### VM Setup (one-time)
-
-The VM has:
-- Docker with keycast container (port 127.0.0.1:3000)
-- Caddy reverse proxy (port 443 with Cloudflare Origin CA cert)
-- Certs at `/etc/caddy/certs/origin.crt` and `/etc/caddy/certs/origin.key`
 
 ## Notes
 
