@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use keycast_core::authorization_channel::{AuthorizationReceiver, AuthorizationCommand};
 use keycast_core::encryption::KeyManager;
 use keycast_core::hashring::SignerHashRing;
+use keycast_core::metrics::METRICS;
 use keycast_core::signing_handler::{SigningHandler, SignerHandlersCache};
 use keycast_core::types::authorization::Authorization;
 use keycast_core::types::oauth_authorization::OAuthAuthorization;
@@ -677,6 +678,7 @@ impl UnifiedSigner {
         {
             let ring = hashring.lock().await;
             if !ring.should_handle(bunker_pubkey) {
+                METRICS.inc_nip46_rejected_hashring();
                 tracing::trace!(
                     "Hashring: bunker {} assigned to another instance, skipping",
                     bunker_pubkey
@@ -685,14 +687,20 @@ impl UnifiedSigner {
             }
         }
 
+        // Count all requests that pass hashring check (our responsibility)
+        METRICS.inc_nip46_request();
         tracing::trace!("Received NIP-46 request for bunker: {}", bunker_pubkey);
 
         // Check if this bunker pubkey is in cache (concurrent LRU)
         let handler = handlers.get(bunker_pubkey).await;
 
         let handler = match handler {
-            Some(h) => h,
+            Some(h) => {
+                METRICS.inc_cache_hit();
+                h
+            }
             None => {
+                METRICS.inc_cache_miss();
                 // Not in cache - check database (on-demand loading)
                 tracing::trace!("Bunker {} not in cache, checking database", bunker_pubkey);
 
@@ -814,6 +822,7 @@ impl UnifiedSigner {
                             },
                             None => {
                                 // Not in any database table - not our bunker
+                                METRICS.inc_nip46_handler_not_found();
                                 tracing::trace!("Bunker {} not found in any database, ignoring", bunker_pubkey);
                                 return Ok(());
                             }
@@ -1090,6 +1099,10 @@ impl UnifiedSigner {
         })?;
 
         tracing::info!("Sent NIP-46 response for request {} (send_result: {:?})", event.id, send_result);
+
+        // Count successful processing and update cache size metric
+        METRICS.inc_nip46_processed();
+        METRICS.set_cache_size(handlers.entry_count());
 
         Ok(())
     }

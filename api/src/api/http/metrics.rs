@@ -3,6 +3,7 @@ use axum::{
     http::{header, StatusCode},
     response::{IntoResponse, Response},
 };
+use keycast_core::metrics::METRICS;
 use sqlx::PgPool;
 
 /// GET /metrics - Prometheus-formatted metrics endpoint
@@ -13,11 +14,17 @@ pub async fn metrics(
     let metrics = collect_metrics(&pool).await;
 
     match metrics {
-        Ok(body) => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
-            .body(body)
-            .unwrap(),
+        Ok(mut body) => {
+            // Append runtime metrics (cache, NIP-46 requests)
+            body.push_str("\n# Runtime metrics (reset on restart)\n");
+            body.push_str(&METRICS.to_prometheus());
+
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
+                .body(body)
+                .unwrap()
+        }
         Err(e) => {
             tracing::error!("Failed to collect metrics: {}", e);
             Response::builder()
