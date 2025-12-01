@@ -299,7 +299,9 @@ impl AuthorizationHandler {
 }
 
 /// Default LRU cache capacity for authorization handlers
-const DEFAULT_HANDLER_CACHE_SIZE: usize = 10_000;
+/// At ~1KB per handler, 1M handlers ≈ 1GB memory
+/// This is a hard cap - moka evicts LRU entries when full
+const DEFAULT_HANDLER_CACHE_SIZE: usize = 1_000_000;
 
 pub struct UnifiedSigner {
     handlers: Cache<String, AuthorizationHandler>, // bunker_pubkey -> handler (concurrent LRU cache, internal use)
