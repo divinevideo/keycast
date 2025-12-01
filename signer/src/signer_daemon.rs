@@ -5,7 +5,7 @@ use crate::error::{SignerError, SignerResult};
 use async_trait::async_trait;
 use keycast_core::authorization_channel::{AuthorizationReceiver, AuthorizationCommand};
 use keycast_core::encryption::KeyManager;
-use keycast_core::hashring::HashRing;
+use keycast_core::hashring::SignerHashRing;
 use keycast_core::signing_handler::{SigningHandler, SignerHandlersCache};
 use keycast_core::types::authorization::Authorization;
 use keycast_core::types::oauth_authorization::OAuthAuthorization;
@@ -307,7 +307,7 @@ pub struct UnifiedSigner {
     client: Client,
     pool: PgPool,
     key_manager: Arc<Box<dyn KeyManager>>,
-    hashring: Arc<Mutex<HashRing>>,
+    hashring: Arc<Mutex<SignerHashRing>>,
     auth_rx: Option<AuthorizationReceiver>,
 }
 
@@ -317,7 +317,7 @@ impl UnifiedSigner {
         pool: PgPool,
         key_manager: Box<dyn KeyManager>,
         auth_rx: AuthorizationReceiver,
-        hashring: Arc<Mutex<HashRing>>,
+        hashring: Arc<Mutex<SignerHashRing>>,
     ) -> SignerResult<Self> {
         let client = Client::default();
 
@@ -656,7 +656,7 @@ impl UnifiedSigner {
         event: Box<Event>,
         pool: &PgPool,
         key_manager: &Arc<Box<dyn KeyManager>>,
-        hashring: &Arc<Mutex<HashRing>>,
+        hashring: &Arc<Mutex<SignerHashRing>>,
     ) -> SignerResult<()> {
         // SINGLE SUBSCRIPTION ARCHITECTURE:
         // We receive ALL kind 24133 events from the relay (no pubkey filter)
@@ -1170,11 +1170,11 @@ impl AuthorizationHandler {
         event_id: &str,
         source: &str,
     ) -> SignerResult<()> {
-        // Get user public key and application ID
-        let (user_pubkey, application_id, client_pubkey, bunker_secret) = if self.is_oauth {
+        // Get user public key and client pubkey
+        let (user_pubkey, client_pubkey, bunker_secret) = if self.is_oauth {
             // For OAuth, look up the oauth_authorization
-            let oauth_auth: (String, Option<i64>, Option<String>, String) = sqlx::query_as(
-                "SELECT user_pubkey, application_id, client_pubkey, secret
+            let oauth_auth: (String, Option<String>, String) = sqlx::query_as(
+                "SELECT user_pubkey, client_pubkey, secret
                  FROM oauth_authorizations
                  WHERE tenant_id = $1 AND id = $2"
             )
@@ -1205,7 +1205,7 @@ impl AuthorizationHandler {
             .fetch_one(&self.pool)
             .await?;
 
-            (stored_key.0, None, None, bunker_secret)
+            (stored_key.0, None, bunker_secret)
         };
 
         // Truncate content for storage (don't store huge amounts of text)
@@ -1218,11 +1218,10 @@ impl AuthorizationHandler {
         // Insert signing activity
         sqlx::query(
             "INSERT INTO signing_activity
-             (user_pubkey, application_id, bunker_secret, event_kind, event_content, event_id, client_pubkey, tenant_id, source, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())"
+             (user_pubkey, bunker_secret, event_kind, event_content, event_id, client_pubkey, tenant_id, source, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())"
         )
         .bind(&user_pubkey)
-        .bind(application_id)
         .bind(&bunker_secret)
         .bind(event_kind as i32)
         .bind(&truncated_content)
@@ -1265,21 +1264,18 @@ impl AuthorizationHandler {
 }
 
 impl UnifiedSigner {
-    /// Get authorization handler for a user's keycast-login session
+    /// Get authorization handler for a user's OAuth session
     /// Returns cached handler if available (fast path), otherwise None
     pub async fn get_handler_for_user(
         &self,
         user_pubkey: &str,
     ) -> SignerResult<Option<AuthorizationHandler>> {
-        // Find user's keycast-login OAuth authorization
+        // Find any active OAuth authorization for this user
         let bunker_pubkey: Option<String> = sqlx::query_scalar(
             "SELECT bunker_public_key FROM oauth_authorizations
              WHERE user_pubkey = $1
                AND revoked_at IS NULL
                AND (expires_at IS NULL OR expires_at > NOW())
-               AND application_id = (
-                   SELECT id FROM oauth_applications WHERE redirect_origin = 'app://keycast-login'
-               )
              ORDER BY created_at DESC
              LIMIT 1"
         )
@@ -1448,7 +1444,7 @@ mod tests {
             keycast_core::encryption::file_key_manager::FileKeyManager::new().unwrap()
         );
         let (_tx, rx) = tokio::sync::mpsc::channel(100);
-        let hashring = Arc::new(Mutex::new(HashRing::new("test-instance".to_string())));
+        let hashring = Arc::new(Mutex::new(SignerHashRing::new("test-instance".to_string())));
         let signer = UnifiedSigner::new(pool, key_manager, rx, hashring).await.unwrap();
 
         let user_pubkey = Keys::generate().public_key().to_hex();
@@ -1470,7 +1466,7 @@ mod tests {
             keycast_core::encryption::file_key_manager::FileKeyManager::new().unwrap()
         );
         let (_tx, rx) = tokio::sync::mpsc::channel(100);
-        let hashring = Arc::new(Mutex::new(HashRing::new("test-instance".to_string())));
+        let hashring = Arc::new(Mutex::new(SignerHashRing::new("test-instance".to_string())));
         let signer = UnifiedSigner::new(pool.clone(), key_manager, rx, hashring).await.unwrap();
 
         // Act - clone handlers (moka Cache uses internal Arc, clones are cheap and share data)

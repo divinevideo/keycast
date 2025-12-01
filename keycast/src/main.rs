@@ -8,7 +8,7 @@ use keycast_core::database::Database;
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::gcp_key_manager::GcpKeyManager;
 use keycast_core::encryption::KeyManager;
-use keycast_core::hashring::HashRing;
+use keycast_core::hashring::SignerHashRing;
 use keycast_core::instance_registry::InstanceRegistry;
 use keycast_signer::UnifiedSigner;
 use nostr_sdk::Keys;
@@ -142,7 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("✔︎ Registered signer instance: {}", instance_id);
 
     // Initialize hashring with just this instance for now
-    let hashring = Arc::new(Mutex::new(HashRing::new(instance_id.clone())));
+    let hashring = Arc::new(Mutex::new(SignerHashRing::new(instance_id.clone())));
     {
         let mut ring = hashring.lock().await;
         ring.rebuild(vec![instance_id.clone()]);

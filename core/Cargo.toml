@@ -30,4 +30,4 @@ tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
 urlencoding = "2.1"
 uuid = { workspace = true }
-siphasher = "1.0"
+anchorhash = "0.2"

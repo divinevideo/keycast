@@ -1,74 +1,119 @@
-use siphasher::sip::SipHasher24;
-use std::collections::BTreeMap;
-use std::hash::{Hash, Hasher};
+use anchorhash::{AnchorHash, Builder};
+use std::collections::HashSet;
+use std::hash::{BuildHasherDefault, DefaultHasher};
 
-const VIRTUAL_NODES: usize = 150;
+// Use a deterministic hasher so all instances agree on key->node mapping
+type DeterministicHasher = BuildHasherDefault<DefaultHasher>;
 
-pub struct HashRing {
-    ring: BTreeMap<u64, String>,
+/// Wrapper around anchorhash for consistent hashing of bunker pubkeys to signer instances.
+///
+/// Uses AnchorHash algorithm which provides:
+/// - Guaranteed optimal disruption (minimal key remapping on node changes)
+/// - Extremely fast lookups (10s-100s of millions per second)
+/// - Low memory footprint
+/// - Uniform load distribution
+pub struct SignerHashRing {
+    anchor: Option<AnchorHash<u64, String, DeterministicHasher>>,
     my_instance_id: String,
+    current_instances: HashSet<String>,
 }
 
-impl HashRing {
+impl SignerHashRing {
     pub fn new(my_instance_id: String) -> Self {
         Self {
-            ring: BTreeMap::new(),
+            anchor: None,
             my_instance_id,
+            current_instances: HashSet::new(),
         }
     }
 
+    /// Rebuild the ring with a new set of instance IDs.
+    ///
+    /// Since we get a fresh sorted list from PostgreSQL every 5 seconds,
+    /// we rebuild the AnchorHash from scratch for simplicity and correctness.
     pub fn rebuild(&mut self, instance_ids: Vec<String>) {
-        self.ring.clear();
-        for id in instance_ids {
-            for i in 0..VIRTUAL_NODES {
-                let key = format!("{}:{}", id, i);
-                let hash = self.hash_key(&key);
-                self.ring.insert(hash, id.clone());
-            }
+        let new_instances: HashSet<String> = instance_ids.iter().cloned().collect();
+
+        // Only rebuild if the instance set actually changed
+        if new_instances == self.current_instances {
+            return;
         }
+
+        self.current_instances = new_instances;
+
+        if instance_ids.is_empty() {
+            self.anchor = None;
+            return;
+        }
+
+        // Build AnchorHash with capacity for the current number of instances
+        // The capacity parameter is the maximum number of resources the anchor can hold (u16)
+        // Use deterministic hasher so all signer instances agree on key->node mapping
+        let capacity = instance_ids.len().max(16).min(u16::MAX as usize) as u16;
+        self.anchor = Some(
+            Builder::with_hasher(DeterministicHasher::default())
+                .with_resources(instance_ids)
+                .build(capacity),
+        );
     }
 
+    /// Check if this instance should handle the given key (bunker pubkey).
+    ///
+    /// Uses the key's hash to consistently map to an instance.
     pub fn should_handle(&self, key: &str) -> bool {
-        if self.ring.is_empty() {
+        if self.current_instances.is_empty() {
+            // No instances registered - handle everything (solo mode)
             return true;
         }
-        let hash = self.hash_key(key);
-        let owner = self
-            .ring
-            .range(hash..)
-            .next()
-            .or_else(|| self.ring.iter().next())
-            .map(|(_, id)| id.as_str());
-        owner == Some(&self.my_instance_id)
+
+        match &self.anchor {
+            Some(anchor) => {
+                // Hash the key to u64 for anchorhash lookup
+                let key_hash = Self::hash_key(key);
+                match anchor.get_resource(key_hash) {
+                    Some(owner) => owner == &self.my_instance_id,
+                    None => true, // No owner found - handle it
+                }
+            }
+            None => true, // No anchor configured - handle everything
+        }
     }
 
     pub fn instance_id(&self) -> &str {
         &self.my_instance_id
     }
 
-    fn hash_key(&self, key: &str) -> u64 {
-        let mut hasher = SipHasher24::new();
-        key.hash(&mut hasher);
-        hasher.finish()
+    /// Hash a string key to u64 using FNV-1a for speed and good distribution.
+    #[inline]
+    fn hash_key(key: &str) -> u64 {
+        // FNV-1a hash - fast and good distribution for strings
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+
+        let mut hash = FNV_OFFSET;
+        for byte in key.bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
     #[test]
     fn test_solo_instance_handles_all() {
-        let ring = HashRing::new("instance-1".to_string());
+        let ring = SignerHashRing::new("instance-1".to_string());
         assert!(ring.should_handle("any-pubkey"));
         assert!(ring.should_handle("another-pubkey"));
     }
 
     #[test]
     fn test_two_instances_split_work() {
-        let mut ring1 = HashRing::new("instance-1".to_string());
-        let mut ring2 = HashRing::new("instance-2".to_string());
+        let mut ring1 = SignerHashRing::new("instance-1".to_string());
+        let mut ring2 = SignerHashRing::new("instance-2".to_string());
 
         let instances = vec!["instance-1".to_string(), "instance-2".to_string()];
         ring1.rebuild(instances.clone());
@@ -94,7 +139,7 @@ mod tests {
 
     #[test]
     fn test_consistent_assignment() {
-        let mut ring = HashRing::new("instance-1".to_string());
+        let mut ring = SignerHashRing::new("instance-1".to_string());
         ring.rebuild(vec![
             "instance-1".to_string(),
             "instance-2".to_string(),
@@ -117,9 +162,9 @@ mod tests {
             "instance-3".to_string(),
         ];
 
-        let mut ring1 = HashRing::new("instance-1".to_string());
-        let mut ring2 = HashRing::new("instance-2".to_string());
-        let mut ring3 = HashRing::new("instance-3".to_string());
+        let mut ring1 = SignerHashRing::new("instance-1".to_string());
+        let mut ring2 = SignerHashRing::new("instance-2".to_string());
+        let mut ring3 = SignerHashRing::new("instance-3".to_string());
 
         ring1.rebuild(instances.clone());
         ring2.rebuild(instances.clone());
@@ -139,14 +184,14 @@ mod tests {
 
     #[test]
     fn test_scale_up_minimal_remapping() {
-        let mut ring_before = HashRing::new("instance-1".to_string());
+        let mut ring_before = SignerHashRing::new("instance-1".to_string());
         ring_before.rebuild(vec![
             "instance-1".to_string(),
             "instance-2".to_string(),
             "instance-3".to_string(),
         ]);
 
-        let mut ring_after = HashRing::new("instance-1".to_string());
+        let mut ring_after = SignerHashRing::new("instance-1".to_string());
         ring_after.rebuild(vec![
             "instance-1".to_string(),
             "instance-2".to_string(),
@@ -164,7 +209,7 @@ mod tests {
             }
         }
 
-        // With consistent hashing, ~75% should remain unchanged (only ~25% remap to new instance)
+        // AnchorHash guarantees optimal disruption: ~75% should remain unchanged
         let unchanged_pct = (unchanged as f64 / total as f64) * 100.0;
         assert!(
             unchanged_pct > 60.0,
@@ -175,7 +220,7 @@ mod tests {
 
     #[test]
     fn test_scale_down_minimal_remapping() {
-        let mut ring_before = HashRing::new("instance-1".to_string());
+        let mut ring_before = SignerHashRing::new("instance-1".to_string());
         ring_before.rebuild(vec![
             "instance-1".to_string(),
             "instance-2".to_string(),
@@ -183,7 +228,7 @@ mod tests {
             "instance-4".to_string(),
         ]);
 
-        let mut ring_after = HashRing::new("instance-1".to_string());
+        let mut ring_after = SignerHashRing::new("instance-1".to_string());
         ring_after.rebuild(vec![
             "instance-1".to_string(),
             "instance-2".to_string(),
@@ -200,7 +245,7 @@ mod tests {
             }
         }
 
-        // With consistent hashing, ~75% should remain unchanged
+        // AnchorHash guarantees optimal disruption: ~75% should remain unchanged
         let unchanged_pct = (unchanged as f64 / total as f64) * 100.0;
         assert!(
             unchanged_pct > 60.0,
@@ -213,10 +258,10 @@ mod tests {
     fn test_ten_instances_even_distribution() {
         let instances: Vec<String> = (1..=10).map(|i| format!("instance-{}", i)).collect();
 
-        let rings: Vec<HashRing> = instances
+        let rings: Vec<SignerHashRing> = instances
             .iter()
             .map(|id| {
-                let mut ring = HashRing::new(id.clone());
+                let mut ring = SignerHashRing::new(id.clone());
                 ring.rebuild(instances.clone());
                 ring
             })
@@ -251,33 +296,48 @@ mod tests {
     }
 
     #[test]
-    fn test_rebuild_clears_old_state() {
-        let mut ring = HashRing::new("instance-1".to_string());
+    fn test_rebuild_with_different_instances() {
+        // Test that rebuilding with a different instance set works correctly
+        let mut ring1 = SignerHashRing::new("instance-1".to_string());
+        let mut ring2 = SignerHashRing::new("instance-2".to_string());
+        let mut ringx = SignerHashRing::new("instance-X".to_string());
 
-        ring.rebuild(vec!["instance-1".to_string(), "instance-2".to_string()]);
-        let handled_before: HashSet<String> = (0..100)
-            .map(|i| format!("pubkey-{}", i))
-            .filter(|k| ring.should_handle(k))
-            .collect();
+        // First configuration: instance-1 and instance-2
+        ring1.rebuild(vec!["instance-1".to_string(), "instance-2".to_string()]);
+        ring2.rebuild(vec!["instance-1".to_string(), "instance-2".to_string()]);
 
-        // Rebuild with completely different instances
-        ring.rebuild(vec!["instance-1".to_string(), "instance-X".to_string()]);
-        let handled_after: HashSet<String> = (0..100)
-            .map(|i| format!("pubkey-{}", i))
-            .filter(|k| ring.should_handle(k))
-            .collect();
+        // Second configuration: instance-1 and instance-X
+        let mut ring1_after = SignerHashRing::new("instance-1".to_string());
+        ringx.rebuild(vec!["instance-1".to_string(), "instance-X".to_string()]);
+        ring1_after.rebuild(vec!["instance-1".to_string(), "instance-X".to_string()]);
 
-        // Distribution should change significantly
-        let overlap = handled_before.intersection(&handled_after).count();
-        assert!(
-            overlap < handled_before.len(),
-            "Rebuild should change key distribution"
-        );
+        // Verify each key has exactly one owner in both configurations
+        for i in 0..100 {
+            let pubkey = format!("pubkey-{}", i);
+
+            // Config 1: exactly one of instance-1 or instance-2
+            let owners_before = [ring1.should_handle(&pubkey), ring2.should_handle(&pubkey)];
+            assert_eq!(
+                owners_before.iter().filter(|&&x| x).count(),
+                1,
+                "Key {} should have exactly 1 owner in config 1",
+                pubkey
+            );
+
+            // Config 2: exactly one of instance-1 or instance-X
+            let owners_after = [ring1_after.should_handle(&pubkey), ringx.should_handle(&pubkey)];
+            assert_eq!(
+                owners_after.iter().filter(|&&x| x).count(),
+                1,
+                "Key {} should have exactly 1 owner in config 2",
+                pubkey
+            );
+        }
     }
 
     #[test]
     fn test_empty_ring_handles_all() {
-        let mut ring = HashRing::new("instance-1".to_string());
+        let mut ring = SignerHashRing::new("instance-1".to_string());
         // Don't call rebuild - ring is empty
         assert!(ring.should_handle("any-key"));
         assert!(ring.should_handle("another-key"));
@@ -300,9 +360,9 @@ mod tests {
             "instance-3".to_string(),
         ];
 
-        let mut ring1 = HashRing::new("instance-1".to_string());
-        let mut ring2 = HashRing::new("instance-2".to_string());
-        let mut ring3 = HashRing::new("instance-3".to_string());
+        let mut ring1 = SignerHashRing::new("instance-1".to_string());
+        let mut ring2 = SignerHashRing::new("instance-2".to_string());
+        let mut ring3 = SignerHashRing::new("instance-3".to_string());
 
         ring1.rebuild(instances.clone());
         ring2.rebuild(instances.clone());
@@ -325,5 +385,27 @@ mod tests {
             let owner_count = owners.iter().filter(|&&x| x).count();
             assert_eq!(owner_count, 1, "Pubkey {} should have exactly 1 owner", pubkey);
         }
+    }
+
+    #[test]
+    fn test_rebuild_skips_unchanged() {
+        let mut ring = SignerHashRing::new("instance-1".to_string());
+
+        let instances = vec!["instance-1".to_string(), "instance-2".to_string()];
+        ring.rebuild(instances.clone());
+
+        // Get a reference to verify it's the same anchor after no-op rebuild
+        let handled_before: Vec<bool> = (0..10)
+            .map(|i| ring.should_handle(&format!("key-{}", i)))
+            .collect();
+
+        // Rebuild with same instances (should be a no-op)
+        ring.rebuild(instances);
+
+        let handled_after: Vec<bool> = (0..10)
+            .map(|i| ring.should_handle(&format!("key-{}", i)))
+            .collect();
+
+        assert_eq!(handled_before, handled_after, "No-op rebuild should preserve assignments");
     }
 }
