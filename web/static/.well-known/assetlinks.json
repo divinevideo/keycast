@@ -1,0 +1,18 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "co.openvine.keycast_flutter_demo",
+      "sha256_cert_fingerprints": []
+    }
+  },
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "co.openvine.divine",
+      "sha256_cert_fingerprints": []
+    }
+  }
+]

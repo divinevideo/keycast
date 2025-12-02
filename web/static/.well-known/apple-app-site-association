@@ -1,0 +1,29 @@
+{
+  "applinks": {
+    "apps": [],
+    "details": [
+      {
+        "appIDs": [
+          "GZCZBKH7MY.co.openvine.keycastFlutterDemo",
+          "GZCZBKH7MY.co.openvine.divine"
+        ],
+        "components": [
+          {
+            "/": "/app/callback",
+            "comment": "OAuth callback for native apps"
+          },
+          {
+            "/": "/app/callback/*",
+            "comment": "OAuth callback with path params"
+          }
+        ]
+      }
+    ]
+  },
+  "webcredentials": {
+    "apps": [
+      "GZCZBKH7MY.co.openvine.keycastFlutterDemo",
+      "GZCZBKH7MY.co.openvine.divine"
+    ]
+  }
+}
