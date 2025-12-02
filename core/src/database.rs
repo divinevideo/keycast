@@ -6,6 +6,14 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::time::sleep;
 
+// Pool configuration constants - tune these based on Cloud SQL tier
+// db-f1-micro: ~25 max connections (0.6GB RAM)
+// db-g1-small: ~100 max connections (1.7GB RAM)
+// db-n1-standard-1: ~250 max connections (3.75GB RAM)
+const MAX_CONNECTIONS_PER_INSTANCE: u32 = 2;
+const ACQUIRE_TIMEOUT_SECS: u64 = 60;
+const MAX_CONNECTION_ATTEMPTS: u32 = 5;
+
 #[derive(Error, Debug)]
 pub enum DatabaseError {
     #[error("Database not initialized")]
@@ -28,14 +36,72 @@ impl Database {
         let database_url =
             env::var("DATABASE_URL").expect("DATABASE_URL must be set for PostgreSQL");
 
-        eprintln!("🐘 Using PostgreSQL database");
-        eprintln!("Connecting to database...");
+        let instance_id = env::var("K_REVISION").unwrap_or_else(|_| "local".to_string());
 
-        let pool = PgPoolOptions::new()
-            .acquire_timeout(Duration::from_secs(10))
-            .max_connections(20)
-            .connect(&database_url)
-            .await?;
+        eprintln!("🐘 Database pool config:");
+        eprintln!("   Instance: {}", instance_id);
+        eprintln!(
+            "   Max connections per instance: {}",
+            MAX_CONNECTIONS_PER_INSTANCE
+        );
+        eprintln!("   Acquire timeout: {}s", ACQUIRE_TIMEOUT_SECS);
+        eprintln!("   ⚠️  If PoolTimedOut errors occur, check:");
+        eprintln!("      - Cloud SQL max_connections (db-f1-micro ≈ 25)");
+        eprintln!(
+            "      - Number of Cloud Run instances × {} = total connections",
+            MAX_CONNECTIONS_PER_INSTANCE
+        );
+        eprintln!("      - Total must be < Cloud SQL max_connections");
+
+        // With Moka cache (1M entries), DB is rarely hit in steady state.
+        // Connections mainly used for: startup load, new OAuth, cache misses.
+        // Keep pool small to allow more Cloud Run instances.
+        let pool_options = PgPoolOptions::new()
+            .acquire_timeout(Duration::from_secs(ACQUIRE_TIMEOUT_SECS))
+            .max_connections(MAX_CONNECTIONS_PER_INSTANCE);
+
+        // Retry connection with exponential backoff for Cloud SQL proxy startup race
+        let mut connection_attempts = 0;
+        let pool = loop {
+            connection_attempts += 1;
+            match pool_options.clone().connect(&database_url).await {
+                Ok(pool) => break pool,
+                Err(e) if connection_attempts < MAX_CONNECTION_ATTEMPTS => {
+                    let delay = Duration::from_millis(500 * (1 << connection_attempts));
+                    eprintln!(
+                        "⏳ Database connection attempt {}/{} failed: {}",
+                        connection_attempts, MAX_CONNECTION_ATTEMPTS, e
+                    );
+                    eprintln!("   Retrying in {:?}...", delay);
+                    sleep(delay).await;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "❌ Database connection failed after {} attempts",
+                        MAX_CONNECTION_ATTEMPTS
+                    );
+                    eprintln!("   Error: {}", e);
+                    if e.to_string().contains("PoolTimedOut") {
+                        eprintln!(
+                            "   🔍 DIAGNOSIS: PoolTimedOut usually means connection exhaustion."
+                        );
+                        eprintln!("      Cloud SQL db-f1-micro has ~25 max connections.");
+                        eprintln!(
+                            "      With {} conn/instance, max {} instances can connect.",
+                            MAX_CONNECTIONS_PER_INSTANCE,
+                            25 / MAX_CONNECTIONS_PER_INSTANCE
+                        );
+                        eprintln!("      Solutions:");
+                        eprintln!("        1. Reduce min-instances in Cloud Run");
+                        eprintln!(
+                            "        2. Upgrade Cloud SQL tier (db-g1-small has ~100 connections)"
+                        );
+                        eprintln!("        3. Reduce MAX_CONNECTIONS_PER_INSTANCE in database.rs");
+                    }
+                    return Err(e.into());
+                }
+            }
+        };
 
         // Run migrations
         eprintln!("Running migrations...");
