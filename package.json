@@ -17,7 +17,9 @@
 		"logs:watch": "./scripts/logs-watch.sh",
 		"db:reset": "sqlx database reset --database-url postgres://postgres:password@localhost/keycast --source ./database/migrations",
 		"key:generate": "./scripts/generate_key.sh",
-		"key:generate:force": "./scripts/generate_key.sh --force"
+		"key:generate:force": "./scripts/generate_key.sh --force",
+		"setup:hooks": "cp scripts/hooks/pre-push .git/hooks/ && chmod +x .git/hooks/pre-push",
+		"check": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets --all-features -- -D warnings -A deprecated && cargo test --workspace"
 	},
 	"devDependencies": {
 		"concurrently": "^9.1.2",

@@ -1,0 +1,21 @@
+#!/bin/bash
+# Pre-push hook: runs the same checks as CI before allowing push
+# Install: cp scripts/hooks/pre-push .git/hooks/ && chmod +x .git/hooks/pre-push
+
+set -e
+
+echo "Running pre-push checks..."
+
+echo "→ Checking Rust formatting..."
+cargo fmt --all -- --check
+
+echo "→ Running clippy..."
+cargo clippy --workspace --all-targets --all-features -- -D warnings -A deprecated
+
+echo "→ Running tests..."
+cargo test --workspace
+
+echo "→ Building release..."
+cargo build --release --workspace
+
+echo "✓ All checks passed!"
