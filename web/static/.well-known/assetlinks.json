@@ -1,5 +1,6 @@
 [
   {
+    "_comment": "TODO: Add sha256_cert_fingerprints for production Android builds. Get with: keytool -list -v -keystore release.keystore",
     "relation": ["delegate_permission/common.handle_all_urls"],
     "target": {
       "namespace": "android_app",
