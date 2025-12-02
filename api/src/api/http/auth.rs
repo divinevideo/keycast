@@ -79,11 +79,13 @@ pub(crate) async fn generate_ucan_token(
 /// Generate server-signed UCAN for users without personal keys yet
 /// Used during OAuth registration before keys are created
 /// redirect_origin identifies which app/authorization this token is for
+/// bunker_pubkey uniquely identifies the authorization for direct cache lookup
 pub(crate) async fn generate_server_signed_ucan(
     user_pubkey: &nostr_sdk::PublicKey,
     tenant_id: i64,
     email: &str,
     redirect_origin: &str,
+    bunker_pubkey: Option<&str>,
     server_keys: &Keys,
 ) -> Result<String, AuthError> {
     use crate::ucan_auth::{NostrKeyMaterial, nostr_pubkey_to_did};
@@ -93,11 +95,14 @@ pub(crate) async fn generate_server_signed_ucan(
     let server_key_material = NostrKeyMaterial::from_keys(server_keys.clone());
     let user_did = nostr_pubkey_to_did(user_pubkey);
 
-    let facts = json!({
+    let mut facts = json!({
         "tenant_id": tenant_id,
         "email": email,
         "redirect_origin": redirect_origin,
     });
+    if let Some(bpk) = bunker_pubkey {
+        facts["bunker_pubkey"] = json!(bpk);
+    }
 
     let ucan = UcanBuilder::default()
         .issued_by(&server_key_material)  // Server issues
@@ -324,19 +329,20 @@ impl From<bcrypt::BcryptError> for AuthError {
 
 /// Extract user public key from UCAN token in Authorization header or cookie
 pub(crate) fn extract_user_from_token(headers: &HeaderMap) -> Result<String, AuthError> {
-    let (pubkey, _redirect_origin) = extract_user_and_origin_from_token(headers)?;
+    let (pubkey, _redirect_origin, _bunker_pubkey) = extract_user_and_origin_from_token(headers)?;
     Ok(pubkey)
 }
 
-/// Extract user public key AND redirect_origin from UCAN token in Authorization header or cookie
+/// Extract user public key, redirect_origin, and bunker_pubkey from UCAN token in Authorization header or cookie
 /// redirect_origin identifies which app/authorization this token is for
-pub(crate) fn extract_user_and_origin_from_token(headers: &HeaderMap) -> Result<(String, String), AuthError> {
+/// bunker_pubkey uniquely identifies the authorization for direct cache lookup (optional)
+pub(crate) fn extract_user_and_origin_from_token(headers: &HeaderMap) -> Result<(String, String, Option<String>), AuthError> {
     // Try Bearer token first
     if let Some(auth_header) = headers.get("Authorization") {
         let auth_str = auth_header.to_str().map_err(|_| AuthError::InvalidToken)?;
 
         if auth_str.starts_with("Bearer ") {
-            // Validate UCAN token and extract user pubkey and redirect_origin
+            // Validate UCAN token and extract user pubkey, redirect_origin, and bunker_pubkey
             return crate::ucan_auth::extract_user_from_ucan(headers, 0)
                 .map_err(|_| AuthError::InvalidToken);
         }
@@ -345,13 +351,13 @@ pub(crate) fn extract_user_and_origin_from_token(headers: &HeaderMap) -> Result<
     // Fall back to cookie-based UCAN
     if let Some(token) = extract_ucan_from_cookie(headers) {
         // Parse UCAN from string using ucan_auth helper (tenant validation done by caller)
-        let (pubkey, redirect_origin, _ucan) = crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), 0)
+        let (pubkey, redirect_origin, bunker_pubkey, _ucan) = crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), 0)
             .map_err(|e| {
                 tracing::warn!("UCAN parse error from cookie: {}", e);
                 AuthError::InvalidToken
             })?;
 
-        Ok((pubkey, redirect_origin))
+        Ok((pubkey, redirect_origin, bunker_pubkey))
     } else {
         Err(AuthError::MissingToken)
     }
@@ -831,7 +837,7 @@ pub async fn get_bunker_url(
     headers: HeaderMap,
 ) -> Result<Json<BunkerUrlResponse>, AuthError> {
     // Extract user pubkey AND redirect_origin from UCAN token
-    let (user_pubkey, redirect_origin) = extract_user_and_origin_from_token(&headers)?;
+    let (user_pubkey, redirect_origin, _bunker_pubkey) = extract_user_and_origin_from_token(&headers)?;
     let tenant_id = tenant.0.id;
     tracing::info!("Fetching bunker URL for user: {} origin: {} in tenant: {}", user_pubkey, redirect_origin, tenant_id);
 
@@ -1996,7 +2002,7 @@ pub async fn sign_event(
     headers: HeaderMap,
     Json(req): Json<SignEventRequest>,
 ) -> Result<Json<SignEventResponse>, AuthError> {
-    let (user_pubkey, redirect_origin) = extract_user_and_origin_from_token(&headers)?;
+    let (user_pubkey, redirect_origin, _bunker_pubkey) = extract_user_and_origin_from_token(&headers)?;
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
     let tenant_id = tenant.0.id;

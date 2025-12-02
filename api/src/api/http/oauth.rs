@@ -43,17 +43,36 @@ pub fn extract_nsec_from_verifier_public(verifier: &str) -> Option<String> {
 /// Extract origin (scheme + host + optional port) from a redirect_uri
 /// Examples: "https://example.com/callback" -> "https://example.com"
 ///           "http://localhost:3000/auth" -> "http://localhost:3000"
+///
+/// Security: HTTP is only allowed for localhost/127.0.0.1/[::1].
+/// All other hosts require HTTPS.
 pub fn extract_origin(redirect_uri: &str) -> Result<String, OAuthError> {
     use nostr_sdk::Url;
     let url = Url::parse(redirect_uri)
         .map_err(|_| OAuthError::InvalidRequest("Invalid redirect_uri".to_string()))?;
 
+    let scheme = url.scheme();
     let host = url.host_str()
         .ok_or(OAuthError::InvalidRequest("redirect_uri missing host".to_string()))?;
 
+    // Security: Only allow http:// for localhost development
+    let is_localhost = host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "::1";
+    if scheme == "http" && !is_localhost {
+        return Err(OAuthError::InvalidRequest(
+            "HTTPS required for non-localhost redirect_uri".to_string()
+        ));
+    }
+
+    // Only allow http or https schemes
+    if scheme != "http" && scheme != "https" {
+        return Err(OAuthError::InvalidRequest(
+            "redirect_uri must use http or https scheme".to_string()
+        ));
+    }
+
     let origin = match url.port() {
-        Some(port) => format!("{}://{}:{}", url.scheme(), host, port),
-        None => format!("{}://{}", url.scheme(), host),
+        Some(port) => format!("{}://{}:{}", scheme, host, port),
+        None => format!("{}://{}", scheme, host),
     };
 
     Ok(origin)
@@ -349,7 +368,7 @@ pub async fn auth_status(
 
     if let Some(user_pubkey) = super::auth::extract_ucan_from_cookie(&headers).and_then(|token| {
         // Parse UCAN from string using ucan_auth helper
-        crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), tenant_id).ok().map(|(pubkey, _, _)| pubkey)
+        crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), tenant_id).ok().map(|(pubkey, _, _, _)| pubkey)
     }) {
         // Query user from database - user must exist for session to be valid
         let user_info: Option<(Option<String>, Option<bool>)> = sqlx::query_as(
@@ -408,7 +427,7 @@ pub async fn authorize_get(
             // Parse UCAN from string using ucan_auth helper (tenant validation done later)
             crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), tenant_id)
                 .ok()
-                .map(|(pubkey, _redirect_origin, ucan)| {
+                .map(|(pubkey, _redirect_origin, _bunker_pubkey, ucan)| {
                     // Extract relays from UCAN facts
                     let relays: Vec<String> = ucan.facts()
                         .iter()
@@ -1602,7 +1621,7 @@ pub async fn authorize_post(
     // Extract user public key from UCAN cookie
     let user_pubkey = super::auth::extract_ucan_from_cookie(&headers).and_then(|token| {
         // Parse UCAN from string using ucan_auth helper
-        crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), tenant_id).ok().map(|(pubkey, _, _)| pubkey)
+        crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), tenant_id).ok().map(|(pubkey, _, _, _)| pubkey)
     })
         .ok_or(OAuthError::Unauthorized)?;
 
@@ -1846,16 +1865,6 @@ async fn create_oauth_authorization_and_token(
     // Extract origin from redirect_uri - this is the primary identifier
     let redirect_origin = extract_origin(redirect_uri)?;
 
-    // Generate server-signed UCAN for REST RPC API access
-    let access_token = super::auth::generate_server_signed_ucan(
-        &nostr_sdk::PublicKey::from_hex(user_pubkey)
-            .map_err(|e| OAuthError::InvalidRequest(format!("Invalid public key: {}", e)))?,
-        tenant_id,
-        email,
-        &redirect_origin,
-        &auth_state.state.server_keys,
-    ).await.map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?;
-
     // Generate connection secret for NIP-46 authentication (must be generated first for HKDF)
     let connection_secret: String = rand::thread_rng()
         .sample_iter(&rand::distributions::Alphanumeric)
@@ -1874,6 +1883,17 @@ async fn create_oauth_authorization_and_token(
 
     let bunker_keys = keycast_core::bunker_key::derive_bunker_keys(&user_secret_key, &connection_secret);
     let bunker_public_key = bunker_keys.public_key();
+
+    // Generate server-signed UCAN for REST RPC API access (after bunker key derivation)
+    let access_token = super::auth::generate_server_signed_ucan(
+        &nostr_sdk::PublicKey::from_hex(user_pubkey)
+            .map_err(|e| OAuthError::InvalidRequest(format!("Invalid public key: {}", e)))?,
+        tenant_id,
+        email,
+        &redirect_origin,
+        Some(&bunker_public_key.to_hex()),
+        &auth_state.state.server_keys,
+    ).await.map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?;
 
     // Create authorization in database - use relay that supports NIP-46
     let relay_url = "wss://relay.damus.io";
@@ -2280,7 +2300,7 @@ pub async fn oauth_register(
             .map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?
     } else {
         // BYOK flow: server-signed UCAN (user doesn't have keys yet)
-        super::auth::generate_server_signed_ucan(&public_key, tenant_id, &req.email, &redirect_origin, &auth_state.state.server_keys).await
+        super::auth::generate_server_signed_ucan(&public_key, tenant_id, &req.email, &redirect_origin, None, &auth_state.state.server_keys).await
             .map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?
     };
 

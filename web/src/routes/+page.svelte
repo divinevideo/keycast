@@ -379,6 +379,7 @@ onMount(async () => {
 								<button class="app-header" onclick={() => toggleSession(session.bunker_pubkey)}>
 									<div class="app-info">
 										<p class="app-name">{session.application_name}</p>
+										<p class="app-domain">{session.redirect_origin}</p>
 										<p class="app-meta">
 											{#if session.activity_count > 0}
 												{session.activity_count} {session.activity_count === 1 ? 'request' : 'requests'}
@@ -1018,6 +1019,13 @@ onMount(async () => {
 		color: var(--color-divine-text);
 		font-weight: 500;
 		margin: 0;
+	}
+
+	.app-domain {
+		color: var(--color-divine-text-tertiary);
+		font-size: 0.75rem;
+		margin: 0.125rem 0 0 0;
+		opacity: 0.7;
 	}
 
 	.app-meta {

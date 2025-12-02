@@ -138,30 +138,11 @@ describe('KeycastRpc', () => {
     });
   });
 
-  describe('fromCredentials', () => {
-    it('should create client from valid credentials', () => {
-      const rpc = KeycastRpc.fromCredentials({
-        nostrApi: 'https://api.test',
-        accessToken: 'token',
-      });
+  describe('fromServerUrl', () => {
+    it('should create client from server URL and access token', () => {
+      const rpc = KeycastRpc.fromServerUrl('https://login.divine.video', 'token');
 
       expect(rpc).toBeInstanceOf(KeycastRpc);
-    });
-
-    it('should return null for missing nostrApi', () => {
-      const rpc = KeycastRpc.fromCredentials({
-        accessToken: 'token',
-      });
-
-      expect(rpc).toBeNull();
-    });
-
-    it('should return null for missing accessToken', () => {
-      const rpc = KeycastRpc.fromCredentials({
-        nostrApi: 'https://api.test',
-      });
-
-      expect(rpc).toBeNull();
     });
   });
 });

@@ -88,8 +88,7 @@ Import an existing Nostr identity during OAuth:
 
 ```typescript
 const { url, pkce } = await client.oauth.getAuthorizationUrl({
-  nsec: 'nsec1...', // User's existing key
-  byokPubkey: 'hex_pubkey',
+  nsec: 'nsec1...', // User's existing key (pubkey derived automatically)
   defaultRegister: true,
 });
 ```

@@ -1048,15 +1048,6 @@ impl UnifiedSigner {
             }
         };
 
-        // Update activity tracking for all successful methods (not just signing)
-        // Check if this was a successful response (has "result" key, not "error")
-        if result.get("result").is_some() {
-            if let Err(e) = handler.update_activity().await {
-                tracing::warn!("Failed to update activity: {}", e);
-                // Don't fail the request if activity tracking fails
-            }
-        }
-
         let response = result;
 
         // Encrypt response using the same method as the request
@@ -1304,31 +1295,6 @@ impl AuthorizationHandler {
         .await?;
 
         tracing::debug!("Logged signing activity for tenant {} user {} kind {}", self.tenant_id, user_pubkey, event_kind);
-
-        Ok(())
-    }
-
-    /// Update last_activity timestamp and increment activity_count for this authorization
-    /// Called on every successful NIP-46 method (connect, get_public_key, sign_event, etc.)
-    async fn update_activity(&self) -> SignerResult<()> {
-        if self.is_oauth {
-            sqlx::query(
-                "UPDATE oauth_authorizations
-                 SET last_activity = NOW(), activity_count = activity_count + 1
-                 WHERE tenant_id = $1 AND id = $2"
-            )
-            .bind(self.tenant_id)
-            .bind(self.authorization_id as i64)
-            .execute(&self.pool)
-            .await?;
-
-            tracing::debug!(
-                "Updated activity for OAuth authorization {} (tenant {})",
-                self.authorization_id,
-                self.tenant_id
-            );
-        }
-        // For regular authorizations, we could add similar tracking if needed
 
         Ok(())
     }

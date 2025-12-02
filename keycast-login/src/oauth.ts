@@ -11,6 +11,26 @@ import type {
 } from './types';
 
 /**
+ * Derive public key from nsec using nostr-tools (optional peer dependency)
+ * Uses dynamic import to avoid hard dependency on nostr-tools
+ */
+async function derivePublicKeyFromNsec(nsec: string): Promise<string> {
+  try {
+    // Use Function constructor to avoid TypeScript module resolution
+    const importModule = new Function('specifier', 'return import(specifier)');
+    const nip19 = await importModule('nostr-tools/nip19');
+    const pure = await importModule('nostr-tools/pure');
+    const decoded = nip19.decode(nsec);
+    if (decoded.type !== 'nsec') {
+      throw new Error('Not a valid nsec');
+    }
+    return pure.getPublicKey(decoded.data);
+  } catch (e) {
+    throw new Error(`Invalid nsec or nostr-tools not installed: ${e instanceof Error ? e.message : 'unknown error'}`);
+  }
+}
+
+/**
  * OAuth client for Keycast authorization
  */
 export class KeycastOAuth {
@@ -31,8 +51,7 @@ export class KeycastOAuth {
    */
   async getAuthorizationUrl(options: {
     scopes?: string[];
-    nsec?: string; // For BYOK flow
-    byokPubkey?: string;
+    nsec?: string; // For BYOK flow - pubkey is derived automatically
     defaultRegister?: boolean;
   } = {}): Promise<{ url: string; pkce: PkceChallenge }> {
     const pkce = await generatePkce(options.nsec);
@@ -49,8 +68,10 @@ export class KeycastOAuth {
       url.searchParams.set('default_register', 'true');
     }
 
-    if (options.byokPubkey) {
-      url.searchParams.set('byok_pubkey', options.byokPubkey);
+    // Derive pubkey from nsec if provided (BYOK flow)
+    if (options.nsec) {
+      const pubkey = await derivePublicKeyFromNsec(options.nsec);
+      url.searchParams.set('byok_pubkey', pubkey);
     }
 
     return { url: url.toString(), pkce };

@@ -20,12 +20,13 @@ static SERVER_PUBKEY: Lazy<String> = Lazy::new(|| {
 
 /// Validate UCAN token from Authorization header
 ///
-/// Returns: (user_pubkey_hex, redirect_origin, ucan)
+/// Returns: (user_pubkey_hex, redirect_origin, bunker_pubkey, ucan)
 /// redirect_origin identifies which app/authorization this token is for
+/// bunker_pubkey uniquely identifies the authorization for direct cache lookup (optional)
 pub fn validate_ucan_token(
     auth_header: &str,
     expected_tenant_id: i64,
-) -> Result<(String, String, Ucan)> {
+) -> Result<(String, String, Option<String>, Ucan)> {
     // Extract token from "Bearer <token>"
     let token = auth_header
         .strip_prefix("Bearer ")
@@ -46,6 +47,11 @@ pub fn validate_ucan_token(
         .find_map(|fact| fact.get("redirect_origin").and_then(|v| v.as_str()))
         .map(String::from)
         .ok_or_else(|| anyhow!("UCAN missing required redirect_origin fact"))?;
+
+    // Extract bunker_pubkey from facts (optional - for direct cache lookup)
+    let bunker_pubkey = facts.iter()
+        .find_map(|fact| fact.get("bunker_pubkey").and_then(|v| v.as_str()))
+        .map(String::from);
 
     // Validate tenant_id from facts (if expected_tenant_id != 0)
     if expected_tenant_id != 0 {
@@ -86,23 +92,23 @@ pub fn validate_ucan_token(
         ));
     }
 
-    Ok((user_pubkey_hex, redirect_origin, ucan))
+    Ok((user_pubkey_hex, redirect_origin, bunker_pubkey, ucan))
 }
 
-/// Extract user pubkey and redirect_origin from UCAN in Authorization header
+/// Extract user pubkey, redirect_origin, and bunker_pubkey from UCAN in Authorization header
 pub fn extract_user_from_ucan(
     headers: &HeaderMap,
     expected_tenant_id: i64,
-) -> Result<(String, String)> {
+) -> Result<(String, String, Option<String>)> {
     let auth_header = headers
         .get("Authorization")
         .ok_or_else(|| anyhow!("Missing Authorization header"))?
         .to_str()
         .map_err(|_| anyhow!("Invalid Authorization header"))?;
 
-    let (pubkey, redirect_origin, _ucan) = validate_ucan_token(auth_header, expected_tenant_id)?;
+    let (pubkey, redirect_origin, bunker_pubkey, _ucan) = validate_ucan_token(auth_header, expected_tenant_id)?;
 
-    Ok((pubkey, redirect_origin))
+    Ok((pubkey, redirect_origin, bunker_pubkey))
 }
 
 #[cfg(test)]
@@ -144,10 +150,11 @@ mod tests {
 
         // Validate the token
         let auth_header = format!("Bearer {}", token);
-        let (extracted_pubkey, redirect_origin, _) = validate_ucan_token(&auth_header, 1).unwrap();
+        let (extracted_pubkey, redirect_origin, bunker_pubkey, _) = validate_ucan_token(&auth_header, 1).unwrap();
 
         assert_eq!(extracted_pubkey, pubkey.to_hex());
         assert_eq!(redirect_origin, "https://test.example.com");
+        assert!(bunker_pubkey.is_none()); // No bunker_pubkey in test facts
     }
 
     #[tokio::test]

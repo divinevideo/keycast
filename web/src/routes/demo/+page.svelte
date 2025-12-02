@@ -12,7 +12,8 @@ import { createKeycastClient, KeycastRpc, generatePkce } from 'keycast-login';
 
 // Configuration
 const SERVER_URL = import.meta.env.VITE_DOMAIN || 'http://localhost:3000';
-const CLIENT_ID = 'divine';
+const CLIENT_ID = 'diVine Login Demo';
+console.log('SERVER_URL:', SERVER_URL, 'VITE_DOMAIN:', import.meta.env.VITE_DOMAIN);
 
 // Create Keycast client (initialized in onMount for SSR safety)
 let client: ReturnType<typeof createKeycastClient> | null = null;
@@ -97,6 +98,7 @@ async function connectWithKeycast() {
             defaultRegister: true,
         });
 
+        console.log('OAuth URL:', url);  // Debug
         sessionStorage.setItem('pkce_verifier', pkce.verifier);
         sessionStorage.setItem('byok_used', 'false');
 
@@ -121,11 +123,11 @@ async function connectWithBYOK() {
     oauthError = null;
 
     try {
+        // Pubkey is derived automatically from nsec inside the library
         const { url, pkce } = await client.oauth.getAuthorizationUrl({
             scopes: ['policy:social'],
             defaultRegister: true,
             nsec: identity.nsec,
-            byokPubkey: identity.pubkey,
         });
 
         sessionStorage.setItem('pkce_verifier', pkce.verifier);

@@ -14,7 +14,6 @@ use serde_json::Value as JsonValue;
 
 use super::auth::{extract_user_and_origin_from_token, AuthError};
 use super::routes::AuthState;
-use sqlx::PgPool;
 
 /// RPC request format (mirrors NIP-46)
 #[derive(Debug, Deserialize)]
@@ -99,14 +98,14 @@ pub async fn nostr_rpc(
     headers: HeaderMap,
     Json(req): Json<NostrRpcRequest>,
 ) -> Result<Json<NostrRpcResponse>, RpcError> {
-    let (user_pubkey, redirect_origin) = extract_user_and_origin_from_token(&headers)?;
+    let (user_pubkey, redirect_origin, bunker_pubkey) = extract_user_and_origin_from_token(&headers)?;
     let pool = &auth_state.state.db;
     let tenant_id = tenant.0.id;
 
     tracing::info!("RPC request: method={} from user={} origin={}", req.method, &user_pubkey[..8], &redirect_origin);
 
-    // Get user keys (try fast path first, then slow path)
-    let keys = get_user_keys(&auth_state, pool, tenant_id, &user_pubkey, &redirect_origin).await?;
+    // Get user keys - try direct cache lookup via bunker_pubkey first
+    let keys = get_user_keys(&auth_state, pool, tenant_id, &user_pubkey, &redirect_origin, bunker_pubkey.as_deref()).await?;
 
     // Dispatch based on method
     let result = match req.method.as_str() {
@@ -126,17 +125,6 @@ pub async fn nostr_rpc(
                 .map_err(|e| RpcError::SigningFailed(format!("Signing failed: {}", e)))?;
 
             tracing::info!("RPC: Signed event {} kind={}", signed.id, signed.kind.as_u16());
-
-            // Log signing activity (don't block on failure)
-            log_signing_activity(
-                pool,
-                tenant_id,
-                &user_pubkey,
-                &redirect_origin,
-                signed.kind.as_u16(),
-                &signed.content,
-                &signed.id.to_hex(),
-            ).await;
 
             serde_json::to_value(&signed)
                 .map_err(|e| RpcError::Internal(format!("JSON serialization failed: {}", e)))?
@@ -222,15 +210,24 @@ async fn get_user_keys(
     tenant_id: i64,
     user_pubkey: &str,
     redirect_origin: &str,
+    bunker_pubkey_from_ucan: Option<&str>,
 ) -> Result<Keys, RpcError> {
     // FAST PATH: Try to use cached signer handler if in unified mode
     if let Some(ref handlers) = auth_state.state.signer_handlers {
-        // Query for user's bunker public key for this specific origin
+        // If bunker_pubkey was provided in UCAN, use it directly (no DB query needed!)
+        if let Some(bunker_key) = bunker_pubkey_from_ucan {
+            if let Some(handler) = handlers.get(bunker_key).await {
+                tracing::debug!("RPC: Using cached keys via UCAN bunker_pubkey for user {}", &user_pubkey[..8]);
+                return Ok(handler.get_keys());
+            }
+        }
+
+        // Fallback: Query DB for bunker public key (for older UCANs without bunker_pubkey)
         let bunker_pubkey: Option<String> = sqlx::query_scalar(
             "SELECT oa.bunker_public_key
              FROM oauth_authorizations oa
              JOIN users u ON oa.user_pubkey = u.pubkey
-             WHERE oa.user_pubkey = $1 AND u.tenant_id = $2 AND oa.redirect_origin = $3
+             WHERE oa.user_pubkey = $1 AND u.tenant_id = $2 AND oa.redirect_origin = $3 AND oa.revoked_at IS NULL
              ORDER BY oa.created_at DESC
              LIMIT 1"
         )
@@ -243,7 +240,7 @@ async fn get_user_keys(
 
         if let Some(bunker_key) = bunker_pubkey {
             if let Some(handler) = handlers.get(&bunker_key).await {
-                tracing::debug!("RPC: Using cached keys for user {}", &user_pubkey[..8]);
+                tracing::debug!("RPC: Using cached keys (DB lookup) for user {}", &user_pubkey[..8]);
                 return Ok(handler.get_keys());
             }
         }
@@ -348,47 +345,6 @@ fn parse_decrypt_params(params: &[JsonValue]) -> Result<(PublicKey, String), Rpc
         .map_err(|e| RpcError::InvalidParams(format!("Invalid pubkey: {}", e)))?;
 
     Ok((pubkey, ciphertext.to_string()))
-}
-
-/// Log signing activity to database for RPC-based signing
-async fn log_signing_activity(
-    pool: &PgPool,
-    tenant_id: i64,
-    user_pubkey: &str,
-    redirect_origin: &str,
-    event_kind: u16,
-    event_content: &str,
-    event_id: &str,
-) {
-    // Truncate content for storage
-    let truncated_content = if event_content.len() > 500 {
-        format!("{}... (truncated)", &event_content[..500])
-    } else {
-        event_content.to_string()
-    };
-
-    // Use rpc:<origin> as bunker_secret identifier for RPC requests
-    let bunker_secret = format!("rpc:{}", redirect_origin);
-
-    let result = sqlx::query(
-        "INSERT INTO signing_activity
-         (user_pubkey, bunker_secret, event_kind, event_content, event_id, tenant_id, source, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, 'rpc', NOW())"
-    )
-    .bind(user_pubkey)
-    .bind(&bunker_secret)
-    .bind(event_kind as i32)
-    .bind(&truncated_content)
-    .bind(event_id)
-    .bind(tenant_id)
-    .execute(pool)
-    .await;
-
-    if let Err(e) = result {
-        tracing::error!("Failed to log RPC signing activity: {}", e);
-    } else {
-        tracing::debug!("Logged RPC signing activity for user {} kind {}", &user_pubkey[..8], event_kind);
-    }
 }
 
 #[cfg(test)]

@@ -31,17 +31,21 @@ describe('KeycastOAuth', () => {
       expect(url).toContain('scope=sign_event+encrypt');
     });
 
-    it('should include BYOK parameters', async () => {
+    it('should include BYOK parameters when nsec provided', async () => {
+      // Note: This test requires nostr-tools to be installed
+      // The nsec below is a test vector, not a real key
+      const testNsec = 'nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5';
+      const expectedPubkey = '7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e';
+
       const oauth = new KeycastOAuth(config);
       const { url, pkce } = await oauth.getAuthorizationUrl({
-        nsec: 'nsec1test',
-        byokPubkey: 'abc123',
+        nsec: testNsec,
         defaultRegister: true,
       });
 
-      expect(url).toContain('byok_pubkey=abc123');
+      expect(url).toContain(`byok_pubkey=${expectedPubkey}`);
       expect(url).toContain('default_register=true');
-      expect(pkce.verifier).toContain('nsec1test');
+      expect(pkce.verifier).toContain(testNsec);
     });
   });
 
@@ -83,7 +87,6 @@ describe('KeycastOAuth', () => {
           Promise.resolve({
             bunker_url: 'bunker://abc?relay=wss://relay.test&secret=xyz',
             access_token: 'ucan_token',
-            nostr_api: 'https://login.divine.video/api/nostr',
             token_type: 'Bearer',
             expires_in: 86400,
             scope: 'sign_event',
@@ -99,7 +102,6 @@ describe('KeycastOAuth', () => {
 
       expect(tokens.bunker_url).toBeDefined();
       expect(tokens.access_token).toBe('ucan_token');
-      expect(tokens.nostr_api).toBe('https://login.divine.video/api/nostr');
 
       expect(mockFetch).toHaveBeenCalledWith(
         'https://login.divine.video/api/oauth/token',
@@ -143,7 +145,6 @@ describe('KeycastOAuth', () => {
       const response = {
         bunker_url: 'bunker://abc',
         access_token: 'token',
-        nostr_api: 'https://api.test',
         token_type: 'Bearer',
         expires_in: 3600,
         scope: 'sign_event',
@@ -153,7 +154,6 @@ describe('KeycastOAuth', () => {
 
       expect(credentials.bunkerUrl).toBe('bunker://abc');
       expect(credentials.accessToken).toBe('token');
-      expect(credentials.nostrApi).toBe('https://api.test');
       expect(credentials.expiresAt).toBeGreaterThan(Date.now());
     });
 

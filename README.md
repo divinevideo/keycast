@@ -1,99 +1,265 @@
 # Keycast
 
-Secure remote signing and permissions for teams using Nostr.
+Secure Nostr key custody with OAuth 2.0 access for apps.
 
-## Overview
+## What is Keycast?
 
-Keycast aims to make remote signing and secure key management easy for teams using Nostr. Previous solutions like [nsec.app](https://nsec.app/), [Knox](https://gitlab.com/soapbox-pub/knox), and [Amber](https://github.com/greenart7c3/Amber) are great for individuals, but Keycast is designed for teams. This means that you can collaboratively manage your keys and create policies and permissions to control who can sign and what they can sign.
+Keycast lets users store their Nostr private key (nsec) securely on a server and grant apps permission to sign events on their behalf. Apps integrate via standard OAuth 2.0 and receive credentials for remote signing.
 
-Keycast is fully open source and will offer both a hosted version (if you don't want to have to manage your own deployment) and options for running your own sovereign instance via Docker, StartOS, or Umbrel.
+**Use cases:**
+- Mobile apps that need signing without storing nsec locally
+- Web apps that want to offer "Login with Nostr" without browser extensions
+- Multi-device access to the same Nostr identity
 
-## Features
+## Quick Start for App Developers
 
-- [x] NIP-98 HTTP Auth based web application and API authentication
-- [x] Team management (create teams, manage stored keys, manage users, manage policies). Supports multiple teams per user.
-- [x] Secure key management (row-level aes-256 encryption, file or aws kms backed key storage)
-- [x] Permissions and policies (flexible, extensible permissions model)
-- [x] NIP-46 Remote signing for managed keys
-- [x] Docker based deployment
-- [ ] StartOS service
-- [ ] Umbrel app
-- [ ] CLI for managing teams, keys, users, and policies
+### TypeScript/JavaScript (Recommended)
 
-## Contributing
+Install the official client:
 
-Contributions are welcome! Please fork or clone the repository and submit a PR with your changes. Small, well-documented changes are appreciated.
+```bash
+npm install keycast-login
+# or
+bun add keycast-login
+```
 
-### Contributors
+```typescript
+import { createKeycastClient, KeycastRpc } from 'keycast-login';
 
-<a href="https://github.com/erskingardner/keycast/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=erskingardner/keycast" />
-</a>
+// 1. Create client
+const client = createKeycastClient({
+  serverUrl: 'https://login.divine.video',
+  clientId: 'your-app-id',
+  redirectUri: window.location.origin + '/callback',
+});
 
-### The stack
+// 2. Start OAuth flow
+// Option A: Let Keycast generate a new identity for the user
+const { url, pkce } = await client.oauth.getAuthorizationUrl({
+  scopes: ['policy:social'],
+  defaultRegister: true,  // Auto-generate new nsec if user doesn't have one
+});
 
-The `api` subdirectory is a Rust application that uses SQLx for database interactions on a PostgreSQL database. We use `cargo watch` to run the API in watch mode, make sure to install that if you don't already have it.
-- [Rust](https://www.rust-lang.org/)
-- [SQLx](https://github.com/launchbadge/sqlx)
-- [cargo-watch](https://github.com/watchexec/cargo-watch)
+// Option B: Bring Your Own Key - import user's existing nsec
+// const { url, pkce } = await client.oauth.getAuthorizationUrl({
+//   scopes: ['policy:social'],
+//   nsec: 'nsec1...',  // User's existing key (pubkey derived automatically)
+// });
 
-The `web` subdirectory contains a SvelteKit app that uses Bun for bundling and Tailwind for styling.
-- [SvelteKit](https://kit.svelte.dev/)
-- [Bun](https://bun.sh/)
-- [Tailwind](https://tailwindcss.com/)
+sessionStorage.setItem('pkce_verifier', pkce.verifier);
+window.location.href = url;
 
-### Getting Started
+// 3. Handle callback (on /callback page)
+const code = new URLSearchParams(location.search).get('code');
+const verifier = sessionStorage.getItem('pkce_verifier');
+const tokens = await client.oauth.exchangeCode(code, verifier);
+// tokens.bunker_url    - NIP-46 bunker URL (for nostr-tools)
+// tokens.access_token  - UCAN token (for REST RPC API)
 
-1. Clone the repository and install workspace dependencies with `bun install`
-1. Install the web app dependencies with `cd web && bun install`
-1. Then, from the root directory, generate a master encryption key with `bun run key:generate`. This master key is used to encrypt and decrypt Nostr private keys in the database. These are only decrypted when used and remain encrypted at rest. In the future we hope to support other key storage methods, like AWS KMS.
-1. Create a `.env` file in the `/web` directory with the following variables:
-    - `VITE_ALLOWED_PUBKEYS` - A comma separated list of pubkeys that are allowed to sign in to the app. This would include your own pubkey for development. This `.env` file is ignored and has no bearing on the docker image.
+// 4. Sign events via REST RPC
+const rpc = client.createRpc(tokens);
 
-### Running the dev server (API + Web + Signer)
-1. You can now run the dev server with `bun run dev`. We use `concurrently` to run the API and web app in parallel. You'll see the web app start up at `https://localhost:5173` and the API will start up at `http://localhost:3000`. Both apps will output logs to the console and will hotreload on code changes. The signer will also start up and will spawn signing processes for each of your authentications. The signing manager will keep an eye on the authentications and pick up new ones as they come in or remove them if they are removed from the database. It will also attempt to restart signing processes if they crash.
+const pubkey = await rpc.getPublicKey();
+const signed = await rpc.signEvent({
+  kind: 1,
+  content: 'Hello Nostr!',
+  tags: [],
+  created_at: Math.floor(Date.now() / 1000),
+  pubkey,
+});
 
-### Managing the database
+// 5. Publish to relays (using nostr-tools or your preferred library)
+// await pool.publish(['wss://relay.example.com'], signed);
+```
 
-The database is a PostgreSQL database. There is a helper command to reset the database (drop, create, and run migrations). More can be added as needed.
+See [`keycast-login/README.md`](./keycast-login/README.md) for full API reference.
 
-- `bun run db:reset` - Reset the database (drop, create, and run migrations)
+### Other Languages (HTTP API)
 
-### Custom Permissions
+#### 1. OAuth Authorization Flow
 
-Keycast is built with a flexible permissions model that allows you to define custom permissions. These permissions are defined in the `core/src/custom_permissions` directory. You can define your own custom permissions by implementing the `CustomPermission` trait which has three methods, `can_encrypt`, `can_decrypt`, and `can_sign`. These methods take in the same arguments as the NIP-46 Request objects and return a boolean.
+Redirect users to Keycast's authorization endpoint:
 
-Each request for one of the matching methods (`sign_event`, `nip04_encrypt`, `nip04_decrypt`, `nip44_encrypt`, `nip44_decrypt`) will be checked against all the permissions defined in the policy. If the permission is not granted, the request will be denied.
+```
+GET /api/oauth/authorize?
+  client_id=your-app-id&
+  redirect_uri=https://yourapp.com/callback&
+  scope=sign_event&
+  code_challenge=<PKCE_CHALLENGE>&
+  code_challenge_method=S256
+```
 
-To make your custom permission usable in the app, you'll also need to reference it in three places:
-1. The `AVAILABLE_PERMISSIONS` array in `web/src/lib/types.ts`
-1. The `AVAILABLE_PERMISSIONS` array in `core/src/custom_permissions/mod.rs`
-1. The `to_custom_permission` method in `core/src/types/permission.rs`
+User logs in (or registers), approves your app, and gets redirected back with an authorization code.
 
-## Deployment with Docker
+#### 2. Exchange Code for Credentials
 
-1. ssh into your VM or server where you'll want to run Keycast.
-1. Install docker following the instructions for your OS here: https://docs.docker.com/engine/install
-1. Clone the repository and navigate to the root directory. `git clone https://github.com/erskingardner/keycast.git && cd keycast`
-1. Run the init script with a domain: `bash scripts/init.sh <domain>` (you should provide the domain without the protocol (e.g. `https://`) that you want to use for your Keycast instance)
-1. (Optional) If you're going to use the caddy reverse proxy, you'll want to set up a Caddy container on your VM as well. There is an example docker-compose file that you can use to get started: [`caddy-docker-compose-example.yml`](./caddy-docker-compose-example.yml).
-1. Build and run the docker image with `sudo docker compose up -d --build`. (If you have trouble with the build step stalling while transforming or "Rendering chunks", this is because Vite is non-deterministic and the build step is likely stuck waiting for a lock on the file system. Just cancel the build and run it again - it can take a few tries to get it to build.)
+```bash
+POST /api/oauth/token
+Content-Type: application/json
 
-## Updating the app
+{
+  "code": "<authorization_code>",
+  "client_id": "your-app-id",
+  "redirect_uri": "https://yourapp.com/callback",
+  "code_verifier": "<PKCE_VERIFIER>"
+}
+```
 
-To update the app on your server, simply run `git pull` to get the latest changes and then run `sudo docker compose up -d --build` to rebuild and restart the container.
+Response:
+```json
+{
+  "bunker_url": "bunker://abc123...?relay=wss://relay.example.com&secret=xyz",
+  "access_token": "eyJ...",
+  "token_type": "Bearer",
+  "expires_in": 86400
+}
+```
 
-### VM requirements
+You get **two ways to sign**:
 
-The running app requires very little resources but in order to build the docker images you'll need at least 2GB of RAM (usually helps to have some swap space set up as well). If you're seeing the following errors when building, try to increase the swap space on your VM or use a larger VM.
+| Credential | Transport | Use Case |
+|------------|-----------|----------|
+| `bunker_url` | NIP-46 via Nostr relays | Standard Nostr clients, works with nostr-tools |
+| `access_token` | HTTP REST API | Low-latency signing, simpler integration |
 
-`failed to solve: process "/bin/sh -c bun run build" did not complete successfully: exit code: 137`
+#### 3a. Sign via NIP-46 (Bunker URL)
 
-### Reverse proxy
+Use `bunker_url` with any NIP-46 compatible library.
 
-The included [`docker-compose.yml`](./docker-compose.yml) file provides some caddy labels that a caddy reverse proxy docker conatiner will pick up and use to generate SSL certs and wire up the port forwarding required.
+#### 3b. Sign via HTTP RPC (Access Token)
 
-This reqiures that your service is running a caddy proxy container. The included [`caddy-docker-compose-example.yml`](./caddy-docker-compose-example.yml) file can be used to start a caddy proxy container and link it to the keycast network.
+```bash
+POST /api/nostr
+Authorization: Bearer <access_token>
+Content-Type: application/json
+
+{
+  "method": "sign_event",
+  "params": [{
+    "kind": 1,
+    "content": "Hello Nostr!",
+    "created_at": 1234567890,
+    "tags": []
+  }]
+}
+```
+
+**Available RPC methods:**
+- `get_public_key` - Get user's public key
+- `sign_event` - Sign an unsigned event
+- `nip04_encrypt` / `nip04_decrypt` - NIP-04 encryption
+- `nip44_encrypt` / `nip44_decrypt` - NIP-44 encryption
+
+## Live Demo
+
+Visit `/demo` on your Keycast instance to test the full OAuth flow interactively. The demo shows both key generation modes (server-generated and BYOK) and all RPC operations (signing, encryption, decryption).
+
+## Architecture
+
+```
+┌─────────────────┐                              ┌─────────────────┐
+│                 │────── 1. OAuth 2.0 ─────────►│                 │
+│   Your App      │                              │    Keycast      │
+│  (Flutter/Web)  │◄───── 2. bunker_url ────────│     Server      │
+│                 │◄───── 2. access_token ──────│                 │
+└────────┬────────┘                              └────────┬────────┘
+         │                                                │
+         │  Sign Requests (two options):                  │
+         │                                                │
+         │  A) HTTP RPC (access_token)                    │
+         │     ──────────────────────────────────────────►│
+         │                                                │
+         │  B) NIP-46 (bunker_url)                        │
+         │     ─────────►┌──────────────┐◄────────────────┤
+         │               │ Nostr Relays │                 │
+         │     ◄─────────└──────────────┘────────────────►│
+         │                                                │
+         │                                                ▼
+         │                                       ┌─────────────────┐
+         │                                       │   PostgreSQL    │
+         │                                       │ (encrypted keys)│
+         │                                       └────────┬────────┘
+         │                                                │
+         │                                                ▼
+         │                                       ┌─────────────────┐
+         │                                       │  GCP KMS or     │
+         │                                       │  master.key     │
+         │                                       └─────────────────┘
+```
+
+**Two signing transports:**
+- **HTTP RPC**: App → Keycast (direct, ~50ms latency)
+- **NIP-46**: App ↔ Nostr Relays ↔ Keycast (standard protocol, ~200-500ms)
+
+**Key encryption:**
+- Private keys are AES-256-GCM encrypted in PostgreSQL
+- **Production (GCP KMS)**: Master key never leaves KMS hardware - even with DB access, keys cannot be decrypted without KMS permissions
+- **Development (master.key)**: File-based AES key for local testing
+
+## Hosting Your Own Instance
+
+### Prerequisites
+
+- Docker and Docker Compose
+- PostgreSQL (included in docker-compose)
+- A domain with HTTPS (for production)
+
+### Quick Start
+
+```bash
+git clone https://github.com/ArcadeLabsInc/keycast.git
+cd keycast
+bun install
+
+# Generate encryption key
+bun run key:generate
+
+# Configure environment
+cp .env.example .env
+# Edit .env with your settings
+
+# Run with Docker
+docker compose up -d --build
+```
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `DATABASE_URL` | PostgreSQL connection string |
+| `SERVER_NSEC` | Server's Nostr secret key for signing tokens |
+| `ALLOWED_ORIGINS` | CORS origins (comma-separated) |
+| `BUNKER_RELAYS` | NIP-46 relay URLs (default: several public relays) |
+| `MASTER_KEY_PATH` | Path to encryption key file |
+| `USE_GCP_KMS` | Use GCP KMS instead of file-based key (production) |
+
+### Development
+
+```bash
+# Run dev server (API + NIP-46 signer)
+bun run dev
+
+# Run web admin UI
+bun run dev:web
+
+# Run tests
+cargo test
+```
+
+## Team Key Management (Original Keycast)
+
+Keycast was originally built for team-based Nostr key management. This functionality is still available and works via NIP-46 bunker URLs (not yet integrated with OAuth/HTTP RPC).
+
+**Team features:**
+- Create teams with shared Nostr keys
+- Role-based access control (admin/member)
+- Custom permission policies:
+  - `allowed_kinds` - Restrict which event kinds can be signed
+  - `content_filter` - Filter events by content patterns
+  - `encrypt_to_self` - Restrict encryption to user's own pubkey
+- NIP-46 remote signing for team keys
+
+Access the web admin at your Keycast URL to manage teams. See the [original Keycast repository](https://github.com/erskingardner/keycast) for the team-focused implementation.
 
 ## License
 
