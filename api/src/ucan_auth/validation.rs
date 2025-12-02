@@ -1,10 +1,10 @@
 // ABOUTME: UCAN token validation and pubkey extraction
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use axum::http::HeaderMap;
-use ucan::Ucan;
 use once_cell::sync::Lazy;
 use std::env;
+use ucan::Ucan;
 
 use super::did::did_to_nostr_pubkey;
 
@@ -43,13 +43,15 @@ pub fn validate_ucan_token(
     let facts: &Vec<serde_json::Value> = ucan.facts();
 
     // Extract redirect_origin from facts (required)
-    let redirect_origin = facts.iter()
+    let redirect_origin = facts
+        .iter()
         .find_map(|fact| fact.get("redirect_origin").and_then(|v| v.as_str()))
         .map(String::from)
         .ok_or_else(|| anyhow!("UCAN missing required redirect_origin fact"))?;
 
     // Extract bunker_pubkey from facts (optional - for direct cache lookup)
-    let bunker_pubkey = facts.iter()
+    let bunker_pubkey = facts
+        .iter()
         .find_map(|fact| fact.get("bunker_pubkey").and_then(|v| v.as_str()))
         .map(String::from);
 
@@ -106,7 +108,8 @@ pub fn extract_user_from_ucan(
         .to_str()
         .map_err(|_| anyhow!("Invalid Authorization header"))?;
 
-    let (pubkey, redirect_origin, bunker_pubkey, _ucan) = validate_ucan_token(auth_header, expected_tenant_id)?;
+    let (pubkey, redirect_origin, bunker_pubkey, _ucan) =
+        validate_ucan_token(auth_header, expected_tenant_id)?;
 
     Ok((pubkey, redirect_origin, bunker_pubkey))
 }
@@ -114,7 +117,7 @@ pub fn extract_user_from_ucan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ucan_auth::{NostrKeyMaterial, nostr_pubkey_to_did};
+    use crate::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
     use nostr_sdk::Keys;
     use ucan::builder::UcanBuilder;
 
@@ -150,7 +153,8 @@ mod tests {
 
         // Validate the token
         let auth_header = format!("Bearer {}", token);
-        let (extracted_pubkey, redirect_origin, bunker_pubkey, _) = validate_ucan_token(&auth_header, 1).unwrap();
+        let (extracted_pubkey, redirect_origin, bunker_pubkey, _) =
+            validate_ucan_token(&auth_header, 1).unwrap();
 
         assert_eq!(extracted_pubkey, pubkey.to_hex());
         assert_eq!(redirect_origin, "https://test.example.com");
@@ -250,7 +254,10 @@ mod tests {
         // Missing "Bearer " prefix
         let result = validate_ucan_token(&token, 0);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Authorization header format"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Authorization header format"));
     }
 
     #[tokio::test]
@@ -265,7 +272,10 @@ mod tests {
         let result = extract_user_from_ucan(&headers, 0);
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Missing Authorization"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Missing Authorization"));
     }
 
     #[tokio::test]

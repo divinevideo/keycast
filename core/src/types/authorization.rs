@@ -131,7 +131,9 @@ impl Authorization {
         Ok(authorizations)
     }
 
-    pub async fn all_ids_for_all_tenants(pool: &PgPool) -> Result<Vec<(i64, i32)>, AuthorizationError> {
+    pub async fn all_ids_for_all_tenants(
+        pool: &PgPool,
+    ) -> Result<Vec<(i64, i32)>, AuthorizationError> {
         let authorizations = sqlx::query_as::<_, (i64, i32)>(
             r#"
             SELECT tenant_id, id FROM authorizations
@@ -143,7 +145,11 @@ impl Authorization {
     }
 
     /// Get the stored key for this authorization
-    pub async fn stored_key(&self, pool: &PgPool, tenant_id: i64) -> Result<StoredKey, AuthorizationError> {
+    pub async fn stored_key(
+        &self,
+        pool: &PgPool,
+        tenant_id: i64,
+    ) -> Result<StoredKey, AuthorizationError> {
         let stored_key = sqlx::query_as::<_, StoredKey>(
             r#"
             SELECT * FROM stored_keys WHERE tenant_id = $1 AND id = $2
@@ -205,8 +211,10 @@ impl Authorization {
 
     /// Get the configured bunker relay list from environment
     pub fn get_bunker_relays() -> Vec<String> {
-        let relays_str = std::env::var("BUNKER_RELAYS")
-            .unwrap_or_else(|_| "wss://relay.divine.video,wss://relay.primal.net,wss://relay.nsec.app,wss://nos.lol".to_string());
+        let relays_str = std::env::var("BUNKER_RELAYS").unwrap_or_else(|_| {
+            "wss://relay.divine.video,wss://relay.primal.net,wss://relay.nsec.app,wss://nos.lol"
+                .to_string()
+        });
 
         relays_str
             .split(',')

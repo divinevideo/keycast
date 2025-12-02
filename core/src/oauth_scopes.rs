@@ -25,11 +25,11 @@ pub enum ScopeCategory {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub enum RiskLevel {
-    Safe,       // Read-only or basic social actions
-    Moderate,   // Posting, messaging
-    Sensitive,  // Private messages, personal data
-    High,       // Financial operations
-    Critical,   // Irreversible actions (deletions, reports)
+    Safe,      // Read-only or basic social actions
+    Moderate,  // Posting, messaging
+    Sensitive, // Private messages, personal data
+    High,      // Financial operations
+    Critical,  // Irreversible actions (deletions, reports)
 }
 
 /// Parse a space-separated scope string into individual scopes
@@ -65,9 +65,7 @@ pub fn scopes_to_event_kinds(scopes: &[Scope]) -> Vec<u16> {
 
 /// Get the definition for a specific scope by name
 pub fn get_scope_definition(name: &str) -> Option<Scope> {
-    ALL_SCOPES.iter()
-        .find(|s| s.name == name)
-        .cloned()
+    ALL_SCOPES.iter().find(|s| s.name == name).cloned()
 }
 
 /// Get all available scopes, grouped by category
@@ -75,11 +73,46 @@ pub fn get_scopes_by_category() -> Vec<(ScopeCategory, Vec<Scope>)> {
     use ScopeCategory::*;
 
     vec![
-        (Social, ALL_SCOPES.iter().filter(|s| s.category == Social).cloned().collect()),
-        (Messaging, ALL_SCOPES.iter().filter(|s| s.category == Messaging).cloned().collect()),
-        (Financial, ALL_SCOPES.iter().filter(|s| s.category == Financial).cloned().collect()),
-        (Data, ALL_SCOPES.iter().filter(|s| s.category == Data).cloned().collect()),
-        (Dangerous, ALL_SCOPES.iter().filter(|s| s.category == Dangerous).cloned().collect()),
+        (
+            Social,
+            ALL_SCOPES
+                .iter()
+                .filter(|s| s.category == Social)
+                .cloned()
+                .collect(),
+        ),
+        (
+            Messaging,
+            ALL_SCOPES
+                .iter()
+                .filter(|s| s.category == Messaging)
+                .cloned()
+                .collect(),
+        ),
+        (
+            Financial,
+            ALL_SCOPES
+                .iter()
+                .filter(|s| s.category == Financial)
+                .cloned()
+                .collect(),
+        ),
+        (
+            Data,
+            ALL_SCOPES
+                .iter()
+                .filter(|s| s.category == Data)
+                .cloned()
+                .collect(),
+        ),
+        (
+            Dangerous,
+            ALL_SCOPES
+                .iter()
+                .filter(|s| s.category == Dangerous)
+                .cloned()
+                .collect(),
+        ),
     ]
 }
 
@@ -255,13 +288,13 @@ mod tests {
         // Should deduplicate kinds 7 and 9735 which appear in both
         assert!(kinds.contains(&7));
         assert!(kinds.contains(&9735));
-        assert!(kinds.len() > 2);  // all-social includes more kinds
+        assert!(kinds.len() > 2); // all-social includes more kinds
     }
 
     #[test]
     fn test_get_scopes_by_category() {
         let grouped = get_scopes_by_category();
-        assert_eq!(grouped.len(), 5);  // 5 categories
+        assert_eq!(grouped.len(), 5); // 5 categories
 
         let social_scopes = &grouped[0].1;
         assert!(!social_scopes.is_empty());

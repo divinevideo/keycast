@@ -113,7 +113,10 @@ impl Policy {
     pub fn to_info(&self) -> PolicyInfo {
         PolicyInfo {
             slug: self.slug.clone().unwrap_or_else(|| self.id.to_string()),
-            display_name: self.display_name.clone().unwrap_or_else(|| self.name.clone()),
+            display_name: self
+                .display_name
+                .clone()
+                .unwrap_or_else(|| self.name.clone()),
             description: self.description.clone().unwrap_or_default(),
         }
     }

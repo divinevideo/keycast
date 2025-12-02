@@ -94,11 +94,12 @@ mod tests {
         let registry = InstanceRegistry::register(pool.clone()).await.unwrap();
 
         // Verify instance exists in database
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM signer_instances WHERE instance_id = $1::uuid")
-            .bind(registry.instance_id())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM signer_instances WHERE instance_id = $1::uuid")
+                .bind(registry.instance_id())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
 
         assert_eq!(count.0, 1);
 
@@ -115,7 +116,10 @@ mod tests {
         let id = registry.instance_id();
 
         // Should be a valid UUID
-        assert!(Uuid::parse_str(id).is_ok(), "instance_id should be a valid UUID");
+        assert!(
+            Uuid::parse_str(id).is_ok(),
+            "instance_id should be a valid UUID"
+        );
 
         registry.deregister().await.unwrap();
     }
@@ -129,7 +133,7 @@ mod tests {
 
         // Get initial heartbeat
         let initial: (chrono::DateTime<chrono::Utc>,) = sqlx::query_as(
-            "SELECT last_heartbeat FROM signer_instances WHERE instance_id = $1::uuid"
+            "SELECT last_heartbeat FROM signer_instances WHERE instance_id = $1::uuid",
         )
         .bind(registry.instance_id())
         .fetch_one(&pool)
@@ -144,7 +148,7 @@ mod tests {
 
         // Get updated heartbeat
         let updated: (chrono::DateTime<chrono::Utc>,) = sqlx::query_as(
-            "SELECT last_heartbeat FROM signer_instances WHERE instance_id = $1::uuid"
+            "SELECT last_heartbeat FROM signer_instances WHERE instance_id = $1::uuid",
         )
         .bind(registry.instance_id())
         .fetch_one(&pool)
@@ -186,11 +190,12 @@ mod tests {
         registry.deregister().await.unwrap();
 
         // Verify instance no longer exists
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM signer_instances WHERE instance_id = $1::uuid")
-            .bind(&instance_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM signer_instances WHERE instance_id = $1::uuid")
+                .bind(&instance_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
 
         assert_eq!(count.0, 0);
     }

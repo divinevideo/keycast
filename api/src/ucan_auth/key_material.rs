@@ -29,7 +29,7 @@ impl NostrKeyMaterial {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl KeyMaterial for NostrKeyMaterial {
     fn get_jwt_algorithm_name(&self) -> String {
-        "ES256K".to_string()  // secp256k1 ECDSA
+        "ES256K".to_string() // secp256k1 ECDSA
     }
 
     async fn get_did(&self) -> Result<String> {
@@ -37,8 +37,8 @@ impl KeyMaterial for NostrKeyMaterial {
     }
 
     async fn sign(&self, payload: &[u8]) -> Result<Vec<u8>> {
-        use secp256k1::{Secp256k1, Message, SecretKey as Secp256k1SecretKey};
-        use sha2::{Sha256, Digest};
+        use secp256k1::{Message, Secp256k1, SecretKey as Secp256k1SecretKey};
+        use sha2::{Digest, Sha256};
 
         let secp = Secp256k1::signing_only();
 
@@ -59,8 +59,8 @@ impl KeyMaterial for NostrKeyMaterial {
     }
 
     async fn verify(&self, payload: &[u8], signature: &[u8]) -> Result<()> {
-        use secp256k1::{Secp256k1, Message, ecdsa::Signature};
-        use sha2::{Sha256, Digest};
+        use secp256k1::{ecdsa::Signature, Message, Secp256k1};
+        use sha2::{Digest, Sha256};
 
         let secp = Secp256k1::verification_only();
 

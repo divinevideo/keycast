@@ -25,19 +25,19 @@ pub fn assert_test_database_url() {
 
     // Known production indicators - check these FIRST
     let production_indicators = [
-        "keycast-db",      // Cloud SQL instance name
-        "cloudsql",        // Cloud SQL indicator
-        "prod",            // Production indicator
-        "130.211.",        // GCP IP range
-        "35.192.",         // GCP IP range
-        "35.188.",         // GCP IP range
-        "35.193.",         // GCP IP range
-        "34.66.",          // GCP IP range
-        "34.67.",          // GCP IP range
-        ".gcp.",           // GCP indicator
-        ".cloud.",         // Cloud indicator
-        "rds.amazonaws",   // AWS RDS
-        "azure",           // Azure
+        "keycast-db",    // Cloud SQL instance name
+        "cloudsql",      // Cloud SQL indicator
+        "prod",          // Production indicator
+        "130.211.",      // GCP IP range
+        "35.192.",       // GCP IP range
+        "35.188.",       // GCP IP range
+        "35.193.",       // GCP IP range
+        "34.66.",        // GCP IP range
+        "34.67.",        // GCP IP range
+        ".gcp.",         // GCP indicator
+        ".cloud.",       // Cloud indicator
+        "rds.amazonaws", // AWS RDS
+        "azure",         // Azure
     ];
 
     let url_lower = url.to_lowercase();

@@ -25,8 +25,8 @@ pub struct Database {
 
 impl Database {
     pub async fn new(_db_path: PathBuf, migrations_path: PathBuf) -> Result<Self, DatabaseError> {
-        let database_url = env::var("DATABASE_URL")
-            .expect("DATABASE_URL must be set for PostgreSQL");
+        let database_url =
+            env::var("DATABASE_URL").expect("DATABASE_URL must be set for PostgreSQL");
 
         eprintln!("🐘 Using PostgreSQL database");
         eprintln!("Connecting to database...");

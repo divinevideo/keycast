@@ -48,9 +48,7 @@ fn test_bunker_url_format() {
 
     let bunker_url = format!(
         "bunker://{}?relay={}&secret={}",
-        bunker_public_key,
-        relay_url,
-        bunker_secret
+        bunker_public_key, relay_url, bunker_secret
     );
 
     assert!(bunker_url.starts_with("bunker://"));
@@ -73,7 +71,9 @@ async fn setup_pool() -> PgPool {
     common::assert_test_database_url();
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string());
-    PgPool::connect(&database_url).await.expect("Failed to connect to database")
+    PgPool::connect(&database_url)
+        .await
+        .expect("Failed to connect to database")
 }
 
 /// Test authorization code expiration logic
@@ -107,15 +107,17 @@ async fn test_authorization_code_expiration() {
     .unwrap();
 
     // Try to fetch the code - should exist but be expired
-    let result: Option<(chrono::DateTime<Utc>,)> = sqlx::query_as(
-        "SELECT expires_at FROM oauth_codes WHERE code = $1 AND expires_at > NOW()"
-    )
-    .bind(&code)
-    .fetch_optional(&pool)
-    .await
-    .unwrap();
+    let result: Option<(chrono::DateTime<Utc>,)> =
+        sqlx::query_as("SELECT expires_at FROM oauth_codes WHERE code = $1 AND expires_at > NOW()")
+            .bind(&code)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
 
-    assert!(result.is_none(), "Expired code should not be found when filtering by expires_at > NOW()");
+    assert!(
+        result.is_none(),
+        "Expired code should not be found when filtering by expires_at > NOW()"
+    );
 }
 
 /// Test one-time use of authorization codes
@@ -152,7 +154,10 @@ async fn test_authorization_code_one_time_use() {
         .fetch_optional(&pool)
         .await
         .unwrap();
-    assert!(deleted.is_some(), "First exchange should find and delete the code");
+    assert!(
+        deleted.is_some(),
+        "First exchange should find and delete the code"
+    );
 
     // Second exchange - code should be gone
     let deleted_again = sqlx::query("DELETE FROM oauth_codes WHERE code = $1 RETURNING code")
@@ -160,7 +165,10 @@ async fn test_authorization_code_one_time_use() {
         .fetch_optional(&pool)
         .await
         .unwrap();
-    assert!(deleted_again.is_none(), "Second exchange should fail - code already used");
+    assert!(
+        deleted_again.is_none(),
+        "Second exchange should fail - code already used"
+    );
 }
 
 /// Test that multiple authorizations can exist for the same user (different origins)
@@ -208,17 +216,15 @@ async fn test_multiple_authorizations_per_user() {
     .unwrap();
 
     // Count authorizations for this user
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM oauth_authorizations WHERE user_pubkey = $1"
-    )
-    .bind(&user_pubkey)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM oauth_authorizations WHERE user_pubkey = $1")
+            .bind(&user_pubkey)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
     assert_eq!(count, 2, "User should have 2 authorizations (one per app)");
 }
-
 
 // ============================================================================
 // Unit Tests (No Database Required)
@@ -228,20 +234,31 @@ async fn test_multiple_authorizations_per_user() {
 #[test]
 fn test_extract_nsec_from_verifier() {
     // Test with nsec1 format (bech32)
-    let verifier_with_nsec = "randombase64data.nsec1abcdefghijklmnopqrstuvwxyz234567890123456789012";
-    let result = keycast_api::api::http::oauth::extract_nsec_from_verifier_public(verifier_with_nsec);
+    let verifier_with_nsec =
+        "randombase64data.nsec1abcdefghijklmnopqrstuvwxyz234567890123456789012";
+    let result =
+        keycast_api::api::http::oauth::extract_nsec_from_verifier_public(verifier_with_nsec);
     assert!(result.is_some());
-    assert_eq!(result.unwrap(), "nsec1abcdefghijklmnopqrstuvwxyz234567890123456789012");
+    assert_eq!(
+        result.unwrap(),
+        "nsec1abcdefghijklmnopqrstuvwxyz234567890123456789012"
+    );
 
     // Test with hex format (64 chars)
-    let verifier_with_hex = "randombase64data.0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let result = keycast_api::api::http::oauth::extract_nsec_from_verifier_public(verifier_with_hex);
+    let verifier_with_hex =
+        "randombase64data.0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let result =
+        keycast_api::api::http::oauth::extract_nsec_from_verifier_public(verifier_with_hex);
     assert!(result.is_some());
-    assert_eq!(result.unwrap(), "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    assert_eq!(
+        result.unwrap(),
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    );
 
     // Test without nsec (standard PKCE)
     let verifier_without_nsec = "randombase64datawithnodot";
-    let result = keycast_api::api::http::oauth::extract_nsec_from_verifier_public(verifier_without_nsec);
+    let result =
+        keycast_api::api::http::oauth::extract_nsec_from_verifier_public(verifier_without_nsec);
     assert!(result.is_none());
 
     // Test with short value after dot (not valid nsec)
@@ -269,7 +286,10 @@ fn test_secret_key_encryption_format() {
     // Verify we can reconstruct from bytes
     use nostr_sdk::secp256k1::SecretKey as Secp256k1SecretKey;
     let reconstructed = Secp256k1SecretKey::from_slice(&secret_bytes);
-    assert!(reconstructed.is_ok(), "Should be able to create SecretKey from bytes");
+    assert!(
+        reconstructed.is_ok(),
+        "Should be able to create SecretKey from bytes"
+    );
 
     // Verify reconstructed key matches original
     let reconstructed_keys = Keys::new(reconstructed.unwrap().into());
@@ -329,7 +349,9 @@ async fn test_handler_cache_stores_by_bunker_pubkey() {
     }) as Arc<dyn SigningHandler + Send + Sync>;
 
     // Insert handler
-    cache.insert(bunker_pubkey.to_string(), handler.clone()).await;
+    cache
+        .insert(bunker_pubkey.to_string(), handler.clone())
+        .await;
 
     // Retrieve by bunker pubkey
     let retrieved = cache.get(bunker_pubkey).await;

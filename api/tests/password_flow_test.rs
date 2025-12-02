@@ -71,7 +71,10 @@ fn test_password_reset_flow_simulation() {
     println!("  Initial hash: {}", &initial_hash[..30]);
 
     // Verify initial password works
-    assert!(verify(initial_password, &initial_hash).unwrap(), "Initial password should work");
+    assert!(
+        verify(initial_password, &initial_hash).unwrap(),
+        "Initial password should work"
+    );
 
     println!("\nStep 2: Simulate password reset - hash new password");
     let new_hash = hash(new_password, TEST_BCRYPT_COST).unwrap();
@@ -118,7 +121,10 @@ fn test_password_with_json_encoding() {
     println!("Original:  {:?}", original_password);
     println!("Recovered: {:?}", recovered_password);
 
-    assert_eq!(original_password, recovered_password, "Password should survive JSON round-trip");
+    assert_eq!(
+        original_password, recovered_password,
+        "Password should survive JSON round-trip"
+    );
 
     // Now test the hash/verify with the recovered password
     let hash1 = hash(original_password, TEST_BCRYPT_COST).unwrap();
@@ -144,7 +150,10 @@ fn test_password_bytes_vs_string() {
     let hash_from_str = hash(password_str, TEST_BCRYPT_COST).unwrap();
 
     // Verify using String
-    assert!(verify(&password_string, &hash_from_str).unwrap(), "String should verify against &str hash");
+    assert!(
+        verify(&password_string, &hash_from_str).unwrap(),
+        "String should verify against &str hash"
+    );
 
     // bcrypt::hash takes AsRef<[u8]>, so both should work identically
     println!("Password as str: {:?}", password_str);

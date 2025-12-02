@@ -58,13 +58,19 @@ pub async fn create_team(
             let allowed: Vec<&str> = allowed_pubkeys.split(',').map(|s| s.trim()).collect();
 
             if !allowed.contains(&user_pubkey_hex.as_str()) {
-                tracing::warn!("Team creation denied for non-whitelisted pubkey: {}", user_pubkey_hex);
+                tracing::warn!(
+                    "Team creation denied for non-whitelisted pubkey: {}",
+                    user_pubkey_hex
+                );
                 return Err(ApiError::forbidden(
-                    "Team creation is restricted to authorized users. Contact admin for access."
+                    "Team creation is restricted to authorized users. Contact admin for access.",
                 ));
             }
 
-            tracing::info!("Team creation authorized for whitelisted pubkey: {}", user_pubkey_hex);
+            tracing::info!(
+                "Team creation authorized for whitelisted pubkey: {}",
+                user_pubkey_hex
+            );
         }
     }
 
@@ -433,8 +439,7 @@ pub async fn add_key(
         Keys::parse(&request.secret_key).map_err(|e| ApiError::bad_request(e.to_string()))?;
 
     // Encrypt the secret key
-    let key_manager = get_key_manager()
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let key_manager = get_key_manager().map_err(|e| ApiError::internal(e.to_string()))?;
     let encrypted_secret = key_manager
         .encrypt(keys.secret_key().as_secret_bytes())
         .await
@@ -634,12 +639,13 @@ pub async fn add_authorization(
     .await?;
 
     // Verify policy exists and belongs to this team
-    let policy_exists =
-        sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM policies WHERE team_id = $1 AND id = $2)")
-            .bind(team_id)
-            .bind(request.policy_id)
-            .fetch_one(&mut *tx)
-            .await?;
+    let policy_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM policies WHERE team_id = $1 AND id = $2)",
+    )
+    .bind(team_id)
+    .bind(request.policy_id)
+    .fetch_one(&mut *tx)
+    .await?;
 
     if !policy_exists {
         return Err(ApiError::not_found("Policy not found"));
@@ -804,8 +810,8 @@ pub async fn verify_admin<'a>(
     team_id: i32,
     tenant_id: i64,
 ) -> ApiResult<()> {
-    let pubkey = PublicKey::from_hex(pubkey_hex)
-        .map_err(|_| ApiError::bad_request("Invalid pubkey"))?;
+    let pubkey =
+        PublicKey::from_hex(pubkey_hex).map_err(|_| ApiError::bad_request("Invalid pubkey"))?;
 
     match User::is_team_admin(pool, tenant_id, &pubkey, team_id).await {
         Ok(true) => Ok(()),

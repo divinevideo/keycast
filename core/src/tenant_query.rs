@@ -153,7 +153,10 @@ mod tests {
         let sql = "SELECT * FROM users WHERE email = ?";
         let result = inject_tenant_filter_sql(sql);
         assert!(result.contains("AND tenant_id = ?"));
-        assert_eq!(result, "SELECT * FROM users WHERE email = ? AND tenant_id = ?");
+        assert_eq!(
+            result,
+            "SELECT * FROM users WHERE email = ? AND tenant_id = ?"
+        );
     }
 
     #[test]

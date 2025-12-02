@@ -23,9 +23,8 @@ impl CustomPermission for DecryptOnly {
     fn from_permission(
         permission: &Permission,
     ) -> Result<Box<dyn CustomPermission>, PermissionError> {
-        let parsed_config: DecryptOnlyConfig =
-            serde_json::from_value(permission.config.0.clone())
-                .map_err(|e| PermissionError::InvalidConfig(e.to_string()))?;
+        let parsed_config: DecryptOnlyConfig = serde_json::from_value(permission.config.0.clone())
+            .map_err(|e| PermissionError::InvalidConfig(e.to_string()))?;
 
         Ok(Box::new(Self {
             config: parsed_config,
@@ -64,7 +63,8 @@ impl CustomPermission for DecryptOnly {
         PermissionDisplay {
             icon: "👁️",
             title: "Read only",
-            description: "Can only read encrypted messages, cannot post or send messages".to_string(),
+            description: "Can only read encrypted messages, cannot post or send messages"
+                .to_string(),
         }
     }
 }

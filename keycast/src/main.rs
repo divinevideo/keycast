@@ -1,7 +1,12 @@
 // ABOUTME: Unified binary that runs both API server and Signer daemon in one process
 // ABOUTME: Shares AuthorizationHandler state between HTTP endpoints and NIP-46 signer for optimal performance
 
-use axum::{routing::get, Router, http::StatusCode, response::{Html, IntoResponse}};
+use axum::{
+    http::StatusCode,
+    response::{Html, IntoResponse},
+    routing::get,
+    Router,
+};
 use dotenv::dotenv;
 use keycast_core::authorization_channel;
 use keycast_core::database::Database;
@@ -17,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
-use tokio::sync::{Notify, Mutex};
+use tokio::sync::{Mutex, Notify};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -167,13 +172,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load server keys for signing UCANs
     let server_nsec = env::var("SERVER_NSEC")?; // Validated above
-    let server_keys = Keys::parse(&server_nsec)
-        .map_err(|e| format!("Invalid SERVER_NSEC: {}. Must be valid hex (64 chars) or nsec bech32.", e))?;
-    tracing::info!("✔︎ Server keys loaded (pubkey: {})", server_keys.public_key().to_hex());
+    let server_keys = Keys::parse(&server_nsec).map_err(|e| {
+        format!(
+            "Invalid SERVER_NSEC: {}. Must be valid hex (64 chars) or nsec bech32.",
+            e
+        )
+    })?;
+    tracing::info!(
+        "✔︎ Server keys loaded (pubkey: {})",
+        server_keys.public_key().to_hex()
+    );
 
     // Create authorization channel for instant communication between API and Signer
     let (auth_tx, auth_rx) = authorization_channel::create_channel();
-    tracing::info!("✔︎ Authorization channel created (buffer size: {})", authorization_channel::CHANNEL_BUFFER_SIZE);
+    tracing::info!(
+        "✔︎ Authorization channel created (buffer size: {})",
+        authorization_channel::CHANNEL_BUFFER_SIZE
+    );
 
     // Create signer and load all authorizations into memory
     let mut signer = UnifiedSigner::new(
@@ -181,7 +196,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         signer_key_manager,
         auth_rx,
         hashring.clone(),
-    ).await?;
+    )
+    .await?;
     signer.load_authorizations().await?;
     signer.connect_to_relays().await?;
     tracing::info!("✔︎ Signer daemon initialized and connected to relays");
@@ -198,7 +214,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Set global state for routes that use it
-    keycast_api::state::KEYCAST_STATE.set(api_state.clone()).ok();
+    keycast_api::state::KEYCAST_STATE
+        .set(api_state.clone())
+        .ok();
 
     // Get API port (default 3000)
     let api_port = env::var("PORT")
@@ -206,20 +224,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse::<u16>()
         .unwrap_or(3000);
 
-
     // Set up static file directories
     let root_dir = env!("CARGO_MANIFEST_DIR");
 
     // Use WEB_BUILD_DIR if set, otherwise use web/build for dev
-    let web_build_dir = env::var("WEB_BUILD_DIR")
-        .unwrap_or_else(|_| {
-            PathBuf::from(root_dir)
-                .parent()
-                .unwrap()
-                .join("web/build")
-                .to_string_lossy()
-                .to_string()
-        });
+    let web_build_dir = env::var("WEB_BUILD_DIR").unwrap_or_else(|_| {
+        PathBuf::from(root_dir)
+            .parent()
+            .unwrap()
+            .join("web/build")
+            .to_string_lossy()
+            .to_string()
+    });
 
     tracing::info!("✔︎ Serving web frontend from: {}", web_build_dir);
 
@@ -235,10 +251,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if origin_str.starts_with("http://localhost:") || origin_str == "http://localhost" {
                 return true;
             }
-            allowed_origins_for_closure.split(',').map(|s| s.trim()).any(|allowed| origin_str == allowed)
+            allowed_origins_for_closure
+                .split(',')
+                .map(|s| s.trim())
+                .any(|allowed| origin_str == allowed)
         }))
-        .allow_methods([axum::http::Method::POST, axum::http::Method::GET, axum::http::Method::OPTIONS, axum::http::Method::PUT, axum::http::Method::DELETE])
-        .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::AUTHORIZATION])
+        .allow_methods([
+            axum::http::Method::POST,
+            axum::http::Method::GET,
+            axum::http::Method::OPTIONS,
+            axum::http::Method::PUT,
+            axum::http::Method::DELETE,
+        ])
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+        ])
         .allow_credentials(true);
 
     let public_cors = CorsLayer::new()
@@ -248,7 +276,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .allow_credentials(false);
 
     // Get pure API routes (JSON endpoints only) - pass authorization sender
-    let api_routes = keycast_api::api::http::routes::api_routes(database.pool.clone(), api_state.clone(), auth_cors, public_cors, Some(auth_tx));
+    let api_routes = keycast_api::api::http::routes::api_routes(
+        database.pool.clone(),
+        api_state.clone(),
+        auth_cors,
+        public_cors,
+        Some(auth_tx),
+    );
 
     // Serve examples directory (only in development)
     let enable_examples = env::var("ENABLE_EXAMPLES")
@@ -261,11 +295,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/health", get(health_check))
         .route("/healthz/startup", get(health_check))
         .route("/healthz/ready", get(health_check))
-
         // NIP-05 discovery at root level
-        .route("/.well-known/nostr.json", get(keycast_api::api::http::nostr_discovery_public))
+        .route(
+            "/.well-known/nostr.json",
+            get(keycast_api::api::http::nostr_discovery_public),
+        )
         .with_state(database.pool.clone())
-
         // All API endpoints under /api prefix
         .nest("/api", api_routes);
 
@@ -280,7 +315,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap()
                 .join("examples")
         };
-        tracing::info!("✔︎ Examples directory enabled at /examples (serving from {:?})", examples_path);
+        tracing::info!(
+            "✔︎ Examples directory enabled at /examples (serving from {:?})",
+            examples_path
+        );
         app = app.nest_service("/examples", ServeDir::new(&examples_path));
 
         // Serve keycast-client dist for examples (IIFE bundle)
@@ -293,7 +331,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .join("packages/keycast-client/dist")
         };
         if client_dist_path.exists() {
-            tracing::info!("✔︎ Keycast client served at /dist (from {:?})", client_dist_path);
+            tracing::info!(
+                "✔︎ Keycast client served at /dist (from {:?})",
+                client_dist_path
+            );
             app = app.nest_service("/dist", ServeDir::new(&client_dist_path));
         }
     }
@@ -301,8 +342,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // SvelteKit frontend (fallback - catches all other routes)
     // SPA mode: serve index.html for all non-file routes
     let index_path = PathBuf::from(&web_build_dir).join("index.html");
-    let app = app.fallback_service(ServeDir::new(&web_build_dir).fallback(
-        axum::routing::get(move || {
+    let app = app.fallback_service(ServeDir::new(&web_build_dir).fallback(axum::routing::get(
+        move || {
             let index_path = index_path.clone();
             async move {
                 match tokio::fs::read_to_string(&index_path).await {
@@ -310,8 +351,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(_) => (StatusCode::NOT_FOUND, "Not found").into_response(),
                 }
             }
-        })
-    ));
+        },
+    )));
 
     let api_addr = std::net::SocketAddr::from(([0, 0, 0, 0], api_port));
     tracing::info!("✔︎ API server ready on {}", api_addr);

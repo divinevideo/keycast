@@ -43,14 +43,13 @@ impl EmailService {
         let api_key = env::var("SENDGRID_API_KEY")
             .map_err(|_| "SENDGRID_API_KEY environment variable not set".to_string())?;
 
-        let from_email = env::var("FROM_EMAIL")
-            .unwrap_or_else(|_| "noreply@keycast.app".to_string());
+        let from_email =
+            env::var("FROM_EMAIL").unwrap_or_else(|_| "noreply@keycast.app".to_string());
 
-        let from_name = env::var("FROM_NAME")
-            .unwrap_or_else(|_| "diVine".to_string());
+        let from_name = env::var("FROM_NAME").unwrap_or_else(|_| "diVine".to_string());
 
-        let base_url = env::var("BASE_URL")
-            .unwrap_or_else(|_| "https://login.divine.video".to_string());
+        let base_url =
+            env::var("BASE_URL").unwrap_or_else(|_| "https://login.divine.video".to_string());
 
         Ok(Self {
             api_key,
@@ -147,11 +146,7 @@ impl EmailService {
             .await
     }
 
-    pub async fn send_key_export_code(
-        &self,
-        to_email: &str,
-        code: &str,
-    ) -> Result<(), String> {
+    pub async fn send_key_export_code(&self, to_email: &str, code: &str) -> Result<(), String> {
         let subject = "Your diVine key export verification code".to_string();
         let html_content = format!(
             r#"

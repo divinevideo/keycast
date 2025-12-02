@@ -62,7 +62,10 @@ impl IntoResponse for ApiError {
         let (status, message) = match &self {
             ApiError::Database(e) => {
                 tracing::error!("Database error: {}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong. Please try again.".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Something went wrong. Please try again.".to_string(),
+                )
             }
             ApiError::Auth(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
@@ -70,15 +73,24 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             ApiError::Internal(msg) => {
                 tracing::error!("Internal error: {}", msg);
-                (StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong. Please try again.".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Something went wrong. Please try again.".to_string(),
+                )
             }
             ApiError::User(e) => {
                 tracing::error!("User error: {}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong. Please try again.".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Something went wrong. Please try again.".to_string(),
+                )
             }
             ApiError::Team(e) => {
                 tracing::error!("Team error: {}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong. Please try again.".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Something went wrong. Please try again.".to_string(),
+                )
             }
         };
 

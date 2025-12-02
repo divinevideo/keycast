@@ -52,15 +52,18 @@ impl Metrics {
     }
 
     pub fn inc_nip46_rejected_hashring(&self) {
-        self.nip46_requests_rejected_hashring.fetch_add(1, Ordering::Relaxed);
+        self.nip46_requests_rejected_hashring
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_nip46_handler_not_found(&self) {
-        self.nip46_requests_handler_not_found.fetch_add(1, Ordering::Relaxed);
+        self.nip46_requests_handler_not_found
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_nip46_processed(&self) {
-        self.nip46_requests_processed.fetch_add(1, Ordering::Relaxed);
+        self.nip46_requests_processed
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Format all metrics as Prometheus text
@@ -101,17 +104,21 @@ impl Metrics {
         output.push_str("# TYPE keycast_nip46_rejected_hashring_total counter\n");
         output.push_str(&format!(
             "keycast_nip46_rejected_hashring_total {}\n",
-            self.nip46_requests_rejected_hashring.load(Ordering::Relaxed)
+            self.nip46_requests_rejected_hashring
+                .load(Ordering::Relaxed)
         ));
 
         output.push_str("\n# HELP keycast_nip46_handler_not_found_total NIP-46 requests where authorization was not found\n");
         output.push_str("# TYPE keycast_nip46_handler_not_found_total counter\n");
         output.push_str(&format!(
             "keycast_nip46_handler_not_found_total {}\n",
-            self.nip46_requests_handler_not_found.load(Ordering::Relaxed)
+            self.nip46_requests_handler_not_found
+                .load(Ordering::Relaxed)
         ));
 
-        output.push_str("\n# HELP keycast_nip46_processed_total NIP-46 requests successfully processed\n");
+        output.push_str(
+            "\n# HELP keycast_nip46_processed_total NIP-46 requests successfully processed\n",
+        );
         output.push_str("# TYPE keycast_nip46_processed_total counter\n");
         output.push_str(&format!(
             "keycast_nip46_processed_total {}\n",

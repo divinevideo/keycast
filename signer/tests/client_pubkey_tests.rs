@@ -3,7 +3,7 @@
 //
 // TDD: These tests are written BEFORE the implementation. They should fail initially.
 
-use keycast_core::encryption::{KeyManager, file_key_manager::FileKeyManager};
+use keycast_core::encryption::{file_key_manager::FileKeyManager, KeyManager};
 use keycast_core::signing_handler::SigningHandler;
 use keycast_core::types::oauth_authorization::OAuthAuthorization;
 use keycast_signer::AuthorizationHandler;
@@ -17,7 +17,8 @@ async fn setup_test_db() -> PgPool {
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast".to_string());
 
-    let pool = PgPool::connect(&database_url).await
+    let pool = PgPool::connect(&database_url)
+        .await
         .expect("Failed to connect to database. Make sure PostgreSQL is running.");
 
     pool
@@ -39,7 +40,7 @@ async fn create_oauth_authorization_for_client_test(
     sqlx::query(
         "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
          VALUES ($1, $2, NOW(), NOW())
-         ON CONFLICT (pubkey) DO NOTHING"
+         ON CONFLICT (pubkey) DO NOTHING",
     )
     .bind(user_keys.public_key().to_hex())
     .bind(tenant_id)
@@ -49,12 +50,14 @@ async fn create_oauth_authorization_for_client_test(
 
     // Encrypt user secret for personal_keys
     let user_secret = user_keys.secret_key().secret_bytes();
-    let encrypted_secret = key_manager.encrypt(&user_secret).await
+    let encrypted_secret = key_manager
+        .encrypt(&user_secret)
+        .await
         .expect("Failed to encrypt user secret");
 
     sqlx::query(
         "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id)
-         VALUES ($1, $2, $3)"
+         VALUES ($1, $2, $3)",
     )
     .bind(user_keys.public_key().to_hex())
     .bind(&encrypted_secret)
@@ -82,7 +85,8 @@ async fn create_oauth_authorization_for_client_test(
     .expect("Failed to create OAuth authorization");
 
     // Load OAuth authorization
-    let oauth_auth = OAuthAuthorization::find(pool, tenant_id, oauth_id).await
+    let oauth_auth = OAuthAuthorization::find(pool, tenant_id, oauth_id)
+        .await
         .expect("Failed to load OAuth authorization");
 
     (oauth_auth, user_keys, unique_secret)
@@ -123,15 +127,22 @@ async fn test_connect_stores_client_pubkey() {
 
     // Verify client pubkey was stored in database
     let stored_client: Option<String> = sqlx::query_scalar(
-        "SELECT connected_client_pubkey FROM oauth_authorizations WHERE id = $1"
+        "SELECT connected_client_pubkey FROM oauth_authorizations WHERE id = $1",
     )
     .bind(oauth_auth.id)
     .fetch_one(&pool)
     .await
     .expect("Failed to query database");
 
-    assert!(stored_client.is_some(), "connected_client_pubkey should be stored");
-    assert_eq!(stored_client.unwrap(), client_pubkey, "Stored client pubkey should match");
+    assert!(
+        stored_client.is_some(),
+        "connected_client_pubkey should be stored"
+    );
+    assert_eq!(
+        stored_client.unwrap(),
+        client_pubkey,
+        "Stored client pubkey should match"
+    );
 }
 
 // ============================================================================
@@ -159,19 +170,27 @@ async fn test_connect_rejects_reused_secret() {
 
     // First client connects successfully
     let client_a = Keys::generate();
-    let result = handler.process_connect(&client_a.public_key().to_hex(), &secret).await;
+    let result = handler
+        .process_connect(&client_a.public_key().to_hex(), &secret)
+        .await;
     assert!(result.is_ok(), "First connect should succeed");
 
     // Second client tries to use same secret
     let client_b = Keys::generate();
-    let result = handler.process_connect(&client_b.public_key().to_hex(), &secret).await;
+    let result = handler
+        .process_connect(&client_b.public_key().to_hex(), &secret)
+        .await;
 
     // Should be rejected - secret already used by client_a
-    assert!(result.is_err(), "Second connect with same secret should fail");
+    assert!(
+        result.is_err(),
+        "Second connect with same secret should fail"
+    );
     let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("already used") || err_msg.contains("Secret"),
-        "Error should indicate secret was already used, got: {}", err_msg
+        "Error should indicate secret was already used, got: {}",
+        err_msg
     );
 }
 
@@ -234,16 +253,20 @@ async fn test_request_from_connected_client_succeeds() {
     // Client connects first
     let client = Keys::generate();
     let client_pubkey = client.public_key().to_hex();
-    handler.process_connect(&client_pubkey, &secret).await
+    handler
+        .process_connect(&client_pubkey, &secret)
+        .await
         .expect("Connect should succeed");
 
     // Now client makes a sign request
-    let unsigned = EventBuilder::text_note("Hello world")
-        .build(user_keys.public_key());
+    let unsigned = EventBuilder::text_note("Hello world").build(user_keys.public_key());
 
     // validate_client should pass for this client
     let validation = handler.validate_client(&client_pubkey).await;
-    assert!(validation.is_ok(), "Request from connected client should be validated");
+    assert!(
+        validation.is_ok(),
+        "Request from connected client should be validated"
+    );
 
     // Actually sign the event
     let result = handler.sign_event_direct(unsigned).await;
@@ -274,18 +297,26 @@ async fn test_request_from_unknown_client_rejected() {
 
     // Client A connects
     let client_a = Keys::generate();
-    handler.process_connect(&client_a.public_key().to_hex(), &secret).await
+    handler
+        .process_connect(&client_a.public_key().to_hex(), &secret)
+        .await
         .expect("Connect should succeed");
 
     // Client B (never connected) tries to make a request
     let client_b = Keys::generate();
-    let validation = handler.validate_client(&client_b.public_key().to_hex()).await;
+    let validation = handler
+        .validate_client(&client_b.public_key().to_hex())
+        .await;
 
-    assert!(validation.is_err(), "Request from unknown client should be rejected");
+    assert!(
+        validation.is_err(),
+        "Request from unknown client should be rejected"
+    );
     let err_msg = validation.unwrap_err().to_string();
     assert!(
         err_msg.contains("Unknown client") || err_msg.contains("not connected"),
-        "Error should indicate unknown client, got: {}", err_msg
+        "Error should indicate unknown client, got: {}",
+        err_msg
     );
 }
 
@@ -313,13 +344,16 @@ async fn test_first_request_without_connect_allowed() {
 
     // Verify no client is connected yet
     let stored_client: Option<String> = sqlx::query_scalar(
-        "SELECT connected_client_pubkey FROM oauth_authorizations WHERE id = $1"
+        "SELECT connected_client_pubkey FROM oauth_authorizations WHERE id = $1",
     )
     .bind(oauth_auth.id)
     .fetch_one(&pool)
     .await
     .expect("Failed to query database");
-    assert!(stored_client.is_none(), "No client should be connected initially");
+    assert!(
+        stored_client.is_none(),
+        "No client should be connected initially"
+    );
 
     // Client makes request without explicit connect (NULL means accept first client)
     let client = Keys::generate();
@@ -327,17 +361,23 @@ async fn test_first_request_without_connect_allowed() {
 
     // validate_and_store_client should store the client on first request
     let validation = handler.validate_and_store_client(&client_pubkey).await;
-    assert!(validation.is_ok(), "First request should be allowed when no client connected");
+    assert!(
+        validation.is_ok(),
+        "First request should be allowed when no client connected"
+    );
 
     // Verify client was stored
     let stored_client: Option<String> = sqlx::query_scalar(
-        "SELECT connected_client_pubkey FROM oauth_authorizations WHERE id = $1"
+        "SELECT connected_client_pubkey FROM oauth_authorizations WHERE id = $1",
     )
     .bind(oauth_auth.id)
     .fetch_one(&pool)
     .await
     .expect("Failed to query database");
-    assert!(stored_client.is_some(), "Client should be stored after first request");
+    assert!(
+        stored_client.is_some(),
+        "Client should be stored after first request"
+    );
     assert_eq!(stored_client.unwrap(), client_pubkey);
 }
 
@@ -366,12 +406,14 @@ async fn test_revocation_clears_client_pubkey() {
     // Client connects
     let client = Keys::generate();
     let client_pubkey = client.public_key().to_hex();
-    handler.process_connect(&client_pubkey, &secret).await
+    handler
+        .process_connect(&client_pubkey, &secret)
+        .await
         .expect("Connect should succeed");
 
     // Verify client is stored
     let stored_client: Option<String> = sqlx::query_scalar(
-        "SELECT connected_client_pubkey FROM oauth_authorizations WHERE id = $1"
+        "SELECT connected_client_pubkey FROM oauth_authorizations WHERE id = $1",
     )
     .bind(oauth_auth.id)
     .fetch_one(&pool)
@@ -392,7 +434,10 @@ async fn test_revocation_clears_client_pubkey() {
     let validation = handler.validate_client(&client_pubkey).await;
 
     // After revocation, client must reconnect
-    assert!(validation.is_err(), "Request after revocation should require reconnect");
+    assert!(
+        validation.is_err(),
+        "Request after revocation should require reconnect"
+    );
 }
 
 // ============================================================================
@@ -419,17 +464,21 @@ async fn test_connected_at_timestamp_set() {
 
     // Client connects
     let client = Keys::generate();
-    handler.process_connect(&client.public_key().to_hex(), &secret).await
+    handler
+        .process_connect(&client.public_key().to_hex(), &secret)
+        .await
         .expect("Connect should succeed");
 
     // Verify connected_at is set
-    let connected_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
-        "SELECT connected_at FROM oauth_authorizations WHERE id = $1"
-    )
-    .bind(oauth_auth.id)
-    .fetch_one(&pool)
-    .await
-    .expect("Failed to query database");
+    let connected_at: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT connected_at FROM oauth_authorizations WHERE id = $1")
+            .bind(oauth_auth.id)
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to query database");
 
-    assert!(connected_at.is_some(), "connected_at should be set after connect");
+    assert!(
+        connected_at.is_some(),
+        "connected_at should be set after connect"
+    );
 }

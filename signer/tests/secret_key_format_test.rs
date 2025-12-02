@@ -2,7 +2,7 @@
 // Verifies that OAuth authorization bunker_secret is stored as raw bytes
 // and can be correctly decrypted and parsed into Keys
 
-use keycast_core::encryption::{KeyManager, file_key_manager::FileKeyManager};
+use keycast_core::encryption::{file_key_manager::FileKeyManager, KeyManager};
 use nostr_sdk::prelude::*;
 
 /// Test that raw bytes format works correctly for OAuth secrets
@@ -19,11 +19,15 @@ async fn test_oauth_secret_raw_bytes_format() {
     assert_eq!(secret_bytes.len(), 32, "Secret key should be 32 bytes");
 
     // Encrypt the raw bytes (this is how OAuth registration stores it)
-    let encrypted = key_manager.encrypt(&secret_bytes).await
+    let encrypted = key_manager
+        .encrypt(&secret_bytes)
+        .await
         .expect("Failed to encrypt secret");
 
     // Decrypt and verify we can reconstruct the key
-    let decrypted = key_manager.decrypt(&encrypted).await
+    let decrypted = key_manager
+        .decrypt(&encrypted)
+        .await
         .expect("Failed to decrypt secret");
 
     // Should be able to create SecretKey directly from decrypted bytes
@@ -53,20 +57,22 @@ async fn test_oauth_secret_hex_string_format() {
     assert_eq!(secret_hex.len(), 64, "Hex secret should be 64 chars");
 
     // Encrypt the hex string as bytes
-    let encrypted = key_manager.encrypt(secret_hex.as_bytes()).await
+    let encrypted = key_manager
+        .encrypt(secret_hex.as_bytes())
+        .await
         .expect("Failed to encrypt secret");
 
     // Decrypt and verify we can parse it
-    let decrypted = key_manager.decrypt(&encrypted).await
+    let decrypted = key_manager
+        .decrypt(&encrypted)
+        .await
         .expect("Failed to decrypt secret");
 
     // Should be valid UTF-8 (hex string)
-    let decrypted_str = std::str::from_utf8(&decrypted)
-        .expect("Hex format should be valid UTF-8");
+    let decrypted_str = std::str::from_utf8(&decrypted).expect("Hex format should be valid UTF-8");
 
     // Should be able to parse as Keys
-    let recovered_keys = Keys::parse(decrypted_str)
-        .expect("Should be able to parse hex string");
+    let recovered_keys = Keys::parse(decrypted_str).expect("Should be able to parse hex string");
 
     // Verify the public key matches
     assert_eq!(
@@ -89,11 +95,15 @@ async fn test_raw_bytes_are_not_utf8() {
     let secret_bytes = user_keys.secret_key().secret_bytes();
 
     // Encrypt the raw bytes
-    let encrypted = key_manager.encrypt(&secret_bytes).await
+    let encrypted = key_manager
+        .encrypt(&secret_bytes)
+        .await
         .expect("Failed to encrypt secret");
 
     // Decrypt
-    let decrypted = key_manager.decrypt(&encrypted).await
+    let decrypted = key_manager
+        .decrypt(&encrypted)
+        .await
         .expect("Failed to decrypt secret");
 
     // Raw bytes are typically NOT valid UTF-8
@@ -105,15 +115,18 @@ async fn test_raw_bytes_are_not_utf8() {
     // Run the test multiple times to see it fail on invalid UTF-8
     if utf8_result.is_err() {
         // This is expected - raw bytes usually aren't valid UTF-8
-        println!("As expected, raw bytes are not valid UTF-8: {:?}", utf8_result.err());
+        println!(
+            "As expected, raw bytes are not valid UTF-8: {:?}",
+            utf8_result.err()
+        );
     } else {
         // This is rare but possible - if the random bytes happen to be valid UTF-8
         println!("Note: This random sequence happened to be valid UTF-8");
     }
 
     // The CORRECT way to handle raw bytes:
-    let secret_key = SecretKey::from_slice(&decrypted)
-        .expect("Raw bytes should always work with from_slice");
+    let secret_key =
+        SecretKey::from_slice(&decrypted).expect("Raw bytes should always work with from_slice");
     let recovered_keys = Keys::new(secret_key);
 
     assert_eq!(
@@ -161,10 +174,13 @@ async fn test_universal_parser_handles_raw_bytes() {
     let encrypted = key_manager.encrypt(&secret_bytes).await.unwrap();
     let decrypted = key_manager.decrypt(&encrypted).await.unwrap();
 
-    let recovered = parse_decrypted_secret(&decrypted)
-        .expect("Universal parser should handle raw bytes");
+    let recovered =
+        parse_decrypted_secret(&decrypted).expect("Universal parser should handle raw bytes");
 
-    assert_eq!(recovered.public_key().to_hex(), user_keys.public_key().to_hex());
+    assert_eq!(
+        recovered.public_key().to_hex(),
+        user_keys.public_key().to_hex()
+    );
 }
 
 #[tokio::test]
@@ -177,8 +193,11 @@ async fn test_universal_parser_handles_hex_string() {
     let encrypted = key_manager.encrypt(secret_hex.as_bytes()).await.unwrap();
     let decrypted = key_manager.decrypt(&encrypted).await.unwrap();
 
-    let recovered = parse_decrypted_secret(&decrypted)
-        .expect("Universal parser should handle hex string");
+    let recovered =
+        parse_decrypted_secret(&decrypted).expect("Universal parser should handle hex string");
 
-    assert_eq!(recovered.public_key().to_hex(), user_keys.public_key().to_hex());
+    assert_eq!(
+        recovered.public_key().to_hex(),
+        user_keys.public_key().to_hex()
+    );
 }

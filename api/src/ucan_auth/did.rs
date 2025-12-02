@@ -1,6 +1,6 @@
 // ABOUTME: DID:key utilities for converting Nostr pubkeys to/from DID format for UCAN
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use nostr_sdk::PublicKey;
 
 /// Convert Nostr public key to DID:key format
@@ -34,8 +34,7 @@ pub fn did_to_nostr_pubkey(did: &str) -> Result<PublicKey> {
 
     let pubkey_bytes = &decoded[2..];
 
-    PublicKey::from_slice(pubkey_bytes)
-        .map_err(|e| anyhow!("Invalid public key: {}", e))
+    PublicKey::from_slice(pubkey_bytes).map_err(|e| anyhow!("Invalid public key: {}", e))
 }
 
 #[cfg(test)]

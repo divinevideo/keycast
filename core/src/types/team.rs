@@ -76,11 +76,12 @@ impl Team {
         team_id: i32,
     ) -> Result<TeamWithRelations, TeamError> {
         // Get team
-        let team = sqlx::query_as::<_, Team>("SELECT * FROM teams WHERE tenant_id = $1 AND id = $2")
-            .bind(tenant_id)
-            .bind(team_id)
-            .fetch_one(pool)
-            .await?;
+        let team =
+            sqlx::query_as::<_, Team>("SELECT * FROM teams WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(team_id)
+                .fetch_one(pool)
+                .await?;
 
         // Get team_users for this team
         let team_users = sqlx::query_as::<_, TeamUser>(
@@ -95,12 +96,13 @@ impl Team {
         .await?;
 
         // Get stored keys for this team
-        let stored_keys =
-            sqlx::query_as::<_, StoredKey>("SELECT * FROM stored_keys WHERE tenant_id = $1 AND team_id = $2")
-                .bind(tenant_id)
-                .bind(team_id)
-                .fetch_all(pool)
-                .await?;
+        let stored_keys = sqlx::query_as::<_, StoredKey>(
+            "SELECT * FROM stored_keys WHERE tenant_id = $1 AND team_id = $2",
+        )
+        .bind(tenant_id)
+        .bind(team_id)
+        .fetch_all(pool)
+        .await?;
 
         let public_stored_keys: Vec<PublicStoredKey> = stored_keys
             .into_iter()

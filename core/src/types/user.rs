@@ -51,7 +51,11 @@ pub enum TeamUserRole {
 }
 
 impl User {
-    pub async fn find_by_pubkey(pool: &PgPool, tenant_id: i64, pubkey: &PublicKey) -> Result<Self, UserError> {
+    pub async fn find_by_pubkey(
+        pool: &PgPool,
+        tenant_id: i64,
+        pubkey: &PublicKey,
+    ) -> Result<Self, UserError> {
         match sqlx::query_as::<_, User>("SELECT * FROM users WHERE tenant_id = $1 AND pubkey = $2")
             .bind(tenant_id)
             .bind(pubkey.to_hex())
@@ -67,7 +71,11 @@ impl User {
         }
     }
 
-    pub async fn teams(&self, pool: &PgPool, tenant_id: i64) -> Result<Vec<TeamWithRelations>, UserError> {
+    pub async fn teams(
+        &self,
+        pool: &PgPool,
+        tenant_id: i64,
+    ) -> Result<Vec<TeamWithRelations>, UserError> {
         let teams = sqlx::query_as::<_, Team>(
             "SELECT * FROM teams WHERE tenant_id = $1 AND id IN (SELECT team_id FROM team_users WHERE user_pubkey = $2)",
         )
@@ -92,12 +100,13 @@ impl User {
             .await?;
 
             // Get stored keys for this team
-            let stored_keys =
-                sqlx::query_as::<_, StoredKey>("SELECT * FROM stored_keys WHERE tenant_id = $1 AND team_id = $2")
-                    .bind(tenant_id)
-                    .bind(team.id)
-                    .fetch_all(pool)
-                    .await?;
+            let stored_keys = sqlx::query_as::<_, StoredKey>(
+                "SELECT * FROM stored_keys WHERE tenant_id = $1 AND team_id = $2",
+            )
+            .bind(tenant_id)
+            .bind(team.id)
+            .fetch_all(pool)
+            .await?;
 
             // Get policies for this team
             let policies = Team::get_policies_with_permissions(pool, tenant_id, team.id)

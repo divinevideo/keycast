@@ -20,13 +20,16 @@ pub struct AuthState {
 
 /// Build API routes - pure JSON endpoints, no HTML
 /// Returns unrooted Router that can be nested at any path (e.g., /api, /v1, etc.)
-pub fn api_routes(pool: PgPool, state: Arc<KeycastState>, auth_cors: tower_http::cors::CorsLayer, public_cors: tower_http::cors::CorsLayer, auth_tx: Option<AuthorizationSender>) -> Router {
+pub fn api_routes(
+    pool: PgPool,
+    state: Arc<KeycastState>,
+    auth_cors: tower_http::cors::CorsLayer,
+    public_cors: tower_http::cors::CorsLayer,
+    auth_tx: Option<AuthorizationSender>,
+) -> Router {
     tracing::debug!("Building routes");
 
-    let auth_state = AuthState {
-        state,
-        auth_tx,
-    };
+    let auth_state = AuthState { state, auth_tx };
 
     // Routes that need restricted CORS (first-party only + credentials)
     // These endpoints accept user credentials and must prevent phishing
@@ -52,7 +55,7 @@ pub fn api_routes(pool: PgPool, state: Arc<KeycastState>, auth_cors: tower_http:
         .route("/oauth/authorize", get(oauth::authorize_get))
         .route("/oauth/authorize", post(oauth::authorize_post))
         .route("/oauth/token", post(oauth::token))
-        .route("/oauth/poll", get(oauth::poll))  // iOS PWA polling endpoint
+        .route("/oauth/poll", get(oauth::poll)) // iOS PWA polling endpoint
         .route("/oauth/connect", post(oauth::connect_post))
         .layer(public_cors.clone())
         .with_state(auth_state.clone());
@@ -82,10 +85,16 @@ pub fn api_routes(pool: PgPool, state: Arc<KeycastState>, auth_cors: tower_http:
         .route("/user/profile", get(auth::get_profile))
         .route("/user/sessions", get(auth::list_sessions))
         .route("/user/permissions", get(auth::list_permissions))
-        .route("/user/sessions/:secret/activity", get(auth::get_session_activity))
+        .route(
+            "/user/sessions/:secret/activity",
+            get(auth::get_session_activity),
+        )
         .route("/user/profile", post(auth::update_profile))
         .route("/user/sessions/disconnect", post(auth::disconnect_client))
-        .route("/user/verify-password", post(auth::verify_password_for_export))
+        .route(
+            "/user/verify-password",
+            post(auth::verify_password_for_export),
+        )
         .route("/user/request-key-export", post(auth::request_key_export))
         .route("/user/verify-export-code", post(auth::verify_export_code))
         .layer(auth_cors.clone())
@@ -128,8 +137,7 @@ pub fn api_routes(pool: PgPool, state: Arc<KeycastState>, auth_cors: tower_http:
         .with_state(pool.clone());
 
     // API documentation route (public)
-    let docs_route = Router::new()
-        .route("/docs/openapi.json", get(openapi_spec));
+    let docs_route = Router::new().route("/docs/openapi.json", get(openapi_spec));
 
     // Protected team routes (authentication required)
     let team_routes = Router::new()
@@ -162,28 +170,27 @@ pub fn api_routes(pool: PgPool, state: Arc<KeycastState>, auth_cors: tower_http:
     // Authenticated routes have restricted CORS (need cookies)
     // Public routes have wildcard CORS (third-party safe, no credentials)
     Router::new()
-        .merge(first_party_routes)      // Has auth_cors (credentials, needs cookies)
-        .merge(user_routes)              // Has auth_cors (authenticated, needs cookies)
-        .merge(bunker_routes)            // Has auth_cors (bunker creation)
-        .merge(key_export_routes)        // Has auth_cors (authenticated, needs cookies)
-        .merge(change_key_route)         // Has auth_cors (authenticated, needs cookies)
+        .merge(first_party_routes) // Has auth_cors (credentials, needs cookies)
+        .merge(user_routes) // Has auth_cors (authenticated, needs cookies)
+        .merge(bunker_routes) // Has auth_cors (bunker creation)
+        .merge(key_export_routes) // Has auth_cors (authenticated, needs cookies)
+        .merge(change_key_route) // Has auth_cors (authenticated, needs cookies)
         .merge(email_routes.layer(public_cors.clone()))
-        .merge(oauth_routes)             // Has public_cors (third-party safe)
+        .merge(oauth_routes) // Has public_cors (third-party safe)
         .merge(connect_routes.layer(public_cors.clone()))
         .merge(signing_routes.layer(public_cors.clone()))
-        .merge(nostr_rpc_routes.layer(public_cors.clone()))  // NIP-46 RPC for OAuth apps
-        .merge(team_routes.layer(auth_cors.clone()))       // Team routes need credentials
+        .merge(nostr_rpc_routes.layer(public_cors.clone())) // NIP-46 RPC for OAuth apps
+        .merge(team_routes.layer(auth_cors.clone())) // Team routes need credentials
         .merge(discovery_route.layer(public_cors.clone()))
-        .merge(policy_routes.layer(public_cors.clone()))   // Public - available to third-party OAuth apps
-        .merge(metrics_route.layer(public_cors.clone()))   // Public - Prometheus metrics
+        .merge(policy_routes.layer(public_cors.clone())) // Public - available to third-party OAuth apps
+        .merge(metrics_route.layer(public_cors.clone())) // Public - Prometheus metrics
         .merge(docs_route.layer(public_cors))
 }
 
 /// Serve OpenAPI specification as JSON
 async fn openapi_spec() -> AxumJson<JsonValue> {
     let yaml_content = include_str!("../../../openapi.yaml");
-    let spec: JsonValue = serde_yaml::from_str(yaml_content)
-        .expect("Failed to parse OpenAPI spec");
+    let spec: JsonValue = serde_yaml::from_str(yaml_content).expect("Failed to parse OpenAPI spec");
     AxumJson(spec)
 }
 
@@ -194,8 +201,8 @@ pub async fn nostr_discovery_public(
     axum::extract::State(pool): axum::extract::State<PgPool>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl axum::response::IntoResponse {
-    use axum::http::{header, StatusCode};
     use axum::body::Body;
+    use axum::http::{header, StatusCode};
     use axum::response::Response;
 
     let tenant_id = tenant.0.id;
@@ -203,15 +210,14 @@ pub async fn nostr_discovery_public(
     // Check if "name" query parameter is provided
     if let Some(name) = params.get("name") {
         // Look up user by username in this tenant
-        let result: Option<(String,)> = sqlx::query_as(
-            "SELECT pubkey FROM users WHERE username = $1 AND tenant_id = $2"
-        )
-        .bind(name)
-        .bind(tenant_id)
-        .fetch_optional(&pool)
-        .await
-        .ok()
-        .flatten();
+        let result: Option<(String,)> =
+            sqlx::query_as("SELECT pubkey FROM users WHERE username = $1 AND tenant_id = $2")
+                .bind(name)
+                .bind(tenant_id)
+                .fetch_optional(&pool)
+                .await
+                .ok()
+                .flatten();
 
         if let Some((pubkey,)) = result {
             // Return NIP-05 response with user's pubkey

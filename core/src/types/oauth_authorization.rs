@@ -103,7 +103,9 @@ impl OAuthAuthorization {
         Ok(authorizations)
     }
 
-    pub async fn all_ids_for_all_tenants(pool: &PgPool) -> Result<Vec<(i64, i32)>, AuthorizationError> {
+    pub async fn all_ids_for_all_tenants(
+        pool: &PgPool,
+    ) -> Result<Vec<(i64, i32)>, AuthorizationError> {
         let authorizations = sqlx::query_as::<_, (i64, i32)>(
             r#"
             SELECT tenant_id, id FROM oauth_authorizations

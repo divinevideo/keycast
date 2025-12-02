@@ -230,13 +230,12 @@ async fn test_signer_daemon_filters_revoked() {
     );
 
     // Verify the auth exists when not filtering
-    let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM oauth_authorizations WHERE id = $1)",
-    )
-    .bind(auth_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM oauth_authorizations WHERE id = $1)")
+            .bind(auth_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
     assert!(exists, "Authorization should still exist in database");
 }
@@ -320,13 +319,12 @@ async fn test_soft_delete_revoke() {
         .unwrap();
 
     // Verify it still exists
-    let (exists, revoked_at): (bool, Option<chrono::DateTime<Utc>>) = sqlx::query_as(
-        "SELECT true, revoked_at FROM oauth_authorizations WHERE id = $1",
-    )
-    .bind(auth_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let (exists, revoked_at): (bool, Option<chrono::DateTime<Utc>>) =
+        sqlx::query_as("SELECT true, revoked_at FROM oauth_authorizations WHERE id = $1")
+            .bind(auth_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
     assert!(exists, "Authorization should still exist after soft-delete");
     assert!(
@@ -414,13 +412,12 @@ async fn test_auto_revoke_specific_auth_from_ucan() {
     .unwrap();
 
     // Verify first auth (Device A old) is revoked
-    let revoked_at_1: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
-        "SELECT revoked_at FROM oauth_authorizations WHERE id = $1",
-    )
-    .bind(auth_id_1)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let revoked_at_1: Option<chrono::DateTime<Utc>> =
+        sqlx::query_scalar("SELECT revoked_at FROM oauth_authorizations WHERE id = $1")
+            .bind(auth_id_1)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
     assert!(
         revoked_at_1.is_some(),
@@ -428,13 +425,12 @@ async fn test_auto_revoke_specific_auth_from_ucan() {
     );
 
     // Verify second auth (Device B) is still active - NOT affected by Device A re-login
-    let revoked_at_2: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
-        "SELECT revoked_at FROM oauth_authorizations WHERE id = $1",
-    )
-    .bind(auth_id_2)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let revoked_at_2: Option<chrono::DateTime<Utc>> =
+        sqlx::query_scalar("SELECT revoked_at FROM oauth_authorizations WHERE id = $1")
+            .bind(auth_id_2)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
     assert!(
         revoked_at_2.is_none(),
@@ -457,4 +453,3 @@ async fn test_auto_revoke_specific_auth_from_ucan() {
         "Should have 2 active authorizations (Device B + Device A new)"
     );
 }
-

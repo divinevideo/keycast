@@ -64,9 +64,10 @@ impl IntoResponse for RpcError {
         let (status, message) = match self {
             RpcError::Auth(e) => return e.into_response(),
             RpcError::InvalidParams(msg) => (StatusCode::BAD_REQUEST, msg),
-            RpcError::UnsupportedMethod(method) => {
-                (StatusCode::BAD_REQUEST, format!("Unsupported method: {}", method))
-            }
+            RpcError::UnsupportedMethod(method) => (
+                StatusCode::BAD_REQUEST,
+                format!("Unsupported method: {}", method),
+            ),
             RpcError::SigningFailed(msg) => (StatusCode::BAD_REQUEST, msg),
             RpcError::EncryptionFailed(msg) => (StatusCode::BAD_REQUEST, msg),
             RpcError::DecryptionFailed(msg) => (StatusCode::BAD_REQUEST, msg),
@@ -98,33 +99,58 @@ pub async fn nostr_rpc(
     headers: HeaderMap,
     Json(req): Json<NostrRpcRequest>,
 ) -> Result<Json<NostrRpcResponse>, RpcError> {
-    let (user_pubkey, redirect_origin, bunker_pubkey) = extract_user_and_origin_from_token(&headers)?;
+    let (user_pubkey, redirect_origin, bunker_pubkey) =
+        extract_user_and_origin_from_token(&headers)?;
     let pool = &auth_state.state.db;
     let tenant_id = tenant.0.id;
 
-    tracing::info!("RPC request: method={} from user={} origin={}", req.method, &user_pubkey[..8], &redirect_origin);
+    tracing::info!(
+        "RPC request: method={} from user={} origin={}",
+        req.method,
+        &user_pubkey[..8],
+        &redirect_origin
+    );
 
     // Get user keys - try direct cache lookup via bunker_pubkey first
-    let keys = get_user_keys(&auth_state, pool, tenant_id, &user_pubkey, &redirect_origin, bunker_pubkey.as_deref()).await?;
+    let keys = get_user_keys(
+        &auth_state,
+        pool,
+        tenant_id,
+        &user_pubkey,
+        &redirect_origin,
+        bunker_pubkey.as_deref(),
+    )
+    .await?;
 
     // Dispatch based on method
     let result = match req.method.as_str() {
-        "get_public_key" => {
-            JsonValue::String(keys.public_key().to_hex())
-        }
+        "get_public_key" => JsonValue::String(keys.public_key().to_hex()),
 
         "sign_event" => {
             let unsigned_event = parse_unsigned_event(&req.params)?;
 
             // Validate permissions before signing
-            super::auth::validate_signing_permissions(pool, tenant_id, &user_pubkey, &redirect_origin, &unsigned_event).await
-                .map_err(RpcError::Auth)?;
+            super::auth::validate_signing_permissions(
+                pool,
+                tenant_id,
+                &user_pubkey,
+                &redirect_origin,
+                &unsigned_event,
+            )
+            .await
+            .map_err(RpcError::Auth)?;
 
             // Sign the event
-            let signed = unsigned_event.sign(&keys).await
+            let signed = unsigned_event
+                .sign(&keys)
+                .await
                 .map_err(|e| RpcError::SigningFailed(format!("Signing failed: {}", e)))?;
 
-            tracing::info!("RPC: Signed event {} kind={}", signed.id, signed.kind.as_u16());
+            tracing::info!(
+                "RPC: Signed event {} kind={}",
+                signed.id,
+                signed.kind.as_u16()
+            );
 
             serde_json::to_value(&signed)
                 .map_err(|e| RpcError::Internal(format!("JSON serialization failed: {}", e)))?
@@ -134,15 +160,24 @@ pub async fn nostr_rpc(
             let (recipient_pubkey, plaintext) = parse_encrypt_params(&req.params)?;
 
             // Validate permissions before encrypting
-            super::auth::validate_encrypt_permissions(pool, tenant_id, &user_pubkey, &redirect_origin, &plaintext, &recipient_pubkey).await
-                .map_err(RpcError::Auth)?;
+            super::auth::validate_encrypt_permissions(
+                pool,
+                tenant_id,
+                &user_pubkey,
+                &redirect_origin,
+                &plaintext,
+                &recipient_pubkey,
+            )
+            .await
+            .map_err(RpcError::Auth)?;
 
             let ciphertext = nip44::encrypt(
                 keys.secret_key(),
                 &recipient_pubkey,
                 &plaintext,
                 nip44::Version::V2,
-            ).map_err(|e| RpcError::EncryptionFailed(format!("NIP-44 encryption failed: {}", e)))?;
+            )
+            .map_err(|e| RpcError::EncryptionFailed(format!("NIP-44 encryption failed: {}", e)))?;
 
             JsonValue::String(ciphertext)
         }
@@ -151,14 +186,21 @@ pub async fn nostr_rpc(
             let (sender_pubkey, ciphertext) = parse_decrypt_params(&req.params)?;
 
             // Validate permissions before decrypting
-            super::auth::validate_decrypt_permissions(pool, tenant_id, &user_pubkey, &redirect_origin, &ciphertext, &sender_pubkey).await
-                .map_err(RpcError::Auth)?;
-
-            let plaintext = nip44::decrypt(
-                keys.secret_key(),
-                &sender_pubkey,
+            super::auth::validate_decrypt_permissions(
+                pool,
+                tenant_id,
+                &user_pubkey,
+                &redirect_origin,
                 &ciphertext,
-            ).map_err(|e| RpcError::DecryptionFailed(format!("NIP-44 decryption failed: {}", e)))?;
+                &sender_pubkey,
+            )
+            .await
+            .map_err(RpcError::Auth)?;
+
+            let plaintext = nip44::decrypt(keys.secret_key(), &sender_pubkey, &ciphertext)
+                .map_err(|e| {
+                    RpcError::DecryptionFailed(format!("NIP-44 decryption failed: {}", e))
+                })?;
 
             JsonValue::String(plaintext)
         }
@@ -167,14 +209,21 @@ pub async fn nostr_rpc(
             let (recipient_pubkey, plaintext) = parse_encrypt_params(&req.params)?;
 
             // Validate permissions before encrypting
-            super::auth::validate_encrypt_permissions(pool, tenant_id, &user_pubkey, &redirect_origin, &plaintext, &recipient_pubkey).await
-                .map_err(RpcError::Auth)?;
-
-            let ciphertext = nip04::encrypt(
-                keys.secret_key(),
-                &recipient_pubkey,
+            super::auth::validate_encrypt_permissions(
+                pool,
+                tenant_id,
+                &user_pubkey,
+                &redirect_origin,
                 &plaintext,
-            ).map_err(|e| RpcError::EncryptionFailed(format!("NIP-04 encryption failed: {}", e)))?;
+                &recipient_pubkey,
+            )
+            .await
+            .map_err(RpcError::Auth)?;
+
+            let ciphertext = nip04::encrypt(keys.secret_key(), &recipient_pubkey, &plaintext)
+                .map_err(|e| {
+                    RpcError::EncryptionFailed(format!("NIP-04 encryption failed: {}", e))
+                })?;
 
             JsonValue::String(ciphertext)
         }
@@ -183,14 +232,21 @@ pub async fn nostr_rpc(
             let (sender_pubkey, ciphertext) = parse_decrypt_params(&req.params)?;
 
             // Validate permissions before decrypting
-            super::auth::validate_decrypt_permissions(pool, tenant_id, &user_pubkey, &redirect_origin, &ciphertext, &sender_pubkey).await
-                .map_err(RpcError::Auth)?;
-
-            let plaintext = nip04::decrypt(
-                keys.secret_key(),
-                &sender_pubkey,
+            super::auth::validate_decrypt_permissions(
+                pool,
+                tenant_id,
+                &user_pubkey,
+                &redirect_origin,
                 &ciphertext,
-            ).map_err(|e| RpcError::DecryptionFailed(format!("NIP-04 decryption failed: {}", e)))?;
+                &sender_pubkey,
+            )
+            .await
+            .map_err(RpcError::Auth)?;
+
+            let plaintext = nip04::decrypt(keys.secret_key(), &sender_pubkey, &ciphertext)
+                .map_err(|e| {
+                    RpcError::DecryptionFailed(format!("NIP-04 decryption failed: {}", e))
+                })?;
 
             JsonValue::String(plaintext)
         }
@@ -217,7 +273,10 @@ async fn get_user_keys(
         // If bunker_pubkey was provided in UCAN, use it directly (no DB query needed!)
         if let Some(bunker_key) = bunker_pubkey_from_ucan {
             if let Some(handler) = handlers.get(bunker_key).await {
-                tracing::debug!("RPC: Using cached keys via UCAN bunker_pubkey for user {}", &user_pubkey[..8]);
+                tracing::debug!(
+                    "RPC: Using cached keys via UCAN bunker_pubkey for user {}",
+                    &user_pubkey[..8]
+                );
                 return Ok(handler.get_keys());
             }
         }
@@ -240,14 +299,20 @@ async fn get_user_keys(
 
         if let Some(bunker_key) = bunker_pubkey {
             if let Some(handler) = handlers.get(&bunker_key).await {
-                tracing::debug!("RPC: Using cached keys (DB lookup) for user {}", &user_pubkey[..8]);
+                tracing::debug!(
+                    "RPC: Using cached keys (DB lookup) for user {}",
+                    &user_pubkey[..8]
+                );
                 return Ok(handler.get_keys());
             }
         }
     }
 
     // SLOW PATH: Fallback to DB + KMS decryption
-    tracing::warn!("RPC: Using slow path (DB+KMS) for user {}", &user_pubkey[..8]);
+    tracing::warn!(
+        "RPC: Using slow path (DB+KMS) for user {}",
+        &user_pubkey[..8]
+    );
 
     let key_manager = auth_state.state.key_manager.as_ref();
 
@@ -258,7 +323,7 @@ async fn get_user_keys(
             SELECT 1 FROM oauth_authorizations oa
             JOIN users u ON oa.user_pubkey = u.pubkey
             WHERE oa.user_pubkey = $1 AND u.tenant_id = $2 AND oa.redirect_origin = $3
-         )"
+         )",
     )
     .bind(user_pubkey)
     .bind(tenant_id)
@@ -276,7 +341,7 @@ async fn get_user_keys(
         "SELECT pk.encrypted_secret_key
          FROM personal_keys pk
          JOIN users u ON pk.user_pubkey = u.pubkey
-         WHERE pk.user_pubkey = $1 AND u.tenant_id = $2"
+         WHERE pk.user_pubkey = $1 AND u.tenant_id = $2",
     )
     .bind(user_pubkey)
     .bind(tenant_id)
@@ -300,7 +365,8 @@ async fn get_user_keys(
 
 /// Parse unsigned event from params (first param is the event object)
 fn parse_unsigned_event(params: &[JsonValue]) -> Result<UnsignedEvent, RpcError> {
-    let event_value = params.first()
+    let event_value = params
+        .first()
         .ok_or_else(|| RpcError::InvalidParams("Missing event parameter".into()))?;
 
     // Handle both string (NIP-46 style) and object (direct JSON) formats
@@ -317,11 +383,13 @@ fn parse_unsigned_event(params: &[JsonValue]) -> Result<UnsignedEvent, RpcError>
 
 /// Parse encrypt params: [pubkey, plaintext]
 fn parse_encrypt_params(params: &[JsonValue]) -> Result<(PublicKey, String), RpcError> {
-    let pubkey_hex = params.first()
+    let pubkey_hex = params
+        .first()
         .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::InvalidParams("Missing recipient pubkey parameter".into()))?;
 
-    let plaintext = params.get(1)
+    let plaintext = params
+        .get(1)
         .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::InvalidParams("Missing plaintext parameter".into()))?;
 
@@ -333,11 +401,13 @@ fn parse_encrypt_params(params: &[JsonValue]) -> Result<(PublicKey, String), Rpc
 
 /// Parse decrypt params: [pubkey, ciphertext]
 fn parse_decrypt_params(params: &[JsonValue]) -> Result<(PublicKey, String), RpcError> {
-    let pubkey_hex = params.first()
+    let pubkey_hex = params
+        .first()
         .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::InvalidParams("Missing sender pubkey parameter".into()))?;
 
-    let ciphertext = params.get(1)
+    let ciphertext = params
+        .get(1)
         .and_then(|v| v.as_str())
         .ok_or_else(|| RpcError::InvalidParams("Missing ciphertext parameter".into()))?;
 
@@ -380,7 +450,9 @@ mod tests {
     #[test]
     fn test_parse_encrypt_params() {
         let params = vec![
-            JsonValue::String("0000000000000000000000000000000000000000000000000000000000000001".to_string()),
+            JsonValue::String(
+                "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+            ),
             JsonValue::String("Hello, world!".to_string()),
         ];
 
@@ -388,7 +460,10 @@ mod tests {
         assert!(result.is_ok());
         let (pubkey, plaintext) = result.unwrap();
         assert_eq!(plaintext, "Hello, world!");
-        assert_eq!(pubkey.to_hex(), "0000000000000000000000000000000000000000000000000000000000000001");
+        assert_eq!(
+            pubkey.to_hex(),
+            "0000000000000000000000000000000000000000000000000000000000000001"
+        );
     }
 
     #[test]
@@ -400,9 +475,9 @@ mod tests {
 
     #[test]
     fn test_parse_encrypt_params_missing_plaintext() {
-        let params = vec![
-            JsonValue::String("0000000000000000000000000000000000000000000000000000000000000001".to_string()),
-        ];
+        let params = vec![JsonValue::String(
+            "0000000000000000000000000000000000000000000000000000000000000001".to_string(),
+        )];
         let result = parse_encrypt_params(&params);
         assert!(result.is_err());
     }

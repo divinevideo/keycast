@@ -4,7 +4,7 @@
 mod common;
 
 use chrono::{Duration, Utc};
-use keycast_api::ucan_auth::{NostrKeyMaterial, nostr_pubkey_to_did, validate_ucan_token};
+use keycast_api::ucan_auth::{nostr_pubkey_to_did, validate_ucan_token, NostrKeyMaterial};
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::KeyManager;
 use nostr_sdk::prelude::*;
@@ -37,7 +37,7 @@ async fn create_test_tenant(pool: &PgPool) -> i64 {
     sqlx::query_scalar::<_, i64>(
         "INSERT INTO tenants (domain, name, created_at, updated_at)
          VALUES ($1, $2, NOW(), NOW())
-         RETURNING id"
+         RETURNING id",
     )
     .bind(&domain)
     .bind("Test Tenant")
@@ -58,7 +58,7 @@ async fn insert_user(pool: &PgPool, tenant_id: i64, pubkey: &str) {
     sqlx::query(
         "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
          VALUES ($1, $2, NOW(), NOW())
-         ON CONFLICT (pubkey) DO NOTHING"
+         ON CONFLICT (pubkey) DO NOTHING",
     )
     .bind(pubkey)
     .bind(tenant_id)
@@ -83,7 +83,7 @@ async fn create_personal_key(
 
     sqlx::query(
         "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id)
-         VALUES ($1, $2, $3)"
+         VALUES ($1, $2, $3)",
     )
     .bind(user_pubkey)
     .bind(&encrypted_secret)
@@ -132,14 +132,14 @@ async fn create_test_authorization(
 /// Note: policies are associated with teams, not tenants directly
 async fn create_test_policy(
     pool: &PgPool,
-    _tenant_id: i64,  // Keep for API consistency, but policies don't have tenant_id
+    _tenant_id: i64, // Keep for API consistency, but policies don't have tenant_id
     permissions: Vec<(&str, serde_json::Value)>,
 ) -> i32 {
     // Create policy (no tenant_id - policies belong to teams)
     let policy_id: i32 = sqlx::query_scalar(
         "INSERT INTO policies (name, created_at, updated_at)
          VALUES ($1, NOW(), NOW())
-         RETURNING id"
+         RETURNING id",
     )
     .bind(format!("Test Policy {}", Uuid::new_v4()))
     .fetch_one(pool)
@@ -151,7 +151,7 @@ async fn create_test_policy(
         let permission_id: i32 = sqlx::query_scalar(
             "INSERT INTO permissions (identifier, config, created_at, updated_at)
              VALUES ($1, $2, NOW(), NOW())
-             RETURNING id"
+             RETURNING id",
         )
         .bind(identifier)
         .bind(config)
@@ -161,7 +161,7 @@ async fn create_test_policy(
 
         sqlx::query(
             "INSERT INTO policy_permissions (policy_id, permission_id, created_at, updated_at)
-             VALUES ($1, $2, NOW(), NOW())"
+             VALUES ($1, $2, NOW(), NOW())",
         )
         .bind(policy_id)
         .bind(permission_id)
@@ -174,11 +174,7 @@ async fn create_test_policy(
 }
 
 /// Build a UCAN with specific facts
-async fn build_test_ucan(
-    keys: &Keys,
-    tenant_id: i64,
-    redirect_origin: Option<&str>,
-) -> String {
+async fn build_test_ucan(keys: &Keys, tenant_id: i64, redirect_origin: Option<&str>) -> String {
     let pubkey = keys.public_key();
     let user_did = nostr_pubkey_to_did(&pubkey);
     let key_material = NostrKeyMaterial::from_keys(keys.clone());
@@ -221,11 +217,15 @@ async fn test_ucan_without_redirect_origin_rejected() {
     // Validation should fail
     let result = validate_ucan_token(&auth_header, 1);
 
-    assert!(result.is_err(), "UCAN without redirect_origin should be rejected");
+    assert!(
+        result.is_err(),
+        "UCAN without redirect_origin should be rejected"
+    );
     let err = result.unwrap_err();
     assert!(
         err.to_string().contains("redirect_origin"),
-        "Error should mention redirect_origin, got: {}", err
+        "Error should mention redirect_origin, got: {}",
+        err
     );
 }
 
@@ -252,14 +252,22 @@ async fn test_no_authorization_for_origin_returns_forbidden() {
         &pubkey,
         &redirect_origin,
         tenant_id,
-    ).await;
+    )
+    .await;
 
-    assert!(result.is_err(), "Should return error when no authorization exists");
+    assert!(
+        result.is_err(),
+        "Should return error when no authorization exists"
+    );
 
     // Check it's a Forbidden error
     match result {
         Err(keycast_api::api::http::auth::AuthError::Forbidden(msg)) => {
-            assert!(msg.contains("No authorization"), "Should mention no authorization: {}", msg);
+            assert!(
+                msg.contains("No authorization"),
+                "Should mention no authorization: {}",
+                msg
+            );
         }
         other => panic!("Expected Forbidden error, got: {:?}", other),
     }
@@ -288,14 +296,15 @@ async fn test_null_policy_grants_full_access() {
         tenant_id,
         &pubkey,
         &redirect_origin,
-        None,  // NULL policy_id = full access
+        None, // NULL policy_id = full access
         None,
         &key_manager,
-    ).await;
+    )
+    .await;
 
     // Create any event (kind 4 - encrypted DM, which would normally be restricted)
-    let unsigned_event = EventBuilder::new(Kind::EncryptedDirectMessage, "Secret message")
-        .build(keys.public_key());
+    let unsigned_event =
+        EventBuilder::new(Kind::EncryptedDirectMessage, "Secret message").build(keys.public_key());
 
     // Validate permissions - should succeed
     let result = keycast_api::api::http::auth::validate_signing_permissions(
@@ -304,9 +313,14 @@ async fn test_null_policy_grants_full_access() {
         &pubkey,
         &redirect_origin,
         &unsigned_event,
-    ).await;
+    )
+    .await;
 
-    assert!(result.is_ok(), "NULL policy_id should grant full access, got: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "NULL policy_id should grant full access, got: {:?}",
+        result
+    );
 }
 
 // ============================================================================
@@ -329,7 +343,8 @@ async fn test_policy_enforces_kind_restrictions() {
         &pool,
         tenant_id,
         vec![("allowed_kinds", json!({"allowed_kinds": [1]}))],
-    ).await;
+    )
+    .await;
 
     let redirect_origin = format!("https://restricted-{}.example.com", Uuid::new_v4());
 
@@ -342,11 +357,11 @@ async fn test_policy_enforces_kind_restrictions() {
         Some(policy_id),
         None,
         &key_manager,
-    ).await;
+    )
+    .await;
 
     // Test A: Kind 1 should succeed
-    let kind1_event = EventBuilder::text_note("Hello world")
-        .build(keys.public_key());
+    let kind1_event = EventBuilder::text_note("Hello world").build(keys.public_key());
 
     let result = keycast_api::api::http::auth::validate_signing_permissions(
         &pool,
@@ -354,12 +369,13 @@ async fn test_policy_enforces_kind_restrictions() {
         &pubkey,
         &redirect_origin,
         &kind1_event,
-    ).await;
+    )
+    .await;
     assert!(result.is_ok(), "Kind 1 should be allowed: {:?}", result);
 
     // Test B: Kind 4 (encrypted DM) should fail
-    let kind4_event = EventBuilder::new(Kind::EncryptedDirectMessage, "Secret")
-        .build(keys.public_key());
+    let kind4_event =
+        EventBuilder::new(Kind::EncryptedDirectMessage, "Secret").build(keys.public_key());
 
     let result = keycast_api::api::http::auth::validate_signing_permissions(
         &pool,
@@ -367,7 +383,8 @@ async fn test_policy_enforces_kind_restrictions() {
         &pubkey,
         &redirect_origin,
         &kind4_event,
-    ).await;
+    )
+    .await;
     assert!(result.is_err(), "Kind 4 should be denied by policy");
 }
 
@@ -398,7 +415,8 @@ async fn test_expired_authorization_rejected() {
         None,
         Some(expired_at),
         &key_manager,
-    ).await;
+    )
+    .await;
 
     // Lookup should fail
     let result = keycast_api::api::http::auth::get_authorization_for_origin(
@@ -406,12 +424,17 @@ async fn test_expired_authorization_rejected() {
         &pubkey,
         &redirect_origin,
         tenant_id,
-    ).await;
+    )
+    .await;
 
     assert!(result.is_err(), "Expired authorization should be rejected");
     match result {
         Err(keycast_api::api::http::auth::AuthError::Forbidden(msg)) => {
-            assert!(msg.contains("No authorization"), "Should say no authorization: {}", msg);
+            assert!(
+                msg.contains("No authorization"),
+                "Should say no authorization: {}",
+                msg
+            );
         }
         other => panic!("Expected Forbidden error, got: {:?}", other),
     }
@@ -443,12 +466,17 @@ async fn test_encrypt_requires_authorization() {
         &redirect_origin,
         "test plaintext",
         &recipient,
-    ).await;
+    )
+    .await;
 
     assert!(result.is_err(), "Encrypt should require authorization");
     match result {
         Err(keycast_api::api::http::auth::AuthError::Forbidden(msg)) => {
-            assert!(msg.contains("No authorization"), "Should say no authorization: {}", msg);
+            assert!(
+                msg.contains("No authorization"),
+                "Should say no authorization: {}",
+                msg
+            );
         }
         other => panic!("Expected Forbidden error, got: {:?}", other),
     }
@@ -480,12 +508,17 @@ async fn test_decrypt_requires_authorization() {
         &redirect_origin,
         "encrypted_ciphertext_here",
         &sender,
-    ).await;
+    )
+    .await;
 
     assert!(result.is_err(), "Decrypt should require authorization");
     match result {
         Err(keycast_api::api::http::auth::AuthError::Forbidden(msg)) => {
-            assert!(msg.contains("No authorization"), "Should say no authorization: {}", msg);
+            assert!(
+                msg.contains("No authorization"),
+                "Should say no authorization: {}",
+                msg
+            );
         }
         other => panic!("Expected Forbidden error, got: {:?}", other),
     }

@@ -5,6 +5,6 @@ mod did;
 mod key_material;
 mod validation;
 
-pub use did::{nostr_pubkey_to_did, did_to_nostr_pubkey};
+pub use did::{did_to_nostr_pubkey, nostr_pubkey_to_did};
 pub use key_material::NostrKeyMaterial;
-pub use validation::{validate_ucan_token, extract_user_from_ucan};
+pub use validation::{extract_user_from_ucan, validate_ucan_token};

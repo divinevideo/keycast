@@ -36,7 +36,7 @@ async fn test_concurrent_tenant_creation() {
                 "INSERT INTO tenants (domain, name, settings, created_at, updated_at)
                  VALUES ($1, $2, $3, NOW(), NOW())
                  ON CONFLICT (domain) DO UPDATE SET updated_at = tenants.updated_at
-                 RETURNING id, domain, name"
+                 RETURNING id, domain, name",
             )
             .bind(&domain)
             .bind(format!("Test Tenant {}", i))
@@ -66,7 +66,11 @@ async fn test_concurrent_tenant_creation() {
     // All tasks should have returned the same tenant ID
     let first_id = tenant_ids[0];
     for (i, id) in tenant_ids.iter().enumerate() {
-        assert_eq!(*id, first_id, "Task {} got different tenant ID: {} vs {}", i, id, first_id);
+        assert_eq!(
+            *id, first_id,
+            "Task {} got different tenant ID: {} vs {}",
+            i, id, first_id
+        );
     }
 
     // Verify only one tenant was created
@@ -76,7 +80,11 @@ async fn test_concurrent_tenant_creation() {
         .await
         .expect("Failed to count tenants");
 
-    assert_eq!(count.0, 1, "Expected exactly 1 tenant, but found {}", count.0);
+    assert_eq!(
+        count.0, 1,
+        "Expected exactly 1 tenant, but found {}",
+        count.0
+    );
 
     // Cleanup
     sqlx::query("DELETE FROM tenants WHERE domain = $1")
@@ -98,22 +106,28 @@ async fn test_tenant_sequence_after_seeded_data() {
 
     // The default tenant (id=1) is inserted by migrations
     // Verify it exists
-    let default_tenant: Option<(i64,)> = sqlx::query_as(
-        "SELECT id FROM tenants WHERE domain = 'default'"
-    )
-    .fetch_optional(&pool)
-    .await
-    .expect("Failed to query default tenant");
+    let default_tenant: Option<(i64,)> =
+        sqlx::query_as("SELECT id FROM tenants WHERE domain = 'default'")
+            .fetch_optional(&pool)
+            .await
+            .expect("Failed to query default tenant");
 
-    assert!(default_tenant.is_some(), "Default tenant should exist from migrations");
-    assert_eq!(default_tenant.unwrap().0, 1, "Default tenant should have id=1");
+    assert!(
+        default_tenant.is_some(),
+        "Default tenant should exist from migrations"
+    );
+    assert_eq!(
+        default_tenant.unwrap().0,
+        1,
+        "Default tenant should have id=1"
+    );
 
     // Now insert a new tenant using the sequence (no explicit ID)
     let unique_domain = format!("sequence-test-{}.example.com", uuid::Uuid::new_v4());
     let new_tenant: (i64, String) = sqlx::query_as(
         "INSERT INTO tenants (domain, name, created_at, updated_at)
          VALUES ($1, 'New Tenant', NOW(), NOW())
-         RETURNING id, domain"
+         RETURNING id, domain",
     )
     .bind(&unique_domain)
     .fetch_one(&pool)
@@ -121,7 +135,11 @@ async fn test_tenant_sequence_after_seeded_data() {
     .expect("Failed to insert new tenant - sequence may not be properly set");
 
     // The new tenant should have id > 1 (not conflict with seeded data)
-    assert!(new_tenant.0 > 1, "New tenant ID should be > 1, got {}", new_tenant.0);
+    assert!(
+        new_tenant.0 > 1,
+        "New tenant ID should be > 1, got {}",
+        new_tenant.0
+    );
     assert_eq!(new_tenant.1, unique_domain);
 
     // Cleanup
@@ -143,7 +161,7 @@ async fn test_get_or_create_returns_existing_tenant() {
         "INSERT INTO tenants (domain, name, settings, created_at, updated_at)
          VALUES ($1, $2, $3, NOW(), NOW())
          ON CONFLICT (domain) DO UPDATE SET updated_at = tenants.updated_at
-         RETURNING id, domain, name"
+         RETURNING id, domain, name",
     )
     .bind(&domain)
     .bind("First Name")
@@ -157,10 +175,10 @@ async fn test_get_or_create_returns_existing_tenant() {
         "INSERT INTO tenants (domain, name, settings, created_at, updated_at)
          VALUES ($1, $2, $3, NOW(), NOW())
          ON CONFLICT (domain) DO UPDATE SET updated_at = tenants.updated_at
-         RETURNING id, domain, name"
+         RETURNING id, domain, name",
     )
     .bind(&domain)
-    .bind("Second Name")  // Different name
+    .bind("Second Name") // Different name
     .bind(r#"{}"#)
     .fetch_one(&pool)
     .await

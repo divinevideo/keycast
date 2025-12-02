@@ -88,29 +88,20 @@ where
         let host = parts
             .headers
             .get("host")
-            .ok_or((
-                StatusCode::BAD_REQUEST,
-                "Missing Host header".to_string(),
-            ))?
+            .ok_or((StatusCode::BAD_REQUEST, "Missing Host header".to_string()))?
             .to_str()
-            .map_err(|_| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    "Invalid Host header".to_string(),
-                )
-            })?;
+            .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid Host header".to_string()))?;
 
         // Remove port if present (e.g., "localhost:3000" -> "localhost")
         let domain = host.split(':').next().unwrap_or(host);
 
         // Get database pool from global state
-        let pool = crate::state::get_db_pool()
-            .map_err(|_| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Database not initialized".to_string(),
-                )
-            })?;
+        let pool = crate::state::get_db_pool().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database not initialized".to_string(),
+            )
+        })?;
 
         // Get or create tenant (auto-provision if needed)
         let tenant = get_or_create_tenant(pool, domain).await.map_err(|e| {
@@ -127,7 +118,7 @@ where
                         StatusCode::BAD_REQUEST,
                         format!("Invalid domain: {}", domain),
                     )
-                },
+                }
                 TenantError::DatabaseError(_) => {
                     tracing::error!(
                         target: "tenant_auto_provision",
@@ -139,7 +130,7 @@ where
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "Failed to provision tenant".to_string(),
                     )
-                },
+                }
             }
         })?;
 
@@ -148,10 +139,7 @@ where
 }
 
 /// Get tenant by domain from database
-pub async fn get_tenant_by_domain(
-    pool: &PgPool,
-    domain: &str,
-) -> Result<Tenant, sqlx::Error> {
+pub async fn get_tenant_by_domain(pool: &PgPool, domain: &str) -> Result<Tenant, sqlx::Error> {
     sqlx::query_as::<_, Tenant>(
         "SELECT id, domain, name, settings, created_at, updated_at
          FROM tenants
@@ -163,10 +151,7 @@ pub async fn get_tenant_by_domain(
 }
 
 /// Get tenant by ID from database
-pub async fn get_tenant_by_id(
-    pool: &PgPool,
-    tenant_id: i64,
-) -> Result<Tenant, sqlx::Error> {
+pub async fn get_tenant_by_id(pool: &PgPool, tenant_id: i64) -> Result<Tenant, sqlx::Error> {
     sqlx::query_as::<_, Tenant>(
         "SELECT id, domain, name, settings, created_at, updated_at
          FROM tenants
@@ -211,7 +196,9 @@ pub async fn list_tenants(pool: &PgPool) -> Result<Vec<Tenant>, sqlx::Error> {
 fn validate_domain(domain: &str) -> Result<(), TenantError> {
     // Basic validation rules
     if domain.is_empty() {
-        return Err(TenantError::InvalidDomain("Domain cannot be empty".to_string()));
+        return Err(TenantError::InvalidDomain(
+            "Domain cannot be empty".to_string(),
+        ));
     }
 
     // Length check (max 253 chars per DNS spec)
@@ -227,14 +214,17 @@ fn validate_domain(domain: &str) -> Result<(), TenantError> {
     // Must contain at least one dot (prevent localhost, etc)
     if !domain.contains('.') {
         return Err(TenantError::ValidationFailed(
-            "Domain must contain at least one dot".to_string()
+            "Domain must contain at least one dot".to_string(),
         ));
     }
 
     // Basic character validation (alphanumeric, dots, hyphens)
-    if !domain.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-') {
+    if !domain
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '.' || c == '-')
+    {
         return Err(TenantError::InvalidDomain(
-            "Domain contains invalid characters".to_string()
+            "Domain contains invalid characters".to_string(),
         ));
     }
 
@@ -251,9 +241,10 @@ fn validate_domain(domain: &str) -> Result<(), TenantError> {
 
     for pattern in &blocked_patterns {
         if domain.contains(pattern) {
-            return Err(TenantError::ValidationFailed(
-                format!("Domain matches blocked pattern: {}", pattern)
-            ));
+            return Err(TenantError::ValidationFailed(format!(
+                "Domain matches blocked pattern: {}",
+                pattern
+            )));
         }
     }
 
@@ -267,8 +258,9 @@ fn get_default_settings(domain: &str) -> String {
         email_from: Some(format!("noreply@{}", domain)),
     };
 
-    serde_json::to_string(&settings)
-        .unwrap_or_else(|_| r#"{"relay":"wss://relay.damus.io","auto_provisioned":true}"#.to_string())
+    serde_json::to_string(&settings).unwrap_or_else(|_| {
+        r#"{"relay":"wss://relay.damus.io","auto_provisioned":true}"#.to_string()
+    })
 }
 
 /// Generate friendly tenant name from domain
@@ -305,10 +297,7 @@ fn generate_tenant_name(domain: &str) -> String {
 /// # Security Considerations
 /// - Domain validation prevents obviously malicious inputs
 /// - Auto-provisioned tenants use restrictive defaults
-pub async fn get_or_create_tenant(
-    pool: &PgPool,
-    domain: &str,
-) -> Result<Tenant, TenantError> {
+pub async fn get_or_create_tenant(pool: &PgPool, domain: &str) -> Result<Tenant, TenantError> {
     // 1. Validate domain format
     validate_domain(domain)?;
 
@@ -356,7 +345,9 @@ mod tests {
             id: 1,
             domain: "test.com".to_string(),
             name: "Test".to_string(),
-            settings: Some(r#"{"relay":"wss://test.relay","email_from":"noreply@test.com"}"#.to_string()),
+            settings: Some(
+                r#"{"relay":"wss://test.relay","email_from":"noreply@test.com"}"#.to_string(),
+            ),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

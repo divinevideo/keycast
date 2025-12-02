@@ -3,19 +3,19 @@
 
 use axum::{
     extract::State,
-    http::{StatusCode, HeaderMap},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use bcrypt::{hash, verify, DEFAULT_COST};
 use bip39;
 use chrono::{Duration, Utc};
-use nostr_sdk::{Keys, UnsignedEvent, PublicKey, ToBech32};
+use keycast_core::traits::CustomPermission;
+use keycast_core::types::permission::Permission;
+use nostr_sdk::{Keys, PublicKey, ToBech32, UnsignedEvent};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use keycast_core::types::permission::Permission;
-use keycast_core::traits::CustomPermission;
 
 // Registration and login return simple JSON (not OAuth TokenResponse)
 
@@ -41,9 +41,9 @@ pub(crate) async fn generate_ucan_token(
     redirect_origin: &str,
     relays: Option<&[String]>,
 ) -> Result<String, AuthError> {
-    use crate::ucan_auth::{NostrKeyMaterial, nostr_pubkey_to_did};
-    use ucan::builder::UcanBuilder;
+    use crate::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
     use serde_json::json;
+    use ucan::builder::UcanBuilder;
 
     let key_material = NostrKeyMaterial::from_keys(user_keys.clone());
     let user_did = nostr_pubkey_to_did(&user_keys.public_key());
@@ -63,8 +63,8 @@ pub(crate) async fn generate_ucan_token(
 
     let ucan = UcanBuilder::default()
         .issued_by(&key_material)
-        .for_audience(&user_did)  // Self-issued
-        .with_lifetime((TOKEN_EXPIRY_HOURS * 3600) as u64)  // 24 hours in seconds
+        .for_audience(&user_did) // Self-issued
+        .with_lifetime((TOKEN_EXPIRY_HOURS * 3600) as u64) // 24 hours in seconds
         .with_fact(facts)
         .build()
         .map_err(|e| AuthError::Internal(format!("Failed to build UCAN: {}", e)))?
@@ -88,9 +88,9 @@ pub(crate) async fn generate_server_signed_ucan(
     bunker_pubkey: Option<&str>,
     server_keys: &Keys,
 ) -> Result<String, AuthError> {
-    use crate::ucan_auth::{NostrKeyMaterial, nostr_pubkey_to_did};
-    use ucan::builder::UcanBuilder;
+    use crate::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
     use serde_json::json;
+    use ucan::builder::UcanBuilder;
 
     let server_key_material = NostrKeyMaterial::from_keys(server_keys.clone());
     let user_did = nostr_pubkey_to_did(user_pubkey);
@@ -105,8 +105,8 @@ pub(crate) async fn generate_server_signed_ucan(
     }
 
     let ucan = UcanBuilder::default()
-        .issued_by(&server_key_material)  // Server issues
-        .for_audience(&user_did)           // For this user
+        .issued_by(&server_key_material) // Server issues
+        .for_audience(&user_did) // For this user
         .with_lifetime((TOKEN_EXPIRY_HOURS * 3600) as u64)
         .with_fact(facts)
         .build()
@@ -124,9 +124,9 @@ pub struct RegisterRequest {
     pub email: String,
     pub password: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub nsec: Option<String>,  // Optional: user can provide their own nsec/hex secret key
+    pub nsec: Option<String>, // Optional: user can provide their own nsec/hex secret key
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub relays: Option<Vec<String>>,  // Optional: user's preferred relays
+    pub relays: Option<Vec<String>>, // Optional: user's preferred relays
 }
 
 #[derive(Debug, Serialize)]
@@ -221,9 +221,9 @@ pub enum AuthError {
     InvalidToken,
     TokenExpired,
     EmailSendFailed(String),
-    DuplicateKey,  // Nostr pubkey already registered (BYOK case)
+    DuplicateKey, // Nostr pubkey already registered (BYOK case)
     BadRequest(String),
-    Forbidden(String),  // User has no authorization for this origin
+    Forbidden(String), // User has no authorization for this origin
 }
 
 impl IntoResponse for AuthError {
@@ -336,7 +336,9 @@ pub(crate) fn extract_user_from_token(headers: &HeaderMap) -> Result<String, Aut
 /// Extract user public key, redirect_origin, and bunker_pubkey from UCAN token in Authorization header or cookie
 /// redirect_origin identifies which app/authorization this token is for
 /// bunker_pubkey uniquely identifies the authorization for direct cache lookup (optional)
-pub(crate) fn extract_user_and_origin_from_token(headers: &HeaderMap) -> Result<(String, String, Option<String>), AuthError> {
+pub(crate) fn extract_user_and_origin_from_token(
+    headers: &HeaderMap,
+) -> Result<(String, String, Option<String>), AuthError> {
     // Try Bearer token first
     if let Some(auth_header) = headers.get("Authorization") {
         let auth_str = auth_header.to_str().map_err(|_| AuthError::InvalidToken)?;
@@ -351,11 +353,13 @@ pub(crate) fn extract_user_and_origin_from_token(headers: &HeaderMap) -> Result<
     // Fall back to cookie-based UCAN
     if let Some(token) = extract_ucan_from_cookie(headers) {
         // Parse UCAN from string using ucan_auth helper (tenant validation done by caller)
-        let (pubkey, redirect_origin, bunker_pubkey, _ucan) = crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), 0)
-            .map_err(|e| {
-                tracing::warn!("UCAN parse error from cookie: {}", e);
-                AuthError::InvalidToken
-            })?;
+        let (pubkey, redirect_origin, bunker_pubkey, _ucan) =
+            crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), 0).map_err(
+                |e| {
+                    tracing::warn!("UCAN parse error from cookie: {}", e);
+                    AuthError::InvalidToken
+                },
+            )?;
 
         Ok((pubkey, redirect_origin, bunker_pubkey))
     } else {
@@ -380,7 +384,8 @@ pub(crate) fn extract_ucan_from_cookie(headers: &HeaderMap) -> Option<String> {
 /// Extract redirect_origin from HTTP Origin header
 /// Required for first-party login/register to identify which app the UCAN is for
 pub(crate) fn extract_origin_from_headers(headers: &HeaderMap) -> Result<String, AuthError> {
-    headers.get("origin")
+    headers
+        .get("origin")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .ok_or(AuthError::BadRequest("Origin header required".to_string()))
@@ -408,11 +413,12 @@ pub async fn register(
     );
 
     // Check if email already exists in this tenant
-    let existing: Option<(String,)> = sqlx::query_as("SELECT pubkey FROM users WHERE email = $1 AND tenant_id = $2")
-        .bind(&req.email)
-        .bind(tenant_id)
-        .fetch_optional(pool)
-        .await?;
+    let existing: Option<(String,)> =
+        sqlx::query_as("SELECT pubkey FROM users WHERE email = $1 AND tenant_id = $2")
+            .bind(&req.email)
+            .bind(tenant_id)
+            .fetch_optional(pool)
+            .await?;
 
     if existing.is_some() {
         return Err(AuthError::EmailAlreadyExists);
@@ -427,7 +433,10 @@ pub async fn register(
 
     // Use provided nsec or generate new Nostr keypair
     let keys = if let Some(ref nsec_str) = req.nsec {
-        tracing::info!("User provided their own key (BYOK) for email: {}", req.email);
+        tracing::info!(
+            "User provided their own key (BYOK) for email: {}",
+            req.email
+        );
         // Try parsing as bech32 nsec first, then as hex
         Keys::parse(nsec_str)
             .map_err(|e| AuthError::Internal(format!("Invalid nsec or secret key: {}. Please provide a valid nsec (bech32) or hex secret key.", e)))?
@@ -441,13 +450,12 @@ pub async fn register(
 
     // Check if this public key is already registered in this tenant (for BYOK case)
     if req.nsec.is_some() {
-        let existing_pubkey: Option<(String,)> = sqlx::query_as(
-            "SELECT pubkey FROM users WHERE pubkey = $1 AND tenant_id = $2"
-        )
-        .bind(public_key.to_hex())
-        .bind(tenant_id)
-        .fetch_optional(pool)
-        .await?;
+        let existing_pubkey: Option<(String,)> =
+            sqlx::query_as("SELECT pubkey FROM users WHERE pubkey = $1 AND tenant_id = $2")
+                .bind(public_key.to_hex())
+                .bind(tenant_id)
+                .fetch_optional(pool)
+                .await?;
 
         if existing_pubkey.is_some() {
             return Err(AuthError::DuplicateKey);
@@ -499,19 +507,32 @@ pub async fn register(
     // Send verification email (optional - don't fail if email service unavailable)
     match crate::email_service::EmailService::new() {
         Ok(email_service) => {
-            if let Err(e) = email_service.send_verification_email(&req.email, &verification_token).await {
+            if let Err(e) = email_service
+                .send_verification_email(&req.email, &verification_token)
+                .await
+            {
                 tracing::error!("Failed to send verification email to {}: {}", req.email, e);
             } else {
                 tracing::info!("Sent verification email to {}", req.email);
             }
-        },
+        }
         Err(e) => {
-            tracing::warn!("Email service unavailable, skipping verification email: {}", e);
+            tracing::warn!(
+                "Email service unavailable, skipping verification email: {}",
+                e
+            );
         }
     }
 
     // Generate UCAN token for session cookie with redirect_origin and optional relays
-    let ucan_token = generate_ucan_token(&keys, tenant_id, &req.email, &redirect_origin, req.relays.as_deref()).await?;
+    let ucan_token = generate_ucan_token(
+        &keys,
+        tenant_id,
+        &req.email,
+        &redirect_origin,
+        req.relays.as_deref(),
+    )
+    .await?;
 
     tracing::info!(
         event = "registration",
@@ -532,7 +553,7 @@ pub async fn register(
         axum::Json(AuthResponse {
             success: true,
             pubkey: public_key.to_hex(),
-        })
+        }),
     );
 
     Ok(response)
@@ -597,12 +618,11 @@ pub async fn login(
     }
 
     // Get user's Nostr keys from personal_keys
-    let encrypted_secret: Vec<u8> = sqlx::query_scalar(
-        "SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1"
-    )
-    .bind(&public_key)
-    .fetch_one(pool)
-    .await?;
+    let encrypted_secret: Vec<u8> =
+        sqlx::query_scalar("SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1")
+            .bind(&public_key)
+            .fetch_one(pool)
+            .await?;
 
     let key_manager = auth_state.state.key_manager.as_ref();
     let decrypted_secret = key_manager
@@ -615,7 +635,8 @@ pub async fn login(
     let keys = Keys::new(secret_key.into());
 
     // Generate UCAN token for session cookie with redirect_origin
-    let ucan_token = generate_ucan_token(&keys, tenant_id, &req.email, &redirect_origin, None).await?;
+    let ucan_token =
+        generate_ucan_token(&keys, tenant_id, &req.email, &redirect_origin, None).await?;
 
     tracing::info!(
         event = "login",
@@ -636,15 +657,14 @@ pub async fn login(
         axum::Json(AuthResponse {
             success: true,
             pubkey: public_key,
-        })
+        }),
     );
 
     Ok(response)
 }
 
 /// Logout endpoint - clears the keycast_session cookie
-pub async fn logout(
-) -> Result<impl axum::response::IntoResponse, AuthError> {
+pub async fn logout() -> Result<impl axum::response::IntoResponse, AuthError> {
     tracing::info!("User logging out");
 
     // Clear the session cookie by setting Max-Age=0
@@ -656,7 +676,7 @@ pub async fn logout(
         axum::Json(serde_json::json!({
             "success": true,
             "message": "Logged out successfully"
-        }))
+        })),
     );
 
     Ok(response)
@@ -683,7 +703,8 @@ fn validate_origin(origin: &str) -> Result<(), AuthError> {
     let url = nostr::Url::parse(origin)
         .map_err(|_| AuthError::BadRequest("Invalid origin URL".to_string()))?;
 
-    let host = url.host_str()
+    let host = url
+        .host_str()
         .ok_or_else(|| AuthError::BadRequest("Origin must have a host".to_string()))?;
 
     // Allow http:// only for localhost (development)
@@ -719,15 +740,19 @@ pub async fn create_bunker(
     let redirect_origin = req.origin.clone().unwrap_or_default();
     let display_name = &req.app_name;
 
-    tracing::info!("Creating manual bunker for user: {} in tenant: {}, redirect_origin: {}", user_pubkey, tenant_id, redirect_origin);
+    tracing::info!(
+        "Creating manual bunker for user: {} in tenant: {}, redirect_origin: {}",
+        user_pubkey,
+        tenant_id,
+        redirect_origin
+    );
 
     // Get user's encrypted secret key
-    let encrypted_secret: Vec<u8> = sqlx::query_scalar(
-        "SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1"
-    )
-    .bind(&user_pubkey)
-    .fetch_one(pool)
-    .await?;
+    let encrypted_secret: Vec<u8> =
+        sqlx::query_scalar("SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1")
+            .bind(&user_pubkey)
+            .fetch_one(pool)
+            .await?;
 
     // Generate connection secret
     let connection_secret: String = rand::thread_rng()
@@ -738,12 +763,10 @@ pub async fn create_bunker(
 
     // Look up policy_id from slug if provided
     let policy_id: Option<i32> = if let Some(ref slug) = req.policy_slug {
-        sqlx::query_scalar(
-            "SELECT id FROM policies WHERE slug = $1"
-        )
-        .bind(slug)
-        .fetch_optional(pool)
-        .await?
+        sqlx::query_scalar("SELECT id FROM policies WHERE slug = $1")
+            .bind(slug)
+            .fetch_optional(pool)
+            .await?
     } else {
         None
     };
@@ -757,7 +780,8 @@ pub async fn create_bunker(
     let user_secret_key = nostr_sdk::SecretKey::from_slice(&decrypted_user_secret)
         .map_err(|e| AuthError::Internal(format!("Invalid secret key: {}", e)))?;
 
-    let bunker_keys = keycast_core::bunker_key::derive_bunker_keys(&user_secret_key, &connection_secret);
+    let bunker_keys =
+        keycast_core::bunker_key::derive_bunker_keys(&user_secret_key, &connection_secret);
     let bunker_public_key = bunker_keys.public_key();
 
     // Use deployment-wide relay list (ignore any client-provided relay)
@@ -788,16 +812,24 @@ pub async fn create_bunker(
     .fetch_one(pool)
     .await?;
 
-    tracing::info!("Created new OAuth authorization {} for user {} app {}", auth_id, user_pubkey, redirect_origin);
+    tracing::info!(
+        "Created new OAuth authorization {} for user {} app {}",
+        auth_id,
+        user_pubkey,
+        redirect_origin
+    );
 
     // Signal signer daemon to reload via channel (instant notification)
     if let Some(tx) = &auth_state.auth_tx {
         use keycast_core::authorization_channel::AuthorizationCommand;
-        if let Err(e) = tx.send(AuthorizationCommand::Upsert {
-            bunker_pubkey: bunker_public_key.to_hex(),
-            tenant_id,
-            is_oauth: true,
-        }).await {
+        if let Err(e) = tx
+            .send(AuthorizationCommand::Upsert {
+                bunker_pubkey: bunker_public_key.to_hex(),
+                tenant_id,
+                is_oauth: true,
+            })
+            .await
+        {
             tracing::error!("Failed to send authorization upsert command: {}", e);
         } else {
             tracing::info!("Sent authorization upsert command to signer daemon");
@@ -818,7 +850,11 @@ pub async fn create_bunker(
         connection_secret
     );
 
-    tracing::info!("Created manual bunker connection for user: {}, redirect_origin: {}", user_pubkey, redirect_origin);
+    tracing::info!(
+        "Created manual bunker connection for user: {}, redirect_origin: {}",
+        user_pubkey,
+        redirect_origin
+    );
 
     Ok(Json(CreateBunkerResponse {
         bunker_url,
@@ -837,16 +873,22 @@ pub async fn get_bunker_url(
     headers: HeaderMap,
 ) -> Result<Json<BunkerUrlResponse>, AuthError> {
     // Extract user pubkey AND redirect_origin from UCAN token
-    let (user_pubkey, redirect_origin, _bunker_pubkey) = extract_user_and_origin_from_token(&headers)?;
+    let (user_pubkey, redirect_origin, _bunker_pubkey) =
+        extract_user_and_origin_from_token(&headers)?;
     let tenant_id = tenant.0.id;
-    tracing::info!("Fetching bunker URL for user: {} origin: {} in tenant: {}", user_pubkey, redirect_origin, tenant_id);
+    tracing::info!(
+        "Fetching bunker URL for user: {} origin: {} in tenant: {}",
+        user_pubkey,
+        redirect_origin,
+        tenant_id
+    );
 
     // Get the authorization for this specific origin
     let result: Option<(String, String)> = sqlx::query_as(
         "SELECT oa.bunker_public_key, oa.secret FROM oauth_authorizations oa
          WHERE oa.user_pubkey = $1
          AND oa.redirect_origin = $2
-         AND oa.tenant_id = $3"
+         AND oa.tenant_id = $3",
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin)
@@ -855,8 +897,16 @@ pub async fn get_bunker_url(
     .await?;
 
     let (bunker_pubkey, connection_secret) = result.ok_or_else(|| {
-        tracing::warn!("No authorization found for user {} origin {} in tenant {}", user_pubkey, redirect_origin, tenant_id);
-        AuthError::Forbidden("No authorization for this origin. Create one via OAuth or /user/bunker/create".to_string())
+        tracing::warn!(
+            "No authorization found for user {} origin {} in tenant {}",
+            user_pubkey,
+            redirect_origin,
+            tenant_id
+        );
+        AuthError::Forbidden(
+            "No authorization for this origin. Create one via OAuth or /user/bunker/create"
+                .to_string(),
+        )
     })?;
 
     // Build bunker URL with deployment-wide relay list
@@ -869,12 +919,14 @@ pub async fn get_bunker_url(
 
     let bunker_url = format!(
         "bunker://{}?{}&secret={}",
-        bunker_pubkey,
-        relay_params,
-        connection_secret
+        bunker_pubkey, relay_params, connection_secret
     );
 
-    tracing::info!("Returning bunker URL for origin: {} with pubkey: {}", redirect_origin, bunker_pubkey);
+    tracing::info!(
+        "Returning bunker URL for origin: {} with pubkey: {}",
+        redirect_origin,
+        bunker_pubkey
+    );
 
     Ok(Json(BunkerUrlResponse { bunker_url }))
 }
@@ -886,12 +938,16 @@ pub async fn verify_email(
     Json(req): Json<VerifyEmailRequest>,
 ) -> Result<Json<VerifyEmailResponse>, AuthError> {
     let tenant_id = tenant.0.id;
-    tracing::info!("Email verification attempt with token: {}... for tenant: {}", &req.token[..10], tenant_id);
+    tracing::info!(
+        "Email verification attempt with token: {}... for tenant: {}",
+        &req.token[..10],
+        tenant_id
+    );
 
     // Find user with this verification token in this tenant
     let user: Option<(String, Option<chrono::DateTime<Utc>>)> = sqlx::query_as(
         "SELECT pubkey, email_verification_expires_at FROM users
-         WHERE email_verification_token = $1 AND tenant_id = $2"
+         WHERE email_verification_token = $1 AND tenant_id = $2",
     )
     .bind(&req.token)
     .bind(tenant_id)
@@ -917,7 +973,7 @@ pub async fn verify_email(
              email_verification_token = NULL,
              email_verification_expires_at = NULL,
              updated_at = $2
-         WHERE pubkey = $3"
+         WHERE pubkey = $3",
     )
     .bind(true)
     .bind(Utc::now())
@@ -952,7 +1008,11 @@ pub async fn resend_verification(
 ) -> Result<Json<ResendVerificationResponse>, AuthError> {
     let user_pubkey = extract_user_from_token(&headers)?;
     let tenant_id = tenant.0.id;
-    tracing::info!("Resend verification requested for user: {} in tenant: {}", user_pubkey, tenant_id);
+    tracing::info!(
+        "Resend verification requested for user: {} in tenant: {}",
+        user_pubkey,
+        tenant_id
+    );
 
     // Get user's email and verification status
     let user: Option<(String, bool, Option<chrono::DateTime<Utc>>)> = sqlx::query_as(
@@ -982,7 +1042,10 @@ pub async fn resend_verification(
         if minutes_since < 5 {
             return Ok(Json(ResendVerificationResponse {
                 success: false,
-                message: format!("Please wait {} minutes before requesting another verification email.", 5 - minutes_since),
+                message: format!(
+                    "Please wait {} minutes before requesting another verification email.",
+                    5 - minutes_since
+                ),
             }));
         }
     }
@@ -997,7 +1060,7 @@ pub async fn resend_verification(
              email_verification_expires_at = $2,
              email_verification_sent_at = $3,
              updated_at = $4
-         WHERE pubkey = $5"
+         WHERE pubkey = $5",
     )
     .bind(&verification_token)
     .bind(verification_expires)
@@ -1010,15 +1073,20 @@ pub async fn resend_verification(
     // Send verification email
     match crate::email_service::EmailService::new() {
         Ok(email_service) => {
-            if let Err(e) = email_service.send_verification_email(&email, &verification_token).await {
+            if let Err(e) = email_service
+                .send_verification_email(&email, &verification_token)
+                .await
+            {
                 tracing::error!("Failed to send verification email to {}: {}", email, e);
                 return Err(AuthError::EmailSendFailed(e.to_string()));
             }
             tracing::info!("Sent verification email to {}", email);
-        },
+        }
         Err(e) => {
             tracing::warn!("Email service unavailable: {}", e);
-            return Err(AuthError::EmailSendFailed("Email service unavailable".to_string()));
+            return Err(AuthError::EmailSendFailed(
+                "Email service unavailable".to_string(),
+            ));
         }
     }
 
@@ -1035,25 +1103,33 @@ pub async fn forgot_password(
     Json(req): Json<ForgotPasswordRequest>,
 ) -> Result<Json<ForgotPasswordResponse>, AuthError> {
     let tenant_id = tenant.0.id;
-    tracing::info!("Password reset requested for email: {} in tenant: {}", req.email, tenant_id);
+    tracing::info!(
+        "Password reset requested for email: {} in tenant: {}",
+        req.email,
+        tenant_id
+    );
 
     // Check if user exists in this tenant
-    let user: Option<(String,)> = sqlx::query_as(
-        "SELECT pubkey FROM users WHERE email = $1 AND tenant_id = $2"
-    )
-    .bind(&req.email)
-    .bind(tenant_id)
-    .fetch_optional(&pool)
-    .await?;
+    let user: Option<(String,)> =
+        sqlx::query_as("SELECT pubkey FROM users WHERE email = $1 AND tenant_id = $2")
+            .bind(&req.email)
+            .bind(tenant_id)
+            .fetch_optional(&pool)
+            .await?;
 
     // Always return success even if email doesn't exist (security best practice)
     let public_key = match user {
         Some((pubkey,)) => pubkey,
         None => {
-            tracing::info!("Password reset requested for non-existent email: {}", req.email);
+            tracing::info!(
+                "Password reset requested for non-existent email: {}",
+                req.email
+            );
             return Ok(Json(ForgotPasswordResponse {
                 success: true,
-                message: "If an account exists with that email, a password reset link has been sent.".to_string(),
+                message:
+                    "If an account exists with that email, a password reset link has been sent."
+                        .to_string(),
             }));
         }
     };
@@ -1068,7 +1144,7 @@ pub async fn forgot_password(
          SET password_reset_token = $1,
              password_reset_expires_at = $2,
              updated_at = $3
-         WHERE pubkey = $4"
+         WHERE pubkey = $4",
     )
     .bind(&reset_token)
     .bind(reset_expires)
@@ -1080,20 +1156,31 @@ pub async fn forgot_password(
     // Send password reset email (optional - don't fail if email service unavailable)
     match crate::email_service::EmailService::new() {
         Ok(email_service) => {
-            if let Err(e) = email_service.send_password_reset_email(&req.email, &reset_token).await {
-                tracing::error!("Failed to send password reset email to {}: {}", req.email, e);
+            if let Err(e) = email_service
+                .send_password_reset_email(&req.email, &reset_token)
+                .await
+            {
+                tracing::error!(
+                    "Failed to send password reset email to {}: {}",
+                    req.email,
+                    e
+                );
             } else {
                 tracing::info!("Sent password reset email to {}", req.email);
             }
-        },
+        }
         Err(e) => {
-            tracing::warn!("Email service unavailable, skipping password reset email: {}", e);
+            tracing::warn!(
+                "Email service unavailable, skipping password reset email: {}",
+                e
+            );
         }
     }
 
     Ok(Json(ForgotPasswordResponse {
         success: true,
-        message: "If an account exists with that email, a password reset link has been sent.".to_string(),
+        message: "If an account exists with that email, a password reset link has been sent."
+            .to_string(),
     }))
 }
 
@@ -1104,12 +1191,16 @@ pub async fn reset_password(
     Json(req): Json<ResetPasswordRequest>,
 ) -> Result<Json<ResetPasswordResponse>, AuthError> {
     let tenant_id = tenant.0.id;
-    tracing::info!("Password reset attempt with token: {}... for tenant: {}", &req.token[..10], tenant_id);
+    tracing::info!(
+        "Password reset attempt with token: {}... for tenant: {}",
+        &req.token[..10],
+        tenant_id
+    );
 
     // Find user with this reset token in this tenant
     let user: Option<(String, Option<chrono::DateTime<Utc>>)> = sqlx::query_as(
         "SELECT pubkey, password_reset_expires_at FROM users
-         WHERE password_reset_token = $1 AND tenant_id = $2"
+         WHERE password_reset_token = $1 AND tenant_id = $2",
     )
     .bind(&req.token)
     .bind(tenant_id)
@@ -1142,7 +1233,7 @@ pub async fn reset_password(
              email_verification_token = NULL,
              email_verification_expires_at = NULL,
              updated_at = $2
-         WHERE pubkey = $3"
+         WHERE pubkey = $3",
     )
     .bind(&password_hash)
     .bind(Utc::now())
@@ -1159,7 +1250,8 @@ pub async fn reset_password(
 
     Ok(Json(ResetPasswordResponse {
         success: true,
-        message: "Password reset successfully! You can now log in with your new password.".to_string(),
+        message: "Password reset successfully! You can now log in with your new password."
+            .to_string(),
     }))
 }
 
@@ -1171,17 +1263,20 @@ pub async fn get_profile(
 ) -> Result<Json<ProfileData>, AuthError> {
     let user_pubkey = extract_user_from_token(&headers)?;
     let tenant_id = tenant.0.id;
-    tracing::info!("Fetching username for user: {} in tenant: {}", user_pubkey, tenant_id);
+    tracing::info!(
+        "Fetching username for user: {} in tenant: {}",
+        user_pubkey,
+        tenant_id
+    );
 
     // Get username from users table - this is the ONLY thing we store
     // The client should fetch actual kind 0 profile data from Nostr relays via bunker
-    let username: Option<(Option<String>,)> = sqlx::query_as(
-        "SELECT username FROM users WHERE pubkey = $1 AND tenant_id = $2"
-    )
-    .bind(&user_pubkey)
-    .bind(tenant_id)
-    .fetch_optional(&pool)
-    .await?;
+    let username: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT username FROM users WHERE pubkey = $1 AND tenant_id = $2")
+            .bind(&user_pubkey)
+            .bind(tenant_id)
+            .fetch_optional(&pool)
+            .await?;
 
     let username = username.and_then(|(u,)| u);
 
@@ -1206,10 +1301,14 @@ pub async fn get_account_status(
 ) -> Result<Json<AccountStatusResponse>, AuthError> {
     let user_pubkey = extract_user_from_token(&headers)?;
     let tenant_id = tenant.0.id;
-    tracing::debug!("Fetching account status for user: {} in tenant: {}", user_pubkey, tenant_id);
+    tracing::debug!(
+        "Fetching account status for user: {} in tenant: {}",
+        user_pubkey,
+        tenant_id
+    );
 
     let user: Option<(String, bool)> = sqlx::query_as(
-        "SELECT email, email_verified FROM users WHERE pubkey = $1 AND tenant_id = $2"
+        "SELECT email, email_verified FROM users WHERE pubkey = $1 AND tenant_id = $2",
     )
     .bind(&user_pubkey)
     .bind(tenant_id)
@@ -1237,18 +1336,27 @@ pub async fn update_profile(
     let user_pubkey = extract_user_from_token(&headers)?;
     let tenant_id = tenant.0.id;
 
-    tracing::info!("Updating username for user: {} in tenant: {}", user_pubkey, tenant_id);
+    tracing::info!(
+        "Updating username for user: {} in tenant: {}",
+        user_pubkey,
+        tenant_id
+    );
 
     // Only update username - everything else is stored on Nostr relays
     if let Some(ref username) = profile.username {
         // Validate username (alphanumeric, dash, underscore only)
-        if !username.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
-            return Err(AuthError::Internal("Username can only contain letters, numbers, dashes, and underscores".to_string()));
+        if !username
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(AuthError::Internal(
+                "Username can only contain letters, numbers, dashes, and underscores".to_string(),
+            ));
         }
 
         // Check if username is already taken in this tenant
         let existing: Option<(String,)> = sqlx::query_as(
-            "SELECT pubkey FROM users WHERE username = $1 AND pubkey != $2 AND tenant_id = $3"
+            "SELECT pubkey FROM users WHERE username = $1 AND pubkey != $2 AND tenant_id = $3",
         )
         .bind(username)
         .bind(&user_pubkey)
@@ -1262,7 +1370,7 @@ pub async fn update_profile(
 
         // Update username in users table
         sqlx::query(
-            "UPDATE users SET username = $1, updated_at = $2 WHERE pubkey = $3 AND tenant_id = $4"
+            "UPDATE users SET username = $1, updated_at = $2 WHERE pubkey = $3 AND tenant_id = $4",
         )
         .bind(username)
         .bind(Utc::now())
@@ -1271,7 +1379,11 @@ pub async fn update_profile(
         .execute(&pool)
         .await?;
 
-        tracing::info!("Username updated to '{}' for user: {}", username, user_pubkey);
+        tracing::info!(
+            "Username updated to '{}' for user: {}",
+            username,
+            user_pubkey
+        );
     }
 
     // Client should publish profile to relays via bunker URL
@@ -1306,10 +1418,22 @@ pub async fn list_sessions(
     // Extract user from UCAN (supports both cookie and Bearer token)
     let user_pubkey = extract_user_from_token(&headers)?;
     let tenant_id = tenant.0.id;
-    tracing::info!("Listing bunker sessions for user: {} in tenant: {}", user_pubkey, tenant_id);
+    tracing::info!(
+        "Listing bunker sessions for user: {} in tenant: {}",
+        user_pubkey,
+        tenant_id
+    );
 
     // Get OAuth authorizations - client_id is the display name
-    type OAuthSessionRow = (String, String, String, Option<String>, String, Option<String>, i32);
+    type OAuthSessionRow = (
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        i32,
+    );
     let oauth_sessions: Vec<OAuthSessionRow> = sqlx::query_as(
         "SELECT
             COALESCE(oa.client_id, oa.redirect_origin) as name,
@@ -1324,7 +1448,7 @@ pub async fn list_sessions(
          WHERE oa.user_pubkey = $1
            AND u.tenant_id = $2
            AND oa.revoked_at IS NULL
-         ORDER BY oa.created_at DESC"
+         ORDER BY oa.created_at DESC",
     )
     .bind(&user_pubkey)
     .bind(tenant_id)
@@ -1333,17 +1457,27 @@ pub async fn list_sessions(
 
     let sessions = oauth_sessions
         .into_iter()
-        .map(|(name, redirect_origin, bunker_pubkey, client_pubkey, created_at, last_activity, activity_count)| {
-            BunkerSession {
-                application_name: name,
+        .map(
+            |(
+                name,
                 redirect_origin,
                 bunker_pubkey,
                 client_pubkey,
                 created_at,
                 last_activity,
-                activity_count: activity_count as i64,
-            }
-        })
+                activity_count,
+            )| {
+                BunkerSession {
+                    application_name: name,
+                    redirect_origin,
+                    bunker_pubkey,
+                    client_pubkey,
+                    created_at,
+                    last_activity,
+                    activity_count: activity_count as i64,
+                }
+            },
+        )
         .collect();
 
     Ok(Json(BunkerSessionsResponse { sessions }))
@@ -1371,13 +1505,17 @@ pub async fn get_session_activity(
 ) -> Result<Json<SessionActivityResponse>, AuthError> {
     let user_pubkey = extract_user_from_token(&headers)?;
     let tenant_id = tenant.0.id;
-    tracing::info!("Fetching activity for bunker secret: {} in tenant: {}", secret, tenant_id);
+    tracing::info!(
+        "Fetching activity for bunker secret: {} in tenant: {}",
+        secret,
+        tenant_id
+    );
 
     // Verify this bunker session belongs to the user in this tenant
     let session: Option<(String,)> = sqlx::query_as(
         "SELECT oa.user_pubkey FROM oauth_authorizations oa
          JOIN users u ON oa.user_pubkey = u.pubkey
-         WHERE oa.secret = $1 AND u.tenant_id = $2"
+         WHERE oa.secret = $1 AND u.tenant_id = $2",
     )
     .bind(&secret)
     .bind(tenant_id)
@@ -1395,7 +1533,7 @@ pub async fn get_session_activity(
          FROM signing_activity
          WHERE bunker_secret = $1
          ORDER BY created_at DESC
-         LIMIT 100"
+         LIMIT 100",
     )
     .bind(&secret)
     .fetch_all(&pool)
@@ -1436,14 +1574,18 @@ pub async fn revoke_session(
     // Extract user from UCAN (supports both cookie and Bearer token)
     let user_pubkey = extract_user_from_token(&headers)?;
     let tenant_id = tenant.0.id;
-    tracing::info!("Revoking bunker session for user: {} in tenant: {}", user_pubkey, tenant_id);
+    tracing::info!(
+        "Revoking bunker session for user: {} in tenant: {}",
+        user_pubkey,
+        tenant_id
+    );
 
     // Verify the authorization exists and belongs to this user
     let exists: Option<(i32,)> = sqlx::query_as(
         "SELECT 1 FROM oauth_authorizations
          WHERE bunker_public_key = $1 AND user_pubkey = $2
            AND revoked_at IS NULL
-           AND user_pubkey IN (SELECT pubkey FROM users WHERE tenant_id = $3)"
+           AND user_pubkey IN (SELECT pubkey FROM users WHERE tenant_id = $3)",
     )
     .bind(&req.bunker_pubkey)
     .bind(&user_pubkey)
@@ -1461,7 +1603,7 @@ pub async fn revoke_session(
          SET revoked_at = NOW(), updated_at = NOW()
          WHERE bunker_public_key = $1 AND user_pubkey = $2
            AND revoked_at IS NULL
-           AND user_pubkey IN (SELECT pubkey FROM users WHERE tenant_id = $3)"
+           AND user_pubkey IN (SELECT pubkey FROM users WHERE tenant_id = $3)",
     )
     .bind(&req.bunker_pubkey)
     .bind(&user_pubkey)
@@ -1472,16 +1614,22 @@ pub async fn revoke_session(
     // Signal signer daemon to remove from cache
     if let Some(tx) = &auth_state.auth_tx {
         use keycast_core::authorization_channel::AuthorizationCommand;
-        if let Err(e) = tx.send(AuthorizationCommand::Remove {
-            bunker_pubkey: req.bunker_pubkey.clone(),
-        }).await {
+        if let Err(e) = tx
+            .send(AuthorizationCommand::Remove {
+                bunker_pubkey: req.bunker_pubkey.clone(),
+            })
+            .await
+        {
             tracing::error!("Failed to send authorization remove command: {}", e);
         } else {
             tracing::debug!("Signaled signer daemon to remove authorization");
         }
     }
 
-    tracing::info!("Successfully revoked bunker session for user: {}", user_pubkey);
+    tracing::info!(
+        "Successfully revoked bunker session for user: {}",
+        user_pubkey
+    );
 
     Ok(Json(RevokeSessionResponse {
         success: true,
@@ -1511,14 +1659,18 @@ pub async fn disconnect_client(
 ) -> Result<Json<DisconnectClientResponse>, AuthError> {
     let user_pubkey = extract_user_from_token(&headers)?;
     let tenant_id = tenant.0.id;
-    tracing::info!("Disconnecting NIP-46 client for user: {} in tenant: {}", user_pubkey, tenant_id);
+    tracing::info!(
+        "Disconnecting NIP-46 client for user: {} in tenant: {}",
+        user_pubkey,
+        tenant_id
+    );
 
     let result = sqlx::query(
         "UPDATE oauth_authorizations
          SET connected_client_pubkey = NULL, connected_at = NULL, updated_at = $1
          WHERE bunker_public_key = $2 AND user_pubkey = $3
            AND revoked_at IS NULL
-           AND user_pubkey IN (SELECT pubkey FROM users WHERE tenant_id = $4)"
+           AND user_pubkey IN (SELECT pubkey FROM users WHERE tenant_id = $4)",
     )
     .bind(Utc::now())
     .bind(&req.bunker_pubkey)
@@ -1531,7 +1683,10 @@ pub async fn disconnect_client(
         return Err(AuthError::InvalidToken);
     }
 
-    tracing::info!("Successfully disconnected NIP-46 client for user: {}", user_pubkey);
+    tracing::info!(
+        "Successfully disconnected NIP-46 client for user: {}",
+        user_pubkey
+    );
 
     Ok(Json(DisconnectClientResponse {
         success: true,
@@ -1575,13 +1730,24 @@ pub async fn list_permissions(
 ) -> Result<Json<PermissionsResponse>, AuthError> {
     let user_pubkey = extract_user_from_token(&headers)?;
     let tenant_id = tenant.0.id;
-    tracing::info!("Listing permissions for user: {} in tenant: {}", user_pubkey, tenant_id);
+    tracing::info!(
+        "Listing permissions for user: {} in tenant: {}",
+        user_pubkey,
+        tenant_id
+    );
 
     // Get OAuth authorizations with policy and permission details
     type AuthDataRow = (
-        String, i64, String,
-        Option<String>, Option<String>, Option<String>,  // policy slug, display_name, description
-        String, String, Option<String>, Option<i64>
+        String,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>, // policy slug, display_name, description
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
     );
     let auth_data: Vec<AuthDataRow> = sqlx::query_as(
         "SELECT
@@ -1601,7 +1767,7 @@ pub async fn list_permissions(
          WHERE oa.user_pubkey = $1
            AND u.tenant_id = $2
            AND oa.revoked_at IS NULL
-         ORDER BY oa.created_at DESC"
+         ORDER BY oa.created_at DESC",
     )
     .bind(&user_pubkey)
     .bind(tenant_id)
@@ -1610,7 +1776,19 @@ pub async fn list_permissions(
 
     let mut permissions = Vec::new();
 
-    for (app_name, policy_id, policy_name, policy_slug, policy_display_name, policy_description, created_at, secret, last_activity, activity_count) in auth_data {
+    for (
+        app_name,
+        policy_id,
+        policy_name,
+        policy_slug,
+        policy_display_name,
+        policy_description,
+        created_at,
+        secret,
+        last_activity,
+        activity_count,
+    ) in auth_data
+    {
         // Load permission displays using the Policy model (policies are now global)
         let permission_displays = if policy_id > 0 {
             use keycast_core::types::policy::Policy;
@@ -1627,7 +1805,7 @@ pub async fn list_permissions(
             let permissions_data: Vec<(String,)> = sqlx::query_as(
                 "SELECT p.config FROM permissions p
                  JOIN policy_permissions pp ON p.id = pp.permission_id
-                 WHERE pp.policy_id = $1 AND p.identifier = 'allowed_kinds'"
+                 WHERE pp.policy_id = $1 AND p.identifier = 'allowed_kinds'",
             )
             .bind(policy_id)
             .fetch_all(&pool)
@@ -1635,7 +1813,9 @@ pub async fn list_permissions(
 
             if let Some((config_json,)) = permissions_data.first() {
                 if let Ok(config) = serde_json::from_str::<serde_json::Value>(config_json) {
-                    if let Some(kinds_array) = config.get("allowed_kinds").and_then(|v| v.as_array()) {
+                    if let Some(kinds_array) =
+                        config.get("allowed_kinds").and_then(|v| v.as_array())
+                    {
                         kinds_array
                             .iter()
                             .filter_map(|v| v.as_u64().map(|n| n as i16))
@@ -1699,7 +1879,7 @@ pub async fn list_permissions(
 
 #[derive(Debug, Deserialize)]
 pub struct SignEventRequest {
-    pub event: serde_json::Value,  // unsigned event JSON
+    pub event: serde_json::Value, // unsigned event JSON
 }
 
 #[derive(Debug, Serialize)]
@@ -1722,7 +1902,7 @@ pub async fn get_authorization_for_origin(
          WHERE user_pubkey = $1
          AND redirect_origin = $2
          AND tenant_id = $3
-         AND (expires_at IS NULL OR expires_at > NOW())"
+         AND (expires_at IS NULL OR expires_at > NOW())",
     )
     .bind(user_pubkey)
     .bind(redirect_origin)
@@ -1731,9 +1911,10 @@ pub async fn get_authorization_for_origin(
     .await?;
 
     match policy_id {
-        Some(pid) => Ok(pid),  // Authorization exists, returns Option<i32> (None = full access)
+        Some(pid) => Ok(pid), // Authorization exists, returns Option<i32> (None = full access)
         None => Err(AuthError::Forbidden(
-            "No authorization for this origin. Create one via OAuth or /user/bunker/create".to_string()
+            "No authorization for this origin. Create one via OAuth or /user/bunker/create"
+                .to_string(),
         )),
     }
 }
@@ -1749,7 +1930,8 @@ pub async fn validate_signing_permissions(
 ) -> Result<(), AuthError> {
     // Get the policy_id from the user's OAuth authorization for this origin
     // NULL policy_id means "full power" - no restrictions
-    let policy_id = get_authorization_for_origin(pool, user_pubkey, redirect_origin, tenant_id).await?;
+    let policy_id =
+        get_authorization_for_origin(pool, user_pubkey, redirect_origin, tenant_id).await?;
 
     // NULL policy_id means full power - allow everything
     let policy_id = match policy_id {
@@ -1770,7 +1952,7 @@ pub async fn validate_signing_permissions(
         "SELECT p.*
          FROM permissions p
          JOIN policy_permissions pp ON pp.permission_id = p.id
-         WHERE pp.policy_id = $1"
+         WHERE pp.policy_id = $1",
     )
     .bind(policy_id)
     .fetch_all(pool)
@@ -1832,7 +2014,8 @@ pub async fn validate_encrypt_permissions(
     plaintext: &str,
     recipient_pubkey: &PublicKey,
 ) -> Result<(), AuthError> {
-    let policy_id = get_authorization_for_origin(pool, user_pubkey, redirect_origin, tenant_id).await?;
+    let policy_id =
+        get_authorization_for_origin(pool, user_pubkey, redirect_origin, tenant_id).await?;
 
     // Parse sender pubkey
     let sender_pubkey = PublicKey::from_hex(user_pubkey)
@@ -1857,7 +2040,7 @@ pub async fn validate_encrypt_permissions(
         "SELECT p.*
          FROM permissions p
          JOIN policy_permissions pp ON pp.permission_id = p.id
-         WHERE pp.policy_id = $1"
+         WHERE pp.policy_id = $1",
     )
     .bind(policy_id)
     .fetch_all(pool)
@@ -1883,7 +2066,9 @@ pub async fn validate_encrypt_permissions(
     }
 
     // Check that ALL permissions allow this encryption (defense-in-depth)
-    let allowed = custom_permissions.iter().all(|p| p.can_encrypt(plaintext, &sender_pubkey, recipient_pubkey));
+    let allowed = custom_permissions
+        .iter()
+        .all(|p| p.can_encrypt(plaintext, &sender_pubkey, recipient_pubkey));
 
     if !allowed {
         tracing::warn!(
@@ -1892,7 +2077,9 @@ pub async fn validate_encrypt_permissions(
             &recipient_pubkey.to_hex()[..8],
             tenant_id
         );
-        return Err(AuthError::Forbidden("Encryption not permitted by policy".to_string()));
+        return Err(AuthError::Forbidden(
+            "Encryption not permitted by policy".to_string(),
+        ));
     }
 
     tracing::info!(
@@ -1915,7 +2102,8 @@ pub async fn validate_decrypt_permissions(
     ciphertext: &str,
     sender_pubkey: &PublicKey,
 ) -> Result<(), AuthError> {
-    let policy_id = get_authorization_for_origin(pool, user_pubkey, redirect_origin, tenant_id).await?;
+    let policy_id =
+        get_authorization_for_origin(pool, user_pubkey, redirect_origin, tenant_id).await?;
 
     // Parse recipient pubkey
     let recipient_pubkey = PublicKey::from_hex(user_pubkey)
@@ -1940,7 +2128,7 @@ pub async fn validate_decrypt_permissions(
         "SELECT p.*
          FROM permissions p
          JOIN policy_permissions pp ON pp.permission_id = p.id
-         WHERE pp.policy_id = $1"
+         WHERE pp.policy_id = $1",
     )
     .bind(policy_id)
     .fetch_all(pool)
@@ -1966,7 +2154,9 @@ pub async fn validate_decrypt_permissions(
     }
 
     // Check that ALL permissions allow this decryption (defense-in-depth)
-    let allowed = custom_permissions.iter().all(|p| p.can_decrypt(ciphertext, sender_pubkey, &recipient_pubkey));
+    let allowed = custom_permissions
+        .iter()
+        .all(|p| p.can_decrypt(ciphertext, sender_pubkey, &recipient_pubkey));
 
     if !allowed {
         tracing::warn!(
@@ -1975,7 +2165,9 @@ pub async fn validate_decrypt_permissions(
             &sender_pubkey.to_hex()[..8],
             tenant_id
         );
-        return Err(AuthError::Forbidden("Decryption not permitted by policy".to_string()));
+        return Err(AuthError::Forbidden(
+            "Decryption not permitted by policy".to_string(),
+        ));
     }
 
     tracing::info!(
@@ -1990,8 +2182,8 @@ pub async fn validate_decrypt_permissions(
 
 #[derive(Debug, Serialize)]
 pub struct PubkeyResponse {
-    pub pubkey: String,  // hex format
-    pub npub: String,    // bech32 format
+    pub pubkey: String, // hex format
+    pub npub: String,   // bech32 format
 }
 
 /// Fast HTTP signing endpoint - sign an event without NIP-46 relay overhead
@@ -2002,7 +2194,8 @@ pub async fn sign_event(
     headers: HeaderMap,
     Json(req): Json<SignEventRequest>,
 ) -> Result<Json<SignEventResponse>, AuthError> {
-    let (user_pubkey, redirect_origin, _bunker_pubkey) = extract_user_and_origin_from_token(&headers)?;
+    let (user_pubkey, redirect_origin, _bunker_pubkey) =
+        extract_user_and_origin_from_token(&headers)?;
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
     let tenant_id = tenant.0.id;
@@ -2012,11 +2205,22 @@ pub async fn sign_event(
         .map_err(|e| AuthError::Internal(format!("Invalid event format: {}", e)))?;
 
     // 🔒 VALIDATE PERMISSIONS BEFORE SIGNING
-    validate_signing_permissions(pool, tenant_id, &user_pubkey, &redirect_origin, &unsigned_event).await?;
+    validate_signing_permissions(
+        pool,
+        tenant_id,
+        &user_pubkey,
+        &redirect_origin,
+        &unsigned_event,
+    )
+    .await?;
 
     // FAST PATH: Try to use cached signer handler if in unified mode
     if let Some(ref handlers) = auth_state.state.signer_handlers {
-        tracing::info!("Attempting fast path signing for user: {} in tenant: {}", user_pubkey, tenant_id);
+        tracing::info!(
+            "Attempting fast path signing for user: {} in tenant: {}",
+            user_pubkey,
+            tenant_id
+        );
 
         // Query for user's bunker public key from any OAuth authorization
         let bunker_pubkey: Option<String> = sqlx::query_scalar(
@@ -2025,7 +2229,7 @@ pub async fn sign_event(
              JOIN users u ON oa.user_pubkey = u.pubkey
              WHERE oa.user_pubkey = $1 AND u.tenant_id = $2
              ORDER BY oa.created_at DESC
-             LIMIT 1"
+             LIMIT 1",
         )
         .bind(&user_pubkey)
         .bind(tenant_id)
@@ -2036,13 +2240,20 @@ pub async fn sign_event(
             if let Some(handler) = handlers.get(&bunker_key).await {
                 tracing::info!("✅ Using cached handler for user {}", user_pubkey);
 
-                let signed_event = handler.sign_event_direct(unsigned_event).await
+                let signed_event = handler
+                    .sign_event_direct(unsigned_event)
+                    .await
                     .map_err(|e| AuthError::Internal(format!("Signing failed: {}", e)))?;
 
-                let signed_json = serde_json::to_value(&signed_event)
-                    .map_err(|e| AuthError::Internal(format!("JSON serialization failed: {}", e)))?;
+                let signed_json = serde_json::to_value(&signed_event).map_err(|e| {
+                    AuthError::Internal(format!("JSON serialization failed: {}", e))
+                })?;
 
-                tracing::info!("Fast path: Successfully signed event {} for user: {}", signed_event.id, user_pubkey);
+                tracing::info!(
+                    "Fast path: Successfully signed event {} for user: {}",
+                    signed_event.id,
+                    user_pubkey
+                );
 
                 return Ok(Json(SignEventResponse {
                     signed_event: signed_json,
@@ -2052,14 +2263,17 @@ pub async fn sign_event(
     }
 
     // SLOW PATH: Fallback to DB + KMS decryption
-    tracing::warn!("⚠️  Handler not cached, using slow path (DB+KMS) for user {}", user_pubkey);
+    tracing::warn!(
+        "⚠️  Handler not cached, using slow path (DB+KMS) for user {}",
+        user_pubkey
+    );
 
     // Get user's encrypted secret key
     let result: Option<(Vec<u8>,)> = sqlx::query_as(
         "SELECT pk.encrypted_secret_key
          FROM personal_keys pk
          JOIN users u ON pk.user_pubkey = u.pubkey
-         WHERE pk.user_pubkey = $1 AND u.tenant_id = $2"
+         WHERE pk.user_pubkey = $1 AND u.tenant_id = $2",
     )
     .bind(&user_pubkey)
     .bind(tenant_id)
@@ -2080,14 +2294,20 @@ pub async fn sign_event(
 
     // Permission validation already done above (before fast path check)
     // Sign the event
-    let signed_event = unsigned_event.sign(&keys).await
+    let signed_event = unsigned_event
+        .sign(&keys)
+        .await
         .map_err(|e| AuthError::Internal(format!("Signing failed: {}", e)))?;
 
     // Convert to JSON
     let signed_json = serde_json::to_value(&signed_event)
         .map_err(|e| AuthError::Internal(format!("JSON serialization failed: {}", e)))?;
 
-    tracing::info!("Slow path: Successfully signed event {} for user: {}", signed_event.id, user_pubkey);
+    tracing::info!(
+        "Slow path: Successfully signed event {} for user: {}",
+        signed_event.id,
+        user_pubkey
+    );
 
     Ok(Json(SignEventResponse {
         signed_event: signed_json,
@@ -2103,16 +2323,19 @@ pub async fn get_pubkey(
     let user_pubkey = extract_user_from_token(&headers)?;
     let tenant_id = tenant.0.id;
 
-    tracing::info!("Fetching pubkey for user: {} in tenant: {}", user_pubkey, tenant_id);
+    tracing::info!(
+        "Fetching pubkey for user: {} in tenant: {}",
+        user_pubkey,
+        tenant_id
+    );
 
     // Verify user exists in this tenant
-    let exists: Option<(String,)> = sqlx::query_as(
-        "SELECT pubkey FROM users WHERE pubkey = $1 AND tenant_id = $2"
-    )
-    .bind(&user_pubkey)
-    .bind(tenant_id)
-    .fetch_optional(&pool)
-    .await?;
+    let exists: Option<(String,)> =
+        sqlx::query_as("SELECT pubkey FROM users WHERE pubkey = $1 AND tenant_id = $2")
+            .bind(&user_pubkey)
+            .bind(tenant_id)
+            .fetch_optional(&pool)
+            .await?;
 
     if exists.is_none() {
         return Err(AuthError::UserNotFound);
@@ -2122,7 +2345,8 @@ pub async fn get_pubkey(
     let pubkey = PublicKey::from_hex(&user_pubkey)
         .map_err(|e| AuthError::Internal(format!("Invalid public key: {}", e)))?;
 
-    let npub = pubkey.to_bech32()
+    let npub = pubkey
+        .to_bech32()
         .map_err(|e| AuthError::Internal(format!("Bech32 conversion failed: {}", e)))?;
 
     Ok(Json(PubkeyResponse {
@@ -2162,8 +2386,8 @@ pub struct VerifyExportCodeResponse {
 #[derive(Debug, Deserialize)]
 pub struct ExportKeyRequest {
     pub export_token: String,
-    pub format: String,  // "nsec", "ncryptsec", or "mnemonic"
-    pub encryption_password: Option<String>,  // Required for ncryptsec
+    pub format: String,                      // "nsec", "ncryptsec", or "mnemonic"
+    pub encryption_password: Option<String>, // Required for ncryptsec
 }
 
 #[derive(Debug, Serialize)]
@@ -2185,7 +2409,7 @@ pub async fn verify_password_for_export(
 
     // Get user's email and password hash
     let result: Option<(String, String)> = sqlx::query_as(
-        "SELECT email, password_hash FROM users WHERE pubkey = $1 AND tenant_id = $2"
+        "SELECT email, password_hash FROM users WHERE pubkey = $1 AND tenant_id = $2",
     )
     .bind(&user_pubkey)
     .bind(tenant_id)
@@ -2216,7 +2440,7 @@ pub async fn request_key_export(
 
     // Get user's email and verification status
     let user: Option<(String, bool)> = sqlx::query_as(
-        "SELECT email, email_verified FROM users WHERE pubkey = $1 AND tenant_id = $2"
+        "SELECT email, email_verified FROM users WHERE pubkey = $1 AND tenant_id = $2",
     )
     .bind(&user_pubkey)
     .bind(tenant_id)
@@ -2237,7 +2461,7 @@ pub async fn request_key_export(
     // Store code in database
     sqlx::query(
         "INSERT INTO key_export_codes (user_pubkey, code, expires_at, created_at)
-         VALUES ($1, $2, $3, $4)"
+         VALUES ($1, $2, $3, $4)",
     )
     .bind(&user_pubkey)
     .bind(&code)
@@ -2271,7 +2495,7 @@ pub async fn verify_export_code(
     let result: Option<(String, chrono::DateTime<Utc>)> = sqlx::query_as(
         "SELECT code, expires_at FROM key_export_codes
          WHERE user_pubkey = $1 AND code = $2 AND used_at IS NULL
-         ORDER BY created_at DESC LIMIT 1"
+         ORDER BY created_at DESC LIMIT 1",
     )
     .bind(&user_pubkey)
     .bind(&req.code)
@@ -2285,14 +2509,12 @@ pub async fn verify_export_code(
     }
 
     // Mark code as used
-    sqlx::query(
-        "UPDATE key_export_codes SET used_at = $1 WHERE user_pubkey = $2 AND code = $3"
-    )
-    .bind(Utc::now())
-    .bind(&user_pubkey)
-    .bind(&code)
-    .execute(&pool)
-    .await?;
+    sqlx::query("UPDATE key_export_codes SET used_at = $1 WHERE user_pubkey = $2 AND code = $3")
+        .bind(Utc::now())
+        .bind(&user_pubkey)
+        .bind(&code)
+        .execute(&pool)
+        .await?;
 
     // Generate export token (valid for 5 minutes)
     let export_token = generate_secure_token();
@@ -2300,7 +2522,7 @@ pub async fn verify_export_code(
 
     sqlx::query(
         "INSERT INTO key_export_tokens (user_pubkey, token, expires_at, created_at)
-         VALUES ($1, $2, $3, $4)"
+         VALUES ($1, $2, $3, $4)",
     )
     .bind(&user_pubkey)
     .bind(&export_token)
@@ -2325,13 +2547,12 @@ pub async fn export_key(
     let tenant_id = tenant.0.id;
 
     // Require email verification
-    let email_verified: Option<bool> = sqlx::query_scalar(
-        "SELECT email_verified FROM users WHERE pubkey = $1 AND tenant_id = $2"
-    )
-    .bind(&user_pubkey)
-    .bind(tenant_id)
-    .fetch_optional(pool)
-    .await?;
+    let email_verified: Option<bool> =
+        sqlx::query_scalar("SELECT email_verified FROM users WHERE pubkey = $1 AND tenant_id = $2")
+            .bind(&user_pubkey)
+            .bind(tenant_id)
+            .fetch_optional(pool)
+            .await?;
 
     if email_verified != Some(true) {
         return Err(AuthError::EmailNotVerified);
@@ -2340,7 +2561,7 @@ pub async fn export_key(
     // Verify export token
     let token_result: Option<(chrono::DateTime<Utc>,)> = sqlx::query_as(
         "SELECT expires_at FROM key_export_tokens
-         WHERE user_pubkey = $1 AND token = $2 AND used_at IS NULL"
+         WHERE user_pubkey = $1 AND token = $2 AND used_at IS NULL",
     )
     .bind(&user_pubkey)
     .bind(&req.export_token)
@@ -2354,21 +2575,19 @@ pub async fn export_key(
     }
 
     // Mark token as used
-    sqlx::query(
-        "UPDATE key_export_tokens SET used_at = $1 WHERE user_pubkey = $2 AND token = $3"
-    )
-    .bind(Utc::now())
-    .bind(&user_pubkey)
-    .bind(&req.export_token)
-    .execute(pool)
-    .await?;
+    sqlx::query("UPDATE key_export_tokens SET used_at = $1 WHERE user_pubkey = $2 AND token = $3")
+        .bind(Utc::now())
+        .bind(&user_pubkey)
+        .bind(&req.export_token)
+        .execute(pool)
+        .await?;
 
     // Get user's encrypted secret key
     let encrypted_key: Option<Vec<u8>> = sqlx::query_scalar(
         "SELECT pk.encrypted_secret_key
          FROM personal_keys pk
          JOIN users u ON pk.user_pubkey = u.pubkey
-         WHERE pk.user_pubkey = $1 AND u.tenant_id = $2"
+         WHERE pk.user_pubkey = $1 AND u.tenant_id = $2",
     )
     .bind(&user_pubkey)
     .bind(tenant_id)
@@ -2391,26 +2610,30 @@ pub async fn export_key(
     let key_string = match req.format.as_str() {
         "nsec" => {
             // Plain nsec format
-            keys.secret_key().to_bech32()
+            keys.secret_key()
+                .to_bech32()
                 .map_err(|e| AuthError::Internal(format!("Failed to encode nsec: {}", e)))?
-        },
+        }
         "ncryptsec" => {
             // NIP-49 encrypted format
-            let password = req.encryption_password
-                .ok_or(AuthError::BadRequest("encryption_password required for ncryptsec format".to_string()))?;
+            let password = req.encryption_password.ok_or(AuthError::BadRequest(
+                "encryption_password required for ncryptsec format".to_string(),
+            ))?;
 
             use nostr_sdk::nips::nip49::{EncryptedSecretKey, KeySecurity};
 
             let encrypted = EncryptedSecretKey::new(
                 keys.secret_key(),
                 &password,
-                16,  // log_n parameter (2^16 rounds)
+                16, // log_n parameter (2^16 rounds)
                 KeySecurity::Unknown,
-            ).map_err(|e| AuthError::Internal(format!("Failed to encrypt key: {}", e)))?;
+            )
+            .map_err(|e| AuthError::Internal(format!("Failed to encrypt key: {}", e)))?;
 
-            encrypted.to_bech32()
+            encrypted
+                .to_bech32()
                 .map_err(|e| AuthError::Internal(format!("Failed to encode ncryptsec: {}", e)))?
-        },
+        }
         "mnemonic" => {
             // BIP-39 mnemonic format
             // Convert the secret key to mnemonic
@@ -2423,15 +2646,17 @@ pub async fn export_key(
                 .map_err(|e| AuthError::Internal(format!("Failed to generate mnemonic: {}", e)))?;
 
             mnemonic.to_string()
-        },
+        }
         _ => {
-            return Err(AuthError::BadRequest("Invalid format. Must be 'nsec', 'ncryptsec', or 'mnemonic'".to_string()));
+            return Err(AuthError::BadRequest(
+                "Invalid format. Must be 'nsec', 'ncryptsec', or 'mnemonic'".to_string(),
+            ));
         }
     };
 
     // Log the export for security audit
     sqlx::query(
-        "INSERT INTO key_export_log (user_pubkey, format, exported_at) VALUES ($1, $2, $3)"
+        "INSERT INTO key_export_log (user_pubkey, format, exported_at) VALUES ($1, $2, $3)",
     )
     .bind(&user_pubkey)
     .bind(&req.format)
@@ -2445,7 +2670,7 @@ pub async fn export_key(
 #[derive(Debug, Deserialize)]
 pub struct ChangeKeyRequest {
     pub password: String,
-    pub nsec: Option<String>,  // If None, auto-generate new key
+    pub nsec: Option<String>, // If None, auto-generate new key
 }
 
 #[derive(Debug, Serialize)]
@@ -2468,13 +2693,12 @@ pub async fn export_key_simple(
     let tenant_id = tenant.0.id;
 
     // Extract password and format from request
-    let password = req.get("password")
+    let password = req
+        .get("password")
         .and_then(|v| v.as_str())
         .ok_or(AuthError::BadRequest("Missing password".to_string()))?;
 
-    let format = req.get("format")
-        .and_then(|v| v.as_str())
-        .unwrap_or("nsec");
+    let format = req.get("format").and_then(|v| v.as_str()).unwrap_or("nsec");
 
     // Verify password and email verification status
     let result: Option<(String, String, bool)> = sqlx::query_as(
@@ -2504,7 +2728,7 @@ pub async fn export_key_simple(
         "SELECT pk.encrypted_secret_key
          FROM personal_keys pk
          JOIN users u ON pk.user_pubkey = u.pubkey
-         WHERE pk.user_pubkey = $1 AND u.tenant_id = $2"
+         WHERE pk.user_pubkey = $1 AND u.tenant_id = $2",
     )
     .bind(&user_pubkey)
     .bind(tenant_id)
@@ -2525,14 +2749,20 @@ pub async fn export_key_simple(
 
     // Format the key based on requested format
     let key_string = match format {
-        "nsec" => keys.secret_key().to_bech32()
+        "nsec" => keys
+            .secret_key()
+            .to_bech32()
             .map_err(|e| AuthError::Internal(format!("Failed to encode nsec: {}", e)))?,
-        _ => return Err(AuthError::BadRequest("Invalid format. Must be 'nsec'".to_string())),
+        _ => {
+            return Err(AuthError::BadRequest(
+                "Invalid format. Must be 'nsec'".to_string(),
+            ))
+        }
     };
 
     // Log the export for security audit
     sqlx::query(
-        "INSERT INTO key_export_log (user_pubkey, format, exported_at) VALUES ($1, $2, $3)"
+        "INSERT INTO key_export_log (user_pubkey, format, exported_at) VALUES ($1, $2, $3)",
     )
     .bind(&user_pubkey)
     .bind(format)
@@ -2558,7 +2788,7 @@ pub async fn change_key(
 
     // Get user's email and verify password
     let result: Option<(String, String)> = sqlx::query_as(
-        "SELECT email, password_hash FROM users WHERE pubkey = $1 AND tenant_id = $2"
+        "SELECT email, password_hash FROM users WHERE pubkey = $1 AND tenant_id = $2",
     )
     .bind(&old_pubkey)
     .bind(tenant_id)
@@ -2589,13 +2819,12 @@ pub async fn change_key(
     let new_secret_bytes = new_keys.secret_key().to_secret_bytes();
 
     // Check if new pubkey already exists in this tenant
-    let exists: Option<(String,)> = sqlx::query_as(
-        "SELECT pubkey FROM users WHERE pubkey = $1 AND tenant_id = $2"
-    )
-    .bind(&new_pubkey)
-    .bind(tenant_id)
-    .fetch_optional(pool)
-    .await?;
+    let exists: Option<(String,)> =
+        sqlx::query_as("SELECT pubkey FROM users WHERE pubkey = $1 AND tenant_id = $2")
+            .bind(&new_pubkey)
+            .bind(tenant_id)
+            .fetch_optional(pool)
+            .await?;
 
     if exists.is_some() {
         return Err(AuthError::DuplicateKey);
@@ -2611,33 +2840,28 @@ pub async fn change_key(
     let mut tx = pool.begin().await?;
 
     // Count OAuth authorizations that will be deleted (for response message)
-    let oauth_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM oauth_authorizations WHERE user_pubkey = $1"
-    )
-    .bind(&old_pubkey)
-    .fetch_one(&mut *tx)
-    .await?;
+    let oauth_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM oauth_authorizations WHERE user_pubkey = $1")
+            .bind(&old_pubkey)
+            .fetch_one(&mut *tx)
+            .await?;
 
     // Delete OAuth authorizations (we can't sign with old nsec anymore)
-    sqlx::query(
-        "DELETE FROM oauth_authorizations WHERE user_pubkey = $1"
-    )
-    .bind(&old_pubkey)
-    .execute(&mut *tx)
-    .await?;
+    sqlx::query("DELETE FROM oauth_authorizations WHERE user_pubkey = $1")
+        .bind(&old_pubkey)
+        .execute(&mut *tx)
+        .await?;
 
     // Delete old personal_keys (we no longer hold old nsec)
-    sqlx::query(
-        "DELETE FROM personal_keys WHERE user_pubkey = $1"
-    )
-    .bind(&old_pubkey)
-    .execute(&mut *tx)
-    .await?;
+    sqlx::query("DELETE FROM personal_keys WHERE user_pubkey = $1")
+        .bind(&old_pubkey)
+        .execute(&mut *tx)
+        .await?;
 
     // Transfer email/password to NULL on old identity (orphan it)
     sqlx::query(
         "UPDATE users SET email = NULL, password_hash = NULL, updated_at = $1
-         WHERE pubkey = $2 AND tenant_id = $3"
+         WHERE pubkey = $2 AND tenant_id = $3",
     )
     .bind(Utc::now())
     .bind(&old_pubkey)
@@ -2678,16 +2902,21 @@ pub async fn change_key(
     // Signal signer daemon to remove old authorizations
     if let Some(tx) = &auth_state.auth_tx {
         use keycast_core::authorization_channel::AuthorizationCommand;
-        if let Err(e) = tx.send(AuthorizationCommand::Remove {
-            bunker_pubkey: old_pubkey.clone(),
-        }).await {
+        if let Err(e) = tx
+            .send(AuthorizationCommand::Remove {
+                bunker_pubkey: old_pubkey.clone(),
+            })
+            .await
+        {
             tracing::error!("Failed to send authorization remove command: {}", e);
         }
     }
 
     tracing::info!(
         "Successfully changed key for user {} → {} (deleted {} OAuth authorizations)",
-        old_pubkey, new_pubkey, oauth_count
+        old_pubkey,
+        new_pubkey,
+        oauth_count
     );
 
     Ok(Json(ChangeKeyResponse {
@@ -2706,7 +2935,7 @@ mod tests {
     use keycast_core::encryption::file_key_manager::FileKeyManager;
     use keycast_core::encryption::KeyManager;
     use keycast_core::signing_handler::SigningHandler;
-    use nostr_sdk::{Keys, UnsignedEvent, Kind, Timestamp};
+    use nostr_sdk::{Keys, Kind, Timestamp, UnsignedEvent};
     use sqlx::PgPool;
 
     /// Helper to create test database connection
@@ -2730,7 +2959,9 @@ mod tests {
             &self,
             unsigned_event: UnsignedEvent,
         ) -> Result<nostr_sdk::Event, Box<dyn std::error::Error + Send + Sync>> {
-            let signed = unsigned_event.sign(&self.user_keys).await
+            let signed = unsigned_event
+                .sign(&self.user_keys)
+                .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
             Ok(signed)
         }
@@ -2787,14 +3018,18 @@ mod tests {
              JOIN users u ON oa.user_pubkey = u.pubkey
              WHERE oa.user_pubkey = $1 AND u.tenant_id = 1
              ORDER BY oa.created_at DESC
-             LIMIT 1"
+             LIMIT 1",
         )
         .bind(&user_pubkey)
         .fetch_optional(&pool)
         .await
         .unwrap();
 
-        assert_eq!(result, Some(bunker_pubkey), "Should find bunker pubkey for fast path");
+        assert_eq!(
+            result,
+            Some(bunker_pubkey),
+            "Should find bunker pubkey for fast path"
+        );
 
         // Verify handler can sign
         let mock_handler = MockSigningHandler {
@@ -2807,7 +3042,7 @@ mod tests {
             Timestamp::now(),
             Kind::TextNote,
             vec![],
-            "Test fast path"
+            "Test fast path",
         );
 
         let signed = mock_handler.sign_event_direct(unsigned).await.unwrap();
@@ -2849,7 +3084,7 @@ mod tests {
             "SELECT pk.encrypted_secret_key
              FROM personal_keys pk
              JOIN users u ON pk.user_pubkey = u.pubkey
-             WHERE pk.user_pubkey = $1 AND u.tenant_id = 1"
+             WHERE pk.user_pubkey = $1 AND u.tenant_id = 1",
         )
         .bind(&user_pubkey)
         .fetch_optional(&pool)
@@ -2871,7 +3106,7 @@ mod tests {
             Timestamp::now(),
             Kind::TextNote,
             vec![],
-            "Test slow path"
+            "Test slow path",
         );
 
         let signed = unsigned.sign(&recovered_keys).await.unwrap();
@@ -2899,14 +3134,17 @@ mod tests {
             "SELECT oa.bunker_public_key
              FROM oauth_authorizations oa
              JOIN users u ON oa.user_pubkey = u.pubkey
-             WHERE oa.user_pubkey = $1 AND u.tenant_id = 1"
+             WHERE oa.user_pubkey = $1 AND u.tenant_id = 1",
         )
         .bind(&user_pubkey)
         .fetch_optional(&pool)
         .await
         .unwrap();
 
-        assert!(bunker_pubkey.is_none(), "Should not find OAuth authorization for fallback");
+        assert!(
+            bunker_pubkey.is_none(),
+            "Should not find OAuth authorization for fallback"
+        );
 
         println!("✅ Fallback detection test passed");
     }
@@ -2921,7 +3159,7 @@ mod tests {
             Timestamp::now(),
             Kind::TextNote,
             vec![],
-            "Test signature"
+            "Test signature",
         );
 
         let signed = unsigned.sign(&user_keys).await.unwrap();
@@ -2941,9 +3179,9 @@ mod tests {
         let unsigned = UnsignedEvent::new(
             user_keys.public_key(),
             Timestamp::now(),
-            Kind::TextNote,  // Kind 1 - should be allowed
+            Kind::TextNote, // Kind 1 - should be allowed
             vec![],
-            "This is a normal text note"
+            "This is a normal text note",
         );
 
         let signed = unsigned.sign(&user_keys).await.unwrap();
@@ -2975,7 +3213,7 @@ mod tests {
                 Timestamp::now(),
                 kind,
                 vec![],
-                format!("Test {}", name)
+                format!("Test {}", name),
             );
 
             let signed = unsigned.sign(&user_keys).await;
@@ -2997,20 +3235,20 @@ mod tests {
             Timestamp::now(),
             Kind::TextNote,
             vec![],
-            normal_content
+            normal_content,
         );
 
         let signed = unsigned_normal.sign(&user_keys).await.unwrap();
         assert!(signed.verify().is_ok());
 
         // Test very long content (currently no limit, but we might want one)
-        let long_content = "x".repeat(100_000);  // 100KB of text
+        let long_content = "x".repeat(100_000); // 100KB of text
         let unsigned_long = UnsignedEvent::new(
             user_keys.public_key(),
             Timestamp::now(),
             Kind::TextNote,
             vec![],
-            &long_content
+            &long_content,
         );
 
         let signed_long = unsigned_long.sign(&user_keys).await.unwrap();
@@ -3021,4 +3259,3 @@ mod tests {
         println!("✅ Content length validation tested");
     }
 }
-

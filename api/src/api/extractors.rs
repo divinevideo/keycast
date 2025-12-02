@@ -7,7 +7,7 @@ use nostr_sdk::Event;
 pub struct AuthEvent(pub Event);
 
 // Dual authentication extractor - accepts NIP-98 or UCAN
-pub struct DualAuthEvent(pub String);  // Returns pubkey as hex string
+pub struct DualAuthEvent(pub String); // Returns pubkey as hex string
 
 // Extract the auth event from the request
 #[async_trait]
@@ -62,10 +62,17 @@ where
         if let Some(auth_header) = parts.headers.get("Authorization") {
             if let Ok(auth_str) = auth_header.to_str() {
                 if auth_str.starts_with("Nostr ") {
-                    let event = extract_auth_event_from_header(auth_str)
-                        .map_err(|e| (StatusCode::UNAUTHORIZED, format!("Invalid NIP-98 event: {}", e)))?;
+                    let event = extract_auth_event_from_header(auth_str).map_err(|e| {
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            format!("Invalid NIP-98 event: {}", e),
+                        )
+                    })?;
 
-                    tracing::debug!("DualAuth: Authenticated via NIP-98 header for pubkey: {}", event.pubkey);
+                    tracing::debug!(
+                        "DualAuth: Authenticated via NIP-98 header for pubkey: {}",
+                        event.pubkey
+                    );
                     return Ok(DualAuthEvent(event.pubkey.to_hex()));
                 }
             }
@@ -76,10 +83,18 @@ where
             if let Ok(auth_str) = auth_header.to_str() {
                 if auth_str.starts_with("Bearer ") {
                     // Use tenant_id = 0 for now (will validate in endpoint if needed)
-                    let (pubkey, _redirect_origin, _bunker_pubkey, _ucan) = crate::ucan_auth::validate_ucan_token(auth_str, 0)
-                        .map_err(|e| (StatusCode::UNAUTHORIZED, format!("Invalid UCAN token: {}", e)))?;
+                    let (pubkey, _redirect_origin, _bunker_pubkey, _ucan) =
+                        crate::ucan_auth::validate_ucan_token(auth_str, 0).map_err(|e| {
+                            (
+                                StatusCode::UNAUTHORIZED,
+                                format!("Invalid UCAN token: {}", e),
+                            )
+                        })?;
 
-                    tracing::debug!("DualAuth: Authenticated via UCAN Bearer token for pubkey: {}", pubkey);
+                    tracing::debug!(
+                        "DualAuth: Authenticated via UCAN Bearer token for pubkey: {}",
+                        pubkey
+                    );
                     return Ok(DualAuthEvent(pubkey));
                 }
             }
@@ -93,12 +108,19 @@ where
                     let cookie = cookie.trim();
                     if let Some(value) = cookie.strip_prefix("keycast_session=") {
                         // Validate UCAN token from cookie
-                        let (pubkey, _redirect_origin, _bunker_pubkey, _ucan) = crate::ucan_auth::validate_ucan_token(
-                            &format!("Bearer {}", value),
-                            0
-                        ).map_err(|e| (StatusCode::UNAUTHORIZED, format!("Invalid UCAN cookie: {}", e)))?;
+                        let (pubkey, _redirect_origin, _bunker_pubkey, _ucan) =
+                            crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", value), 0)
+                                .map_err(|e| {
+                                    (
+                                        StatusCode::UNAUTHORIZED,
+                                        format!("Invalid UCAN cookie: {}", e),
+                                    )
+                                })?;
 
-                        tracing::debug!("DualAuth: Authenticated via UCAN cookie for pubkey: {}", pubkey);
+                        tracing::debug!(
+                            "DualAuth: Authenticated via UCAN cookie for pubkey: {}",
+                            pubkey
+                        );
                         return Ok(DualAuthEvent(pubkey));
                     }
                 }
@@ -107,7 +129,8 @@ where
 
         Err((
             StatusCode::UNAUTHORIZED,
-            "Missing authentication - expected NIP-98 header, UCAN Bearer token, or UCAN cookie".to_string(),
+            "Missing authentication - expected NIP-98 header, UCAN Bearer token, or UCAN cookie"
+                .to_string(),
         ))
     }
 }

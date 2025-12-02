@@ -50,9 +50,8 @@ impl CustomPermission for AllowedKinds {
     fn from_permission(
         permission: &Permission,
     ) -> Result<Box<dyn CustomPermission>, PermissionError> {
-        let parsed_config: AllowedKindsConfig =
-            serde_json::from_value(permission.config.0.clone())
-                .map_err(|e| PermissionError::InvalidConfig(e.to_string()))?;
+        let parsed_config: AllowedKindsConfig = serde_json::from_value(permission.config.0.clone())
+            .map_err(|e| PermissionError::InvalidConfig(e.to_string()))?;
 
         Ok(Box::new(Self {
             config: parsed_config,

@@ -1,7 +1,7 @@
 // Permission validation tests for signer daemon
 // Tests that the signer properly enforces policy permissions before signing/encrypting/decrypting
 
-use keycast_core::encryption::{KeyManager, file_key_manager::FileKeyManager};
+use keycast_core::encryption::{file_key_manager::FileKeyManager, KeyManager};
 use keycast_core::signing_handler::SigningHandler;
 use keycast_core::types::authorization::Authorization;
 use keycast_core::types::oauth_authorization::OAuthAuthorization;
@@ -18,8 +18,9 @@ async fn setup_test_db() -> PgPool {
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast".to_string());
 
-    let pool = PgPool::connect(&database_url).await
-        .expect("Failed to connect to database. Make sure PostgreSQL is running and DATABASE_URL is set.");
+    let pool = PgPool::connect(&database_url).await.expect(
+        "Failed to connect to database. Make sure PostgreSQL is running and DATABASE_URL is set.",
+    );
 
     pool
 }
@@ -32,19 +33,18 @@ async fn create_policy_with_permissions(
     permission_configs: Vec<(&str, serde_json::Value)>,
 ) -> i32 {
     // Ensure team exists first (check if exists, create if not)
-    let team_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM teams WHERE id = $1 AND tenant_id = $2)"
-    )
-    .bind(team_id)
-    .bind(tenant_id)
-    .fetch_one(pool)
-    .await
-    .expect("Failed to check team existence");
+    let team_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM teams WHERE id = $1 AND tenant_id = $2)")
+            .bind(team_id)
+            .bind(tenant_id)
+            .fetch_one(pool)
+            .await
+            .expect("Failed to check team existence");
 
     if !team_exists {
         sqlx::query(
             "INSERT INTO teams (name, tenant_id, created_at, updated_at)
-             VALUES ($1, $2, NOW(), NOW())"
+             VALUES ($1, $2, NOW(), NOW())",
         )
         .bind("Test Team")
         .bind(tenant_id)
@@ -57,7 +57,7 @@ async fn create_policy_with_permissions(
     let policy_id: i32 = sqlx::query_scalar(
         "INSERT INTO policies (name, team_id, created_at, updated_at)
          VALUES ($1, $2, NOW(), NOW())
-         RETURNING id"
+         RETURNING id",
     )
     .bind(format!("Test Policy {}", Uuid::new_v4()))
     .bind(team_id)
@@ -70,7 +70,7 @@ async fn create_policy_with_permissions(
         let permission_id: i32 = sqlx::query_scalar(
             "INSERT INTO permissions (identifier, config, created_at, updated_at)
              VALUES ($1, $2, NOW(), NOW())
-             RETURNING id"
+             RETURNING id",
         )
         .bind(identifier)
         .bind(config)
@@ -81,7 +81,7 @@ async fn create_policy_with_permissions(
         // Link to policy
         sqlx::query(
             "INSERT INTO policy_permissions (policy_id, permission_id, created_at, updated_at)
-             VALUES ($1, $2, NOW(), NOW())"
+             VALUES ($1, $2, NOW(), NOW())",
         )
         .bind(policy_id)
         .bind(permission_id)
@@ -107,7 +107,9 @@ async fn create_test_authorization(
 
     // Encrypt user secret
     let user_secret = user_keys.secret_key().secret_bytes();
-    let encrypted_secret = key_manager.encrypt(&user_secret).await
+    let encrypted_secret = key_manager
+        .encrypt(&user_secret)
+        .await
         .expect("Failed to encrypt user secret");
 
     // Create stored key
@@ -127,7 +129,9 @@ async fn create_test_authorization(
 
     // Encrypt bunker secret
     let bunker_secret = bunker_keys.secret_key().secret_bytes();
-    let encrypted_bunker_secret = key_manager.encrypt(&bunker_secret).await
+    let encrypted_bunker_secret = key_manager
+        .encrypt(&bunker_secret)
+        .await
         .expect("Failed to encrypt bunker secret");
 
     // Generate unique secret for this test
@@ -152,7 +156,8 @@ async fn create_test_authorization(
     .expect("Failed to create authorization");
 
     // Load authorization
-    let auth = Authorization::find(pool, tenant_id, auth_id).await
+    let auth = Authorization::find(pool, tenant_id, auth_id)
+        .await
         .expect("Failed to load authorization");
 
     (auth, bunker_keys, user_keys)
@@ -175,7 +180,7 @@ async fn create_oauth_authorization(
     sqlx::query(
         "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
          VALUES ($1, $2, NOW(), NOW())
-         ON CONFLICT (pubkey) DO NOTHING"
+         ON CONFLICT (pubkey) DO NOTHING",
     )
     .bind(user_keys.public_key().to_hex())
     .bind(tenant_id)
@@ -185,12 +190,14 @@ async fn create_oauth_authorization(
 
     // Encrypt user secret for personal_keys
     let user_secret = user_keys.secret_key().secret_bytes();
-    let encrypted_secret = key_manager.encrypt(&user_secret).await
+    let encrypted_secret = key_manager
+        .encrypt(&user_secret)
+        .await
         .expect("Failed to encrypt user secret");
 
     sqlx::query(
         "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id)
-         VALUES ($1, $2, $3)"
+         VALUES ($1, $2, $3)",
     )
     .bind(user_keys.public_key().to_hex())
     .bind(&encrypted_secret)
@@ -219,7 +226,8 @@ async fn create_oauth_authorization(
     .expect("Failed to create OAuth authorization");
 
     // Load OAuth authorization
-    let oauth_auth = OAuthAuthorization::find(pool, tenant_id, oauth_id).await
+    let oauth_auth = OAuthAuthorization::find(pool, tenant_id, oauth_id)
+        .await
         .expect("Failed to load OAuth authorization");
 
     (oauth_auth, user_keys)
@@ -251,8 +259,7 @@ async fn test_1_no_policy_allows_all() {
     );
 
     // Try signing kind 1 event
-    let unsigned = EventBuilder::text_note("Hello world")
-        .build(user_keys.public_key());
+    let unsigned = EventBuilder::text_note("Hello world").build(user_keys.public_key());
 
     let result = handler.sign_event_direct(unsigned).await;
 
@@ -270,10 +277,8 @@ async fn test_2_allowed_kinds_permits_matching_kind() {
 
     // Create policy allowing only kind 1
     let config = json!({ "allowed_kinds": [1] });
-    let policy_id = create_policy_with_permissions(
-        &pool, 1, 1,
-        vec![("allowed_kinds", config)]
-    ).await;
+    let policy_id =
+        create_policy_with_permissions(&pool, 1, 1, vec![("allowed_kinds", config)]).await;
 
     let (auth, bunker_keys, user_keys) =
         create_test_authorization(&pool, 1, 1, policy_id, &key_manager).await;
@@ -289,8 +294,7 @@ async fn test_2_allowed_kinds_permits_matching_kind() {
     );
 
     // Try signing kind 1 event
-    let unsigned = EventBuilder::text_note("Hello world")
-        .build(user_keys.public_key());
+    let unsigned = EventBuilder::text_note("Hello world").build(user_keys.public_key());
 
     let result = handler.sign_event_direct(unsigned).await;
 
@@ -308,10 +312,8 @@ async fn test_3_allowed_kinds_denies_non_matching_kind() {
 
     // Create policy allowing only kind 1
     let config = json!({ "allowed_kinds": [1] });
-    let policy_id = create_policy_with_permissions(
-        &pool, 1, 1,
-        vec![("allowed_kinds", config)]
-    ).await;
+    let policy_id =
+        create_policy_with_permissions(&pool, 1, 1, vec![("allowed_kinds", config)]).await;
 
     let (auth, bunker_keys, user_keys) =
         create_test_authorization(&pool, 1, 1, policy_id, &key_manager).await;
@@ -336,8 +338,11 @@ async fn test_3_allowed_kinds_denies_non_matching_kind() {
     assert!(result.is_err(), "Kind 4 should be denied by policy");
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("permission") || err_msg.contains("Unauthorized") || err_msg.contains("denied"),
-        "Error should mention permission denial, got: {}", err_msg
+        err_msg.contains("permission")
+            || err_msg.contains("Unauthorized")
+            || err_msg.contains("denied"),
+        "Error should mention permission denial, got: {}",
+        err_msg
     );
 }
 
@@ -348,10 +353,8 @@ async fn test_4_content_filter_allows_clean_content() {
 
     // Block words containing "spam"
     let config = json!({ "blocked_words": ["spam", "scam"] });
-    let policy_id = create_policy_with_permissions(
-        &pool, 1, 1,
-        vec![("content_filter", config)]
-    ).await;
+    let policy_id =
+        create_policy_with_permissions(&pool, 1, 1, vec![("content_filter", config)]).await;
 
     let (auth, bunker_keys, user_keys) =
         create_test_authorization(&pool, 1, 1, policy_id, &key_manager).await;
@@ -383,10 +386,8 @@ async fn test_5_content_filter_denies_blocked_words() {
 
     // Block words containing "spam"
     let config = json!({ "blocked_words": ["spam", "scam"] });
-    let policy_id = create_policy_with_permissions(
-        &pool, 1, 1,
-        vec![("content_filter", config)]
-    ).await;
+    let policy_id =
+        create_policy_with_permissions(&pool, 1, 1, vec![("content_filter", config)]).await;
 
     let (auth, bunker_keys, user_keys) =
         create_test_authorization(&pool, 1, 1, policy_id, &key_manager).await;
@@ -402,13 +403,16 @@ async fn test_5_content_filter_denies_blocked_words() {
     );
 
     // Content with blocked word
-    let unsigned = EventBuilder::text_note("Buy my spam product now!")
-        .build(user_keys.public_key());
+    let unsigned =
+        EventBuilder::text_note("Buy my spam product now!").build(user_keys.public_key());
 
     let result = handler.sign_event_direct(unsigned).await;
 
     // Should fail - contains "spam"
-    assert!(result.is_err(), "Content with blocked words should be denied");
+    assert!(
+        result.is_err(),
+        "Content with blocked words should be denied"
+    );
 }
 
 #[tokio::test]
@@ -420,12 +424,15 @@ async fn test_6_multiple_permissions_all_must_pass() {
     // 1. Only allow kind 1
     // 2. Block word "spam"
     let policy_id = create_policy_with_permissions(
-        &pool, 1, 1,
+        &pool,
+        1,
+        1,
         vec![
             ("allowed_kinds", json!({ "allowed_kinds": [1] })),
             ("content_filter", json!({ "blocked_words": ["spam"] })),
-        ]
-    ).await;
+        ],
+    )
+    .await;
 
     let (auth, bunker_keys, user_keys) =
         create_test_authorization(&pool, 1, 1, policy_id, &key_manager).await;
@@ -441,22 +448,29 @@ async fn test_6_multiple_permissions_all_must_pass() {
     );
 
     // Test A: Kind 1 with clean content - BOTH permissions pass
-    let unsigned = EventBuilder::text_note("Hello world")
-        .build(user_keys.public_key());
+    let unsigned = EventBuilder::text_note("Hello world").build(user_keys.public_key());
     let result = handler.sign_event_direct(unsigned).await;
-    assert!(result.is_ok(), "Kind 1 + clean content should pass both permissions");
+    assert!(
+        result.is_ok(),
+        "Kind 1 + clean content should pass both permissions"
+    );
 
     // Test B: Kind 1 with spam - allowed_kinds passes, content_filter fails
-    let unsigned = EventBuilder::text_note("Buy spam products")
-        .build(user_keys.public_key());
+    let unsigned = EventBuilder::text_note("Buy spam products").build(user_keys.public_key());
     let result = handler.sign_event_direct(unsigned).await;
-    assert!(result.is_err(), "Content filter should deny even if kind is allowed");
+    assert!(
+        result.is_err(),
+        "Content filter should deny even if kind is allowed"
+    );
 
     // Test C: Kind 4 with clean content - allowed_kinds fails, content_filter passes
     let unsigned = EventBuilder::new(Kind::EncryptedDirectMessage, "Clean message")
         .build(user_keys.public_key());
     let result = handler.sign_event_direct(unsigned).await;
-    assert!(result.is_err(), "Wrong kind should deny even if content is clean");
+    assert!(
+        result.is_err(),
+        "Wrong kind should deny even if content is clean"
+    );
 }
 
 #[tokio::test]
@@ -465,8 +479,7 @@ async fn test_7_oauth_no_policy_allows_all() {
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
 
     // OAuth auth with NULL policy_id
-    let (oauth_auth, user_keys) =
-        create_oauth_authorization(&pool, 1, None, &key_manager).await;
+    let (oauth_auth, user_keys) = create_oauth_authorization(&pool, 1, None, &key_manager).await;
 
     let handler = AuthorizationHandler::new_for_test(
         user_keys.clone(),
@@ -485,7 +498,10 @@ async fn test_7_oauth_no_policy_allows_all() {
     let result = handler.sign_event_direct(unsigned).await;
 
     // Should succeed - no policy means allow all
-    assert!(result.is_ok(), "OAuth with no policy should allow all operations");
+    assert!(
+        result.is_ok(),
+        "OAuth with no policy should allow all operations"
+    );
 }
 
 #[tokio::test]
@@ -495,10 +511,8 @@ async fn test_8_oauth_with_policy_enforces_restrictions() {
 
     // Create policy only allowing kind 1
     let config = json!({ "allowed_kinds": [1] });
-    let policy_id = create_policy_with_permissions(
-        &pool, 1, 1,
-        vec![("allowed_kinds", config)]
-    ).await;
+    let policy_id =
+        create_policy_with_permissions(&pool, 1, 1, vec![("allowed_kinds", config)]).await;
 
     // OAuth auth WITH policy_id
     let (oauth_auth, user_keys) =
@@ -515,14 +529,13 @@ async fn test_8_oauth_with_policy_enforces_restrictions() {
     );
 
     // Test A: Kind 1 - SHOULD PASS
-    let unsigned = EventBuilder::text_note("Hello")
-        .build(user_keys.public_key());
+    let unsigned = EventBuilder::text_note("Hello").build(user_keys.public_key());
     let result = handler.sign_event_direct(unsigned).await;
     assert!(result.is_ok(), "OAuth with policy should allow kind 1");
 
     // Test B: Kind 4 - SHOULD FAIL
-    let unsigned = EventBuilder::new(Kind::EncryptedDirectMessage, "Secret")
-        .build(user_keys.public_key());
+    let unsigned =
+        EventBuilder::new(Kind::EncryptedDirectMessage, "Secret").build(user_keys.public_key());
     let result = handler.sign_event_direct(unsigned).await;
     assert!(result.is_err(), "OAuth with policy should deny kind 4");
 }
