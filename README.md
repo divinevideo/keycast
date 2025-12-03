@@ -1,210 +1,157 @@
 # Keycast
 
-Secure Nostr key custody with OAuth 2.0 access for apps.
+OAuth 2.0 remote signing for Nostr. Users authenticate once, apps get signing access via REST API or NIP-46.
 
 ## What is Keycast?
 
-Keycast lets users store their Nostr private key (nsec) securely on a server and grant apps permission to sign events on their behalf. Apps integrate via standard OAuth 2.0 and receive credentials for remote signing.
+Keycast is a managed key custody service for Nostr apps. Users create an account (or import their nsec), and apps request signing permission via OAuth. Keys are encrypted server-side; signing happens via HTTP RPC or NIP-46 bunker URL.
 
-**Use cases:**
-- Mobile apps that need signing without storing nsec locally
-- Web apps that want to offer "Login with Nostr" without browser extensions
-- Multi-device access to the same Nostr identity
+**For mobile apps**: No browser extensions, no relay infrastructure to manage. One OAuth flow, then sign events via HTTPS or connect with the returned bunker URL.
 
-## Quick Start for App Developers
+**For users**: One identity across all apps. Revoke access per-app anytime. Import existing keys or let Keycast generate one.
 
-### TypeScript/JavaScript (Recommended)
+## Client Libraries
 
-Install the official client:
+| Platform | Package | Docs |
+|----------|---------|------|
+| Flutter/Dart | keycast_flutter | [Demo + Guide](https://github.com/divinevideo/keycast_flutter_demo) |
+| JS/TS | keycast-login | [README](./keycast-login) |
 
-```bash
-npm install keycast-login
-# or
-bun add keycast-login
+## Quick Start
+
+### Flutter/Dart
+
+```dart
+import 'package:keycast_flutter/keycast_flutter.dart';
+
+final oauth = KeycastOAuth(config: OAuthConfig(
+  serverUrl: 'https://login.divine.video',
+  clientId: 'your-app',
+  redirectUri: 'https://login.divine.video/app/callback',
+));
+
+// 1. Start OAuth flow
+final (url, verifier) = oauth.getAuthorizationUrl(scope: 'policy:social');
+await launchUrl(Uri.parse(url));
+
+// 2. Handle Universal Link callback, exchange code
+final tokens = await oauth.exchangeCode(code: code, verifier: verifier);
+final session = KeycastSession.fromTokenResponse(tokens);
+await session.save();
+
+// 3. Sign events via HTTP RPC
+final rpc = KeycastRpc.fromSession(oauth.config, session);
+final signed = await rpc.signEvent(myEvent);
 ```
 
-```typescript
-import { createKeycastClient, KeycastRpc } from 'keycast-login';
+Requires Universal Links (iOS) / App Links (Android). See [keycast_flutter_demo](https://github.com/divinevideo/keycast_flutter_demo) for complete setup including deep link configuration.
 
-// 1. Create client
+### JavaScript/TypeScript
+
+```typescript
+import { createKeycastClient } from 'keycast-login';
+
 const client = createKeycastClient({
   serverUrl: 'https://login.divine.video',
-  clientId: 'your-app-id',
+  clientId: 'your-app',
   redirectUri: window.location.origin + '/callback',
 });
 
-// 2. Start OAuth flow
-// Option A: Let Keycast generate a new identity for the user
+// 1. Start OAuth flow
 const { url, pkce } = await client.oauth.getAuthorizationUrl({
   scopes: ['policy:social'],
-  defaultRegister: true,  // Auto-generate new nsec if user doesn't have one
 });
-
-// Option B: Bring Your Own Key - import user's existing nsec
-// const { url, pkce } = await client.oauth.getAuthorizationUrl({
-//   scopes: ['policy:social'],
-//   nsec: 'nsec1...',  // User's existing key (pubkey derived automatically)
-// });
-
 sessionStorage.setItem('pkce_verifier', pkce.verifier);
 window.location.href = url;
 
-// 3. Handle callback (on /callback page)
+// 2. Handle callback
 const code = new URLSearchParams(location.search).get('code');
 const verifier = sessionStorage.getItem('pkce_verifier');
 const tokens = await client.oauth.exchangeCode(code, verifier);
-// tokens.bunker_url    - NIP-46 bunker URL (for nostr-tools)
-// tokens.access_token  - UCAN token (for REST RPC API)
 
-// 4. Sign events via REST RPC
+// 3. Sign events via HTTP RPC
 const rpc = client.createRpc(tokens);
-
-const pubkey = await rpc.getPublicKey();
 const signed = await rpc.signEvent({
   kind: 1,
   content: 'Hello Nostr!',
   tags: [],
   created_at: Math.floor(Date.now() / 1000),
-  pubkey,
+  pubkey: await rpc.getPublicKey(),
 });
-
-// 5. Publish to relays (using nostr-tools or your preferred library)
-// await pool.publish(['wss://relay.example.com'], signed);
 ```
 
-See [`keycast-login/README.md`](./keycast-login/README.md) for full API reference.
+See [keycast-login README](./keycast-login/README.md) for full API reference including BYOK (Bring Your Own Key) flows.
 
-### Other Languages (HTTP API)
+### HTTP API
 
-#### 1. OAuth Authorization Flow
-
-Redirect users to Keycast's authorization endpoint:
-
-```
-GET /api/oauth/authorize?
-  client_id=your-app-id&
-  redirect_uri=https://yourapp.com/callback&
-  scope=sign_event&
-  code_challenge=<PKCE_CHALLENGE>&
-  code_challenge_method=S256
-```
-
-User logs in (or registers), approves your app, and gets redirected back with an authorization code.
-
-#### 2. Exchange Code for Credentials
+For other languages, use the REST API directly:
 
 ```bash
-POST /api/oauth/token
-Content-Type: application/json
+# Exchange authorization code for credentials
+curl -X POST https://login.divine.video/api/oauth/token \
+  -H "Content-Type: application/json" \
+  -d '{
+    "code": "<authorization_code>",
+    "client_id": "your-app",
+    "redirect_uri": "https://yourapp.com/callback",
+    "code_verifier": "<pkce_verifier>"
+  }'
 
-{
-  "code": "<authorization_code>",
-  "client_id": "your-app-id",
-  "redirect_uri": "https://yourapp.com/callback",
-  "code_verifier": "<PKCE_VERIFIER>"
-}
+# Response includes both bunker_url (NIP-46) and access_token (HTTP RPC)
 ```
-
-Response:
-```json
-{
-  "bunker_url": "bunker://abc123...?relay=wss://relay.example.com&secret=xyz",
-  "access_token": "eyJ...",
-  "token_type": "Bearer",
-  "expires_in": 86400
-}
-```
-
-You get **two ways to sign**:
-
-| Credential | Transport | Use Case |
-|------------|-----------|----------|
-| `bunker_url` | NIP-46 via Nostr relays | Standard Nostr clients, works with nostr-tools |
-| `access_token` | HTTP REST API | Low-latency signing, simpler integration |
-
-#### 3a. Sign via NIP-46 (Bunker URL)
-
-Use `bunker_url` with any NIP-46 compatible library.
-
-#### 3b. Sign via HTTP RPC (Access Token)
 
 ```bash
-POST /api/nostr
-Authorization: Bearer <access_token>
-Content-Type: application/json
-
-{
-  "method": "sign_event",
-  "params": [{
-    "kind": 1,
-    "content": "Hello Nostr!",
-    "created_at": 1234567890,
-    "tags": []
-  }]
-}
+# Sign an event via HTTP RPC
+curl -X POST https://login.divine.video/api/nostr \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "method": "sign_event",
+    "params": [{
+      "kind": 1,
+      "content": "Hello Nostr!",
+      "created_at": 1234567890,
+      "tags": []
+    }]
+  }'
 ```
 
-**Available RPC methods:**
-- `get_public_key` - Get user's public key
-- `sign_event` - Sign an unsigned event
-- `nip04_encrypt` / `nip04_decrypt` - NIP-04 encryption
-- `nip44_encrypt` / `nip44_decrypt` - NIP-44 encryption
+## How It Works
 
-## Live Demo
+**OAuth flow**: App redirects to Keycast. User authenticates (or registers). App receives access token and bunker URL.
 
-Visit `/demo` on your Keycast instance to test the full OAuth flow interactively. The demo shows both key generation modes (server-generated and BYOK) and all RPC operations (signing, encryption, decryption).
+**Two signing transports**:
 
-## Architecture
+| Transport | Latency | Use Case |
+|-----------|---------|----------|
+| HTTP RPC | ~50ms | Direct HTTPS with access token |
+| NIP-46 | ~200-500ms | Standard Nostr protocol via relays |
 
-```
-┌─────────────────┐                              ┌─────────────────┐
-│                 │────── 1. OAuth 2.0 ─────────►│                 │
-│   Your App      │                              │    Keycast      │
-│  (Flutter/Web)  │◄───── 2. bunker_url ────────│     Server      │
-│                 │◄───── 2. access_token ──────│                 │
-└────────┬────────┘                              └────────┬────────┘
-         │                                                │
-         │  Sign Requests (two options):                  │
-         │                                                │
-         │  A) HTTP RPC (access_token)                    │
-         │     ──────────────────────────────────────────►│
-         │                                                │
-         │  B) NIP-46 (bunker_url)                        │
-         │     ─────────►┌──────────────┐◄────────────────┤
-         │               │ Nostr Relays │                 │
-         │     ◄─────────└──────────────┘────────────────►│
-         │                                                │
-         │                                                ▼
-         │                                       ┌─────────────────┐
-         │                                       │   PostgreSQL    │
-         │                                       │ (encrypted keys)│
-         │                                       └────────┬────────┘
-         │                                                │
-         │                                                ▼
-         │                                       ┌─────────────────┐
-         │                                       │  GCP KMS or     │
-         │                                       │  master.key     │
-         │                                       └─────────────────┘
-```
+Both return the same signed events. Use HTTP RPC for lower latency; use NIP-46 bunker URL with existing nostr-tools/NDK integrations.
 
-**Two signing transports:**
-- **HTTP RPC**: App → Keycast (direct, ~50ms latency)
-- **NIP-46**: App ↔ Nostr Relays ↔ Keycast (standard protocol, ~200-500ms)
+**Key encryption**: AES-256-GCM at rest in PostgreSQL. Production uses GCP KMS (keys never leave hardware).
 
-**Key encryption:**
-- Private keys are AES-256-GCM encrypted in PostgreSQL
-- **Production (GCP KMS)**: Master key never leaves KMS hardware - even with DB access, keys cannot be decrypted without KMS permissions
-- **Development (master.key)**: File-based AES key for local testing
+## API Reference
 
-## Hosting Your Own Instance
+### OAuth Endpoints
 
-### Prerequisites
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/oauth/authorize` | GET | Start OAuth flow (redirect user here) |
+| `/api/oauth/token` | POST | Exchange code for access_token + bunker_url |
 
-- Docker and Docker Compose
-- PostgreSQL (included in docker-compose)
-- A domain with HTTPS (for production)
+### RPC Methods
 
-### Quick Start
+POST to `/api/nostr` with `Authorization: Bearer <access_token>`:
+
+| Method | Description |
+|--------|-------------|
+| `get_public_key` | Get user's public key (hex) |
+| `sign_event` | Sign an unsigned event |
+| `nip44_encrypt` / `nip44_decrypt` | NIP-44 encryption |
+| `nip04_encrypt` / `nip04_decrypt` | NIP-04 encryption |
+
+## Self-Hosting
 
 ```bash
 git clone https://github.com/ArcadeLabsInc/keycast.git
@@ -216,11 +163,13 @@ bun run key:generate
 
 # Configure environment
 cp .env.example .env
-# Edit .env with your settings
+# Edit DATABASE_URL, SERVER_NSEC, ALLOWED_ORIGINS
 
 # Run with Docker
 docker compose up -d --build
 ```
+
+See [DEVELOPMENT.md](./docs/DEVELOPMENT.md) for local development setup.
 
 ### Environment Variables
 
@@ -229,37 +178,15 @@ docker compose up -d --build
 | `DATABASE_URL` | PostgreSQL connection string |
 | `SERVER_NSEC` | Server's Nostr secret key for signing tokens |
 | `ALLOWED_ORIGINS` | CORS origins (comma-separated) |
-| `BUNKER_RELAYS` | NIP-46 relay URLs (default: several public relays) |
+| `BUNKER_RELAYS` | NIP-46 relay URLs |
 | `MASTER_KEY_PATH` | Path to encryption key file |
-| `USE_GCP_KMS` | Use GCP KMS instead of file-based key (production) |
+| `USE_GCP_KMS` | Use GCP KMS instead of file-based key |
 
-### Development
+## History & Team Key Management
 
-```bash
-# Run dev server (API + NIP-46 signer)
-bun run dev
+Keycast started as a team-based key management system, forked from [erskingardner/keycast](https://github.com/erskingardner/keycast). That original functionality—shared team keys with role-based access and custom permission policies—is still available but works via manual bunker URL distribution rather than OAuth.
 
-# Run web admin UI
-bun run dev:web
-
-# Run tests
-cargo test
-```
-
-## Team Key Management (Original Keycast)
-
-Keycast was originally built for team-based Nostr key management. This functionality is still available and works via NIP-46 bunker URLs (not yet integrated with OAuth/HTTP RPC).
-
-**Team features:**
-- Create teams with shared Nostr keys
-- Role-based access control (admin/member)
-- Custom permission policies:
-  - `allowed_kinds` - Restrict which event kinds can be signed
-  - `content_filter` - Filter events by content patterns
-  - `encrypt_to_self` - Restrict encryption to user's own pubkey
-- NIP-46 remote signing for team keys
-
-Access the web admin at your Keycast URL to manage teams. See the [original Keycast repository](https://github.com/erskingardner/keycast) for the team-focused implementation.
+See [docs/TEAMS.md](./docs/TEAMS.md) for team key management documentation.
 
 ## License
 
