@@ -31,6 +31,42 @@ async fn health_check() -> impl IntoResponse {
     StatusCode::OK
 }
 
+/// Serve Apple App Site Association file with correct content type
+async fn apple_app_site_association(
+    axum::extract::State(web_build_dir): axum::extract::State<String>,
+) -> impl IntoResponse {
+    use axum::http::header;
+
+    let path = PathBuf::from(&web_build_dir).join(".well-known/apple-app-site-association");
+    match tokio::fs::read_to_string(&path).await {
+        Ok(content) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            content,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "Not found").into_response(),
+    }
+}
+
+/// Serve Android Asset Links file with correct content type
+async fn assetlinks_json(
+    axum::extract::State(web_build_dir): axum::extract::State<String>,
+) -> impl IntoResponse {
+    use axum::http::header;
+
+    let path = PathBuf::from(&web_build_dir).join(".well-known/assetlinks.json");
+    match tokio::fs::read_to_string(&path).await {
+        Ok(content) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            content,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "Not found").into_response(),
+    }
+}
+
 /// Validate required environment variables at startup
 fn validate_environment() -> Result<(), String> {
     let mut errors = Vec::new();
@@ -290,6 +326,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse::<bool>()
         .unwrap_or(false);
 
+    // Routes for Apple/Android app association files (with correct content type)
+    let well_known_routes = Router::new()
+        .route(
+            "/apple-app-site-association",
+            get(apple_app_site_association),
+        )
+        .route("/assetlinks.json", get(assetlinks_json))
+        .with_state(web_build_dir.clone());
+
     let mut app = Router::new()
         // Health checks at root level (for k8s/Cloud Run)
         .route("/health", get(health_check))
@@ -301,6 +346,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(keycast_api::api::http::nostr_discovery_public),
         )
         .with_state(database.pool.clone())
+        // Apple/Android app association files
+        .nest("/.well-known", well_known_routes)
         // All API endpoints under /api prefix
         .nest("/api", api_routes);
 
