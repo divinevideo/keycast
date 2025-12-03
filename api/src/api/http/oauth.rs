@@ -27,6 +27,13 @@ static POLLING_CACHE: Lazy<DashMap<String, (String, Instant)>> = Lazy::new(DashM
 
 const POLLING_TTL: StdDuration = StdDuration::from_secs(300); // 5 minutes
 
+/// Generate a 256-bit random authorization handle (64 hex characters)
+/// Used for silent re-authentication in OAuth flows
+pub fn generate_authorization_handle() -> String {
+    let random_bytes: [u8; 32] = rand::thread_rng().gen();
+    hex::encode(random_bytes)
+}
+
 /// Extract optional nsec from PKCE code_verifier
 /// Format: "{random}.{nsec}" where nsec is either nsec1... (bech32) or 64-char hex
 /// Returns None if no nsec embedded (standard PKCE flow)
@@ -46,8 +53,10 @@ pub fn extract_nsec_from_verifier_public(verifier: &str) -> Option<String> {
 /// Examples: "https://example.com/callback" -> "https://example.com"
 ///           "http://localhost:3000/auth" -> "http://localhost:3000"
 ///
-/// Security: HTTP is only allowed for localhost/127.0.0.1/[::1].
-/// All other hosts require HTTPS.
+/// Security: Only HTTPS URLs are allowed (HTTP for localhost only).
+/// Custom URL schemes (divine://, myapp://) are rejected because any app can
+/// register any scheme, making them vulnerable to hijacking attacks.
+/// HTTPS URLs use DNS for identity verification.
 pub fn extract_origin(redirect_uri: &str) -> Result<String, OAuthError> {
     use nostr_sdk::Url;
     let url = Url::parse(redirect_uri)
@@ -58,28 +67,30 @@ pub fn extract_origin(redirect_uri: &str) -> Result<String, OAuthError> {
         "redirect_uri missing host".to_string(),
     ))?;
 
-    // Security: Only allow http:// for localhost development
-    let is_localhost =
-        host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "::1";
-    if scheme == "http" && !is_localhost {
-        return Err(OAuthError::InvalidRequest(
-            "HTTPS required for non-localhost redirect_uri".to_string(),
-        ));
+    // For http/https schemes, apply web security rules
+    if scheme == "http" || scheme == "https" {
+        let is_localhost =
+            host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "::1";
+        if scheme == "http" && !is_localhost {
+            return Err(OAuthError::InvalidRequest(
+                "HTTPS required for non-localhost redirect_uri".to_string(),
+            ));
+        }
+
+        let origin = match url.port() {
+            Some(port) => format!("{}://{}:{}", scheme, host, port),
+            None => format!("{}://{}", scheme, host),
+        };
+        return Ok(origin);
     }
 
-    // Only allow http or https schemes
-    if scheme != "http" && scheme != "https" {
-        return Err(OAuthError::InvalidRequest(
-            "redirect_uri must use http or https scheme".to_string(),
-        ));
-    }
-
-    let origin = match url.port() {
-        Some(port) => format!("{}://{}:{}", scheme, host, port),
-        None => format!("{}://{}", scheme, host),
-    };
-
-    Ok(origin)
+    // Reject custom URL schemes - only http/https allowed
+    // Custom schemes (divine://, myapp://) are vulnerable to hijacking attacks
+    // since any app can register any scheme. HTTPS URLs use DNS for identity verification.
+    Err(OAuthError::InvalidRequest(format!(
+        "Invalid redirect_uri scheme '{}'. Only https:// URLs are allowed (http:// for localhost only).",
+        scheme
+    )))
 }
 
 /// Parse OAuth scope parameter for policy-based authorization.
@@ -116,10 +127,51 @@ async fn store_oauth_code(
     code_challenge: Option<&str>,
     code_challenge_method: Option<&str>,
     expires_at: chrono::DateTime<Utc>,
+    previous_auth_id: Option<i32>,
 ) -> Result<(), OAuthError> {
     sqlx::query(
-        "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
+        "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, previous_auth_id, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"
+    )
+    .bind(tenant_id)
+    .bind(code)
+    .bind(user_pubkey)
+    .bind(client_id)
+    .bind(redirect_uri)
+    .bind(scope)
+    .bind(code_challenge)
+    .bind(code_challenge_method)
+    .bind(expires_at)
+    .bind(previous_auth_id)
+    .bind(Utc::now())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Store OAuth code with pending registration data (deferred user creation)
+/// Used by oauth_register to defer user creation until token exchange
+#[allow(clippy::too_many_arguments)]
+async fn store_oauth_code_with_pending_registration(
+    pool: &sqlx::PgPool,
+    tenant_id: i64,
+    code: &str,
+    user_pubkey: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    scope: &str,
+    code_challenge: Option<&str>,
+    code_challenge_method: Option<&str>,
+    expires_at: chrono::DateTime<Utc>,
+    pending_email: &str,
+    pending_password_hash: &str,
+    pending_email_verification_token: &str,
+    pending_encrypted_secret: Option<&[u8]>,
+) -> Result<(), OAuthError> {
+    sqlx::query(
+        "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at,
+         pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)"
     )
     .bind(tenant_id)
     .bind(code)
@@ -131,6 +183,10 @@ async fn store_oauth_code(
     .bind(code_challenge_method)
     .bind(expires_at)
     .bind(Utc::now())
+    .bind(pending_email)
+    .bind(pending_password_hash)
+    .bind(pending_email_verification_token)
+    .bind(pending_encrypted_secret)
     .execute(pool)
     .await?;
     Ok(())
@@ -146,6 +202,7 @@ pub struct AuthorizeRequest {
     pub prompt: Option<String>, // OAuth 2.0 prompt parameter: "login", "consent", "none"
     pub byok_pubkey: Option<String>, // BYOK: force registration with this pubkey
     pub default_register: Option<bool>, // Legacy: show register form by default
+    pub authorization_handle: Option<String>, // For silent re-authentication
 }
 
 #[derive(Debug, Deserialize)]
@@ -230,6 +287,8 @@ pub struct TokenResponse {
     pub scope: Option<String>, // RFC 6749 optional - granted permissions
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<TokenPolicyInfo>, // Keycast extension - policy details
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization_handle: Option<String>, // For silent re-authentication
 }
 
 #[derive(Debug)]
@@ -495,39 +554,39 @@ pub async fn authorize_get(
         (None, false)
     };
 
-    // If authenticated, check if they've already authorized this origin
+    // Check for silent re-authentication via authorization_handle
+    // This replaces the buggy origin-based auto-approve check
     if let Some(ref pubkey) = user_pubkey {
-        // Extract origin from redirect_uri - this is the primary identifier
-        let redirect_origin = extract_origin(&params.redirect_uri)?;
+        let previous_auth_id: Option<i32> = if let Some(ref handle) = params.authorization_handle {
+            tracing::info!(
+                "Auto-approve check via authorization_handle for user {}",
+                pubkey
+            );
+
+            // Look up by handle (must be active and not expired)
+            sqlx::query_scalar(
+                "SELECT id FROM oauth_authorizations
+                 WHERE authorization_handle = $1
+                   AND revoked_at IS NULL
+                   AND (expires_at IS NULL OR expires_at > NOW())",
+            )
+            .bind(handle)
+            .fetch_optional(pool)
+            .await?
+        } else {
+            None
+        };
 
         tracing::info!(
-            "Auto-approve check: redirect_origin={}, client_id={}, user_pubkey={}",
-            redirect_origin,
-            params.client_id,
-            pubkey
-        );
-
-        // Check if user has already authorized this origin (not application_id)
-        let existing_auth: Option<(i32,)> = sqlx::query_as(
-            "SELECT id FROM oauth_authorizations
-             WHERE tenant_id = $1 AND user_pubkey = $2 AND redirect_origin = $3",
-        )
-        .bind(tenant_id)
-        .bind(pubkey)
-        .bind(&redirect_origin)
-        .fetch_optional(pool)
-        .await?;
-
-        tracing::info!(
-            "Existing authorization check: found={}",
-            existing_auth.is_some()
+            "Authorization handle lookup: found={}",
+            previous_auth_id.is_some()
         );
 
         // Skip auto-approve if prompt=consent (always show approval screen)
-        if existing_auth.is_some() && !force_consent {
+        if previous_auth_id.is_some() && !force_consent {
             tracing::info!(
-                "Auto-approving: user has already authorized origin {}",
-                redirect_origin
+                "Auto-approving via authorization_handle for user {}",
+                pubkey
             );
 
             // Auto-approve: generate code and send directly to parent window
@@ -551,6 +610,7 @@ pub async fn authorize_get(
                 params.code_challenge.as_deref(),
                 params.code_challenge_method.as_deref(),
                 expires_at,
+                previous_auth_id,
             )
             .await?;
 
@@ -558,7 +618,7 @@ pub async fn authorize_get(
             return Ok(
                 Redirect::to(&format!("{}?code={}", params.redirect_uri, code)).into_response(),
             );
-        } else if existing_auth.is_some() && force_consent {
+        } else if previous_auth_id.is_some() && force_consent {
             tracing::info!("prompt=consent: skipping auto-approve, showing approval screen");
         }
     }
@@ -1673,6 +1733,7 @@ pub async fn authorize_post(
     let expires_at = Utc::now() + Duration::minutes(10);
 
     // Store authorization code with PKCE support
+    // No previous_auth_id since this is explicit user consent (first login or re-consent)
     store_oauth_code(
         &auth_state.state.db,
         tenant_id,
@@ -1684,6 +1745,7 @@ pub async fn authorize_post(
         req.code_challenge.as_deref(),
         req.code_challenge_method.as_deref(),
         expires_at,
+        None,
     )
     .await?;
 
@@ -1727,18 +1789,26 @@ async fn handle_authorization_code_grant(
     req: TokenRequest,
 ) -> Result<Response, OAuthError> {
     let pool = &auth_state.state.db;
+    let key_manager = auth_state.state.key_manager.as_ref();
 
-    // Fetch and validate authorization code with PKCE fields
+    // Fetch and validate authorization code with PKCE fields AND pending registration data
     type AuthCodeRow = (
-        String,
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
+        String,          // user_pubkey
+        String,          // client_id
+        String,          // redirect_uri
+        String,          // scope
+        Option<String>,  // code_challenge
+        Option<String>,  // code_challenge_method
+        Option<String>,  // pending_email
+        Option<String>,  // pending_password_hash
+        Option<String>,  // pending_email_verification_token
+        Option<Vec<u8>>, // pending_encrypted_secret
+        Option<i32>,     // previous_auth_id (for cleanup on re-auth)
     );
     let auth_code: Option<AuthCodeRow> = sqlx::query_as(
-        "SELECT user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method
+        "SELECT user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method,
+                pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret,
+                previous_auth_id
          FROM oauth_codes
          WHERE tenant_id = $1 AND code = $2 AND expires_at > $3",
     )
@@ -1748,8 +1818,19 @@ async fn handle_authorization_code_grant(
     .fetch_optional(pool)
     .await?;
 
-    let (user_pubkey, client_id, stored_redirect_uri, scope, code_challenge, code_challenge_method) =
-        auth_code.ok_or(OAuthError::Unauthorized)?;
+    let (
+        user_pubkey,
+        client_id,
+        stored_redirect_uri,
+        scope,
+        code_challenge,
+        code_challenge_method,
+        pending_email,
+        pending_password_hash,
+        pending_email_verification_token,
+        pending_encrypted_secret,
+        previous_auth_id,
+    ) = auth_code.ok_or(OAuthError::Unauthorized)?;
 
     // Validate redirect_uri matches
     if stored_redirect_uri != req.redirect_uri {
@@ -1769,26 +1850,182 @@ async fn handle_authorization_code_grant(
         tracing::debug!("PKCE validation successful for code: {}", &req.code[..8]);
     }
 
-    // Delete the authorization code (one-time use)
-    sqlx::query("DELETE FROM oauth_codes WHERE tenant_id = $1 AND code = $2")
-        .bind(tenant_id)
-        .bind(&req.code)
-        .execute(pool)
-        .await?;
-
-    // Get user's email for UCAN
-    let email: String =
-        sqlx::query_scalar("SELECT email FROM users WHERE pubkey = $1 AND tenant_id = $2")
-            .bind(&user_pubkey)
-            .bind(tenant_id)
-            .fetch_one(pool)
-            .await?;
-
-    // Extract optional nsec from code_verifier
+    // Extract optional nsec from code_verifier (for BYOK flow)
     let nsec_from_verifier = req
         .code_verifier
         .as_ref()
         .and_then(|v| extract_nsec_from_verifier_public(v));
+
+    // Check if this is a registration flow (has pending_email)
+    let email = if let Some(ref pending_email_val) = pending_email {
+        // This is a registration - create user + keys atomically
+        tracing::info!(
+            "Token exchange completing deferred registration for email: {}",
+            pending_email_val
+        );
+
+        // Re-check email uniqueness (handle race condition)
+        let existing_email: Option<(String,)> =
+            sqlx::query_as("SELECT pubkey FROM users WHERE email = $1 AND tenant_id = $2")
+                .bind(pending_email_val)
+                .bind(tenant_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(OAuthError::Database)?;
+
+        if existing_email.is_some() {
+            return Err(OAuthError::InvalidRequest(
+                "This email is already registered. Please sign in instead.".to_string(),
+            ));
+        }
+
+        // Re-check pubkey uniqueness (handle race condition)
+        let existing_pubkey: Option<(String,)> =
+            sqlx::query_as("SELECT email FROM users WHERE pubkey = $1 AND tenant_id = $2")
+                .bind(&user_pubkey)
+                .bind(tenant_id)
+                .fetch_optional(pool)
+                .await
+                .map_err(OAuthError::Database)?;
+
+        if existing_pubkey.is_some() {
+            return Err(OAuthError::InvalidRequest(
+                "This Nostr key is already registered.".to_string(),
+            ));
+        }
+
+        // Get encrypted secret (from oauth_codes for auto-generate, or encrypt now for BYOK)
+        let encrypted_secret: Vec<u8> = if let Some(stored_secret) = pending_encrypted_secret {
+            // Auto-generate flow: secret was encrypted at registration, just copy it
+            tracing::info!(
+                "Using pre-encrypted secret from oauth_codes ({} bytes)",
+                stored_secret.len()
+            );
+            stored_secret
+        } else {
+            // BYOK flow: nsec comes via code_verifier, encrypt now
+            let nsec_str = nsec_from_verifier.as_ref().ok_or_else(|| {
+                OAuthError::InvalidRequest(
+                    "Missing nsec in code_verifier for BYOK flow".to_string(),
+                )
+            })?;
+            let keys = Keys::parse(nsec_str).map_err(|e| {
+                OAuthError::InvalidRequest(format!("Invalid nsec in code_verifier: {}", e))
+            })?;
+            if keys.public_key().to_hex() != user_pubkey {
+                return Err(OAuthError::InvalidRequest(
+                    "nsec doesn't match pubkey from registration".to_string(),
+                ));
+            }
+            let secret_bytes = keys.secret_key().to_secret_bytes();
+            key_manager
+                .encrypt(&secret_bytes)
+                .await
+                .map_err(|e| OAuthError::Encryption(e.to_string()))?
+        };
+
+        let pending_password_hash_val = pending_password_hash.ok_or_else(|| {
+            OAuthError::InvalidRequest("Missing password hash in pending registration".to_string())
+        })?;
+        let verification_token = pending_email_verification_token.ok_or_else(|| {
+            OAuthError::InvalidRequest(
+                "Missing verification token in pending registration".to_string(),
+            )
+        })?;
+
+        // Start transaction for atomic user + keys creation
+        let mut tx = pool.begin().await.map_err(OAuthError::Database)?;
+
+        // Create users row
+        let verification_expires = Utc::now() + Duration::hours(EMAIL_VERIFICATION_EXPIRY_HOURS);
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, email_verification_token, email_verification_expires_at, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(&user_pubkey)
+        .bind(tenant_id)
+        .bind(pending_email_val)
+        .bind(&pending_password_hash_val)
+        .bind(false)
+        .bind(&verification_token)
+        .bind(verification_expires)
+        .bind(Utc::now())
+        .bind(Utc::now())
+        .execute(&mut *tx)
+        .await
+        .map_err(OAuthError::Database)?;
+
+        // Create personal_keys row (copy encrypted bytes directly - no re-encryption!)
+        sqlx::query(
+            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(&user_pubkey)
+        .bind(&encrypted_secret)
+        .bind(tenant_id)
+        .bind(Utc::now())
+        .bind(Utc::now())
+        .execute(&mut *tx)
+        .await
+        .map_err(OAuthError::Database)?;
+
+        // Delete the authorization code (one-time use) within transaction
+        sqlx::query("DELETE FROM oauth_codes WHERE tenant_id = $1 AND code = $2")
+            .bind(tenant_id)
+            .bind(&req.code)
+            .execute(&mut *tx)
+            .await
+            .map_err(OAuthError::Database)?;
+
+        tx.commit().await.map_err(OAuthError::Database)?;
+
+        tracing::info!(
+            "Created user + personal_keys atomically for: {} (email: {})",
+            user_pubkey,
+            pending_email_val
+        );
+
+        // Send verification email (optional - don't fail if email service unavailable)
+        match crate::email_service::EmailService::new() {
+            Ok(email_service) => {
+                if let Err(e) = email_service
+                    .send_verification_email(pending_email_val, &verification_token)
+                    .await
+                {
+                    tracing::error!(
+                        "Failed to send verification email to {}: {}",
+                        pending_email_val,
+                        e
+                    );
+                } else {
+                    tracing::info!("Sent verification email to {}", pending_email_val);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Email service unavailable, skipping verification email: {}",
+                    e
+                );
+            }
+        }
+
+        pending_email_val.clone()
+    } else {
+        // Normal token exchange (existing user, not registration)
+        // Delete the authorization code (one-time use)
+        sqlx::query("DELETE FROM oauth_codes WHERE tenant_id = $1 AND code = $2")
+            .bind(tenant_id)
+            .bind(&req.code)
+            .execute(pool)
+            .await?;
+
+        // Get user's email for UCAN
+        sqlx::query_scalar("SELECT email FROM users WHERE pubkey = $1 AND tenant_id = $2")
+            .bind(&user_pubkey)
+            .bind(tenant_id)
+            .fetch_one(pool)
+            .await?
+    };
 
     tracing::info!(
         "Token exchange for user {}: has code_verifier: {}, has nsec in verifier: {}",
@@ -1807,6 +2044,7 @@ async fn handle_authorization_code_grant(
             scope: &scope,
             redirect_uri: &stored_redirect_uri,
             nsec_from_verifier,
+            previous_auth_id,
         },
         auth_state,
     )
@@ -1824,6 +2062,7 @@ struct CreateAuthorizationParams<'a> {
     scope: &'a str,
     redirect_uri: &'a str,
     nsec_from_verifier: Option<String>,
+    previous_auth_id: Option<i32>,
 }
 
 /// Common function to create OAuth authorization and generate TokenResponse
@@ -1841,6 +2080,7 @@ async fn create_oauth_authorization_and_token(
         scope,
         redirect_uri,
         nsec_from_verifier,
+        previous_auth_id,
     } = params;
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
@@ -1967,13 +2207,16 @@ async fn create_oauth_authorization_and_token(
     // Resolve policy from scope (policy:slug format)
     let policy_id = resolve_policy_from_scope(pool, scope).await?;
 
+    // Generate authorization handle for silent re-authentication
+    let authorization_handle = generate_authorization_handle();
+
     // Create new OAuth authorization - always INSERT (multi-device support)
     // Each authorization is a separate "ticket" for one client/device
     // Old authorizations remain valid until explicitly revoked
     // Note: bunker key is derived via HKDF from user secret, not stored
     let auth_id: i32 = sqlx::query_scalar(
-        "INSERT INTO oauth_authorizations (tenant_id, user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, policy_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        "INSERT INTO oauth_authorizations (tenant_id, user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, policy_id, authorization_handle, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          RETURNING id"
     )
     .bind(tenant_id)
@@ -1984,6 +2227,7 @@ async fn create_oauth_authorization_and_token(
     .bind(&connection_secret)
     .bind(&relays_json)
     .bind(policy_id)
+    .bind(&authorization_handle)
     .bind(Utc::now())
     .bind(Utc::now())
     .fetch_one(pool)
@@ -1995,6 +2239,18 @@ async fn create_oauth_authorization_and_token(
         user_pubkey,
         redirect_origin
     );
+
+    // Revoke old authorization if this was a re-auth (cleanup)
+    if let Some(old_auth_id) = previous_auth_id {
+        sqlx::query("UPDATE oauth_authorizations SET revoked_at = NOW() WHERE id = $1")
+            .bind(old_auth_id)
+            .execute(pool)
+            .await?;
+        tracing::info!(
+            "Revoked old authorization {} after re-auth (signer will detect on next poll)",
+            old_auth_id
+        );
+    }
 
     // Signal signer daemon to reload via channel (instant notification)
     if let Some(tx) = &auth_state.auth_tx {
@@ -2063,6 +2319,7 @@ async fn create_oauth_authorization_and_token(
         expires_in: super::auth::TOKEN_EXPIRY_HOURS * 3600, // UCAN expiry in seconds
         scope: Some(scope.to_string()),
         policy: policy_info,
+        authorization_handle: Some(authorization_handle),
     })
     .into_response())
 }
@@ -2284,87 +2541,36 @@ pub async fn oauth_register(
         ));
     }
 
-    // Generate email verification token
+    // Generate email verification token (will be stored in oauth_codes for later use)
     let verification_token = generate_secure_token();
-    let verification_expires = Utc::now() + Duration::hours(EMAIL_VERIFICATION_EXPIRY_HOURS);
 
-    // Start transaction for user + optional keys creation
-    let mut tx = pool.begin().await.map_err(OAuthError::Database)?;
-
-    // Insert user with email verification token
-    sqlx::query(
-        "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, email_verification_token, email_verification_expires_at, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
-    )
-    .bind(public_key.to_hex())
-    .bind(tenant_id)
-    .bind(&req.email)
-    .bind(&password_hash)
-    .bind(false)
-    .bind(&verification_token)
-    .bind(verification_expires)
-    .bind(Utc::now())
-    .bind(Utc::now())
-    .execute(&mut *tx)
-    .await
-    .map_err(OAuthError::Database)?;
-
-    // If auto-generate flow, create personal_keys immediately
-    if let Some(ref keys) = generated_keys {
+    // For auto-generate or direct-nsec: encrypt secret now and store in oauth_codes
+    // For BYOK: secret comes later via code_verifier at token exchange
+    let pending_encrypted_secret: Option<Vec<u8>> = if let Some(ref keys) = generated_keys {
         let secret_bytes = keys.secret_key().to_secret_bytes();
-        let encrypted_secret = auth_state
+        let encrypted = auth_state
             .state
             .key_manager
             .encrypt(&secret_bytes)
             .await
             .map_err(|e| OAuthError::Encryption(e.to_string()))?;
-
-        // Must include tenant_id for multi-tenant isolation
-        sqlx::query(
-            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5)"
-        )
-        .bind(public_key.to_hex())
-        .bind(&encrypted_secret)
-        .bind(tenant_id)
-        .bind(Utc::now())
-        .bind(Utc::now())
-        .execute(&mut *tx)
-        .await
-        .map_err(OAuthError::Database)?;
-
         tracing::info!(
-            "Created personal_keys for auto-generate flow: {}",
-            public_key.to_hex()
+            "Encrypted secret for deferred registration: {} ({} bytes)",
+            public_key.to_hex(),
+            encrypted.len()
         );
+        Some(encrypted)
     } else {
         tracing::info!(
-            "BYOK flow - personal_keys will be created during token exchange: {}",
+            "BYOK flow - nsec will come via code_verifier at token exchange: {}",
             public_key.to_hex()
         );
-    }
+        None
+    };
 
-    tx.commit().await.map_err(OAuthError::Database)?;
-
-    // Send verification email (optional - don't fail if email service unavailable)
-    match crate::email_service::EmailService::new() {
-        Ok(email_service) => {
-            if let Err(e) = email_service
-                .send_verification_email(&req.email, &verification_token)
-                .await
-            {
-                tracing::error!("Failed to send verification email to {}: {}", req.email, e);
-            } else {
-                tracing::info!("Sent verification email to {}", req.email);
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Email service unavailable, skipping verification email: {}",
-                e
-            );
-        }
-    }
+    // DO NOT create users row here - defer to token exchange
+    // DO NOT create personal_keys row here - defer to token exchange
+    // DO NOT send verification email here - defer to token exchange
 
     // Auto-approve: first-time registration implies consent
     // Generate authorization code immediately
@@ -2379,9 +2585,10 @@ pub async fn oauth_register(
     // Extract redirect_origin - the ONLY secure app identifier
     let redirect_origin = extract_origin(&req.redirect_uri)?;
 
-    // Store authorization code with PKCE support
+    // Store authorization code with pending registration data
+    // User + personal_keys will be created atomically at token exchange
     let scope = req.scope.as_deref().unwrap_or("sign_event");
-    store_oauth_code(
+    store_oauth_code_with_pending_registration(
         pool,
         tenant_id,
         &code,
@@ -2392,8 +2599,18 @@ pub async fn oauth_register(
         req.code_challenge.as_deref(),
         req.code_challenge_method.as_deref(),
         expires_at,
+        &req.email,
+        &password_hash,
+        &verification_token,
+        pending_encrypted_secret.as_deref(),
     )
     .await?;
+
+    tracing::info!(
+        "OAuth registration deferred to token exchange: user {}, email {}",
+        public_key.to_hex(),
+        req.email
+    );
 
     tracing::info!(
         "OAuth auto-approve for new registration: user {}, origin {}",
@@ -3011,12 +3228,15 @@ pub async fn connect_post(
     let relays_json = serde_json::to_string(&vec![form.relay.clone()])
         .map_err(|e| OAuthError::InvalidRequest(format!("Failed to serialize relays: {}", e)))?;
 
+    // Generate authorization handle for silent re-authentication
+    let authorization_handle = generate_authorization_handle();
+
     // Create new OAuth authorization - always INSERT (multi-device support)
     // Each nostr-login creates a NEW authorization for that client
     let auth_id: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (tenant_id, user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, client_pubkey, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         (tenant_id, user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, client_pubkey, authorization_handle, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          RETURNING id"
     )
     .bind(tenant_id)
@@ -3027,6 +3247,7 @@ pub async fn connect_post(
     .bind(&form.secret)
     .bind(&relays_json)
     .bind(&form.client_pubkey)
+    .bind(&authorization_handle)
     .bind(Utc::now())
     .bind(Utc::now())
     .fetch_one(&auth_state.state.db)
@@ -3142,5 +3363,71 @@ pub async fn poll(Query(req): Query<PollRequest>) -> Result<Response, OAuthError
             Json(serde_json::json!({ "status": "pending" })),
         )
             .into_response())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_origin_https() {
+        assert_eq!(
+            extract_origin("https://example.com/callback").unwrap(),
+            "https://example.com"
+        );
+        assert_eq!(
+            extract_origin("https://example.com:8080/path").unwrap(),
+            "https://example.com:8080"
+        );
+    }
+
+    #[test]
+    fn test_extract_origin_http_localhost() {
+        assert_eq!(
+            extract_origin("http://localhost:3000/callback").unwrap(),
+            "http://localhost:3000"
+        );
+        assert_eq!(
+            extract_origin("http://127.0.0.1:3000/callback").unwrap(),
+            "http://127.0.0.1:3000"
+        );
+        assert_eq!(
+            extract_origin("http://[::1]:3000/callback").unwrap(),
+            "http://[::1]:3000"
+        );
+    }
+
+    #[test]
+    fn test_extract_origin_http_non_localhost_rejected() {
+        let err = extract_origin("http://example.com/callback").unwrap_err();
+        assert!(matches!(err, OAuthError::InvalidRequest(msg) if msg.contains("HTTPS required")));
+    }
+
+    #[test]
+    fn test_extract_origin_custom_schemes_rejected() {
+        // Custom URL schemes are rejected - they're vulnerable to hijacking attacks
+        let err = extract_origin("divine://callback").unwrap_err();
+        assert!(
+            matches!(err, OAuthError::InvalidRequest(msg) if msg.contains("Invalid redirect_uri scheme"))
+        );
+
+        let err = extract_origin("myapp://auth").unwrap_err();
+        assert!(
+            matches!(err, OAuthError::InvalidRequest(msg) if msg.contains("Only https:// URLs are allowed"))
+        );
+
+        let err = extract_origin("com.example.app://oauth").unwrap_err();
+        assert!(
+            matches!(err, OAuthError::InvalidRequest(msg) if msg.contains("Invalid redirect_uri scheme"))
+        );
+    }
+
+    #[test]
+    fn test_extract_origin_invalid_url() {
+        let err = extract_origin("not-a-url").unwrap_err();
+        assert!(
+            matches!(err, OAuthError::InvalidRequest(msg) if msg.contains("Invalid redirect_uri"))
+        );
     }
 }
