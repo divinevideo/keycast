@@ -53,6 +53,7 @@ export class KeycastOAuth {
     scopes?: string[];
     nsec?: string; // For BYOK flow - pubkey is derived automatically
     defaultRegister?: boolean;
+    authorizationHandle?: string; // For silent re-authentication
   } = {}): Promise<{ url: string; pkce: PkceChallenge }> {
     const pkce = await generatePkce(options.nsec);
     this.pendingPkce = pkce;
@@ -66,6 +67,11 @@ export class KeycastOAuth {
 
     if (options.defaultRegister) {
       url.searchParams.set('default_register', 'true');
+    }
+
+    // Pass authorization handle for silent re-authentication
+    if (options.authorizationHandle) {
+      url.searchParams.set('authorization_handle', options.authorizationHandle);
     }
 
     // Derive pubkey from nsec if provided (BYOK flow)
@@ -153,6 +159,7 @@ export class KeycastOAuth {
       bunkerUrl: response.bunker_url,
       accessToken: response.access_token,
       expiresAt,
+      authorizationHandle: response.authorization_handle,
     };
   }
 

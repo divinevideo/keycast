@@ -15,6 +15,8 @@ export interface TokenResponse {
   expires_in: number;
   /** Granted OAuth scopes */
   scope?: string;
+  /** Handle for silent re-authentication (pass to next authorize request) */
+  authorization_handle?: string;
 }
 
 /**
@@ -89,4 +91,6 @@ export interface StoredCredentials {
   bunkerUrl: string;
   accessToken?: string;
   expiresAt?: number;
+  /** Handle for silent re-authentication */
+  authorizationHandle?: string;
 }

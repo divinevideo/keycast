@@ -41,6 +41,7 @@
     bunkerUrl: string;
     accessToken: string;
     nostrApi: string;
+    authorizationHandle?: string;
   } | null = $state(null);
   let connected = $derived(credentials !== null);
 
@@ -116,6 +117,7 @@
       const { url, pkce } = await client.oauth.getAuthorizationUrl({
         scopes: ["policy:social"],
         defaultRegister: true,
+        authorizationHandle: credentials?.authorizationHandle,
       });
 
       console.log("OAuth URL:", url); // Debug
@@ -178,6 +180,7 @@
         bunkerUrl: tokens.bunker_url,
         accessToken: tokens.access_token ?? "",
         nostrApi: `${SERVER_URL}/api/nostr`,
+        authorizationHandle: tokens.authorization_handle,
       };
 
       // Create RPC client from tokens
