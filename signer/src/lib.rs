@@ -6,4 +6,4 @@ pub mod signer_daemon;
 
 // Re-export main types for convenience
 pub use error::{SignerError, SignerResult};
-pub use signer_daemon::{AuthorizationHandler, UnifiedSigner};
+pub use signer_daemon::{Nip46Handler, UnifiedSigner};

@@ -5,8 +5,8 @@
 	"description": "Keycast is a secure key management system for teams on Nostr.",
 	"scripts": {
 		"start": "bun run build:web && bun run dev",
-		"dev": "DATABASE_URL=postgres://postgres:password@localhost/keycast RUST_LOG=info,keycast_signer=debug MASTER_KEY_PATH=./master.key ENABLE_EXAMPLES=true ALLOWED_ORIGINS=http://localhost:3000 SERVER_NSEC=e870badb3c21ac7b6d7e9529b5214d39b270f96a7e1c6bb34d9ffab430d272a4 WEB_BUILD_DIR=./web/build cargo run --bin keycast",
-		"dev:watch": "DATABASE_URL=postgres://postgres:password@localhost/keycast RUST_LOG=info,keycast_signer=debug MASTER_KEY_PATH=./master.key ENABLE_EXAMPLES=true ALLOWED_ORIGINS=http://localhost:3000 SERVER_NSEC=e870badb3c21ac7b6d7e9529b5214d39b270f96a7e1c6bb34d9ffab430d272a4 WEB_BUILD_DIR=./web/build cargo watch -x \"run --bin keycast\"",
+		"dev": "DATABASE_URL=postgres://postgres:password@localhost/keycast RUST_LOG=debug,hyper=info,h2=info,rustls=info,sqlx=info,nostr_relay_pool=info MASTER_KEY_PATH=./master.key ENABLE_EXAMPLES=true ALLOWED_ORIGINS=http://localhost:3000 SERVER_NSEC=e870badb3c21ac7b6d7e9529b5214d39b270f96a7e1c6bb34d9ffab430d272a4 WEB_BUILD_DIR=./web/build cargo run --bin keycast",
+		"dev:watch": "DATABASE_URL=postgres://postgres:password@localhost/keycast RUST_LOG=debug,hyper=info,h2=info,rustls=info,sqlx=info,nostr_relay_pool=info MASTER_KEY_PATH=./master.key ENABLE_EXAMPLES=true ALLOWED_ORIGINS=http://localhost:3000 SERVER_NSEC=e870badb3c21ac7b6d7e9529b5214d39b270f96a7e1c6bb34d9ffab430d272a4 WEB_BUILD_DIR=./web/build cargo watch -x \"run --bin keycast\"",
 		"dev:web": "cd web && bun run dev",
 		"dev:all": "concurrently \"bun run dev\" \"bun run dev:web\"",
 		"build": "cargo build --release --bin keycast",

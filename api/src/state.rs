@@ -1,3 +1,4 @@
+use crate::handlers::http_rpc_handler::HttpHandlerCache;
 use keycast_core::encryption::KeyManager;
 use keycast_core::signing_handler::SignerHandlersCache;
 use nostr_sdk::Keys;
@@ -17,9 +18,13 @@ pub enum StateError {
 pub struct KeycastState {
     pub db: PgPool,
     pub key_manager: Arc<Box<dyn KeyManager>>,
-    /// Shared signer handlers cache for unified mode (live, not a snapshot)
+    /// Shared signer handlers cache for unified mode (populated by NIP-46 signer)
     /// Moka cache handles concurrency internally - no Mutex needed
     pub signer_handlers: Option<SignerHandlersCache>,
+    /// HTTP RPC handler cache for on-demand loaded handlers (HTTP RPC path)
+    /// Keyed by [u8; 32] for both bunker_pubkey and authorization_handle
+    /// Caches authorization metadata (expires_at, revoked_at) for spam protection
+    pub http_handler_cache: HttpHandlerCache,
     /// Server keys for signing UCANs for users without personal keys
     pub server_keys: Keys,
 }

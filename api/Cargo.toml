@@ -46,6 +46,7 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 urlencoding = "2.1"
 hex = "0.4"
+moka = { version = "0.12", features = ["future"] }
 reqwest = { version = "0.12", features = ["json"] }
 
 [dev-dependencies]
@@ -56,4 +57,3 @@ aes-gcm = "0.10"
 async-trait = "0.1"
 md5 = "0.7"
 bcrypt = "0.15"
-moka = { version = "0.12", features = ["future"] }

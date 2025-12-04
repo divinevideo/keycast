@@ -6,7 +6,7 @@ use keycast_core::encryption::{file_key_manager::FileKeyManager, KeyManager};
 use keycast_core::signing_handler::SigningHandler;
 use keycast_core::types::authorization::Authorization;
 use keycast_core::types::oauth_authorization::OAuthAuthorization;
-use keycast_signer::AuthorizationHandler;
+use keycast_signer::Nip46Handler;
 use nostr_sdk::prelude::*;
 use serde_json::json;
 use sqlx::PgPool;
@@ -249,7 +249,7 @@ async fn test_1_no_policy_allows_all() {
     let (auth, bunker_keys, user_keys) =
         create_test_authorization(&pool, 1, 1, policy_id, &key_manager).await;
 
-    let handler = AuthorizationHandler::new_for_test(
+    let handler = Nip46Handler::new_for_test(
         bunker_keys,
         user_keys.clone(),
         auth.secret.clone(),
@@ -284,7 +284,7 @@ async fn test_2_allowed_kinds_permits_matching_kind() {
     let (auth, bunker_keys, user_keys) =
         create_test_authorization(&pool, 1, 1, policy_id, &key_manager).await;
 
-    let handler = AuthorizationHandler::new_for_test(
+    let handler = Nip46Handler::new_for_test(
         bunker_keys,
         user_keys.clone(),
         auth.secret.clone(),
@@ -319,7 +319,7 @@ async fn test_3_allowed_kinds_denies_non_matching_kind() {
     let (auth, bunker_keys, user_keys) =
         create_test_authorization(&pool, 1, 1, policy_id, &key_manager).await;
 
-    let handler = AuthorizationHandler::new_for_test(
+    let handler = Nip46Handler::new_for_test(
         bunker_keys,
         user_keys.clone(),
         auth.secret.clone(),
@@ -360,7 +360,7 @@ async fn test_4_content_filter_allows_clean_content() {
     let (auth, bunker_keys, user_keys) =
         create_test_authorization(&pool, 1, 1, policy_id, &key_manager).await;
 
-    let handler = AuthorizationHandler::new_for_test(
+    let handler = Nip46Handler::new_for_test(
         bunker_keys,
         user_keys.clone(),
         auth.secret.clone(),
@@ -393,7 +393,7 @@ async fn test_5_content_filter_denies_blocked_words() {
     let (auth, bunker_keys, user_keys) =
         create_test_authorization(&pool, 1, 1, policy_id, &key_manager).await;
 
-    let handler = AuthorizationHandler::new_for_test(
+    let handler = Nip46Handler::new_for_test(
         bunker_keys,
         user_keys.clone(),
         auth.secret.clone(),
@@ -438,7 +438,7 @@ async fn test_6_multiple_permissions_all_must_pass() {
     let (auth, bunker_keys, user_keys) =
         create_test_authorization(&pool, 1, 1, policy_id, &key_manager).await;
 
-    let handler = AuthorizationHandler::new_for_test(
+    let handler = Nip46Handler::new_for_test(
         bunker_keys,
         user_keys.clone(),
         auth.secret.clone(),
@@ -482,7 +482,7 @@ async fn test_7_oauth_no_policy_allows_all() {
     // OAuth auth with NULL policy_id
     let (oauth_auth, user_keys) = create_oauth_authorization(&pool, 1, None, &key_manager).await;
 
-    let handler = AuthorizationHandler::new_for_test(
+    let handler = Nip46Handler::new_for_test(
         user_keys.clone(),
         user_keys.clone(),
         oauth_auth.secret.clone(),
@@ -519,7 +519,7 @@ async fn test_8_oauth_with_policy_enforces_restrictions() {
     let (oauth_auth, user_keys) =
         create_oauth_authorization(&pool, 1, Some(policy_id), &key_manager).await;
 
-    let handler = AuthorizationHandler::new_for_test(
+    let handler = Nip46Handler::new_for_test(
         user_keys.clone(),
         user_keys.clone(),
         oauth_auth.secret.clone(),

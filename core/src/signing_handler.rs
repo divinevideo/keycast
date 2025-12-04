@@ -11,7 +11,7 @@ use std::sync::Arc;
 pub type SignerHandlersCache = moka::future::Cache<String, Arc<dyn SigningHandler>>;
 
 /// Trait for handlers that can sign Nostr events
-/// Implemented by AuthorizationHandler in the signer crate
+/// Implemented by Nip46Handler in the signer crate
 #[async_trait]
 pub trait SigningHandler: Send + Sync {
     /// Sign an event directly without NIP-46 encryption overhead

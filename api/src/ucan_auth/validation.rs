@@ -1,12 +1,15 @@
-// ABOUTME: UCAN token validation and pubkey extraction
+// ABOUTME: UCAN token validation and pubkey extraction with Schnorr signature verification
 
 use anyhow::{anyhow, Result};
 use axum::http::HeaderMap;
 use once_cell::sync::Lazy;
 use std::env;
+use ucan::crypto::did::{DidParser, SECP256K1_MAGIC_BYTES};
+use ucan::crypto::KeyMaterial;
 use ucan::Ucan;
 
 use super::did::did_to_nostr_pubkey;
+use super::key_material::NostrVerifyKeyMaterial;
 
 /// Server public key for validating server-signed UCANs
 /// Loaded from SERVER_NSEC environment variable
@@ -18,12 +21,25 @@ static SERVER_PUBKEY: Lazy<String> = Lazy::new(|| {
         .expect("SERVER_NSEC must be set and valid")
 });
 
-/// Validate UCAN token from Authorization header
+/// Create a DidParser configured for Nostr secp256k1 keys with Schnorr verification
+fn create_nostr_did_parser() -> DidParser {
+    DidParser::new(&[(
+        SECP256K1_MAGIC_BYTES,
+        nostr_key_constructor as fn(Vec<u8>) -> anyhow::Result<Box<dyn KeyMaterial>>,
+    )])
+}
+
+/// Constructor function for DidParser - creates a verify-only KeyMaterial from public key bytes
+fn nostr_key_constructor(key_bytes: Vec<u8>) -> anyhow::Result<Box<dyn KeyMaterial>> {
+    Ok(Box::new(NostrVerifyKeyMaterial::from_bytes(&key_bytes)?))
+}
+
+/// Validate UCAN token from Authorization header with cryptographic signature verification.
 ///
 /// Returns: (user_pubkey_hex, redirect_origin, bunker_pubkey, ucan)
 /// redirect_origin identifies which app/authorization this token is for
 /// bunker_pubkey uniquely identifies the authorization for direct cache lookup (optional)
-pub fn validate_ucan_token(
+pub async fn validate_ucan_token(
     auth_header: &str,
     expected_tenant_id: i64,
 ) -> Result<(String, String, Option<String>, Ucan)> {
@@ -32,10 +48,18 @@ pub fn validate_ucan_token(
         .strip_prefix("Bearer ")
         .ok_or_else(|| anyhow!("Invalid Authorization header format"))?;
 
-    // Decode and validate UCAN using try_from_token_string
+    // Decode UCAN from token string (does not verify signature)
     let ucan = Ucan::try_from_token_string(token)?;
 
-    // Validate expiry (no parameter needed)
+    // Verify signature cryptographically using Schnorr (BIP-340)
+    let mut did_parser = create_nostr_did_parser();
+    ucan.check_signature(&mut did_parser)
+        .await
+        .map_err(|e| anyhow!("UCAN signature verification failed: {}", e))?;
+
+    tracing::debug!("UCAN Schnorr signature verified for issuer: {}", ucan.issuer());
+
+    // Validate expiry
     if ucan.is_expired() {
         return Err(anyhow!("Token expired"));
     }
@@ -98,7 +122,7 @@ pub fn validate_ucan_token(
 }
 
 /// Extract user pubkey, redirect_origin, and bunker_pubkey from UCAN in Authorization header
-pub fn extract_user_from_ucan(
+pub async fn extract_user_from_ucan(
     headers: &HeaderMap,
     expected_tenant_id: i64,
 ) -> Result<(String, String, Option<String>)> {
@@ -109,7 +133,7 @@ pub fn extract_user_from_ucan(
         .map_err(|_| anyhow!("Invalid Authorization header"))?;
 
     let (pubkey, redirect_origin, bunker_pubkey, _ucan) =
-        validate_ucan_token(auth_header, expected_tenant_id)?;
+        validate_ucan_token(auth_header, expected_tenant_id).await?;
 
     Ok((pubkey, redirect_origin, bunker_pubkey))
 }
@@ -117,6 +141,7 @@ pub fn extract_user_from_ucan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use crate::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
     use nostr_sdk::Keys;
     use ucan::builder::UcanBuilder;
@@ -151,10 +176,10 @@ mod tests {
 
         let token = ucan.encode().unwrap();
 
-        // Validate the token
+        // Validate the token (now with signature verification!)
         let auth_header = format!("Bearer {}", token);
         let (extracted_pubkey, redirect_origin, bunker_pubkey, _) =
-            validate_ucan_token(&auth_header, 1).unwrap();
+            validate_ucan_token(&auth_header, 1).await.unwrap();
 
         assert_eq!(extracted_pubkey, pubkey.to_hex());
         assert_eq!(redirect_origin, "https://test.example.com");
@@ -184,7 +209,7 @@ mod tests {
 
         let token = ucan.encode().unwrap();
         let auth_header = format!("Bearer {}", token);
-        let result = validate_ucan_token(&auth_header, 0);
+        let result = validate_ucan_token(&auth_header, 0).await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("expired"));
@@ -219,10 +244,10 @@ mod tests {
         let auth_header = format!("Bearer {}", token);
 
         // Should succeed with correct tenant_id
-        assert!(validate_ucan_token(&auth_header, 1).is_ok());
+        assert!(validate_ucan_token(&auth_header, 1).await.is_ok());
 
         // Should fail with different tenant_id
-        let result = validate_ucan_token(&auth_header, 2);
+        let result = validate_ucan_token(&auth_header, 2).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("mismatch"));
     }
@@ -252,7 +277,7 @@ mod tests {
         let token = ucan.encode().unwrap();
 
         // Missing "Bearer " prefix
-        let result = validate_ucan_token(&token, 0);
+        let result = validate_ucan_token(&token, 0).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -262,14 +287,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_ucan_invalid_token_format() {
-        let result = validate_ucan_token("Bearer invalid-token-string", 0);
+        let result = validate_ucan_token("Bearer invalid-token-string", 0).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_extract_user_from_ucan_missing_header() {
+    #[tokio::test]
+    async fn test_extract_user_from_ucan_missing_header() {
         let headers = axum::http::HeaderMap::new();
-        let result = extract_user_from_ucan(&headers, 0);
+        let result = extract_user_from_ucan(&headers, 0).await;
 
         assert!(result.is_err());
         assert!(result
@@ -299,5 +324,76 @@ mod tests {
         // Verify issuer == audience (self-issued pattern)
         assert_eq!(ucan.issuer(), ucan.audience());
         assert_eq!(ucan.issuer(), &user_did);
+    }
+
+    #[tokio::test]
+    async fn test_ucan_tampered_signature_rejected() {
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let user_did = nostr_pubkey_to_did(&pubkey);
+        let key_material = NostrKeyMaterial::from_keys(keys);
+
+        let facts = serde_json::json!({
+            "redirect_origin": "https://test.example.com"
+        });
+
+        let ucan = UcanBuilder::default()
+            .issued_by(&key_material)
+            .for_audience(&user_did)
+            .with_lifetime(3600)
+            .with_fact(facts)
+            .build()
+            .unwrap()
+            .sign()
+            .await
+            .unwrap();
+
+        let token = ucan.encode().unwrap();
+
+        // Tamper with the signature (flip a bit in the signature part)
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT should have 3 parts");
+
+        let mut sig_bytes = URL_SAFE_NO_PAD.decode(parts[2]).expect("valid base64");
+        sig_bytes[0] ^= 0x01; // Flip one bit
+        let tampered_sig = URL_SAFE_NO_PAD.encode(&sig_bytes);
+        let tampered_token = format!("{}.{}.{}", parts[0], parts[1], tampered_sig);
+
+        let auth_header = format!("Bearer {}", tampered_token);
+        let result = validate_ucan_token(&auth_header, 0).await;
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("signature verification failed"),
+            "Should reject tampered signature"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_schnorr_signature_is_64_bytes() {
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let user_did = nostr_pubkey_to_did(&pubkey);
+        let key_material = NostrKeyMaterial::from_keys(keys);
+
+        let ucan = UcanBuilder::default()
+            .issued_by(&key_material)
+            .for_audience(&user_did)
+            .with_lifetime(3600)
+            .build()
+            .unwrap()
+            .sign()
+            .await
+            .unwrap();
+
+        let token = ucan.encode().unwrap();
+        let parts: Vec<&str> = token.split('.').collect();
+        let sig_bytes = URL_SAFE_NO_PAD.decode(parts[2]).expect("valid base64");
+
+        // Schnorr signatures are always 64 bytes
+        assert_eq!(sig_bytes.len(), 64, "Schnorr signature should be 64 bytes");
     }
 }

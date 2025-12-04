@@ -6,7 +6,7 @@
 use keycast_core::encryption::{file_key_manager::FileKeyManager, KeyManager};
 use keycast_core::signing_handler::SigningHandler;
 use keycast_core::types::oauth_authorization::OAuthAuthorization;
-use keycast_signer::AuthorizationHandler;
+use keycast_signer::Nip46Handler;
 use nostr_sdk::prelude::*;
 use serde_json::json;
 use sqlx::PgPool;
@@ -106,7 +106,7 @@ async fn test_connect_stores_client_pubkey() {
         create_oauth_authorization_for_client_test(&pool, tenant_id, &key_manager).await;
 
     // Create handler
-    let handler = AuthorizationHandler::new_for_test(
+    let handler = Nip46Handler::new_for_test(
         user_keys.clone(),
         user_keys.clone(),
         secret.clone(),
@@ -158,7 +158,7 @@ async fn test_connect_rejects_reused_secret() {
     let (oauth_auth, user_keys, secret) =
         create_oauth_authorization_for_client_test(&pool, tenant_id, &key_manager).await;
 
-    let handler = AuthorizationHandler::new_for_test(
+    let handler = Nip46Handler::new_for_test(
         user_keys.clone(),
         user_keys.clone(),
         secret.clone(),
@@ -206,7 +206,7 @@ async fn test_same_client_can_reconnect() {
     let (oauth_auth, user_keys, secret) =
         create_oauth_authorization_for_client_test(&pool, tenant_id, &key_manager).await;
 
-    let handler = AuthorizationHandler::new_for_test(
+    let handler = Nip46Handler::new_for_test(
         user_keys.clone(),
         user_keys.clone(),
         secret.clone(),
@@ -240,7 +240,7 @@ async fn test_request_from_connected_client_succeeds() {
     let (oauth_auth, user_keys, secret) =
         create_oauth_authorization_for_client_test(&pool, tenant_id, &key_manager).await;
 
-    let handler = AuthorizationHandler::new_for_test(
+    let handler = Nip46Handler::new_for_test(
         user_keys.clone(),
         user_keys.clone(),
         secret.clone(),
@@ -285,7 +285,7 @@ async fn test_request_from_unknown_client_rejected() {
     let (oauth_auth, user_keys, secret) =
         create_oauth_authorization_for_client_test(&pool, tenant_id, &key_manager).await;
 
-    let handler = AuthorizationHandler::new_for_test(
+    let handler = Nip46Handler::new_for_test(
         user_keys.clone(),
         user_keys.clone(),
         secret.clone(),
@@ -332,7 +332,7 @@ async fn test_first_request_without_connect_allowed() {
     let (oauth_auth, user_keys, secret) =
         create_oauth_authorization_for_client_test(&pool, tenant_id, &key_manager).await;
 
-    let handler = AuthorizationHandler::new_for_test(
+    let handler = Nip46Handler::new_for_test(
         user_keys.clone(),
         user_keys.clone(),
         secret.clone(),
@@ -393,7 +393,7 @@ async fn test_revocation_clears_client_pubkey() {
     let (oauth_auth, user_keys, secret) =
         create_oauth_authorization_for_client_test(&pool, tenant_id, &key_manager).await;
 
-    let handler = AuthorizationHandler::new_for_test(
+    let handler = Nip46Handler::new_for_test(
         user_keys.clone(),
         user_keys.clone(),
         secret.clone(),
@@ -452,7 +452,7 @@ async fn test_connected_at_timestamp_set() {
     let (oauth_auth, user_keys, secret) =
         create_oauth_authorization_for_client_test(&pool, tenant_id, &key_manager).await;
 
-    let handler = AuthorizationHandler::new_for_test(
+    let handler = Nip46Handler::new_for_test(
         user_keys.clone(),
         user_keys.clone(),
         secret.clone(),

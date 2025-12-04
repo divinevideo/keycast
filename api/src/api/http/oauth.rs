@@ -433,12 +433,17 @@ pub async fn auth_status(
     let tenant_id = tenant.0.id;
     let pool = &auth_state.state.db;
 
-    if let Some(user_pubkey) = super::auth::extract_ucan_from_cookie(&headers).and_then(|token| {
-        // Parse UCAN from string using ucan_auth helper
+    // Extract and validate UCAN from cookie (async)
+    let user_pubkey = if let Some(token) = super::auth::extract_ucan_from_cookie(&headers) {
         crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), tenant_id)
+            .await
             .ok()
             .map(|(pubkey, _, _, _)| pubkey)
-    }) {
+    } else {
+        None
+    };
+
+    if let Some(user_pubkey) = user_pubkey {
         // Query user from database - user must exist for session to be valid
         let user_info: Option<(Option<String>, Option<bool>)> = sqlx::query_as(
             "SELECT email, email_verified FROM users WHERE tenant_id = $1 AND pubkey = $2",
@@ -490,10 +495,10 @@ pub async fn authorize_get(
     let tenant_id = tenant.0.id;
     let pool = &auth_state.state.db;
 
-    // Check if user is authenticated via cookie and extract user data
-    let user_data = super::auth::extract_ucan_from_cookie(&headers).and_then(|token| {
-        // Parse UCAN from string using ucan_auth helper (tenant validation done later)
+    // Check if user is authenticated via cookie and extract user data (async)
+    let user_data = if let Some(token) = super::auth::extract_ucan_from_cookie(&headers) {
         crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), tenant_id)
+            .await
             .ok()
             .map(|(pubkey, _redirect_origin, _bunker_pubkey, ucan)| {
                 // Extract relays from UCAN facts
@@ -512,7 +517,9 @@ pub async fn authorize_get(
 
                 (pubkey, relays)
             })
-    });
+    } else {
+        None
+    };
 
     let user_pubkey = user_data.as_ref().map(|(pk, _)| pk.clone());
     let user_relays = user_data
@@ -1712,15 +1719,16 @@ pub async fn authorize_post(
 
     let tenant_id = tenant.0.id;
 
-    // Extract user public key from UCAN cookie
-    let user_pubkey = super::auth::extract_ucan_from_cookie(&headers)
-        .and_then(|token| {
-            // Parse UCAN from string using ucan_auth helper
-            crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), tenant_id)
-                .ok()
-                .map(|(pubkey, _, _, _)| pubkey)
-        })
-        .ok_or(OAuthError::Unauthorized)?;
+    // Extract user public key from UCAN cookie (async)
+    let user_pubkey = if let Some(token) = super::auth::extract_ucan_from_cookie(&headers) {
+        crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), tenant_id)
+            .await
+            .ok()
+            .map(|(pubkey, _, _, _)| pubkey)
+    } else {
+        None
+    }
+    .ok_or(OAuthError::Unauthorized)?;
 
     // Generate authorization code
     let code: String = rand::thread_rng()
@@ -3193,8 +3201,9 @@ pub async fn connect_post(
     }
 
     // Extract user public key from JWT token in Authorization header
-    let user_pubkey =
-        super::auth::extract_user_from_token(&headers).map_err(|_| OAuthError::Unauthorized)?;
+    let user_pubkey = super::auth::extract_user_from_token(&headers)
+        .await
+        .map_err(|_| OAuthError::Unauthorized)?;
 
     // Get user's encrypted key
     let encrypted_user_key: Vec<u8> = sqlx::query_scalar(

@@ -1,5 +1,5 @@
 // ABOUTME: Unified binary that runs both API server and Signer daemon in one process
-// ABOUTME: Shares AuthorizationHandler state between HTTP endpoints and NIP-46 signer for optimal performance
+// ABOUTME: API uses HttpRpcHandler cache, NIP-46 signer uses Nip46Handler cache
 
 use axum::{
     http::StatusCode,
@@ -9,6 +9,7 @@ use axum::{
 };
 use dotenv::dotenv;
 use keycast_core::authorization_channel;
+use keycast_api::handlers::http_rpc_handler::new_http_handler_cache;
 use keycast_core::database::Database;
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::gcp_key_manager::GcpKeyManager;
@@ -238,14 +239,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     signer.connect_to_relays().await?;
     tracing::info!("✔︎ Signer daemon initialized and connected to relays");
 
-    // Get shared handlers for API (live moka cache, not a snapshot)
-    let signer_handlers = signer.handlers();
-
-    // Create API state with shared signer handlers and server keys
+    // Create API state with http_handler_cache for on-demand loading
+    // Note: api no longer depends on signer's handler cache (decoupled)
     let api_state = Arc::new(keycast_api::state::KeycastState {
         db: database.pool.clone(),
         key_manager: Arc::new(api_key_manager),
-        signer_handlers: Some(signer_handlers),
+        signer_handlers: None, // Deprecated: api uses http_handler_cache with on-demand loading
+        http_handler_cache: new_http_handler_cache(),
         server_keys,
     });
 
@@ -466,7 +466,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   API: http://0.0.0.0:{}", api_port);
     println!("   Signer: NIP-46 relay listener active");
     println!("   Instance: {} (hashring enabled)", instance_id);
-    println!("   Shared state: AuthorizationHandlers cached\n");
+    println!("   HTTP handler cache: on-demand loading enabled\n");
 
     // Wait for shutdown signal
     wait_for_shutdown_signal().await;

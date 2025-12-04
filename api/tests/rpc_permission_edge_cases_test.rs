@@ -215,7 +215,7 @@ async fn test_ucan_without_redirect_origin_rejected() {
     let auth_header = format!("Bearer {}", token);
 
     // Validation should fail
-    let result = validate_ucan_token(&auth_header, 1);
+    let result = validate_ucan_token(&auth_header, 1).await;
 
     assert!(
         result.is_err(),

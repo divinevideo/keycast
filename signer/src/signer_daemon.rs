@@ -7,7 +7,7 @@ use keycast_core::authorization_channel::{AuthorizationCommand, AuthorizationRec
 use keycast_core::encryption::KeyManager;
 use keycast_core::hashring::SignerHashRing;
 use keycast_core::metrics::METRICS;
-use keycast_core::signing_handler::{SignerHandlersCache, SigningHandler};
+use keycast_core::signing_handler::SigningHandler;
 use keycast_core::types::authorization::Authorization;
 use keycast_core::types::oauth_authorization::OAuthAuthorization;
 use moka::future::Cache;
@@ -20,10 +20,20 @@ use tokio::sync::Mutex;
 /// Default timeout for relay connection operations
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// NIP-46 handler for a single authorization
+///
+/// Manages both wire encryption (bunker_keys) and user event signing (user_keys).
+/// Handles NIP-46 protocol operations including connect, sign_event, encrypt/decrypt.
+///
+/// Note: Unlike HttpRpcHandler which caches everything, this handler maintains
+/// DB access for real-time client tracking and permission validation.
 #[derive(Clone)]
-pub struct AuthorizationHandler {
+pub struct Nip46Handler {
+    /// Keys for NIP-46 wire encryption (bunker identity)
     bunker_keys: Keys,
+    /// Keys for signing user events
     pub user_keys: Keys,
+    /// Connection secret for NIP-46 connect validation
     secret: String,
     authorization_id: i32,
     tenant_id: i64,
@@ -31,7 +41,7 @@ pub struct AuthorizationHandler {
     pool: PgPool,
 }
 
-impl AuthorizationHandler {
+impl Nip46Handler {
     /// Constructor for testing only - do not use in production code
     #[doc(hidden)]
     pub fn new_for_test(
@@ -313,8 +323,7 @@ impl AuthorizationHandler {
 const DEFAULT_HANDLER_CACHE_SIZE: usize = 1_000_000;
 
 pub struct UnifiedSigner {
-    handlers: Cache<String, AuthorizationHandler>, // bunker_pubkey -> handler (concurrent LRU cache, internal use)
-    shared_handlers: SignerHandlersCache,          // Same data as trait objects (shared with API)
+    handlers: Cache<String, Nip46Handler>, // bunker_pubkey -> handler (concurrent LRU cache)
     client: Client,
     pool: PgPool,
     key_manager: Arc<Box<dyn KeyManager>>,
@@ -340,15 +349,10 @@ impl UnifiedSigner {
 
         let handlers = Cache::builder().max_capacity(cache_size as u64).build();
 
-        // Shared cache for API access (same data as trait objects)
-        let shared_handlers: SignerHandlersCache =
-            Cache::builder().max_capacity(cache_size as u64).build();
-
         tracing::info!("Initialized authorization cache (capacity: {})", cache_size);
 
         Ok(Self {
             handlers,
-            shared_handlers,
             client,
             pool,
             key_manager: Arc::new(key_manager),
@@ -454,7 +458,6 @@ impl UnifiedSigner {
         let pool_clone = self.pool.clone();
         let key_manager_clone = self.key_manager.clone();
         let handlers_clone = self.handlers.clone();
-        let shared_handlers_clone = self.shared_handlers.clone();
 
         // Take ownership of the receiver (we only spawn this once)
         if let Some(mut auth_rx) = self.auth_rx.take() {
@@ -475,7 +478,6 @@ impl UnifiedSigner {
                                 &pool_clone,
                                 &key_manager_clone,
                                 &handlers_clone,
-                                &shared_handlers_clone,
                                 &bunker_pubkey,
                                 tenant_id,
                                 is_oauth,
@@ -492,7 +494,6 @@ impl UnifiedSigner {
                         AuthorizationCommand::Remove { bunker_pubkey } => {
                             tracing::debug!("Removing authorization from cache: {}", bunker_pubkey);
                             handlers_clone.invalidate(&bunker_pubkey).await;
-                            shared_handlers_clone.invalidate(&bunker_pubkey).await;
                         }
                         AuthorizationCommand::ReloadAll => {
                             // No-op with lazy loading - cache is populated on-demand
@@ -511,13 +512,11 @@ impl UnifiedSigner {
         let pool = self.pool.clone();
         let key_manager = self.key_manager.clone();
         let hashring = self.hashring.clone();
-        let shared_handlers = self.shared_handlers.clone();
         self.client
             .handle_notifications(|notification| async {
                 if let RelayPoolNotification::Event { event, .. } = notification {
                     if event.kind == Kind::NostrConnect {
                         let handlers_lock = handlers.clone();
-                        let shared_handlers_clone = shared_handlers.clone();
                         let client_clone = client.clone();
                         let pool_clone = pool.clone();
                         let key_manager_clone = key_manager.clone();
@@ -525,7 +524,6 @@ impl UnifiedSigner {
                         tokio::spawn(async move {
                             if let Err(e) = Self::handle_nip46_request(
                                 handlers_lock,
-                                shared_handlers_clone,
                                 client_clone,
                                 event,
                                 &pool_clone,
@@ -555,12 +553,11 @@ impl UnifiedSigner {
         Ok(())
     }
 
-    /// Load a single authorization into both caches (called via channel for new authorizations)
+    /// Load a single authorization into cache (called via channel for new authorizations)
     async fn load_single_authorization(
         pool: &PgPool,
         key_manager: &Arc<Box<dyn KeyManager>>,
-        handlers: &Cache<String, AuthorizationHandler>,
-        shared_handlers: &SignerHandlersCache,
+        handlers: &Cache<String, Nip46Handler>,
         bunker_pubkey: &str,
         tenant_id: i64,
         is_oauth: bool,
@@ -615,7 +612,7 @@ impl UnifiedSigner {
                     ));
                 }
 
-                let handler = AuthorizationHandler {
+                let handler = Nip46Handler {
                     bunker_keys,
                     user_keys,
                     secret: auth.secret.clone(),
@@ -625,16 +622,7 @@ impl UnifiedSigner {
                     pool: pool.clone(),
                 };
 
-                // Insert into both caches (internal + shared for API)
-                handlers
-                    .insert(bunker_pubkey.to_string(), handler.clone())
-                    .await;
-                shared_handlers
-                    .insert(
-                        bunker_pubkey.to_string(),
-                        Arc::new(handler) as Arc<dyn SigningHandler>,
-                    )
-                    .await;
+                handlers.insert(bunker_pubkey.to_string(), handler).await;
                 tracing::debug!("Cached authorization: {}", bunker_pubkey);
             }
         } else {
@@ -677,7 +665,7 @@ impl UnifiedSigner {
                     })?;
                 let user_keys = Keys::new(user_secret_key);
 
-                let handler = AuthorizationHandler {
+                let handler = Nip46Handler {
                     bunker_keys,
                     user_keys,
                     secret: connection_secret,
@@ -687,16 +675,7 @@ impl UnifiedSigner {
                     pool: pool.clone(),
                 };
 
-                // Insert into both caches (internal + shared for API)
-                handlers
-                    .insert(bunker_pubkey.to_string(), handler.clone())
-                    .await;
-                shared_handlers
-                    .insert(
-                        bunker_pubkey.to_string(),
-                        Arc::new(handler) as Arc<dyn SigningHandler>,
-                    )
-                    .await;
+                handlers.insert(bunker_pubkey.to_string(), handler).await;
                 tracing::debug!("Cached authorization: {}", bunker_pubkey);
             }
         }
@@ -705,8 +684,7 @@ impl UnifiedSigner {
     }
 
     async fn handle_nip46_request(
-        handlers: Cache<String, AuthorizationHandler>,
-        shared_handlers: SignerHandlersCache,
+        handlers: Cache<String, Nip46Handler>,
         client: Client,
         event: Box<Event>,
         pool: &PgPool,
@@ -808,7 +786,7 @@ impl UnifiedSigner {
                             )));
                         }
 
-                        let handler = AuthorizationHandler {
+                        let handler = Nip46Handler {
                             bunker_keys,
                             user_keys,
                             secret: auth.secret.clone(),
@@ -819,15 +797,8 @@ impl UnifiedSigner {
                         };
 
                         // Cache it for future requests (LRU will evict old entries automatically)
-                        // Insert into both caches (internal + shared for API)
                         handlers
                             .insert(bunker_pubkey.to_string(), handler.clone())
-                            .await;
-                        shared_handlers
-                            .insert(
-                                bunker_pubkey.to_string(),
-                                Arc::new(handler.clone()) as Arc<dyn SigningHandler>,
-                            )
                             .await;
 
                         handler
@@ -899,7 +870,7 @@ impl UnifiedSigner {
                                     })?;
                                 let user_keys = Keys::new(user_secret_key);
 
-                                let handler = AuthorizationHandler {
+                                let handler = Nip46Handler {
                                     bunker_keys,
                                     user_keys,
                                     secret: connection_secret,
@@ -912,12 +883,6 @@ impl UnifiedSigner {
                                 // Cache it for future requests
                                 handlers
                                     .insert(bunker_pubkey.to_string(), handler.clone())
-                                    .await;
-                                shared_handlers
-                                    .insert(
-                                        bunker_pubkey.to_string(),
-                                        Arc::new(handler.clone()) as Arc<dyn SigningHandler>,
-                                    )
                                     .await;
 
                                 handler
@@ -1212,7 +1177,7 @@ impl UnifiedSigner {
 }
 
 #[async_trait]
-impl SigningHandler for AuthorizationHandler {
+impl SigningHandler for Nip46Handler {
     async fn sign_event_direct(
         &self,
         unsigned_event: UnsignedEvent,
@@ -1263,7 +1228,7 @@ impl SigningHandler for AuthorizationHandler {
     }
 }
 
-impl AuthorizationHandler {
+impl Nip46Handler {
     async fn handle_sign_event(
         &self,
         request: &serde_json::Value,
@@ -1443,7 +1408,7 @@ impl UnifiedSigner {
     pub async fn get_handler_for_user(
         &self,
         user_pubkey: &str,
-    ) -> SignerResult<Option<AuthorizationHandler>> {
+    ) -> SignerResult<Option<Nip46Handler>> {
         // Find any active OAuth authorization for this user
         let bunker_pubkey: Option<String> = sqlx::query_scalar(
             "SELECT bunker_public_key FROM oauth_authorizations
@@ -1462,12 +1427,6 @@ impl UnifiedSigner {
         } else {
             Ok(None)
         }
-    }
-
-    /// Get the shared handlers cache for API access
-    /// Returns a clone of the cache Arc (not the data) - changes are immediately visible
-    pub fn handlers(&self) -> SignerHandlersCache {
-        self.shared_handlers.clone()
     }
 }
 
@@ -1490,7 +1449,7 @@ mod tests {
     }
 
     /// Helper to create test authorization handler with database records
-    async fn create_test_handler_with_db(pool: PgPool) -> AuthorizationHandler {
+    async fn create_test_handler_with_db(pool: PgPool) -> Nip46Handler {
         let user_keys = create_test_keys();
         let bunker_keys = create_test_keys();
         let user_pubkey = user_keys.public_key().to_hex();
@@ -1543,7 +1502,7 @@ mod tests {
         .await
         .unwrap();
 
-        AuthorizationHandler {
+        Nip46Handler {
             bunker_keys,
             user_keys,
             secret: "test_secret".to_string(),
@@ -1656,7 +1615,7 @@ mod tests {
         let handlers2 = signer.handlers.clone();
 
         // Insert into one clone
-        let test_handler = AuthorizationHandler {
+        let test_handler = Nip46Handler {
             bunker_keys: Keys::generate(),
             user_keys: Keys::generate(),
             secret: "test".to_string(),

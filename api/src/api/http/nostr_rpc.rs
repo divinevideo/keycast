@@ -7,10 +7,14 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use nostr_sdk::nips::{nip04, nip44};
+use crate::handlers::http_rpc_handler::{insert_handler_dual_key, HandlerError, HttpRpcHandler};
+use keycast_core::signing_session::{parse_cache_key, SigningSession};
+use keycast_core::traits::CustomPermission;
+use keycast_core::types::permission::Permission;
 use nostr_sdk::{Keys, PublicKey, UnsignedEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::sync::Arc;
 
 use super::auth::{extract_user_and_origin_from_token, AuthError};
 use super::routes::AuthState;
@@ -84,6 +88,19 @@ impl From<AuthError> for RpcError {
     }
 }
 
+impl From<HandlerError> for RpcError {
+    fn from(e: HandlerError) -> Self {
+        match e {
+            HandlerError::AuthorizationInvalid => RpcError::Auth(AuthError::InvalidToken),
+            HandlerError::PermissionDenied => {
+                RpcError::Auth(AuthError::Forbidden("Operation denied by policy".into()))
+            }
+            HandlerError::Signing(msg) => RpcError::SigningFailed(msg),
+            HandlerError::Encryption(msg) => RpcError::EncryptionFailed(msg),
+        }
+    }
+}
+
 /// POST /api/nostr - JSON-RPC style endpoint for NIP-46 operations
 ///
 /// Supports all NIP-46 methods:
@@ -93,6 +110,8 @@ impl From<AuthError> for RpcError {
 /// - nip04_decrypt: Decrypts ciphertext using NIP-04
 /// - nip44_encrypt: Encrypts plaintext using NIP-44
 /// - nip44_decrypt: Decrypts ciphertext using NIP-44
+///
+/// All operations use cached handler with in-memory permission validation (no DB hits).
 pub async fn nostr_rpc(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
@@ -100,7 +119,7 @@ pub async fn nostr_rpc(
     Json(req): Json<NostrRpcRequest>,
 ) -> Result<Json<NostrRpcResponse>, RpcError> {
     let (user_pubkey, redirect_origin, bunker_pubkey) =
-        extract_user_and_origin_from_token(&headers)?;
+        extract_user_and_origin_from_token(&headers).await?;
     let pool = &auth_state.state.db;
     let tenant_id = tenant.0.id;
 
@@ -111,8 +130,8 @@ pub async fn nostr_rpc(
         &redirect_origin
     );
 
-    // Get user keys - try direct cache lookup via bunker_pubkey first
-    let keys = get_user_keys(
+    // Get cached handler (loads from DB on cache miss, then all ops use cached data)
+    let handler = get_handler(
         &auth_state,
         pool,
         tenant_id,
@@ -122,29 +141,15 @@ pub async fn nostr_rpc(
     )
     .await?;
 
-    // Dispatch based on method
+    // Dispatch based on method - all permission checks use cached data (no DB hits)
     let result = match req.method.as_str() {
-        "get_public_key" => JsonValue::String(keys.public_key().to_hex()),
+        "get_public_key" => JsonValue::String(handler.user_pubkey_hex()),
 
         "sign_event" => {
             let unsigned_event = parse_unsigned_event(&req.params)?;
 
-            // Validate permissions before signing
-            super::auth::validate_signing_permissions(
-                pool,
-                tenant_id,
-                &user_pubkey,
-                &redirect_origin,
-                &unsigned_event,
-            )
-            .await
-            .map_err(RpcError::Auth)?;
-
-            // Sign the event
-            let signed = unsigned_event
-                .sign(&keys)
-                .await
-                .map_err(|e| RpcError::SigningFailed(format!("Signing failed: {}", e)))?;
+            // Handler validates expiration, revocation, and permissions (all cached)
+            let signed = handler.sign_event(unsigned_event).await?;
 
             tracing::info!(
                 "RPC: Signed event {} kind={}",
@@ -159,25 +164,8 @@ pub async fn nostr_rpc(
         "nip44_encrypt" => {
             let (recipient_pubkey, plaintext) = parse_encrypt_params(&req.params)?;
 
-            // Validate permissions before encrypting
-            super::auth::validate_encrypt_permissions(
-                pool,
-                tenant_id,
-                &user_pubkey,
-                &redirect_origin,
-                &plaintext,
-                &recipient_pubkey,
-            )
-            .await
-            .map_err(RpcError::Auth)?;
-
-            let ciphertext = nip44::encrypt(
-                keys.secret_key(),
-                &recipient_pubkey,
-                &plaintext,
-                nip44::Version::V2,
-            )
-            .map_err(|e| RpcError::EncryptionFailed(format!("NIP-44 encryption failed: {}", e)))?;
+            // Handler validates expiration, revocation, and permissions (all cached)
+            let ciphertext = handler.nip44_encrypt(&recipient_pubkey, &plaintext)?;
 
             JsonValue::String(ciphertext)
         }
@@ -185,22 +173,8 @@ pub async fn nostr_rpc(
         "nip44_decrypt" => {
             let (sender_pubkey, ciphertext) = parse_decrypt_params(&req.params)?;
 
-            // Validate permissions before decrypting
-            super::auth::validate_decrypt_permissions(
-                pool,
-                tenant_id,
-                &user_pubkey,
-                &redirect_origin,
-                &ciphertext,
-                &sender_pubkey,
-            )
-            .await
-            .map_err(RpcError::Auth)?;
-
-            let plaintext = nip44::decrypt(keys.secret_key(), &sender_pubkey, &ciphertext)
-                .map_err(|e| {
-                    RpcError::DecryptionFailed(format!("NIP-44 decryption failed: {}", e))
-                })?;
+            // Handler validates expiration, revocation, and permissions (all cached)
+            let plaintext = handler.nip44_decrypt(&sender_pubkey, &ciphertext)?;
 
             JsonValue::String(plaintext)
         }
@@ -208,22 +182,8 @@ pub async fn nostr_rpc(
         "nip04_encrypt" => {
             let (recipient_pubkey, plaintext) = parse_encrypt_params(&req.params)?;
 
-            // Validate permissions before encrypting
-            super::auth::validate_encrypt_permissions(
-                pool,
-                tenant_id,
-                &user_pubkey,
-                &redirect_origin,
-                &plaintext,
-                &recipient_pubkey,
-            )
-            .await
-            .map_err(RpcError::Auth)?;
-
-            let ciphertext = nip04::encrypt(keys.secret_key(), &recipient_pubkey, &plaintext)
-                .map_err(|e| {
-                    RpcError::EncryptionFailed(format!("NIP-04 encryption failed: {}", e))
-                })?;
+            // Handler validates expiration, revocation, and permissions (all cached)
+            let ciphertext = handler.nip04_encrypt(&recipient_pubkey, &plaintext)?;
 
             JsonValue::String(ciphertext)
         }
@@ -231,22 +191,8 @@ pub async fn nostr_rpc(
         "nip04_decrypt" => {
             let (sender_pubkey, ciphertext) = parse_decrypt_params(&req.params)?;
 
-            // Validate permissions before decrypting
-            super::auth::validate_decrypt_permissions(
-                pool,
-                tenant_id,
-                &user_pubkey,
-                &redirect_origin,
-                &ciphertext,
-                &sender_pubkey,
-            )
-            .await
-            .map_err(RpcError::Auth)?;
-
-            let plaintext = nip04::decrypt(keys.secret_key(), &sender_pubkey, &ciphertext)
-                .map_err(|e| {
-                    RpcError::DecryptionFailed(format!("NIP-04 decryption failed: {}", e))
-                })?;
+            // Handler validates expiration, revocation, and permissions (all cached)
+            let plaintext = handler.nip04_decrypt(&sender_pubkey, &ciphertext)?;
 
             JsonValue::String(plaintext)
         }
@@ -259,97 +205,69 @@ pub async fn nostr_rpc(
     Ok(Json(NostrRpcResponse::success(result)))
 }
 
-/// Get user's signing keys (tries fast path with cached handlers, falls back to DB+KMS)
-async fn get_user_keys(
+/// Load an HttpRpcHandler on-demand from DB and cache it
+/// Called when http_handler_cache misses for the given bunker_pubkey
+/// Loads authorization metadata, user keys, AND permissions - all cached in handler
+async fn load_handler_on_demand(
     auth_state: &AuthState,
     pool: &sqlx::PgPool,
-    tenant_id: i64,
-    user_pubkey: &str,
-    redirect_origin: &str,
-    bunker_pubkey_from_ucan: Option<&str>,
-) -> Result<Keys, RpcError> {
-    // FAST PATH: Try to use cached signer handler if in unified mode
-    if let Some(ref handlers) = auth_state.state.signer_handlers {
-        // If bunker_pubkey was provided in UCAN, use it directly (no DB query needed!)
-        if let Some(bunker_key) = bunker_pubkey_from_ucan {
-            if let Some(handler) = handlers.get(bunker_key).await {
-                tracing::debug!(
-                    "RPC: Using cached keys via UCAN bunker_pubkey for user {}",
-                    &user_pubkey[..8]
-                );
-                return Ok(handler.get_keys());
-            }
-        }
-
-        // Fallback: Query DB for bunker public key (for older UCANs without bunker_pubkey)
-        let bunker_pubkey: Option<String> = sqlx::query_scalar(
-            "SELECT oa.bunker_public_key
-             FROM oauth_authorizations oa
-             JOIN users u ON oa.user_pubkey = u.pubkey
-             WHERE oa.user_pubkey = $1 AND u.tenant_id = $2 AND oa.redirect_origin = $3 AND oa.revoked_at IS NULL
-             ORDER BY oa.created_at DESC
-             LIMIT 1"
-        )
-        .bind(user_pubkey)
-        .bind(tenant_id)
-        .bind(redirect_origin)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?;
-
-        if let Some(bunker_key) = bunker_pubkey {
-            if let Some(handler) = handlers.get(&bunker_key).await {
-                tracing::debug!(
-                    "RPC: Using cached keys (DB lookup) for user {}",
-                    &user_pubkey[..8]
-                );
-                return Ok(handler.get_keys());
-            }
-        }
-    }
-
-    // SLOW PATH: Fallback to DB + KMS decryption
-    tracing::warn!(
-        "RPC: Using slow path (DB+KMS) for user {}",
-        &user_pubkey[..8]
-    );
-
+    bunker_pubkey_hex: &str,
+) -> Result<Arc<HttpRpcHandler>, RpcError> {
     let key_manager = auth_state.state.key_manager.as_ref();
 
-    // First verify an oauth_authorization exists for this user+origin combination
-    // (protects against using revoked/deleted authorizations)
-    let auth_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(
-            SELECT 1 FROM oauth_authorizations oa
-            JOIN users u ON oa.user_pubkey = u.pubkey
-            WHERE oa.user_pubkey = $1 AND u.tenant_id = $2 AND oa.redirect_origin = $3
-         )",
+    // Query oauth_authorization for this bunker_pubkey
+    // Includes: expires_at, revoked_at (for validity), policy_id (for permissions)
+    let auth_data: Option<(
+        i32,
+        String,
+        Option<String>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<i32>,
+    )> = sqlx::query_as(
+        "SELECT id, user_pubkey, authorization_handle, expires_at, revoked_at, policy_id
+         FROM oauth_authorizations
+         WHERE bunker_public_key = $1",
     )
-    .bind(user_pubkey)
-    .bind(tenant_id)
-    .bind(redirect_origin)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?;
-
-    if !auth_exists {
-        return Err(RpcError::Auth(AuthError::InvalidToken));
-    }
-
-    // Get user's encrypted secret key
-    let result: Option<(Vec<u8>,)> = sqlx::query_as(
-        "SELECT pk.encrypted_secret_key
-         FROM personal_keys pk
-         JOIN users u ON pk.user_pubkey = u.pubkey
-         WHERE pk.user_pubkey = $1 AND u.tenant_id = $2",
-    )
-    .bind(user_pubkey)
-    .bind(tenant_id)
+    .bind(bunker_pubkey_hex)
     .fetch_optional(pool)
     .await
     .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?;
 
-    let (encrypted_secret,) = result.ok_or(RpcError::Auth(AuthError::UserNotFound))?;
+    let (auth_id, user_pubkey, auth_handle_opt, expires_at, revoked_at, policy_id) =
+        auth_data.ok_or(RpcError::Auth(AuthError::InvalidToken))?;
+
+    // Load permissions for this authorization's policy (if any)
+    let permissions: Vec<Box<dyn CustomPermission>> = if let Some(pid) = policy_id {
+        let db_permissions: Vec<Permission> = sqlx::query_as(
+            "SELECT p.*
+             FROM permissions p
+             JOIN policy_permissions pp ON pp.permission_id = p.id
+             WHERE pp.policy_id = $1",
+        )
+        .bind(pid)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| RpcError::Internal(format!("Database error loading permissions: {}", e)))?;
+
+        // Convert to CustomPermission trait objects
+        db_permissions
+            .iter()
+            .filter_map(|p| p.to_custom_permission().ok())
+            .collect()
+    } else {
+        // No policy = full access (empty permissions vec)
+        vec![]
+    };
+
+    // Get user's encrypted secret key
+    let encrypted_secret: Vec<u8> = sqlx::query_scalar(
+        "SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1",
+    )
+    .bind(&user_pubkey)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?;
 
     // Decrypt the secret key
     let decrypted_secret = key_manager
@@ -359,8 +277,126 @@ async fn get_user_keys(
 
     let secret_key = nostr_sdk::secp256k1::SecretKey::from_slice(&decrypted_secret)
         .map_err(|e| RpcError::Internal(format!("Invalid secret key bytes: {}", e)))?;
+    let user_keys = Keys::new(secret_key.into());
 
-    Ok(Keys::new(secret_key.into()))
+    // Parse cache keys
+    let bunker_key = parse_cache_key(bunker_pubkey_hex)
+        .map_err(|e| RpcError::Internal(format!("Invalid bunker_pubkey: {}", e)))?;
+
+    // For authorization_handle, use it if present, otherwise use bunker_pubkey as fallback
+    let auth_handle = if let Some(ref handle) = auth_handle_opt {
+        parse_cache_key(handle)
+            .map_err(|e| RpcError::Internal(format!("Invalid authorization_handle: {}", e)))?
+    } else {
+        bunker_key // Fallback: use bunker_pubkey as handle for legacy auths
+    };
+
+    // Create signing session (pure crypto wrapper - just keys)
+    let session = Arc::new(SigningSession::new(user_keys));
+
+    // Create handler with cached authorization metadata, permissions, and cache keys
+    let handler = Arc::new(HttpRpcHandler::new(
+        session,
+        auth_id as i64,
+        expires_at,
+        revoked_at,
+        permissions,
+        true, // OAuth authorization
+        bunker_key,
+        auth_handle,
+    ));
+
+    // Cache the handler for future requests
+    insert_handler_dual_key(&auth_state.state.http_handler_cache, handler.clone()).await;
+
+    tracing::debug!(
+        "RPC: Loaded and cached handler for bunker {} (policy_id={:?})",
+        &bunker_pubkey_hex[..8],
+        policy_id
+    );
+
+    Ok(handler)
+}
+
+/// Get the HttpRpcHandler for this request (uses cache with on-demand loading)
+///
+/// Returns the full handler with cached permissions and validity state.
+/// The handler is loaded on-demand from the database if not in cache.
+/// All subsequent operations (sign, encrypt, decrypt) use cached data - no DB hits.
+async fn get_handler(
+    auth_state: &AuthState,
+    pool: &sqlx::PgPool,
+    tenant_id: i64,
+    user_pubkey: &str,
+    redirect_origin: &str,
+    bunker_pubkey_from_ucan: Option<&str>,
+) -> Result<Arc<HttpRpcHandler>, RpcError> {
+    // FAST PATH: Check http_handler_cache by bunker_pubkey (if provided in UCAN)
+    if let Some(bunker_key_hex) = bunker_pubkey_from_ucan {
+        if let Ok(cache_key) = parse_cache_key(bunker_key_hex) {
+            if let Some(handler) = auth_state.state.http_handler_cache.get(&cache_key).await {
+                // Check cached validity (no DB hit for expired/revoked)
+                if !handler.is_valid() {
+                    // Evict invalid handler from cache
+                    auth_state.state.http_handler_cache.invalidate(&cache_key).await;
+                    return Err(RpcError::Auth(AuthError::InvalidToken));
+                }
+                tracing::debug!(
+                    "RPC: Cache hit for user {} (bunker={})",
+                    &user_pubkey[..8],
+                    &bunker_key_hex[..8]
+                );
+                return Ok(handler);
+            }
+        }
+
+        // On-demand load using bunker_pubkey from UCAN (one-time DB hit)
+        let handler = load_handler_on_demand(auth_state, pool, bunker_key_hex).await?;
+        if !handler.is_valid() {
+            return Err(RpcError::Auth(AuthError::InvalidToken));
+        }
+        return Ok(handler);
+    }
+
+    // Legacy path: resolve bunker_pubkey from DB (for older UCANs without bunker_pubkey)
+    let bunker_pubkey_hex: String = sqlx::query_scalar(
+        "SELECT oa.bunker_public_key
+         FROM oauth_authorizations oa
+         JOIN users u ON oa.user_pubkey = u.pubkey
+         WHERE oa.user_pubkey = $1 AND u.tenant_id = $2 AND oa.redirect_origin = $3
+         AND oa.revoked_at IS NULL
+         ORDER BY oa.created_at DESC
+         LIMIT 1",
+    )
+    .bind(user_pubkey)
+    .bind(tenant_id)
+    .bind(redirect_origin)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?
+    .ok_or(RpcError::Auth(AuthError::InvalidToken))?;
+
+    // Check http_handler_cache with resolved bunker_pubkey
+    if let Ok(cache_key) = parse_cache_key(&bunker_pubkey_hex) {
+        if let Some(handler) = auth_state.state.http_handler_cache.get(&cache_key).await {
+            if !handler.is_valid() {
+                auth_state.state.http_handler_cache.invalidate(&cache_key).await;
+                return Err(RpcError::Auth(AuthError::InvalidToken));
+            }
+            tracing::debug!(
+                "RPC: Cache hit (after legacy lookup) for user {}",
+                &user_pubkey[..8]
+            );
+            return Ok(handler);
+        }
+    }
+
+    // On-demand load (one-time DB hit)
+    let handler = load_handler_on_demand(auth_state, pool, &bunker_pubkey_hex).await?;
+    if !handler.is_valid() {
+        return Err(RpcError::Auth(AuthError::InvalidToken));
+    }
+    Ok(handler)
 }
 
 /// Parse unsigned event from params (first param is the event object)

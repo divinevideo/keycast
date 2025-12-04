@@ -84,12 +84,14 @@ where
                 if auth_str.starts_with("Bearer ") {
                     // Use tenant_id = 0 for now (will validate in endpoint if needed)
                     let (pubkey, _redirect_origin, _bunker_pubkey, _ucan) =
-                        crate::ucan_auth::validate_ucan_token(auth_str, 0).map_err(|e| {
-                            (
-                                StatusCode::UNAUTHORIZED,
-                                format!("Invalid UCAN token: {}", e),
-                            )
-                        })?;
+                        crate::ucan_auth::validate_ucan_token(auth_str, 0)
+                            .await
+                            .map_err(|e| {
+                                (
+                                    StatusCode::UNAUTHORIZED,
+                                    format!("Invalid UCAN token: {}", e),
+                                )
+                            })?;
 
                     tracing::debug!(
                         "DualAuth: Authenticated via UCAN Bearer token for pubkey: {}",
@@ -110,6 +112,7 @@ where
                         // Validate UCAN token from cookie
                         let (pubkey, _redirect_origin, _bunker_pubkey, _ucan) =
                             crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", value), 0)
+                                .await
                                 .map_err(|e| {
                                     (
                                         StatusCode::UNAUTHORIZED,
