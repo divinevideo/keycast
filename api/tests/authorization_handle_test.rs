@@ -89,8 +89,8 @@ async fn test_authorization_handle_can_be_stored_and_retrieved() {
     // Insert authorization with handle
     let auth_id: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, authorization_handle, created_at, updated_at)
-         VALUES ($1, $2, 'Test App', $3, 'secret', '[]', 1, $4, NOW(), NOW())
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, authorization_handle, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, 'Test App', $3, 'secret', '[]', 1, $4, NOW() + INTERVAL '30 days', NOW(), NOW())
          RETURNING id",
     )
     .bind(&user_pubkey)
@@ -130,8 +130,8 @@ async fn test_authorization_handle_unique_index_on_active() {
     // First insert should succeed
     sqlx::query(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, authorization_handle, created_at, updated_at)
-         VALUES ($1, $2, 'Test App', $3, 'secret1', '[]', 1, $4, NOW(), NOW())",
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, authorization_handle, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, 'Test App', $3, 'secret1', '[]', 1, $4, NOW() + INTERVAL '30 days', NOW(), NOW())",
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin1)
@@ -144,8 +144,8 @@ async fn test_authorization_handle_unique_index_on_active() {
     // Second insert with same handle should fail (unique constraint)
     let result = sqlx::query(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, authorization_handle, created_at, updated_at)
-         VALUES ($1, $2, 'Test App', $3, 'secret2', '[]', 1, $4, NOW(), NOW())",
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, authorization_handle, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, 'Test App', $3, 'secret2', '[]', 1, $4, NOW() + INTERVAL '30 days', NOW(), NOW())",
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin2)
@@ -174,8 +174,8 @@ async fn test_authorization_handle_allows_duplicate_if_revoked() {
     // First insert
     let auth_id: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, authorization_handle, created_at, updated_at)
-         VALUES ($1, $2, 'Test App', $3, 'secret1', '[]', 1, $4, NOW(), NOW())
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, authorization_handle, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, 'Test App', $3, 'secret1', '[]', 1, $4, NOW() + INTERVAL '30 days', NOW(), NOW())
          RETURNING id",
     )
     .bind(&user_pubkey)
@@ -196,8 +196,8 @@ async fn test_authorization_handle_allows_duplicate_if_revoked() {
     // Second insert with same handle should succeed (first is revoked)
     let result = sqlx::query(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, authorization_handle, created_at, updated_at)
-         VALUES ($1, $2, 'Test App', $3, 'secret2', '[]', 1, $4, NOW(), NOW())",
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, authorization_handle, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, 'Test App', $3, 'secret2', '[]', 1, $4, NOW() + INTERVAL '30 days', NOW(), NOW())",
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin2)
@@ -316,13 +316,14 @@ async fn test_token_response_includes_authorization_handle() {
 // ============================================================================
 
 /// Helper function that mimics the authorization handle lookup query
-/// Returns the authorization ID if the handle is valid, active, and not expired
+/// Returns the authorization ID if the handle is valid, active, not expired, and handle not past absolute expiration
 async fn lookup_authorization_by_handle(pool: &PgPool, handle: &str) -> Option<i32> {
     sqlx::query_scalar(
         "SELECT id FROM oauth_authorizations
          WHERE authorization_handle = $1
            AND revoked_at IS NULL
-           AND (expires_at IS NULL OR expires_at > NOW())",
+           AND (expires_at IS NULL OR expires_at > NOW())
+           AND handle_expires_at > NOW()",
     )
     .bind(handle)
     .fetch_optional(pool)
@@ -342,8 +343,8 @@ async fn test_valid_handle_enables_auto_approve() {
     // Create authorization with handle (no expiry, not revoked)
     let auth_id: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, authorization_handle, created_at, updated_at)
-         VALUES ($1, $2, 'Test App', $3, 'secret', '[]', 1, $4, NOW(), NOW())
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, authorization_handle, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, 'Test App', $3, 'secret', '[]', 1, $4, NOW() + INTERVAL '30 days', NOW(), NOW())
          RETURNING id",
     )
     .bind(&user_pubkey)
@@ -375,8 +376,8 @@ async fn test_revoked_handle_requires_consent() {
     // Create authorization with handle
     let auth_id: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, authorization_handle, created_at, updated_at)
-         VALUES ($1, $2, 'Test App', $3, 'secret', '[]', 1, $4, NOW(), NOW())
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, authorization_handle, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, 'Test App', $3, 'secret', '[]', 1, $4, NOW() + INTERVAL '30 days', NOW(), NOW())
          RETURNING id",
     )
     .bind(&user_pubkey)
@@ -415,8 +416,8 @@ async fn test_expired_handle_requires_consent() {
     // Create authorization with handle that's expired
     sqlx::query(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, authorization_handle, expires_at, created_at, updated_at)
-         VALUES ($1, $2, 'Test App', $3, 'secret', '[]', 1, $4, $5, NOW(), NOW())",
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, authorization_handle, expires_at, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, 'Test App', $3, 'secret', '[]', 1, $4, $5, NOW() + INTERVAL '30 days', NOW(), NOW())",
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin)
@@ -459,8 +460,8 @@ async fn test_handle_lookup_ignores_null_handles() {
     // Create authorization WITHOUT a handle (NULL)
     sqlx::query(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, 'Test App', $3, 'secret', '[]', 1, NOW(), NOW())",
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, 'Test App', $3, 'secret', '[]', 1, NOW() + INTERVAL '30 days', NOW(), NOW())",
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin)
@@ -542,8 +543,8 @@ async fn test_revoke_old_authorization_query() {
     // Create authorization that will be "old"
     let old_auth_id: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, authorization_handle, created_at, updated_at)
-         VALUES ($1, $2, 'Test App', $3, 'secret', '[]', 1, $4, NOW(), NOW())
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, authorization_handle, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, 'Test App', $3, 'secret', '[]', 1, $4, NOW() + INTERVAL '30 days', NOW(), NOW())
          RETURNING id",
     )
     .bind(&user_pubkey)

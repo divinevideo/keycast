@@ -570,12 +570,13 @@ pub async fn authorize_get(
                 pubkey
             );
 
-            // Look up by handle (must be active and not expired)
+            // Look up by handle (must be active, not expired, and handle not past absolute expiration)
             sqlx::query_scalar(
                 "SELECT id FROM oauth_authorizations
                  WHERE authorization_handle = $1
                    AND revoked_at IS NULL
-                   AND (expires_at IS NULL OR expires_at > NOW())",
+                   AND (expires_at IS NULL OR expires_at > NOW())
+                   AND handle_expires_at > NOW()",
             )
             .bind(handle)
             .fetch_optional(pool)
@@ -2218,13 +2219,16 @@ async fn create_oauth_authorization_and_token(
     // Generate authorization handle for silent re-authentication
     let authorization_handle = generate_authorization_handle();
 
+    // Handle absolute expiration (30 days from creation - hard ceiling for silent re-auth)
+    let handle_expires_at = Utc::now() + Duration::days(30);
+
     // Create new OAuth authorization - always INSERT (multi-device support)
     // Each authorization is a separate "ticket" for one client/device
     // Old authorizations remain valid until explicitly revoked
     // Note: bunker key is derived via HKDF from user secret, not stored
     let auth_id: i32 = sqlx::query_scalar(
-        "INSERT INTO oauth_authorizations (tenant_id, user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, policy_id, authorization_handle, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        "INSERT INTO oauth_authorizations (tenant_id, user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, policy_id, authorization_handle, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
          RETURNING id"
     )
     .bind(tenant_id)
@@ -2236,6 +2240,7 @@ async fn create_oauth_authorization_and_token(
     .bind(&relays_json)
     .bind(policy_id)
     .bind(&authorization_handle)
+    .bind(handle_expires_at)
     .bind(Utc::now())
     .bind(Utc::now())
     .fetch_one(pool)
@@ -3240,12 +3245,15 @@ pub async fn connect_post(
     // Generate authorization handle for silent re-authentication
     let authorization_handle = generate_authorization_handle();
 
+    // Handle absolute expiration (30 days from creation - hard ceiling for silent re-auth)
+    let handle_expires_at = Utc::now() + Duration::days(30);
+
     // Create new OAuth authorization - always INSERT (multi-device support)
     // Each nostr-login creates a NEW authorization for that client
     let auth_id: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (tenant_id, user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, client_pubkey, authorization_handle, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         (tenant_id, user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, client_pubkey, authorization_handle, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
          RETURNING id"
     )
     .bind(tenant_id)
@@ -3257,6 +3265,7 @@ pub async fn connect_post(
     .bind(&relays_json)
     .bind(&form.client_pubkey)
     .bind(&authorization_handle)
+    .bind(handle_expires_at)
     .bind(Utc::now())
     .bind(Utc::now())
     .fetch_one(&auth_state.state.db)

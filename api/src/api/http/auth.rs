@@ -795,10 +795,11 @@ pub async fn create_bunker(
     // Each "Accept" creates a NEW authorization, old ones remain valid until revoked
     // Note: bunker key is derived via HKDF from user secret, not stored
     let created_at = Utc::now();
+    let handle_expires_at = created_at + chrono::Duration::days(30);
     let auth_id: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (tenant_id, user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, policy_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         (tenant_id, user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, policy_id, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          RETURNING id"
     )
     .bind(tenant_id)
@@ -809,6 +810,7 @@ pub async fn create_bunker(
     .bind(&connection_secret)
     .bind(&relays_json)
     .bind(policy_id)
+    .bind(handle_expires_at)
     .bind(created_at)
     .bind(created_at)
     .fetch_one(pool)
@@ -3003,8 +3005,8 @@ mod tests {
         let bunker_pubkey = bunker_keys.public_key().to_hex();
 
         sqlx::query(
-            "INSERT INTO oauth_authorizations (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
-             VALUES ($1, $2, 'Test App', $3, 'test-secret', '[]', 1, NOW(), NOW())"
+            "INSERT INTO oauth_authorizations (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, handle_expires_at, created_at, updated_at)
+             VALUES ($1, $2, 'Test App', $3, 'test-secret', '[]', 1, NOW() + INTERVAL '30 days', NOW(), NOW())"
         )
         .bind(&user_pubkey)
         .bind(&redirect_origin)

@@ -113,8 +113,8 @@ async fn create_test_oauth_authorization(
 
     let auth_id: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, bunker_public_key, secret, relays, policy_id, tenant_id, expires_at, revoked_at, authorization_handle, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
+         (user_pubkey, redirect_origin, bunker_public_key, secret, relays, policy_id, tenant_id, expires_at, revoked_at, authorization_handle, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW() + INTERVAL '30 days', NOW(), NOW())
          RETURNING id"
     )
     .bind(user_pubkey)

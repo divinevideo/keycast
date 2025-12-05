@@ -13,7 +13,7 @@ import type {
 
 /** Storage key for session credentials */
 const STORAGE_KEY_SESSION = 'keycast_session';
-/** Storage key for authorization handle (survives logout for silent re-auth) */
+/** Storage key for authorization handle (for silent re-auth when session expires) */
 const STORAGE_KEY_HANDLE = 'keycast_auth_handle';
 
 /**
@@ -97,16 +97,10 @@ export class KeycastOAuth {
   }
 
   /**
-   * Clear session but preserve authorization handle for silent re-auth
+   * Clear all session data including authorization handle
+   * Use this when user explicitly logs out - clears everything for security
    */
   logout(): void {
-    this.storage.removeItem(STORAGE_KEY_SESSION);
-  }
-
-  /**
-   * Clear all stored data including authorization handle
-   */
-  clearAll(): void {
     this.storage.removeItem(STORAGE_KEY_SESSION);
     this.storage.removeItem(STORAGE_KEY_HANDLE);
   }

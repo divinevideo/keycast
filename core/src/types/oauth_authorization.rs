@@ -43,6 +43,13 @@ pub struct OAuthAuthorization {
     /// When the authorization was revoked (soft-delete for audit trail)
     /// NULL means active, set timestamp means revoked
     pub revoked_at: Option<DateTime<chrono::Utc>>,
+    /// Token expiration (idle timeout - can be extended on use)
+    pub expires_at: Option<DateTime<chrono::Utc>>,
+    /// Handle absolute expiration (hard ceiling - never changes after creation)
+    /// Set at authorization creation, represents maximum lifetime for silent re-auth
+    pub handle_expires_at: DateTime<chrono::Utc>,
+    /// Authorization handle for silent re-authentication
+    pub authorization_handle: Option<String>,
 }
 
 impl OAuthAuthorization {
@@ -96,6 +103,7 @@ impl OAuthAuthorization {
             SELECT id FROM oauth_authorizations
             WHERE revoked_at IS NULL
               AND (expires_at IS NULL OR expires_at > NOW())
+              AND handle_expires_at > NOW()
             "#,
         )
         .fetch_all(pool)
@@ -111,6 +119,7 @@ impl OAuthAuthorization {
             SELECT tenant_id, id FROM oauth_authorizations
             WHERE revoked_at IS NULL
               AND (expires_at IS NULL OR expires_at > NOW())
+              AND handle_expires_at > NOW()
             "#,
         )
         .fetch_all(pool)

@@ -192,8 +192,8 @@ async fn test_multiple_authorizations_per_user() {
     // Create authorization for App 1
     let bunker_keys_1 = Keys::generate();
     sqlx::query(
-        "INSERT INTO oauth_authorizations (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, 'App 1', $3, 'secret1', '[]', 1, NOW(), NOW())"
+        "INSERT INTO oauth_authorizations (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, 'App 1', $3, 'secret1', '[]', 1, NOW() + INTERVAL '30 days', NOW(), NOW())"
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin_1)
@@ -205,8 +205,8 @@ async fn test_multiple_authorizations_per_user() {
     // Create authorization for App 2
     let bunker_keys_2 = Keys::generate();
     sqlx::query(
-        "INSERT INTO oauth_authorizations (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, 'App 2', $3, 'secret2', '[]', 1, NOW(), NOW())"
+        "INSERT INTO oauth_authorizations (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, 'App 2', $3, 'secret2', '[]', 1, NOW() + INTERVAL '30 days', NOW(), NOW())"
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin_2)

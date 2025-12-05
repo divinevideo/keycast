@@ -120,7 +120,7 @@ Built-in options:
 
 Storage keys used:
 - `keycast_session` - Full session credentials
-- `keycast_auth_handle` - Authorization handle (survives logout for silent re-auth)
+- `keycast_auth_handle` - Authorization handle (for silent re-auth when session expires)
 
 ## API Reference
 
@@ -134,8 +134,7 @@ Storage keys used:
 **Storage Management:**
 - `getSession()` - Get stored session (returns null if expired or missing)
 - `getAuthorizationHandle()` - Get stored authorization handle for silent re-auth
-- `logout()` - Clear session but preserve authorization handle
-- `clearAll()` - Clear all stored data including authorization handle
+- `logout()` - Clear all session data including authorization handle (use when user explicitly logs out)
 
 **Utilities:**
 - `toStoredCredentials(response)` - Convert token response to storable format

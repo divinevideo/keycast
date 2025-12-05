@@ -55,8 +55,8 @@ async fn test_multiple_authorizations_per_app_allowed() {
 
     sqlx::query(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'secret1', '[]', 1, NOW(), NOW())",
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'secret1', '[]', 1, NOW() + INTERVAL '30 days', NOW(), NOW())",
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin)
@@ -73,8 +73,8 @@ async fn test_multiple_authorizations_per_app_allowed() {
 
     let result = sqlx::query(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'secret2', '[]', 1, NOW(), NOW())",
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'secret2', '[]', 1, NOW() + INTERVAL '30 days', NOW(), NOW())",
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin)
@@ -121,8 +121,8 @@ async fn test_revoked_at_filtering() {
     // First auth - will be revoked
     let auth_id_1: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'secret1', '[]', 1, NOW(), NOW())
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'secret1', '[]', 1, NOW() + INTERVAL '30 days', NOW(), NOW())
          RETURNING id",
     )
     .bind(&user_pubkey)
@@ -136,8 +136,8 @@ async fn test_revoked_at_filtering() {
     // Second auth - will remain active
     sqlx::query(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'secret2', '[]', 1, NOW(), NOW())",
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'secret2', '[]', 1, NOW() + INTERVAL '30 days', NOW(), NOW())",
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin)
@@ -200,8 +200,8 @@ async fn test_signer_daemon_filters_revoked() {
     // Create and immediately revoke an authorization
     let auth_id: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at, revoked_at)
-         VALUES ($1, $2, $3, $4, 'secret1', '[]', 1, NOW(), NOW(), NOW())
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, handle_expires_at, created_at, updated_at, revoked_at)
+         VALUES ($1, $2, $3, $4, 'secret1', '[]', 1, NOW() + INTERVAL '30 days', NOW(), NOW(), NOW())
          RETURNING id",
     )
     .bind(&user_pubkey)
@@ -298,8 +298,8 @@ async fn test_soft_delete_revoke() {
     // Create authorization
     let auth_id: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'secret1', '[]', 1, NOW(), NOW())
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'secret1', '[]', 1, NOW() + INTERVAL '30 days', NOW(), NOW())
          RETURNING id",
     )
     .bind(&user_pubkey)
@@ -351,8 +351,8 @@ async fn test_auto_revoke_specific_auth_from_ucan() {
 
     let auth_id_1: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'secret1', '[]', 1, NOW(), NOW())
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'secret1', '[]', 1, NOW() + INTERVAL '30 days', NOW(), NOW())
          RETURNING id",
     )
     .bind(&user_pubkey)
@@ -369,8 +369,8 @@ async fn test_auto_revoke_specific_auth_from_ucan() {
 
     let auth_id_2: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'secret2', '[]', 1, NOW(), NOW())
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'secret2', '[]', 1, NOW() + INTERVAL '30 days', NOW(), NOW())
          RETURNING id",
     )
     .bind(&user_pubkey)
@@ -399,8 +399,8 @@ async fn test_auto_revoke_specific_auth_from_ucan() {
 
     let _auth_id_3: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, 'secret3', '[]', 1, NOW(), NOW())
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, tenant_id, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, 'secret3', '[]', 1, NOW() + INTERVAL '30 days', NOW(), NOW())
          RETURNING id",
     )
     .bind(&user_pubkey)
