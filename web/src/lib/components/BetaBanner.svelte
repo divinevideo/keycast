@@ -1,5 +1,5 @@
 <div class="beta-banner">
-  <span>Early Access</span> - This service is in active development. Your data may be reset during this period.
+  <span>Alpha</span> - Database resets periodically during development. Last reset: Dec 5, 2024.
 </div>
 
 <style>
