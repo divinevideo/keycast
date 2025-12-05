@@ -41,6 +41,7 @@ steps:
       - '--no-cpu-throttling'
       - '--execution-environment=gen2'
       - '--cpu-boost'
+      - '--session-affinity'
       - '--startup-probe=httpGet.path=/health,httpGet.port=3000,initialDelaySeconds=5,periodSeconds=10,failureThreshold=30,timeoutSeconds=5'
       - '--liveness-probe=httpGet.path=/health,httpGet.port=3000,periodSeconds=30,timeoutSeconds=5,failureThreshold=3'
       - '--add-cloudsql-instances=openvine-co:us-central1:keycast-db'
