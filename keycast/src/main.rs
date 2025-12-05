@@ -173,13 +173,29 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
 
+    // Calculate worker count using same logic as RPC workers:
+    // 2x CPUs with minimum of 8 to avoid I/O driver starvation
+    // See: https://github.com/tokio-rs/tokio/issues/4730
+    let worker_threads = std::env::var("TOKIO_WORKER_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| num_cpus::get().max(4) * 2);
+
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()?
+        .block_on(async_main(worker_threads))
+}
+
+async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Error>> {
     println!("\n================================================");
     println!("🔑 Keycast Unified Service Starting...");
     println!("   Running API + Signer in single process");
+    println!("   Tokio worker threads: {}", worker_threads);
     println!("================================================\n");
 
     // Validate environment variables before proceeding
@@ -297,7 +313,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         signer.coordinator(),
     );
     tracing::info!(
-        "✔︎ Signer daemon initialized with {} RPC workers (queue capacity: 4096)",
+        "✔︎ Signer daemon initialized (Tokio workers: {}, RPC tasks: {}, queue: 4096)",
+        worker_threads,
         num_workers
     );
 
@@ -501,8 +518,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   API: http://0.0.0.0:{}", api_port);
     println!("   Signer: NIP-46 relay listener active");
     println!(
-        "   RPC workers: {} (bounded queue, capacity 4096)",
-        num_workers
+        "   Tokio workers: {}, RPC tasks: {} (queue: 4096)",
+        worker_threads, num_workers
     );
     println!(
         "   Instance: {} (pg-hashring LISTEN/NOTIFY enabled)",
