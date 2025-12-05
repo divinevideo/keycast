@@ -1490,6 +1490,7 @@ checksum = "65bc07b1a8bc7c85c5f2e110c476c7389b4554ba72af57d8445ea63a576b0876"
 dependencies = [
  "futures-channel",
  "futures-core",
+ "futures-executor",
  "futures-io",
  "futures-sink",
  "futures-task",
@@ -3372,6 +3373,22 @@ dependencies = [
  "once_cell",
  "pest",
  "sha2 0.10.8",
+]
+
+[[package]]
+name = "pg-hashring"
+version = "0.1.0"
+dependencies = [
+ "anchorhash",
+ "chrono",
+ "ctrlc",
+ "futures",
+ "sqlx",
+ "thiserror 2.0.9",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

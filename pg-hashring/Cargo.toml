@@ -1,0 +1,20 @@
+[package]
+name = "pg-hashring"
+version = "0.1.0"
+edition = "2021"
+description = "PostgreSQL-backed cluster membership with consistent hashing"
+
+[dependencies]
+anchorhash = "0.2"
+sqlx = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+futures = "0.3"
+ctrlc = { version = "3.4", features = ["termination"] }
