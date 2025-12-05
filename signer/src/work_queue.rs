@@ -75,8 +75,16 @@ impl RpcQueue {
                 let coordinator = coordinator.clone();
 
                 tokio::spawn(async move {
-                    rpc_worker_loop(worker_id, rx, handlers, client, pool, key_manager, coordinator)
-                        .await
+                    rpc_worker_loop(
+                        worker_id,
+                        rx,
+                        handlers,
+                        client,
+                        pool,
+                        key_manager,
+                        coordinator,
+                    )
+                    .await
                 })
             })
             .collect()
@@ -160,15 +168,8 @@ async fn rpc_worker_loop(
         };
 
         // Process the item
-        if let Err(e) = process_nip46_item(
-            &item,
-            &handlers,
-            &client,
-            &pool,
-            &key_manager,
-            &coordinator,
-        )
-        .await
+        if let Err(e) =
+            process_nip46_item(&item, &handlers, &client, &pool, &key_manager, &coordinator).await
         {
             // Filter out expected noise
             match &e {

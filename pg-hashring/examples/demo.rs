@@ -52,8 +52,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║              pg-hashring Interactive Demo                    ║");
     println!("╠══════════════════════════════════════════════════════════════╣");
-    println!("║  Instance: {}                                        ║", short_id);
-    println!("║  Cluster:  {} instance(s)                                    ║", coordinator.instance_count());
+    println!(
+        "║  Instance: {}                                        ║",
+        short_id
+    );
+    println!(
+        "║  Cluster:  {} instance(s)                                    ║",
+        coordinator.instance_count()
+    );
     println!("╠══════════════════════════════════════════════════════════════╣");
     println!("║  Type any text and press Enter to broadcast.                 ║");
     println!("║  Only the owning instance will claim the message.            ║");
@@ -215,7 +221,10 @@ async fn run_listener(
                         if !new_id.starts_with(&short_id) {
                             tokio::time::sleep(Duration::from_millis(100)).await;
                             let count = coordinator.instance_count();
-                            println!("\n  📥 Instance joined! Cluster now has {} instance(s)", count);
+                            println!(
+                                "\n  📥 Instance joined! Cluster now has {} instance(s)",
+                                count
+                            );
                             print!("[{}] > ", short_id);
                             let _ = io::stdout().flush();
                         }
@@ -224,7 +233,10 @@ async fn run_listener(
                         if !left_id.starts_with(&short_id) {
                             tokio::time::sleep(Duration::from_millis(100)).await;
                             let count = coordinator.instance_count();
-                            println!("\n  📤 Instance left. Cluster now has {} instance(s)", count);
+                            println!(
+                                "\n  📤 Instance left. Cluster now has {} instance(s)",
+                                count
+                            );
                             print!("[{}] > ", short_id);
                             let _ = io::stdout().flush();
                         }

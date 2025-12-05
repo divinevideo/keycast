@@ -1,13 +1,13 @@
 // ABOUTME: REST RPC API that mirrors NIP-46 methods for low-latency signing
 // ABOUTME: Allows HTTP-based signing instead of relay-based NIP-46 communication
 
+use crate::handlers::http_rpc_handler::{insert_handler_dual_key, HandlerError, HttpRpcHandler};
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
-use crate::handlers::http_rpc_handler::{insert_handler_dual_key, HandlerError, HttpRpcHandler};
 use keycast_core::signing_session::{parse_cache_key, SigningSession};
 use keycast_core::traits::CustomPermission;
 use keycast_core::types::permission::Permission;
@@ -261,13 +261,12 @@ async fn load_handler_on_demand(
     };
 
     // Get user's encrypted secret key
-    let encrypted_secret: Vec<u8> = sqlx::query_scalar(
-        "SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1",
-    )
-    .bind(&user_pubkey)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?;
+    let encrypted_secret: Vec<u8> =
+        sqlx::query_scalar("SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1")
+            .bind(&user_pubkey)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?;
 
     // Decrypt the secret key
     let decrypted_secret = key_manager
@@ -338,7 +337,11 @@ async fn get_handler(
                 // Check cached validity (no DB hit for expired/revoked)
                 if !handler.is_valid() {
                     // Evict invalid handler from cache
-                    auth_state.state.http_handler_cache.invalidate(&cache_key).await;
+                    auth_state
+                        .state
+                        .http_handler_cache
+                        .invalidate(&cache_key)
+                        .await;
                     return Err(RpcError::Auth(AuthError::InvalidToken));
                 }
                 tracing::debug!(
@@ -380,7 +383,11 @@ async fn get_handler(
     if let Ok(cache_key) = parse_cache_key(&bunker_pubkey_hex) {
         if let Some(handler) = auth_state.state.http_handler_cache.get(&cache_key).await {
             if !handler.is_valid() {
-                auth_state.state.http_handler_cache.invalidate(&cache_key).await;
+                auth_state
+                    .state
+                    .http_handler_cache
+                    .invalidate(&cache_key)
+                    .await;
                 return Err(RpcError::Auth(AuthError::InvalidToken));
             }
             tracing::debug!(

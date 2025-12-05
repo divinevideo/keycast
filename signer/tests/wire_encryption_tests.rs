@@ -30,8 +30,12 @@ fn test_nip44_wire_encryption_round_trip() {
     .expect("Client encryption should succeed");
 
     // Bunker decrypts request FROM client using bunker's secret and client's pubkey
-    let decrypted = nip44::decrypt(bunker_keys.secret_key(), &client_keys.public_key(), &encrypted)
-        .expect("Bunker decryption should succeed");
+    let decrypted = nip44::decrypt(
+        bunker_keys.secret_key(),
+        &client_keys.public_key(),
+        &encrypted,
+    )
+    .expect("Bunker decryption should succeed");
 
     assert_eq!(
         decrypted, plaintext,
@@ -57,9 +61,12 @@ fn test_nip44_response_encryption() {
     .expect("Bunker encryption should succeed");
 
     // Client decrypts response FROM bunker
-    let decrypted =
-        nip44::decrypt(client_keys.secret_key(), &bunker_keys.public_key(), &encrypted)
-            .expect("Client decryption should succeed");
+    let decrypted = nip44::decrypt(
+        client_keys.secret_key(),
+        &bunker_keys.public_key(),
+        &encrypted,
+    )
+    .expect("Client decryption should succeed");
 
     assert_eq!(
         decrypted, response,
@@ -84,16 +91,23 @@ fn test_nip04_fallback_encryption() {
     .expect("NIP-04 encryption should succeed");
 
     // Bunker tries NIP-44 first (should fail for NIP-04 ciphertext)
-    let nip44_result = nip44::decrypt(bunker_keys.secret_key(), &client_keys.public_key(), &encrypted);
+    let nip44_result = nip44::decrypt(
+        bunker_keys.secret_key(),
+        &client_keys.public_key(),
+        &encrypted,
+    );
     assert!(
         nip44_result.is_err(),
         "NIP-44 should fail on NIP-04 ciphertext"
     );
 
     // Bunker falls back to NIP-04
-    let decrypted =
-        nip04::decrypt(bunker_keys.secret_key(), &client_keys.public_key(), &encrypted)
-            .expect("NIP-04 decryption should succeed as fallback");
+    let decrypted = nip04::decrypt(
+        bunker_keys.secret_key(),
+        &client_keys.public_key(),
+        &encrypted,
+    )
+    .expect("NIP-04 decryption should succeed as fallback");
 
     assert_eq!(
         decrypted, plaintext,
@@ -120,12 +134,13 @@ fn test_wrong_keys_fail_decryption() {
     .expect("Encryption should succeed");
 
     // Try to decrypt with wrong keys
-    let result = nip44::decrypt(wrong_keys.secret_key(), &client_keys.public_key(), &encrypted);
-
-    assert!(
-        result.is_err(),
-        "Decryption with wrong keys should fail"
+    let result = nip44::decrypt(
+        wrong_keys.secret_key(),
+        &client_keys.public_key(),
+        &encrypted,
     );
+
+    assert!(result.is_err(), "Decryption with wrong keys should fail");
 }
 
 /// Test encryption of various JSON-RPC message types
@@ -157,19 +172,19 @@ fn test_various_nip46_message_encryption() {
         )
         .expect(&format!("Failed to encrypt: {}", msg));
 
-        let decrypted =
-            nip44::decrypt(bunker_keys.secret_key(), &client_keys.public_key(), &encrypted)
-                .expect(&format!("Failed to decrypt: {}", msg));
+        let decrypted = nip44::decrypt(
+            bunker_keys.secret_key(),
+            &client_keys.public_key(),
+            &encrypted,
+        )
+        .expect(&format!("Failed to decrypt: {}", msg));
 
         assert_eq!(decrypted, msg, "Round-trip failed for message");
 
         // Verify we can parse the JSON
         let parsed: serde_json::Value =
             serde_json::from_str(&decrypted).expect("Decrypted content should be valid JSON");
-        assert!(
-            parsed.get("method").is_some(),
-            "Should have method field"
-        );
+        assert!(parsed.get("method").is_some(), "Should have method field");
     }
 }
 
@@ -199,9 +214,12 @@ fn test_nip44_rpc_encrypt_decrypt() {
     .expect("nip44_encrypt should succeed");
 
     // Third party decrypts FROM user
-    let decrypted =
-        nip44::decrypt(third_party_keys.secret_key(), &user_keys.public_key(), &ciphertext)
-            .expect("Third party should decrypt successfully");
+    let decrypted = nip44::decrypt(
+        third_party_keys.secret_key(),
+        &user_keys.public_key(),
+        &ciphertext,
+    )
+    .expect("Third party should decrypt successfully");
 
     assert_eq!(decrypted, plaintext);
 }
@@ -225,8 +243,12 @@ fn test_nip44_rpc_decrypt() {
     .expect("Third party encryption should succeed");
 
     // Simulates RPC nip44_decrypt: user decrypts FROM third party
-    let decrypted = nip44::decrypt(user_keys.secret_key(), &third_party_keys.public_key(), &ciphertext)
-        .expect("nip44_decrypt should succeed");
+    let decrypted = nip44::decrypt(
+        user_keys.secret_key(),
+        &third_party_keys.public_key(),
+        &ciphertext,
+    )
+    .expect("nip44_decrypt should succeed");
 
     assert_eq!(decrypted, plaintext);
 }
@@ -265,22 +287,31 @@ fn test_dual_key_separation() {
     .expect("Payload encryption should use user_keys");
 
     // Verify bunker can decrypt wire but NOT payload
-    let wire_decrypted =
-        nip44::decrypt(bunker_keys.secret_key(), &client_keys.public_key(), &wire_encrypted)
-            .expect("Bunker should decrypt wire messages");
+    let wire_decrypted = nip44::decrypt(
+        bunker_keys.secret_key(),
+        &client_keys.public_key(),
+        &wire_encrypted,
+    )
+    .expect("Bunker should decrypt wire messages");
     assert_eq!(wire_decrypted, wire_message);
 
     // Bunker cannot decrypt payload (wrong keys)
-    let bunker_payload_result =
-        nip44::decrypt(bunker_keys.secret_key(), &third_party_keys.public_key(), &payload_encrypted);
+    let bunker_payload_result = nip44::decrypt(
+        bunker_keys.secret_key(),
+        &third_party_keys.public_key(),
+        &payload_encrypted,
+    );
     assert!(
         bunker_payload_result.is_err(),
         "Bunker should NOT be able to decrypt payload messages"
     );
 
     // Third party can decrypt payload
-    let payload_decrypted =
-        nip44::decrypt(third_party_keys.secret_key(), &user_keys.public_key(), &payload_encrypted)
-            .expect("Third party should decrypt payload messages");
+    let payload_decrypted = nip44::decrypt(
+        third_party_keys.secret_key(),
+        &user_keys.public_key(),
+        &payload_encrypted,
+    )
+    .expect("Third party should decrypt payload messages");
     assert_eq!(payload_decrypted, payload_message);
 }

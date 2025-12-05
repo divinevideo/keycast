@@ -237,7 +237,10 @@ impl ClusterCoordinator {
             let _ = handle.await;
         }
 
-        tracing::debug!(drain_ms = crate::SHUTDOWN_DRAIN_MS, "Shutdown complete with drain");
+        tracing::debug!(
+            drain_ms = crate::SHUTDOWN_DRAIN_MS,
+            "Shutdown complete with drain"
+        );
         Ok(())
     }
 }
@@ -361,7 +364,11 @@ mod tests {
             }
         }
 
-        assert!(before < 70, "coord1 should handle ~50% before, got {}", before);
+        assert!(
+            before < 70,
+            "coord1 should handle ~50% before, got {}",
+            before
+        );
 
         // Shutdown coord2
         coord2.shutdown().await.unwrap();
@@ -377,7 +384,10 @@ mod tests {
             }
         }
 
-        assert_eq!(after, 100, "coord1 should handle all keys after coord2 leaves");
+        assert_eq!(
+            after, 100,
+            "coord1 should handle all keys after coord2 leaves"
+        );
 
         coord1.shutdown().await.unwrap();
     }

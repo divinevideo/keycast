@@ -5,13 +5,13 @@ use crate::error::{SignerError, SignerResult};
 use async_trait::async_trait;
 use keycast_core::authorization_channel::{AuthorizationCommand, AuthorizationReceiver};
 use keycast_core::encryption::KeyManager;
-use pg_hashring::ClusterCoordinator;
 use keycast_core::metrics::METRICS;
 use keycast_core::signing_handler::SigningHandler;
 use keycast_core::types::authorization::Authorization;
 use keycast_core::types::oauth_authorization::OAuthAuthorization;
 use moka::future::Cache;
 use nostr_sdk::prelude::*;
+use pg_hashring::ClusterCoordinator;
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -587,7 +587,10 @@ impl UnifiedSigner {
                                     // Filter out expected noise from malformed external requests
                                     match &e {
                                         SignerError::MissingParameter("p-tag") => {
-                                            tracing::trace!("Ignoring malformed NIP-46 request: {}", e);
+                                            tracing::trace!(
+                                                "Ignoring malformed NIP-46 request: {}",
+                                                e
+                                            );
                                         }
                                         _ => {
                                             tracing::error!("Error handling NIP-46 request: {}", e);
@@ -1146,11 +1149,11 @@ impl UnifiedSigner {
                     let secret = handler.user_keys.secret_key().clone();
                     let pubkey = third_party_pubkey;
                     let text = ciphertext.to_string();
-                    tokio::task::spawn_blocking(move || {
-                        nip44::decrypt(&secret, &pubkey, &text)
-                    })
-                    .await
-                    .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
+                    tokio::task::spawn_blocking(move || nip44::decrypt(&secret, &pubkey, &text))
+                        .await
+                        .map_err(|e| {
+                            SignerError::internal(format!("spawn_blocking failed: {}", e))
+                        })??
                 };
 
                 serde_json::json!({
@@ -1175,11 +1178,11 @@ impl UnifiedSigner {
                     let secret = handler.user_keys.secret_key().clone();
                     let pubkey = third_party_pubkey;
                     let text = plaintext.to_string();
-                    tokio::task::spawn_blocking(move || {
-                        nip04::encrypt(&secret, &pubkey, &text)
-                    })
-                    .await
-                    .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
+                    tokio::task::spawn_blocking(move || nip04::encrypt(&secret, &pubkey, &text))
+                        .await
+                        .map_err(|e| {
+                            SignerError::internal(format!("spawn_blocking failed: {}", e))
+                        })??
                 };
 
                 serde_json::json!({
@@ -1204,11 +1207,11 @@ impl UnifiedSigner {
                     let secret = handler.user_keys.secret_key().clone();
                     let pubkey = third_party_pubkey;
                     let text = ciphertext.to_string();
-                    tokio::task::spawn_blocking(move || {
-                        nip04::decrypt(&secret, &pubkey, &text)
-                    })
-                    .await
-                    .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
+                    tokio::task::spawn_blocking(move || nip04::decrypt(&secret, &pubkey, &text))
+                        .await
+                        .map_err(|e| {
+                            SignerError::internal(format!("spawn_blocking failed: {}", e))
+                        })??
                 };
 
                 serde_json::json!({

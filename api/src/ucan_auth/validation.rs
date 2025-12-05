@@ -57,7 +57,10 @@ pub async fn validate_ucan_token(
         .await
         .map_err(|e| anyhow!("UCAN signature verification failed: {}", e))?;
 
-    tracing::debug!("UCAN Schnorr signature verified for issuer: {}", ucan.issuer());
+    tracing::debug!(
+        "UCAN Schnorr signature verified for issuer: {}",
+        ucan.issuer()
+    );
 
     // Validate expiry
     if ucan.is_expired() {
@@ -141,8 +144,8 @@ pub async fn extract_user_from_ucan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use crate::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use nostr_sdk::Keys;
     use ucan::builder::UcanBuilder;
 

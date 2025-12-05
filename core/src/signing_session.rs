@@ -11,9 +11,7 @@ pub type CacheKey = [u8; 32];
 /// Parse hex string to CacheKey
 pub fn parse_cache_key(hex_str: &str) -> Result<CacheKey, SessionError> {
     let bytes = hex::decode(hex_str).map_err(SessionError::HexDecode)?;
-    bytes
-        .try_into()
-        .map_err(|_| SessionError::InvalidKeyLength)
+    bytes.try_into().map_err(|_| SessionError::InvalidKeyLength)
 }
 
 #[derive(Debug, Error)]

@@ -198,13 +198,12 @@ async fn load_handler_from_db(
         auth_data.ok_or_else(|| "No authorization found".to_string())?;
 
     // Get user's encrypted secret key
-    let encrypted_secret: Vec<u8> = sqlx::query_scalar(
-        "SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1",
-    )
-    .bind(&user_pubkey)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| format!("Database error: {}", e))?;
+    let encrypted_secret: Vec<u8> =
+        sqlx::query_scalar("SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1")
+            .bind(&user_pubkey)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("Database error: {}", e))?;
 
     // Decrypt the secret key
     let decrypted_secret = key_manager
@@ -217,8 +216,8 @@ async fn load_handler_from_db(
     let user_keys = Keys::new(secret_key.into());
 
     // Parse cache keys
-    let bunker_key = parse_cache_key(bunker_pubkey_hex)
-        .map_err(|e| format!("Invalid bunker_pubkey: {}", e))?;
+    let bunker_key =
+        parse_cache_key(bunker_pubkey_hex).map_err(|e| format!("Invalid bunker_pubkey: {}", e))?;
 
     let auth_handle = if let Some(ref handle) = auth_handle_opt {
         parse_cache_key(handle).map_err(|e| format!("Invalid authorization_handle: {}", e))?
@@ -282,8 +281,8 @@ async fn test_sign_event_returns_valid_signature() {
     assert_eq!(handler.user_pubkey_hex(), pubkey);
 
     // Create and sign an event
-    let unsigned = EventBuilder::text_note("Hello from integration test")
-        .build(handler.keys().public_key());
+    let unsigned =
+        EventBuilder::text_note("Hello from integration test").build(handler.keys().public_key());
 
     let signed = handler
         .sign_event(unsigned.clone())
@@ -341,8 +340,7 @@ async fn test_expired_authorization_handler_not_valid() {
     );
 
     // Signing should fail for expired handler
-    let unsigned = EventBuilder::text_note("test")
-        .build(handler.keys().public_key());
+    let unsigned = EventBuilder::text_note("test").build(handler.keys().public_key());
 
     let result = handler.sign_event(unsigned).await;
     assert!(
@@ -393,8 +391,7 @@ async fn test_revoked_authorization_handler_not_valid() {
     );
 
     // Signing should fail for revoked handler
-    let unsigned = EventBuilder::text_note("test")
-        .build(handler.keys().public_key());
+    let unsigned = EventBuilder::text_note("test").build(handler.keys().public_key());
 
     let result = handler.sign_event(unsigned).await;
     assert!(
@@ -490,8 +487,8 @@ async fn test_sign_event_blocked_by_policy() {
     assert!(handler.is_valid(), "Handler should be valid");
 
     // Create kind 4 event (encrypted DM - not in allowed list)
-    let unsigned_kind4 =
-        EventBuilder::new(Kind::EncryptedDirectMessage, "Secret").build(handler.keys().public_key());
+    let unsigned_kind4 = EventBuilder::new(Kind::EncryptedDirectMessage, "Secret")
+        .build(handler.keys().public_key());
 
     // Permission validation should fail
     let result = keycast_api::api::http::auth::validate_signing_permissions(

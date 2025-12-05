@@ -10,15 +10,15 @@ use axum::{
     Router,
 };
 use dotenv::dotenv;
-use keycast_core::authorization_channel;
 use keycast_api::handlers::http_rpc_handler::new_http_handler_cache;
+use keycast_core::authorization_channel;
 use keycast_core::database::Database;
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::gcp_key_manager::GcpKeyManager;
 use keycast_core::encryption::KeyManager;
 use keycast_signer::{RpcQueue, UnifiedSigner};
-use pg_hashring::ClusterCoordinator;
 use nostr_sdk::Keys;
+use pg_hashring::ClusterCoordinator;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -99,10 +99,9 @@ async fn cache_control_middleware(request: Request<Body>, next: Next) -> Respons
         "public, max-age=0, must-revalidate"
     };
 
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        cache_value.parse().unwrap(),
-    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, cache_value.parse().unwrap());
 
     response
 }
@@ -223,7 +222,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let coordinator = Arc::new(ClusterCoordinator::start(database.pool.clone()).await?);
     coordinator.wait_for_established().await;
     let instance_id = coordinator.instance_id().to_string();
-    tracing::info!("✔︎ Cluster coordinator started: {} (LISTEN/NOTIFY enabled)", instance_id);
+    tracing::info!(
+        "✔︎ Cluster coordinator started: {} (LISTEN/NOTIFY enabled)",
+        instance_id
+    );
 
     // Setup key managers (one for signer, one for API - they're cheap to create)
     let use_gcp_kms = env::var("USE_GCP_KMS").unwrap_or_else(|_| "false".to_string()) == "true";
@@ -498,8 +500,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("✨ Unified service running!");
     println!("   API: http://0.0.0.0:{}", api_port);
     println!("   Signer: NIP-46 relay listener active");
-    println!("   RPC workers: {} (bounded queue, capacity 4096)", num_workers);
-    println!("   Instance: {} (pg-hashring LISTEN/NOTIFY enabled)", instance_id);
+    println!(
+        "   RPC workers: {} (bounded queue, capacity 4096)",
+        num_workers
+    );
+    println!(
+        "   Instance: {} (pg-hashring LISTEN/NOTIFY enabled)",
+        instance_id
+    );
     println!("   HTTP handler cache: on-demand loading enabled\n");
 
     // Wait for shutdown signal
