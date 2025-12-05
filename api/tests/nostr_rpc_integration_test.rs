@@ -109,7 +109,7 @@ async fn create_test_oauth_authorization(
     let bunker_keys = Keys::generate();
     let bunker_pubkey = bunker_keys.public_key().to_hex();
     let secret = format!("auth_secret_{}", Uuid::new_v4());
-    let auth_handle = hex::encode(&rand::random::<[u8; 32]>());
+    let auth_handle = hex::encode(rand::random::<[u8; 32]>());
 
     let auth_id: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
@@ -178,6 +178,7 @@ async fn load_handler_from_db(
     key_manager: &dyn KeyManager,
 ) -> Result<Arc<HttpRpcHandler>, String> {
     // Query oauth_authorization for this bunker_pubkey (including expires_at, revoked_at)
+    #[allow(clippy::type_complexity)]
     let auth_data: Option<(
         i32,
         String,
