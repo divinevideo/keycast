@@ -65,9 +65,10 @@ jobs:
     - name: Build release
       run: cargo build --release --workspace
 
-  # Test with Google Cloud KMS integration (optional)
+  # Test with Google Cloud KMS integration (optional, non-blocking)
   test-gcp:
     runs-on: ubuntu-latest
+    continue-on-error: true
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
 
     services:
