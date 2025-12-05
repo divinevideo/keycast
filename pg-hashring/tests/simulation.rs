@@ -4,6 +4,7 @@
 //! coordinators joining and leaving the cluster.
 
 use pg_hashring::ClusterCoordinator;
+use serial_test::serial;
 use sqlx::PgPool;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -22,6 +23,7 @@ async fn cleanup_test_instances(pool: &PgPool) {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_scale_up_from_1_to_5_instances() {
     let pool = get_test_pool().await;
     cleanup_test_instances(&pool).await;
@@ -83,6 +85,7 @@ async fn test_scale_up_from_1_to_5_instances() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_scale_down_gracefully() {
     let pool = get_test_pool().await;
     cleanup_test_instances(&pool).await;
@@ -134,6 +137,7 @@ async fn test_scale_down_gracefully() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_rolling_restart_no_orphans() {
     let pool = get_test_pool().await;
     cleanup_test_instances(&pool).await;
@@ -185,6 +189,7 @@ async fn test_rolling_restart_no_orphans() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_crash_recovery_via_heartbeat() {
     let pool = get_test_pool().await;
     cleanup_test_instances(&pool).await;
@@ -250,6 +255,7 @@ async fn test_crash_recovery_via_heartbeat() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_concurrent_joins() {
     let pool = get_test_pool().await;
     cleanup_test_instances(&pool).await;
@@ -300,6 +306,7 @@ async fn test_concurrent_joins() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_shutdown_drain_period() {
     use std::time::Instant;
 

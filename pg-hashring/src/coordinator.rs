@@ -248,6 +248,7 @@ impl ClusterCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     async fn get_test_pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
@@ -281,6 +282,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_coordinator_starts_and_handles_keys() {
         let pool = get_test_pool().await;
         cleanup_test_instances(&pool).await;
@@ -296,6 +298,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_two_coordinators_split_keys() {
         let pool = get_test_pool().await;
         cleanup_test_instances(&pool).await;
@@ -343,6 +346,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_graceful_shutdown_redistributes_keys() {
         let pool = get_test_pool().await;
         cleanup_test_instances(&pool).await;
@@ -393,6 +397,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_notification_latency() {
         let pool = get_test_pool().await;
         cleanup_test_instances(&pool).await;

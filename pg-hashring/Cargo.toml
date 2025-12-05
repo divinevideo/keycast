@@ -19,3 +19,4 @@ tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
 futures = "0.3"
 ctrlc = { version = "3.4", features = ["termination"] }
+serial_test = "3.2"

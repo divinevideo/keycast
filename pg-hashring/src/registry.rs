@@ -113,6 +113,7 @@ impl InstanceRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::time::Duration;
 
     async fn get_test_pool() -> PgPool {
@@ -129,6 +130,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_registry_register_creates_instance() {
         let pool = get_test_pool().await;
         cleanup_test_instances(&pool).await;
@@ -148,6 +150,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_registry_notify_on_register() {
         let pool = get_test_pool().await;
         cleanup_test_instances(&pool).await;
@@ -175,6 +178,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_registry_notify_on_deregister() {
         let pool = get_test_pool().await;
         cleanup_test_instances(&pool).await;
@@ -202,6 +206,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_registry_graceful_shutdown_removes_from_active() {
         let pool = get_test_pool().await;
         cleanup_test_instances(&pool).await;
@@ -222,6 +227,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_registry_heartbeat_updates_timestamp() {
         let pool = get_test_pool().await;
         cleanup_test_instances(&pool).await;
@@ -254,6 +260,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_registry_multiple_instances_unique_ids() {
         let pool = get_test_pool().await;
         cleanup_test_instances(&pool).await;
