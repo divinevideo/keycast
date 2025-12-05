@@ -24,23 +24,25 @@ Keycast is a managed key custody service for Nostr apps. Users create an account
 ```dart
 import 'package:keycast_flutter/keycast_flutter.dart';
 
-final oauth = KeycastOAuth(config: OAuthConfig(
-  serverUrl: 'https://login.divine.video',
-  clientId: 'your-app',
-  redirectUri: 'https://login.divine.video/app/callback',
-));
+final oauth = KeycastOAuth(
+  config: OAuthConfig(
+    serverUrl: 'https://login.divine.video',
+    clientId: 'your-app',
+    redirectUri: 'https://login.divine.video/app/callback',
+  ),
+  storage: SecureKeycastStorage(), // Auto-saves credentials
+);
 
-// 1. Start OAuth flow
-final (url, verifier) = oauth.getAuthorizationUrl(scope: 'policy:social');
+// 1. Start OAuth flow (auto-includes authorization_handle for silent re-auth)
+final (url, verifier) = await oauth.getAuthorizationUrl(scope: 'policy:social');
 await launchUrl(Uri.parse(url));
 
-// 2. Handle Universal Link callback, exchange code
+// 2. Handle Universal Link callback, exchange code (auto-saves session)
 final tokens = await oauth.exchangeCode(code: code, verifier: verifier);
-final session = KeycastSession.fromTokenResponse(tokens);
-await session.save();
 
 // 3. Sign events via HTTP RPC
-final rpc = KeycastRpc.fromSession(oauth.config, session);
+final session = await oauth.getSession(); // Load from storage
+final rpc = KeycastRpc.fromSession(oauth.config, session!);
 final signed = await rpc.signEvent(myEvent);
 ```
 
@@ -55,16 +57,17 @@ const client = createKeycastClient({
   serverUrl: 'https://login.divine.video',
   clientId: 'your-app',
   redirectUri: window.location.origin + '/callback',
+  storage: localStorage, // Auto-saves credentials (optional, defaults to in-memory)
 });
 
-// 1. Start OAuth flow
+// 1. Start OAuth flow (auto-includes authorization_handle for silent re-auth)
 const { url, pkce } = await client.oauth.getAuthorizationUrl({
   scopes: ['policy:social'],
 });
 sessionStorage.setItem('pkce_verifier', pkce.verifier);
 window.location.href = url;
 
-// 2. Handle callback
+// 2. Handle callback (auto-saves session to storage)
 const code = new URLSearchParams(location.search).get('code');
 const verifier = sessionStorage.getItem('pkce_verifier');
 const tokens = await client.oauth.exchangeCode(code, verifier);
@@ -78,6 +81,12 @@ const signed = await rpc.signEvent({
   created_at: Math.floor(Date.now() / 1000),
   pubkey: await rpc.getPublicKey(),
 });
+
+// On page reload, restore session from storage
+const session = client.oauth.getSession();
+if (session) {
+  // User is already authenticated
+}
 ```
 
 See [keycast-login README](./keycast-login/README.md) for full API reference including BYOK (Bring Your Own Key) flows.

@@ -4,12 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Keycast is a secure remote signing and permissions system for teams using Nostr. It provides NIP-46 remote signing, team-based key management, and flexible permissions policies. The project consists of four Rust workspace crates:
+Keycast is a secure remote signing and permissions system for teams using Nostr. It provides NIP-46 remote signing, team-based key management, and flexible permissions policies. The project consists of:
 
+**Rust workspace crates:**
 - **keycast**: Unified binary (main.rs) - runs API + Signer in single process
 - **api**: HTTP API library - team management, authentication, OAuth 2.0 (library only, no binary)
 - **core**: Shared business logic, database models, encryption, permissions system
 - **signer**: NIP-46 signer library - handles multiple bunker connections
+
+**Client libraries:**
+- **keycast-login**: TypeScript/JavaScript OAuth client with storage abstraction
+- **keycast_flutter**: Dart/Flutter OAuth client (separate repo: keycast_flutter_demo)
+
+**Frontend:**
 - **web**: SvelteKit frontend application (uses Bun for package management)
 
 ## Development Commands
@@ -138,7 +145,7 @@ Existing permissions:
 
 ### Signer Daemon Architecture
 
-The `keycast_signer` binary (`signer/src/main.rs`) is a unified NIP-46 signer daemon:
+The unified binary (`keycast/src/main.rs`) runs both the HTTP API and NIP-46 signer daemon:
 - Single process handles all active authorizations (both team and OAuth)
 - Loads all authorizations on startup into in-memory HashMap (bunker_pubkey -> handler)
 - Connects to all configured relays for all authorizations

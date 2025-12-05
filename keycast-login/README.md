@@ -15,17 +15,25 @@ bun add keycast-login
 ```typescript
 import { createKeycastClient } from 'keycast-login';
 
-// Create client
+// Create client with optional storage for automatic credential management
 const client = createKeycastClient({
   serverUrl: 'https://login.divine.video',
   clientId: 'divine',
   redirectUri: window.location.origin + '/callback',
+  storage: localStorage, // Optional: auto-saves credentials (defaults to in-memory)
 });
 
-// Start OAuth flow
+// Check for existing session
+const existingSession = client.oauth.getSession();
+if (existingSession) {
+  // User is already authenticated
+  const rpc = client.createRpc({ access_token: existingSession.accessToken, bunker_url: existingSession.bunkerUrl });
+}
+
+// Start OAuth flow (auto-includes authorization_handle for silent re-auth)
 const { url, pkce } = await client.oauth.getAuthorizationUrl();
 
-// Store PKCE verifier for later
+// Store PKCE verifier for callback (library stores internally but redirect loses state)
 sessionStorage.setItem('pkce_verifier', pkce.verifier);
 
 // Redirect to Keycast
@@ -39,13 +47,13 @@ After the user authorizes, handle the callback:
 const result = client.oauth.parseCallback(window.location.href);
 
 if ('code' in result) {
-  // Exchange code for tokens
+  // Exchange code for tokens (auto-saves to storage)
   const verifier = sessionStorage.getItem('pkce_verifier');
   const tokens = await client.oauth.exchangeCode(result.code, verifier);
 
   // tokens.bunker_url - NIP-46 bunker URL for nostr-tools
   // tokens.access_token - UCAN token for REST RPC API
-  // tokens.nostr_api - REST RPC API endpoint
+  // tokens.authorization_handle - Handle for silent re-auth
 }
 ```
 
@@ -93,13 +101,43 @@ const { url, pkce } = await client.oauth.getAuthorizationUrl({
 });
 ```
 
+## Storage Interface
+
+The library accepts any storage backend compatible with the `KeycastStorage` interface:
+
+```typescript
+interface KeycastStorage {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+}
+```
+
+Built-in options:
+- `localStorage` - Persists across browser sessions
+- `sessionStorage` - Cleared when tab closes
+- In-memory (default) - No persistence
+
+Storage keys used:
+- `keycast_session` - Full session credentials
+- `keycast_auth_handle` - Authorization handle (survives logout for silent re-auth)
+
 ## API Reference
 
 ### KeycastOAuth
 
-- `getAuthorizationUrl(options?)` - Generate OAuth authorization URL
-- `exchangeCode(code, verifier?)` - Exchange authorization code for tokens
+**OAuth Flow:**
+- `getAuthorizationUrl(options?)` - Generate OAuth authorization URL (auto-includes stored handle)
+- `exchangeCode(code, verifier?)` - Exchange authorization code for tokens (auto-saves to storage)
 - `parseCallback(url)` - Parse callback URL for code or error
+
+**Storage Management:**
+- `getSession()` - Get stored session (returns null if expired or missing)
+- `getAuthorizationHandle()` - Get stored authorization handle for silent re-auth
+- `logout()` - Clear session but preserve authorization handle
+- `clearAll()` - Clear all stored data including authorization handle
+
+**Utilities:**
 - `toStoredCredentials(response)` - Convert token response to storable format
 - `isExpired(credentials)` - Check if credentials are expired
 
