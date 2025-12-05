@@ -11,6 +11,7 @@ COPY ./api ./api
 COPY ./signer ./signer
 COPY ./core ./core
 COPY ./keycast ./keycast
+COPY ./pg-hashring ./pg-hashring
 COPY ./Cargo.toml ./Cargo.toml
 COPY ./Cargo.lock ./Cargo.lock
 

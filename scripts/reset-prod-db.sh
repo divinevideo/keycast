@@ -8,6 +8,8 @@ RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+PROJECT="openvine-co"
+
 echo -e "${RED}╔════════════════════════════════════════════════════════════╗${NC}"
 echo -e "${RED}║  WARNING: This will DELETE ALL DATA in PRODUCTION database ║${NC}"
 echo -e "${RED}╚════════════════════════════════════════════════════════════╝${NC}"
@@ -21,18 +23,38 @@ if [ "$confirmation" != "RESET PRODUCTION DATABASE" ]; then
     exit 1
 fi
 
-echo ""
-echo "Fetching database URL from GCP Secret Manager..."
-DATABASE_URL=$(gcloud secrets versions access latest --secret=keycast-database-url --project=openvine-co)
+INSTANCE="openvine-co:us-central1:keycast-db"
+# Use high port unlikely to conflict with anything
+PROXY_PORT=54329
 
-echo "Connecting to production database and dropping all tables..."
-psql "$DATABASE_URL" <<EOF
--- Drop all tables in public schema
-DROP SCHEMA public CASCADE;
-CREATE SCHEMA public;
-GRANT ALL ON SCHEMA public TO postgres;
-GRANT ALL ON SCHEMA public TO public;
-EOF
+cleanup() {
+    echo "Cleaning up proxy..."
+    kill $PROXY_PID 2>/dev/null || true
+    unset PGPASSWORD
+}
+trap cleanup EXIT
+
+echo ""
+echo "Fetching database credentials..."
+
+# Extract password from DATABASE_URL secret (format: postgres://user:pass@host/db)
+# Password is set via env var, never printed
+export PGPASSWORD=$(gcloud secrets versions access latest --secret=keycast-database-url --project="$PROJECT" | sed 's|.*://[^:]*:\([^@]*\)@.*|\1|')
+
+echo "Starting Cloud SQL Proxy (will auto-terminate when done)..."
+cloud-sql-proxy "$INSTANCE" --port "$PROXY_PORT" &
+PROXY_PID=$!
+
+# Wait for proxy to be ready
+sleep 2
+
+echo "Resetting database..."
+psql -h 127.0.0.1 -p "$PROXY_PORT" -U postgres -d keycast -c "DROP SCHEMA public CASCADE;"
+psql -h 127.0.0.1 -p "$PROXY_PORT" -U postgres -d keycast -c "CREATE SCHEMA public;"
+psql -h 127.0.0.1 -p "$PROXY_PORT" -U postgres -d keycast -c "GRANT ALL ON SCHEMA public TO postgres;"
+psql -h 127.0.0.1 -p "$PROXY_PORT" -U postgres -d keycast -c "GRANT ALL ON SCHEMA public TO public;"
+
+# Cleanup happens via trap
 
 echo ""
 echo -e "${YELLOW}Database reset complete. All tables dropped.${NC}"
