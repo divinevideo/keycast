@@ -328,6 +328,7 @@ pub struct UnifiedSigner {
     key_manager: Arc<Box<dyn KeyManager>>,
     coordinator: Arc<ClusterCoordinator>,
     auth_rx: Option<AuthorizationReceiver>,
+    rpc_sender: Option<crate::work_queue::RpcSender>,
 }
 
 impl UnifiedSigner {
@@ -357,11 +358,38 @@ impl UnifiedSigner {
             key_manager: Arc::new(key_manager),
             coordinator,
             auth_rx: Some(auth_rx),
+            rpc_sender: None,
         })
     }
 
     pub fn client(&self) -> Client {
         self.client.clone()
+    }
+
+    /// Get the handlers cache (for spawning RPC workers)
+    pub fn handlers(&self) -> Cache<String, Nip46Handler> {
+        self.handlers.clone()
+    }
+
+    /// Get the database pool
+    pub fn pool(&self) -> PgPool {
+        self.pool.clone()
+    }
+
+    /// Get the key manager
+    pub fn key_manager(&self) -> Arc<Box<dyn KeyManager>> {
+        self.key_manager.clone()
+    }
+
+    /// Get the cluster coordinator
+    pub fn coordinator(&self) -> Arc<ClusterCoordinator> {
+        self.coordinator.clone()
+    }
+
+    /// Set the RPC sender for queue-based processing
+    /// When set, incoming NIP-46 requests are sent to the queue instead of spawning tasks
+    pub fn set_rpc_sender(&mut self, sender: crate::work_queue::RpcSender) {
+        self.rpc_sender = Some(sender);
     }
 
     /// No-op: authorizations are now loaded on-demand with LRU caching
@@ -511,37 +539,63 @@ impl UnifiedSigner {
         let pool = self.pool.clone();
         let key_manager = self.key_manager.clone();
         let coordinator = self.coordinator.clone();
+        let rpc_sender = self.rpc_sender.clone();
+
         self.client
             .handle_notifications(|notification| async {
                 if let RelayPoolNotification::Event { event, .. } = notification {
                     if event.kind == Kind::NostrConnect {
-                        let handlers_lock = handlers.clone();
-                        let client_clone = client.clone();
-                        let pool_clone = pool.clone();
-                        let key_manager_clone = key_manager.clone();
-                        let coordinator_clone = coordinator.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = Self::handle_nip46_request(
-                                handlers_lock,
-                                client_clone,
-                                event,
-                                &pool_clone,
-                                &key_manager_clone,
-                                &coordinator_clone,
-                            )
-                            .await
-                            {
-                                // Filter out expected noise from malformed external requests
-                                match &e {
-                                    SignerError::MissingParameter("p-tag") => {
-                                        tracing::trace!("Ignoring malformed NIP-46 request: {}", e);
-                                    }
-                                    _ => {
-                                        tracing::error!("Error handling NIP-46 request: {}", e);
+                        // Extract bunker pubkey early for queue-based processing
+                        let bunker_pubkey = event
+                            .tags
+                            .iter()
+                            .find(|tag| tag.kind() == TagKind::p())
+                            .and_then(|tag| tag.content())
+                            .map(|s| s.to_string());
+
+                        if let Some(ref sender) = rpc_sender {
+                            // QUEUE-BASED PROCESSING: Send to RPC queue for bounded concurrency
+                            if let Some(bunker_pubkey) = bunker_pubkey {
+                                let item = crate::work_queue::Nip46RpcItem {
+                                    event,
+                                    bunker_pubkey,
+                                };
+                                if let Err(e) = sender.try_send(item) {
+                                    tracing::warn!("Failed to enqueue NIP-46 request: {}", e);
+                                }
+                            } else {
+                                tracing::trace!("Ignoring NIP-46 event without p-tag");
+                            }
+                        } else {
+                            // LEGACY: Direct spawning (for backwards compatibility / testing)
+                            let handlers_lock = handlers.clone();
+                            let client_clone = client.clone();
+                            let pool_clone = pool.clone();
+                            let key_manager_clone = key_manager.clone();
+                            let coordinator_clone = coordinator.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = Self::handle_nip46_request(
+                                    handlers_lock,
+                                    client_clone,
+                                    event,
+                                    &pool_clone,
+                                    &key_manager_clone,
+                                    &coordinator_clone,
+                                )
+                                .await
+                                {
+                                    // Filter out expected noise from malformed external requests
+                                    match &e {
+                                        SignerError::MissingParameter("p-tag") => {
+                                            tracing::trace!("Ignoring malformed NIP-46 request: {}", e);
+                                        }
+                                        _ => {
+                                            tracing::error!("Error handling NIP-46 request: {}", e);
+                                        }
                                     }
                                 }
-                            }
-                        });
+                            });
+                        }
                     }
                 }
                 Ok(false) // Continue listening
@@ -682,7 +736,7 @@ impl UnifiedSigner {
         Ok(())
     }
 
-    async fn handle_nip46_request(
+    pub async fn handle_nip46_request(
         handlers: Cache<String, Nip46Handler>,
         client: Client,
         event: Box<Event>,
@@ -908,35 +962,41 @@ impl UnifiedSigner {
             event.pubkey.to_hex()
         );
 
-        // Try NIP-44 first (new standard), track which method worked
-        let (decrypted, use_nip44) = match nip44::decrypt(
-            bunker_secret,
-            &event.pubkey,
-            &event.content,
-        ) {
-            Ok(d) => {
-                tracing::debug!("Successfully decrypted with NIP-44");
-                (d, true)
-            }
-            Err(nip44_err) => {
-                tracing::debug!("NIP-44 decrypt failed ({}), trying NIP-04...", nip44_err);
-                // Fall back to NIP-04 for backwards compatibility
-                match nip04::decrypt(bunker_secret, &event.pubkey, &event.content) {
+        // Try NIP-44 first (new standard), fall back to NIP-04
+        // CPU-bound crypto wrapped in spawn_blocking to avoid blocking async runtime
+        let (decrypted, use_nip44) = {
+            let secret = bunker_secret.clone();
+            let sender_pubkey = event.pubkey;
+            let content = event.content.clone();
+
+            tokio::task::spawn_blocking(move || {
+                match nip44::decrypt(&secret, &sender_pubkey, &content) {
                     Ok(d) => {
-                        tracing::debug!("Successfully decrypted with NIP-04");
-                        (d, false)
+                        tracing::debug!("Successfully decrypted with NIP-44");
+                        Ok((d, true))
                     }
-                    Err(nip04_err) => {
-                        tracing::error!(
-                            "Both NIP-44 and NIP-04 decrypt failed - NIP-44: {}, NIP-04: {} | From: {}",
-                            nip44_err,
-                            nip04_err,
-                            event.pubkey.to_hex()
-                        );
-                        return Err(nip04_err.into());
+                    Err(nip44_err) => {
+                        tracing::debug!("NIP-44 decrypt failed ({}), trying NIP-04...", nip44_err);
+                        match nip04::decrypt(&secret, &sender_pubkey, &content) {
+                            Ok(d) => {
+                                tracing::debug!("Successfully decrypted with NIP-04");
+                                Ok((d, false))
+                            }
+                            Err(nip04_err) => {
+                                tracing::error!(
+                                    "Both NIP-44 and NIP-04 decrypt failed - NIP-44: {}, NIP-04: {} | From: {}",
+                                    nip44_err,
+                                    nip04_err,
+                                    sender_pubkey.to_hex()
+                                );
+                                Err(SignerError::from(nip04_err))
+                            }
+                        }
                     }
                 }
-            }
+            })
+            .await
+            .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
         };
 
         tracing::debug!("Decrypted NIP-46 request: {}", decrypted);
@@ -970,26 +1030,41 @@ impl UnifiedSigner {
                     "error": format!("Client not authorized: {}", e)
                 });
 
-                // Encrypt and send error response
+                // Encrypt and send error response (CPU-bound, use spawn_blocking)
                 let response_str = response.to_string();
-                let encrypted_response = if use_nip44 {
-                    nip44::encrypt(
-                        bunker_secret,
-                        &event.pubkey,
-                        &response_str,
-                        nip44::Version::V2,
-                    )?
-                } else {
-                    nip04::encrypt(bunker_secret, &event.pubkey, &response_str)?
+                let encrypted_response = {
+                    let secret = bunker_secret.clone();
+                    let pubkey = event.pubkey;
+                    let text = response_str.clone();
+                    let use_44 = use_nip44;
+                    tokio::task::spawn_blocking(move || {
+                        if use_44 {
+                            nip44::encrypt(&secret, &pubkey, &text, nip44::Version::V2)
+                                .map_err(SignerError::from)
+                        } else {
+                            nip04::encrypt(&secret, &pubkey, &text).map_err(SignerError::from)
+                        }
+                    })
+                    .await
+                    .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
                 };
 
-                let response_event = EventBuilder::new(Kind::NostrConnect, encrypted_response)
-                    .tags(vec![
-                        Tag::public_key(event.pubkey),
-                        Tag::parse(vec!["e".to_string(), event.id.to_hex()])?,
-                    ])
-                    .sign(&handler.bunker_keys)
-                    .await?;
+                let response_event = {
+                    let keys = handler.bunker_keys.clone();
+                    let content = encrypted_response;
+                    let sender = event.pubkey;
+                    let event_id = event.id.to_hex();
+                    tokio::task::spawn_blocking(move || {
+                        EventBuilder::new(Kind::NostrConnect, content)
+                            .tags(vec![
+                                Tag::public_key(sender),
+                                Tag::parse(vec!["e".to_string(), event_id]).unwrap(),
+                            ])
+                            .sign_with_keys(&keys)
+                    })
+                    .await
+                    .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
+                };
 
                 client.send_event(&response_event).await?;
                 return Ok(());
@@ -1036,12 +1111,18 @@ impl UnifiedSigner {
 
                 let third_party_pubkey = PublicKey::from_hex(third_party_hex)
                     .map_err(|e| SignerError::invalid_key(e.to_string()))?;
-                let ciphertext = nip44::encrypt(
-                    handler.user_keys.secret_key(),
-                    &third_party_pubkey,
-                    plaintext,
-                    nip44::Version::V2,
-                )?;
+
+                // CPU-bound crypto wrapped in spawn_blocking
+                let ciphertext = {
+                    let secret = handler.user_keys.secret_key().clone();
+                    let pubkey = third_party_pubkey;
+                    let text = plaintext.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        nip44::encrypt(&secret, &pubkey, &text, nip44::Version::V2)
+                    })
+                    .await
+                    .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
+                };
 
                 serde_json::json!({
                     "id": request_id,
@@ -1059,11 +1140,18 @@ impl UnifiedSigner {
 
                 let third_party_pubkey = PublicKey::from_hex(third_party_hex)
                     .map_err(|e| SignerError::invalid_key(e.to_string()))?;
-                let plaintext = nip44::decrypt(
-                    handler.user_keys.secret_key(),
-                    &third_party_pubkey,
-                    ciphertext,
-                )?;
+
+                // CPU-bound crypto wrapped in spawn_blocking
+                let plaintext = {
+                    let secret = handler.user_keys.secret_key().clone();
+                    let pubkey = third_party_pubkey;
+                    let text = ciphertext.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        nip44::decrypt(&secret, &pubkey, &text)
+                    })
+                    .await
+                    .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
+                };
 
                 serde_json::json!({
                     "id": request_id,
@@ -1081,11 +1169,18 @@ impl UnifiedSigner {
 
                 let third_party_pubkey = PublicKey::from_hex(third_party_hex)
                     .map_err(|e| SignerError::invalid_key(e.to_string()))?;
-                let ciphertext = nip04::encrypt(
-                    handler.user_keys.secret_key(),
-                    &third_party_pubkey,
-                    plaintext,
-                )?;
+
+                // CPU-bound crypto wrapped in spawn_blocking
+                let ciphertext = {
+                    let secret = handler.user_keys.secret_key().clone();
+                    let pubkey = third_party_pubkey;
+                    let text = plaintext.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        nip04::encrypt(&secret, &pubkey, &text)
+                    })
+                    .await
+                    .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
+                };
 
                 serde_json::json!({
                     "id": request_id,
@@ -1103,11 +1198,18 @@ impl UnifiedSigner {
 
                 let third_party_pubkey = PublicKey::from_hex(third_party_hex)
                     .map_err(|e| SignerError::invalid_key(e.to_string()))?;
-                let plaintext = nip04::decrypt(
-                    handler.user_keys.secret_key(),
-                    &third_party_pubkey,
-                    ciphertext,
-                )?;
+
+                // CPU-bound crypto wrapped in spawn_blocking
+                let plaintext = {
+                    let secret = handler.user_keys.secret_key().clone();
+                    let pubkey = third_party_pubkey;
+                    let text = ciphertext.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        nip04::decrypt(&secret, &pubkey, &text)
+                    })
+                    .await
+                    .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
+                };
 
                 serde_json::json!({
                     "id": request_id,
@@ -1122,31 +1224,46 @@ impl UnifiedSigner {
 
         let response = result;
 
-        // Encrypt response using the same method as the request
+        // Encrypt response using the same method as the request (CPU-bound, use spawn_blocking)
         let response_str = response.to_string();
-        let encrypted_response = if use_nip44 {
-            tracing::debug!("Encrypting response with NIP-44");
-            nip44::encrypt(
-                bunker_secret,
-                &event.pubkey,
-                &response_str,
-                nip44::Version::V2,
-            )?
-        } else {
-            tracing::debug!("Encrypting response with NIP-04");
-            nip04::encrypt(bunker_secret, &event.pubkey, &response_str)?
+        let encrypted_response = {
+            let secret = bunker_secret.clone();
+            let pubkey = event.pubkey;
+            let text = response_str.clone();
+            let use_44 = use_nip44;
+            tokio::task::spawn_blocking(move || {
+                if use_44 {
+                    tracing::debug!("Encrypting response with NIP-44");
+                    nip44::encrypt(&secret, &pubkey, &text, nip44::Version::V2)
+                        .map_err(SignerError::from)
+                } else {
+                    tracing::debug!("Encrypting response with NIP-04");
+                    nip04::encrypt(&secret, &pubkey, &text).map_err(SignerError::from)
+                }
+            })
+            .await
+            .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
         };
 
-        // Build and publish response event
+        // Build and publish response event (signing is CPU-bound, use spawn_blocking)
         tracing::debug!("Sending NIP-46 response to {}", event.pubkey);
 
-        let response_event = EventBuilder::new(Kind::NostrConnect, encrypted_response)
-            .tags(vec![
-                Tag::public_key(event.pubkey), // Tag the original requester
-                Tag::parse(vec!["e".to_string(), event.id.to_hex()])?, // Reference the request event
-            ])
-            .sign(&handler.bunker_keys)
-            .await?;
+        let response_event = {
+            let keys = handler.bunker_keys.clone();
+            let content = encrypted_response;
+            let sender = event.pubkey;
+            let event_id = event.id.to_hex();
+            tokio::task::spawn_blocking(move || {
+                EventBuilder::new(Kind::NostrConnect, content)
+                    .tags(vec![
+                        Tag::public_key(sender),
+                        Tag::parse(vec!["e".to_string(), event_id]).unwrap(),
+                    ])
+                    .sign_with_keys(&keys)
+            })
+            .await
+            .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
+        };
 
         tracing::debug!(
             "Sending response event {} (size: {} bytes)",
@@ -1289,16 +1406,25 @@ impl Nip46Handler {
         // VALIDATE PERMISSIONS BEFORE SIGNING
         self.validate_permissions_for_sign(&unsigned_event).await?;
 
-        // Sign the event with user keys
-        let signed_event = EventBuilder::new(unsigned_event.kind, &unsigned_event.content)
-            .tags(tags)
-            .custom_created_at(Timestamp::from(created_at))
-            .sign(&self.user_keys)
+        // Sign the event with user keys (CPU-bound, use spawn_blocking)
+        let signed_event = {
+            let keys = self.user_keys.clone();
+            let kind = unsigned_event.kind;
+            let content = unsigned_event.content.clone();
+            let tags = tags.clone();
+            tokio::task::spawn_blocking(move || {
+                EventBuilder::new(kind, &content)
+                    .tags(tags)
+                    .custom_created_at(Timestamp::from(created_at))
+                    .sign_with_keys(&keys)
+            })
             .await
+            .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))?
             .map_err(|e| {
                 tracing::error!("Failed to sign event: {:?}", e);
-                e
-            })?;
+                SignerError::from(e)
+            })?
+        };
 
         tracing::debug!("Successfully signed event: {}", signed_event.id);
 

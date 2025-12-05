@@ -28,5 +28,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Utilities
 dotenv = "0.15"
+num_cpus = "1.16"
 
 [dev-dependencies]

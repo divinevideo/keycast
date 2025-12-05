@@ -20,6 +20,8 @@ pub struct Metrics {
     pub nip46_requests_handler_not_found: AtomicU64,
     /// NIP-46 requests successfully processed
     pub nip46_requests_processed: AtomicU64,
+    /// NIP-46 requests dropped due to queue full (backpressure)
+    pub nip46_requests_queue_dropped: AtomicU64,
 }
 
 impl Metrics {
@@ -32,6 +34,7 @@ impl Metrics {
             nip46_requests_rejected_hashring: AtomicU64::new(0),
             nip46_requests_handler_not_found: AtomicU64::new(0),
             nip46_requests_processed: AtomicU64::new(0),
+            nip46_requests_queue_dropped: AtomicU64::new(0),
         }
     }
 
@@ -63,6 +66,11 @@ impl Metrics {
 
     pub fn inc_nip46_processed(&self) {
         self.nip46_requests_processed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_queue_dropped(&self) {
+        self.nip46_requests_queue_dropped
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -123,6 +131,13 @@ impl Metrics {
         output.push_str(&format!(
             "keycast_nip46_processed_total {}\n",
             self.nip46_requests_processed.load(Ordering::Relaxed)
+        ));
+
+        output.push_str("\n# HELP keycast_nip46_queue_dropped_total NIP-46 requests dropped due to queue full (backpressure)\n");
+        output.push_str("# TYPE keycast_nip46_queue_dropped_total counter\n");
+        output.push_str(&format!(
+            "keycast_nip46_queue_dropped_total {}\n",
+            self.nip46_requests_queue_dropped.load(Ordering::Relaxed)
         ));
 
         output

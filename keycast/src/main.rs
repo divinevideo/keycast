@@ -14,7 +14,7 @@ use keycast_core::database::Database;
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::gcp_key_manager::GcpKeyManager;
 use keycast_core::encryption::KeyManager;
-use keycast_signer::UnifiedSigner;
+use keycast_signer::{RpcQueue, UnifiedSigner};
 use pg_hashring::ClusterCoordinator;
 use nostr_sdk::Keys;
 use std::env;
@@ -232,7 +232,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     signer.load_authorizations().await?;
     signer.connect_to_relays().await?;
-    tracing::info!("✔︎ Signer daemon initialized and connected to relays");
+
+    // Create RPC queue for bounded concurrency on NIP-46 requests
+    // Workers process sign/encrypt/decrypt operations with backpressure
+    let rpc_queue = RpcQueue::new();
+    let rpc_sender = rpc_queue.sender();
+    signer.set_rpc_sender(rpc_sender);
+
+    // Spawn RPC workers - more than CPUs to handle I/O-bound operations
+    // Default: 2x CPUs (min 8) to avoid starvation when workers wait on DB/network
+    // Can override with RPC_WORKER_COUNT env var
+    let num_workers = std::env::var("RPC_WORKER_COUNT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| num_cpus::get().max(4) * 2);
+    let _rpc_worker_handles = rpc_queue.spawn_workers(
+        num_workers,
+        signer.handlers(),
+        signer.client(),
+        signer.pool(),
+        signer.key_manager(),
+        signer.coordinator(),
+    );
+    tracing::info!(
+        "✔︎ Signer daemon initialized with {} RPC workers (queue capacity: 4096)",
+        num_workers
+    );
 
     // Create API state with http_handler_cache for on-demand loading
     // Note: api no longer depends on signer's handler cache (decoupled)
@@ -430,6 +455,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("✨ Unified service running!");
     println!("   API: http://0.0.0.0:{}", api_port);
     println!("   Signer: NIP-46 relay listener active");
+    println!("   RPC workers: {} (bounded queue, capacity 4096)", num_workers);
     println!("   Instance: {} (pg-hashring LISTEN/NOTIFY enabled)", instance_id);
     println!("   HTTP handler cache: on-demand loading enabled\n");
 

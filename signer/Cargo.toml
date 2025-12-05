@@ -18,10 +18,12 @@ moka = { version = "0.12", features = ["future"] }
 axum = { workspace = true }
 chrono = { workspace = true }
 config = { workspace = true }
+crossbeam-channel = "0.5"
 ctrlc = "3.4"
 dotenv = { workspace = true }
 libc = "0.2"
 nostr-sdk = {workspace = true}
+num_cpus = "1.16"
 nostr = {workspace = true}
 nostr-connect = {version = "0.37", git="https://github.com/rust-nostr/nostr", rev="5ef7353789d54931b664639c11df1aa22e9aa37c"}
 once_cell = { workspace = true }
