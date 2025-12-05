@@ -5,7 +5,7 @@ use crate::error::{SignerError, SignerResult};
 use async_trait::async_trait;
 use keycast_core::authorization_channel::{AuthorizationCommand, AuthorizationReceiver};
 use keycast_core::encryption::KeyManager;
-use keycast_core::hashring::SignerHashRing;
+use pg_hashring::ClusterCoordinator;
 use keycast_core::metrics::METRICS;
 use keycast_core::signing_handler::SigningHandler;
 use keycast_core::types::authorization::Authorization;
@@ -15,7 +15,6 @@ use nostr_sdk::prelude::*;
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 
 /// Default timeout for relay connection operations
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -327,7 +326,7 @@ pub struct UnifiedSigner {
     client: Client,
     pool: PgPool,
     key_manager: Arc<Box<dyn KeyManager>>,
-    hashring: Arc<Mutex<SignerHashRing>>,
+    coordinator: Arc<ClusterCoordinator>,
     auth_rx: Option<AuthorizationReceiver>,
 }
 
@@ -337,7 +336,7 @@ impl UnifiedSigner {
         pool: PgPool,
         key_manager: Box<dyn KeyManager>,
         auth_rx: AuthorizationReceiver,
-        hashring: Arc<Mutex<SignerHashRing>>,
+        coordinator: Arc<ClusterCoordinator>,
     ) -> SignerResult<Self> {
         let client = Client::default();
 
@@ -356,7 +355,7 @@ impl UnifiedSigner {
             client,
             pool,
             key_manager: Arc::new(key_manager),
-            hashring,
+            coordinator,
             auth_rx: Some(auth_rx),
         })
     }
@@ -511,7 +510,7 @@ impl UnifiedSigner {
         let client = self.client.clone();
         let pool = self.pool.clone();
         let key_manager = self.key_manager.clone();
-        let hashring = self.hashring.clone();
+        let coordinator = self.coordinator.clone();
         self.client
             .handle_notifications(|notification| async {
                 if let RelayPoolNotification::Event { event, .. } = notification {
@@ -520,7 +519,7 @@ impl UnifiedSigner {
                         let client_clone = client.clone();
                         let pool_clone = pool.clone();
                         let key_manager_clone = key_manager.clone();
-                        let hashring_clone = hashring.clone();
+                        let coordinator_clone = coordinator.clone();
                         tokio::spawn(async move {
                             if let Err(e) = Self::handle_nip46_request(
                                 handlers_lock,
@@ -528,7 +527,7 @@ impl UnifiedSigner {
                                 event,
                                 &pool_clone,
                                 &key_manager_clone,
-                                &hashring_clone,
+                                &coordinator_clone,
                             )
                             .await
                             {
@@ -689,7 +688,7 @@ impl UnifiedSigner {
         event: Box<Event>,
         pool: &PgPool,
         key_manager: &Arc<Box<dyn KeyManager>>,
-        hashring: &Arc<Mutex<SignerHashRing>>,
+        coordinator: &Arc<ClusterCoordinator>,
     ) -> SignerResult<()> {
         // SINGLE SUBSCRIPTION ARCHITECTURE:
         // We receive ALL kind 24133 events from the relay (no pubkey filter)
@@ -706,16 +705,14 @@ impl UnifiedSigner {
             .ok_or(SignerError::MissingParameter("p-tag"))?;
 
         // HASHRING CHECK: Only process if this instance owns this pubkey
-        {
-            let ring = hashring.lock().await;
-            if !ring.should_handle(bunker_pubkey) {
-                METRICS.inc_nip46_rejected_hashring();
-                tracing::trace!(
-                    "Hashring: bunker {} assigned to another instance, skipping",
-                    bunker_pubkey
-                );
-                return Ok(());
-            }
+        // Note: should_handle() is lock-free (uses arc_swap)
+        if !coordinator.should_handle(bunker_pubkey) {
+            METRICS.inc_nip46_rejected_hashring();
+            tracing::trace!(
+                "Hashring: bunker {} assigned to another instance, skipping",
+                bunker_pubkey
+            );
+            return Ok(());
         }
 
         // Count all requests that pass hashring check (our responsibility)
@@ -1492,8 +1489,8 @@ mod tests {
         // Note: bunker_secret is no longer stored (derived via HKDF on demand)
         let auth_id: i32 = sqlx::query_scalar(
             "INSERT INTO oauth_authorizations
-             (user_pubkey, redirect_origin, bunker_public_key, secret, relays, tenant_id, created_at, updated_at)
-             VALUES ($1, 'http://test.example.com', $2, 'test_secret', '[\"wss://relay.test\"]', 1, NOW(), NOW())
+             (user_pubkey, redirect_origin, bunker_public_key, secret, relays, tenant_id, handle_expires_at, created_at, updated_at)
+             VALUES ($1, 'http://test.example.com', $2, 'test_secret', '[\"wss://relay.test\"]', 1, NOW() + INTERVAL '30 days', NOW(), NOW())
              RETURNING id"
         )
         .bind(&user_pubkey)
@@ -1578,8 +1575,9 @@ mod tests {
         let key_manager: Box<dyn KeyManager> =
             Box::new(keycast_core::encryption::file_key_manager::FileKeyManager::new().unwrap());
         let (_tx, rx) = tokio::sync::mpsc::channel(100);
-        let hashring = Arc::new(Mutex::new(SignerHashRing::new("test-instance".to_string())));
-        let signer = UnifiedSigner::new(pool, key_manager, rx, hashring)
+        pg_hashring::setup(&pool).await.unwrap();
+        let coordinator = Arc::new(ClusterCoordinator::start(pool.clone()).await.unwrap());
+        let signer = UnifiedSigner::new(pool, key_manager, rx, coordinator)
             .await
             .unwrap();
 
@@ -1605,8 +1603,9 @@ mod tests {
         let key_manager: Box<dyn KeyManager> =
             Box::new(keycast_core::encryption::file_key_manager::FileKeyManager::new().unwrap());
         let (_tx, rx) = tokio::sync::mpsc::channel(100);
-        let hashring = Arc::new(Mutex::new(SignerHashRing::new("test-instance".to_string())));
-        let signer = UnifiedSigner::new(pool.clone(), key_manager, rx, hashring)
+        pg_hashring::setup(&pool).await.unwrap();
+        let coordinator = Arc::new(ClusterCoordinator::start(pool.clone()).await.unwrap());
+        let signer = UnifiedSigner::new(pool.clone(), key_manager, rx, coordinator)
             .await
             .unwrap();
 

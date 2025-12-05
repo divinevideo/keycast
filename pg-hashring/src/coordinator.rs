@@ -1,9 +1,9 @@
 use crate::{Error, HashRing, InstanceRegistry};
+use arc_swap::ArcSwap;
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 
 /// Membership change event from PostgreSQL LISTEN/NOTIFY.
 #[derive(Debug, Clone, PartialEq)]
@@ -26,7 +26,7 @@ impl MembershipEvent {
 
 /// Orchestrates HashRing + PostgreSQL membership with LISTEN/NOTIFY.
 pub struct ClusterCoordinator {
-    ring: Arc<Mutex<HashRing>>,
+    ring: Arc<ArcSwap<HashRing>>,
     registry: Arc<InstanceRegistry>,
     pool: sqlx::PgPool,
     shutdown: Arc<AtomicBool>,
@@ -40,15 +40,14 @@ impl ClusterCoordinator {
         let registry = Arc::new(InstanceRegistry::register(pool.clone()).await?);
         let instance_id = registry.instance_id().to_string();
 
-        let ring = Arc::new(Mutex::new(HashRing::new(&instance_id)));
+        // Create initial ring and sync from database
+        let mut initial_ring = HashRing::new(&instance_id);
+        let instances = InstanceRegistry::get_active_instances(&pool).await?;
+        initial_ring.rebuild(instances);
+
+        let ring = Arc::new(ArcSwap::from_pointee(initial_ring));
         let shutdown = Arc::new(AtomicBool::new(false));
         let established = Arc::new(AtomicBool::new(false));
-
-        // Initial full sync
-        {
-            let instances = InstanceRegistry::get_active_instances(&pool).await?;
-            ring.lock().await.rebuild(instances);
-        }
 
         // Spawn coordination task
         let task_handle = Self::spawn_coordination_task(
@@ -71,7 +70,7 @@ impl ClusterCoordinator {
 
     fn spawn_coordination_task(
         pool: PgPool,
-        ring: Arc<Mutex<HashRing>>,
+        ring: Arc<ArcSwap<HashRing>>,
         registry: Arc<InstanceRegistry>,
         shutdown: Arc<AtomicBool>,
         established: Arc<AtomicBool>,
@@ -107,25 +106,27 @@ impl ClusterCoordinator {
                         match result {
                             Ok(notification) => {
                                 if let Some(event) = MembershipEvent::parse(notification.payload()) {
-                                    let mut ring = ring.lock().await;
+                                    // Clone current ring, modify, and swap atomically
+                                    let mut new_ring = (**ring.load()).clone();
                                     match event {
                                         MembershipEvent::Joined(id) => {
-                                            ring.add_instance(id.clone());
+                                            new_ring.add_instance(id.clone());
                                             tracing::debug!(
                                                 id = %id,
-                                                count = ring.instance_count(),
+                                                count = new_ring.instance_count(),
                                                 "Instance joined"
                                             );
                                         }
                                         MembershipEvent::Left(id) => {
-                                            ring.remove_instance(&id);
+                                            new_ring.remove_instance(&id);
                                             tracing::debug!(
                                                 id = %id,
-                                                count = ring.instance_count(),
+                                                count = new_ring.instance_count(),
                                                 "Instance left"
                                             );
                                         }
                                     }
+                                    ring.store(Arc::new(new_ring));
                                 }
                             }
                             Err(e) => {
@@ -146,12 +147,14 @@ impl ClusterCoordinator {
 
                         match InstanceRegistry::get_active_instances(&pool).await {
                             Ok(instances) => {
-                                let mut ring = ring.lock().await;
-                                ring.rebuild(instances);
+                                // Clone current ring, rebuild, and swap atomically
+                                let mut new_ring = (**ring.load()).clone();
+                                new_ring.rebuild(instances);
                                 tracing::trace!(
-                                    count = ring.instance_count(),
+                                    count = new_ring.instance_count(),
                                     "Heartbeat: hashring synced"
                                 );
+                                ring.store(Arc::new(new_ring));
                             }
                             Err(e) => {
                                 tracing::error!("Failed to get instances: {}", e);
@@ -164,8 +167,10 @@ impl ClusterCoordinator {
     }
 
     /// Check if this coordinator should handle the given key.
-    pub async fn should_handle(&self, key: &str) -> bool {
-        self.ring.lock().await.should_handle(key)
+    ///
+    /// This is a lock-free operation using atomic pointer loading.
+    pub fn should_handle(&self, key: &str) -> bool {
+        self.ring.load().should_handle(key)
     }
 
     /// Wait until LISTEN is established.
@@ -181,8 +186,10 @@ impl ClusterCoordinator {
     }
 
     /// Get current instance count in the ring.
-    pub async fn instance_count(&self) -> usize {
-        self.ring.lock().await.instance_count()
+    ///
+    /// This is a lock-free operation using atomic pointer loading.
+    pub fn instance_count(&self) -> usize {
+        self.ring.load().instance_count()
     }
 
     /// Manually refresh the hashring from the database.
@@ -197,11 +204,12 @@ impl ClusterCoordinator {
         // Get fresh list of active instances
         let instances = InstanceRegistry::get_active_instances(&self.pool).await?;
 
-        // Rebuild the ring
-        let mut ring = self.ring.lock().await;
-        ring.rebuild(instances);
+        // Clone current ring, rebuild, and swap atomically
+        let mut new_ring = (**self.ring.load()).clone();
+        new_ring.rebuild(instances);
 
-        tracing::debug!(count = ring.instance_count(), "Manual hashring refresh");
+        tracing::debug!(count = new_ring.instance_count(), "Manual hashring refresh");
+        self.ring.store(Arc::new(new_ring));
         Ok(())
     }
 
@@ -278,8 +286,8 @@ mod tests {
         coordinator.wait_for_established().await;
 
         // Solo instance should handle everything
-        assert!(coordinator.should_handle("any-key").await);
-        assert!(coordinator.should_handle("another-key").await);
+        assert!(coordinator.should_handle("any-key"));
+        assert!(coordinator.should_handle("another-key"));
 
         coordinator.shutdown().await.unwrap();
     }
@@ -303,10 +311,10 @@ mod tests {
         let mut handled_by_2 = 0;
         for i in 0..100 {
             let key = format!("key-{}", i);
-            if coord1.should_handle(&key).await {
+            if coord1.should_handle(&key) {
                 handled_by_1 += 1;
             }
-            if coord2.should_handle(&key).await {
+            if coord2.should_handle(&key) {
                 handled_by_2 += 1;
             }
         }
@@ -348,7 +356,7 @@ mod tests {
         let mut before = 0;
         for i in 0..100 {
             let key = format!("key-{}", i);
-            if coord1.should_handle(&key).await {
+            if coord1.should_handle(&key) {
                 before += 1;
             }
         }
@@ -364,7 +372,7 @@ mod tests {
         let mut after = 0;
         for i in 0..100 {
             let key = format!("key-{}", i);
-            if coord1.should_handle(&key).await {
+            if coord1.should_handle(&key) {
                 after += 1;
             }
         }
@@ -390,7 +398,7 @@ mod tests {
         // Poll until coord1 sees coord2
         let mut attempts = 0;
         loop {
-            let count = coord1.instance_count().await;
+            let count = coord1.instance_count();
             if count == 2 {
                 break;
             }

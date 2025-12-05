@@ -10,6 +10,7 @@ type DeterministicHasher = BuildHasherDefault<DefaultHasher>;
 /// - Guaranteed optimal disruption (minimal key remapping on node changes)
 /// - Extremely fast lookups
 /// - Uniform load distribution
+#[derive(Clone)]
 pub struct HashRing {
     anchor: Option<AnchorHash<u64, String, DeterministicHasher>>,
     my_instance_id: String,

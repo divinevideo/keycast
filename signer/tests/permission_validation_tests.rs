@@ -211,8 +211,8 @@ async fn create_oauth_authorization(
     let redirect_origin = format!("https://test-{}.example.com", Uuid::new_v4());
     let oauth_id: i32 = sqlx::query_scalar(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, policy_id, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, 'Test App', $3, $4, $5, $6, $7, NOW(), NOW())
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, policy_id, tenant_id, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, 'Test App', $3, $4, $5, $6, $7, NOW() + INTERVAL '30 days', NOW(), NOW())
          RETURNING id"
     )
     .bind(user_keys.public_key().to_hex())
@@ -598,8 +598,8 @@ async fn create_oauth_authorization_with_expiry(
     let redirect_origin = format!("https://expiry-test-{}.example.com", Uuid::new_v4());
     sqlx::query(
         "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, policy_id, tenant_id, expires_at, created_at, updated_at)
-         VALUES ($1, $2, 'Test App', $3, $4, $5, NULL, $6, $7, NOW(), NOW())"
+         (user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, policy_id, tenant_id, expires_at, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, 'Test App', $3, $4, $5, NULL, $6, $7, NOW() + INTERVAL '30 days', NOW(), NOW())"
     )
     .bind(&user_pubkey)
     .bind(&redirect_origin)

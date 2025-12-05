@@ -11,6 +11,7 @@ PostgreSQL-backed cluster membership with consistent hashing for Rust.
 - **Near-instant membership updates** via PostgreSQL LISTEN/NOTIFY (~5-20ms)
 - **Crash detection** via heartbeat fallback (30s)
 - **Graceful shutdown** with drain period (no dropped events)
+- **Lock-free reads** via `arc_swap` for zero-contention key lookups
 
 ## Quick Start
 
@@ -28,8 +29,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let coordinator = ClusterCoordinator::start(pool).await?;
     coordinator.wait_for_established().await;
 
-    // Check if this instance should handle a key
-    if coordinator.should_handle("user-123").await {
+    // Check if this instance should handle a key (lock-free, no await!)
+    if coordinator.should_handle("user-123") {
         // Process the request - only one instance in the cluster will return true
     }
 
@@ -110,13 +111,13 @@ let coordinator = ClusterCoordinator::start(pool).await?;
 // Wait for LISTEN to be established (useful in tests)
 coordinator.wait_for_established().await;
 
-// Check if this instance owns a key
-if coordinator.should_handle("some-key").await {
+// Check if this instance owns a key (lock-free, no await!)
+if coordinator.should_handle("some-key") {
     // Handle it
 }
 
-// Get instance count in the cluster
-let count = coordinator.instance_count().await;
+// Get instance count in the cluster (lock-free, no await!)
+let count = coordinator.instance_count();
 
 // Force refresh from database (useful after crash recovery)
 coordinator.refresh().await?;

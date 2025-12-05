@@ -31,8 +31,8 @@ async fn test_scale_up_from_1_to_5_instances() {
     coordinators[0].wait_for_established().await;
 
     // Verify solo instance handles all keys
-    assert!(coordinators[0].should_handle("key-1").await);
-    assert!(coordinators[0].should_handle("key-99").await);
+    assert!(coordinators[0].should_handle("key-1"));
+    assert!(coordinators[0].should_handle("key-99"));
 
     // Scale up to 5 instances
     for _ in 1..5 {
@@ -51,7 +51,7 @@ async fn test_scale_up_from_1_to_5_instances() {
         let key = format!("key-{}", key_idx);
         let mut handlers = 0;
         for coord in &coordinators {
-            if coord.should_handle(&key).await {
+            if coord.should_handle(&key) {
                 handlers += 1;
             }
         }
@@ -64,7 +64,7 @@ async fn test_scale_up_from_1_to_5_instances() {
     for (i, coord) in coordinators.iter().enumerate() {
         let mut handled = 0;
         for k in 0..100 {
-            if coord.should_handle(&format!("key-{}", k)).await {
+            if coord.should_handle(&format!("key-{}", k)) {
                 handled += 1;
             }
         }
@@ -103,7 +103,7 @@ async fn test_scale_down_gracefully() {
     let mut coord2_keys = Vec::new();
     for i in 0..100 {
         let key = format!("key-{}", i);
-        if coord2.should_handle(&key).await {
+        if coord2.should_handle(&key) {
             coord2_keys.push(key);
         }
     }
@@ -115,8 +115,8 @@ async fn test_scale_down_gracefully() {
 
     // coord2's keys should now be handled by coord1 or coord3
     for key in &coord2_keys {
-        let handled_by_1 = coord1.should_handle(key).await;
-        let handled_by_3 = coord3.should_handle(key).await;
+        let handled_by_1 = coord1.should_handle(key);
+        let handled_by_3 = coord3.should_handle(key);
         assert!(
             handled_by_1 || handled_by_3,
             "Key {} orphaned after coord2 shutdown",
@@ -163,13 +163,13 @@ async fn test_rolling_restart_no_orphans() {
     for key_idx in 0..100 {
         let key = format!("key-{}", key_idx);
         let mut handlers = 0;
-        if coord1.should_handle(&key).await {
+        if coord1.should_handle(&key) {
             handlers += 1;
         }
-        if coord2.should_handle(&key).await {
+        if coord2.should_handle(&key) {
             handlers += 1;
         }
-        if coord3.should_handle(&key).await {
+        if coord3.should_handle(&key) {
             handlers += 1;
         }
         assert_eq!(
@@ -202,7 +202,7 @@ async fn test_crash_recovery_via_heartbeat() {
     let mut coord2_key = None;
     for i in 0..100 {
         let key = format!("key-{}", i);
-        if coord2.should_handle(&key).await {
+        if coord2.should_handle(&key) {
             coord2_key = Some(key);
             break;
         }
@@ -217,7 +217,7 @@ async fn test_crash_recovery_via_heartbeat() {
     // Immediately after crash, coord1 still thinks coord2 owns the key
     // (because no notification was sent)
     assert!(
-        !coord1.should_handle(&coord2_key).await,
+        !coord1.should_handle(&coord2_key),
         "Immediately after crash, coord1 should NOT handle coord2's key (stale ring)"
     );
 
@@ -235,13 +235,13 @@ async fn test_crash_recovery_via_heartbeat() {
 
     // After refresh, coord1 should now handle the key that coord2 used to own
     assert!(
-        coord1.should_handle(&coord2_key).await,
+        coord1.should_handle(&coord2_key),
         "After refresh, coord1 should handle coord2's former key"
     );
 
     // Verify instance count is now 1
     assert_eq!(
-        coord1.instance_count().await,
+        coord1.instance_count(),
         1,
         "After refresh, only coord1 should be in the ring"
     );
@@ -274,7 +274,7 @@ async fn test_concurrent_joins() {
 
     // All should see 5 instances
     for (i, coord) in coordinators.iter().enumerate() {
-        let count = coord.instance_count().await;
+        let count = coord.instance_count();
         assert_eq!(
             count, 5,
             "Coordinator {} sees {} instances (expected 5)",
@@ -287,7 +287,7 @@ async fn test_concurrent_joins() {
         let key = format!("key-{}", key_idx);
         let mut handlers = 0;
         for coord in &coordinators {
-            if coord.should_handle(&key).await {
+            if coord.should_handle(&key) {
                 handlers += 1;
             }
         }
@@ -319,7 +319,7 @@ async fn test_shutdown_drain_period() {
     let mut coord2_key = None;
     for i in 0..100 {
         let key = format!("key-{}", i);
-        if coord2.should_handle(&key).await {
+        if coord2.should_handle(&key) {
             coord2_key = Some(key);
             break;
         }
@@ -328,7 +328,7 @@ async fn test_shutdown_drain_period() {
 
     // Before shutdown, coord1 does NOT handle coord2's key
     assert!(
-        !coord1.should_handle(&coord2_key).await,
+        !coord1.should_handle(&coord2_key),
         "Before shutdown, coord1 should NOT handle coord2's key"
     );
 
@@ -348,13 +348,13 @@ async fn test_shutdown_drain_period() {
     // IMMEDIATELY after shutdown (no sleep!), coord1 should already handle the key
     // This proves the drain period gave coord1 time to receive the notification
     assert!(
-        coord1.should_handle(&coord2_key).await,
+        coord1.should_handle(&coord2_key),
         "Immediately after shutdown, coord1 should handle coord2's former key (drain worked)"
     );
 
     // Verify coord1 now sees only 1 instance
     assert_eq!(
-        coord1.instance_count().await,
+        coord1.instance_count(),
         1,
         "After shutdown, only coord1 should remain"
     );

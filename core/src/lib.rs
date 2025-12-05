@@ -4,8 +4,6 @@ pub mod signing_session;
 pub mod custom_permissions;
 pub mod database;
 pub mod encryption;
-pub mod hashring;
-pub mod instance_registry;
 pub mod metrics;
 pub mod oauth_scopes;
 pub mod signing_handler;

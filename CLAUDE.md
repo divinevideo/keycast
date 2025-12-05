@@ -11,6 +11,7 @@ Keycast is a secure remote signing and permissions system for teams using Nostr.
 - **api**: HTTP API library - team management, authentication, OAuth 2.0 (library only, no binary)
 - **core**: Shared business logic, database models, encryption, permissions system
 - **signer**: NIP-46 signer library - handles multiple bunker connections
+- **pg-hashring**: PostgreSQL-backed cluster coordination with consistent hashing (LISTEN/NOTIFY)
 
 **Client libraries:**
 - **keycast-login**: TypeScript/JavaScript OAuth client with storage abstraction

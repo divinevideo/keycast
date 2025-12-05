@@ -14,16 +14,15 @@ use keycast_core::database::Database;
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::gcp_key_manager::GcpKeyManager;
 use keycast_core::encryption::KeyManager;
-use keycast_core::hashring::SignerHashRing;
-use keycast_core::instance_registry::InstanceRegistry;
 use keycast_signer::UnifiedSigner;
+use pg_hashring::ClusterCoordinator;
 use nostr_sdk::Keys;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Notify;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -178,17 +177,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database = Database::new(database_url.clone(), database_migrations.clone()).await?;
     tracing::info!("✔︎ Database initialized at {:?}", database_url);
 
-    // Register this instance in the signer registry (for hashring coordination)
-    let instance_registry = InstanceRegistry::register(database.pool.clone()).await?;
-    let instance_id = instance_registry.instance_id().to_string();
-    tracing::info!("✔︎ Registered signer instance: {}", instance_id);
-
-    // Initialize hashring with just this instance for now
-    let hashring = Arc::new(Mutex::new(SignerHashRing::new(instance_id.clone())));
-    {
-        let mut ring = hashring.lock().await;
-        ring.rebuild(vec![instance_id.clone()]);
-    }
+    // Initialize cluster coordination with pg-hashring
+    // This handles instance registration, LISTEN/NOTIFY for membership changes, and heartbeats
+    pg_hashring::setup(&database.pool).await?;
+    let coordinator = Arc::new(ClusterCoordinator::start(database.pool.clone()).await?);
+    coordinator.wait_for_established().await;
+    let instance_id = coordinator.instance_id().to_string();
+    tracing::info!("✔︎ Cluster coordinator started: {} (LISTEN/NOTIFY enabled)", instance_id);
 
     // Setup key managers (one for signer, one for API - they're cheap to create)
     let use_gcp_kms = env::var("USE_GCP_KMS").unwrap_or_else(|_| "false".to_string()) == "true";
@@ -232,7 +227,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         database.pool.clone(),
         signer_key_manager,
         auth_rx,
-        hashring.clone(),
+        coordinator.clone(),
     )
     .await?;
     signer.load_authorizations().await?;
@@ -429,43 +424,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         signer.run().await.unwrap();
     });
 
-    // Spawn heartbeat and hashring coordination task
-    let heartbeat_registry = instance_registry;
-    let heartbeat_hashring = hashring.clone();
-    let heartbeat_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
-        loop {
-            interval.tick().await;
-
-            // Send heartbeat
-            if let Err(e) = heartbeat_registry.heartbeat().await {
-                tracing::error!("Heartbeat failed: {}", e);
-                continue;
-            }
-
-            // Cleanup stale instances
-            if let Err(e) = heartbeat_registry.cleanup_stale().await {
-                tracing::warn!("Failed to cleanup stale instances: {}", e);
-            }
-
-            // Get active instances and rebuild hashring
-            match heartbeat_registry.get_active_instances().await {
-                Ok(instances) => {
-                    let mut ring = heartbeat_hashring.lock().await;
-                    ring.rebuild(instances.clone());
-                    tracing::debug!("Hashring rebuilt with {} instances", instances.len());
-                }
-                Err(e) => {
-                    tracing::error!("Failed to get active instances: {}", e);
-                }
-            }
-        }
-    });
+    // Note: Heartbeat and hashring coordination is now handled internally by ClusterCoordinator
+    // via LISTEN/NOTIFY for fast updates (~5-20ms) and 30s heartbeat for crash detection
 
     println!("✨ Unified service running!");
     println!("   API: http://0.0.0.0:{}", api_port);
     println!("   Signer: NIP-46 relay listener active");
-    println!("   Instance: {} (hashring enabled)", instance_id);
+    println!("   Instance: {} (pg-hashring LISTEN/NOTIFY enabled)", instance_id);
     println!("   HTTP handler cache: on-demand loading enabled\n");
 
     // Wait for shutdown signal
@@ -474,10 +439,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Shutting down gracefully...");
 
-    // Stop heartbeat task
-    heartbeat_handle.abort();
-
     // Shutdown signer client (disconnect from relays)
+    // Note: ClusterCoordinator will be dropped automatically, triggering deregister
     client_for_shutdown.shutdown().await;
 
     // Wait for API server to drain (max 25s to leave buffer before Cloud Run's 30s timeout)
