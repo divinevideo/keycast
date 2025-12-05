@@ -216,8 +216,7 @@ async fn run_listener(
 
                 if channel == "cluster_membership" {
                     // Membership change
-                    if payload.starts_with("joined:") {
-                        let new_id = &payload[7..];
+                    if let Some(new_id) = payload.strip_prefix("joined:") {
                         if !new_id.starts_with(&short_id) {
                             tokio::time::sleep(Duration::from_millis(100)).await;
                             let count = coordinator.instance_count();
@@ -228,8 +227,7 @@ async fn run_listener(
                             print!("[{}] > ", short_id);
                             let _ = io::stdout().flush();
                         }
-                    } else if payload.starts_with("left:") {
-                        let left_id = &payload[5..];
+                    } else if let Some(left_id) = payload.strip_prefix("left:") {
                         if !left_id.starts_with(&short_id) {
                             tokio::time::sleep(Duration::from_millis(100)).await;
                             let count = coordinator.instance_count();
