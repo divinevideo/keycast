@@ -97,34 +97,11 @@ CREATE SEQUENCE public.key_export_tokens_id_seq
 
 ALTER SEQUENCE public.key_export_tokens_id_seq OWNED BY public.key_export_tokens.id;
 
-CREATE TABLE public.oauth_applications (
-    id integer NOT NULL,
-    redirect_origin text NOT NULL,
-    display_name text,
-    name text NOT NULL,
-    redirect_uris text NOT NULL,
-    client_secret text NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    tenant_id bigint DEFAULT 1 NOT NULL,
-    policy_id integer
-);
-
-CREATE SEQUENCE public.oauth_applications_id_seq
-    AS integer
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-ALTER SEQUENCE public.oauth_applications_id_seq OWNED BY public.oauth_applications.id;
-
 CREATE TABLE public.oauth_authorizations (
     id integer NOT NULL,
     user_pubkey character(64) NOT NULL,
     redirect_origin text,  -- nullable for bunker-only apps (no OAuth flow)
-    application_id integer,
+    client_id text,        -- app display name from OAuth request
     bunker_public_key character(64) NOT NULL,
     secret text NOT NULL,
     relays text NOT NULL,
@@ -137,7 +114,10 @@ CREATE TABLE public.oauth_authorizations (
     connected_client_pubkey text,
     connected_at timestamp with time zone,
     last_activity timestamp with time zone,
-    activity_count integer DEFAULT 0 NOT NULL
+    activity_count integer DEFAULT 0 NOT NULL,
+    revoked_at timestamp with time zone,
+    authorization_handle character(64),
+    handle_expires_at timestamp with time zone NOT NULL
 );
 
 CREATE SEQUENCE public.oauth_authorizations_id_seq
@@ -153,14 +133,19 @@ ALTER SEQUENCE public.oauth_authorizations_id_seq OWNED BY public.oauth_authoriz
 CREATE TABLE public.oauth_codes (
     code text NOT NULL,
     user_pubkey character(64) NOT NULL,
-    application_id integer NOT NULL,
+    client_id text,
     redirect_uri text NOT NULL,
     scope text NOT NULL,
     expires_at timestamp with time zone NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     tenant_id bigint DEFAULT 1 NOT NULL,
     code_challenge text,
-    code_challenge_method text
+    code_challenge_method text,
+    pending_email text,
+    pending_password_hash text,
+    pending_email_verification_token text,
+    pending_encrypted_secret bytea,
+    previous_auth_id integer
 );
 
 CREATE TABLE public.password_reset_tokens (
@@ -408,8 +393,6 @@ ALTER TABLE ONLY public.key_export_log ALTER COLUMN id SET DEFAULT nextval('publ
 
 ALTER TABLE ONLY public.key_export_tokens ALTER COLUMN id SET DEFAULT nextval('public.key_export_tokens_id_seq'::regclass);
 
-ALTER TABLE ONLY public.oauth_applications ALTER COLUMN id SET DEFAULT nextval('public.oauth_applications_id_seq'::regclass);
-
 ALTER TABLE ONLY public.oauth_authorizations ALTER COLUMN id SET DEFAULT nextval('public.oauth_authorizations_id_seq'::regclass);
 
 ALTER TABLE ONLY public.permissions ALTER COLUMN id SET DEFAULT nextval('public.permissions_id_seq'::regclass);
@@ -452,12 +435,6 @@ ALTER TABLE ONLY public.key_export_tokens
 
 ALTER TABLE ONLY public.key_export_tokens
     ADD CONSTRAINT key_export_tokens_token_key UNIQUE (token);
-
-ALTER TABLE ONLY public.oauth_applications
-    ADD CONSTRAINT oauth_applications_pkey PRIMARY KEY (id);
-
-ALTER TABLE ONLY public.oauth_authorizations
-    ADD CONSTRAINT oauth_auth_user_origin_unique UNIQUE (tenant_id, user_pubkey, redirect_origin);
 
 ALTER TABLE ONLY public.oauth_authorizations
     ADD CONSTRAINT oauth_authorizations_pkey PRIMARY KEY (id);
@@ -538,16 +515,19 @@ CREATE INDEX idx_key_export_tokens_token ON public.key_export_tokens USING btree
 
 CREATE INDEX idx_key_export_tokens_user ON public.key_export_tokens USING btree (user_pubkey);
 
-CREATE UNIQUE INDEX idx_oauth_applications_redirect_origin_tenant ON public.oauth_applications USING btree (tenant_id, redirect_origin);
-
-
-CREATE INDEX idx_oauth_applications_tenant_id ON public.oauth_applications USING btree (tenant_id);
-
-CREATE INDEX idx_oauth_applications_policy_id ON public.oauth_applications USING btree (policy_id);
-
-CREATE INDEX idx_oauth_auth_app ON public.oauth_authorizations USING btree (application_id);
-
 CREATE INDEX idx_oauth_auth_user ON public.oauth_authorizations USING btree (user_pubkey);
+
+-- Index for active (non-revoked) authorizations
+CREATE INDEX oauth_auth_active_idx ON public.oauth_authorizations (tenant_id, user_pubkey) WHERE revoked_at IS NULL;
+
+-- Index for signer daemon fast path (non-revoked by bunker pubkey)
+CREATE INDEX oauth_auth_bunker_active_idx ON public.oauth_authorizations (bunker_public_key) WHERE revoked_at IS NULL;
+
+-- Partial unique index for authorization handles (only active ones)
+CREATE UNIQUE INDEX idx_oauth_auth_handle ON public.oauth_authorizations (authorization_handle) WHERE authorization_handle IS NOT NULL AND revoked_at IS NULL;
+
+-- Index for handle expiration queries
+CREATE INDEX idx_oauth_auth_handle_expires ON public.oauth_authorizations (handle_expires_at) WHERE revoked_at IS NULL;
 
 CREATE INDEX idx_oauth_authorizations_bunker_tenant ON public.oauth_authorizations USING btree (bunker_public_key, tenant_id);
 
@@ -645,8 +625,6 @@ CREATE UNIQUE INDEX users_pubkey_idx ON public.users USING btree (pubkey);
 
 CREATE TRIGGER authorizations_update_trigger BEFORE UPDATE ON public.authorizations FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
 
-CREATE TRIGGER oauth_applications_update_trigger BEFORE UPDATE ON public.oauth_applications FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
-
 CREATE TRIGGER oauth_authorizations_update_trigger BEFORE UPDATE ON public.oauth_authorizations FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
 
 CREATE TRIGGER permissions_update_trigger BEFORE UPDATE ON public.permissions FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
@@ -690,15 +668,6 @@ ALTER TABLE ONLY public.key_export_log
 ALTER TABLE ONLY public.key_export_tokens
     ADD CONSTRAINT key_export_tokens_user_pubkey_fkey FOREIGN KEY (user_pubkey) REFERENCES public.users(pubkey) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.oauth_applications
-    ADD CONSTRAINT oauth_applications_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
-
-ALTER TABLE ONLY public.oauth_applications
-    ADD CONSTRAINT oauth_applications_policy_id_fkey FOREIGN KEY (policy_id) REFERENCES public.policies(id);
-
-ALTER TABLE ONLY public.oauth_authorizations
-    ADD CONSTRAINT oauth_authorizations_application_id_fkey FOREIGN KEY (application_id) REFERENCES public.oauth_applications(id);
-
 ALTER TABLE ONLY public.oauth_authorizations
     ADD CONSTRAINT oauth_authorizations_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
 
@@ -706,13 +675,7 @@ ALTER TABLE ONLY public.oauth_authorizations
     ADD CONSTRAINT oauth_authorizations_user_pubkey_fkey FOREIGN KEY (user_pubkey) REFERENCES public.users(pubkey);
 
 ALTER TABLE ONLY public.oauth_codes
-    ADD CONSTRAINT oauth_codes_application_id_fkey FOREIGN KEY (application_id) REFERENCES public.oauth_applications(id);
-
-ALTER TABLE ONLY public.oauth_codes
     ADD CONSTRAINT oauth_codes_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
-
-ALTER TABLE ONLY public.oauth_codes
-    ADD CONSTRAINT oauth_codes_user_pubkey_fkey FOREIGN KEY (user_pubkey) REFERENCES public.users(pubkey);
 
 ALTER TABLE ONLY public.password_reset_tokens
     ADD CONSTRAINT password_reset_tokens_user_pubkey_fkey FOREIGN KEY (user_pubkey) REFERENCES public.users(pubkey) ON DELETE CASCADE;
@@ -733,9 +696,6 @@ ALTER TABLE ONLY public.policy_permissions
 
 ALTER TABLE ONLY public.policy_permissions
     ADD CONSTRAINT policy_permissions_policy_id_fkey FOREIGN KEY (policy_id) REFERENCES public.policies(id);
-
-ALTER TABLE ONLY public.signing_activity
-    ADD CONSTRAINT signing_activity_application_id_fkey FOREIGN KEY (application_id) REFERENCES public.oauth_applications(id) ON DELETE SET NULL;
 
 ALTER TABLE ONLY public.signing_activity
     ADD CONSTRAINT signing_activity_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
@@ -986,60 +946,3 @@ WHERE p.name = 'Full Access'
     SELECT 1 FROM policy_permissions pp
     WHERE pp.policy_id = p.id AND pp.permission_id = perm.id
   );
-
--- Note: policy is on oauth_authorizations, not oauth_applications
--- redirect_origin is the secure identifier (cannot be spoofed)
-INSERT INTO oauth_applications (
-    redirect_origin,
-    display_name,
-    client_secret,
-    name,
-    redirect_uris,
-    tenant_id,
-    created_at,
-    updated_at
-)
-VALUES (
-    'app://keycast-login',
-    'keycast-login',
-    'not-used-for-personal-auth',
-    'Personal Keycast Bunker',
-    'http://localhost:3000/api/connect,https://login.divine.video/api/connect',
-    1,
-    NOW(),
-    NOW()
-)
-ON CONFLICT (tenant_id, redirect_origin)
-DO UPDATE SET
-    client_secret = EXCLUDED.client_secret,
-    name = EXCLUDED.name,
-    redirect_uris = EXCLUDED.redirect_uris,
-    updated_at = NOW();
-
--- Divine OAuth application (third-party app)
-INSERT INTO oauth_applications (
-    redirect_origin,
-    display_name,
-    client_secret,
-    name,
-    redirect_uris,
-    tenant_id,
-    created_at,
-    updated_at
-)
-VALUES (
-    'https://divine.video',
-    'divine',
-    'public-client',
-    'diVine Login Demo',
-    'https://divine.video/callback,http://localhost:5173/callback,http://localhost:3000/callback,divine://callback',
-    1,
-    NOW(),
-    NOW()
-)
-ON CONFLICT (tenant_id, redirect_origin)
-DO UPDATE SET
-    client_secret = EXCLUDED.client_secret,
-    name = EXCLUDED.name,
-    redirect_uris = EXCLUDED.redirect_uris,
-    updated_at = NOW();
