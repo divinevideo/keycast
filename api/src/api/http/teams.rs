@@ -10,7 +10,7 @@ use nostr_sdk::prelude::*;
 use sqlx::PgPool;
 
 use crate::api::error::{ApiError, ApiResult};
-use crate::api::extractors::DualAuthEvent;
+use crate::api::extractors::UcanAuth;
 use crate::state::get_key_manager;
 use keycast_core::custom_permissions::{allowed_kinds::AllowedKindsConfig, AVAILABLE_PERMISSIONS};
 use keycast_core::types::authorization::{
@@ -25,7 +25,7 @@ use keycast_core::types::user::{TeamUser, User};
 pub async fn list_teams(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
+    UcanAuth(user_pubkey_hex): UcanAuth,
 ) -> ApiResult<Json<Vec<TeamWithRelations>>> {
     let tenant_id = tenant.0.id;
 
@@ -47,7 +47,7 @@ pub async fn list_teams(
 pub async fn create_team(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
+    UcanAuth(user_pubkey_hex): UcanAuth,
     Json(request): Json<CreateTeamRequest>,
 ) -> ApiResult<Json<TeamWithRelations>> {
     let tenant_id = tenant.0.id;
@@ -172,7 +172,7 @@ pub async fn create_team(
 pub async fn get_team(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
+    UcanAuth(user_pubkey_hex): UcanAuth,
     Path(team_id): Path<i32>,
 ) -> ApiResult<Json<TeamWithRelations>> {
     let tenant_id = tenant.0.id;
@@ -186,7 +186,7 @@ pub async fn get_team(
 pub async fn update_team(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
+    UcanAuth(user_pubkey_hex): UcanAuth,
     Json(request): Json<UpdateTeamRequest>,
 ) -> ApiResult<Json<Team>> {
     let tenant_id = tenant.0.id;
@@ -214,7 +214,7 @@ pub async fn update_team(
 pub async fn delete_team(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
+    UcanAuth(user_pubkey_hex): UcanAuth,
     Path(team_id): Path<i32>,
 ) -> ApiResult<StatusCode> {
     let tenant_id = tenant.0.id;
@@ -320,7 +320,7 @@ pub async fn delete_team(
 pub async fn add_user(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
+    UcanAuth(user_pubkey_hex): UcanAuth,
     Path(team_id): Path<i32>,
     Json(request): Json<AddTeammateRequest>,
 ) -> ApiResult<Json<TeamUser>> {
@@ -384,7 +384,7 @@ pub async fn add_user(
 pub async fn remove_user(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
+    UcanAuth(user_pubkey_hex): UcanAuth,
     Path((team_id, user_pubkey)): Path<(i32, String)>,
 ) -> ApiResult<StatusCode> {
     let tenant_id = tenant.0.id;
@@ -426,7 +426,7 @@ pub async fn remove_user(
 pub async fn add_key(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
+    UcanAuth(user_pubkey_hex): UcanAuth,
     Path(team_id): Path<i32>,
     Json(request): Json<AddKeyRequest>,
 ) -> ApiResult<Json<PublicStoredKey>> {
@@ -470,7 +470,7 @@ pub async fn add_key(
 pub async fn remove_key(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
+    UcanAuth(user_pubkey_hex): UcanAuth,
     Path((team_id, pubkey)): Path<(i32, String)>,
 ) -> ApiResult<StatusCode> {
     let tenant_id = tenant.0.id;
@@ -523,7 +523,7 @@ pub async fn remove_key(
 pub async fn get_key(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
+    UcanAuth(user_pubkey_hex): UcanAuth,
     Path((team_id, pubkey)): Path<(i32, String)>,
 ) -> ApiResult<Json<KeyWithRelations>> {
     let tenant_id = tenant.0.id;
@@ -615,7 +615,7 @@ pub async fn get_key(
 pub async fn add_authorization(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
+    UcanAuth(user_pubkey_hex): UcanAuth,
     Path((team_id, pubkey)): Path<(i32, String)>,
     Json(request): Json<AddAuthorizationRequest>,
 ) -> ApiResult<Json<Authorization>> {
@@ -695,7 +695,7 @@ pub async fn add_authorization(
 pub async fn delete_authorization(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
+    UcanAuth(user_pubkey_hex): UcanAuth,
     Path((team_id, pubkey, auth_id)): Path<(i32, String, i32)>,
 ) -> ApiResult<StatusCode> {
     let tenant_id = tenant.0.id;
@@ -745,7 +745,7 @@ pub async fn delete_authorization(
 pub async fn add_policy(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    DualAuthEvent(user_pubkey_hex): DualAuthEvent,
+    UcanAuth(user_pubkey_hex): UcanAuth,
     Path(team_id): Path<i32>,
     Json(request): Json<CreatePolicyRequest>,
 ) -> ApiResult<Json<PolicyWithPermissions>> {

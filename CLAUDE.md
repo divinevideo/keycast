@@ -77,27 +77,24 @@ cd api && cargo test --test oauth_unit_test
 
 ## Architecture
 
-### Multi-Authentication System
+### Authentication System
 
-The web admin supports three authentication methods, all converging to unified NIP-98 request signing:
+All API authentication uses **UCAN tokens** (Bearer token or `keycast_session` cookie).
 
-1. **NIP-07 Browser Extension**: For whitelisted team admins with browser extension (nos2x, Alby, etc.)
-2. **Email/Password**: For personal users, sets UCAN session cookie (bunker created separately)
-3. **NIP-46 Bunker URL**: For power users with existing bunker URLs (dogfooding)
-
-**Unified Flow**: All methods → Bunker URL credential → BunkerSigner → NIP-98 signed requests
+**Authentication Methods**:
+1. **Email/Password**: Login/register sets UCAN session cookie
+2. **OAuth Flow**: Third-party apps receive UCAN token via `/api/oauth/token`
 
 **Authentication Architecture**:
 - Email login/register creates user in `users` table and stores encrypted keys in `personal_keys`
 - Returns UCAN session token (set as `keycast_session` HttpOnly cookie)
-- UCAN contains: tenant_id, email, redirect_origin (no oauth_authorization created yet)
-- OAuth authorizations (`oauth_authorizations`) are created later via:
+- UCAN contains: tenant_id, email, redirect_origin, bunker_pubkey
+- OAuth authorizations (`oauth_authorizations`) are created via:
   - Third-party OAuth flow: `/api/oauth/token` creates authorization when app exchanges code
   - Manual bunker creation: User explicitly creates bunker via `/user/bunker/create`
 - Each authorization has its own bunker keypair (derived via HKDF) and connection secret
-- Frontend uses nostr-tools BunkerSigner to sign NIP-98 auth headers
-- All authenticated API requests include NIP-98 signature in Authorization header
-- Backend extracts pubkey from NIP-98 event, validates signature
+- All authenticated API requests use UCAN Bearer token or session cookie
+- Backend validates UCAN signature and extracts user pubkey
 
 **Permission Model**:
 - **Whitelist** (VITE_ALLOWED_PUBKEYS): Can create teams, full admin access
@@ -170,12 +167,12 @@ Key endpoints (see `api/src/api/http/routes.rs`):
 - `/api/oauth/poll?state={state}`: Poll for authorization code (iOS PWA pattern). Returns HTTP 200 with code when ready, HTTP 202 if pending, HTTP 404 if expired
 - CORS: Permissive (any origin)
 
-**User Management (NIP-98 Auth Required)**:
+**User Management (UCAN Auth Required)**:
 - `/api/user/oauth-authorizations`: List personal OAuth authorizations
 - `/api/user/oauth-authorizations/:id`: Revoke authorization
 - `/api/user/bunker`: Get personal NIP-46 bunker URL (legacy)
 
-**Team Management (NIP-98 Auth Required)**:
+**Team Management (UCAN Auth Required)**:
 - `/api/teams/*`: Team CRUD, member management, key management, policies
 - Requires whitelist or team membership
 
@@ -203,7 +200,7 @@ Development (`.env` in `/web`):
 
 - Uses `nostr-sdk` crate (from git, specific revision) with NIP-04, NIP-44, NIP-46, NIP-49, NIP-59 support
 - NIP-46 remote signing: Clients connect via bunker URLs (`bunker://<pubkey>?relay=<relay>&secret=<secret>`)
-- NIP-98 HTTP Auth: Web app signs HTTP requests with Nostr events for API authentication
+- HTTP RPC (`/api/nostr`): REST endpoint that mirrors NIP-46 methods for low-latency signing (uses UCAN auth)
 
 ## Deployment
 
