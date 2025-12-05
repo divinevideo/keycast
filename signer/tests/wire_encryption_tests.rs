@@ -170,14 +170,14 @@ fn test_various_nip46_message_encryption() {
             msg,
             nip44::Version::V2,
         )
-        .expect(&format!("Failed to encrypt: {}", msg));
+        .unwrap_or_else(|_| panic!("Failed to encrypt: {}", msg));
 
         let decrypted = nip44::decrypt(
             bunker_keys.secret_key(),
             &client_keys.public_key(),
             &encrypted,
         )
-        .expect(&format!("Failed to decrypt: {}", msg));
+        .unwrap_or_else(|_| panic!("Failed to decrypt: {}", msg));
 
         assert_eq!(decrypted, msg, "Round-trip failed for message");
 

@@ -62,6 +62,7 @@ pub struct HttpRpcHandler {
 
 impl HttpRpcHandler {
     /// Create a new HTTP RPC handler with cached permissions and cache keys
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         signing: Arc<SigningSession>,
         authorization_id: i64,

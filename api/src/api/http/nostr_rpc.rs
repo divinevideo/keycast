@@ -217,6 +217,7 @@ async fn load_handler_on_demand(
 
     // Query oauth_authorization for this bunker_pubkey
     // Includes: expires_at, revoked_at (for validity), policy_id (for permissions)
+    #[allow(clippy::type_complexity)]
     let auth_data: Option<(
         i32,
         String,
