@@ -81,6 +81,7 @@
       serverUrl: SERVER_URL,
       clientId: CLIENT_ID,
       redirectUri,
+      storage: localStorage,
     });
   }
 
@@ -114,10 +115,10 @@
     oauthError = null;
 
     try {
+      // Library auto-loads authorization handle from storage for silent re-auth
       const { url, pkce } = await client.oauth.getAuthorizationUrl({
         scopes: ["policy:social"],
         defaultRegister: true,
-        authorizationHandle: credentials?.authorizationHandle,
       });
 
       console.log("OAuth URL:", url); // Debug
@@ -174,6 +175,7 @@
       const verifier = sessionStorage.getItem("pkce_verifier");
       if (!verifier) throw new Error("Missing PKCE verifier");
 
+      // Library auto-saves session and authorization handle to storage
       const tokens = await client.oauth.exchangeCode(code, verifier);
 
       credentials = {
@@ -185,9 +187,6 @@
 
       // Create RPC client from tokens
       rpc = client.createRpc(tokens);
-
-      // Store credentials
-      localStorage.setItem("demo_credentials", JSON.stringify(credentials));
 
       oauthStatus = "success";
 
@@ -343,22 +342,18 @@
 
   // Clear everything and sign out
   async function disconnect() {
-    // Clear all localStorage/sessionStorage
-    localStorage.removeItem("demo_credentials");
+    initClient();
+
+    // Library handles session storage and logout API call
+    if (client) {
+      client.oauth.logout();
+    }
+
+    // Clear demo-specific sessionStorage
     sessionStorage.removeItem("pkce_verifier");
     sessionStorage.removeItem("byok_used");
     sessionStorage.removeItem("byok_pubkey");
     sessionStorage.removeItem("demo_identity");
-
-    // Clear keycast_session cookie via logout endpoint (HttpOnly cookies can't be cleared via JS)
-    try {
-      await fetch(`${SERVER_URL}/api/auth/logout`, {
-        method: "POST",
-        credentials: "include",
-      });
-    } catch (e) {
-      console.warn("Logout request failed:", e);
-    }
 
     // Reload page to show fresh state
     window.location.reload();
@@ -366,6 +361,8 @@
 
   // Initialize on mount
   onMount(async () => {
+    initClient();
+
     // Load stored identity
     const storedIdentity = sessionStorage.getItem("demo_identity");
     if (storedIdentity) {
@@ -374,12 +371,18 @@
       await generateIdentity();
     }
 
-    // Load stored credentials
-    const storedCredentials = localStorage.getItem("demo_credentials");
-    if (storedCredentials) {
-      credentials = JSON.parse(storedCredentials);
-      oauthStatus = "success";
-      // Don't auto-fetch - let user click the button
+    // Load stored session from library
+    if (client) {
+      const storedSession = client.oauth.getSession();
+      if (storedSession) {
+        credentials = {
+          bunkerUrl: storedSession.bunkerUrl,
+          accessToken: storedSession.accessToken ?? "",
+          nostrApi: `${SERVER_URL}/api/nostr`,
+          authorizationHandle: storedSession.authorizationHandle,
+        };
+        oauthStatus = "success";
+      }
     }
 
     // Check for OAuth callback

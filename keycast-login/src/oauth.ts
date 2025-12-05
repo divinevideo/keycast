@@ -4,11 +4,36 @@
 import { generatePkce } from './pkce';
 import type {
   KeycastClientConfig,
+  KeycastStorage,
   OAuthError,
   PkceChallenge,
   StoredCredentials,
   TokenResponse,
 } from './types';
+
+/** Storage key for session credentials */
+const STORAGE_KEY_SESSION = 'keycast_session';
+/** Storage key for authorization handle (survives logout for silent re-auth) */
+const STORAGE_KEY_HANDLE = 'keycast_auth_handle';
+
+/**
+ * In-memory storage fallback when no storage is provided
+ */
+class MemoryStorage implements KeycastStorage {
+  private data = new Map<string, string>();
+
+  getItem(key: string): string | null {
+    return this.data.get(key) ?? null;
+  }
+
+  setItem(key: string, value: string): void {
+    this.data.set(key, value);
+  }
+
+  removeItem(key: string): void {
+    this.data.delete(key);
+  }
+}
 
 /**
  * Derive public key from nsec using nostr-tools (optional peer dependency)
@@ -36,15 +61,66 @@ async function derivePublicKeyFromNsec(nsec: string): Promise<string> {
 export class KeycastOAuth {
   private config: KeycastClientConfig;
   private fetch: typeof globalThis.fetch;
+  private storage: KeycastStorage;
   private pendingPkce: PkceChallenge | null = null;
 
   constructor(config: KeycastClientConfig) {
     this.config = config;
     this.fetch = config.fetch ?? globalThis.fetch.bind(globalThis);
+    this.storage = config.storage ?? new MemoryStorage();
+  }
+
+  /**
+   * Get stored session from storage
+   * Returns null if no session or session is expired
+   */
+  getSession(): StoredCredentials | null {
+    const json = this.storage.getItem(STORAGE_KEY_SESSION);
+    if (!json) return null;
+
+    try {
+      const credentials = JSON.parse(json) as StoredCredentials;
+      if (this.isExpired(credentials)) {
+        return null;
+      }
+      return credentials;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Get stored authorization handle (survives logout)
+   */
+  getAuthorizationHandle(): string | null {
+    return this.storage.getItem(STORAGE_KEY_HANDLE);
+  }
+
+  /**
+   * Clear session but preserve authorization handle for silent re-auth
+   */
+  logout(): void {
+    this.storage.removeItem(STORAGE_KEY_SESSION);
+  }
+
+  /**
+   * Clear all stored data including authorization handle
+   */
+  clearAll(): void {
+    this.storage.removeItem(STORAGE_KEY_SESSION);
+    this.storage.removeItem(STORAGE_KEY_HANDLE);
+  }
+
+  private saveSession(credentials: StoredCredentials): void {
+    this.storage.setItem(STORAGE_KEY_SESSION, JSON.stringify(credentials));
+    if (credentials.authorizationHandle) {
+      this.storage.setItem(STORAGE_KEY_HANDLE, credentials.authorizationHandle);
+    }
   }
 
   /**
    * Generate authorization URL for OAuth flow
+   * Automatically uses stored authorization handle for silent re-auth if available
    *
    * @param options - Authorization options
    * @returns Authorization URL and PKCE verifier
@@ -53,7 +129,7 @@ export class KeycastOAuth {
     scopes?: string[];
     nsec?: string; // For BYOK flow - pubkey is derived automatically
     defaultRegister?: boolean;
-    authorizationHandle?: string; // For silent re-authentication
+    authorizationHandle?: string; // Override stored handle for silent re-authentication
   } = {}): Promise<{ url: string; pkce: PkceChallenge }> {
     const pkce = await generatePkce(options.nsec);
     this.pendingPkce = pkce;
@@ -69,9 +145,10 @@ export class KeycastOAuth {
       url.searchParams.set('default_register', 'true');
     }
 
-    // Pass authorization handle for silent re-authentication
-    if (options.authorizationHandle) {
-      url.searchParams.set('authorization_handle', options.authorizationHandle);
+    // Use provided handle, or auto-load from storage for silent re-authentication
+    const handle = options.authorizationHandle ?? this.getAuthorizationHandle();
+    if (handle) {
+      url.searchParams.set('authorization_handle', handle);
     }
 
     // Derive pubkey from nsec if provided (BYOK flow)
@@ -85,6 +162,7 @@ export class KeycastOAuth {
 
   /**
    * Exchange authorization code for tokens
+   * Automatically saves session to storage after successful exchange
    *
    * @param code - Authorization code from callback
    * @param verifier - PKCE verifier (optional if stored from getAuthorizationUrl)
@@ -119,7 +197,13 @@ export class KeycastOAuth {
     // Clear pending PKCE after successful exchange
     this.pendingPkce = null;
 
-    return data as TokenResponse;
+    const tokenResponse = data as TokenResponse;
+
+    // Auto-save session and authorization handle to storage
+    const credentials = this.toStoredCredentials(tokenResponse);
+    this.saveSession(credentials);
+
+    return tokenResponse;
   }
 
   /**

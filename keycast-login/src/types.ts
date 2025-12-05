@@ -2,6 +2,16 @@
 // ABOUTME: Includes OAuth response types and RPC request/response formats
 
 /**
+ * Storage interface for persisting credentials
+ * Compatible with localStorage, sessionStorage, or custom implementations
+ */
+export interface KeycastStorage {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+}
+
+/**
  * OAuth token response from Keycast server
  */
 export interface TokenResponse {
@@ -82,6 +92,8 @@ export interface KeycastClientConfig {
   redirectUri: string;
   /** Optional custom fetch implementation */
   fetch?: typeof fetch;
+  /** Optional storage backend (defaults to in-memory) */
+  storage?: KeycastStorage;
 }
 
 /**

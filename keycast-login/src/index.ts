@@ -11,6 +11,7 @@ export { generatePkce, validatePkce } from './pkce';
 
 export type {
   KeycastClientConfig,
+  KeycastStorage,
   OAuthError,
   PkceChallenge,
   RpcRequest,
