@@ -2,8 +2,10 @@
 // ABOUTME: API uses HttpRpcHandler cache, NIP-46 signer uses Nip46Handler cache
 
 use axum::{
-    http::StatusCode,
-    response::{Html, IntoResponse},
+    body::Body,
+    http::{header, Request, StatusCode},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Response},
     routing::get,
     Router,
 };
@@ -35,8 +37,6 @@ async fn health_check() -> impl IntoResponse {
 async fn apple_app_site_association(
     axum::extract::State(web_build_dir): axum::extract::State<String>,
 ) -> impl IntoResponse {
-    use axum::http::header;
-
     let path = PathBuf::from(&web_build_dir).join(".well-known/apple-app-site-association");
     match tokio::fs::read_to_string(&path).await {
         Ok(content) => (
@@ -53,8 +53,6 @@ async fn apple_app_site_association(
 async fn assetlinks_json(
     axum::extract::State(web_build_dir): axum::extract::State<String>,
 ) -> impl IntoResponse {
-    use axum::http::header;
-
     let path = PathBuf::from(&web_build_dir).join(".well-known/assetlinks.json");
     match tokio::fs::read_to_string(&path).await {
         Ok(content) => (
@@ -65,6 +63,48 @@ async fn assetlinks_json(
             .into_response(),
         Err(_) => (StatusCode::NOT_FOUND, "Not found").into_response(),
     }
+}
+
+/// Middleware to set Cache-Control headers for static assets
+/// Browser caching reduces load and improves performance
+async fn cache_control_middleware(request: Request<Body>, next: Next) -> Response {
+    let path = request.uri().path().to_string();
+    let mut response = next.run(request).await;
+
+    // Don't overwrite if route already set Cache-Control
+    if response.headers().contains_key(header::CACHE_CONTROL) {
+        return response;
+    }
+
+    let cache_value = if path.starts_with("/_app/") {
+        // SvelteKit hash-versioned assets - cache forever (1 year)
+        "public, max-age=31536000, immutable"
+    } else if path.starts_with("/api/") || path.starts_with("/health") {
+        // Dynamic content - no caching
+        "no-store"
+    } else if path == "/index.html" || path == "/" {
+        // SPA entry - must revalidate to get latest app
+        "public, max-age=0, must-revalidate"
+    } else if path.starts_with("/.well-known/") || path == "/site.webmanifest" {
+        // Config files - cache 24 hours
+        "public, max-age=86400"
+    } else if path.starts_with("/dist/") || path.starts_with("/examples/") {
+        // Dev bundles - cache 1 hour
+        "public, max-age=3600"
+    } else if path.ends_with(".png") || path.ends_with(".ico") || path.ends_with(".svg") {
+        // Static images - cache 30 days
+        "public, max-age=2592000"
+    } else {
+        // Default for other static files (HTML fallback via SPA)
+        "public, max-age=0, must-revalidate"
+    };
+
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        cache_value.parse().unwrap(),
+    );
+
+    response
 }
 
 /// Validate required environment variables at startup
@@ -420,6 +460,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
     )));
+
+    // Add Cache-Control headers for browser caching
+    let app = app.layer(middleware::from_fn(cache_control_middleware));
 
     let api_addr = std::net::SocketAddr::from(([0, 0, 0, 0], api_port));
     tracing::info!("✔︎ API server ready on {}", api_addr);
