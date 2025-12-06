@@ -296,10 +296,22 @@ impl HttpRpcHandler {
 /// Uses the same CacheKey as SigningSession for bunker_pubkey lookups
 pub type HttpHandlerCache = Cache<CacheKey, Arc<HttpRpcHandler>>;
 
-/// Create a new HTTP handler cache with default settings
+/// Default handler cache size (1 million entries)
+const DEFAULT_HANDLER_CACHE_SIZE: u64 = 1_000_000;
+
+/// Create a new HTTP handler cache
+///
+/// Cache size is configurable via `HANDLER_CACHE_SIZE` env var (default: 1,000,000)
 pub fn new_http_handler_cache() -> HttpHandlerCache {
+    let cache_size = std::env::var("HANDLER_CACHE_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_HANDLER_CACHE_SIZE);
+
+    tracing::info!("HTTP handler cache capacity: {}", cache_size);
+
     Cache::builder()
-        .max_capacity(10_000)
+        .max_capacity(cache_size)
         .time_to_idle(std::time::Duration::from_secs(3600)) // 1 hour idle timeout
         .build()
 }

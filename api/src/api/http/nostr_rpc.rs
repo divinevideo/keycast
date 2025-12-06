@@ -1,14 +1,15 @@
 // ABOUTME: REST RPC API that mirrors NIP-46 methods for low-latency signing
 // ABOUTME: Allows HTTP-based signing instead of relay-based NIP-46 communication
 
-use crate::handlers::http_rpc_handler::{insert_handler_dual_key, HandlerError, HttpRpcHandler};
+use crate::handlers::http_rpc_handler::{HandlerError, HttpRpcHandler};
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
-use keycast_core::signing_session::{parse_cache_key, SigningSession};
+use keycast_core::metrics::METRICS;
+use keycast_core::signing_session::{parse_cache_key, CacheKey, SigningSession};
 use keycast_core::traits::CustomPermission;
 use keycast_core::types::permission::Permission;
 use nostr_sdk::{Keys, PublicKey, UnsignedEvent};
@@ -16,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
-use super::auth::{extract_user_and_origin_from_token, AuthError};
+use super::auth::AuthError;
 use super::routes::AuthState;
 
 /// RPC request format (mirrors NIP-46)
@@ -111,35 +112,37 @@ impl From<HandlerError> for RpcError {
 /// - nip44_encrypt: Encrypts plaintext using NIP-44
 /// - nip44_decrypt: Decrypts ciphertext using NIP-44
 ///
+/// Uses BLAKE3 token cache - on cache hit, skips UCAN verification entirely.
 /// All operations use cached handler with in-memory permission validation (no DB hits).
 pub async fn nostr_rpc(
-    tenant: crate::api::tenant::TenantExtractor,
+    _tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
     headers: HeaderMap,
     Json(req): Json<NostrRpcRequest>,
 ) -> Result<Json<NostrRpcResponse>, RpcError> {
-    let (user_pubkey, redirect_origin, bunker_pubkey) =
-        extract_user_and_origin_from_token(&headers).await?;
+    // Track total HTTP RPC requests
+    METRICS.inc_http_rpc_request();
+
+    // Extract raw Authorization header for BLAKE3 caching
+    let auth_header = headers
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .ok_or(RpcError::Auth(AuthError::MissingToken))?;
+
     let pool = &auth_state.state.db;
-    let tenant_id = tenant.0.id;
 
-    tracing::info!(
-        "RPC request: method={} from user={} origin={}",
-        req.method,
-        &user_pubkey[..8],
-        &redirect_origin
-    );
+    tracing::debug!("RPC request: method={}", req.method);
 
-    // Get cached handler (loads from DB on cache miss, then all ops use cached data)
-    let handler = get_handler(
-        &auth_state,
-        pool,
-        tenant_id,
-        &user_pubkey,
-        &redirect_origin,
-        bunker_pubkey.as_deref(),
-    )
-    .await?;
+    // Get cached handler using BLAKE3(token) as cache key
+    // On cache hit: skips UCAN verification entirely (~25% CPU savings)
+    // On cache miss: verifies UCAN, loads from DB, caches result
+    let handler = match get_handler(&auth_state, pool, auth_header).await {
+        Ok(h) => h,
+        Err(e) => {
+            METRICS.inc_http_rpc_auth_error();
+            return Err(e);
+        }
+    };
 
     // Dispatch based on method - all permission checks use cached data (no DB hits)
     let result = match req.method.as_str() {
@@ -201,6 +204,9 @@ pub async fn nostr_rpc(
             return Err(RpcError::UnsupportedMethod(method.to_string()));
         }
     };
+
+    // Track successful requests
+    METRICS.inc_http_rpc_success();
 
     Ok(Json(NostrRpcResponse::success(result)))
 }
@@ -306,104 +312,90 @@ async fn load_handler_on_demand(
         auth_handle,
     ));
 
-    // Cache the handler for future requests
-    insert_handler_dual_key(&auth_state.state.http_handler_cache, handler.clone()).await;
-
-    tracing::debug!(
-        "RPC: Loaded and cached handler for bunker {} (policy_id={:?})",
-        &bunker_pubkey_hex[..8],
-        policy_id
-    );
+    // Note: Caching is done by caller with BLAKE3(token) key, not here
+    // This allows skipping UCAN verification entirely on cache hits
 
     Ok(handler)
 }
 
-/// Get the HttpRpcHandler for this request (uses cache with on-demand loading)
+/// Compute BLAKE3 hash of token for cache lookup
+/// BLAKE3 is ~500ns for 500-byte token vs ~1-2ms for Schnorr verification (2000-4000x faster)
+fn compute_token_cache_key(auth_header: &str) -> Option<CacheKey> {
+    let token = auth_header.strip_prefix("Bearer ")?;
+    Some(*blake3::hash(token.as_bytes()).as_bytes())
+}
+
+/// Get the HttpRpcHandler for this request using BLAKE3 token cache
 ///
-/// Returns the full handler with cached permissions and validity state.
-/// The handler is loaded on-demand from the database if not in cache.
+/// FAST PATH (cache hit): BLAKE3(token) lookup → return handler (~500ns)
+/// - Skips UCAN parsing and Schnorr signature verification entirely
+///
+/// SLOW PATH (cache miss): Full UCAN verification → DB load → cache insert
+/// - Requires bunker_pubkey in UCAN (only OAuth access tokens are valid)
+/// - Session UCANs (from /api/auth/login) do not have bunker_pubkey and will be rejected
+///
 /// All subsequent operations (sign, encrypt, decrypt) use cached data - no DB hits.
 async fn get_handler(
     auth_state: &AuthState,
     pool: &sqlx::PgPool,
-    tenant_id: i64,
-    user_pubkey: &str,
-    redirect_origin: &str,
-    bunker_pubkey_from_ucan: Option<&str>,
+    auth_header: &str,
 ) -> Result<Arc<HttpRpcHandler>, RpcError> {
-    // FAST PATH: Check http_handler_cache by bunker_pubkey (if provided in UCAN)
-    if let Some(bunker_key_hex) = bunker_pubkey_from_ucan {
-        if let Ok(cache_key) = parse_cache_key(bunker_key_hex) {
-            if let Some(handler) = auth_state.state.http_handler_cache.get(&cache_key).await {
-                // Check cached validity (no DB hit for expired/revoked)
-                if !handler.is_valid() {
-                    // Evict invalid handler from cache
-                    auth_state
-                        .state
-                        .http_handler_cache
-                        .invalidate(&cache_key)
-                        .await;
-                    return Err(RpcError::Auth(AuthError::InvalidToken));
-                }
-                tracing::debug!(
-                    "RPC: Cache hit for user {} (bunker={})",
-                    &user_pubkey[..8],
-                    &bunker_key_hex[..8]
-                );
-                return Ok(handler);
-            }
-        }
+    // Compute BLAKE3 hash for cache lookup (~500ns)
+    let blake3_key =
+        compute_token_cache_key(auth_header).ok_or(RpcError::Auth(AuthError::InvalidToken))?;
 
-        // On-demand load using bunker_pubkey from UCAN (one-time DB hit)
-        let handler = load_handler_on_demand(auth_state, pool, bunker_key_hex).await?;
+    // FAST PATH: Check cache by BLAKE3(token) - skips UCAN entirely!
+    if let Some(handler) = auth_state.state.http_handler_cache.get(&blake3_key).await {
+        // Check cached validity (no DB hit for expired/revoked)
         if !handler.is_valid() {
+            // Evict invalid handler from cache
+            auth_state
+                .state
+                .http_handler_cache
+                .invalidate(&blake3_key)
+                .await;
             return Err(RpcError::Auth(AuthError::InvalidToken));
         }
+        // Cache hit! Skip UCAN verification entirely
+        METRICS.inc_http_rpc_cache_hit();
+        tracing::trace!("RPC: Cache hit (BLAKE3)");
         return Ok(handler);
     }
 
-    // Legacy path: resolve bunker_pubkey from DB (for older UCANs without bunker_pubkey)
-    let bunker_pubkey_hex: String = sqlx::query_scalar(
-        "SELECT oa.bunker_public_key
-         FROM oauth_authorizations oa
-         JOIN users u ON oa.user_pubkey = u.pubkey
-         WHERE oa.user_pubkey = $1 AND u.tenant_id = $2 AND oa.redirect_origin = $3
-         AND oa.revoked_at IS NULL
-         ORDER BY oa.created_at DESC
-         LIMIT 1",
-    )
-    .bind(user_pubkey)
-    .bind(tenant_id)
-    .bind(redirect_origin)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?
-    .ok_or(RpcError::Auth(AuthError::InvalidToken))?;
+    // SLOW PATH: Cache miss - full UCAN verification
+    METRICS.inc_http_rpc_cache_miss();
 
-    // Check http_handler_cache with resolved bunker_pubkey
-    if let Ok(cache_key) = parse_cache_key(&bunker_pubkey_hex) {
-        if let Some(handler) = auth_state.state.http_handler_cache.get(&cache_key).await {
-            if !handler.is_valid() {
-                auth_state
-                    .state
-                    .http_handler_cache
-                    .invalidate(&cache_key)
-                    .await;
-                return Err(RpcError::Auth(AuthError::InvalidToken));
-            }
-            tracing::debug!(
-                "RPC: Cache hit (after legacy lookup) for user {}",
-                &user_pubkey[..8]
-            );
-            return Ok(handler);
-        }
-    }
+    // Verify UCAN and extract bunker_pubkey (Schnorr signature verification ~1-2ms)
+    let (_user_pubkey, _redirect_origin, bunker_pubkey, _ucan) =
+        crate::ucan_auth::validate_ucan_token(auth_header, 0)
+            .await
+            .map_err(|_| RpcError::Auth(AuthError::InvalidToken))?;
 
-    // On-demand load (one-time DB hit)
-    let handler = load_handler_on_demand(auth_state, pool, &bunker_pubkey_hex).await?;
+    // Require bunker_pubkey - session UCANs are not valid for HTTP RPC
+    let bunker_key_hex = bunker_pubkey.ok_or(RpcError::Auth(AuthError::InvalidToken))?;
+
+    // Load handler from DB using bunker_pubkey
+    let handler = load_handler_on_demand(auth_state, pool, &bunker_key_hex).await?;
+
     if !handler.is_valid() {
         return Err(RpcError::Auth(AuthError::InvalidToken));
     }
+
+    // Insert into cache with BLAKE3(token) as key
+    auth_state
+        .state
+        .http_handler_cache
+        .insert(blake3_key, handler.clone())
+        .await;
+
+    // Update cache size metric
+    METRICS.set_http_rpc_cache_size(auth_state.state.http_handler_cache.entry_count());
+
+    tracing::debug!(
+        "RPC: Loaded and cached handler for bunker {}",
+        &bunker_key_hex[..8]
+    );
+
     Ok(handler)
 }
 

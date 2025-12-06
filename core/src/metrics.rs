@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Global metrics counters accessible from any crate
 pub struct Metrics {
+    // === NIP-46 Signer Daemon Metrics ===
     /// Total cache hits - handler was found in LRU cache
     pub cache_hits: AtomicU64,
     /// Total cache misses - handler had to be loaded from DB
@@ -22,11 +23,26 @@ pub struct Metrics {
     pub nip46_requests_processed: AtomicU64,
     /// NIP-46 requests dropped due to queue full (backpressure)
     pub nip46_requests_queue_dropped: AtomicU64,
+
+    // === HTTP RPC Metrics ===
+    /// Total HTTP RPC requests
+    pub http_rpc_requests_total: AtomicU64,
+    /// HTTP RPC cache hits
+    pub http_rpc_cache_hits: AtomicU64,
+    /// HTTP RPC cache misses
+    pub http_rpc_cache_misses: AtomicU64,
+    /// HTTP RPC cache size
+    pub http_rpc_cache_size: AtomicU64,
+    /// HTTP RPC requests successfully processed
+    pub http_rpc_success: AtomicU64,
+    /// HTTP RPC authorization errors
+    pub http_rpc_auth_errors: AtomicU64,
 }
 
 impl Metrics {
     const fn new() -> Self {
         Self {
+            // NIP-46 metrics
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
             cache_size: AtomicU64::new(0),
@@ -35,6 +51,13 @@ impl Metrics {
             nip46_requests_handler_not_found: AtomicU64::new(0),
             nip46_requests_processed: AtomicU64::new(0),
             nip46_requests_queue_dropped: AtomicU64::new(0),
+            // HTTP RPC metrics
+            http_rpc_requests_total: AtomicU64::new(0),
+            http_rpc_cache_hits: AtomicU64::new(0),
+            http_rpc_cache_misses: AtomicU64::new(0),
+            http_rpc_cache_size: AtomicU64::new(0),
+            http_rpc_success: AtomicU64::new(0),
+            http_rpc_auth_errors: AtomicU64::new(0),
         }
     }
 
@@ -72,6 +95,32 @@ impl Metrics {
     pub fn inc_queue_dropped(&self) {
         self.nip46_requests_queue_dropped
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    // === HTTP RPC metric methods ===
+
+    pub fn inc_http_rpc_request(&self) {
+        self.http_rpc_requests_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_http_rpc_cache_hit(&self) {
+        self.http_rpc_cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_http_rpc_cache_miss(&self) {
+        self.http_rpc_cache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_http_rpc_cache_size(&self, size: u64) {
+        self.http_rpc_cache_size.store(size, Ordering::Relaxed);
+    }
+
+    pub fn inc_http_rpc_success(&self) {
+        self.http_rpc_success.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_http_rpc_auth_error(&self) {
+        self.http_rpc_auth_errors.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Format all metrics as Prometheus text
@@ -138,6 +187,58 @@ impl Metrics {
         output.push_str(&format!(
             "keycast_nip46_queue_dropped_total {}\n",
             self.nip46_requests_queue_dropped.load(Ordering::Relaxed)
+        ));
+
+        // HTTP RPC metrics
+        output.push_str(
+            "\n# HELP keycast_http_rpc_requests_total Total HTTP RPC requests to /api/nostr\n",
+        );
+        output.push_str("# TYPE keycast_http_rpc_requests_total counter\n");
+        output.push_str(&format!(
+            "keycast_http_rpc_requests_total {}\n",
+            self.http_rpc_requests_total.load(Ordering::Relaxed)
+        ));
+
+        output.push_str("\n# HELP keycast_http_rpc_cache_hits_total HTTP RPC handler cache hits\n");
+        output.push_str("# TYPE keycast_http_rpc_cache_hits_total counter\n");
+        output.push_str(&format!(
+            "keycast_http_rpc_cache_hits_total {}\n",
+            self.http_rpc_cache_hits.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(
+            "\n# HELP keycast_http_rpc_cache_misses_total HTTP RPC handler cache misses\n",
+        );
+        output.push_str("# TYPE keycast_http_rpc_cache_misses_total counter\n");
+        output.push_str(&format!(
+            "keycast_http_rpc_cache_misses_total {}\n",
+            self.http_rpc_cache_misses.load(Ordering::Relaxed)
+        ));
+
+        output
+            .push_str("\n# HELP keycast_http_rpc_cache_size Current HTTP RPC handler cache size\n");
+        output.push_str("# TYPE keycast_http_rpc_cache_size gauge\n");
+        output.push_str(&format!(
+            "keycast_http_rpc_cache_size {}\n",
+            self.http_rpc_cache_size.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(
+            "\n# HELP keycast_http_rpc_success_total HTTP RPC requests successfully processed\n",
+        );
+        output.push_str("# TYPE keycast_http_rpc_success_total counter\n");
+        output.push_str(&format!(
+            "keycast_http_rpc_success_total {}\n",
+            self.http_rpc_success.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(
+            "\n# HELP keycast_http_rpc_auth_errors_total HTTP RPC authorization errors\n",
+        );
+        output.push_str("# TYPE keycast_http_rpc_auth_errors_total counter\n");
+        output.push_str(&format!(
+            "keycast_http_rpc_auth_errors_total {}\n",
+            self.http_rpc_auth_errors.load(Ordering::Relaxed)
         ));
 
         output

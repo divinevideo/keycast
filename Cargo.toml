@@ -1,5 +1,5 @@
 [workspace]
-members = ["api", "core", "signer", "keycast", "pg-hashring"]
+members = ["api", "core", "signer", "keycast", "pg-hashring", "tools/loadtest"]
 exclude = ["tests/qa"]
 resolver = "2"
 

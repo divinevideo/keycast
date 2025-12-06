@@ -175,6 +175,16 @@ async fn create_test_policy(
 
 /// Build a UCAN with specific facts
 async fn build_test_ucan(keys: &Keys, tenant_id: i64, redirect_origin: Option<&str>) -> String {
+    build_test_ucan_with_bunker(keys, tenant_id, redirect_origin, None).await
+}
+
+/// Build a UCAN with specific facts including optional bunker_pubkey
+async fn build_test_ucan_with_bunker(
+    keys: &Keys,
+    tenant_id: i64,
+    redirect_origin: Option<&str>,
+    bunker_pubkey: Option<&str>,
+) -> String {
     let pubkey = keys.public_key();
     let user_did = nostr_pubkey_to_did(&pubkey);
     let key_material = NostrKeyMaterial::from_keys(keys.clone());
@@ -186,6 +196,10 @@ async fn build_test_ucan(keys: &Keys, tenant_id: i64, redirect_origin: Option<&s
 
     if let Some(origin) = redirect_origin {
         facts["redirect_origin"] = json!(origin);
+    }
+
+    if let Some(bunker) = bunker_pubkey {
+        facts["bunker_pubkey"] = json!(bunker);
     }
 
     let ucan = UcanBuilder::default()
@@ -522,4 +536,76 @@ async fn test_decrypt_requires_authorization() {
         }
         other => panic!("Expected Forbidden error, got: {:?}", other),
     }
+}
+
+// ============================================================================
+// REGRESSION TESTS: bunker_pubkey Requirement for HTTP RPC
+// ============================================================================
+// These tests ensure HTTP RPC only accepts OAuth access tokens (with bunker_pubkey)
+// and rejects session UCANs (without bunker_pubkey).
+//
+// Background: A legacy path was removed that allowed UCANs without bunker_pubkey
+// to access HTTP RPC by resolving bunker_pubkey from DB. This was both:
+// 1. A security issue (cookie-based session UCANs could access RPC)
+// 2. A performance issue (43% of CPU time was DB queries from legacy path)
+
+#[tokio::test]
+async fn test_ucan_without_bunker_pubkey_returns_none() {
+    // Session UCANs (from /api/auth/login) do NOT include bunker_pubkey
+    // because at login time, no OAuth authorization exists yet.
+    let (keys, _pubkey) = create_test_user();
+
+    // Build UCAN without bunker_pubkey (simulates session UCAN)
+    let token = build_test_ucan(&keys, 1, Some("https://test.example.com")).await;
+    let auth_header = format!("Bearer {}", token);
+
+    // Validate and extract - should succeed but bunker_pubkey should be None
+    let result = validate_ucan_token(&auth_header, 1).await;
+    assert!(result.is_ok(), "UCAN validation should succeed");
+
+    let (user_pubkey, redirect_origin, bunker_pubkey, _ucan) = result.unwrap();
+
+    assert_eq!(user_pubkey, keys.public_key().to_hex());
+    assert_eq!(redirect_origin, "https://test.example.com");
+    assert!(
+        bunker_pubkey.is_none(),
+        "Session UCAN should NOT have bunker_pubkey"
+    );
+}
+
+#[tokio::test]
+async fn test_ucan_with_bunker_pubkey_returns_some() {
+    // OAuth access tokens (from /api/oauth/token code exchange) DO include bunker_pubkey
+    // because the bunker keypair is created during OAuth authorization.
+    let (keys, _pubkey) = create_test_user();
+    let bunker_keys = Keys::generate();
+    let bunker_pubkey_hex = bunker_keys.public_key().to_hex();
+
+    // Build UCAN with bunker_pubkey (simulates OAuth access token)
+    let token = build_test_ucan_with_bunker(
+        &keys,
+        1,
+        Some("https://test.example.com"),
+        Some(&bunker_pubkey_hex),
+    )
+    .await;
+    let auth_header = format!("Bearer {}", token);
+
+    // Validate and extract - should succeed with bunker_pubkey present
+    let result = validate_ucan_token(&auth_header, 1).await;
+    assert!(result.is_ok(), "UCAN validation should succeed");
+
+    let (user_pubkey, redirect_origin, bunker_pubkey, _ucan) = result.unwrap();
+
+    assert_eq!(user_pubkey, keys.public_key().to_hex());
+    assert_eq!(redirect_origin, "https://test.example.com");
+    assert!(
+        bunker_pubkey.is_some(),
+        "OAuth access token should have bunker_pubkey"
+    );
+    assert_eq!(
+        bunker_pubkey.unwrap(),
+        bunker_pubkey_hex,
+        "bunker_pubkey should match"
+    );
 }
