@@ -1,0 +1,134 @@
+# Test environment for comparing DIRECT vs HYBRID pool modes locally.
+#
+# Usage:
+#   # Test DIRECT mode (PgBouncer unused)
+#   docker-compose -f docker-compose.test.yml --profile direct up
+#
+#   # Test HYBRID mode (queries via PgBouncer)
+#   docker-compose -f docker-compose.test.yml --profile hybrid up
+#
+# Key verification:
+#   - DIRECT mode: PgBouncer should show 0 queries
+#   - HYBRID mode: PgBouncer should show query traffic
+#   - Both modes: LISTEN/NOTIFY visible in pg_stat_activity
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: keycast
+    ports:
+      - "5432:5432"
+    command: >
+      postgres
+      -c max_connections=100
+      -c log_statement=all
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_test_data:/var/lib/postgresql/data
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:password@postgres:5432/keycast
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 200
+      DEFAULT_POOL_SIZE: 20
+      MIN_POOL_SIZE: 5
+      RESERVE_POOL_SIZE: 5
+      AUTH_TYPE: plain
+      ADMIN_USERS: postgres
+    ports:
+      - "6432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h localhost -p 5432 -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  # === DIRECT MODE (current pg-hashring, PgBouncer unused) ===
+  keycast-direct-1:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:password@postgres:5432/keycast
+      POOL_MODE: direct
+      ALLOWED_ORIGINS: "*"
+      SERVER_NSEC: ${SERVER_NSEC:-0000000000000000000000000000000000000000000000000000000000000001}
+      MASTER_KEY_PATH: /app/master.key
+      RUST_LOG: info,keycast=debug,pg_hashring=debug
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./master.key:/app/master.key:ro
+    profiles: ["direct"]
+
+  keycast-direct-2:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:password@postgres:5432/keycast
+      POOL_MODE: direct
+      ALLOWED_ORIGINS: "*"
+      SERVER_NSEC: ${SERVER_NSEC:-0000000000000000000000000000000000000000000000000000000000000001}
+      MASTER_KEY_PATH: /app/master.key
+      RUST_LOG: info,keycast=debug,pg_hashring=debug
+    ports:
+      - "3002:3000"
+    volumes:
+      - ./master.key:/app/master.key:ro
+    profiles: ["direct"]
+
+  # === HYBRID MODE (coordination direct, queries via PgBouncer) ===
+  keycast-hybrid-1:
+    build: .
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:password@postgres:5432/keycast
+      DATABASE_URL_POOLED: postgres://postgres:password@pgbouncer:6432/keycast
+      POOL_MODE: hybrid
+      ALLOWED_ORIGINS: "*"
+      SERVER_NSEC: ${SERVER_NSEC:-0000000000000000000000000000000000000000000000000000000000000001}
+      MASTER_KEY_PATH: /app/master.key
+      RUST_LOG: info,keycast=debug,pg_hashring=debug
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./master.key:/app/master.key:ro
+    profiles: ["hybrid"]
+
+  keycast-hybrid-2:
+    build: .
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:password@postgres:5432/keycast
+      DATABASE_URL_POOLED: postgres://postgres:password@pgbouncer:6432/keycast
+      POOL_MODE: hybrid
+      ALLOWED_ORIGINS: "*"
+      SERVER_NSEC: ${SERVER_NSEC:-0000000000000000000000000000000000000000000000000000000000000001}
+      MASTER_KEY_PATH: /app/master.key
+      RUST_LOG: info,keycast=debug,pg_hashring=debug
+    ports:
+      - "3002:3000"
+    volumes:
+      - ./master.key:/app/master.key:ro
+    profiles: ["hybrid"]
+
+volumes:
+  postgres_test_data:

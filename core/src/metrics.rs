@@ -3,9 +3,14 @@
 
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 /// Global metrics counters accessible from any crate
 pub struct Metrics {
+    // === Pool Configuration Metrics ===
+    /// Current pool mode (direct/hybrid) - set once at startup
+    pool_mode: Mutex<String>,
+
     // === NIP-46 Signer Daemon Metrics ===
     /// Total cache hits - handler was found in LRU cache
     pub cache_hits: AtomicU64,
@@ -40,8 +45,10 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
+            // Pool configuration
+            pool_mode: Mutex::new(String::from("unknown")),
             // NIP-46 metrics
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
@@ -58,6 +65,12 @@ impl Metrics {
             http_rpc_cache_size: AtomicU64::new(0),
             http_rpc_success: AtomicU64::new(0),
             http_rpc_auth_errors: AtomicU64::new(0),
+        }
+    }
+
+    pub fn set_pool_mode(&self, mode: &str) {
+        if let Ok(mut guard) = self.pool_mode.lock() {
+            *guard = mode.to_string();
         }
     }
 
@@ -126,6 +139,12 @@ impl Metrics {
     /// Format all metrics as Prometheus text
     pub fn to_prometheus(&self) -> String {
         let mut output = String::new();
+
+        // Pool mode metric
+        let mode = self.pool_mode.lock().map(|g| g.clone()).unwrap_or_default();
+        output.push_str("# HELP keycast_pool_mode Current database pool mode (1 = active)\n");
+        output.push_str("# TYPE keycast_pool_mode gauge\n");
+        output.push_str(&format!("keycast_pool_mode{{mode=\"{}\"}} 1\n", mode));
 
         // Cache metrics
         output.push_str("# HELP keycast_cache_hits_total Authorization handler cache hits (handler found in memory)\n");

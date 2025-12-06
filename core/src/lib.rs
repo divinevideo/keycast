@@ -1,5 +1,6 @@
 pub mod authorization_channel;
 pub mod bunker_key;
+pub mod config;
 pub mod custom_permissions;
 pub mod database;
 pub mod encryption;

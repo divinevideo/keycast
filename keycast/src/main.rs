@@ -12,10 +12,12 @@ use axum::{
 use dotenv::dotenv;
 use keycast_api::handlers::http_rpc_handler::new_http_handler_cache;
 use keycast_core::authorization_channel;
+use keycast_core::config::PoolMode;
 use keycast_core::database::Database;
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::gcp_key_manager::GcpKeyManager;
 use keycast_core::encryption::KeyManager;
+use keycast_core::metrics::METRICS;
 use keycast_signer::{RpcQueue, UnifiedSigner};
 use nostr_sdk::Keys;
 use pg_hashring::ClusterCoordinator;
@@ -220,26 +222,39 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
             .init();
     }
 
-    // Setup database
+    // Setup database with pool mode
     let root_dir = env!("CARGO_MANIFEST_DIR");
-    let database_url = PathBuf::from(env::var("DATABASE_URL")?); // Validated above
+    let pool_mode = PoolMode::from_env();
+    let database_url_display = env::var("DATABASE_URL").unwrap_or_default(); // For logging only
 
     let database_migrations = PathBuf::from(root_dir)
         .parent()
         .unwrap()
         .join("database/migrations");
 
-    let database = Database::new(database_url.clone(), database_migrations.clone()).await?;
-    tracing::info!("✔︎ Database initialized at {:?}", database_url);
+    let database = Database::new(
+        PathBuf::from(&database_url_display),
+        database_migrations.clone(),
+        pool_mode,
+    )
+    .await?;
+    tracing::info!(
+        "✔︎ Database initialized (mode: {}, url: {}...)",
+        pool_mode,
+        &database_url_display[..database_url_display.len().min(40)]
+    );
+
+    // Set pool mode in metrics for /api/metrics endpoint
+    METRICS.set_pool_mode(&pool_mode.to_string());
 
     // Initialize cluster coordination with pg-hashring
-    // This handles instance registration, LISTEN/NOTIFY for membership changes, and heartbeats
-    pg_hashring::setup(&database.pool).await?;
-    let coordinator = Arc::new(ClusterCoordinator::start(database.pool.clone()).await?);
+    // Uses coord_pool (always direct) for LISTEN/NOTIFY
+    pg_hashring::setup(database.coord_pool()).await?;
+    let coordinator = Arc::new(ClusterCoordinator::start(database.coord_pool().clone()).await?);
     coordinator.wait_for_established().await;
     let instance_id = coordinator.instance_id().to_string();
     tracing::info!(
-        "✔︎ Cluster coordinator started: {} (LISTEN/NOTIFY enabled)",
+        "✔︎ Cluster coordinator started: {} (LISTEN/NOTIFY on coord_pool)",
         instance_id
     );
 
@@ -281,8 +296,9 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     );
 
     // Create signer and load all authorizations into memory
+    // Signer uses query_pool for DB operations (works with both direct and MCP)
     let mut signer = UnifiedSigner::new(
-        database.pool.clone(),
+        database.query_pool().clone(),
         signer_key_manager,
         auth_rx,
         coordinator.clone(),
@@ -321,7 +337,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     // Create API state with http_handler_cache for on-demand loading
     // Note: api no longer depends on signer's handler cache (decoupled)
     let api_state = Arc::new(keycast_api::state::KeycastState {
-        db: database.pool.clone(),
+        db: database.query_pool().clone(),
         key_manager: Arc::new(api_key_manager),
         signer_handlers: None, // Deprecated: api uses http_handler_cache with on-demand loading
         http_handler_cache: new_http_handler_cache(),
@@ -392,7 +408,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
 
     // Get pure API routes (JSON endpoints only) - pass authorization sender
     let api_routes = keycast_api::api::http::routes::api_routes(
-        database.pool.clone(),
+        database.query_pool().clone(),
         api_state.clone(),
         auth_cors,
         public_cors,
@@ -424,7 +440,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
             "/.well-known/nostr.json",
             get(keycast_api::api::http::nostr_discovery_public),
         )
-        .with_state(database.pool.clone())
+        .with_state(database.query_pool().clone())
         // Apple/Android app association files
         .nest("/.well-known", well_known_routes)
         // All API endpoints under /api prefix
@@ -490,7 +506,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     let shutdown_signal = Arc::new(Notify::new());
     let shutdown_for_api = shutdown_signal.clone();
     let client_for_shutdown = signer.client();
-    let pool_for_shutdown = database.pool.clone();
+    let pool_for_shutdown = database.query_pool().clone();
 
     // Spawn API server with graceful shutdown
     let api_handle = tokio::spawn(async move {
@@ -524,6 +540,15 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     println!(
         "   Instance: {} (pg-hashring LISTEN/NOTIFY enabled)",
         instance_id
+    );
+    println!(
+        "   Pool mode: {} ({})",
+        pool_mode,
+        if pool_mode == PoolMode::Hybrid {
+            "queries via MCP"
+        } else {
+            "all direct"
+        }
     );
     println!("   HTTP handler cache: on-demand loading enabled\n");
 
