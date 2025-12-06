@@ -4,6 +4,8 @@ use sqlx::PgPool;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 /// Membership change event from PostgreSQL LISTEN/NOTIFY.
 #[derive(Debug, Clone, PartialEq)]
@@ -25,17 +27,25 @@ impl MembershipEvent {
 }
 
 /// Orchestrates HashRing + PostgreSQL membership with LISTEN/NOTIFY.
+///
+/// Provides a subscription mechanism for consumers to receive membership events
+/// after the ring has been updated, ensuring consistent state.
 pub struct ClusterCoordinator {
     ring: Arc<ArcSwap<HashRing>>,
     registry: Arc<InstanceRegistry>,
     pool: sqlx::PgPool,
-    shutdown: Arc<AtomicBool>,
+    cancel_token: CancellationToken,
     established: Arc<AtomicBool>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
+    event_tx: broadcast::Sender<MembershipEvent>,
 }
 
 impl ClusterCoordinator {
     /// Start a new coordinator, registering with the cluster.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if registration or initial sync fails.
     pub async fn start(pool: PgPool) -> Result<Self, Error> {
         let registry = Arc::new(InstanceRegistry::register(pool.clone()).await?);
         let instance_id = registry.instance_id().to_string();
@@ -46,25 +56,30 @@ impl ClusterCoordinator {
         initial_ring.rebuild(instances);
 
         let ring = Arc::new(ArcSwap::from_pointee(initial_ring));
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let cancel_token = CancellationToken::new();
         let established = Arc::new(AtomicBool::new(false));
+
+        // Broadcast channel for membership events (16 capacity is enough for bursts)
+        let (event_tx, _) = broadcast::channel(16);
 
         // Spawn coordination task
         let task_handle = Self::spawn_coordination_task(
             pool.clone(),
             ring.clone(),
             registry.clone(),
-            shutdown.clone(),
+            cancel_token.clone(),
             established.clone(),
+            event_tx.clone(),
         );
 
         Ok(Self {
             ring,
             registry,
             pool,
-            shutdown,
+            cancel_token,
             established,
             task_handle: Some(task_handle),
+            event_tx,
         })
     }
 
@@ -72,8 +87,9 @@ impl ClusterCoordinator {
         pool: PgPool,
         ring: Arc<ArcSwap<HashRing>>,
         registry: Arc<InstanceRegistry>,
-        shutdown: Arc<AtomicBool>,
+        cancel_token: CancellationToken,
         established: Arc<AtomicBool>,
+        event_tx: broadcast::Sender<MembershipEvent>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut listener = match InstanceRegistry::create_listener(&pool).await {
@@ -87,19 +103,16 @@ impl ClusterCoordinator {
             // Signal that LISTEN is active
             established.store(true, Ordering::Release);
 
-            let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(30));
+            // Heartbeat every 15s (faster crash detection than default 30s)
+            let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(15));
+            let mut consecutive_failures: u32 = 0;
 
             loop {
-                // Check shutdown flag
-                if shutdown.load(Ordering::Acquire) {
-                    tracing::debug!("Coordinator shutting down");
-                    break;
-                }
-
                 tokio::select! {
-                    // Timeout to check shutdown flag
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                        continue;
+                    // Cancellation - immediate response
+                    _ = cancel_token.cancelled() => {
+                        tracing::debug!("Coordinator shutting down");
+                        break;
                     }
 
                     result = listener.recv() => {
@@ -108,7 +121,7 @@ impl ClusterCoordinator {
                                 if let Some(event) = MembershipEvent::parse(notification.payload()) {
                                     // Clone current ring, modify, and swap atomically
                                     let mut new_ring = (**ring.load()).clone();
-                                    match event {
+                                    match &event {
                                         MembershipEvent::Joined(id) => {
                                             new_ring.add_instance(id.clone());
                                             tracing::debug!(
@@ -118,7 +131,7 @@ impl ClusterCoordinator {
                                             );
                                         }
                                         MembershipEvent::Left(id) => {
-                                            new_ring.remove_instance(&id);
+                                            new_ring.remove_instance(id);
                                             tracing::debug!(
                                                 id = %id,
                                                 count = new_ring.instance_count(),
@@ -127,17 +140,45 @@ impl ClusterCoordinator {
                                         }
                                     }
                                     ring.store(Arc::new(new_ring));
+
+                                    // Broadcast event AFTER ring is updated
+                                    // Ignore send errors (no subscribers is fine)
+                                    let _ = event_tx.send(event);
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!("Listener error: {}, will recover on heartbeat", e);
+                                consecutive_failures += 1;
+                                let backoff_ms = 100 * 2u64.pow(consecutive_failures.min(6));
+                                tracing::warn!(
+                                    failures = consecutive_failures,
+                                    backoff_ms,
+                                    "Listener error: {}, backing off",
+                                    e
+                                );
+                                // Sleep with cancellation support
+                                tokio::select! {
+                                    _ = cancel_token.cancelled() => break,
+                                    _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+                                }
                             }
                         }
                     }
 
                     _ = heartbeat_interval.tick() => {
                         if let Err(e) = registry.heartbeat().await {
-                            tracing::error!("Heartbeat failed: {}", e);
+                            consecutive_failures += 1;
+                            let backoff_ms = 100 * 2u64.pow(consecutive_failures.min(6));
+                            tracing::error!(
+                                failures = consecutive_failures,
+                                backoff_ms,
+                                "Heartbeat failed: {}, backing off",
+                                e
+                            );
+                            // Sleep with cancellation support
+                            tokio::select! {
+                                _ = cancel_token.cancelled() => break,
+                                _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+                            }
                             continue;
                         }
 
@@ -147,6 +188,8 @@ impl ClusterCoordinator {
 
                         match InstanceRegistry::get_active_instances(&pool).await {
                             Ok(instances) => {
+                                // Reset failures on successful DB operation
+                                consecutive_failures = 0;
                                 // Clone current ring, rebuild, and swap atomically
                                 let mut new_ring = (**ring.load()).clone();
                                 new_ring.rebuild(instances);
@@ -157,7 +200,19 @@ impl ClusterCoordinator {
                                 ring.store(Arc::new(new_ring));
                             }
                             Err(e) => {
-                                tracing::error!("Failed to get instances: {}", e);
+                                consecutive_failures += 1;
+                                let backoff_ms = 100 * 2u64.pow(consecutive_failures.min(6));
+                                tracing::error!(
+                                    failures = consecutive_failures,
+                                    backoff_ms,
+                                    "Failed to get instances: {}, backing off",
+                                    e
+                                );
+                                // Sleep with cancellation support
+                                tokio::select! {
+                                    _ = cancel_token.cancelled() => break,
+                                    _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+                                }
                             }
                         }
                     }
@@ -192,11 +247,45 @@ impl ClusterCoordinator {
         self.ring.load().instance_count()
     }
 
+    /// Subscribe to membership change events.
+    ///
+    /// Events are broadcast AFTER the ring has been updated, so subscribers
+    /// can safely call `instance_count()` and get the new value.
+    ///
+    /// This eliminates the race condition where a consumer might see a stale
+    /// `instance_count()` if they were listening to PostgreSQL NOTIFY directly.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut rx = coordinator.subscribe();
+    /// tokio::spawn(async move {
+    ///     while let Ok(event) = rx.recv().await {
+    ///         match event {
+    ///             MembershipEvent::Joined(id) => {
+    ///                 // Safe to call instance_count() here - ring is already updated
+    ///                 pool.on_membership_change();
+    ///             }
+    ///             MembershipEvent::Left(id) => {
+    ///                 pool.on_membership_change();
+    ///             }
+    ///         }
+    ///     }
+    /// });
+    /// ```
+    pub fn subscribe(&self) -> broadcast::Receiver<MembershipEvent> {
+        self.event_tx.subscribe()
+    }
+
     /// Manually refresh the hashring from the database.
     ///
     /// Useful after a crash when you don't want to wait for the heartbeat.
     /// In normal operation, the ring is updated automatically via LISTEN/NOTIFY
     /// for graceful shutdowns, and via heartbeat (30s) for crash detection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if cleanup or database query fails.
     pub async fn refresh(&self) -> Result<(), Error> {
         // Clean up stale instances first
         InstanceRegistry::cleanup_stale(&self.pool).await?;
@@ -213,6 +302,14 @@ impl ClusterCoordinator {
         Ok(())
     }
 
+    /// Deregister from the cluster without consuming self.
+    ///
+    /// Use when you can't take ownership (e.g., Arc::try_unwrap fails).
+    /// Sends "left:" notification to peers but doesn't stop the background task.
+    pub async fn force_deregister(&self) -> Result<(), Error> {
+        self.registry.deregister().await
+    }
+
     /// Graceful shutdown - deregisters from cluster and stops task.
     ///
     /// The shutdown sequence includes a "drain period" to prevent dropped events:
@@ -222,24 +319,32 @@ impl ClusterCoordinator {
     ///
     /// During the drain period, both this instance and its successors may handle
     /// the same keys. This is safe for idempotent operations like NIP-46 signing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deregistration fails.
     pub async fn shutdown(mut self) -> Result<(), Error> {
         // 1. Notify peers we're leaving (they start accepting our keys)
         self.registry.deregister().await?;
 
         // 2. Keep processing during drain period (overlap with peers)
         //    Our local ring still thinks we own our keys, so we keep handling them
-        tokio::time::sleep(Duration::from_millis(crate::SHUTDOWN_DRAIN_MS)).await;
+        //    Scale drain period with cluster size: 100ms × instance_count, capped at 5s
+        let drain_ms = (crate::SHUTDOWN_DRAIN_MS as usize * self.instance_count().max(1)).min(5000);
+        tokio::time::sleep(Duration::from_millis(drain_ms as u64)).await;
 
-        // 3. Now signal background task to stop
-        self.shutdown.store(true, Ordering::Release);
+        // 3. Cancel the background task (immediate response via CancellationToken)
+        self.cancel_token.cancel();
 
         if let Some(handle) = self.task_handle.take() {
+            // Task should exit immediately since we use CancellationToken
             let _ = handle.await;
         }
 
         tracing::debug!(
-            drain_ms = crate::SHUTDOWN_DRAIN_MS,
-            "Shutdown complete with drain"
+            drain_ms,
+            instance_count = self.instance_count(),
+            "Shutdown complete with dynamic drain"
         );
         Ok(())
     }

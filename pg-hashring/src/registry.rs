@@ -97,7 +97,7 @@ impl InstanceRegistry {
 
     pub async fn cleanup_stale(pool: &PgPool) -> Result<u64, Error> {
         let result = sqlx::query(&format!(
-            "DELETE FROM {} WHERE last_heartbeat < NOW() - INTERVAL '60 seconds'",
+            "DELETE FROM {} WHERE last_heartbeat < NOW() - INTERVAL '30 seconds'",
             DEFAULT_TABLE
         ))
         .execute(pool)

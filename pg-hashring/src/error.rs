@@ -7,4 +7,7 @@ pub enum Error {
 
     #[error("Configuration error: {0}")]
     Config(String),
+
+    #[error("Pool error: {0}")]
+    Pool(String),
 }

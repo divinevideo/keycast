@@ -56,10 +56,16 @@ mod error;
 mod registry;
 mod ring;
 
+#[cfg(feature = "pool")]
+mod cluster_pool;
+
 pub use coordinator::{ClusterCoordinator, MembershipEvent};
 pub use error::Error;
 pub use registry::InstanceRegistry;
 pub use ring::HashRing;
+
+#[cfg(feature = "pool")]
+pub use cluster_pool::{ClusterAwarePool, ClusterPoolConnection, PoolMetrics};
 
 use sqlx::PgPool;
 
