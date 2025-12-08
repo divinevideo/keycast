@@ -37,7 +37,7 @@ steps:
       - '--timeout=300'
       - '--min-instances=3'
       - '--max-instances=300'
-      - '--concurrency=200'
+      - '--concurrency=1000'
       - '--no-cpu-throttling'
       - '--execution-environment=gen2'
       - '--cpu-boost'
@@ -45,8 +45,8 @@ steps:
       - '--use-http2'
       - '--startup-probe=httpGet.path=/health,httpGet.port=3000,initialDelaySeconds=5,periodSeconds=10,failureThreshold=30,timeoutSeconds=5'
       - '--liveness-probe=httpGet.path=/health,httpGet.port=3000,periodSeconds=30,timeoutSeconds=5,failureThreshold=3'
-      - '--add-cloudsql-instances=openvine-co:us-central1:keycast-db'
-      - '--set-secrets=DATABASE_URL=keycast-database-url:6,SERVER_NSEC=keycast-ucan-secret:latest,SENDGRID_API_KEY=keycast-sendgrid-api-key:latest'
+      - '--add-cloudsql-instances=openvine-co:us-central1:keycast-db-plus'
+      - '--set-secrets=DATABASE_URL=keycast-database-url:latest,SERVER_NSEC=keycast-ucan-secret:latest,SENDGRID_API_KEY=keycast-sendgrid-api-key:latest'
       - '--set-env-vars=NODE_ENV=production,USE_GCP_KMS=true,GCP_PROJECT_ID=${PROJECT_ID},ALLOWED_ORIGINS=https://login.divine.video,APP_URL=https://login.divine.video,FROM_EMAIL=noreply@divine.video,RUST_LOG=info,ENABLE_EXAMPLES=true'
 
   # Smoke tests - verify deployment
