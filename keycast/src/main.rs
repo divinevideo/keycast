@@ -235,14 +235,14 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     let database = Database::new(database_url.clone(), database_migrations.clone()).await?;
     tracing::info!("✔︎ Database initialized at {:?}", database_url);
 
-    // Initialize cluster coordination with pg-hashring
-    // This handles instance registration, LISTEN/NOTIFY for membership changes, and heartbeats
+    // Initialize cluster coordination with pg-hashring (polling mode)
+    // This handles instance registration, membership polling, and heartbeats
+    // Compatible with managed connection pooling (no LISTEN/NOTIFY)
     pg_hashring::setup(&database.pool).await?;
     let coordinator = Arc::new(ClusterCoordinator::start(database.pool.clone()).await?);
-    coordinator.wait_for_established().await;
     let instance_id = coordinator.instance_id().to_string();
     tracing::info!(
-        "✔︎ Cluster coordinator started: {} (LISTEN/NOTIFY enabled)",
+        "✔︎ Cluster coordinator started: {} (polling mode)",
         instance_id
     );
 

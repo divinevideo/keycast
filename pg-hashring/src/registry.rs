@@ -1,4 +1,3 @@
-use sqlx::postgres::PgListener;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -19,7 +18,6 @@ impl Drop for InstanceRegistry {
 }
 
 const DEFAULT_TABLE: &str = "signer_instances";
-const DEFAULT_CHANNEL: &str = "cluster_membership";
 
 impl InstanceRegistry {
     pub async fn register(pool: PgPool) -> Result<Self, Error> {
@@ -32,12 +30,6 @@ impl InstanceRegistry {
         .bind(&instance_id)
         .execute(&pool)
         .await?;
-
-        sqlx::query("SELECT pg_notify($1, $2)")
-            .bind(DEFAULT_CHANNEL)
-            .bind(format!("joined:{}", instance_id))
-            .execute(&pool)
-            .await?;
 
         tracing::info!(%instance_id, "Registered instance");
         Ok(Self { pool, instance_id })
@@ -52,24 +44,12 @@ impl InstanceRegistry {
         .execute(&self.pool)
         .await?;
 
-        sqlx::query("SELECT pg_notify($1, $2)")
-            .bind(DEFAULT_CHANNEL)
-            .bind(format!("left:{}", self.instance_id))
-            .execute(&self.pool)
-            .await?;
-
         tracing::info!(instance_id = %self.instance_id, "Deregistered instance");
         Ok(())
     }
 
     pub fn instance_id(&self) -> &str {
         &self.instance_id
-    }
-
-    pub async fn create_listener(pool: &PgPool) -> Result<PgListener, Error> {
-        let mut listener = PgListener::connect_with(pool).await?;
-        listener.listen(DEFAULT_CHANNEL).await?;
-        Ok(listener)
     }
 
     pub async fn heartbeat(&self) -> Result<(), Error> {
@@ -151,63 +131,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_registry_notify_on_register() {
-        let pool = get_test_pool().await;
-        cleanup_test_instances(&pool).await;
-
-        let mut listener = InstanceRegistry::create_listener(&pool).await.unwrap();
-
-        let registry = InstanceRegistry::register(pool.clone()).await.unwrap();
-
-        let notification = tokio::time::timeout(Duration::from_millis(500), listener.recv())
-            .await
-            .expect("timeout waiting for notification")
-            .unwrap();
-
-        assert!(
-            notification.payload().starts_with("joined:"),
-            "Expected 'joined:' prefix, got: {}",
-            notification.payload()
-        );
-        assert!(
-            notification.payload().contains(registry.instance_id()),
-            "Notification should contain instance_id"
-        );
-
-        registry.deregister().await.unwrap();
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_registry_notify_on_deregister() {
-        let pool = get_test_pool().await;
-        cleanup_test_instances(&pool).await;
-
-        let registry = InstanceRegistry::register(pool.clone()).await.unwrap();
-        let instance_id = registry.instance_id().to_string();
-
-        let mut listener = InstanceRegistry::create_listener(&pool).await.unwrap();
-
-        // Drain any pending notifications from register
-        let _ = tokio::time::timeout(Duration::from_millis(50), listener.recv()).await;
-
-        registry.deregister().await.unwrap();
-
-        let notification = tokio::time::timeout(Duration::from_millis(500), listener.recv())
-            .await
-            .expect("timeout waiting for notification")
-            .unwrap();
-
-        assert_eq!(
-            notification.payload(),
-            format!("left:{}", instance_id),
-            "Expected 'left:<id>' notification"
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_registry_graceful_shutdown_removes_from_active() {
+    async fn test_registry_deregister_removes_instance() {
         let pool = get_test_pool().await;
         cleanup_test_instances(&pool).await;
 
@@ -276,5 +200,23 @@ mod tests {
         r1.deregister().await.unwrap();
         r2.deregister().await.unwrap();
         r3.deregister().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_registry_get_active_returns_recent() {
+        let pool = get_test_pool().await;
+        cleanup_test_instances(&pool).await;
+
+        let r1 = InstanceRegistry::register(pool.clone()).await.unwrap();
+        let r2 = InstanceRegistry::register(pool.clone()).await.unwrap();
+
+        let active = InstanceRegistry::get_active_instances(&pool).await.unwrap();
+        assert_eq!(active.len(), 2);
+        assert!(active.contains(&r1.instance_id().to_string()));
+        assert!(active.contains(&r2.instance_id().to_string()));
+
+        r1.deregister().await.unwrap();
+        r2.deregister().await.unwrap();
     }
 }

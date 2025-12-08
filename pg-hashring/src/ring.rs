@@ -99,6 +99,11 @@ impl HashRing {
         &self.my_instance_id
     }
 
+    /// Get the current set of instances in the ring.
+    pub fn instances(&self) -> &HashSet<String> {
+        &self.current_instances
+    }
+
     #[inline]
     fn hash_key(key: &str) -> u64 {
         const FNV_OFFSET: u64 = 0xcbf29ce484222325;

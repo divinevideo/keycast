@@ -2,9 +2,12 @@
 //!
 //! This crate provides:
 //! - Consistent hashing via AnchorHash (optimal minimal disruption)
-//! - PostgreSQL LISTEN/NOTIFY for near-instant membership changes (~100ms)
-//! - Heartbeat fallback for crash detection (30s)
+//! - PostgreSQL polling for membership changes (~2.5s average detection)
+//! - Heartbeat-based liveness (configurable interval, default 5s)
 //! - Graceful deregistration on shutdown
+//!
+//! **Compatible with managed connection poolers** (PgBouncer transaction mode,
+//! Cloud SQL Managed Connection Pooling) because it doesn't use LISTEN/NOTIFY.
 //!
 //! # Example
 //!
@@ -18,38 +21,39 @@
 //!     // Ensure schema exists (safe to call multiple times)
 //!     pg_hashring::setup(&pool).await?;
 //!
-//!     // Start coordinator - registers with cluster, begins listening
+//!     // Start coordinator - registers with cluster, begins polling
 //!     let coordinator = ClusterCoordinator::start(pool).await?;
 //!
-//!     // Wait for LISTEN to be established (useful for tests)
-//!     coordinator.wait_for_established().await;
-//!
 //!     // Check if we should handle a key
-//!     if coordinator.should_handle("some-bunker-pubkey").await {
+//!     if coordinator.should_handle("some-bunker-pubkey") {
 //!         // Process the request
 //!     }
 //!
-//!     // Graceful shutdown - deregisters and notifies other instances
+//!     // Graceful shutdown - deregisters from cluster
 //!     coordinator.shutdown().await?;
 //!     Ok(())
 //! }
 //! ```
 //!
-//! # Scale and Limitations
+//! # Scale and Performance
+//!
+//! With 300 instances polling every 5 seconds = 60 queries/second (negligible load).
 //!
 //! Appropriate for:
-//! - Small to medium clusters (3-100 instances)
+//! - Small to medium clusters (3-300 instances)
 //! - Infrequent membership changes (nodes join/leave rarely)
-//! - Environments where instances share a database but can't form UDP mesh
+//! - Environments using managed connection poolers
+//! - Serverless environments (Cloud Run, Lambda)
 //!
 //! Not suitable for:
 //! - Very large clusters (1000+ nodes)
 //! - High-frequency membership churn
+//! - Sub-second membership detection requirements
 //!
 //! # Failure Detection
 //!
-//! - **Graceful shutdown**: Other instances know within ~100ms (via NOTIFY)
-//! - **Crash/kill -9**: Other instances know within 30-60s (via heartbeat)
+//! - **Graceful shutdown**: Other instances detect within poll interval (default 5s)
+//! - **Crash/kill -9**: Other instances detect within 30-60s (via stale heartbeat cleanup)
 
 mod coordinator;
 mod error;
@@ -62,17 +66,6 @@ pub use registry::InstanceRegistry;
 pub use ring::HashRing;
 
 use sqlx::PgPool;
-
-/// Duration (in milliseconds) to continue processing after sending "left:" notification.
-///
-/// This "drain period" allows peers to receive the notification and update their rings
-/// before we stop processing. During this overlap, both the departing instance and its
-/// successors may handle the same keys (idempotent operations are safe).
-///
-/// Without this, there's a brief window (~5-20ms of LISTEN/NOTIFY latency) where
-/// events could be dropped because the departing instance has stopped but peers
-/// haven't yet learned they should take over.
-pub const SHUTDOWN_DRAIN_MS: u64 = 100;
 
 /// SQL schema required by pg-hashring (table creation).
 pub const SCHEMA_TABLE_SQL: &str = r#"
