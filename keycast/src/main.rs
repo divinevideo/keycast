@@ -10,7 +10,10 @@ use axum::{
     Router,
 };
 use dotenv::dotenv;
+use keycast_api::api::tenant::Tenant;
 use keycast_api::handlers::http_rpc_handler::new_http_handler_cache;
+use keycast_api::state::TenantCache;
+use moka::future::Cache;
 use keycast_core::authorization_channel;
 use keycast_core::database::Database;
 use keycast_core::encryption::file_key_manager::FileKeyManager;
@@ -318,6 +321,31 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         num_workers
     );
 
+    // Create tenant cache and preload existing tenants
+    let tenant_cache: TenantCache = Cache::builder()
+        .max_capacity(100)
+        .time_to_live(Duration::from_secs(3600))
+        .build();
+
+    let tenants: Vec<Tenant> = sqlx::query_as(
+        "SELECT id, domain, name, settings, created_at, updated_at FROM tenants",
+    )
+    .fetch_all(&database.pool)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!("Failed to preload tenants: {}", e);
+        vec![]
+    });
+
+    for tenant in tenants {
+        let domain = tenant.domain.clone();
+        tenant_cache.insert(domain.clone(), Arc::new(tenant)).await;
+    }
+    tracing::info!(
+        "✔︎ Tenant cache initialized ({} tenants preloaded)",
+        tenant_cache.entry_count()
+    );
+
     // Create API state with http_handler_cache for on-demand loading
     // Note: api no longer depends on signer's handler cache (decoupled)
     let api_state = Arc::new(keycast_api::state::KeycastState {
@@ -326,6 +354,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         signer_handlers: None, // Deprecated: api uses http_handler_cache with on-demand loading
         http_handler_cache: new_http_handler_cache(),
         server_keys,
+        tenant_cache,
     });
 
     // Set global state for routes that use it
@@ -497,6 +526,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         let listener = tokio::net::TcpListener::bind(api_addr).await.unwrap();
         tracing::info!("🌐 API server listening on {}", api_addr);
         axum::serve(listener, app)
+            .tcp_nodelay(true)
             .with_graceful_shutdown(async move {
                 shutdown_for_api.notified().await;
             })

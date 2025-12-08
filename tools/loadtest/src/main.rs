@@ -132,8 +132,6 @@ pub enum RpcMethod {
     GetPublicKey,
     /// Encrypt with NIP-44
     Nip44Encrypt,
-    /// Decrypt with NIP-44
-    Nip44Decrypt,
 }
 
 #[derive(clap::Args)]

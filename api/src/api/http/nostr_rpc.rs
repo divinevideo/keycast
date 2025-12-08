@@ -168,7 +168,8 @@ pub async fn nostr_rpc(
             let (recipient_pubkey, plaintext) = parse_encrypt_params(&req.params)?;
 
             // Handler validates expiration, revocation, and permissions (all cached)
-            let ciphertext = handler.nip44_encrypt(&recipient_pubkey, &plaintext)?;
+            // Crypto runs on spawn_blocking to avoid blocking async workers
+            let ciphertext = handler.nip44_encrypt(&recipient_pubkey, &plaintext).await?;
 
             JsonValue::String(ciphertext)
         }
@@ -177,7 +178,8 @@ pub async fn nostr_rpc(
             let (sender_pubkey, ciphertext) = parse_decrypt_params(&req.params)?;
 
             // Handler validates expiration, revocation, and permissions (all cached)
-            let plaintext = handler.nip44_decrypt(&sender_pubkey, &ciphertext)?;
+            // Crypto runs on spawn_blocking to avoid blocking async workers
+            let plaintext = handler.nip44_decrypt(&sender_pubkey, &ciphertext).await?;
 
             JsonValue::String(plaintext)
         }
@@ -186,7 +188,8 @@ pub async fn nostr_rpc(
             let (recipient_pubkey, plaintext) = parse_encrypt_params(&req.params)?;
 
             // Handler validates expiration, revocation, and permissions (all cached)
-            let ciphertext = handler.nip04_encrypt(&recipient_pubkey, &plaintext)?;
+            // Crypto runs on spawn_blocking to avoid blocking async workers
+            let ciphertext = handler.nip04_encrypt(&recipient_pubkey, &plaintext).await?;
 
             JsonValue::String(ciphertext)
         }
@@ -195,7 +198,8 @@ pub async fn nostr_rpc(
             let (sender_pubkey, ciphertext) = parse_decrypt_params(&req.params)?;
 
             // Handler validates expiration, revocation, and permissions (all cached)
-            let plaintext = handler.nip04_decrypt(&sender_pubkey, &ciphertext)?;
+            // Crypto runs on spawn_blocking to avoid blocking async workers
+            let plaintext = handler.nip04_decrypt(&sender_pubkey, &ciphertext).await?;
 
             JsonValue::String(plaintext)
         }

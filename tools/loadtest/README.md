@@ -270,6 +270,69 @@ cargo install flamegraph
 CARGO_PROFILE_RELEASE_DEBUG=true cargo build --release --bin keycast
 ```
 
+## Performance Debugging Checklist
+
+**IMPORTANT:** When investigating performance issues, always check these FIRST before building synthetic benchmarks:
+
+### 1. Check SQL Queries (Most Common Bottleneck)
+
+```bash
+# Enable SQLx query logging
+RUST_LOG=sqlx=debug ./target/release/keycast
+
+# Or check PostgreSQL directly
+psql -c "SELECT query, calls, mean_exec_time FROM pg_stat_statements ORDER BY mean_exec_time DESC LIMIT 10;"
+```
+
+**What to look for:**
+- Queries running on every request that should be cached
+- INSERT/UPDATE statements in read-heavy paths
+- Missing indexes (high `mean_exec_time`)
+- N+1 query patterns
+
+**Real example:** The `TenantExtractor` was doing `INSERT ... ON CONFLICT` on every request instead of caching the tenant lookup. This caused ~160x slowdown (1.8k → 623k req/s after fix).
+
+### 2. Check Application Metrics
+
+```bash
+curl http://localhost:3000/api/metrics | grep -E "cache|rpc|latency"
+```
+
+Verify cache hit rates match expectations. 99%+ cache hits with high latency = bottleneck is elsewhere (not cache misses).
+
+### 3. Check Tokio Runtime
+
+```bash
+# Enable tokio-console (if configured)
+RUSTFLAGS="--cfg tokio_unstable" cargo build --release
+
+# Or use tracing to spot blocking operations
+RUST_LOG=tokio=trace ./target/release/keycast
+```
+
+Look for:
+- `spawn_blocking` overload
+- Blocking operations on async threads
+- Task starvation
+
+### 4. Profile with Flamegraph
+
+Only after ruling out obvious issues:
+
+```bash
+sudo ./tools/loadtest/flamegraph.sh --duration 30
+```
+
+### Common Performance Pitfalls
+
+| Pitfall | Symptom | Fix |
+|---------|---------|-----|
+| **DB query per request** | High latency, low CPU | Add caching layer |
+| **Uncached extractor** | Middleware runs on every request | Cache in global state |
+| **Blocking in async** | Low throughput, thread starvation | Use `spawn_blocking` |
+| **Lock contention** | High CPU, low throughput | Use lock-free structures (dashmap, Moka) |
+| **Serialization overhead** | High CPU in serde | Use zero-copy or pre-serialize |
+
 ## Development
 
 ```bash

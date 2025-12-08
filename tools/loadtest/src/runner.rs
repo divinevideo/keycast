@@ -242,13 +242,15 @@ fn select_user_index(
         }
         TestScenario::Mixed => {
             // 80% hot users, 20% cold users (deterministic based on request_num)
-            // Use simple hash to determine hot vs cold
-            if request_num % 5 != 0 {
+            // If not enough users for separate pools, just rotate through all
+            if users.len() <= hot_count {
+                request_num % users.len()
+            } else if request_num % 5 != 0 {
                 // 80% hot user (from first 10%)
                 request_num % hot_count
             } else {
                 // 20% cold user (from remaining 90%)
-                let cold_pool = (users.len() - hot_count).max(1);
+                let cold_pool = users.len() - hot_count;
                 hot_count + (request_num % cold_pool)
             }
         }
@@ -279,10 +281,6 @@ async fn execute_request(
                 "nip44_encrypt",
                 vec![json!(recipient), json!("test message for load testing")],
             )
-        }
-        RpcMethod::Nip44Decrypt => {
-            // This requires pre-encrypted data, skip for now
-            ("get_public_key", vec![])
         }
     };
 

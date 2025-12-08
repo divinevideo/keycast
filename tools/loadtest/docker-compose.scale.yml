@@ -1,0 +1,131 @@
+# Scalable test environment for load testing keycast.
+#
+# Uses HAProxy as load balancer with sticky sessions (Authorization header hashing).
+# This simulates Cloud Run's session-affinity behavior for local testing.
+# Each keycast instance gets 4 CPUs to match Cloud Run configuration.
+#
+# Usage (run from tools/loadtest/):
+#   # Auto-scale based on available cores (4 cores per instance):
+#   INSTANCES=$(($(nproc) / 4)) && docker-compose up -d --scale keycast=$INSTANCES
+#
+#   # Or specify manually:
+#   docker-compose up -d --scale keycast=8
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: keycast
+    # No external port - accessed internally only
+    # Tuned for high-concurrency OLTP (many small reads)
+    command: >
+      postgres
+      -c max_connections=500
+      -c shared_buffers=2GB
+      -c effective_cache_size=8GB
+      -c work_mem=64MB
+      -c maintenance_work_mem=512MB
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c max_parallel_workers_per_gather=4
+      -c max_parallel_workers=8
+      -c log_statement=none
+      -c log_min_duration_statement=1000
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_scale_data:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          memory: 12G
+          cpus: '8'
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:password@postgres:5432/keycast
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 5000
+      DEFAULT_POOL_SIZE: 200
+      MIN_POOL_SIZE: 50
+      RESERVE_POOL_SIZE: 50
+      AUTH_TYPE: plain
+      ADMIN_USERS: postgres
+      # Aggressive connection reuse
+      SERVER_IDLE_TIMEOUT: 60
+      SERVER_LIFETIME: 3600
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h localhost -p 5432 -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+
+  # HAProxy provides sticky sessions via Authorization header hashing
+  # This simulates Cloud Run's session-affinity behavior
+  haproxy:
+    image: haproxy:2.9-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "3000:80"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    healthcheck:
+      test: ["CMD", "haproxy", "-c", "-f", "/usr/local/etc/haproxy/haproxy.cfg"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+
+  keycast:
+    build: ../..
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_healthy
+    environment:
+      # Use pgbouncer for connection pooling (recommended for scale testing)
+      DATABASE_URL: ${DATABASE_URL:-postgres://postgres:password@pgbouncer:5432/keycast}
+      ALLOWED_ORIGINS: "*"
+      SERVER_NSEC: ${SERVER_NSEC}
+      MASTER_KEY_PATH: /app/master.key
+      RUST_LOG: ${RUST_LOG:-info,keycast=info}
+      # Reduce log noise at scale
+      RUST_BACKTRACE: 0
+      # Skip migrations after first instance - prevents advisory lock contention
+      SKIP_MIGRATIONS: ${SKIP_MIGRATIONS:-0}
+      # Tokio worker threads - defaults to 4 for 8x4=32 core setup
+      TOKIO_WORKER_THREADS: ${TOKIO_WORKER_THREADS:-4}
+    volumes:
+      - ./master.key:/app/master.key:ro
+    # No port mapping - haproxy handles external access
+    expose:
+      - "3000"
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          # 4 CPUs per instance - for 8 instances = 32 cores total
+          cpus: '${KEYCAST_CPUS:-4}'
+    # Allow scaling
+    # Container names are auto-generated: keycast-keycast-1, keycast-keycast-2, etc.
+
+volumes:
+  postgres_scale_data:

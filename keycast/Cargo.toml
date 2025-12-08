@@ -29,5 +29,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Utilities
 dotenv = "0.15"
 num_cpus = "1.16"
+moka = { version = "0.12", features = ["future"] }
+sqlx = { workspace = true }
 
 [dev-dependencies]

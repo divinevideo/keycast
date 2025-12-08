@@ -226,7 +226,8 @@ impl HttpRpcHandler {
     }
 
     /// Encrypt plaintext using NIP-44 after checking validity and permissions
-    pub fn nip44_encrypt(
+    /// (CPU-bound crypto runs on spawn_blocking via SigningSession)
+    pub async fn nip44_encrypt(
         &self,
         recipient: &PublicKey,
         plaintext: &str,
@@ -239,11 +240,13 @@ impl HttpRpcHandler {
 
         self.signing
             .nip44_encrypt(recipient, plaintext)
+            .await
             .map_err(|e| HandlerError::Encryption(e.to_string()))
     }
 
     /// Decrypt ciphertext using NIP-44 after checking validity and permissions
-    pub fn nip44_decrypt(
+    /// (CPU-bound crypto runs on spawn_blocking via SigningSession)
+    pub async fn nip44_decrypt(
         &self,
         sender: &PublicKey,
         ciphertext: &str,
@@ -256,11 +259,13 @@ impl HttpRpcHandler {
 
         self.signing
             .nip44_decrypt(sender, ciphertext)
+            .await
             .map_err(|e| HandlerError::Encryption(e.to_string()))
     }
 
     /// Encrypt plaintext using NIP-04 after checking validity and permissions
-    pub fn nip04_encrypt(
+    /// (CPU-bound crypto runs on spawn_blocking)
+    pub async fn nip04_encrypt(
         &self,
         recipient: &PublicKey,
         plaintext: &str,
@@ -271,12 +276,19 @@ impl HttpRpcHandler {
 
         self.validate_encrypt_permission(plaintext, recipient)?;
 
-        nip04::encrypt(self.signing.keys().secret_key(), recipient, plaintext)
+        let secret = self.signing.keys().secret_key().clone();
+        let recipient = *recipient;
+        let plaintext = plaintext.to_string();
+
+        tokio::task::spawn_blocking(move || nip04::encrypt(&secret, &recipient, &plaintext))
+            .await
+            .map_err(|e| HandlerError::Encryption(format!("blocking task failed: {}", e)))?
             .map_err(|e| HandlerError::Encryption(e.to_string()))
     }
 
     /// Decrypt ciphertext using NIP-04 after checking validity and permissions
-    pub fn nip04_decrypt(
+    /// (CPU-bound crypto runs on spawn_blocking)
+    pub async fn nip04_decrypt(
         &self,
         sender: &PublicKey,
         ciphertext: &str,
@@ -287,7 +299,13 @@ impl HttpRpcHandler {
 
         self.validate_decrypt_permission(ciphertext, sender)?;
 
-        nip04::decrypt(self.signing.keys().secret_key(), sender, ciphertext)
+        let secret = self.signing.keys().secret_key().clone();
+        let sender = *sender;
+        let ciphertext = ciphertext.to_string();
+
+        tokio::task::spawn_blocking(move || nip04::decrypt(&secret, &sender, &ciphertext))
+            .await
+            .map_err(|e| HandlerError::Encryption(format!("blocking task failed: {}", e)))?
             .map_err(|e| HandlerError::Encryption(e.to_string()))
     }
 }

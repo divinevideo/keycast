@@ -1,9 +1,11 @@
 // ABOUTME: Pure crypto signing session wrapping Nostr Keys
 // ABOUTME: Provides sign/encrypt/decrypt operations for both HTTP and NIP-46 paths
+// ABOUTME: All CPU-bound crypto runs on spawn_blocking to avoid blocking async runtime
 
 use nostr_sdk::nips::nip44;
 use nostr_sdk::{Event, Keys, PublicKey, UnsignedEvent};
 use thiserror::Error;
+use tokio::task::JoinError;
 
 /// 32-byte key for efficient cache lookups (stack-only, no heap allocation)
 pub type CacheKey = [u8; 32];
@@ -24,6 +26,8 @@ pub enum SessionError {
     Signing(String),
     #[error("encryption error: {0}")]
     Encryption(String),
+    #[error("blocking task failed: {0}")]
+    BlockingTask(#[from] JoinError),
 }
 
 /// Pure crypto signing session wrapping Nostr Keys.
@@ -49,36 +53,48 @@ impl SigningSession {
         self.keys.public_key()
     }
 
-    /// Sign an unsigned event
+    /// Sign an unsigned event (CPU-bound crypto runs on spawn_blocking)
     pub async fn sign_event(&self, unsigned: UnsignedEvent) -> Result<Event, SessionError> {
-        unsigned
-            .sign(&self.keys)
-            .await
-            .map_err(|e| SessionError::Signing(e.to_string()))
+        let keys = self.keys.clone();
+
+        tokio::task::spawn_blocking(move || {
+            // Run the async sign on the blocking thread pool
+            // nostr-sdk's sign() is async but the actual Schnorr crypto is sync
+            tokio::runtime::Handle::current().block_on(async { unsigned.sign(&keys).await })
+        })
+        .await?
+        .map_err(|e| SessionError::Signing(e.to_string()))
     }
 
-    /// Encrypt plaintext using NIP-44
-    pub fn nip44_encrypt(
+    /// Encrypt plaintext using NIP-44 (CPU-bound crypto runs on spawn_blocking)
+    pub async fn nip44_encrypt(
         &self,
         recipient: &PublicKey,
         plaintext: &str,
     ) -> Result<String, SessionError> {
-        nip44::encrypt(
-            self.keys.secret_key(),
-            recipient,
-            plaintext,
-            nip44::Version::V2,
-        )
+        let secret = self.keys.secret_key().clone();
+        let recipient = *recipient;
+        let plaintext = plaintext.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            nip44::encrypt(&secret, &recipient, &plaintext, nip44::Version::V2)
+        })
+        .await?
         .map_err(|e| SessionError::Encryption(e.to_string()))
     }
 
-    /// Decrypt ciphertext using NIP-44
-    pub fn nip44_decrypt(
+    /// Decrypt ciphertext using NIP-44 (CPU-bound crypto runs on spawn_blocking)
+    pub async fn nip44_decrypt(
         &self,
         sender: &PublicKey,
         ciphertext: &str,
     ) -> Result<String, SessionError> {
-        nip44::decrypt(self.keys.secret_key(), sender, ciphertext)
+        let secret = self.keys.secret_key().clone();
+        let sender = *sender;
+        let ciphertext = ciphertext.to_string();
+
+        tokio::task::spawn_blocking(move || nip44::decrypt(&secret, &sender, &ciphertext))
+            .await?
             .map_err(|e| SessionError::Encryption(e.to_string()))
     }
 }

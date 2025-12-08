@@ -33,3 +33,8 @@ scripts/deploy-to-pi.sh
 tests/qa/target/
 keycast-login/dist/
 .claude/settings.local.json
+
+# Load testing artifacts
+loadtest-results.json
+loadtest-users.json
+scale-test-results/

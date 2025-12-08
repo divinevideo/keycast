@@ -95,7 +95,19 @@ where
         // Remove port if present (e.g., "localhost:3000" -> "localhost")
         let domain = host.split(':').next().unwrap_or(host);
 
-        // Get database pool from global state
+        // FAST PATH: Check tenant cache first (preloaded at startup)
+        let tenant_cache = crate::state::get_tenant_cache().map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Tenant cache not initialized".to_string(),
+            )
+        })?;
+
+        if let Some(tenant) = tenant_cache.get(domain).await {
+            return Ok(TenantExtractor(tenant));
+        }
+
+        // SLOW PATH: Cache miss - get or create tenant from database
         let pool = crate::state::get_db_pool().map_err(|_| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -103,7 +115,6 @@ where
             )
         })?;
 
-        // Get or create tenant (auto-provision if needed)
         let tenant = get_or_create_tenant(pool, domain).await.map_err(|e| {
             tracing::error!("Failed to get/create tenant for domain {}: {}", domain, e);
             match e {
@@ -134,7 +145,12 @@ where
             }
         })?;
 
-        Ok(TenantExtractor(Arc::new(tenant)))
+        // Cache the tenant for future requests
+        let tenant = Arc::new(tenant);
+        tenant_cache.insert(domain.to_string(), tenant.clone()).await;
+        tracing::info!(domain = %domain, "Tenant cached");
+
+        Ok(TenantExtractor(tenant))
     }
 }
 
