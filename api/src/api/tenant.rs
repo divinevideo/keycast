@@ -84,16 +84,18 @@ where
     type Rejection = (StatusCode, String);
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        // Extract Host header
+        // Extract host from Host header (HTTP/1.1) or URI authority (HTTP/2)
+        // In HTTP/2, the :authority pseudo-header replaces Host, and hyper puts it in the URI
         let host = parts
             .headers
             .get("host")
-            .ok_or((StatusCode::BAD_REQUEST, "Missing Host header".to_string()))?
-            .to_str()
-            .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid Host header".to_string()))?;
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string())
+            .or_else(|| parts.uri.host().map(|h| h.to_string()))
+            .ok_or((StatusCode::BAD_REQUEST, "Missing Host header".to_string()))?;
 
         // Remove port if present (e.g., "localhost:3000" -> "localhost")
-        let domain = host.split(':').next().unwrap_or(host);
+        let domain = host.split(':').next().unwrap_or(&host);
 
         // FAST PATH: Check tenant cache first (preloaded at startup)
         let tenant_cache = crate::state::get_tenant_cache().map_err(|_| {
