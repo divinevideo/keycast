@@ -126,9 +126,13 @@ impl Database {
             .acquire_timeout(Duration::from_secs(ACQUIRE_TIMEOUT_SECS))
             .max_connections(1); // LISTEN only needs 1 persistent connection
 
-        let direct_connect_options = PgConnectOptions::from_str(&direct_url)
+        let mut direct_connect_options = PgConnectOptions::from_str(&direct_url)
             .expect("Invalid DATABASE_DIRECT_URL");
-        // Note: No statement_cache_capacity(0) - direct connections support prepared statements
+        // If using managed pool for direct connections (no DATABASE_DIRECT_URL set),
+        // we still need to disable statement cache due to PgBouncer transaction mode
+        if !using_separate_direct {
+            direct_connect_options = direct_connect_options.statement_cache_capacity(0);
+        }
 
         let direct_pool = direct_pool_options
             .connect_with(direct_connect_options)
