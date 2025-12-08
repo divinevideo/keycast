@@ -29,13 +29,22 @@ pub enum DatabaseError {
 
 #[derive(Clone)]
 pub struct Database {
+    /// Main pool for queries - may go through connection pooler (transaction mode)
     pub pool: PgPool,
+    /// Direct pool for LISTEN/NOTIFY - bypasses connection pooler
+    /// Uses same URL as main pool if DATABASE_DIRECT_URL is not set
+    pub direct_pool: PgPool,
 }
 
 impl Database {
     pub async fn new(_db_path: PathBuf, migrations_path: PathBuf) -> Result<Self, DatabaseError> {
         let database_url =
             env::var("DATABASE_URL").expect("DATABASE_URL must be set for PostgreSQL");
+
+        // Optional direct URL for LISTEN/NOTIFY (bypasses connection pooler)
+        // Falls back to DATABASE_URL if not set
+        let direct_url = env::var("DATABASE_DIRECT_URL").unwrap_or_else(|_| database_url.clone());
+        let using_separate_direct = env::var("DATABASE_DIRECT_URL").is_ok();
 
         let instance_id = env::var("K_REVISION").unwrap_or_else(|_| "local".to_string());
 
@@ -46,6 +55,9 @@ impl Database {
             MAX_CONNECTIONS_PER_INSTANCE
         );
         eprintln!("   Acquire timeout: {}s", ACQUIRE_TIMEOUT_SECS);
+        if using_separate_direct {
+            eprintln!("   Using separate DATABASE_DIRECT_URL for LISTEN/NOTIFY");
+        }
         eprintln!("   ⚠️  If PoolTimedOut errors occur, check:");
         eprintln!("      - Cloud SQL max_connections (db-f1-micro ≈ 25)");
         eprintln!(
@@ -54,9 +66,7 @@ impl Database {
         );
         eprintln!("      - Total must be < Cloud SQL max_connections");
 
-        // With Moka cache (1M entries), DB is rarely hit in steady state.
-        // Connections mainly used for: startup load, new OAuth, cache misses.
-        // Keep pool small to allow more Cloud Run instances.
+        // Main pool options - may go through connection pooler
         let pool_options = PgPoolOptions::new()
             .acquire_timeout(Duration::from_secs(ACQUIRE_TIMEOUT_SECS))
             .max_connections(MAX_CONNECTIONS_PER_INSTANCE);
@@ -110,13 +120,29 @@ impl Database {
             }
         };
 
-        // Run migrations
+        // Direct pool for LISTEN/NOTIFY - only needs 1 connection per instance
+        // No statement_cache_capacity(0) needed since it bypasses pooler
+        let direct_pool_options = PgPoolOptions::new()
+            .acquire_timeout(Duration::from_secs(ACQUIRE_TIMEOUT_SECS))
+            .max_connections(1); // LISTEN only needs 1 persistent connection
+
+        let direct_connect_options = PgConnectOptions::from_str(&direct_url)
+            .expect("Invalid DATABASE_DIRECT_URL");
+        // Note: No statement_cache_capacity(0) - direct connections support prepared statements
+
+        let direct_pool = direct_pool_options
+            .connect_with(direct_connect_options)
+            .await?;
+
+        // Run migrations (use direct_pool to avoid PgBouncer prepared statement conflicts)
+        // When using connection pooling in transaction mode, prepared statements conflict
+        // because multiple connections may share the same underlying database connection
         eprintln!("Running migrations...");
         let mut attempts = 0;
         while attempts < 3 {
             match sqlx::migrate::Migrator::new(migrations_path.clone())
                 .await?
-                .run(&pool)
+                .run(&direct_pool)
                 .await
             {
                 Ok(_) => break,
@@ -130,6 +156,6 @@ impl Database {
 
         eprintln!("✅ PostgreSQL database initialized successfully");
 
-        Ok(Self { pool })
+        Ok(Self { pool, direct_pool })
     }
 }
