@@ -103,6 +103,7 @@ impl RpcClient {
         let client = Client::builder()
             .pool_max_idle_per_host(pool_size)
             .timeout(Duration::from_secs(30))
+            .cookie_store(true) // Store GCLB cookie for session affinity
             .build()?;
 
         Ok(Self {
@@ -401,6 +402,20 @@ impl RegistrationClient {
                 None
             }
         })
+    }
+
+    /// Register with timing information for load test metrics
+    pub async fn register_timed(&self, email: &str, password: &str) -> RequestResult {
+        let start = Instant::now();
+        let result = self.register(email, password).await;
+        let duration = start.elapsed();
+
+        RequestResult {
+            duration,
+            success: result.success,
+            status: if result.success { Some(201) } else { Some(500) },
+            error: result.error,
+        }
     }
 }
 

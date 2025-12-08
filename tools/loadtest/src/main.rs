@@ -132,6 +132,8 @@ pub enum RpcMethod {
     GetPublicKey,
     /// Encrypt with NIP-44
     Nip44Encrypt,
+    /// Full registration flow (register + OAuth authorize + token)
+    Register,
 }
 
 #[derive(clap::Args)]

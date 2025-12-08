@@ -1,40 +1,79 @@
-use crate::client::RpcClient;
+use crate::client::{RegistrationClient, RpcClient};
 use crate::metrics::{Metrics, TestMetadata};
 use crate::setup::{TestUser, TestUsersFile};
 use crate::{RpcMethod, RunArgs, TestScenario};
 use anyhow::Result;
+use rand::distributions::Alphanumeric;
+use rand::Rng;
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 pub async fn run_loadtest(args: RunArgs) -> Result<()> {
-    // Load users from file
-    let users_json = std::fs::read_to_string(&args.users_file)?;
-    let users_file: TestUsersFile = serde_json::from_str(&users_json)?;
-    let users = Arc::new(users_file.users);
+    // For registration mode, we don't need existing users
+    let is_registration_mode = matches!(args.method, RpcMethod::Register);
 
-    if users.is_empty() {
-        anyhow::bail!("No users found in {:?}", args.users_file);
-    }
+    let users = if is_registration_mode {
+        tracing::info!(
+            "Starting REGISTRATION load test against {}",
+            args.url
+        );
+        tracing::info!(
+            "Concurrency: {}, Duration: {}s (creating new users)",
+            args.concurrency,
+            args.duration
+        );
+        Arc::new(Vec::new())
+    } else {
+        // Load users from file for RPC methods
+        let users_json = std::fs::read_to_string(&args.users_file)?;
+        let users_file: TestUsersFile = serde_json::from_str(&users_json)?;
+        let users = Arc::new(users_file.users);
 
-    tracing::info!(
-        "Starting load test against {} with {} users",
-        args.url,
-        users.len()
-    );
-    tracing::info!(
-        "Scenario: {:?}, Concurrency: {}, Duration: {}s",
-        args.scenario,
-        args.concurrency,
-        args.duration
-    );
+        if users.is_empty() {
+            anyhow::bail!("No users found in {:?}", args.users_file);
+        }
 
-    let client = Arc::new(RpcClient::new(&args.url, args.concurrency * 2)?);
+        tracing::info!(
+            "Starting load test against {} with {} users",
+            args.url,
+            users.len()
+        );
+        tracing::info!(
+            "Scenario: {:?}, Concurrency: {}, Duration: {}s",
+            args.scenario,
+            args.concurrency,
+            args.duration
+        );
+        users
+    };
+
+    // Create per-user clients to ensure proper load distribution across instances
+    // Each user needs their own connection pool so Google's load balancer assigns
+    // them to different backend instances (session affinity works at TCP level)
+    let user_clients: Arc<HashMap<usize, RpcClient>> = if !users.is_empty() {
+        let mut clients = HashMap::new();
+        for (i, _user) in users.iter().enumerate() {
+            // Moderate pool per user - each user maintains their own connections
+            // Larger pool handles high concurrency better
+            clients.insert(i, RpcClient::new(&args.url, 50)?);
+        }
+        tracing::info!("Created {} per-user HTTP clients for session affinity", clients.len());
+        Arc::new(clients)
+    } else {
+        Arc::new(HashMap::new())
+    };
+
+    // Shared client only for metrics endpoint and registration mode
+    let shared_client = Arc::new(RpcClient::new(&args.url, args.concurrency * 2)?);
+    let reg_client = Arc::new(RegistrationClient::new(&args.url, args.concurrency * 2)?);
+    let run_id = chrono::Utc::now().timestamp();
 
     // Fetch server metrics before test
-    let metrics_before = match client.fetch_metrics().await {
+    let metrics_before = match shared_client.fetch_metrics().await {
         Ok(m) => {
             tracing::info!(
                 "Server metrics before: requests={}, cache_hits={}, cache_misses={}, cache_size={}",
@@ -88,7 +127,8 @@ pub async fn run_loadtest(args: RunArgs) -> Result<()> {
     // Spawn worker tasks
     let mut handles = Vec::new();
     for worker_id in 0..args.concurrency {
-        let client = client.clone();
+        let user_clients = user_clients.clone();
+        let reg_client = reg_client.clone();
         let metrics = metrics.clone();
         let semaphore = semaphore.clone();
         let running = running.clone();
@@ -111,7 +151,7 @@ pub async fn run_loadtest(args: RunArgs) -> Result<()> {
                 tokio::time::sleep(Duration::from_millis(worker_delay)).await;
             }
 
-            let hot_count = (users.len() / 10).max(1); // 10% hot users
+            let hot_count = if users.is_empty() { 1 } else { (users.len() / 10).max(1) };
 
             loop {
                 // Check termination conditions
@@ -128,12 +168,19 @@ pub async fn run_loadtest(args: RunArgs) -> Result<()> {
                 let _permit = semaphore.acquire().await.unwrap();
                 let request_num = counter.fetch_add(1, Ordering::Relaxed);
 
-                // Select user based on scenario (deterministic selection)
-                let user_index = select_user_index(&users, scenario, request_num, hot_count);
-                let user = &users[user_index];
-
-                // Execute request
-                let result = execute_request(&client, user, method).await;
+                // Execute request based on method
+                let result = if matches!(method, RpcMethod::Register) {
+                    // Registration mode: create unique user each request
+                    let email = format!("lt{}-{}@bench.local", run_id, request_num);
+                    let password = generate_password();
+                    reg_client.register_timed(&email, &password).await
+                } else {
+                    // RPC mode: select existing user and their dedicated client
+                    let user_index = select_user_index(&users, scenario, request_num, hot_count);
+                    let user = &users[user_index];
+                    let client = user_clients.get(&user_index).expect("user client exists");
+                    execute_request(client, user, method).await
+                };
 
                 // Log first few errors for debugging
                 if !result.success && request_num < 3 {
@@ -159,7 +206,7 @@ pub async fn run_loadtest(args: RunArgs) -> Result<()> {
     let _ = progress_handle.await;
 
     // Fetch server metrics after test
-    let metrics_after = match client.fetch_metrics().await {
+    let metrics_after = match shared_client.fetch_metrics().await {
         Ok(m) => {
             tracing::info!(
                 "Server metrics after: requests={}, cache_hits={}, cache_misses={}, cache_size={}",
@@ -282,7 +329,19 @@ async fn execute_request(
                 vec![json!(recipient), json!("test message for load testing")],
             )
         }
+        RpcMethod::Register => {
+            // Handled separately in worker loop, not through RPC
+            unreachable!("Register is handled directly, not through execute_request")
+        }
     };
 
     client.call(&user.ucan_token, method_name, params).await
+}
+
+fn generate_password() -> String {
+    rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect()
 }
