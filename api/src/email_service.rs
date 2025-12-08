@@ -184,6 +184,15 @@ impl EmailService {
         html_content: &str,
         text_content: &str,
     ) -> Result<(), String> {
+        // Check if emails are disabled (useful for load testing)
+        if env::var("DISABLE_EMAILS").is_ok() {
+            tracing::info!(
+                "Emails disabled via DISABLE_EMAILS env var, skipping email to {}",
+                to_email
+            );
+            return Ok(());
+        }
+
         let email = SendGridEmail {
             personalizations: vec![Personalization {
                 to: vec![EmailAddress {
