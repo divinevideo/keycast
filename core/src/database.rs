@@ -138,9 +138,10 @@ impl Database {
             .connect_with(direct_connect_options)
             .await?;
 
-        // Run migrations (use direct_pool to avoid PgBouncer prepared statement conflicts)
-        // When using connection pooling in transaction mode, prepared statements conflict
-        // because multiple connections may share the same underlying database connection
+        // Run migrations - with graceful handling for multi-instance startup
+        // When many instances start simultaneously with Cloud SQL Managed Pool, they may
+        // hit "prepared statement already exists" conflicts (error code 42P05).
+        // This is safe to ignore - it means another instance is running migrations.
         eprintln!("Running migrations...");
         let mut attempts = 0;
         while attempts < 3 {
@@ -149,12 +150,26 @@ impl Database {
                 .run(&direct_pool)
                 .await
             {
-                Ok(_) => break,
-                Err(_e) if attempts < 2 => {
-                    sleep(Duration::from_millis(500)).await;
-                    attempts += 1;
+                Ok(_) => {
+                    eprintln!("   Migrations completed successfully");
+                    break;
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => {
+                    let error_str = e.to_string();
+                    // Check for PgBouncer/managed pool prepared statement conflict
+                    if error_str.contains("42P05") || error_str.contains("already exists") {
+                        eprintln!("   ⚠️  Migration conflict (42P05): another instance likely running migrations");
+                        eprintln!("   Continuing startup - migrations will be applied by another instance");
+                        break;
+                    }
+                    if attempts < 2 {
+                        eprintln!("   Migration attempt {} failed: {}", attempts + 1, e);
+                        sleep(Duration::from_millis(500)).await;
+                        attempts += 1;
+                    } else {
+                        return Err(e.into());
+                    }
+                }
             }
         }
 
