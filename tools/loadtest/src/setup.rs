@@ -100,7 +100,7 @@ async fn setup_http_mode(url: &str, count: usize, concurrency: usize) -> Result<
             let result = client.register(&email, &password).await;
 
             let current = counter.fetch_add(1, Ordering::Relaxed) + 1;
-            if current % 100 == 0 || current == count {
+            if current.is_multiple_of(100) || current == count {
                 let success = success_counter.load(Ordering::Relaxed);
                 tracing::info!(
                     "Progress: {}/{} registrations attempted ({} new)",

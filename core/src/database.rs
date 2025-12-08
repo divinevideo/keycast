@@ -1,7 +1,8 @@
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 use std::env;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::time::sleep;
@@ -60,11 +61,17 @@ impl Database {
             .acquire_timeout(Duration::from_secs(ACQUIRE_TIMEOUT_SECS))
             .max_connections(MAX_CONNECTIONS_PER_INSTANCE);
 
+        // Disable statement cache for PgBouncer/Cloud SQL connection pooling compatibility
+        // See: https://github.com/launchbadge/sqlx/issues/67
+        let connect_options = PgConnectOptions::from_str(&database_url)
+            .expect("Invalid DATABASE_URL")
+            .statement_cache_capacity(0);
+
         // Retry connection with exponential backoff for Cloud SQL proxy startup race
         let mut connection_attempts = 0;
         let pool = loop {
             connection_attempts += 1;
-            match pool_options.clone().connect(&database_url).await {
+            match pool_options.clone().connect_with(connect_options.clone()).await {
                 Ok(pool) => break pool,
                 Err(e) if connection_attempts < MAX_CONNECTION_ATTEMPTS => {
                     let delay = Duration::from_millis(500 * (1 << connection_attempts));

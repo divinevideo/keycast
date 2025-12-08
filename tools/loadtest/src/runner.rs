@@ -245,7 +245,7 @@ fn select_user_index(
             // If not enough users for separate pools, just rotate through all
             if users.len() <= hot_count {
                 request_num % users.len()
-            } else if request_num % 5 != 0 {
+            } else if !request_num.is_multiple_of(5) {
                 // 80% hot user (from first 10%)
                 request_num % hot_count
             } else {

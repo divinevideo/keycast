@@ -82,5 +82,5 @@ pub async fn generate_ucan_token(
         .sign()
         .await?;
 
-    ucan.encode().map_err(Into::into)
+    ucan.encode()
 }
