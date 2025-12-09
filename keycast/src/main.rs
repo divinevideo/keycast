@@ -21,7 +21,7 @@ use keycast_core::encryption::gcp_key_manager::GcpKeyManager;
 use keycast_core::encryption::KeyManager;
 use keycast_signer::{RpcQueue, UnifiedSigner};
 use nostr_sdk::Keys;
-use pg_hashring::ClusterCoordinator;
+use cluster_hashring::ClusterCoordinator;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -124,6 +124,10 @@ fn validate_environment() -> Result<(), String> {
 
     if env::var("SERVER_NSEC").is_err() {
         errors.push("SERVER_NSEC must be set (server's Nostr secret key for signing UCANs)");
+    }
+
+    if env::var("REDIS_URL").is_err() {
+        errors.push("REDIS_URL must be set (Redis/Memorystore URL for cluster coordination)");
     }
 
     // Master key validation (either file or GCP KMS)
@@ -235,14 +239,14 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     let database = Database::new(database_url.clone(), database_migrations.clone()).await?;
     tracing::info!("✔︎ Database initialized at {:?}", database_url);
 
-    // Initialize cluster coordination with pg-hashring (polling mode)
-    // This handles instance registration, membership polling, and heartbeats
-    // Compatible with managed connection pooling (no LISTEN/NOTIFY)
-    pg_hashring::setup(&database.pool).await?;
-    let coordinator = Arc::new(ClusterCoordinator::start(database.pool.clone()).await?);
-    let instance_id = coordinator.instance_id().to_string();
+    // Initialize cluster coordination with Redis (Pub/Sub mode)
+    // This handles instance registration, membership detection, and heartbeats
+    // Uses Redis Pub/Sub for instant membership updates
+    let redis_url = env::var("REDIS_URL")?; // Validated above
+    let coordinator = Arc::new(ClusterCoordinator::start(&redis_url).await?);
+    let instance_id = coordinator.instance_id();
     tracing::info!(
-        "✔︎ Cluster coordinator started: {} (polling mode)",
+        "✔︎ Cluster coordinator started: {} (Redis Pub/Sub)",
         instance_id
     );
 
@@ -542,7 +546,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     });
 
     // Note: Heartbeat and hashring coordination is now handled internally by ClusterCoordinator
-    // via LISTEN/NOTIFY for fast updates (~5-20ms) and 30s heartbeat for crash detection
+    // via Redis Pub/Sub for instant updates and 30s heartbeat for crash detection
 
     println!("✨ Unified service running!");
     println!("   API: http://0.0.0.0:{}", api_port);
@@ -552,7 +556,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         worker_threads, num_workers
     );
     println!(
-        "   Instance: {} (pg-hashring LISTEN/NOTIFY enabled)",
+        "   Instance: {} (cluster-hashring Redis Pub/Sub enabled)",
         instance_id
     );
     println!("   HTTP handler cache: on-demand loading enabled\n");

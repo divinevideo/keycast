@@ -1,24 +1,24 @@
 [package]
-name = "pg-hashring"
-version = "0.1.0"
+name = "cluster-hashring"
+version = "0.2.0"
 edition = "2021"
-description = "PostgreSQL-backed cluster membership with consistent hashing"
+description = "Redis-backed cluster membership with consistent hashing"
 
 [dependencies]
 anchorhash = "0.2"
 arc-swap = "1.7"
-sqlx = { workspace = true }
+futures-util = "0.3"
+rand = { workspace = true }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "aio"] }
 tokio = { workspace = true }
 tokio-util = "0.7"
 uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
-chrono = { workspace = true }
-futures = "0.3"
-ctrlc = { version = "3.4", features = ["termination"] }
 serial_test = "3.2"
-serde_json = "1.0"

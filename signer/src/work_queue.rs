@@ -8,7 +8,7 @@ use keycast_core::encryption::KeyManager;
 use keycast_core::metrics::METRICS;
 use moka::future::Cache;
 use nostr_sdk::prelude::*;
-use pg_hashring::ClusterCoordinator;
+use cluster_hashring::ClusterCoordinator;
 use sqlx::PgPool;
 use std::sync::Arc;
 

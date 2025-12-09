@@ -11,7 +11,7 @@ path = "src/main.rs"
 keycast_core = { path = "../core" }
 keycast_api = { path = "../api" }
 keycast_signer = { path = "../signer" }
-pg-hashring = { path = "../pg-hashring" }
+cluster-hashring = { path = "../cluster-hashring" }
 
 # Nostr
 nostr-sdk = { workspace = true }
