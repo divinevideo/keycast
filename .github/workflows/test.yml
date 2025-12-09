@@ -18,7 +18,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:15
+        image: postgres:16
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: keycast_test
@@ -29,6 +29,16 @@ jobs:
           --health-retries 5
         ports:
           - 5432:5432
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
 
     steps:
     - uses: actions/checkout@v4
@@ -54,6 +64,7 @@ jobs:
     - name: Run tests
       env:
         DATABASE_URL: postgres://postgres:postgres@localhost:5432/keycast_test
+        REDIS_URL: redis://localhost:6379
       run: cargo test --workspace --verbose
     
     - name: Run clippy
@@ -73,7 +84,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:15
+        image: postgres:16
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: keycast_test
@@ -84,6 +95,16 @@ jobs:
           --health-retries 5
         ports:
           - 5432:5432
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
 
     steps:
     - uses: actions/checkout@v4
