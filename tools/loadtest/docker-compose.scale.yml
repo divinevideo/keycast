@@ -12,6 +12,14 @@
 #   docker-compose up -d --scale keycast=8
 
 services:
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 5
+
   postgres:
     image: postgres:16
     environment:
@@ -46,27 +54,20 @@ services:
           cpus: '8'
 
   pgbouncer:
-    image: edoburu/pgbouncer:latest
+    # ongres/pgbouncer 1.24.0+ supports max_prepared_statements for sqlx
+    image: ongres/pgbouncer:latest
     depends_on:
       postgres:
         condition: service_healthy
-    environment:
-      DATABASE_URL: postgres://postgres:password@postgres:5432/keycast
-      POOL_MODE: transaction
-      MAX_CLIENT_CONN: 5000
-      DEFAULT_POOL_SIZE: 200
-      MIN_POOL_SIZE: 50
-      RESERVE_POOL_SIZE: 50
-      AUTH_TYPE: plain
-      ADMIN_USERS: postgres
-      # Aggressive connection reuse
-      SERVER_IDLE_TIMEOUT: 60
-      SERVER_LIFETIME: 3600
+    volumes:
+      - ./pgbouncer-scale.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -h localhost -p 5432 -U postgres"]
+      test: ["CMD-SHELL", "exit 0"]
       interval: 2s
       timeout: 5s
-      retries: 10
+      retries: 3
+      start_period: 3s
     deploy:
       resources:
         limits:
@@ -100,13 +101,29 @@ services:
         condition: service_healthy
       pgbouncer:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Workaround for Tokio async DNS resolver issues with Docker
+    # These entries are added to /etc/hosts for reliable resolution
+    extra_hosts:
+      - "pgbouncer:172.19.0.4"
+      - "postgres:172.19.0.3"
+      - "redis:172.19.0.2"
     environment:
-      # Use pgbouncer for connection pooling (recommended for scale testing)
-      DATABASE_URL: ${DATABASE_URL:-postgres://postgres:password@pgbouncer:5432/keycast}
+      # Use pgbouncer for connection pooling (hardcoded - don't use env override)
+      DATABASE_URL: postgres://postgres:password@172.19.0.4:5432/keycast
+      # Direct connection for migrations (bypasses pgbouncer)
+      DATABASE_DIRECT_URL: postgres://postgres:password@172.19.0.3:5432/keycast
+      # Redis for cluster coordination
+      REDIS_URL: redis://172.19.0.2:6379
       ALLOWED_ORIGINS: "*"
       SERVER_NSEC: ${SERVER_NSEC}
       MASTER_KEY_PATH: /app/master.key
-      RUST_LOG: ${RUST_LOG:-info,keycast=info}
+      RUST_LOG: ${RUST_LOG:-warn,keycast=info}
+      # Statement cache for prepared statements through PgBouncer
+      SQLX_STATEMENT_CACHE: "100"
+      # Disable emails for load testing
+      DISABLE_EMAILS: "true"
       # Reduce log noise at scale
       RUST_BACKTRACE: 0
       # Skip migrations after first instance - prevents advisory lock contention
@@ -124,7 +141,8 @@ services:
           memory: 4G
           # 4 CPUs per instance - for 8 instances = 32 cores total
           cpus: '${KEYCAST_CPUS:-4}'
-    # Allow scaling
+    # Auto-restart on failure (DNS may not be ready immediately)
+    restart: on-failure:5
     # Container names are auto-generated: keycast-keycast-1, keycast-keycast-2, etc.
 
 volumes:
