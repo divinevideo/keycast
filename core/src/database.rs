@@ -60,7 +60,17 @@ impl Database {
             "   Max connections per instance: {}",
             MAX_CONNECTIONS_PER_INSTANCE
         );
-        eprintln!("   Statement cache: {}", if statement_cache_size > 0 { format!("{} (requires PgBouncer max_prepared_statements)", statement_cache_size) } else { "disabled".to_string() });
+        eprintln!(
+            "   Statement cache: {}",
+            if statement_cache_size > 0 {
+                format!(
+                    "{} (requires PgBouncer max_prepared_statements)",
+                    statement_cache_size
+                )
+            } else {
+                "disabled".to_string()
+            }
+        );
         eprintln!("   Acquire timeout: {}s", ACQUIRE_TIMEOUT_SECS);
         if using_separate_direct {
             eprintln!("   Using separate DATABASE_DIRECT_URL for LISTEN/NOTIFY");
@@ -90,7 +100,11 @@ impl Database {
         let mut connection_attempts = 0;
         let pool = loop {
             connection_attempts += 1;
-            match pool_options.clone().connect_with(connect_options.clone()).await {
+            match pool_options
+                .clone()
+                .connect_with(connect_options.clone())
+                .await
+            {
                 Ok(pool) => break pool,
                 Err(e) if connection_attempts < MAX_CONNECTION_ATTEMPTS => {
                     let delay = Duration::from_millis(500 * (1 << connection_attempts));
@@ -135,8 +149,8 @@ impl Database {
             .acquire_timeout(Duration::from_secs(ACQUIRE_TIMEOUT_SECS))
             .max_connections(1); // LISTEN only needs 1 persistent connection
 
-        let mut direct_connect_options = PgConnectOptions::from_str(&direct_url)
-            .expect("Invalid DATABASE_DIRECT_URL");
+        let mut direct_connect_options =
+            PgConnectOptions::from_str(&direct_url).expect("Invalid DATABASE_DIRECT_URL");
         // If using managed pool for direct connections (no DATABASE_DIRECT_URL set),
         // we still need to disable statement cache due to PgBouncer transaction mode
         if !using_separate_direct {

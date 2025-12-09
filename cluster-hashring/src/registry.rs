@@ -79,10 +79,7 @@ impl RedisRegistry {
         let cutoff = current_timestamp_ms() - (STALE_THRESHOLD_SECS * 1000);
 
         // ZREMRANGEBYSCORE signer_instances -inf <cutoff>
-        let count: u64 = self
-            .conn
-            .zrembyscore(INSTANCES_KEY, "-inf", cutoff)
-            .await?;
+        let count: u64 = self.conn.zrembyscore(INSTANCES_KEY, "-inf", cutoff).await?;
 
         if count > 0 {
             tracing::info!(count, "Cleaned up stale instances from Redis");

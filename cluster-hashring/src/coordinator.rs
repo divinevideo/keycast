@@ -123,16 +123,13 @@ impl ClusterCoordinator {
         tokio::spawn(async move {
             let mut heartbeat_interval =
                 tokio::time::interval(Duration::from_secs(DEFAULT_HEARTBEAT_INTERVAL_SECS));
-            let mut sync_interval = tokio::time::interval(Duration::from_secs(FULL_SYNC_INTERVAL_SECS));
+            let mut sync_interval =
+                tokio::time::interval(Duration::from_secs(FULL_SYNC_INTERVAL_SECS));
             let mut consecutive_failures: u32 = 0;
 
             // Track previous membership for change detection
-            let mut previous_members: HashSet<String> = ring
-                .load()
-                .instances()
-                .iter()
-                .cloned()
-                .collect();
+            let mut previous_members: HashSet<String> =
+                ring.load().instances().iter().cloned().collect();
 
             loop {
                 tokio::select! {
@@ -245,14 +242,9 @@ impl ClusterCoordinator {
                     }
                 };
 
-                if let Err(e) = Self::run_pubsub_loop(
-                    conn,
-                    &my_instance_id,
-                    &ring,
-                    &cancel_token,
-                    &event_tx,
-                )
-                .await
+                if let Err(e) =
+                    Self::run_pubsub_loop(conn, &my_instance_id, &ring, &cancel_token, &event_tx)
+                        .await
                 {
                     if !cancel_token.is_cancelled() {
                         tracing::warn!("Pub/Sub loop error, reconnecting: {}", e);

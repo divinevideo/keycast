@@ -2496,12 +2496,11 @@ pub async fn oauth_register(
 
     // Hash password (spawn_blocking to avoid blocking async runtime)
     let password = req.password.clone();
-    let password_hash = tokio::task::spawn_blocking(move || {
-        bcrypt::hash(&password, bcrypt::DEFAULT_COST)
-    })
-    .await
-    .map_err(|e| OAuthError::InvalidRequest(format!("Task join error: {}", e)))?
-    .map_err(|_| OAuthError::InvalidRequest("Password hashing failed".to_string()))?;
+    let password_hash =
+        tokio::task::spawn_blocking(move || bcrypt::hash(&password, bcrypt::DEFAULT_COST))
+            .await
+            .map_err(|e| OAuthError::InvalidRequest(format!("Task join error: {}", e)))?
+            .map_err(|_| OAuthError::InvalidRequest("Password hashing failed".to_string()))?;
 
     // Priority: nsec (direct input) → pubkey (BYOK via code_verifier) → auto-generate
     let (public_key, generated_keys) = if let Some(ref nsec_str) = req.nsec {

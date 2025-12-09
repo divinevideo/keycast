@@ -149,7 +149,9 @@ where
 
         // Cache the tenant for future requests
         let tenant = Arc::new(tenant);
-        tenant_cache.insert(domain.to_string(), tenant.clone()).await;
+        tenant_cache
+            .insert(domain.to_string(), tenant.clone())
+            .await;
         tracing::info!(domain = %domain, "Tenant cached");
 
         Ok(TenantExtractor(tenant))

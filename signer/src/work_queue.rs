@@ -3,12 +3,12 @@
 
 use crate::error::{SignerError, SignerResult};
 use crate::signer_daemon::Nip46Handler;
+use cluster_hashring::ClusterCoordinator;
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use keycast_core::encryption::KeyManager;
 use keycast_core::metrics::METRICS;
 use moka::future::Cache;
 use nostr_sdk::prelude::*;
-use cluster_hashring::ClusterCoordinator;
 use sqlx::PgPool;
 use std::sync::Arc;
 

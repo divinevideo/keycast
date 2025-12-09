@@ -3,6 +3,7 @@
 
 use crate::error::{SignerError, SignerResult};
 use async_trait::async_trait;
+use cluster_hashring::ClusterCoordinator;
 use keycast_core::authorization_channel::{AuthorizationCommand, AuthorizationReceiver};
 use keycast_core::encryption::KeyManager;
 use keycast_core::metrics::METRICS;
@@ -11,7 +12,6 @@ use keycast_core::types::authorization::Authorization;
 use keycast_core::types::oauth_authorization::OAuthAuthorization;
 use moka::future::Cache;
 use nostr_sdk::prelude::*;
-use cluster_hashring::ClusterCoordinator;
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1704,7 +1704,8 @@ mod tests {
         let key_manager: Box<dyn KeyManager> =
             Box::new(keycast_core::encryption::file_key_manager::FileKeyManager::new().unwrap());
         let (_tx, rx) = tokio::sync::mpsc::channel(100);
-        let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let redis_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
         let coordinator = Arc::new(ClusterCoordinator::start(&redis_url).await.unwrap());
         let signer = UnifiedSigner::new(pool, key_manager, rx, coordinator)
             .await
@@ -1732,7 +1733,8 @@ mod tests {
         let key_manager: Box<dyn KeyManager> =
             Box::new(keycast_core::encryption::file_key_manager::FileKeyManager::new().unwrap());
         let (_tx, rx) = tokio::sync::mpsc::channel(100);
-        let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let redis_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
         let coordinator = Arc::new(ClusterCoordinator::start(&redis_url).await.unwrap());
         let signer = UnifiedSigner::new(pool.clone(), key_manager, rx, coordinator)
             .await

@@ -17,10 +17,7 @@ pub async fn run_loadtest(args: RunArgs) -> Result<()> {
     let is_registration_mode = matches!(args.method, RpcMethod::Register);
 
     let users = if is_registration_mode {
-        tracing::info!(
-            "Starting REGISTRATION load test against {}",
-            args.url
-        );
+        tracing::info!("Starting REGISTRATION load test against {}", args.url);
         tracing::info!(
             "Concurrency: {}, Duration: {}s (creating new users)",
             args.concurrency,
@@ -61,7 +58,10 @@ pub async fn run_loadtest(args: RunArgs) -> Result<()> {
             // Larger pool handles high concurrency better
             clients.insert(i, RpcClient::new(&args.url, 50)?);
         }
-        tracing::info!("Created {} per-user HTTP clients for session affinity", clients.len());
+        tracing::info!(
+            "Created {} per-user HTTP clients for session affinity",
+            clients.len()
+        );
         Arc::new(clients)
     } else {
         Arc::new(HashMap::new())
@@ -151,7 +151,11 @@ pub async fn run_loadtest(args: RunArgs) -> Result<()> {
                 tokio::time::sleep(Duration::from_millis(worker_delay)).await;
             }
 
-            let hot_count = if users.is_empty() { 1 } else { (users.len() / 10).max(1) };
+            let hot_count = if users.is_empty() {
+                1
+            } else {
+                (users.len() / 10).max(1)
+            };
 
             loop {
                 // Check termination conditions

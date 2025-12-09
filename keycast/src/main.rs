@@ -9,19 +9,19 @@ use axum::{
     routing::get,
     Router,
 };
+use cluster_hashring::ClusterCoordinator;
 use dotenv::dotenv;
 use keycast_api::api::tenant::Tenant;
 use keycast_api::handlers::http_rpc_handler::new_http_handler_cache;
 use keycast_api::state::TenantCache;
-use moka::future::Cache;
 use keycast_core::authorization_channel;
 use keycast_core::database::Database;
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::gcp_key_manager::GcpKeyManager;
 use keycast_core::encryption::KeyManager;
 use keycast_signer::{RpcQueue, UnifiedSigner};
+use moka::future::Cache;
 use nostr_sdk::Keys;
-use cluster_hashring::ClusterCoordinator;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -331,15 +331,14 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         .time_to_live(Duration::from_secs(3600))
         .build();
 
-    let tenants: Vec<Tenant> = sqlx::query_as(
-        "SELECT id, domain, name, settings, created_at, updated_at FROM tenants",
-    )
-    .fetch_all(&database.pool)
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!("Failed to preload tenants: {}", e);
-        vec![]
-    });
+    let tenants: Vec<Tenant> =
+        sqlx::query_as("SELECT id, domain, name, settings, created_at, updated_at FROM tenants")
+            .fetch_all(&database.pool)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("Failed to preload tenants: {}", e);
+                vec![]
+            });
 
     for tenant in tenants {
         let domain = tenant.domain.clone();
