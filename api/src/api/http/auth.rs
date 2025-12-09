@@ -426,8 +426,11 @@ pub async fn register(
         return Err(AuthError::EmailAlreadyExists);
     }
 
-    // Hash password
-    let password_hash = hash(&req.password, DEFAULT_COST)?;
+    // Hash password (spawn_blocking to avoid blocking async runtime)
+    let password = req.password.clone();
+    let password_hash = tokio::task::spawn_blocking(move || hash(&password, DEFAULT_COST))
+        .await
+        .map_err(|e| AuthError::Internal(format!("Task join error: {}", e)))??;
 
     // Generate email verification token
     let verification_token = generate_secure_token();
@@ -606,8 +609,12 @@ pub async fn login(
         }
     };
 
-    // Verify password
-    let valid = verify(&req.password, &password_hash)?;
+    // Verify password (spawn_blocking to avoid blocking async runtime)
+    let password = req.password.clone();
+    let hash = password_hash.clone();
+    let valid = tokio::task::spawn_blocking(move || verify(&password, &hash))
+        .await
+        .map_err(|e| AuthError::Internal(format!("Task join error: {}", e)))??;
     if !valid {
         tracing::warn!(
             event = "login",
@@ -1223,8 +1230,11 @@ pub async fn reset_password(
         }
     }
 
-    // Hash new password
-    let password_hash = hash(&req.new_password, DEFAULT_COST)?;
+    // Hash new password (spawn_blocking to avoid blocking async runtime)
+    let new_password = req.new_password.clone();
+    let password_hash = tokio::task::spawn_blocking(move || hash(&new_password, DEFAULT_COST))
+        .await
+        .map_err(|e| AuthError::Internal(format!("Task join error: {}", e)))??;
 
     // Update password, clear reset token, and mark email as verified
     // (user proved email ownership by receiving and using the reset link)
@@ -2422,8 +2432,12 @@ pub async fn verify_password_for_export(
 
     let (_email, password_hash) = result.ok_or(AuthError::UserNotFound)?;
 
-    // Verify password
-    let valid = verify(&req.password, &password_hash)
+    // Verify password (spawn_blocking to avoid blocking async runtime)
+    let password = req.password.clone();
+    let hash = password_hash.clone();
+    let valid = tokio::task::spawn_blocking(move || verify(&password, &hash))
+        .await
+        .map_err(|e| AuthError::Internal(format!("Task join error: {}", e)))?
         .map_err(|_| AuthError::Internal("Password verification failed".to_string()))?;
 
     if !valid {

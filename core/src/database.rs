@@ -11,7 +11,7 @@ use tokio::time::sleep;
 // db-f1-micro: ~25 max connections (0.6GB RAM)
 // db-g1-small: ~100 max connections (1.7GB RAM)
 // db-n1-standard-1: ~250 max connections (3.75GB RAM)
-const MAX_CONNECTIONS_PER_INSTANCE: u32 = 2;
+const MAX_CONNECTIONS_PER_INSTANCE: u32 = 20;
 const ACQUIRE_TIMEOUT_SECS: u64 = 60;
 const MAX_CONNECTION_ATTEMPTS: u32 = 5;
 
@@ -48,12 +48,19 @@ impl Database {
 
         let instance_id = env::var("K_REVISION").unwrap_or_else(|_| "local".to_string());
 
+        // Statement cache size - parse early for logging
+        let statement_cache_size: usize = env::var("SQLX_STATEMENT_CACHE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
         eprintln!("🐘 Database pool config:");
         eprintln!("   Instance: {}", instance_id);
         eprintln!(
             "   Max connections per instance: {}",
             MAX_CONNECTIONS_PER_INSTANCE
         );
+        eprintln!("   Statement cache: {}", if statement_cache_size > 0 { format!("{} (requires PgBouncer max_prepared_statements)", statement_cache_size) } else { "disabled".to_string() });
         eprintln!("   Acquire timeout: {}s", ACQUIRE_TIMEOUT_SECS);
         if using_separate_direct {
             eprintln!("   Using separate DATABASE_DIRECT_URL for LISTEN/NOTIFY");
@@ -71,11 +78,13 @@ impl Database {
             .acquire_timeout(Duration::from_secs(ACQUIRE_TIMEOUT_SECS))
             .max_connections(MAX_CONNECTIONS_PER_INSTANCE);
 
-        // Disable statement cache for PgBouncer/Cloud SQL connection pooling compatibility
+        // Statement cache size - configurable for PgBouncer with max_prepared_statements
+        // Set SQLX_STATEMENT_CACHE=100 when Cloud SQL pooler has max_prepared_statements configured
+        // Default 0 for backward compatibility with transaction-mode poolers without prepared statement support
         // See: https://github.com/launchbadge/sqlx/issues/67
         let connect_options = PgConnectOptions::from_str(&database_url)
             .expect("Invalid DATABASE_URL")
-            .statement_cache_capacity(0);
+            .statement_cache_capacity(statement_cache_size);
 
         // Retry connection with exponential backoff for Cloud SQL proxy startup race
         let mut connection_attempts = 0;
