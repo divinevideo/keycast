@@ -67,10 +67,15 @@ pub async fn run_loadtest(args: RunArgs) -> Result<()> {
         Arc::new(HashMap::new())
     };
 
-    // Shared client only for metrics endpoint and registration mode
+    // Shared client only for metrics endpoint
     let shared_client = Arc::new(RpcClient::new(&args.url, args.concurrency * 2)?);
-    let reg_client = Arc::new(RegistrationClient::new(&args.url, args.concurrency * 2)?);
-    let run_id = chrono::Utc::now().timestamp();
+    // Use timestamp + random suffix to avoid email collisions across parallel load testers
+    let random_suffix: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(6)
+        .map(char::from)
+        .collect();
+    let run_id = format!("{}-{}", chrono::Utc::now().timestamp(), random_suffix);
 
     // Fetch server metrics before test
     let metrics_before = match shared_client.fetch_metrics().await {
@@ -128,7 +133,7 @@ pub async fn run_loadtest(args: RunArgs) -> Result<()> {
     let mut handles = Vec::new();
     for worker_id in 0..args.concurrency {
         let user_clients = user_clients.clone();
-        let reg_client = reg_client.clone();
+        let base_url = args.url.clone();
         let metrics = metrics.clone();
         let semaphore = semaphore.clone();
         let running = running.clone();
@@ -137,6 +142,7 @@ pub async fn run_loadtest(args: RunArgs) -> Result<()> {
         let scenario = args.scenario;
         let method = args.method;
         let max_requests = args.requests;
+        let run_id = run_id.clone();
 
         // Calculate ramp-up delay for this worker
         let worker_delay = if args.concurrency > 1 {
@@ -174,10 +180,20 @@ pub async fn run_loadtest(args: RunArgs) -> Result<()> {
 
                 // Execute request based on method
                 let result = if matches!(method, RpcMethod::Register) {
-                    // Registration mode: create unique user each request
+                    // Registration mode: create fresh client per user for realistic simulation.
+                    // Each user gets their own GCLB cookie, so their registration flow
+                    // (register → authorize → token) sticks to one instance via session affinity.
+                    // Different users will naturally distribute across instances.
+                    let user_client = match RegistrationClient::new_for_single_user(&base_url) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::error!("Failed to create registration client: {}", e);
+                            continue;
+                        }
+                    };
                     let email = format!("lt{}-{}@bench.local", run_id, request_num);
                     let password = generate_password();
-                    reg_client.register_timed(&email, &password).await
+                    user_client.register_timed(&email, &password).await
                 } else {
                     // RPC mode: select existing user and their dedicated client
                     let user_index = select_user_index(&users, scenario, request_num, hot_count);

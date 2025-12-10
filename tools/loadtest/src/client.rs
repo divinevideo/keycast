@@ -234,16 +234,34 @@ pub struct RegistrationResult {
 }
 
 impl RegistrationClient {
-    pub fn new(base_url: &str, pool_size: usize) -> Result<Self> {
+    /// Create a new registration client.
+    ///
+    /// With `per_user_cookies=true`: Each client simulates a fresh browser that will receive
+    /// and use its own GCLB session affinity cookie. Create one client per user for realistic
+    /// session affinity simulation.
+    ///
+    /// With `per_user_cookies=false`: No cookie persistence. All requests are treated as fresh
+    /// connections, which maximizes distribution across instances but doesn't simulate real
+    /// browser behavior.
+    pub fn new(base_url: &str, pool_size: usize, per_user_cookies: bool) -> Result<Self> {
         let client = Client::builder()
             .pool_max_idle_per_host(pool_size)
             .timeout(Duration::from_secs(60))
+            .cookie_store(per_user_cookies)
             .build()?;
 
         Ok(Self {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
         })
+    }
+
+    /// Create a fresh client for a single user registration.
+    /// Each user gets their own GCLB cookie, simulating real browser behavior where
+    /// a user's registration flow (register → authorize → token) sticks to one instance,
+    /// but different users may hit different instances.
+    pub fn new_for_single_user(base_url: &str) -> Result<Self> {
+        Self::new(base_url, 1, true)
     }
 
     pub async fn register(&self, email: &str, password: &str) -> RegistrationResult {

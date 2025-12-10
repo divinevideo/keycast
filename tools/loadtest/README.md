@@ -178,6 +178,25 @@ Key metrics:
   --output ./prod-results.json
 ```
 
+### Configuration Risk: Load Skew & Metric Dilution
+
+**CRITICAL AUTOSCALING HAZARD** when combining **Session Affinity (Sticky Sessions)** with a high **`min-instances`** count.
+
+Because the Cloud Run Autoscaler triggers scale-out events based strictly on *cluster-wide averages*, a large pool of idle reserved instances causes **Metric Dilution**, dragging down the global average. This results in **Load Skew**, where specific instances become saturated ("hot") due to sticky user traffic, yet fail to trigger a scale-out because the diluted cluster average incorrectly signals that the system is underutilized.
+
+**Example:**
+- `min-instances=10`, Session Affinity enabled
+- 1 instance handling 100% of traffic (due to sticky sessions from single client)
+- That instance at 95% CPU saturation
+- Other 9 instances idle at ~1% CPU
+- **Cluster average: ~10.4% CPU** → No scale-out triggered (target is 60%)
+
+**Mitigations:**
+1. Lower the `concurrency` limit to force spillover to new instances
+2. Reduce `min-instances` to unmask true load metrics
+3. Use multiple client IPs for load testing (different IPs = different sticky targets)
+4. Monitor per-instance metrics, not just cluster averages
+
 ### Known Bottlenecks
 
 1. **Cloud SQL Connection Pool** (db-g1-small: ~25 max connections)

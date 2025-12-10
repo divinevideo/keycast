@@ -74,7 +74,9 @@ async fn setup_http_mode(url: &str, count: usize, concurrency: usize) -> Result<
         concurrency
     );
 
-    let client = Arc::new(RegistrationClient::new(url, concurrency * 2)?);
+    // Setup mode: use shared client with cookies for connection reuse efficiency.
+    // This isn't simulating real user traffic, just creating test accounts.
+    let client = Arc::new(RegistrationClient::new(url, concurrency * 2, true)?);
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let counter = Arc::new(AtomicUsize::new(0));
     let success_counter = Arc::new(AtomicUsize::new(0));

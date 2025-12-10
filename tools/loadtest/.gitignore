@@ -1,0 +1,10 @@
+# Load test results (local data, not for version control)
+*.json
+
+# Keep only the source files and documentation
+!Cargo.toml
+!Cargo.lock
+
+# Local test configs
+pgbouncer/
+*.cfg
