@@ -10,6 +10,7 @@ use axum::{
 use bcrypt::{hash, verify, DEFAULT_COST};
 use bip39;
 use chrono::{Duration, Utc};
+use keycast_core::metrics::METRICS;
 use keycast_core::traits::CustomPermission;
 use keycast_core::types::permission::Permission;
 use nostr_sdk::{Keys, PublicKey, ToBech32, UnsignedEvent};
@@ -407,26 +408,19 @@ pub async fn register(
     // Extract redirect_origin from HTTP Origin header (required for UCAN)
     let redirect_origin = extract_origin_from_headers(&headers)?;
 
+    let instance_id = keycast_core::instance::instance_id();
+
     tracing::info!(
         event = "registration_attempt",
+        instance_id = %instance_id,
         tenant_id = tenant_id,
-        redirect_origin = %redirect_origin,
-        "Registration attempt for email"
+        "Registration attempt"
     );
 
-    // Check if email already exists in this tenant
-    let existing: Option<(String,)> =
-        sqlx::query_as("SELECT pubkey FROM users WHERE email = $1 AND tenant_id = $2")
-            .bind(&req.email)
-            .bind(tenant_id)
-            .fetch_optional(pool)
-            .await?;
-
-    if existing.is_some() {
-        return Err(AuthError::EmailAlreadyExists);
-    }
-
     // Hash password (spawn_blocking to avoid blocking async runtime)
+    // Note: Email uniqueness is enforced by idx_users_email_tenant constraint.
+    // We catch the constraint violation on INSERT instead of pre-checking,
+    // which saves a DB round-trip and reduces connection pool contention.
     let password = req.password.clone();
     let password_hash = tokio::task::spawn_blocking(move || hash(&password, DEFAULT_COST))
         .await
@@ -478,7 +472,8 @@ pub async fn register(
     let mut tx = pool.begin().await?;
 
     // Insert user with email verification token
-    sqlx::query(
+    // Email uniqueness is enforced by idx_users_email_tenant unique constraint
+    let insert_result = sqlx::query(
         "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, email_verification_token, email_verification_expires_at, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
     )
@@ -492,7 +487,18 @@ pub async fn register(
     .bind(Utc::now())
     .bind(Utc::now())
     .execute(&mut *tx)
-    .await?;
+    .await;
+
+    // Check for unique constraint violation (email already exists)
+    match insert_result {
+        Ok(_) => {}
+        Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
+            // idx_users_email_tenant constraint violated
+            tx.rollback().await.ok();
+            return Err(AuthError::EmailAlreadyExists);
+        }
+        Err(e) => return Err(e.into()),
+    }
 
     // Insert personal key (must include tenant_id for multi-tenant isolation)
     sqlx::query(
@@ -508,6 +514,9 @@ pub async fn register(
     .await?;
 
     tx.commit().await?;
+
+    // Track successful registration
+    METRICS.inc_registration();
 
     // Send verification email (optional - don't fail if email service unavailable)
     match crate::email_service::EmailService::new() {
@@ -540,9 +549,9 @@ pub async fn register(
     .await?;
 
     tracing::info!(
-        event = "registration",
+        event = "registration_success",
+        instance_id = %instance_id,
         tenant_id = tenant_id,
-        success = true,
         "User registered successfully"
     );
 
@@ -623,6 +632,7 @@ pub async fn login(
             reason = "invalid_password",
             "Login failed: invalid password"
         );
+        METRICS.inc_login_failure();
         return Err(AuthError::InvalidCredentials);
     }
 
@@ -646,6 +656,9 @@ pub async fn login(
     // Generate UCAN token for session cookie with redirect_origin
     let ucan_token =
         generate_ucan_token(&keys, tenant_id, &req.email, &redirect_origin, None).await?;
+
+    // Track successful login
+    METRICS.inc_login();
 
     tracing::info!(
         event = "login",
@@ -1624,6 +1637,9 @@ pub async fn revoke_session(
     .bind(tenant_id)
     .execute(pool)
     .await?;
+
+    // Track OAuth authorization revoked
+    METRICS.inc_oauth_revoked();
 
     // Signal signer daemon to remove from cache
     if let Some(tx) = &auth_state.auth_tx {

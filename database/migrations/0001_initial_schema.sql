@@ -623,6 +623,29 @@ CREATE INDEX user_authorizations_user_pubkey_idx ON public.user_authorizations U
 
 CREATE UNIQUE INDEX users_pubkey_idx ON public.users USING btree (pubkey);
 
+-- Functional indexes for CHAR(64)::text (prepared statement compatibility with PgBouncer)
+-- When using transaction-mode pooling, generic plans with text parameters need these indexes
+CREATE INDEX idx_users_pubkey_text ON users ((pubkey::text));
+CREATE INDEX idx_users_pubkey_text_tenant ON users ((pubkey::text), tenant_id);
+CREATE INDEX idx_personal_keys_user_pubkey_text ON personal_keys ((user_pubkey::text));
+CREATE INDEX idx_personal_keys_user_pubkey_text_tenant ON personal_keys ((user_pubkey::text), tenant_id);
+CREATE INDEX idx_oauth_auth_bunker_pubkey_text ON oauth_authorizations ((bunker_public_key::text));
+CREATE INDEX idx_oauth_auth_bunker_pubkey_text_tenant ON oauth_authorizations ((bunker_public_key::text), tenant_id);
+CREATE INDEX idx_oauth_auth_user_pubkey_text ON oauth_authorizations ((user_pubkey::text));
+CREATE INDEX idx_oauth_auth_handle_text ON oauth_authorizations ((authorization_handle::text)) WHERE authorization_handle IS NOT NULL AND revoked_at IS NULL;
+CREATE INDEX idx_oauth_auth_client_pubkey_text ON oauth_authorizations ((client_pubkey::text)) WHERE client_pubkey IS NOT NULL;
+CREATE INDEX idx_oauth_auth_connected_client_text ON oauth_authorizations ((connected_client_pubkey::text)) WHERE connected_client_pubkey IS NOT NULL;
+
+-- Team authorizations table (bunker_public_key lookups)
+CREATE INDEX idx_authorizations_bunker_pubkey_text ON authorizations ((bunker_public_key::text));
+CREATE INDEX idx_authorizations_bunker_pubkey_text_tenant ON authorizations ((bunker_public_key::text), tenant_id);
+
+-- Team users table (user_pubkey lookups for team membership checks)
+CREATE INDEX idx_team_users_user_pubkey_text ON team_users ((user_pubkey::text));
+
+-- Stored keys table (pubkey lookups)
+CREATE INDEX idx_stored_keys_pubkey_text ON stored_keys ((pubkey::text));
+
 CREATE TRIGGER authorizations_update_trigger BEFORE UPDATE ON public.authorizations FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
 
 CREATE TRIGGER oauth_authorizations_update_trigger BEFORE UPDATE ON public.oauth_authorizations FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();

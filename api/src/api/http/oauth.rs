@@ -11,6 +11,7 @@ use base64::Engine;
 use bcrypt::verify;
 use chrono::{Duration, Utc};
 use dashmap::DashMap;
+use keycast_core::metrics::METRICS;
 use nostr_sdk::{Keys, ToBech32};
 use once_cell::sync::Lazy;
 use rand::Rng;
@@ -2253,12 +2254,16 @@ async fn create_oauth_authorization_and_token(
         redirect_origin
     );
 
+    // Track OAuth authorization created
+    METRICS.inc_oauth_created();
+
     // Revoke old authorization if this was a re-auth (cleanup)
     if let Some(old_auth_id) = previous_auth_id {
         sqlx::query("UPDATE oauth_authorizations SET revoked_at = NOW() WHERE id = $1")
             .bind(old_auth_id)
             .execute(pool)
             .await?;
+        METRICS.inc_oauth_revoked();
         tracing::info!(
             "Revoked old authorization {} after re-auth (signer will detect on next poll)",
             old_auth_id
@@ -3286,6 +3291,9 @@ pub async fn connect_post(
         user_pubkey,
         redirect_origin
     );
+
+    // Track OAuth authorization created
+    METRICS.inc_oauth_created();
 
     // Signal signer daemon to reload via channel (instant notification)
     if let Some(tx) = &auth_state.auth_tx {

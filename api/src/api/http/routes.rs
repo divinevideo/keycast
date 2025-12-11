@@ -132,9 +132,8 @@ pub fn api_routes(
         .with_state(pool.clone());
 
     // Prometheus metrics endpoint (public, no auth required)
-    let metrics_route = Router::new()
-        .route("/metrics", get(metrics::metrics))
-        .with_state(pool.clone());
+    // Uses in-memory atomic counters - no database access needed
+    let metrics_route = Router::new().route("/metrics", get(metrics::metrics));
 
     // API documentation route (public)
     let docs_route = Router::new().route("/docs/openapi.json", get(openapi_spec));
