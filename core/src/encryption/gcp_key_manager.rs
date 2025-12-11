@@ -6,7 +6,14 @@ use async_trait::async_trait;
 use google_cloud_kms::client::{Client, ClientConfig};
 use google_cloud_kms::grpc::kms::v1::{DecryptRequest, EncryptRequest};
 use std::env;
-use tracing::{debug, error, info};
+use std::time::Duration;
+use tracing::{debug, error, info, warn};
+
+/// Maximum retry attempts for KMS operations before failing.
+const MAX_KMS_RETRIES: u32 = 3;
+
+/// Base delay for exponential backoff (doubles each attempt: 100ms, 200ms, 400ms).
+const KMS_BASE_DELAY_MS: u64 = 100;
 
 pub struct GcpKeyManager {
     client: Client,
@@ -70,10 +77,31 @@ impl KeyManager for GcpKeyManager {
             additional_authenticated_data_crc32c: None,
         };
 
-        let response = self.client.encrypt(request, None).await.map_err(|e| {
-            error!("Google Cloud KMS encryption failed: {}", e);
-            KeyManagerError::EncryptionError(format!("KMS encryption failed: {}", e))
-        })?;
+        let mut attempt = 0u32;
+        let response = loop {
+            attempt += 1;
+            match self.client.encrypt(request.clone(), None).await {
+                Ok(resp) => break resp,
+                Err(e) if attempt < MAX_KMS_RETRIES => {
+                    let delay_ms = KMS_BASE_DELAY_MS * 2u64.pow(attempt - 1);
+                    warn!(
+                        attempt = attempt,
+                        max_retries = MAX_KMS_RETRIES,
+                        delay_ms = delay_ms,
+                        "KMS encrypt failed, retrying: {}",
+                        e
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                Err(e) => {
+                    error!("KMS encrypt failed after {} attempts: {}", attempt, e);
+                    return Err(KeyManagerError::EncryptionError(format!(
+                        "KMS encryption failed after {} attempts: {}",
+                        attempt, e
+                    )));
+                }
+            }
+        };
 
         let ciphertext = response.ciphertext;
         debug!("Successfully encrypted to {} bytes", ciphertext.len());
@@ -95,10 +123,31 @@ impl KeyManager for GcpKeyManager {
             additional_authenticated_data_crc32c: None,
         };
 
-        let response = self.client.decrypt(request, None).await.map_err(|e| {
-            error!("Google Cloud KMS decryption failed: {}", e);
-            KeyManagerError::DecryptionError(format!("KMS decryption failed: {}", e))
-        })?;
+        let mut attempt = 0u32;
+        let response = loop {
+            attempt += 1;
+            match self.client.decrypt(request.clone(), None).await {
+                Ok(resp) => break resp,
+                Err(e) if attempt < MAX_KMS_RETRIES => {
+                    let delay_ms = KMS_BASE_DELAY_MS * 2u64.pow(attempt - 1);
+                    warn!(
+                        attempt = attempt,
+                        max_retries = MAX_KMS_RETRIES,
+                        delay_ms = delay_ms,
+                        "KMS decrypt failed, retrying: {}",
+                        e
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                Err(e) => {
+                    error!("KMS decrypt failed after {} attempts: {}", attempt, e);
+                    return Err(KeyManagerError::DecryptionError(format!(
+                        "KMS decryption failed after {} attempts: {}",
+                        attempt, e
+                    )));
+                }
+            }
+        };
 
         let plaintext = response.plaintext;
         debug!("Successfully decrypted to {} bytes", plaintext.len());

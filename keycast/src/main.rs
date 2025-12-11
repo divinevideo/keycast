@@ -31,7 +31,10 @@ use tokio::sync::Notify;
 use tokio_util::task::TaskTracker;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
+use tower_http::trace::TraceLayer;
+use tracing::Level;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use uuid::Uuid;
 
 async fn health_check() -> impl IntoResponse {
     StatusCode::OK
@@ -507,6 +510,29 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
             }
         },
     )));
+
+    // Add request tracing with trace_id for debugging
+    // TraceLayer creates a span for each request with method, uri, and trace_id
+    // All logs within the request will automatically include these fields
+    let app = app.layer(
+        TraceLayer::new_for_http().make_span_with(|request: &Request<Body>| {
+            // Use incoming x-trace-id header or generate new 8-char UUID
+            let trace_id = request
+                .headers()
+                .get("x-trace-id")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+                .unwrap_or_else(|| Uuid::new_v4().to_string()[..8].to_string());
+
+            tracing::span!(
+                Level::INFO,
+                "request",
+                method = %request.method(),
+                uri = %request.uri(),
+                trace_id = %trace_id,
+            )
+        }),
+    );
 
     // Add Cache-Control headers for browser caching
     let app = app.layer(middleware::from_fn(cache_control_middleware));

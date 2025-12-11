@@ -32,5 +32,6 @@ dotenv = "0.15"
 num_cpus = "1.16"
 moka = { version = "0.12", features = ["future"] }
 sqlx = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
