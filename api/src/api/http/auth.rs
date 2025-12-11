@@ -2977,7 +2977,19 @@ mod tests {
     async fn create_test_db() -> PgPool {
         let database_url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string());
-        PgPool::connect(&database_url).await.unwrap()
+        PgPool::connect(&database_url).await.expect(
+            "\n\n\
+            ╔══════════════════════════════════════════════════════════════════╗\n\
+            ║  PostgreSQL connection failed - these tests require a database   ║\n\
+            ╠══════════════════════════════════════════════════════════════════╣\n\
+            ║  To run locally:                                                 ║\n\
+            ║    docker run -d --name postgres -p 5432:5432 \\                  ║\n\
+            ║      -e POSTGRES_PASSWORD=password \\                             ║\n\
+            ║      -e POSTGRES_DB=keycast_test postgres:16                     ║\n\
+            ║                                                                  ║\n\
+            ║  Or skip these tests:  cargo test -- --skip test_fast_path      ║\n\
+            ╚══════════════════════════════════════════════════════════════════╝\n\n",
+        )
     }
 
     /// Mock signing handler for testing

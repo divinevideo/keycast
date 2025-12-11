@@ -13,7 +13,8 @@ echo "→ Running clippy..."
 cargo clippy --workspace --all-targets --all-features -- -D warnings -A deprecated
 
 echo "→ Running tests..."
-cargo test --workspace
+# Override DATABASE_URL to use local test database (docker-compose may set it to a network host)
+DATABASE_URL="postgres://postgres:password@localhost/keycast_test" cargo test --workspace
 
 echo "→ Building release..."
 cargo build --release --workspace

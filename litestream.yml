@@ -1,7 +1,0 @@
-dbs:
-  - path: /data/keycast.db
-    replicas:
-      - url: gcs://keycast-database-backups/keycast.db
-        retention: 168h          # Keep PITR for 7 days
-        snapshot-interval: 1h    # Full snapshot every hour
-        sync-interval: 1s        # Sync WAL every second
