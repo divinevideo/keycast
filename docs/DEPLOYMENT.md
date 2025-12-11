@@ -2,26 +2,22 @@
 
 ## Production Services
 
-### Current Active Services
+### Current Active Service
 
-- **`keycast-unified`** (PRODUCTION - login.divine.video)
+- **`keycast`** (PRODUCTION - login.divine.video)
   - Runs both API + Signer daemon in one container
-  - Command: `--args=unified`
   - Domain: https://login.divine.video
-  - Memory: 2Gi, CPU: 2
+  - Memory: 4Gi, CPU: 4
   - Port: 3000
-
-- **`keycast-signer`** (Standalone signer for multi-region)
-  - Dedicated signing service
-  - Command: `--args=signer`
-  - Memory: 1Gi, CPU: 1
-  - Port: 8080
-  - Not publicly accessible
+  - Instance concurrency: 10
+  - Min instances: 3, Max instances: 200
 
 ### Deprecated Services (DO NOT USE)
 
-- **`keycast-oauth`** - Old API-only service, replaced by keycast-unified
+- **`keycast-unified`** - Old service name, replaced by `keycast`
+- **`keycast-oauth`** - Old API-only service
 - **`keycast-oauth-server`** - Duplicate/abandoned service
+- **`keycast-signer`** - Old standalone signer
 
 ## Deployment Process
 
@@ -29,45 +25,39 @@
 
 ```bash
 gcloud builds submit --config=cloudbuild.yaml .
+# Or via bun:
+bun run deploy
 ```
 
-This builds the Docker image and deploys to:
-1. `keycast-unified` (production)
-2. `keycast-signer` (standalone signer)
+This builds the Docker image and deploys to `keycast` service.
 
 ### Manual Deployment
 
 ```bash
-# Deploy unified service
-gcloud run deploy keycast-unified \
+gcloud run deploy keycast \
   --image=us-central1-docker.pkg.dev/openvine-co/docker/keycast:latest \
   --region=us-central1 \
-  --args=unified \
-  [... other flags]
-
-# Deploy signer only
-gcloud run deploy keycast-signer \
-  --image=us-central1-docker.pkg.dev/openvine-co/docker/keycast:latest \
-  --region=us-central1 \
-  --args=signer \
-  [... other flags]
+  [... other flags from cloudbuild.yaml]
 ```
 
 ## Database Configuration
 
-### CRITICAL: Database Persistence Issue
+### Cloud SQL PostgreSQL
 
-**Current Problem**: Production uses an ephemeral PostgreSQL database stored at `/app/database/keycast.db` which is RECREATED on every deployment, **losing all data**.
+Production uses Cloud SQL PostgreSQL with PgBouncer connection pooling:
+- **Instance**: `openvine-co:us-central1:keycast-db-plus`
+- **Connection**: Via Cloud SQL Auth Proxy (automatic in Cloud Run)
+- **Pooling**: Built-in Cloud SQL connection pooler with transaction mode
+- **Pool size per instance**: 10 (configured via `SQLX_POOL_SIZE`)
 
-**Litestream Backup Not Working**: There's a path mismatch between:
-- Application database: `/app/database/keycast.db`
-- Litestream monitoring: `/data/keycast.db`
+### Database Migrations
 
-Litestream is NOT actually backing up the application database!
+Migrations are run manually before deployment:
+```bash
+./tools/run-migrations.sh
+```
 
-**Temporary Solution**: The database is mounted in the container's writable layer, but this is not persistent across deployments.
-
-**Proper Solution (In Progress)**: Migrating to Cloud SQL PostgreSQL for persistent storage.
+This avoids `pg_advisory_lock` thundering herd when many instances start simultaneously.
 
 ## Service Architecture
 
@@ -76,14 +66,22 @@ login.divine.video (DNS)
     ↓
 Cloud Load Balancer / Domain Mapping
     ↓
-keycast-unified (Cloud Run)
+keycast (Cloud Run, 3-200 instances)
     ├── API Server (port 3000)
     │   ├── /api/auth/*
     │   ├── /api/user/*
     │   ├── /api/oauth/*
     │   └── / (static web files)
-    └── Signer Daemon
-        └── NIP-46 relay listener
+    ├── Signer Daemon
+    │   └── NIP-46 relay listener
+    └── Cluster Coordinator
+        └── Redis Pub/Sub for hashring membership
+    ↓
+Cloud SQL (PostgreSQL)
+    └── keycast-db-plus
+    ↓
+Redis Memorystore
+    └── Cluster coordination
 ```
 
 ## Environment Variables
@@ -91,14 +89,19 @@ keycast-unified (Cloud Run)
 See `cloudbuild.yaml` for the full list of required environment variables:
 - `NODE_ENV=production`
 - `USE_GCP_KMS=true`
-- `CORS_ALLOWED_ORIGIN=https://login.divine.video`
+- `ALLOWED_ORIGINS=https://login.divine.video`
 - `APP_URL=https://login.divine.video`
+- `RUST_LOG=info`
+- `SQLX_POOL_SIZE=10`
+- `SQLX_STATEMENT_CACHE=100`
 - etc.
 
 ## Secrets (Google Secret Manager)
 
-- `MASTER_KEY_PATH` - Encryption master key
+- `DATABASE_URL` - Cloud SQL connection string
+- `SERVER_NSEC` - Server Nostr secret key for UCAN signing
 - `SENDGRID_API_KEY` - Email service
+- `REDIS_URL` - Redis Memorystore connection
 
 ## Smoke Tests
 
@@ -109,13 +112,19 @@ cloudbuild.yaml includes automated smoke tests:
 ## Troubleshooting
 
 ### Deployment went to wrong service
-- Check `cloudbuild.yaml` line 27 - should be `keycast-unified`
-- Verify `--args=unified` is set (line 36)
+- Check `cloudbuild.yaml` - service name should be `keycast`
 
-### Database reset after deployment
-- This is EXPECTED with current architecture (ephemeral database)
-- Need to implement persistent database solution
+### Database connection issues
+- Check Cloud SQL instance status
+- Verify `DATABASE_URL` secret is correct
+- Check `SQLX_POOL_SIZE` matches instance concurrency (10)
+- Review connection logs for `PoolTimedOut` errors
 
 ### Service not updating
-- Check which revision is serving traffic: `gcloud run services describe keycast-unified --region=us-central1`
+- Check which revision is serving traffic: `gcloud run services describe keycast --region=us-central1`
 - Verify latest image was deployed
+
+### High latency under load
+- Instance concurrency is set to 10 for CPU-bound crypto operations
+- Check if autoscaling is keeping up with demand
+- Review Redis cluster coordination for hashring membership

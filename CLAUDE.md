@@ -11,7 +11,7 @@ Keycast is a secure remote signing and permissions system for teams using Nostr.
 - **api**: HTTP API library - team management, authentication, OAuth 2.0 (library only, no binary)
 - **core**: Shared business logic, database models, encryption, permissions system
 - **signer**: NIP-46 signer library - handles multiple bunker connections
-- **pg-hashring**: PostgreSQL-backed cluster coordination with consistent hashing (LISTEN/NOTIFY)
+- **cluster-hashring**: Redis-backed cluster coordination with consistent hashing (Pub/Sub)
 
 **Client libraries:**
 - **keycast-login**: TypeScript/JavaScript OAuth client with storage abstraction
@@ -32,12 +32,17 @@ Keycast is a secure remote signing and permissions system for teams using Nostr.
      postgres:16
    ```
 
-2. **Master encryption key**:
+2. **Redis** - Required for cluster coordination:
+   ```bash
+   docker run -d --name redis -p 6379:6379 redis:7
+   ```
+
+3. **Master encryption key**:
    ```bash
    bun run key:generate
    ```
 
-3. **Database setup**:
+4. **Database setup**:
    ```bash
    bun run db:reset  # Creates tables and runs migrations
    ```
@@ -186,10 +191,12 @@ Required (set in `.env` or docker-compose):
 - `DOMAIN`: Domain name for production deployment (docker-compose only)
 
 Optional:
+- `REDIS_URL`: Redis connection string for cluster coordination (required in production)
 - `MASTER_KEY_PATH`: Path to master encryption key file (default: `./master.key`)
 - `USE_GCP_KMS`: Use Google Cloud KMS instead of file-based encryption (default: `false`)
 - `BUNKER_RELAYS`: Comma-separated relay URLs for NIP-46 communication (default: `wss://relay.divine.video,wss://relay.primal.net,wss://relay.nsec.app,wss://nos.lol`)
-- `RUST_LOG`: Log level configuration (default: `info,keycast_signer=debug`)
+- `RUST_LOG`: Log level configuration (default: `info`)
+- `SQLX_POOL_SIZE`: Database connection pool size (should match Cloud Run concurrency, default: `10`)
 - `VITE_ALLOWED_PUBKEYS`: Comma-separated pubkeys for whitelist access (web frontend)
 - `ENABLE_EXAMPLES`: Enable `/examples` directory serving (default: `false`, set to `true` for development)
 
@@ -204,7 +211,7 @@ Development (`.env` in `/web`):
 
 ## Deployment
 
-Production runs on Google Cloud Run as service `keycast` with `min-instances=1` to ensure the NIP-46 signer runs continuously.
+Production runs on Google Cloud Run as service `keycast` with `min-instances=3` to ensure the NIP-46 signer runs continuously.
 
 ### Deploy to Production
 
@@ -222,7 +229,8 @@ This runs Cloud Build which:
 
 - **Service:** `keycast` (Cloud Run, us-central1)
 - **URL:** https://login.divine.video
-- **Database:** Cloud SQL PostgreSQL (`keycast-db`)
+- **Database:** Cloud SQL PostgreSQL (`keycast-db-plus`) with PgBouncer connection pooling
+- **Cache/Coordination:** Redis (Memorystore) for cluster hashring coordination
 - **Secrets:** GCP Secret Manager
 
 ### View Logs
@@ -243,6 +251,7 @@ gcloud logging read 'resource.type=cloud_run_revision AND resource.labels.servic
 
 - All sensitive keys are encrypted at rest with AES-256-GCM
 - Master encryption key must be generated before first run (`bun run key:generate`)
-- Database uses PostgreSQL with automatic migrations on startup
+- Database migrations are run manually via `tools/run-migrations.sh` (not on startup)
 - Signer daemon monitors database for new/removed authorizations and adjusts connections accordingly
 - Build issues on low-memory VMs: Need 2GB+ RAM for Vite build; may require swap space or retries
+- Cloud Run uses `concurrency=10` (optimized for CPU-bound crypto workloads)
