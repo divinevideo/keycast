@@ -289,7 +289,8 @@ impl Metrics {
         ));
 
         // Auth metrics
-        output.push_str("\n# HELP keycast_registrations_total Total successful user registrations\n");
+        output
+            .push_str("\n# HELP keycast_registrations_total Total successful user registrations\n");
         output.push_str("# TYPE keycast_registrations_total counter\n");
         output.push_str(&format!(
             "keycast_registrations_total {}\n",

@@ -549,14 +549,15 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     let tenant_pool = database.pool.clone();
     let tenant_cache_for_preload = api_state.tenant_cache.clone();
     task_tracker.spawn(async move {
-        let tenants: Vec<Tenant> =
-            sqlx::query_as("SELECT id, domain, name, settings, created_at, updated_at FROM tenants")
-                .fetch_all(&tenant_pool)
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::warn!("Failed to preload tenants: {}", e);
-                    vec![]
-                });
+        let tenants: Vec<Tenant> = sqlx::query_as(
+            "SELECT id, domain, name, settings, created_at, updated_at FROM tenants",
+        )
+        .fetch_all(&tenant_pool)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to preload tenants: {}", e);
+            vec![]
+        });
 
         for tenant in tenants {
             let domain = tenant.domain.clone();

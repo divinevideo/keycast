@@ -37,7 +37,6 @@ impl Database {
         let database_url =
             env::var("DATABASE_URL").expect("DATABASE_URL must be set for PostgreSQL");
 
-
         let instance_id = env::var("K_REVISION").unwrap_or_else(|_| "local".to_string());
 
         // Statement cache size - parse early for logging
@@ -56,10 +55,7 @@ impl Database {
 
         eprintln!("🐘 Database pool config:");
         eprintln!("   Instance: {}", instance_id);
-        eprintln!(
-            "   Max connections per instance: {}",
-            max_connections
-        );
+        eprintln!("   Max connections per instance: {}", max_connections);
         eprintln!(
             "   Statement cache: {}",
             if statement_cache_size > 0 {

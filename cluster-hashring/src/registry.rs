@@ -43,8 +43,14 @@ impl RedisRegistry {
         let timestamp = current_timestamp_ms();
 
         let (instances_key, channel) = match prefix {
-            Some(p) => (format!("{p}:{DEFAULT_INSTANCES_KEY}"), format!("{p}:{DEFAULT_CHANNEL}")),
-            None => (DEFAULT_INSTANCES_KEY.to_string(), DEFAULT_CHANNEL.to_string()),
+            Some(p) => (
+                format!("{p}:{DEFAULT_INSTANCES_KEY}"),
+                format!("{p}:{DEFAULT_CHANNEL}"),
+            ),
+            None => (
+                DEFAULT_INSTANCES_KEY.to_string(),
+                DEFAULT_CHANNEL.to_string(),
+            ),
         };
 
         // ZADD signer_instances <timestamp> <instance_id>
