@@ -3,6 +3,7 @@ pub mod bunker_key;
 pub mod custom_permissions;
 pub mod database;
 pub mod encryption;
+pub mod instance;
 pub mod metrics;
 pub mod oauth_scopes;
 pub mod signing_handler;

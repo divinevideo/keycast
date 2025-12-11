@@ -1,17 +1,16 @@
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 use std::env;
-use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::time::sleep;
 
-// Pool configuration constants - tune these based on Cloud SQL tier
-// db-f1-micro: ~25 max connections (0.6GB RAM)
-// db-g1-small: ~100 max connections (1.7GB RAM)
-// db-n1-standard-1: ~250 max connections (3.75GB RAM)
-const MAX_CONNECTIONS_PER_INSTANCE: u32 = 20;
+// Pool configuration - PgBouncer transaction mode allows high client:backend ratios
+// Client connections are multiplexed to fewer backend connections via the pooler.
+// Example: 100 instances × 10 connections = 1000 client connections → 200 backend connections
+// Override with SQLX_POOL_SIZE env var (higher = better throughput per instance)
+const DEFAULT_MAX_CONNECTIONS_PER_INSTANCE: u32 = 10;
 const ACQUIRE_TIMEOUT_SECS: u64 = 60;
 const MAX_CONNECTION_ATTEMPTS: u32 = 5;
 
@@ -29,22 +28,15 @@ pub enum DatabaseError {
 
 #[derive(Clone)]
 pub struct Database {
-    /// Main pool for queries - may go through connection pooler (transaction mode)
+    /// Main pool for queries - goes through connection pooler (transaction mode)
     pub pool: PgPool,
-    /// Direct pool for LISTEN/NOTIFY - bypasses connection pooler
-    /// Uses same URL as main pool if DATABASE_DIRECT_URL is not set
-    pub direct_pool: PgPool,
 }
 
 impl Database {
-    pub async fn new(_db_path: PathBuf, migrations_path: PathBuf) -> Result<Self, DatabaseError> {
+    pub async fn new() -> Result<Self, DatabaseError> {
         let database_url =
             env::var("DATABASE_URL").expect("DATABASE_URL must be set for PostgreSQL");
 
-        // Optional direct URL for LISTEN/NOTIFY (bypasses connection pooler)
-        // Falls back to DATABASE_URL if not set
-        let direct_url = env::var("DATABASE_DIRECT_URL").unwrap_or_else(|_| database_url.clone());
-        let using_separate_direct = env::var("DATABASE_DIRECT_URL").is_ok();
 
         let instance_id = env::var("K_REVISION").unwrap_or_else(|_| "local".to_string());
 
@@ -54,11 +46,19 @@ impl Database {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
 
+        // Pool size per instance - configurable via SQLX_POOL_SIZE env var
+        // PgBouncer multiplexes these client connections to fewer backend connections.
+        // More connections per instance = higher throughput but more memory usage.
+        let max_connections: u32 = env::var("SQLX_POOL_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_MAX_CONNECTIONS_PER_INSTANCE);
+
         eprintln!("🐘 Database pool config:");
         eprintln!("   Instance: {}", instance_id);
         eprintln!(
             "   Max connections per instance: {}",
-            MAX_CONNECTIONS_PER_INSTANCE
+            max_connections
         );
         eprintln!(
             "   Statement cache: {}",
@@ -72,21 +72,18 @@ impl Database {
             }
         );
         eprintln!("   Acquire timeout: {}s", ACQUIRE_TIMEOUT_SECS);
-        if using_separate_direct {
-            eprintln!("   Using separate DATABASE_DIRECT_URL for LISTEN/NOTIFY");
-        }
         eprintln!("   ⚠️  If PoolTimedOut errors occur, check:");
         eprintln!("      - Cloud SQL max_connections (db-f1-micro ≈ 25)");
         eprintln!(
             "      - Number of Cloud Run instances × {} = total connections",
-            MAX_CONNECTIONS_PER_INSTANCE
+            max_connections
         );
         eprintln!("      - Total must be < Cloud SQL max_connections");
 
         // Main pool options - may go through connection pooler
         let pool_options = PgPoolOptions::new()
             .acquire_timeout(Duration::from_secs(ACQUIRE_TIMEOUT_SECS))
-            .max_connections(MAX_CONNECTIONS_PER_INSTANCE);
+            .max_connections(max_connections);
 
         // Statement cache size - configurable for PgBouncer with max_prepared_statements
         // Set SQLX_STATEMENT_CACHE=100 when Cloud SQL pooler has max_prepared_statements configured
@@ -128,76 +125,26 @@ impl Database {
                         eprintln!("      Cloud SQL db-f1-micro has ~25 max connections.");
                         eprintln!(
                             "      With {} conn/instance, max {} instances can connect.",
-                            MAX_CONNECTIONS_PER_INSTANCE,
-                            25 / MAX_CONNECTIONS_PER_INSTANCE
+                            max_connections,
+                            250 / max_connections
                         );
                         eprintln!("      Solutions:");
                         eprintln!("        1. Reduce min-instances in Cloud Run");
                         eprintln!(
                             "        2. Upgrade Cloud SQL tier (db-g1-small has ~100 connections)"
                         );
-                        eprintln!("        3. Reduce MAX_CONNECTIONS_PER_INSTANCE in database.rs");
+                        eprintln!("        3. Set SQLX_POOL_SIZE env var to reduce per-instance connections");
                     }
                     return Err(e.into());
                 }
             }
         };
 
-        // Direct pool for LISTEN/NOTIFY - only needs 1 connection per instance
-        // No statement_cache_capacity(0) needed since it bypasses pooler
-        let direct_pool_options = PgPoolOptions::new()
-            .acquire_timeout(Duration::from_secs(ACQUIRE_TIMEOUT_SECS))
-            .max_connections(1); // LISTEN only needs 1 persistent connection
-
-        let mut direct_connect_options =
-            PgConnectOptions::from_str(&direct_url).expect("Invalid DATABASE_DIRECT_URL");
-        // If using managed pool for direct connections (no DATABASE_DIRECT_URL set),
-        // we still need to disable statement cache due to PgBouncer transaction mode
-        if !using_separate_direct {
-            direct_connect_options = direct_connect_options.statement_cache_capacity(0);
-        }
-
-        let direct_pool = direct_pool_options
-            .connect_with(direct_connect_options)
-            .await?;
-
-        // Run migrations - with graceful handling for multi-instance startup
-        // When many instances start simultaneously with Cloud SQL Managed Pool, they may
-        // hit "prepared statement already exists" conflicts (error code 42P05).
-        // This is safe to ignore - it means another instance is running migrations.
-        eprintln!("Running migrations...");
-        let mut attempts = 0;
-        while attempts < 3 {
-            match sqlx::migrate::Migrator::new(migrations_path.clone())
-                .await?
-                .run(&direct_pool)
-                .await
-            {
-                Ok(_) => {
-                    eprintln!("   Migrations completed successfully");
-                    break;
-                }
-                Err(e) => {
-                    let error_str = e.to_string();
-                    // Check for PgBouncer/managed pool prepared statement conflict
-                    if error_str.contains("42P05") || error_str.contains("already exists") {
-                        eprintln!("   ⚠️  Migration conflict (42P05): another instance likely running migrations");
-                        eprintln!("   Continuing startup - migrations will be applied by another instance");
-                        break;
-                    }
-                    if attempts < 2 {
-                        eprintln!("   Migration attempt {} failed: {}", attempts + 1, e);
-                        sleep(Duration::from_millis(500)).await;
-                        attempts += 1;
-                    } else {
-                        return Err(e.into());
-                    }
-                }
-            }
-        }
+        // Migrations are run manually via tools/run-migrations.sh before deployment
+        // This avoids pg_advisory_lock thundering herd when many instances start simultaneously
 
         eprintln!("✅ PostgreSQL database initialized successfully");
 
-        Ok(Self { pool, direct_pool })
+        Ok(Self { pool })
     }
 }

@@ -7,7 +7,6 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-const MEMBERSHIP_CHANNEL: &str = "cluster:membership";
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 5;
 const FULL_SYNC_INTERVAL_SECS: u64 = 30;
 const CLEANUP_PROBABILITY_PERCENT: u32 = 10;
@@ -46,8 +45,18 @@ impl ClusterCoordinator {
     ///
     /// Returns an error if registration or initial sync fails.
     pub async fn start(redis_url: &str) -> Result<Self, Error> {
-        let mut registry = RedisRegistry::register(redis_url).await?;
+        Self::start_with_prefix(redis_url, None).await
+    }
+
+    /// Start a coordinator with an optional key prefix (for test isolation).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if registration or initial sync fails.
+    pub async fn start_with_prefix(redis_url: &str, prefix: Option<&str>) -> Result<Self, Error> {
+        let mut registry = RedisRegistry::register_with_prefix(redis_url, prefix).await?;
         let instance_id = registry.instance_id().to_string();
+        let channel = registry.channel().to_string();
 
         // Create initial ring and sync from Redis
         let mut initial_ring = HashRing::new(&instance_id);
@@ -77,6 +86,7 @@ impl ClusterCoordinator {
         let pubsub_handle = Self::spawn_pubsub_task(
             redis_url.to_string(),
             instance_id.clone(),
+            channel,
             ring.clone(),
             cancel_token.clone(),
             event_tx.clone(),
@@ -104,13 +114,14 @@ impl ClusterCoordinator {
         let payload = serde_json::to_string(&msg).map_err(|e| Error::Config(e.to_string()))?;
 
         let mut conn = registry.connection();
+        let channel = registry.channel();
         redis::cmd("PUBLISH")
-            .arg(MEMBERSHIP_CHANNEL)
+            .arg(channel)
             .arg(&payload)
             .query_async::<()>(&mut conn)
             .await?;
 
-        tracing::debug!(event, instance_id, "Published membership event");
+        tracing::debug!(event, instance_id, channel, "Published membership event");
         Ok(())
     }
 
@@ -209,6 +220,7 @@ impl ClusterCoordinator {
     fn spawn_pubsub_task(
         redis_url: String,
         my_instance_id: String,
+        channel: String,
         ring: Arc<ArcSwap<HashRing>>,
         cancel_token: CancellationToken,
         event_tx: broadcast::Sender<MembershipEvent>,
@@ -242,9 +254,15 @@ impl ClusterCoordinator {
                     }
                 };
 
-                if let Err(e) =
-                    Self::run_pubsub_loop(conn, &my_instance_id, &ring, &cancel_token, &event_tx)
-                        .await
+                if let Err(e) = Self::run_pubsub_loop(
+                    conn,
+                    &my_instance_id,
+                    &channel,
+                    &ring,
+                    &cancel_token,
+                    &event_tx,
+                )
+                .await
                 {
                     if !cancel_token.is_cancelled() {
                         tracing::warn!("Pub/Sub loop error, reconnecting: {}", e);
@@ -259,12 +277,13 @@ impl ClusterCoordinator {
     async fn run_pubsub_loop(
         mut pubsub: PubSub,
         my_instance_id: &str,
+        channel: &str,
         ring: &Arc<ArcSwap<HashRing>>,
         cancel_token: &CancellationToken,
         event_tx: &broadcast::Sender<MembershipEvent>,
     ) -> Result<(), Error> {
-        pubsub.subscribe(MEMBERSHIP_CHANNEL).await?;
-        tracing::debug!("Subscribed to {}", MEMBERSHIP_CHANNEL);
+        pubsub.subscribe(channel).await?;
+        tracing::debug!("Subscribed to {}", channel);
 
         let mut stream = pubsub.on_message();
 
@@ -398,7 +417,17 @@ impl ClusterCoordinator {
     ///
     /// Returns an error if deregistration fails.
     pub async fn shutdown(mut self) -> Result<(), Error> {
-        // 1. Publish leave event and deregister
+        // 1. Cancel background tasks FIRST to prevent heartbeat from re-registering
+        self.cancel_token.cancel();
+
+        if let Some(handle) = self.heartbeat_handle.take() {
+            let _ = handle.await;
+        }
+        if let Some(handle) = self.pubsub_handle.take() {
+            let _ = handle.await;
+        }
+
+        // 2. Now deregister from cluster (tasks are stopped, so no race)
         {
             let mut reg = self.registry.lock().await;
             let instance_id = reg.instance_id().to_string();
@@ -408,19 +437,9 @@ impl ClusterCoordinator {
             reg.deregister().await?;
         }
 
-        // 2. Brief drain period for in-flight requests
+        // 3. Brief drain period for in-flight requests
         let drain_ms = (100_usize * self.instance_count().max(1)).min(2000);
         tokio::time::sleep(Duration::from_millis(drain_ms as u64)).await;
-
-        // 3. Cancel background tasks
-        self.cancel_token.cancel();
-
-        if let Some(handle) = self.heartbeat_handle.take() {
-            let _ = handle.await;
-        }
-        if let Some(handle) = self.pubsub_handle.take() {
-            let _ = handle.await;
-        }
 
         tracing::debug!(drain_ms, "Shutdown complete");
         Ok(())
@@ -432,20 +451,15 @@ use futures_util::StreamExt;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
+    use uuid::Uuid;
 
-    async fn get_redis_url() -> String {
+    fn get_redis_url() -> String {
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into())
     }
 
-    async fn cleanup_test_data(redis_url: &str) {
-        let client = redis::Client::open(redis_url).unwrap();
-        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
-        let _: () = redis::cmd("DEL")
-            .arg("signer_instances")
-            .query_async(&mut conn)
-            .await
-            .unwrap();
+    /// Generate unique test prefix to isolate test data
+    fn test_prefix() -> String {
+        format!("test:{}", Uuid::new_v4())
     }
 
     #[test]
@@ -457,28 +471,33 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_coordinator_starts_and_handles_keys() {
-        let redis_url = get_redis_url().await;
-        cleanup_test_data(&redis_url).await;
+        let redis_url = get_redis_url();
+        let prefix = test_prefix();
 
-        let coordinator = ClusterCoordinator::start(&redis_url).await.unwrap();
+        let coordinator = ClusterCoordinator::start_with_prefix(&redis_url, Some(&prefix))
+            .await
+            .unwrap();
 
         // Solo instance should handle everything
         assert!(coordinator.should_handle("any-key"));
         assert!(coordinator.should_handle("another-key"));
+        assert_eq!(coordinator.instance_count(), 1);
 
         coordinator.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_two_coordinators_split_keys() {
-        let redis_url = get_redis_url().await;
-        cleanup_test_data(&redis_url).await;
+        let redis_url = get_redis_url();
+        let prefix = test_prefix();
 
-        let coord1 = ClusterCoordinator::start(&redis_url).await.unwrap();
-        let coord2 = ClusterCoordinator::start(&redis_url).await.unwrap();
+        let coord1 = ClusterCoordinator::start_with_prefix(&redis_url, Some(&prefix))
+            .await
+            .unwrap();
+        let coord2 = ClusterCoordinator::start_with_prefix(&redis_url, Some(&prefix))
+            .await
+            .unwrap();
 
         // Wait for Pub/Sub to propagate
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -486,6 +505,9 @@ mod tests {
         // Trigger manual refresh to ensure both see each other
         coord1.refresh().await.unwrap();
         coord2.refresh().await.unwrap();
+
+        assert_eq!(coord1.instance_count(), 2, "coord1 should see 2 instances");
+        assert_eq!(coord2.instance_count(), 2, "coord2 should see 2 instances");
 
         // Keys should be split between them
         let mut handled_by_1 = 0;
@@ -521,18 +543,21 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_pubsub_detects_join() {
-        let redis_url = get_redis_url().await;
-        cleanup_test_data(&redis_url).await;
+        let redis_url = get_redis_url();
+        let prefix = test_prefix();
 
-        let coord1 = ClusterCoordinator::start(&redis_url).await.unwrap();
+        let coord1 = ClusterCoordinator::start_with_prefix(&redis_url, Some(&prefix))
+            .await
+            .unwrap();
         let mut rx = coord1.subscribe();
 
         assert_eq!(coord1.instance_count(), 1);
 
         // Start coord2 - coord1 should detect via Pub/Sub
-        let coord2 = ClusterCoordinator::start(&redis_url).await.unwrap();
+        let coord2 = ClusterCoordinator::start_with_prefix(&redis_url, Some(&prefix))
+            .await
+            .unwrap();
 
         // Wait for Pub/Sub event
         let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
@@ -552,18 +577,28 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_graceful_shutdown_redistributes_keys() {
-        let redis_url = get_redis_url().await;
-        cleanup_test_data(&redis_url).await;
+        let redis_url = get_redis_url();
+        let prefix = test_prefix();
 
-        let coord1 = ClusterCoordinator::start(&redis_url).await.unwrap();
-        let coord2 = ClusterCoordinator::start(&redis_url).await.unwrap();
+        let coord1 = ClusterCoordinator::start_with_prefix(&redis_url, Some(&prefix))
+            .await
+            .unwrap();
+        let coord2 = ClusterCoordinator::start_with_prefix(&redis_url, Some(&prefix))
+            .await
+            .unwrap();
 
-        // Wait for sync
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        coord1.refresh().await.unwrap();
-        coord2.refresh().await.unwrap();
+        // Wait for both coordinators to see exactly 2 instances
+        for _ in 0..20 {
+            coord1.refresh().await.unwrap();
+            coord2.refresh().await.unwrap();
+            if coord1.instance_count() == 2 && coord2.instance_count() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(coord1.instance_count(), 2, "coord1 should see 2 instances");
+        assert_eq!(coord2.instance_count(), 2, "coord2 should see 2 instances");
 
         // Count how many keys coord1 handles with 2 instances
         let mut before = 0;
@@ -583,9 +618,19 @@ mod tests {
         // Shutdown coord2
         coord2.shutdown().await.unwrap();
 
-        // Wait for coord1 to detect coord2 left via Pub/Sub
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        coord1.refresh().await.unwrap();
+        // Poll until coord1 sees only 1 instance (itself)
+        for _ in 0..40 {
+            coord1.refresh().await.unwrap();
+            if coord1.instance_count() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            coord1.instance_count(),
+            1,
+            "coord1 should see only itself after coord2 leaves"
+        );
 
         // coord1 now handles all keys
         let mut after = 0;

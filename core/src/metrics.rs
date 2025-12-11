@@ -37,6 +37,20 @@ pub struct Metrics {
     pub http_rpc_success: AtomicU64,
     /// HTTP RPC authorization errors
     pub http_rpc_auth_errors: AtomicU64,
+
+    // === Auth Metrics ===
+    /// Total successful user registrations
+    pub registrations_total: AtomicU64,
+    /// Total successful logins
+    pub logins_total: AtomicU64,
+    /// Total failed login attempts (wrong password)
+    pub login_failures_total: AtomicU64,
+
+    // === OAuth Metrics ===
+    /// Total OAuth authorizations created
+    pub oauth_authorizations_created: AtomicU64,
+    /// Total OAuth authorizations revoked
+    pub oauth_authorizations_revoked: AtomicU64,
 }
 
 impl Metrics {
@@ -58,6 +72,13 @@ impl Metrics {
             http_rpc_cache_size: AtomicU64::new(0),
             http_rpc_success: AtomicU64::new(0),
             http_rpc_auth_errors: AtomicU64::new(0),
+            // Auth metrics
+            registrations_total: AtomicU64::new(0),
+            logins_total: AtomicU64::new(0),
+            login_failures_total: AtomicU64::new(0),
+            // OAuth metrics
+            oauth_authorizations_created: AtomicU64::new(0),
+            oauth_authorizations_revoked: AtomicU64::new(0),
         }
     }
 
@@ -121,6 +142,32 @@ impl Metrics {
 
     pub fn inc_http_rpc_auth_error(&self) {
         self.http_rpc_auth_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // === Auth metric methods ===
+
+    pub fn inc_registration(&self) {
+        self.registrations_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_login(&self) {
+        self.logins_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_login_failure(&self) {
+        self.login_failures_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // === OAuth metric methods ===
+
+    pub fn inc_oauth_created(&self) {
+        self.oauth_authorizations_created
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_oauth_revoked(&self) {
+        self.oauth_authorizations_revoked
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Format all metrics as Prometheus text
@@ -239,6 +286,47 @@ impl Metrics {
         output.push_str(&format!(
             "keycast_http_rpc_auth_errors_total {}\n",
             self.http_rpc_auth_errors.load(Ordering::Relaxed)
+        ));
+
+        // Auth metrics
+        output.push_str("\n# HELP keycast_registrations_total Total successful user registrations\n");
+        output.push_str("# TYPE keycast_registrations_total counter\n");
+        output.push_str(&format!(
+            "keycast_registrations_total {}\n",
+            self.registrations_total.load(Ordering::Relaxed)
+        ));
+
+        output.push_str("\n# HELP keycast_logins_total Total successful logins\n");
+        output.push_str("# TYPE keycast_logins_total counter\n");
+        output.push_str(&format!(
+            "keycast_logins_total {}\n",
+            self.logins_total.load(Ordering::Relaxed)
+        ));
+
+        output.push_str("\n# HELP keycast_login_failures_total Total failed login attempts\n");
+        output.push_str("# TYPE keycast_login_failures_total counter\n");
+        output.push_str(&format!(
+            "keycast_login_failures_total {}\n",
+            self.login_failures_total.load(Ordering::Relaxed)
+        ));
+
+        // OAuth metrics
+        output.push_str(
+            "\n# HELP keycast_oauth_authorizations_created_total Total OAuth authorizations created\n",
+        );
+        output.push_str("# TYPE keycast_oauth_authorizations_created_total counter\n");
+        output.push_str(&format!(
+            "keycast_oauth_authorizations_created_total {}\n",
+            self.oauth_authorizations_created.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(
+            "\n# HELP keycast_oauth_authorizations_revoked_total Total OAuth authorizations revoked\n",
+        );
+        output.push_str("# TYPE keycast_oauth_authorizations_revoked_total counter\n");
+        output.push_str(&format!(
+            "keycast_oauth_authorizations_revoked_total {}\n",
+            self.oauth_authorizations_revoked.load(Ordering::Relaxed)
         ));
 
         output

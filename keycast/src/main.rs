@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
 use tokio::sync::Notify;
+use tokio_util::task::TaskTracker;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -183,13 +184,12 @@ async fn wait_for_shutdown_signal() {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
 
-    // Calculate worker count using same logic as RPC workers:
-    // 2x CPUs with minimum of 8 to avoid I/O driver starvation
-    // See: https://github.com/tokio-rs/tokio/issues/4730
+    // Use tokio default: 1 worker thread per CPU core
+    // Override with TOKIO_WORKER_THREADS env var if needed
     let worker_threads = std::env::var("TOKIO_WORKER_THREADS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| num_cpus::get().max(4) * 2);
+        .unwrap_or_else(num_cpus::get);
 
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
@@ -227,16 +227,29 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
             .init();
     }
 
+    // Log instance capacity info for distributed tracing
+    // Initialize global instance ID (combines revision + unique UUID)
+    let instance_id = keycast_core::instance::instance_id();
+    let cpu_count = num_cpus::get();
+    let pool_size = env::var("SQLX_POOL_SIZE")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(10);
+
+    tracing::info!(
+        event = "instance_startup",
+        instance_id = %instance_id,
+        cpu_count = cpu_count,
+        worker_threads = worker_threads,
+        pool_size = pool_size,
+        "Instance starting: id={} cpus={} workers={} pool={}",
+        instance_id, cpu_count, worker_threads, pool_size
+    );
+
     // Setup database
-    let root_dir = env!("CARGO_MANIFEST_DIR");
-    let database_url = PathBuf::from(env::var("DATABASE_URL")?); // Validated above
+    let database_url = env::var("DATABASE_URL")?; // Validated above
 
-    let database_migrations = PathBuf::from(root_dir)
-        .parent()
-        .unwrap()
-        .join("database/migrations");
-
-    let database = Database::new(database_url.clone(), database_migrations.clone()).await?;
+    let database = Database::new().await?;
     tracing::info!("✔︎ Database initialized at {:?}", database_url);
 
     // Initialize cluster coordination with Redis (Pub/Sub mode)
@@ -287,7 +300,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         authorization_channel::CHANNEL_BUFFER_SIZE
     );
 
-    // Create signer and load all authorizations into memory
+    // Create signer (relay connections deferred to background task for faster startup)
     let mut signer = UnifiedSigner::new(
         database.pool.clone(),
         signer_key_manager,
@@ -296,7 +309,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     )
     .await?;
     signer.load_authorizations().await?;
-    signer.connect_to_relays().await?;
+    // Note: connect_to_relays() moved to signer daemon task to allow HTTP server to bind faster
 
     // Create RPC queue for bounded concurrency on NIP-46 requests
     // Workers process sign/encrypt/decrypt operations with backpressure
@@ -325,29 +338,12 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         num_workers
     );
 
-    // Create tenant cache and preload existing tenants
+    // Create tenant cache (preload deferred to background task for faster startup)
     let tenant_cache: TenantCache = Cache::builder()
         .max_capacity(100)
         .time_to_live(Duration::from_secs(3600))
         .build();
-
-    let tenants: Vec<Tenant> =
-        sqlx::query_as("SELECT id, domain, name, settings, created_at, updated_at FROM tenants")
-            .fetch_all(&database.pool)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!("Failed to preload tenants: {}", e);
-                vec![]
-            });
-
-    for tenant in tenants {
-        let domain = tenant.domain.clone();
-        tenant_cache.insert(domain.clone(), Arc::new(tenant)).await;
-    }
-    tracing::info!(
-        "✔︎ Tenant cache initialized ({} tenants preloaded)",
-        tenant_cache.entry_count()
-    );
+    tracing::info!("✔︎ Tenant cache initialized (preload deferred)");
 
     // Create API state with http_handler_cache for on-demand loading
     // Note: api no longer depends on signer's handler cache (decoupled)
@@ -518,11 +514,12 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     let api_addr = std::net::SocketAddr::from(([0, 0, 0, 0], api_port));
     tracing::info!("✔︎ API server ready on {}", api_addr);
 
-    // Setup graceful shutdown
+    // Setup graceful shutdown with TaskTracker for background tasks
     let shutdown_signal = Arc::new(Notify::new());
     let shutdown_for_api = shutdown_signal.clone();
     let client_for_shutdown = signer.client();
     let pool_for_shutdown = database.pool.clone();
+    let task_tracker = TaskTracker::new();
 
     // Spawn API server with graceful shutdown
     let api_handle = tokio::spawn(async move {
@@ -537,11 +534,40 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
             .unwrap();
     });
 
-    // Spawn Signer daemon task
-    let signer_handle = tokio::spawn(async move {
-        tracing::info!("🤙 Signer daemon ready, listening for NIP-46 requests");
+    // Spawn Signer daemon task (connects to relays in background for faster startup)
+    let signer_handle = task_tracker.spawn(async move {
         let mut signer = signer;
+        // Connect to relays in background (deferred from startup for faster health checks)
+        if let Err(e) = signer.connect_to_relays().await {
+            tracing::error!("Failed to connect to relays: {}", e);
+        }
+        tracing::info!("🤙 Signer daemon ready, listening for NIP-46 requests");
         signer.run().await.unwrap();
+    });
+
+    // Spawn tenant cache preload task (deferred from startup for faster health checks)
+    let tenant_pool = database.pool.clone();
+    let tenant_cache_for_preload = api_state.tenant_cache.clone();
+    task_tracker.spawn(async move {
+        let tenants: Vec<Tenant> =
+            sqlx::query_as("SELECT id, domain, name, settings, created_at, updated_at FROM tenants")
+                .fetch_all(&tenant_pool)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Failed to preload tenants: {}", e);
+                    vec![]
+                });
+
+        for tenant in tenants {
+            let domain = tenant.domain.clone();
+            tenant_cache_for_preload
+                .insert(domain.clone(), Arc::new(tenant))
+                .await;
+        }
+        tracing::info!(
+            "✔︎ Tenant cache preloaded ({} tenants)",
+            tenant_cache_for_preload.entry_count()
+        );
     });
 
     // Note: Heartbeat and hashring coordination is now handled internally by ClusterCoordinator
@@ -566,24 +592,35 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
 
     tracing::info!("Shutting down gracefully...");
 
+    // Close task tracker to prevent new tasks from being spawned
+    task_tracker.close();
+
     // Shutdown signer client (disconnect from relays)
     // Note: ClusterCoordinator will be dropped automatically, triggering deregister
     client_for_shutdown.shutdown().await;
 
-    // Wait for API server to drain (max 25s to leave buffer before Cloud Run's 30s timeout)
-    match tokio::time::timeout(Duration::from_secs(25), api_handle).await {
+    // Wait for API server to drain (max 15s to leave buffer before Cloud Run's 30s timeout)
+    match tokio::time::timeout(Duration::from_secs(15), api_handle).await {
         Ok(result) => {
             if let Err(e) = result {
                 tracing::warn!("API server task error: {:?}", e);
             }
         }
         Err(_) => {
-            tracing::warn!("API server shutdown timed out after 25s");
+            tracing::warn!("API server shutdown timed out after 15s");
         }
     }
 
-    // Abort signer task
-    signer_handle.abort();
+    // Wait for signer and other tracked tasks to complete (max 10s)
+    match tokio::time::timeout(Duration::from_secs(10), task_tracker.wait()).await {
+        Ok(()) => {
+            tracing::info!("All tracked tasks completed");
+        }
+        Err(_) => {
+            tracing::warn!("Task tracker wait timed out after 10s, aborting signer");
+            signer_handle.abort();
+        }
+    }
 
     // Close database pool
     pool_for_shutdown.close().await;

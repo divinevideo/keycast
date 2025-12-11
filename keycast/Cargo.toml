@@ -19,6 +19,7 @@ nostr-sdk = { workspace = true }
 # Web framework
 axum = { version = "0.7", features = ["macros", "tokio"] }
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
 
