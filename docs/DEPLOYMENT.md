@@ -7,14 +7,14 @@
 
 Keycast is a Nostr key custody service. Users store their cryptographic keys here; apps request signing operations.
 
-**Why this matters for infrastructure:**
+**System Components:**
 
 | Component | What it does | Why it exists |
 |-----------|--------------|---------------|
 | **PostgreSQL** | Stores encrypted user keys | Keys encrypted at rest (AES-256-GCM) |
 | **Cloud KMS** | Holds the master encryption key | Hardware-backed, keys never exported |
 | **Redis** | Cluster coordination only | Hashring for distributing NIP-46 relay requests across instances |
-| **Moka Cache** | Per-instance memory cache for decrypted keys | Avoids repeated KMS decryption; why session affinity matters |
+| **Instance Cache** | Per-instance memory cache for decrypted keys | Avoids repeated KMS decryption; why session affinity matters |
 
 **Two request paths:**
 1. **HTTP RPC** - REST API calls. Session affinity routes repeat users to same instance for cache hits.
@@ -89,12 +89,16 @@ Purpose: Cluster coordination (hashring, heartbeats)
 ```
 PostgreSQL max_connections: 250
 Cloud Run concurrency: 10 per instance
-SQLX_POOL_SIZE: 10 per instance (must match concurrency)
+SQLX_POOL_SIZE: 10 per instance
 
-Example: 200 instances × 10 pool = 2000 potential connections
-  → PgBouncer pools down to stay under 250
+Why pool_size = concurrency:
+  - Worst case: all 10 concurrent requests need DB simultaneously
+  - In practice, fewer connections needed because:
+    - CPU-bound crypto runs off-pool (spawn_blocking)
+    - Connections released between queries (except in transactions)
+  - PgBouncer multiplexes: 200 instances × 10 = 2000 client connections → 200 backend
 
-Rule: concurrency = SQLX_POOL_SIZE (always keep matched)
+Rule: Start with pool_size = concurrency. Lower only if measured.
 ```
 
 ---
@@ -227,8 +231,8 @@ gcloud run services update-traffic keycast \
 | Dependency | At Startup | During Runtime |
 |------------|------------|----------------|
 | **Redis unreachable** | Hard failure, app exits | Exponential backoff retry (heartbeat), 1s reconnect loop (Pub/Sub). Hashring uses stale data until reconnected. App continues but may misroute NIP-46 requests. |
-| **KMS unavailable** | Hard failure if `USE_GCP_KMS=true` | Cached keys in Moka still work. New decryptions retry 3x with exponential backoff (100ms, 200ms, 400ms), then fail. |
-| **PostgreSQL down** | 5 retries with exponential backoff (500ms→8s), then exits | Immediate 500 error per request. No circuit breaker. Pool auto-reconnects when DB returns. |
+| **KMS unavailable** | Hard failure if `USE_GCP_KMS=true` | Cached keys still work. New decryptions retry 3x with exponential backoff (100ms, 200ms, 400ms), then fail. |
+| **PostgreSQL down** | 5 retries with exponential backoff (1s, 2s, 4s, 8s), then exits | Immediate 500 error per request. No circuit breaker. Pool auto-reconnects when DB returns. |
 
 **Key insight:** The app degrades gracefully for Redis/KMS partial failures but has no circuit breaker for database issues.
 
@@ -256,6 +260,11 @@ gcloud run services update-traffic keycast \
 Each HTTP request gets a `trace_id` (8-char UUID) automatically attached to all logs within that request.
 - Clients can pass `x-trace-id` header for correlation across services
 - If not provided, server generates one automatically
+
+**TODO:** Integrate trace_id from mobile (keycast_flutter) and web (keycast-login) clients:
+- Clients should generate trace_id on request initiation
+- Pass via `x-trace-id` header for full request correlation
+- Enables tracing from UI action → API → signer daemon
 
 **Key fields in structured logs:**
 ```json
@@ -318,6 +327,18 @@ Returns Prometheus text format, no auth required. Safe to scrape frequently (in-
 - `keycast_cache_misses_total` high relative to hits → session affinity may be broken
 - `keycast_http_rpc_auth_errors_total` spike → possible attack or client misconfiguration
 
+**Metrics aggregation:**
+
+Cloud Run provides **built-in aggregated metrics** automatically (request count, latency, CPU, memory, instance count). These are sufficient for scaling decisions and basic alerting—no setup required.
+
+The custom Prometheus metrics at `/metrics` (cache hits, NIP-46 stats, auth errors) are **per-instance only**. Options for aggregating these:
+
+1. **Log-based metrics** (simplest) - Create custom metrics from structured logs in Cloud Logging. No code changes, works now.
+2. **Managed Prometheus** - Google Cloud Managed Service for Prometheus can scrape all instances. More infrastructure.
+3. **Push to Cloud Monitoring** - Add OTLP/Cloud Monitoring client to push metrics. Requires code changes.
+
+For a test environment, Cloud Run's built-in metrics + log queries for custom data is probably sufficient.
+
 ---
 
 ## Performance Characteristics
@@ -341,7 +362,7 @@ I/O-bound (Database):
 Workers: 2× CPU cores (min 8), Queue: 4096 items with backpressure
 ```
 
-**Scaling recommendation:** Primary metric is **CPU utilization** (crypto signing dominates under sustained load). However, significant I/O-bound work exists:
+**Scaling recommendation:** Cloud Run autoscales based on per-instance CPU utilization and request concurrency. Requests are routed away from high-CPU instances even if concurrency limit isn't reached. Session affinity is broken when an instance hits max CPU—requests go to other instances. Crypto signing dominates CPU under sustained load. However, significant I/O-bound work exists:
 - NIP-46: WebSocket relay traffic + Redis hashring lookups
 - Cold caches: DB queries + KMS decryption
 - OAuth flows: DB session/authorization lookups
@@ -350,11 +371,14 @@ Monitor **P95 latency** and **cache miss rate** alongside CPU. High latency with
 
 - Current concurrency: 10 requests/instance
 - If `keycast_nip46_queue_dropped_total` increases, add instances
-- Memory is not typically the bottleneck (4 GiB is generous)
+- Memory is not typically the bottleneck (4 GiB); primary consumer is the handler cache (decrypted keys, auth metadata)
 
 **Latency expectations:**
-- HTTP RPC signing: <50ms (cache hit) to ~200ms (cache miss + KMS decrypt)
-- NIP-46 relay signing: +network RTT to relays (~100-500ms total)
+- HTTP RPC signing: Fast (cache hit) to slower (cache miss requires KMS decrypt)
+- NIP-46 relay signing: Above + network RTT to relays (varies by relay latency)
+
+Actual latencies depend on network conditions, KMS region, and relay performance.
+Cache hits are typically an order of magnitude faster than cache misses.
 
 ---
 
@@ -379,7 +403,7 @@ The application handles `SIGTERM` and `SIGINT` signals to ensure zero-downtime d
 - **Requirement:** Ensure the platform's termination grace period is at least **30s** to accommodate this 25s max drain sequence.
 
 ### Session Affinity (Sticky Sessions)
-**CRITICAL:** The application uses an in-memory cache (`Moka`) for decrypted keys to reduce KMS costs and latency.
+**CRITICAL:** The application uses an in-memory cache for decrypted keys to reduce KMS costs and latency.
 - **Requirement:** You **MUST** enable Session Affinity (Sticky Sessions) at the Load Balancer / Ingress level.
 - **Why:** Without it, requests for the same user might land on different instances, causing frequent cache misses and expensive re-decryption calls to Cloud KMS.
 - *Current GCP Implementation:* Enabled in Cloud Run service settings.

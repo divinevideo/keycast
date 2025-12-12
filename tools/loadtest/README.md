@@ -103,7 +103,7 @@ Client Request
      │
      ▼
 ┌─────────────────────────────────────────────────────────┐
-│ Handler Cache Lookup (Moka LRU)                         │
+│ Handler Cache Lookup (LRU)                              │
 │   Key: bunker_pubkey (32 bytes)                         │
 │   Capacity: 1,000,000 (configurable via HANDLER_CACHE_SIZE)
 │   TTL: 1 hour idle timeout                              │
@@ -178,24 +178,11 @@ Key metrics:
   --output ./prod-results.json
 ```
 
-### Configuration Risk: Load Skew & Metric Dilution
+### Session Affinity Behavior Under Load
 
-**CRITICAL AUTOSCALING HAZARD** when combining **Session Affinity (Sticky Sessions)** with a high **`min-instances`** count.
+Cloud Run routes requests away from high-CPU instances even if their concurrency limit isn't reached. Session affinity is broken when an instance hits max CPU—requests go to other instances automatically.
 
-Because the Cloud Run Autoscaler triggers scale-out events based strictly on *cluster-wide averages*, a large pool of idle reserved instances causes **Metric Dilution**, dragging down the global average. This results in **Load Skew**, where specific instances become saturated ("hot") due to sticky user traffic, yet fail to trigger a scale-out because the diluted cluster average incorrectly signals that the system is underutilized.
-
-**Example:**
-- `min-instances=10`, Session Affinity enabled
-- 1 instance handling 100% of traffic (due to sticky sessions from single client)
-- That instance at 95% CPU saturation
-- Other 9 instances idle at ~1% CPU
-- **Cluster average: ~10.4% CPU** → No scale-out triggered (target is 60%)
-
-**Mitigations:**
-1. Lower the `concurrency` limit to force spillover to new instances
-2. Reduce `min-instances` to unmask true load metrics
-3. Use multiple client IPs for load testing (different IPs = different sticky targets)
-4. Monitor per-instance metrics, not just cluster averages
+**For load testing:** Use multiple simulated users with different cookies (this tool does this) to distribute load across instances realistically.
 
 ### Known Bottlenecks
 
@@ -349,7 +336,7 @@ sudo ./tools/loadtest/flamegraph.sh --duration 30
 | **DB query per request** | High latency, low CPU | Add caching layer |
 | **Uncached extractor** | Middleware runs on every request | Cache in global state |
 | **Blocking in async** | Low throughput, thread starvation | Use `spawn_blocking` |
-| **Lock contention** | High CPU, low throughput | Use lock-free structures (dashmap, Moka) |
+| **Lock contention** | High CPU, low throughput | Use lock-free structures (dashmap, concurrent caches) |
 | **Serialization overhead** | High CPU in serde | Use zero-copy or pre-serialize |
 
 ## Development
