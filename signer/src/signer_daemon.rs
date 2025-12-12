@@ -328,7 +328,7 @@ pub struct UnifiedSigner {
     key_manager: Arc<Box<dyn KeyManager>>,
     coordinator: Arc<ClusterCoordinator>,
     auth_rx: Option<AuthorizationReceiver>,
-    rpc_sender: Option<crate::work_queue::RpcSender>,
+    relay_sender: Option<crate::work_queue::RelaySender>,
 }
 
 impl UnifiedSigner {
@@ -358,7 +358,7 @@ impl UnifiedSigner {
             key_manager: Arc::new(key_manager),
             coordinator,
             auth_rx: Some(auth_rx),
-            rpc_sender: None,
+            relay_sender: None,
         })
     }
 
@@ -386,10 +386,10 @@ impl UnifiedSigner {
         self.coordinator.clone()
     }
 
-    /// Set the RPC sender for queue-based processing
-    /// When set, incoming NIP-46 requests are sent to the queue instead of spawning tasks
-    pub fn set_rpc_sender(&mut self, sender: crate::work_queue::RpcSender) {
-        self.rpc_sender = Some(sender);
+    /// Set the relay sender for queue-based processing
+    /// When set, incoming NIP-46 relay requests are sent to the queue instead of spawning tasks
+    pub fn set_relay_sender(&mut self, sender: crate::work_queue::RelaySender) {
+        self.relay_sender = Some(sender);
     }
 
     /// No-op: authorizations are now loaded on-demand with LRU caching
@@ -539,7 +539,7 @@ impl UnifiedSigner {
         let pool = self.pool.clone();
         let key_manager = self.key_manager.clone();
         let coordinator = self.coordinator.clone();
-        let rpc_sender = self.rpc_sender.clone();
+        let relay_sender = self.relay_sender.clone();
 
         self.client
             .handle_notifications(|notification| async {
@@ -553,8 +553,8 @@ impl UnifiedSigner {
                             .and_then(|tag| tag.content())
                             .map(|s| s.to_string());
 
-                        if let Some(ref sender) = rpc_sender {
-                            // QUEUE-BASED PROCESSING: Send to RPC queue for bounded concurrency
+                        if let Some(ref sender) = relay_sender {
+                            // QUEUE-BASED PROCESSING: Send to relay queue for bounded concurrency
                             if let Some(bunker_pubkey) = bunker_pubkey {
                                 let item = crate::work_queue::Nip46RpcItem {
                                     event,

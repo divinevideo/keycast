@@ -19,7 +19,7 @@ use keycast_core::database::Database;
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::gcp_key_manager::GcpKeyManager;
 use keycast_core::encryption::KeyManager;
-use keycast_signer::{RpcQueue, UnifiedSigner};
+use keycast_signer::{RelayQueue, UnifiedSigner};
 use moka::future::Cache;
 use nostr_sdk::Keys;
 use std::env;
@@ -314,20 +314,20 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     signer.load_authorizations().await?;
     // Note: connect_to_relays() moved to signer daemon task to allow HTTP server to bind faster
 
-    // Create RPC queue for bounded concurrency on NIP-46 requests
-    // Workers process sign/encrypt/decrypt operations with backpressure
-    let rpc_queue = RpcQueue::new();
-    let rpc_sender = rpc_queue.sender();
-    signer.set_rpc_sender(rpc_sender);
+    // Create relay queue for bounded concurrency on NIP-46 relay requests
+    // Queue (4096) buffers relay events; workers control processing rate
+    let relay_queue = RelayQueue::new();
+    let relay_sender = relay_queue.sender();
+    signer.set_relay_sender(relay_sender);
 
-    // Spawn RPC workers - more than CPUs to handle I/O-bound operations
-    // Default: 2x CPUs (min 8) to avoid starvation when workers wait on DB/network
-    // Can override with RPC_WORKER_COUNT env var
-    let num_workers = std::env::var("RPC_WORKER_COUNT")
+    // Spawn relay workers for NIP-46 request processing
+    // Worker count balances throughput vs CPU contention with HTTP RPC
+    // Can override with RELAY_WORKER_COUNT env var
+    let num_workers = std::env::var("RELAY_WORKER_COUNT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| num_cpus::get().max(4) * 2);
-    let _rpc_worker_handles = rpc_queue.spawn_workers(
+    let _relay_worker_handles = relay_queue.spawn_workers(
         num_workers,
         signer.handlers(),
         signer.client(),
@@ -336,7 +336,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         signer.coordinator(),
     );
     tracing::info!(
-        "✔︎ Signer daemon initialized (Tokio workers: {}, RPC tasks: {}, queue: 4096)",
+        "✔︎ Signer daemon initialized (Tokio workers: {}, relay workers: {}, queue: 4096)",
         worker_threads,
         num_workers
     );
@@ -604,7 +604,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     println!("   API: http://0.0.0.0:{}", api_port);
     println!("   Signer: NIP-46 relay listener active");
     println!(
-        "   Tokio workers: {}, RPC tasks: {} (queue: 4096)",
+        "   Tokio workers: {}, relay workers: {} (queue: 4096)",
         worker_threads, num_workers
     );
     println!(

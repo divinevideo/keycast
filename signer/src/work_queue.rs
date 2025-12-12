@@ -1,5 +1,5 @@
 // ABOUTME: Work queue infrastructure for bounded concurrency and future batch verification
-// ABOUTME: Two-queue architecture: VerifyQueue (stub for batching) + RpcQueue (bounded workers)
+// ABOUTME: Two-queue architecture: VerifyQueue (stub for batching) + RelayQueue (bounded workers)
 
 use crate::error::{SignerError, SignerResult};
 use crate::signer_daemon::Nip46Handler;
@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 const QUEUE_CAPACITY: usize = 4096;
 
-/// NIP-46 request item for the RPC queue
+/// NIP-46 request item for the relay queue
 /// Contains all data needed to process a single NIP-46 request
 pub struct Nip46RpcItem {
     /// The original NIP-46 event from the relay
@@ -23,33 +23,33 @@ pub struct Nip46RpcItem {
     pub bunker_pubkey: String,
 }
 
-/// RPC Queue for bounded concurrency on sign/encrypt/decrypt operations
+/// Relay queue for bounded concurrency on NIP-46 sign/encrypt/decrypt operations
 ///
 /// Provides backpressure when the system is overloaded by using a bounded channel.
-/// Workers process items one at a time, using spawn_blocking for CPU-bound crypto.
-pub struct RpcQueue {
+/// Queue (4096) buffers relay events; workers control processing rate.
+pub struct RelayQueue {
     tx: Sender<Nip46RpcItem>,
     rx: Receiver<Nip46RpcItem>,
 }
 
-impl RpcQueue {
-    /// Create a new RPC queue with bounded capacity
+impl RelayQueue {
+    /// Create a new relay queue with bounded capacity
     pub fn new() -> Self {
         let (tx, rx) = bounded(QUEUE_CAPACITY);
         Self { tx, rx }
     }
 
     /// Get a sender handle for enqueueing items
-    pub fn sender(&self) -> RpcSender {
-        RpcSender {
+    pub fn sender(&self) -> RelaySender {
+        RelaySender {
             tx: self.tx.clone(),
         }
     }
 
-    /// Spawn RPC workers (one per CPU core)
+    /// Spawn relay workers for NIP-46 request processing
     ///
+    /// Worker count balances throughput vs CPU contention with HTTP RPC.
     /// Workers block on the channel and process items sequentially.
-    /// CPU-bound crypto operations use spawn_blocking to avoid starving the async runtime.
     pub fn spawn_workers(
         &self,
         num_workers: usize,
@@ -60,7 +60,7 @@ impl RpcQueue {
         coordinator: Arc<ClusterCoordinator>,
     ) -> Vec<tokio::task::JoinHandle<()>> {
         tracing::info!(
-            "Spawning {} RPC workers (queue capacity: {})",
+            "Spawning {} relay workers (queue capacity: {})",
             num_workers,
             QUEUE_CAPACITY
         );
@@ -75,7 +75,7 @@ impl RpcQueue {
                 let coordinator = coordinator.clone();
 
                 tokio::spawn(async move {
-                    rpc_worker_loop(
+                    relay_worker_loop(
                         worker_id,
                         rx,
                         handlers,
@@ -91,29 +91,29 @@ impl RpcQueue {
     }
 }
 
-impl Default for RpcQueue {
+impl Default for RelayQueue {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// Sender handle for the RPC queue
+/// Sender handle for the relay queue
 #[derive(Clone)]
-pub struct RpcSender {
+pub struct RelaySender {
     tx: Sender<Nip46RpcItem>,
 }
 
-impl RpcSender {
+impl RelaySender {
     /// Try to send an item to the queue
     /// Returns error if queue is full (backpressure)
-    pub fn try_send(&self, item: Nip46RpcItem) -> Result<(), RpcQueueError> {
+    pub fn try_send(&self, item: Nip46RpcItem) -> Result<(), RelayQueueError> {
         match self.tx.try_send(item) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
                 METRICS.inc_queue_dropped();
-                Err(RpcQueueError::QueueFull)
+                Err(RelayQueueError::QueueFull)
             }
-            Err(TrySendError::Disconnected(_)) => Err(RpcQueueError::Disconnected),
+            Err(TrySendError::Disconnected(_)) => Err(RelayQueueError::Disconnected),
         }
     }
 
@@ -128,17 +128,17 @@ impl RpcSender {
     }
 }
 
-/// Errors from RPC queue operations
+/// Errors from relay queue operations
 #[derive(Debug, thiserror::Error)]
-pub enum RpcQueueError {
-    #[error("RPC queue is full - system overloaded")]
+pub enum RelayQueueError {
+    #[error("Relay queue is full - system overloaded")]
     QueueFull,
-    #[error("RPC queue disconnected")]
+    #[error("Relay queue disconnected")]
     Disconnected,
 }
 
-/// Worker loop that processes RPC items from the queue
-async fn rpc_worker_loop(
+/// Worker loop that processes NIP-46 items from the relay queue
+async fn relay_worker_loop(
     worker_id: usize,
     rx: Receiver<Nip46RpcItem>,
     handlers: Cache<String, Nip46Handler>,
@@ -147,7 +147,7 @@ async fn rpc_worker_loop(
     key_manager: Arc<Box<dyn KeyManager>>,
     coordinator: Arc<ClusterCoordinator>,
 ) {
-    tracing::debug!("RPC worker {} started", worker_id);
+    tracing::debug!("Relay worker {} started", worker_id);
 
     loop {
         // Block on receiving next item (in spawn_blocking to not block async runtime)
@@ -157,11 +157,11 @@ async fn rpc_worker_loop(
                 Ok(Ok(item)) => item,
                 Ok(Err(_)) => {
                     // Channel disconnected - shutdown
-                    tracing::info!("RPC worker {} shutting down (channel closed)", worker_id);
+                    tracing::info!("Relay worker {} shutting down (channel closed)", worker_id);
                     break;
                 }
                 Err(e) => {
-                    tracing::error!("RPC worker {} spawn_blocking panicked: {}", worker_id, e);
+                    tracing::error!("Relay worker {} spawn_blocking panicked: {}", worker_id, e);
                     continue;
                 }
             }
@@ -183,7 +183,7 @@ async fn rpc_worker_loop(
         }
     }
 
-    tracing::debug!("RPC worker {} exited", worker_id);
+    tracing::debug!("Relay worker {} exited", worker_id);
 }
 
 /// Process a single NIP-46 RPC item
@@ -249,15 +249,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_rpc_queue_creation() {
-        let queue = RpcQueue::new();
+    fn test_relay_queue_creation() {
+        let queue = RelayQueue::new();
         let sender = queue.sender();
         assert!(sender.is_empty());
     }
 
     #[test]
-    fn test_rpc_sender_clone() {
-        let queue = RpcQueue::new();
+    fn test_relay_sender_clone() {
+        let queue = RelayQueue::new();
         let sender1 = queue.sender();
         let sender2 = sender1.clone();
 
