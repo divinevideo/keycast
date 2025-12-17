@@ -1,0 +1,131 @@
+# ABOUTME: GitHub Actions workflow for building, testing, and pushing Docker images to GCP Artifact Registry
+# ABOUTME: Uses Workload Identity Federation for secure keyless authentication with GCP
+#
+# Required GitHub Secrets:
+#   - GCP_PROJECT_ID: GCP project ID
+#   - GCP_PROJECT_NUMBER: GCP project number (numeric)
+#   - GCP_SERVICE_ACCOUNT: Service account email for Workload Identity
+#   - GCP_WORKLOAD_IDENTITY_POOL: Workload Identity pool name
+#   - GCP_WORKLOAD_IDENTITY_PROVIDER: Workload Identity provider name
+#   - GCP_ARTIFACT_REGISTRY: Artifact Registry hostname (e.g., us-central1-docker.pkg.dev)
+#   - GCP_ARTIFACT_REPOSITORY: Repository path within project (e.g., docker/keycast)
+#   - VITE_DOMAIN: Domain for the web frontend (e.g., https://example.com)
+#   - VITE_ALLOWED_PUBKEYS: Comma-separated admin pubkeys for the web frontend
+
+name: Build, Test & Push
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: keycast_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy, rustfmt
+
+      - name: Setup test environment
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/keycast_test
+          PGPASSWORD: postgres
+        run: |
+          # Generate master key
+          chmod +x scripts/generate_key.sh
+          ./scripts/generate_key.sh
+
+          # Run migrations
+          cargo install sqlx-cli --no-default-features --features postgres
+          sqlx migrate run --database-url $DATABASE_URL --source database/migrations
+
+      - name: Run tests
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/keycast_test
+          REDIS_URL: redis://localhost:6379
+        run: cargo test --workspace --verbose
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings -A deprecated
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  build-push:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # Required for Workload Identity Federation
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Authenticate to GCP
+        id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ secrets.GCP_WORKLOAD_IDENTITY_POOL }}/providers/${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ secrets.GCP_ARTIFACT_REGISTRY }} --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Determine image tags
+        id: tags
+        run: |
+          FULL_IMAGE="${{ secrets.GCP_ARTIFACT_REGISTRY }}/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.GCP_ARTIFACT_REPOSITORY }}"
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            echo "tags=${FULL_IMAGE}:pr-${{ github.event.pull_request.number }}-ci" >> $GITHUB_OUTPUT
+          else
+            echo "tags=${FULL_IMAGE}:latest,${FULL_IMAGE}:${{ github.sha }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            BUILD_VERSION=${{ github.sha }}
+            VITE_DOMAIN=${{ secrets.VITE_DOMAIN }}
+            VITE_ALLOWED_PUBKEYS=${{ secrets.VITE_ALLOWED_PUBKEYS }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
