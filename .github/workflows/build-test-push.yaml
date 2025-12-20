@@ -1,7 +1,7 @@
 # ABOUTME: GitHub Actions workflow for building, testing, and pushing Docker images to GCP Artifact Registry
 # ABOUTME: Uses Workload Identity Federation for secure keyless authentication with GCP
 #
-# Required GitHub Secrets:
+# Required GitHub Secrets (configured in 'poc' environment):
 #   - GCP_PROJECT_ID: GCP project ID
 #   - GCP_PROJECT_NUMBER: GCP project number (numeric)
 #   - GCP_SERVICE_ACCOUNT: Service account email for Workload Identity
@@ -11,6 +11,9 @@
 #   - GCP_ARTIFACT_REPOSITORY: Repository path within project (e.g., docker/keycast)
 #   - VITE_DOMAIN: Domain for the web frontend (e.g., https://example.com)
 #   - VITE_ALLOWED_PUBKEYS: Comma-separated admin pubkeys for the web frontend
+#
+# Note: Secrets are pulled from the 'poc' GitHub environment. Configure these at:
+#   Settings → Environments → poc → Secrets and variables
 
 name: Build, Test & Push
 
@@ -87,6 +90,7 @@ jobs:
   build-push:
     needs: test
     runs-on: ubuntu-latest
+    environment: poc  # Use 'poc' environment secrets
     permissions:
       contents: read
       id-token: write  # Required for Workload Identity Federation
