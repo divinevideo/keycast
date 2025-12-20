@@ -55,12 +55,12 @@ impl Tenant {
         }
     }
 
-    /// Get relay URL with fallback to default
+    /// Get relay URL with fallback to first BUNKER_RELAYS entry
     pub fn relay_url(&self) -> String {
         self.get_settings()
             .ok()
             .and_then(|s| s.relay)
-            .unwrap_or_else(|| "wss://relay.damus.io".to_string())
+            .unwrap_or_else(get_default_relay)
     }
 
     /// Get email from address with fallback
@@ -286,15 +286,33 @@ fn validate_domain(domain: &str) -> Result<(), TenantError> {
     Ok(())
 }
 
+/// Get default relay URL from BUNKER_RELAYS environment variable
+fn get_default_relay() -> String {
+    std::env::var("BUNKER_RELAYS")
+        .ok()
+        .and_then(|relays| {
+            relays
+                .split(',')
+                .map(|s| s.trim())
+                .find(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "wss://relay.damus.io".to_string())
+}
+
 /// Create default tenant settings JSON
 fn get_default_settings(domain: &str) -> String {
+    let default_relay = get_default_relay();
     let settings = TenantSettings {
-        relay: Some("wss://relay.damus.io".to_string()),
+        relay: Some(default_relay.clone()),
         email_from: Some(format!("noreply@{}", domain)),
     };
 
     serde_json::to_string(&settings).unwrap_or_else(|_| {
-        r#"{"relay":"wss://relay.damus.io","auto_provisioned":true}"#.to_string()
+        format!(
+            r#"{{"relay":"{}","email_from":"noreply@{}"}}"#,
+            default_relay, domain
+        )
     })
 }
 
@@ -394,8 +412,13 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_tenant_relay_url_fallback() {
         use chrono::Utc;
+
+        // Clear any existing BUNKER_RELAYS to test default fallback
+        std::env::remove_var("BUNKER_RELAYS");
+
         let tenant = Tenant {
             id: 1,
             domain: "test.com".to_string(),
@@ -405,7 +428,31 @@ mod tests {
             updated_at: Utc::now(),
         };
 
+        // Without BUNKER_RELAYS, should fall back to relay.damus.io
         assert_eq!(tenant.relay_url(), "wss://relay.damus.io");
+    }
+
+    #[test]
+    #[serial]
+    fn test_tenant_relay_url_from_bunker_relays_env() {
+        use chrono::Utc;
+
+        // Set BUNKER_RELAYS - should use first relay
+        std::env::set_var("BUNKER_RELAYS", "wss://relay1.example.com,wss://relay2.example.com");
+
+        let tenant = Tenant {
+            id: 1,
+            domain: "test.com".to_string(),
+            name: "Test".to_string(),
+            settings: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        assert_eq!(tenant.relay_url(), "wss://relay1.example.com");
+
+        // Clean up
+        std::env::remove_var("BUNKER_RELAYS");
     }
 
     #[test]
