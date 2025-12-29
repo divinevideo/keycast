@@ -11,8 +11,7 @@ use bcrypt::verify;
 use chrono::{Duration, Utc};
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
-    OAuthCodeRepository, PolicyRepository, StoreOAuthCodeWithRegistrationParams,
-    UserRepository,
+    OAuthCodeRepository, PolicyRepository, StoreOAuthCodeWithRegistrationParams, UserRepository,
 };
 use nostr_sdk::Keys;
 use rand::Rng;
@@ -60,9 +59,9 @@ pub struct HeadlessRegisterResponse {
 }
 
 /// POST /api/headless/register
-/// 
+///
 /// Register a new user without web UI. Returns device_code for email verification polling.
-/// 
+///
 /// Flow:
 /// 1. Client calls this endpoint with email/password
 /// 2. Server sends verification email, returns device_code
@@ -94,11 +93,12 @@ pub async fn headless_register(
     if scope.starts_with("policy:") {
         let policy_slug = parse_policy_scope(scope)
             .map_err(|e| HeadlessError::InvalidRequest(format!("{:?}", e)))?;
-        
+
         // Verify policy exists
         let policy_repo = PolicyRepository::new(pool.clone());
-        policy_repo.find_by_slug(&policy_slug).await
-            .map_err(|_| HeadlessError::InvalidRequest(format!("Unknown policy '{}'", policy_slug)))?;
+        policy_repo.find_by_slug(&policy_slug).await.map_err(|_| {
+            HeadlessError::InvalidRequest(format!("Unknown policy '{}'", policy_slug))
+        })?;
     }
 
     // Use provided nsec or generate new Nostr keypair
@@ -114,7 +114,10 @@ pub async fn headless_register(
             ))
         })?
     } else {
-        tracing::info!("Headless registration: auto-generating new keypair for email: {}", req.email);
+        tracing::info!(
+            "Headless registration: auto-generating new keypair for email: {}",
+            req.email
+        );
         Keys::generate()
     };
 
@@ -133,7 +136,11 @@ pub async fn headless_register(
 
     // Check if email is already registered
     let user_repo = UserRepository::new(pool.clone());
-    if user_repo.find_pubkey_by_email(&req.email, tenant_id).await?.is_some() {
+    if user_repo
+        .find_pubkey_by_email(&req.email, tenant_id)
+        .await?
+        .is_some()
+    {
         return Err(HeadlessError::Conflict(
             "This email is already registered. Please log in instead.".to_string(),
         ));
@@ -158,10 +165,11 @@ pub async fn headless_register(
 
     // Hash password synchronously (headless flow can tolerate latency)
     let password = req.password.clone();
-    let password_hash = tokio::task::spawn_blocking(move || bcrypt::hash(&password, bcrypt::DEFAULT_COST))
-        .await
-        .map_err(|e| HeadlessError::Internal(format!("Task join error: {}", e)))?
-        .map_err(|e| HeadlessError::Internal(format!("Password hash error: {}", e)))?;
+    let password_hash =
+        tokio::task::spawn_blocking(move || bcrypt::hash(&password, bcrypt::DEFAULT_COST))
+            .await
+            .map_err(|e| HeadlessError::Internal(format!("Task join error: {}", e)))?
+            .map_err(|e| HeadlessError::Internal(format!("Password hash error: {}", e)))?;
 
     // Generate placeholder authorization code (will be replaced after email verification)
     let placeholder_code: String = rand::thread_rng()
@@ -268,9 +276,9 @@ pub struct HeadlessLoginResponse {
 }
 
 /// POST /api/headless/login
-/// 
+///
 /// Login and get authorization code in one step (no approval screen needed).
-/// 
+///
 /// Flow:
 /// 1. Client calls this with email/password + PKCE
 /// 2. Server validates credentials, returns authorization code
@@ -421,10 +429,10 @@ pub struct HeadlessAuthorizeResponse {
 }
 
 /// POST /api/headless/authorize
-/// 
+///
 /// Generate authorization code for an already-authenticated user.
 /// Requires Bearer token (from previous login) in Authorization header.
-/// 
+///
 /// This is for apps that want to create additional authorizations
 /// (e.g., connecting a second app to the same account).
 pub async fn headless_authorize(
@@ -499,7 +507,10 @@ pub enum HeadlessError {
     InvalidRequest(String),
     Conflict(String),
     Internal(String),
-    ServiceUnavailable { message: String, retry_after: Option<u32> },
+    ServiceUnavailable {
+        message: String,
+        retry_after: Option<u32>,
+    },
 }
 
 impl IntoResponse for HeadlessError {
@@ -515,16 +526,8 @@ impl IntoResponse for HeadlessError {
                 "Please verify your email address before signing in".to_string(),
                 "EMAIL_NOT_VERIFIED",
             ),
-            HeadlessError::InvalidRequest(msg) => (
-                StatusCode::BAD_REQUEST,
-                msg,
-                "INVALID_REQUEST",
-            ),
-            HeadlessError::Conflict(msg) => (
-                StatusCode::CONFLICT,
-                msg,
-                "CONFLICT",
-            ),
+            HeadlessError::InvalidRequest(msg) => (StatusCode::BAD_REQUEST, msg, "INVALID_REQUEST"),
+            HeadlessError::Conflict(msg) => (StatusCode::CONFLICT, msg, "CONFLICT"),
             HeadlessError::Internal(msg) => {
                 tracing::error!("Headless internal error: {}", msg);
                 (
@@ -533,29 +536,36 @@ impl IntoResponse for HeadlessError {
                     "INTERNAL_ERROR",
                 )
             }
-            HeadlessError::ServiceUnavailable { message, retry_after } => {
+            HeadlessError::ServiceUnavailable {
+                message,
+                retry_after,
+            } => {
                 let mut response = (
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(serde_json::json!({
                         "error": message,
                         "code": "SERVICE_UNAVAILABLE"
                     })),
-                ).into_response();
-                
+                )
+                    .into_response();
+
                 if let Some(seconds) = retry_after {
-                    response.headers_mut().insert(
-                        "Retry-After",
-                        seconds.to_string().parse().unwrap(),
-                    );
+                    response
+                        .headers_mut()
+                        .insert("Retry-After", seconds.to_string().parse().unwrap());
                 }
                 return response;
             }
         };
 
-        (status, Json(serde_json::json!({
-            "error": message,
-            "code": code
-        }))).into_response()
+        (
+            status,
+            Json(serde_json::json!({
+                "error": message,
+                "code": code
+            })),
+        )
+            .into_response()
     }
 }
 
@@ -569,7 +579,9 @@ impl From<keycast_core::repositories::RepositoryError> for HeadlessError {
     fn from(e: keycast_core::repositories::RepositoryError) -> Self {
         use keycast_core::repositories::RepositoryError;
         match e {
-            RepositoryError::Duplicate => HeadlessError::Conflict("Resource already exists".to_string()),
+            RepositoryError::Duplicate => {
+                HeadlessError::Conflict("Resource already exists".to_string())
+            }
             RepositoryError::NotFound(msg) => HeadlessError::InvalidRequest(msg),
             _ => HeadlessError::Internal(e.to_string()),
         }
