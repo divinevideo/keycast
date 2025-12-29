@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod headless;
 pub mod metrics;
 pub mod nostr_rpc;
 pub mod oauth;
