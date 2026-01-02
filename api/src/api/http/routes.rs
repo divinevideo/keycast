@@ -133,12 +133,12 @@ pub fn api_routes(
         .with_state(pool.clone());
 
     // Headless auth routes (for native mobile apps like Flutter)
-    // Public CORS - these are for third-party apps that handle their own UI
+    // Restricted CORS - first-party only, these endpoints accept passwords
     let headless_routes = Router::new()
         .route("/headless/register", post(headless::headless_register))
         .route("/headless/login", post(headless::headless_login))
         .route("/headless/authorize", post(headless::headless_authorize))
-        .layer(public_cors.clone())
+        .layer(auth_cors.clone())
         .with_state(auth_state.clone());
 
     // Prometheus metrics endpoint (public, no auth required)
@@ -193,7 +193,7 @@ pub fn api_routes(
         .merge(team_routes.layer(auth_cors.clone())) // Team routes need credentials
         .merge(discovery_route.layer(public_cors.clone()))
         .merge(policy_routes.layer(public_cors.clone())) // Public - available to third-party OAuth apps
-        .merge(headless_routes) // Headless auth for native mobile apps (already has public_cors)
+        .merge(headless_routes) // Headless auth for native mobile apps (has auth_cors - accepts passwords)
         .merge(metrics_route.layer(public_cors.clone())) // Public - Prometheus metrics
         .merge(docs_route.layer(public_cors))
 }
