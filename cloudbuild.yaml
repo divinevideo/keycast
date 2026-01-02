@@ -51,7 +51,7 @@ steps:
       - '--subnet=default'
       - '--vpc-egress=private-ranges-only'
       - '--set-secrets=DATABASE_URL=keycast-database-url:latest,SERVER_NSEC=keycast-ucan-secret:latest,SENDGRID_API_KEY=keycast-sendgrid-api-key:latest,REDIS_URL=keycast-redis-url:latest'
-      - '--set-env-vars=NODE_ENV=production,USE_GCP_KMS=true,GCP_PROJECT_ID=${PROJECT_ID},ALLOWED_ORIGINS=https://login.divine.video,https://divine.video,APP_URL=https://login.divine.video,FROM_EMAIL=noreply@divine.video,RUST_LOG=info,ENABLE_EXAMPLES=true,SQLX_STATEMENT_CACHE=100,SQLX_POOL_SIZE=50'
+      - '--set-env-vars=^;^NODE_ENV=production;USE_GCP_KMS=true;GCP_PROJECT_ID=${PROJECT_ID};ALLOWED_ORIGINS=https://login.divine.video,https://divine.video;APP_URL=https://login.divine.video;FROM_EMAIL=noreply@divine.video;RUST_LOG=info;ENABLE_EXAMPLES=true;SQLX_STATEMENT_CACHE=100;SQLX_POOL_SIZE=50'
 
   # Smoke tests - verify deployment
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
