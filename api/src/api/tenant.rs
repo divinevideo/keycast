@@ -438,7 +438,10 @@ mod tests {
         use chrono::Utc;
 
         // Set BUNKER_RELAYS - should use first relay
-        std::env::set_var("BUNKER_RELAYS", "wss://relay1.example.com,wss://relay2.example.com");
+        std::env::set_var(
+            "BUNKER_RELAYS",
+            "wss://relay1.example.com,wss://relay2.example.com",
+        );
 
         let tenant = Tenant {
             id: 1,
