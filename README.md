@@ -182,14 +182,51 @@ See [DEVELOPMENT.md](./docs/DEVELOPMENT.md) for local development setup.
 
 ### Environment Variables
 
+#### Required
+
 | Variable | Description |
 |----------|-------------|
 | `DATABASE_URL` | PostgreSQL connection string |
 | `SERVER_NSEC` | Server's Nostr secret key for signing tokens |
-| `ALLOWED_ORIGINS` | CORS origins (comma-separated) |
-| `BUNKER_RELAYS` | NIP-46 relay URLs |
 | `MASTER_KEY_PATH` | Path to encryption key file |
-| `USE_GCP_KMS` | Use GCP KMS instead of file-based key |
+
+#### Email (SendGrid)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SENDGRID_API_KEY` | *(none)* | If set, uses SendGrid; otherwise logs emails to console |
+| `FROM_EMAIL` | `noreply@keycast.app` | Sender email address |
+| `FROM_NAME` | `diVine` | Sender display name |
+| `BASE_URL` | `https://login.divine.video` | Base URL for email verification links |
+| `DISABLE_EMAILS` | *(none)* | If set (any value), skips sending emails |
+
+#### Authentication & OAuth
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TOKEN_EXPIRY_SECONDS` | `86400` (24 hours) | JWT token expiry |
+| `APP_URL` | `https://login.divine.video` | Fallback URL for OAuth callbacks |
+| `ALLOWED_PUBKEYS` | *(none)* | Comma-separated admin pubkeys whitelist |
+| `ALLOWED_ORIGINS` | *(none)* | CORS origins (comma-separated) |
+
+#### Multi-tenancy
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BUNKER_RELAYS` | `wss://relay.damus.io` | NIP-46 relay URLs (comma-separated, uses first) |
+| `ALLOWED_TENANT_DOMAINS` | *(none)* | If set, restricts auto-provisioning to these domains |
+
+#### Performance
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HANDLER_CACHE_SIZE` | `1000000` | Max entries in HTTP handler cache |
+
+#### Encryption
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `USE_GCP_KMS` | *(none)* | Use GCP KMS instead of file-based key |
 
 ## History & Team Key Management
 
