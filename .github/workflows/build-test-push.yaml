@@ -404,7 +404,7 @@ jobs:
           fi
           
           # Ensure at least POC is included
-          if [ -z "${{ steps.envs.outputs.environments }}" ]; then
+          if [ ${#ENVS[@]} -eq 0 ]; then
             echo "::error::No environments available for deployment. At least POC must be configured."
             exit 1
           fi
