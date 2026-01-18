@@ -194,7 +194,7 @@ Optional:
 - `REDIS_URL`: Redis connection string for cluster coordination (required in production)
 - `MASTER_KEY_PATH`: Path to master encryption key file (default: `./master.key`)
 - `USE_GCP_KMS`: Use Google Cloud KMS instead of file-based encryption (default: `false`)
-- `BUNKER_RELAYS`: Comma-separated relay URLs for NIP-46 communication (default: `wss://relay.divine.video,wss://relay.primal.net,wss://relay.nsec.app,wss://nos.lol`)
+- `BUNKER_RELAYS`: Comma-separated relay URLs for NIP-46 communication (required, no default)
 - `RUST_LOG`: Log level configuration (default: `info`)
 - `SQLX_POOL_SIZE`: Database connection pool size (should match Cloud Run concurrency, default: `50`)
 - `VITE_ALLOWED_PUBKEYS`: Comma-separated pubkeys for whitelist access (web frontend)

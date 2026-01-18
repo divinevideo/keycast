@@ -324,7 +324,7 @@ pub async fn claim_post(
     );
 
     let app_url =
-        std::env::var("APP_URL").unwrap_or_else(|_| "https://login.divine.video".to_string());
+        std::env::var("APP_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
 
     Ok((
         [

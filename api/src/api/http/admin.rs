@@ -334,7 +334,7 @@ pub async fn create_claim_token(
 
     // Build claim URL
     let app_url =
-        std::env::var("APP_URL").unwrap_or_else(|_| "https://login.divine.video".to_string());
+        std::env::var("APP_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
     let claim_url = format!("{}/api/claim?token={}", app_url, token);
 
     tracing::info!(

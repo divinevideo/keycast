@@ -1406,7 +1406,8 @@ pub async fn verify_email(
 
     // Extract redirect_origin from Origin header for UCAN
     let redirect_origin = extract_origin_from_headers(&headers)
-        .unwrap_or_else(|_| "https://login.divine.video".to_string());
+        .or_else(|_| std::env::var("APP_URL"))
+        .unwrap_or_else(|_| "http://localhost:3000".to_string());
 
     // Generate UCAN token for session cookie
     let ucan_token = generate_ucan_token(&keys, tenant_id, &email, &redirect_origin, None).await?;

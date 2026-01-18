@@ -18,15 +18,16 @@
 
   // Import keycast-login library
   import { createKeycastClient, KeycastRpc, generatePkce } from "keycast-login";
+  import { getViteDomain } from "$lib/utils/env";
 
   // Configuration
-  const SERVER_URL = import.meta.env.VITE_DOMAIN || "http://localhost:3000";
+  const SERVER_URL = getViteDomain();
   const CLIENT_ID = "diVine Login Demo";
   console.log(
     "SERVER_URL:",
     SERVER_URL,
     "VITE_DOMAIN:",
-    import.meta.env.VITE_DOMAIN,
+    getViteDomain(),
   );
 
   // Create Keycast client (initialized in onMount for SSR safety)
@@ -656,7 +657,7 @@
             >import {"{"} createKeycastClient {"}"} from 'keycast-login';
 
 const client = createKeycastClient({"{"}
-  serverUrl: 'https://login.divine.video',
+  serverUrl: '${SERVER_URL}',
   clientId: 'your-app',
   redirectUri: window.location.origin + '/callback',
 {"}"});
@@ -695,7 +696,7 @@ const rpc = client.createRpc(tokens);
 // Or create directly
 import {"{"} KeycastRpc {"}"} from 'keycast-login';
 const rpc = new KeycastRpc({"{"}
-  nostrApi: 'https://login.divine.video/api/nostr',
+  nostrApi: '${SERVER_URL}/api/nostr',
   accessToken: tokens.access_token,
 {"}"});
 

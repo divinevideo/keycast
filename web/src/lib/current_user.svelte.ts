@@ -1,5 +1,5 @@
 import ndk from "$lib/ndk.svelte";
-import type { NDKRelay, NDKUser } from "@nostr-dev-kit/ndk";
+import type { NDKUser } from "@nostr-dev-kit/ndk";
 
 let currentUser: CurrentUser | null = $state(null);
 
@@ -29,26 +29,6 @@ class CurrentUser {
             return follows;
         }
         return Promise.resolve([]);
-    }
-
-    async follow(user: NDKUser): Promise<boolean> {
-        if (!this.user) return false;
-        const result = await this.user.follow(user);
-        if (result) {
-            this.follows = [...this.follows, user.pubkey];
-        }
-        return result;
-    }
-
-    async unfollow(user: NDKUser): Promise<boolean | Set<NDKRelay>> {
-        if (!this.user) return false;
-        const result = await this.user.unfollow(user);
-        if (result) {
-            this.follows = this.follows.filter(
-                (pubkey) => pubkey !== user.pubkey,
-            );
-        }
-        return result;
     }
 }
 

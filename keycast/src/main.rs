@@ -36,9 +36,70 @@ use tracing::Level;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use uuid::Uuid;
 use zeroize::Zeroizing;
+use serde_json::json;
 
 async fn health_check() -> impl IntoResponse {
     StatusCode::OK
+}
+
+/// Inject runtime environment variables into HTML via window.__ENV__
+/// Injects a <script> tag before </head> with runtime config
+fn inject_runtime_env(html: &str) -> String {
+    // Build runtime environment object
+    let mut env_obj = json!({});
+    
+    // VITE_DOMAIN - API domain for frontend
+    if let Ok(domain) = env::var("VITE_DOMAIN") {
+        env_obj["VITE_DOMAIN"] = json!(domain);
+    }
+    
+    // VITE_ALLOWED_PUBKEYS - comma-separated admin pubkeys
+    if let Ok(pubkeys) = env::var("VITE_ALLOWED_PUBKEYS") {
+        env_obj["VITE_ALLOWED_PUBKEYS"] = json!(pubkeys);
+    }
+    
+    // VITE_NDK_EXPLICIT_RELAYS - comma-separated relay URLs for reading/subscribing (optional)
+    if let Ok(relays) = env::var("VITE_NDK_EXPLICIT_RELAYS") {
+        env_obj["VITE_NDK_EXPLICIT_RELAYS"] = json!(relays);
+    }
+    
+    // VITE_NDK_BUNKER_RELAYS - comma-separated relay URLs for bunker NDK (optional)
+    if let Ok(relays) = env::var("VITE_NDK_BUNKER_RELAYS") {
+        env_obj["VITE_NDK_BUNKER_RELAYS"] = json!(relays);
+    }
+    
+    // If no env vars to inject, return original HTML
+    if env_obj.as_object().map_or(true, |o| o.is_empty()) {
+        return html.to_string();
+    }
+    
+    // Serialize to JSON (serde_json properly escapes)
+    let env_json = serde_json::to_string(&env_obj).unwrap_or_else(|_| "{}".to_string());
+    
+    // Create injection script
+    let injection_script = format!(
+        r#"<script>window.__ENV__={};</script>"#,
+        env_json
+    );
+    
+    // Inject before </head> tag, or at the beginning if no </head> found
+    if let Some(head_end_pos) = html.rfind("</head>") {
+        let mut injected = html[..head_end_pos].to_string();
+        injected.push_str(&injection_script);
+        injected.push_str("\n");
+        injected.push_str(&html[head_end_pos..]);
+        injected
+    } else if let Some(body_start_pos) = html.find("<body>") {
+        // Fallback: inject before <body> if no </head>
+        let mut injected = html[..body_start_pos].to_string();
+        injected.push_str(&injection_script);
+        injected.push_str("\n");
+        injected.push_str(&html[body_start_pos..]);
+        injected
+    } else {
+        // Last resort: prepend to HTML
+        format!("{}\n{}", injection_script, html)
+    }
 }
 
 /// Serve Apple App Site Association file with correct content type
@@ -536,12 +597,18 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     // SvelteKit frontend (fallback - catches all other routes)
     // SPA mode: serve index.html for all non-file routes
     let index_path = PathBuf::from(&web_build_dir).join("index.html");
+    let web_build_dir_for_injection = web_build_dir.clone();
     let app = app.fallback_service(ServeDir::new(&web_build_dir).fallback(axum::routing::get(
         move || {
             let index_path = index_path.clone();
+            let _web_build_dir = web_build_dir_for_injection.clone();
             async move {
                 match tokio::fs::read_to_string(&index_path).await {
-                    Ok(content) => Html(content).into_response(),
+                    Ok(content) => {
+                        // Inject runtime environment variables into HTML
+                        let injected_content = inject_runtime_env(&content);
+                        Html(injected_content).into_response()
+                    }
                     Err(_) => (StatusCode::NOT_FOUND, "Not found").into_response(),
                 }
             }

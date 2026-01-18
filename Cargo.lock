@@ -2659,6 +2659,7 @@ dependencies = [
  "nostr-sdk",
  "num_cpus",
  "redis",
+ "serde_json",
  "sqlx",
  "tokio",
  "tokio-util",

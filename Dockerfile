@@ -68,7 +68,7 @@ RUN if [ "$(uname -m)" = "aarch64" ]; then \
     fi
 
 # Generate SvelteKit configuration files (creates .svelte-kit directory)
-RUN svelte-kit sync
+RUN bunx svelte-kit sync
 
 # Build (skip check in Docker - runs locally, but symlink resolution issues in Docker)
 RUN bun run build

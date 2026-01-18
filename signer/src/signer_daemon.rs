@@ -580,17 +580,24 @@ impl UnifiedSigner {
     }
 
     /// Get the configured bunker relay list
+    /// 
+    /// Requires BUNKER_RELAYS environment variable to be set.
+    /// Panics if not configured - relay connections must be explicit.
     pub fn get_bunker_relays() -> Vec<String> {
-        let relays_str = std::env::var("BUNKER_RELAYS").unwrap_or_else(|_| {
-            "wss://relay.divine.video,wss://relay.primal.net,wss://relay.nsec.app,wss://nos.lol"
-                .to_string()
-        });
+        let relays_str = std::env::var("BUNKER_RELAYS")
+            .expect("BUNKER_RELAYS environment variable is required");
 
-        relays_str
+        let relays: Vec<String> = relays_str
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-            .collect()
+            .collect();
+
+        if relays.is_empty() {
+            panic!("BUNKER_RELAYS must contain at least one relay URL");
+        }
+
+        relays
     }
 
     /// Run the signer daemon event loop.

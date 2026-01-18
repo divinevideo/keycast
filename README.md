@@ -213,7 +213,7 @@ See [DEVELOPMENT.md](./docs/DEVELOPMENT.md) for local development setup.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BUNKER_RELAYS` | `wss://relay.damus.io` | NIP-46 relay URLs (comma-separated, uses first) |
+| `BUNKER_RELAYS` | *(required)* | NIP-46 relay URLs (comma-separated) |
 | `ALLOWED_TENANT_DOMAINS` | *(none)* | If set, restricts auto-provisioning to these domains |
 
 #### Performance

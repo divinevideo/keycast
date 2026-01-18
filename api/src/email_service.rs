@@ -211,7 +211,7 @@ impl SendGridEmailSender {
             env::var("FROM_EMAIL").unwrap_or_else(|_| "noreply@keycast.app".to_string());
         let from_name = env::var("FROM_NAME").unwrap_or_else(|_| "diVine".to_string());
         let base_url =
-            env::var("BASE_URL").unwrap_or_else(|_| "https://login.divine.video".to_string());
+            env::var("BASE_URL").unwrap_or_else(|_| "http://localhost:5173".to_string());
 
         tracing::info!("Email service initialized with SendGrid");
 

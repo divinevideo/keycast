@@ -1,4 +1,5 @@
 import { getContext, setContext } from "svelte";
+import { getViteDomain } from "$lib/utils/env";
 
 export class ApiError extends Error {
     status: number;
@@ -14,8 +15,7 @@ export class KeycastApi {
     private defaultHeaders: HeadersInit;
 
     constructor() {
-        const apiDomain =
-            import.meta.env.VITE_DOMAIN || "http://localhost:3000";
+        const apiDomain = getViteDomain();
         const domain = apiDomain.startsWith("http")
             ? apiDomain
             : `https://${apiDomain}`;

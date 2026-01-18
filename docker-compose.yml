@@ -65,9 +65,6 @@ services:
     container_name: keycast-unified
     build:
       context: .
-      args:
-        - VITE_DOMAIN=${DOMAIN:?error}
-        - VITE_ALLOWED_PUBKEYS=${ALLOWED_PUBKEYS}
     command: unified
     ports:
       - "3000:3000"
@@ -79,7 +76,7 @@ services:
       RUST_LOG: ${RUST_LOG:-info,keycast_signer=debug}
       MASTER_KEY_PATH: /app/master.key
       USE_GCP_KMS: ${USE_GCP_KMS:-false}
-      BUNKER_RELAYS: ${BUNKER_RELAYS:-wss://relay.divine.video,wss://relay.primal.net,wss://relay.nsec.app,wss://nos.lol}
+      BUNKER_RELAYS: ${BUNKER_RELAYS:?error}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?error}
       WEB_BUILD_DIR: /app/web
       SERVER_NSEC: ${SERVER_NSEC:?error}
@@ -104,6 +101,11 @@ services:
       GCP_KMS_LOCATION: ${GCP_KMS_LOCATION:-}
       GCP_KMS_KEY_RING: ${GCP_KMS_KEY_RING:-}
       GCP_KMS_KEY_NAME: ${GCP_KMS_KEY_NAME:-}
+      # Frontend runtime configuration (injected into HTML)
+      VITE_DOMAIN: ${VITE_DOMAIN:-https://${DOMAIN:?error}}
+      VITE_ALLOWED_PUBKEYS: ${VITE_ALLOWED_PUBKEYS:-}
+      VITE_NDK_EXPLICIT_RELAYS: ${VITE_NDK_EXPLICIT_RELAYS:-}
+      VITE_NDK_BUNKER_RELAYS: ${VITE_NDK_BUNKER_RELAYS:-}
     depends_on:
       postgres:
         condition: service_healthy

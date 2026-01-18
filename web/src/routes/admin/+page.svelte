@@ -5,10 +5,12 @@
 	import { toast } from 'svelte-hot-french-toast';
 	import { goto } from '$app/navigation';
 	import { Copy, Check, Key, Terminal, Users, Link, Warning, ArrowSquareOut } from 'phosphor-svelte';
+	import { getViteDomain } from '$lib/utils/env';
 
 	const api = new KeycastApi();
 	const currentUser = $derived(getCurrentUser());
 	const user = $derived(currentUser?.user);
+	const serverUrl = getViteDomain();
 
 	// Admin status from API (single source of truth)
 	let isAdmin = $state<boolean | null>(null);
@@ -92,7 +94,7 @@
 	}
 
 	// Example code snippets
-	const preloadUserExample = `curl -X POST https://login.divine.video/api/admin/preload-user \\
+	const preloadUserExample = `curl -X POST ${serverUrl}/api/admin/preload-user \\
   -H "Authorization: Bearer \$ADMIN_TOKEN" \\
   -H "Content-Type: application/json" \\
   -d '{
@@ -101,7 +103,7 @@
     "display_name": "KingBach"
   }'`;
 
-	const signEventExample = `curl -X POST https://login.divine.video/api/nostr \\
+	const signEventExample = `curl -X POST ${serverUrl}/api/nostr \\
   -H "Authorization: Bearer \$USER_TOKEN" \\
   -H "Content-Type: application/json" \\
   -d '{
@@ -115,7 +117,7 @@
     }]
   }'`;
 
-	const claimTokenExample = `curl -X POST https://login.divine.video/api/admin/claim-tokens \\
+	const claimTokenExample = `curl -X POST ${serverUrl}/api/admin/claim-tokens \\
   -H "Authorization: Bearer \$ADMIN_TOKEN" \\
   -H "Content-Type: application/json" \\
   -d '{"vine_id": "12345678"}'`;

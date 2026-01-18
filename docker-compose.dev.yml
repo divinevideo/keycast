@@ -21,9 +21,6 @@ services:
   keycast:
     build:
       context: .
-      args:
-        - VITE_DOMAIN=http://localhost:3000
-        - VITE_ALLOWED_PUBKEYS=
     command: unified
     ports:
       - "3000:3000"
@@ -36,10 +33,14 @@ services:
       MASTER_KEY_PATH: /app/master.key
       USE_GCP_KMS: "false"
       ALLOWED_ORIGINS: http://localhost:5173,http://localhost:5174
-      BUNKER_RELAYS: wss://relay.divine.video,wss://relay.primal.net,wss://relay.nsec.app,wss://nos.lol
+      BUNKER_RELAYS: ${BUNKER_RELAYS:?Set BUNKER_RELAYS in .env}
       WEB_BUILD_DIR: /app/web
       FROM_EMAIL: test@localhost
       SENDGRID_API_KEY: ${SENDGRID_API_KEY:-}
+      VITE_DOMAIN: http://localhost:3000
+      VITE_ALLOWED_PUBKEYS: ${VITE_ALLOWED_PUBKEYS:-}
+      VITE_NDK_EXPLICIT_RELAYS: ${VITE_NDK_EXPLICIT_RELAYS:-}
+      VITE_NDK_BUNKER_RELAYS: ${VITE_NDK_BUNKER_RELAYS:-}
     depends_on:
       postgres:
         condition: service_healthy

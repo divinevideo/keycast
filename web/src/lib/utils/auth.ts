@@ -9,6 +9,7 @@ import {
     type NDKUser,
 } from "@nostr-dev-kit/ndk";
 import toast from "svelte-hot-french-toast";
+import { getViteDomain, getViteAllowedPubkeys } from "$lib/utils/env";
 
 export enum SigninMethod {
     Nip07 = "nip07",
@@ -18,9 +19,8 @@ export enum SigninMethod {
 }
 
 function isAllowedPubkey(pubkey: string) {
-    return JSON.stringify(import.meta.env.VITE_ALLOWED_PUBKEYS).includes(
-        pubkey,
-    );
+    const allowedPubkeys = getViteAllowedPubkeys();
+    return allowedPubkeys && allowedPubkeys.includes(pubkey);
 }
 
 /**
@@ -75,7 +75,7 @@ async function nip07Login(ndk: NDK): Promise<NDKUser | null> {
         }
 
         // Build NIP-98 auth event for login endpoint
-        const apiBase = import.meta.env.VITE_DOMAIN || 'http://localhost:3000';
+        const apiBase = getViteDomain();
         const url = `${apiBase}/api/auth/login`;
 
         const authEvent = new NDKEvent(ndk, {
@@ -128,7 +128,7 @@ async function nip07Login(ndk: NDK): Promise<NDKUser | null> {
 export async function signout(ndk: NDK) {
     // Call API logout endpoint to clear server-side session cookie
     try {
-        const response = await fetch(`${import.meta.env.VITE_DOMAIN || 'http://localhost:3000'}/api/auth/logout`, {
+        const response = await fetch(`${getViteDomain()}/api/auth/logout`, {
             method: 'POST',
             credentials: 'include',
         });

@@ -11,6 +11,7 @@ import { nip19 } from "nostr-tools";
 import { toast } from "svelte-hot-french-toast";
 import ndk from "$lib/ndk.svelte";
 import { signin, SigninMethod } from "$lib/utils/auth";
+import { getViteAllowedPubkeys } from "$lib/utils/env";
 
 const api = new KeycastApi();
 const currentUser = $derived(getCurrentUser());
@@ -72,7 +73,7 @@ async function copyPubkey(hexPubkey: string) {
 
 // Check if user is whitelisted for team creation
 const isWhitelisted = $derived(
-	user?.pubkey ? JSON.stringify(import.meta.env.VITE_ALLOWED_PUBKEYS).includes(user.pubkey) : false
+	user?.pubkey ? getViteAllowedPubkeys().includes(user.pubkey) : false
 );
 
 async function loadTeams() {
