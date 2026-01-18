@@ -323,8 +323,7 @@ pub async fn claim_post(
         60 * 60 * 24 * 7 // 7 days
     );
 
-    let app_url =
-        std::env::var("APP_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
+    let app_url = std::env::var("APP_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
 
     Ok((
         [

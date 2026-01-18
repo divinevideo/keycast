@@ -287,13 +287,13 @@ fn validate_domain(domain: &str) -> Result<(), TenantError> {
 }
 
 /// Get default relay URL from BUNKER_RELAYS environment variable
-/// 
+///
 /// Requires BUNKER_RELAYS environment variable to be set.
 /// Panics if not configured - relay connections must be explicit.
 fn get_default_relay() -> String {
-    let relays_str = std::env::var("BUNKER_RELAYS")
-        .expect("BUNKER_RELAYS environment variable is required");
-    
+    let relays_str =
+        std::env::var("BUNKER_RELAYS").expect("BUNKER_RELAYS environment variable is required");
+
     relays_str
         .split(',')
         .map(|s| s.trim())

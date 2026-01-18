@@ -276,7 +276,7 @@ pub async fn nostr_discovery_public(
 
     // Get relay URL from tenant settings or BUNKER_RELAYS env var
     let relay_url = tenant.0.relay_url();
-    
+
     // Get API base URL from headers or APP_URL env var
     let api_base_url = headers
         .get("x-forwarded-host")

@@ -204,12 +204,12 @@ impl Authorization {
     }
 
     /// Get the configured bunker relay list from environment
-    /// 
+    ///
     /// Requires BUNKER_RELAYS environment variable to be set.
     /// Panics if not configured - relay connections must be explicit.
     pub fn get_bunker_relays() -> Vec<String> {
-        let relays_str = std::env::var("BUNKER_RELAYS")
-            .expect("BUNKER_RELAYS environment variable is required");
+        let relays_str =
+            std::env::var("BUNKER_RELAYS").expect("BUNKER_RELAYS environment variable is required");
 
         let relays: Vec<String> = relays_str
             .split(',')

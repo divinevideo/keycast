@@ -22,6 +22,7 @@ use keycast_core::encryption::KeyManager;
 use keycast_signer::{RelayQueue, UnifiedSigner};
 use moka::future::Cache;
 use nostr_sdk::Keys;
+use serde_json::json;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,7 +37,6 @@ use tracing::Level;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use uuid::Uuid;
 use zeroize::Zeroizing;
-use serde_json::json;
 
 async fn health_check() -> impl IntoResponse {
     StatusCode::OK
@@ -47,53 +47,50 @@ async fn health_check() -> impl IntoResponse {
 fn inject_runtime_env(html: &str) -> String {
     // Build runtime environment object
     let mut env_obj = json!({});
-    
+
     // VITE_DOMAIN - API domain for frontend
     if let Ok(domain) = env::var("VITE_DOMAIN") {
         env_obj["VITE_DOMAIN"] = json!(domain);
     }
-    
+
     // VITE_ALLOWED_PUBKEYS - comma-separated admin pubkeys
     if let Ok(pubkeys) = env::var("VITE_ALLOWED_PUBKEYS") {
         env_obj["VITE_ALLOWED_PUBKEYS"] = json!(pubkeys);
     }
-    
+
     // VITE_NDK_EXPLICIT_RELAYS - comma-separated relay URLs for reading/subscribing (optional)
     if let Ok(relays) = env::var("VITE_NDK_EXPLICIT_RELAYS") {
         env_obj["VITE_NDK_EXPLICIT_RELAYS"] = json!(relays);
     }
-    
+
     // VITE_NDK_BUNKER_RELAYS - comma-separated relay URLs for bunker NDK (optional)
     if let Ok(relays) = env::var("VITE_NDK_BUNKER_RELAYS") {
         env_obj["VITE_NDK_BUNKER_RELAYS"] = json!(relays);
     }
-    
+
     // If no env vars to inject, return original HTML
-    if env_obj.as_object().map_or(true, |o| o.is_empty()) {
+    if env_obj.as_object().is_none_or(|o| o.is_empty()) {
         return html.to_string();
     }
-    
+
     // Serialize to JSON (serde_json properly escapes)
     let env_json = serde_json::to_string(&env_obj).unwrap_or_else(|_| "{}".to_string());
-    
+
     // Create injection script
-    let injection_script = format!(
-        r#"<script>window.__ENV__={};</script>"#,
-        env_json
-    );
-    
+    let injection_script = format!(r#"<script>window.__ENV__={};</script>"#, env_json);
+
     // Inject before </head> tag, or at the beginning if no </head> found
     if let Some(head_end_pos) = html.rfind("</head>") {
         let mut injected = html[..head_end_pos].to_string();
         injected.push_str(&injection_script);
-        injected.push_str("\n");
+        injected.push('\n');
         injected.push_str(&html[head_end_pos..]);
         injected
     } else if let Some(body_start_pos) = html.find("<body>") {
         // Fallback: inject before <body> if no </head>
         let mut injected = html[..body_start_pos].to_string();
         injected.push_str(&injection_script);
-        injected.push_str("\n");
+        injected.push('\n');
         injected.push_str(&html[body_start_pos..]);
         injected
     } else {

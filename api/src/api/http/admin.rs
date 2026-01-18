@@ -333,8 +333,7 @@ pub async fn create_claim_token(
         .await?;
 
     // Build claim URL
-    let app_url =
-        std::env::var("APP_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
+    let app_url = std::env::var("APP_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
     let claim_url = format!("{}/api/claim?token={}", app_url, token);
 
     tracing::info!(
