@@ -202,40 +202,65 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Push to Test registry (on push to main/master)
+  # Push to Test registry (on push to main/master or manual dispatch selecting test/all)
+  # Note: This job always runs but skips actual push when not needed, to avoid blocking dispatch-dev
   push-test:
     name: Push to Test Registry
     needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    # Always run on non-PR events so dispatch-dev isn't blocked by skipped status
+    if: github.event_name != 'pull_request'
     environment: test
     continue-on-error: true  # Don't fail workflow if test environment isn't configured
     permissions:
       contents: read
       id-token: write
+    outputs:
+      pushed: ${{ steps.check.outputs.should_push }}
 
     steps:
+      - name: Check if push is needed
+        id: check
+        run: |
+          SHOULD_PUSH="false"
+          if [ "${{ github.event_name }}" == "push" ] && [ "${{ github.ref }}" == "refs/heads/main" -o "${{ github.ref }}" == "refs/heads/master" ]; then
+            SHOULD_PUSH="true"
+          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            DEPLOY_ENV="${{ github.event.inputs.deploy_environment }}"
+            if [ "$DEPLOY_ENV" == "test" ] || [ "$DEPLOY_ENV" == "all" ]; then
+              SHOULD_PUSH="true"
+            fi
+          fi
+          echo "should_push=$SHOULD_PUSH" >> $GITHUB_OUTPUT
+          echo "Should push to test: $SHOULD_PUSH"
+
       - uses: actions/checkout@v6
+        if: steps.check.outputs.should_push == 'true'
 
       - name: Authenticate to GCP (Test)
+        if: steps.check.outputs.should_push == 'true'
         uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ secrets.GCP_WORKLOAD_IDENTITY_POOL }}/providers/${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
       - name: Configure Docker for Artifact Registry
+        if: steps.check.outputs.should_push == 'true'
         run: gcloud auth configure-docker ${{ env.ARTIFACT_REGISTRY }} --quiet
 
       - name: Set up Docker Buildx
+        if: steps.check.outputs.should_push == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Determine image tags
+        if: steps.check.outputs.should_push == 'true'
         id: tags
         run: |
           FULL_IMAGE="${{ env.ARTIFACT_REGISTRY }}/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.GCP_ARTIFACT_REPOSITORY }}"
           echo "tags=${FULL_IMAGE}:latest,${FULL_IMAGE}:${{ github.sha }}" >> $GITHUB_OUTPUT
 
       - name: Build and push to Test registry
+        if: steps.check.outputs.should_push == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -246,40 +271,69 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Push to Staging registry (on push to main/master)
+      - name: Skip notification
+        if: steps.check.outputs.should_push != 'true'
+        run: echo "Skipping test push - not selected for this deployment"
+
+  # Push to Staging registry (on push to main/master or manual dispatch selecting staging/all)
+  # Note: This job always runs but skips actual push when not needed, to avoid blocking dispatch-dev
   push-staging:
     name: Push to Staging Registry
     needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    # Always run on non-PR events so dispatch-dev isn't blocked by skipped status
+    if: github.event_name != 'pull_request'
     environment: staging
     continue-on-error: true  # Don't fail workflow if staging environment isn't configured
     permissions:
       contents: read
       id-token: write
+    outputs:
+      pushed: ${{ steps.check.outputs.should_push }}
 
     steps:
+      - name: Check if push is needed
+        id: check
+        run: |
+          SHOULD_PUSH="false"
+          if [ "${{ github.event_name }}" == "push" ] && [ "${{ github.ref }}" == "refs/heads/main" -o "${{ github.ref }}" == "refs/heads/master" ]; then
+            SHOULD_PUSH="true"
+          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            DEPLOY_ENV="${{ github.event.inputs.deploy_environment }}"
+            if [ "$DEPLOY_ENV" == "staging" ] || [ "$DEPLOY_ENV" == "all" ]; then
+              SHOULD_PUSH="true"
+            fi
+          fi
+          echo "should_push=$SHOULD_PUSH" >> $GITHUB_OUTPUT
+          echo "Should push to staging: $SHOULD_PUSH"
+
       - uses: actions/checkout@v6
+        if: steps.check.outputs.should_push == 'true'
 
       - name: Authenticate to GCP (Staging)
+        if: steps.check.outputs.should_push == 'true'
         uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ secrets.GCP_WORKLOAD_IDENTITY_POOL }}/providers/${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
       - name: Configure Docker for Artifact Registry
+        if: steps.check.outputs.should_push == 'true'
         run: gcloud auth configure-docker ${{ env.ARTIFACT_REGISTRY }} --quiet
 
       - name: Set up Docker Buildx
+        if: steps.check.outputs.should_push == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Determine image tags
+        if: steps.check.outputs.should_push == 'true'
         id: tags
         run: |
           FULL_IMAGE="${{ env.ARTIFACT_REGISTRY }}/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.GCP_ARTIFACT_REPOSITORY }}"
           echo "tags=${FULL_IMAGE}:latest,${FULL_IMAGE}:${{ github.sha }}" >> $GITHUB_OUTPUT
 
       - name: Build and push to Staging registry
+        if: steps.check.outputs.should_push == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -289,6 +343,10 @@ jobs:
             BUILD_VERSION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Skip notification
+        if: steps.check.outputs.should_push != 'true'
+        run: echo "Skipping staging push - not selected for this deployment"
 
   # Push to Production registry (only on version tags)
   push-production:
@@ -362,14 +420,14 @@ jobs:
             ENV_DISPLAY+=("poc")
           fi
           
-          # Include test if it succeeded
-          if [ "${{ needs.push-test.result }}" == "success" ]; then
+          # Include test if it actually pushed (check output, not just job success)
+          if [ "${{ needs.push-test.outputs.pushed }}" == "true" ]; then
             ENVS+=("\"test\"")
             ENV_DISPLAY+=("test")
           fi
           
-          # Include staging if it succeeded
-          if [ "${{ needs.push-staging.result }}" == "success" ]; then
+          # Include staging if it actually pushed (check output, not just job success)
+          if [ "${{ needs.push-staging.outputs.pushed }}" == "true" ]; then
             ENVS+=("\"staging\"")
             ENV_DISPLAY+=("staging")
           fi
@@ -390,10 +448,10 @@ jobs:
               if [ "$DEPLOY_ENV" == "poc" ] && [ "${{ needs.push-poc.result }}" == "success" ]; then
                 echo "environments=[\"poc\"]" >> $GITHUB_OUTPUT
                 echo "env_display=poc" >> $GITHUB_OUTPUT
-              elif [ "$DEPLOY_ENV" == "test" ] && [ "${{ needs.push-test.result }}" == "success" ]; then
+              elif [ "$DEPLOY_ENV" == "test" ] && [ "${{ needs.push-test.outputs.pushed }}" == "true" ]; then
                 echo "environments=[\"test\"]" >> $GITHUB_OUTPUT
                 echo "env_display=test" >> $GITHUB_OUTPUT
-              elif [ "$DEPLOY_ENV" == "staging" ] && [ "${{ needs.push-staging.result }}" == "success" ]; then
+              elif [ "$DEPLOY_ENV" == "staging" ] && [ "${{ needs.push-staging.outputs.pushed }}" == "true" ]; then
                 echo "environments=[\"staging\"]" >> $GITHUB_OUTPUT
                 echo "env_display=staging" >> $GITHUB_OUTPUT
               else
@@ -403,9 +461,9 @@ jobs:
             fi
           fi
           
-          # Ensure at least POC is included
-          if [ ${#ENVS[@]} -eq 0 ]; then
-            echo "::error::No environments available for deployment. At least POC must be configured."
+          # Ensure at least one environment is included
+          if [ ${#ENVS[@]} -eq 0 ] && [ "${{ github.event_name }}" == "push" ]; then
+            echo "::error::No environments available for deployment."
             exit 1
           fi
 
