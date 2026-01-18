@@ -4,7 +4,12 @@
 
 set -e
 
+# Log file for debugging (visible in VS Code)
+LOG_FILE="${GIT_DIR:-.git}/hooks/pre-push.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
 echo "Running pre-push checks..."
+echo "Hook output will be logged to: $LOG_FILE"
 
 echo "→ Checking Rust formatting..."
 cargo fmt --all -- --check
@@ -13,8 +18,51 @@ echo "→ Running clippy..."
 cargo clippy --workspace --all-targets --all-features -- -D warnings -A deprecated
 
 echo "→ Running tests..."
-# Override DATABASE_URL to use local test database (docker-compose may set it to a network host)
-DATABASE_URL="postgres://postgres:password@localhost/keycast_test" cargo test --workspace
+# Ensure dependencies (Redis, Postgres) are running
+echo "  → Ensuring dependencies are up..."
+if command -v docker &> /dev/null && docker compose -f docker-compose.deps.yml ps | grep -q "Up"; then
+    echo "  → Dependencies already running"
+else
+    echo "  → Starting dependencies..."
+    docker compose -f docker-compose.deps.yml up -d --wait || {
+        echo "⚠️  Warning: Failed to start dependencies. Tests may fail."
+    }
+fi
+
+# Set up test database (create and migrate)
+echo "  → Setting up test database..."
+if command -v sqlx &> /dev/null; then
+    TEST_DB_URL="postgres://postgres:password@localhost/keycast_test"
+    
+    # sqlx database setup creates the database if needed and runs migrations
+    if ! sqlx database setup \
+        --database-url "$TEST_DB_URL" \
+        --source ./database/migrations 2>&1; then
+        echo ""
+        echo "⚠️  Warning: Failed to set up test database."
+        echo "   Troubleshooting steps:"
+        echo "   1. Check if Postgres is running:"
+        echo "      docker compose -f docker-compose.deps.yml ps"
+        echo "   2. Check if another Postgres is using port 5432:"
+        echo "      lsof -i :5432"
+        echo "   3. Restart dependencies:"
+        echo "      docker compose -f docker-compose.deps.yml down && docker compose -f docker-compose.deps.yml up -d"
+        echo "   4. Manually create database:"
+        echo "      sqlx database create --database-url $TEST_DB_URL"
+        echo "      sqlx migrate run --database-url $TEST_DB_URL --source ./database/migrations"
+        echo ""
+        echo "   Continuing anyway - tests may fail..."
+    fi
+else
+    echo "⚠️  Warning: sqlx not found. Skipping database setup."
+    echo "   Install sqlx: cargo install sqlx-cli --no-default-features --features postgres"
+fi
+
+# Override DATABASE_URL and REDIS_URL to use local test database/services
+DATABASE_URL="postgres://postgres:password@localhost/keycast_test" \
+REDIS_URL="redis://localhost:6379" \
+TEST_REDIS_URL="redis://localhost:6379" \
+cargo test --workspace
 
 echo "→ Building release..."
 cargo build --release --workspace

@@ -9,7 +9,7 @@
 		"deps:up": "docker compose -f docker-compose.deps.yml up -d --wait",
 		"deps:down": "docker compose -f docker-compose.deps.yml down",
 		"deps:logs": "docker compose -f docker-compose.deps.yml logs -f",
-		"dev:api": "DATABASE_URL=postgres://postgres:password@localhost/keycast REDIS_URL=redis://localhost:6379 RUST_LOG=debug,hyper=info,h2=info,rustls=info,sqlx=info,nostr_relay_pool=info,tower_http=info MASTER_KEY_PATH=./master.key ENABLE_EXAMPLES=true ALLOWED_ORIGINS=http://localhost:5173,http://localhost:5174,http://localhost:3000 SERVER_NSEC=e870badb3c21ac7b6d7e9529b5214d39b270f96a7e1c6bb34d9ffab430d272a4 WEB_BUILD_DIR=./web/build cargo run --bin keycast",
+		"dev:api": "DATABASE_URL=postgres://postgres:password@localhost/keycast REDIS_URL=redis://localhost:6379 RUST_LOG=debug,hyper=info,h2=info,rustls=info,sqlx=info,nostr_relay_pool=info,tower_http=info MASTER_KEY_PATH=./master.key ENABLE_EXAMPLES=true ALLOWED_ORIGINS=http://localhost:5173,http://localhost:5174,http://localhost:3000 SERVER_NSEC=e870badb3c21ac7b6d7e9529b5214d39b270f96a7e1c6bb34d9ffab430d272a4 WEB_BUILD_DIR=./web/build cargo watch -x 'run --bin keycast'",
 		"dev:web": "cd web && bun run dev",
 		"build": "cargo build --release --bin keycast",
 		"build:web": "cd web && bun run build",

@@ -1,4 +1,6 @@
 use axum::{
+    http::StatusCode,
+    response::IntoResponse,
     routing::{delete, get, post, put},
     Router,
 };
@@ -215,6 +217,7 @@ pub fn api_routes(
         .merge(claim_routes.layer(public_cors.clone())) // Public - claim preloaded accounts
         .merge(metrics_route.layer(public_cors.clone())) // Public - Prometheus metrics
         .merge(docs_route.layer(public_cors))
+        .fallback(api_not_found) // Return 404 for unmatched API routes
 }
 
 /// Serve OpenAPI specification as JSON
@@ -222,6 +225,11 @@ async fn openapi_spec() -> AxumJson<JsonValue> {
     let yaml_content = include_str!("../../../openapi.yaml");
     let spec: JsonValue = serde_yaml::from_str(yaml_content).expect("Failed to parse OpenAPI spec");
     AxumJson(spec)
+}
+
+/// Fallback handler for unmatched API routes - returns 404
+async fn api_not_found() -> impl IntoResponse {
+    (StatusCode::NOT_FOUND, "Not found")
 }
 
 /// NIP-05 discovery endpoint for nostr-login integration

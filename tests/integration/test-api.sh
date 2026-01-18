@@ -15,6 +15,20 @@ NC='\033[0m' # No Color
 API_URL="${API_URL:-http://localhost:3000}"
 FRONTEND_URL="${FRONTEND_URL:-http://localhost:5173}"
 
+# Check if API is running before starting tests
+echo "Checking if API is running at $API_URL..."
+if ! curl -s -m 2 "$API_URL/health" > /dev/null 2>&1; then
+    echo -e "${RED}✗ API is not running at $API_URL${NC}"
+    echo ""
+    echo "Please start the API first:"
+    echo "  Option 1 (native): bun run dev"
+    echo "  Option 2 (Docker): docker-compose -f docker-compose.dev.yml up -d --build"
+    echo ""
+    exit 1
+fi
+echo -e "${GREEN}✓ API is running${NC}"
+echo ""
+
 # Test counters
 PASSED=0
 FAILED=0
@@ -37,11 +51,11 @@ test_fail() {
     echo "    Error: $1"
 }
 
-# HTTP helper functions
+# HTTP helper functions (with 5s timeout to fail fast)
 http_get() {
     local url=$1
     local headers="${2:-}"
-    curl -s -o /tmp/response.json -w "%{http_code}" \
+    curl -s -m 5 -o /tmp/response.json -w "%{http_code}" \
         ${headers:+-H "$headers"} \
         "$API_URL$url"
 }
@@ -50,7 +64,7 @@ http_post() {
     local url=$1
     local data=$2
     local headers="${3:-}"
-    curl -s -o /tmp/response.json -w "%{http_code}" \
+    curl -s -m 5 -o /tmp/response.json -w "%{http_code}" \
         -X POST \
         -H "Content-Type: application/json" \
         ${headers:+-H "$headers"} \
@@ -61,7 +75,7 @@ http_post() {
 http_options() {
     local url=$1
     local origin="${2:-$FRONTEND_URL}"
-    curl -s -o /tmp/response.json -w "%{http_code}" \
+    curl -s -m 5 -o /tmp/response.json -w "%{http_code}" \
         -X OPTIONS \
         -H "Origin: $origin" \
         -H "Access-Control-Request-Method: POST" \
@@ -98,7 +112,7 @@ else
 fi
 
 test_start "CORS headers present"
-CORS_HEADER=$(curl -s -I -X OPTIONS \
+CORS_HEADER=$(curl -s -m 5 -I -X OPTIONS \
     -H "Origin: $FRONTEND_URL" \
     -H "Access-Control-Request-Method: POST" \
     "$API_URL/api/teams" | grep -i "access-control-allow-origin")
@@ -149,7 +163,7 @@ else
 fi
 
 test_start "Malformed JSON returns 400"
-STATUS=$(curl -s -o /tmp/response.json -w "%{http_code}" \
+STATUS=$(curl -s -m 5 -o /tmp/response.json -w "%{http_code}" \
     -X POST \
     -H "Content-Type: application/json" \
     -d "{invalid json}" \
