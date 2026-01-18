@@ -9,19 +9,33 @@
 #   - GCP_WORKLOAD_IDENTITY_PROVIDER: Workload Identity provider name
 #   - GCP_ARTIFACT_REGISTRY: Artifact Registry hostname (e.g., us-central1-docker.pkg.dev)
 #   - GCP_ARTIFACT_REPOSITORY: Repository path within project (e.g., docker/keycast)
-#   - VITE_DOMAIN: Domain for the web frontend (e.g., https://example.com)
-#   - VITE_ALLOWED_PUBKEYS: Comma-separated admin pubkeys for the web frontend
 #
-# Note: Secrets are pulled from the 'poc' GitHub environment. Configure these at:
-#   Settings → Environments → poc → Secrets and variables
+# Required GitHub Secrets (organization level, for coreconfig dispatch):
+#   - CORECONFIG_DISPATCH_APP_ID: GitHub App ID for cross-repo dispatch
+#   - CORECONFIG_DISPATCH_APP_PRIVATE_KEY: GitHub App private key
+#
+# GitHub Environments (configure at: Settings → Environments):
+#   - poc: Used for build-push job (GCP secrets for building Docker images)
+#   - staging: Used for dev deployments (poc, test, staging environments)
+#   - production: Used for production deployments (requires approval if protection rules enabled)
+#
+# See .github/ENVIRONMENT_SETUP.md for complete setup instructions
+#
+# Recommended: Add protection rules to 'production' environment:
+#   - Required reviewers (1+)
+#   - Wait timer (optional, e.g., 5 minutes)
+#   - Deployment branches: restrict to tags matching 'v*'
 
 name: Build, Test & Push
 
 on:
   push:
     branches: [master, main]
+    tags:
+      - 'v*'  # Deploy to production on version tags (e.g., v1.0.0)
   pull_request:
     branches: [master, main]
+  workflow_dispatch:  # Allow manual triggering for testing
 
 env:
   CARGO_TERM_COLOR: always
@@ -129,7 +143,86 @@ jobs:
           tags: ${{ steps.tags.outputs.tags }}
           build-args: |
             BUILD_VERSION=${{ github.sha }}
-            VITE_DOMAIN=${{ secrets.VITE_DOMAIN }}
-            VITE_ALLOWED_PUBKEYS=${{ secrets.VITE_ALLOWED_PUBKEYS }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Deploy via coreconfig
+  # - poc, test, staging: on push to main/master branches (uses 'staging' environment)
+  # - production: on version tags (v*) with protection rules (uses 'production' environment)
+  dispatch-dev:
+    name: Deploy to Dev Environments
+    needs: build-push
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/v')
+    environment: staging  # Use staging environment for non-production deployments
+
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CORECONFIG_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.CORECONFIG_DISPATCH_APP_PRIVATE_KEY }}
+          owner: divinevideo
+          repositories: divine-iac-coreconfig
+
+      - name: Dispatch image deploy to coreconfig
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh api repos/divinevideo/divine-iac-coreconfig/dispatches \
+            -f event_type=image-deploy \
+            -f 'client_payload[application]=keycast' \
+            -f 'client_payload[environments]=["poc","test","staging"]' \
+            -f "client_payload[images]=[{\"name\":\"keycast\",\"tag\":\"${{ github.sha }}\"}]" \
+            -f "client_payload[source_repo]=${{ github.repository }}" \
+            -f "client_payload[source_sha]=${{ github.sha }}" \
+            -f "client_payload[source_ref]=${{ github.ref_name }}"
+          
+          echo "## 🚀 Deploy Dispatched to Dev Environments" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Application | keycast |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image Tag | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environments | poc, test, staging |" >> $GITHUB_STEP_SUMMARY
+          echo "| Target | [divine-iac-coreconfig](https://github.com/divinevideo/divine-iac-coreconfig/actions) |" >> $GITHUB_STEP_SUMMARY
+
+  dispatch-production:
+    name: Deploy to Production
+    needs: build-push
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment: production  # Uses production environment with protection rules
+
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CORECONFIG_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.CORECONFIG_DISPATCH_APP_PRIVATE_KEY }}
+          owner: divinevideo
+          repositories: divine-iac-coreconfig
+
+      - name: Dispatch image deploy to coreconfig
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh api repos/divinevideo/divine-iac-coreconfig/dispatches \
+            -f event_type=image-deploy \
+            -f 'client_payload[application]=keycast' \
+            -f 'client_payload[environments]=["production"]' \
+            -f "client_payload[images]=[{\"name\":\"keycast\",\"tag\":\"${{ github.sha }}\"}]" \
+            -f "client_payload[source_repo]=${{ github.repository }}" \
+            -f "client_payload[source_sha]=${{ github.sha }}" \
+            -f "client_payload[source_ref]=${{ github.ref_name }}"
+          
+          echo "## 🚀 Deploy Dispatched to Production" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Application | keycast |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image Tag | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | production |" >> $GITHUB_STEP_SUMMARY
+          echo "| Target | [divine-iac-coreconfig](https://github.com/divinevideo/divine-iac-coreconfig/actions) |" >> $GITHUB_STEP_SUMMARY
