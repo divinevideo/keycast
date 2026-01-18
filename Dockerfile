@@ -67,6 +67,9 @@ RUN if [ "$(uname -m)" = "aarch64" ]; then \
     bun add -d @rollup/rollup-linux-arm64-gnu; \
     fi
 
+# Generate SvelteKit configuration files (creates .svelte-kit directory)
+RUN svelte-kit sync
+
 # Build (skip check in Docker - runs locally, but symlink resolution issues in Docker)
 RUN bun run build
 
