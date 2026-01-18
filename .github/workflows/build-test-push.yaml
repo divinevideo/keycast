@@ -36,6 +36,18 @@ on:
   pull_request:
     branches: [master, main]
   workflow_dispatch:  # Allow manual triggering for testing
+    inputs:
+      deploy_environment:
+        description: 'Environment to deploy to (poc, test, staging, production, or "all" for all dev environments)'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - poc
+          - test
+          - staging
+          - production
 
 env:
   CARGO_TERM_COLOR: always
@@ -147,16 +159,28 @@ jobs:
           cache-to: type=gha,mode=max
 
   # Deploy via coreconfig
-  # - poc, test, staging: on push to main/master branches (uses 'staging' environment)
-  # - production: on version tags (v*) with protection rules (uses 'production' environment)
+  # - poc, test, staging: manual dispatch only (uses 'staging' environment)
+  # - production: on version tags (v*) or manual dispatch (uses 'production' environment)
   dispatch-dev:
     name: Deploy to Dev Environments
     needs: build-push
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_environment != 'production'
     environment: staging  # Use staging environment for non-production deployments
 
     steps:
+      - name: Determine target environments
+        id: envs
+        run: |
+          DEPLOY_ENV="${{ github.event.inputs.deploy_environment }}"
+          if [ "$DEPLOY_ENV" == "all" ]; then
+            echo "environments=[\"poc\",\"test\",\"staging\"]" >> $GITHUB_OUTPUT
+            echo "env_display=poc, test, staging" >> $GITHUB_OUTPUT
+          else
+            echo "environments=[\"$DEPLOY_ENV\"]" >> $GITHUB_OUTPUT
+            echo "env_display=$DEPLOY_ENV" >> $GITHUB_OUTPUT
+          fi
+
       - name: Generate GitHub App token
         id: app-token
         uses: actions/create-github-app-token@v1
@@ -173,7 +197,7 @@ jobs:
           gh api repos/divinevideo/divine-iac-coreconfig/dispatches \
             -f event_type=image-deploy \
             -f 'client_payload[application]=keycast' \
-            -f 'client_payload[environments]=["poc","test","staging"]' \
+            -f "client_payload[environments]=${{ steps.envs.outputs.environments }}" \
             -f "client_payload[images]=[{\"name\":\"keycast\",\"tag\":\"${{ github.sha }}\"}]" \
             -f "client_payload[source_repo]=${{ github.repository }}" \
             -f "client_payload[source_sha]=${{ github.sha }}" \
@@ -185,14 +209,14 @@ jobs:
           echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Application | keycast |" >> $GITHUB_STEP_SUMMARY
           echo "| Image Tag | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Environments | poc, test, staging |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environments | ${{ steps.envs.outputs.env_display }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Target | [divine-iac-coreconfig](https://github.com/divinevideo/divine-iac-coreconfig/actions) |" >> $GITHUB_STEP_SUMMARY
 
   dispatch-production:
     name: Deploy to Production
     needs: build-push
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_environment == 'production')
     environment: production  # Uses production environment with protection rules
 
     steps:
