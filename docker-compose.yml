@@ -23,6 +23,44 @@ services:
         max-file: "3"
         compress: "true"
 
+  redis:
+    image: redis:7-alpine
+    container_name: keycast-redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - keycast
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        compress: "true"
+
+  migrate:
+    build:
+      context: ./database
+      dockerfile: Dockerfile
+    container_name: keycast-migrate
+    environment:
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:?error}@postgres:5432/keycast
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - keycast
+    restart: "no"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        compress: "true"
+
   keycast:
     container_name: keycast-unified
     build:
@@ -44,9 +82,35 @@ services:
       BUNKER_RELAYS: ${BUNKER_RELAYS:-wss://relay.divine.video,wss://relay.primal.net,wss://relay.nsec.app,wss://nos.lol}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?error}
       WEB_BUILD_DIR: /app/web
+      SERVER_NSEC: ${SERVER_NSEC:?error}
+      REDIS_URL: redis://redis:6379
+      # Email configuration
+      SENDGRID_API_KEY: ${SENDGRID_API_KEY:-}
+      FROM_EMAIL: ${FROM_EMAIL:-noreply@divine.video}
+      FROM_NAME: ${FROM_NAME:-diVine}
+      BASE_URL: ${BASE_URL:-http://localhost:5173}
+      # DISABLE_EMAILS: ${DISABLE_EMAILS:-}
+      # Server configuration
+      PORT: ${PORT:-3000}
+      NODE_ENV: ${NODE_ENV:-development}
+      # Performance tuning (optional)
+      TOKIO_WORKER_THREADS: ${TOKIO_WORKER_THREADS:-}
+      SQLX_POOL_SIZE: ${SQLX_POOL_SIZE:-10}
+      RELAY_WORKER_COUNT: ${RELAY_WORKER_COUNT:-}
+      # Development features
+      ENABLE_EXAMPLES: ${ENABLE_EXAMPLES:-false}
+      # GCP KMS (if USE_GCP_KMS=true)
+      GCP_PROJECT_ID: ${GCP_PROJECT_ID:-}
+      GCP_KMS_LOCATION: ${GCP_KMS_LOCATION:-}
+      GCP_KMS_KEY_RING: ${GCP_KMS_KEY_RING:-}
+      GCP_KMS_KEY_NAME: ${GCP_KMS_KEY_NAME:-}
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "/usr/local/bin/healthcheck.sh", "unified"]
       interval: 10s
@@ -72,5 +136,3 @@ volumes:
 
 networks:
   keycast:
-    external: true
-    name: keycast

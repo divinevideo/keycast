@@ -152,11 +152,11 @@ const formattedResult = $derived(
         overflow-y: auto;
     }
 
-    .text-divine-success {
+    :global(.text-divine-success) {
         color: var(--color-divine-success);
     }
 
-    .text-divine-error {
+    :global(.text-divine-error) {
         color: var(--color-divine-error);
     }
 

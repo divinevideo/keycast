@@ -592,7 +592,7 @@
 		margin: 0 0 1rem 0;
 	}
 
-	.doc-content ol, .doc-content ul {
+	.doc-content ol {
 		margin: 0 0 1rem 1.25rem;
 	}
 

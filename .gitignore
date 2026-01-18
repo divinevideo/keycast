@@ -38,3 +38,7 @@ keycast-login/dist/
 loadtest-results.json
 loadtest-users.json
 scale-test-results/
+
+
+# MCP cache
+.repo-cache/

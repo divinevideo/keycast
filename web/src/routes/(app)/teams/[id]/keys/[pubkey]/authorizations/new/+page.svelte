@@ -217,7 +217,7 @@ function closeSuccessModal() {
             </div>
 
             <div class="mb-4">
-                <label class="block text-sm text-gray-400 mb-2">Bunker URL</label>
+                <div class="block text-sm text-gray-400 mb-2">Bunker URL</div>
                 <div class="bg-gray-900 rounded p-3 font-mono text-sm break-all text-gray-300">
                     {createdBunkerUrl}
                 </div>

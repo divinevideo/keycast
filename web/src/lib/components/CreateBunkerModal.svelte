@@ -391,11 +391,6 @@
 		box-shadow: var(--shadow-sm);
 	}
 
-	.help-text {
-		color: #666;
-		font-size: 0.875rem;
-		line-height: 1.5;
-	}
 
 	.warning-box {
 		background: rgba(245, 158, 11, 0.1);

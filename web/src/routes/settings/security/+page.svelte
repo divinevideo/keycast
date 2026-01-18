@@ -229,16 +229,17 @@
 					{isExporting ? 'Exporting...' : 'Export Private Key'}
 				</button>
 
-				{#if exportedNsec}
-					<div class="exported-key">
-						<label>Your Private Key (nsec):</label>
-						<div class="key-display">
-							<input
-								type={showExportedNsec ? 'text' : 'password'}
-								value={exportedNsec}
-								readonly
-								class="nsec-input"
-							/>
+			{#if exportedNsec}
+				<div class="exported-key">
+					<label for="exported-nsec-input">Your Private Key (nsec):</label>
+					<div class="key-display">
+						<input
+							id="exported-nsec-input"
+							type={showExportedNsec ? 'text' : 'password'}
+							value={exportedNsec}
+							readonly
+							class="nsec-input"
+						/>
 							<button class="btn-icon" onclick={() => (showExportedNsec = !showExportedNsec)}>
 								{showExportedNsec ? '👁️' : '👁️‍🗨️'}
 							</button>
@@ -314,8 +315,8 @@
 			</ul>
 
 			<div class="form-group">
-				<label>Type "DELETE" to confirm:</label>
-				<input type="text" bind:value={confirmText} placeholder="DELETE" autofocus />
+				<label for="confirm-delete-input">Type "DELETE" to confirm:</label>
+				<input id="confirm-delete-input" type="text" bind:value={confirmText} placeholder="DELETE" />
 			</div>
 
 			<div class="modal-actions">

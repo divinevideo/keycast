@@ -1228,12 +1228,12 @@ onMount(async () => {
 		margin: 0.25rem 0 0 0;
 	}
 
-	.arrow-icon {
+	:global(.arrow-icon) {
 		color: var(--color-divine-text-tertiary);
 		transition: all 0.2s;
 	}
 
-	.team-item:hover .arrow-icon {
+	.team-item:hover :global(.arrow-icon) {
 		color: var(--color-divine-green);
 		transform: translateX(4px);
 	}

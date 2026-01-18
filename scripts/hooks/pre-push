@@ -19,4 +19,25 @@ DATABASE_URL="postgres://postgres:password@localhost/keycast_test" cargo test --
 echo "→ Building release..."
 cargo build --release --workspace
 
+echo "→ Building web app..."
+if ! command -v bun &> /dev/null; then
+    echo "⚠️  Warning: bun not found. Skipping web build."
+    echo "   Install bun: curl -fsSL https://bun.sh/install | bash"
+    echo "   Or install mise: curl https://mise.run | sh"
+    echo "   Then run: cd web && bun run build"
+else
+    # Build keycast-login first (dependency of web)
+    echo "  → Building keycast-login dependency..."
+    cd keycast-login
+    bun install
+    bun run build
+    cd ..
+    
+    # Now build web app
+    cd web
+    bun install
+    bun run build
+    cd ..
+fi
+
 echo "✓ All checks passed!"

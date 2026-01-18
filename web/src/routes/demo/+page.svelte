@@ -442,7 +442,7 @@
 
       {#if credentials?.bunkerUrl}
         <div class="credential-display">
-          <label>Bunker URL</label>
+          <div class="credential-label">Bunker URL</div>
           <div class="credential-value">
             <code>{credentials.bunkerUrl.substring(0, 60)}...</code>
             <Copy value={credentials.bunkerUrl} size="16" />
@@ -793,16 +793,6 @@ const signed = await signer.signEvent(unsignedEvent);</code
     border-color: var(--color-divine-text-tertiary);
   }
 
-  .btn-outline {
-    background: transparent;
-    color: var(--color-divine-text);
-    border-color: var(--color-divine-border);
-  }
-
-  .btn-outline:hover:not(:disabled) {
-    background: var(--color-divine-muted);
-    border-color: var(--color-divine-green);
-  }
 
   .btn-ghost {
     background: transparent;
@@ -852,7 +842,7 @@ const signed = await signer.signEvent(unsignedEvent);</code
     margin-top: 1rem;
   }
 
-  .credential-display label {
+  .credential-display .credential-label {
     display: block;
     font-size: 0.75rem;
     font-weight: 500;

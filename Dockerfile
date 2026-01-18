@@ -32,10 +32,8 @@ RUN apt-get update && apt-get install -y \
 # Install node-gyp globally for native module builds
 RUN bun add -g node-gyp
 
-ARG VITE_DOMAIN
-ENV VITE_DOMAIN=$VITE_DOMAIN
-ARG VITE_ALLOWED_PUBKEYS
-ENV VITE_ALLOWED_PUBKEYS=$VITE_ALLOWED_PUBKEYS
+# VITE_DOMAIN and VITE_ALLOWED_PUBKEYS are now runtime environment variables
+# They are injected into the HTML at runtime by the server
 
 ENV NODE_OPTIONS="--max-old-space-size=2048"
 ENV CI=true
