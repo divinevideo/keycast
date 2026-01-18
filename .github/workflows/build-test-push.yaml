@@ -480,14 +480,19 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          gh api repos/divinevideo/divine-iac-coreconfig/dispatches \
-            -f event_type=image-deploy \
-            -f 'client_payload[application]=keycast' \
-            -f "client_payload[environments]=${{ steps.envs.outputs.environments }}" \
-            -f "client_payload[images]=[{\"name\":\"keycast\",\"tag\":\"${{ github.sha }}\"}]" \
-            -f "client_payload[source_repo]=${{ github.repository }}" \
-            -f "client_payload[source_sha]=${{ github.sha }}" \
-            -f "client_payload[source_ref]=${{ github.ref_name }}"
+          cat <<EOF | gh api repos/divinevideo/divine-iac-coreconfig/dispatches --input -
+          {
+            "event_type": "image-deploy",
+            "client_payload": {
+              "application": "keycast",
+              "environments": ${{ steps.envs.outputs.environments }},
+              "images": [{"name": "keycast", "tag": "${{ github.sha }}"}],
+              "source_repo": "${{ github.repository }}",
+              "source_sha": "${{ github.sha }}",
+              "source_ref": "${{ github.ref_name }}"
+            }
+          }
+          EOF
           
           echo "## 🚀 Deploy Dispatched to Dev Environments" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -521,14 +526,19 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          gh api repos/divinevideo/divine-iac-coreconfig/dispatches \
-            -f event_type=image-deploy \
-            -f 'client_payload[application]=keycast' \
-            -f 'client_payload[environments]=["production"]' \
-            -f "client_payload[images]=[{\"name\":\"keycast\",\"tag\":\"${{ github.sha }}\"}]" \
-            -f "client_payload[source_repo]=${{ github.repository }}" \
-            -f "client_payload[source_sha]=${{ github.sha }}" \
-            -f "client_payload[source_ref]=${{ github.ref_name }}"
+          cat <<EOF | gh api repos/divinevideo/divine-iac-coreconfig/dispatches --input -
+          {
+            "event_type": "image-deploy",
+            "client_payload": {
+              "application": "keycast",
+              "environments": ["production"],
+              "images": [{"name": "keycast", "tag": "${{ github.sha }}"}],
+              "source_repo": "${{ github.repository }}",
+              "source_sha": "${{ github.sha }}",
+              "source_ref": "${{ github.ref_name }}"
+            }
+          }
+          EOF
           
           echo "## 🚀 Deploy Dispatched to Production" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
