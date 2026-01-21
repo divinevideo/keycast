@@ -591,14 +591,53 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         }
     }
 
-    // SvelteKit frontend (fallback - catches all other routes)
-    // SPA mode: serve index.html for all non-file routes
+    // SvelteKit frontend - explicitly handle root and index.html with injection
+    // This ensures index.html always goes through injection, not served as static file
     let index_path = PathBuf::from(&web_build_dir).join("index.html");
-    let web_build_dir_for_injection = web_build_dir.clone();
+    let index_path_for_root = index_path.clone();
+    let index_path_for_index = index_path.clone();
+
+    // Handler that injects runtime env vars into index.html
+    let inject_handler = move || {
+        let index_path = index_path_for_root.clone();
+        async move {
+            match tokio::fs::read_to_string(&index_path).await {
+                Ok(content) => {
+                    // Inject runtime environment variables into HTML
+                    let injected_content = inject_runtime_env(&content);
+                    Html(injected_content).into_response()
+                }
+                Err(_) => (StatusCode::NOT_FOUND, "Not found").into_response(),
+            }
+        }
+    };
+
+    let inject_handler_index = move || {
+        let index_path = index_path_for_index.clone();
+        async move {
+            match tokio::fs::read_to_string(&index_path).await {
+                Ok(content) => {
+                    // Inject runtime environment variables into HTML
+                    let injected_content = inject_runtime_env(&content);
+                    Html(injected_content).into_response()
+                }
+                Err(_) => (StatusCode::NOT_FOUND, "Not found").into_response(),
+            }
+        }
+    };
+
+    // Explicitly route root and index.html to injection handler
+    let app = app
+        .route("/", axum::routing::get(inject_handler))
+        .route("/index.html", axum::routing::get(inject_handler_index));
+
+    // Serve other static files, with fallback for SPA routes (non-file routes)
+    let web_build_dir_for_fallback = web_build_dir.clone();
+    let index_path_for_fallback = PathBuf::from(&web_build_dir).join("index.html");
     let app = app.fallback_service(ServeDir::new(&web_build_dir).fallback(axum::routing::get(
         move || {
-            let index_path = index_path.clone();
-            let _web_build_dir = web_build_dir_for_injection.clone();
+            let index_path = index_path_for_fallback.clone();
+            let _web_build_dir = web_build_dir_for_fallback.clone();
             async move {
                 match tokio::fs::read_to_string(&index_path).await {
                     Ok(content) => {
@@ -756,4 +795,118 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     tracing::info!("Graceful shutdown complete");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_inject_runtime_env_with_head_tag() {
+        let html = r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Test</title>
+</head>
+<body>
+    <h1>Hello</h1>
+</body>
+</html>"#;
+
+        // Set environment variables
+        std::env::set_var("VITE_DOMAIN", "https://example.com");
+        std::env::set_var("VITE_ALLOWED_PUBKEYS", "pubkey1,pubkey2");
+
+        let result = inject_runtime_env(html);
+
+        // Should inject script before </head>
+        assert!(result.contains("window.__ENV__"));
+        assert!(result.contains("VITE_DOMAIN"));
+        assert!(result.contains("https://example.com"));
+        assert!(result.contains("VITE_ALLOWED_PUBKEYS"));
+        assert!(result.contains("pubkey1,pubkey2"));
+        assert!(result.contains("</head>"));
+
+        // Clean up
+        std::env::remove_var("VITE_DOMAIN");
+        std::env::remove_var("VITE_ALLOWED_PUBKEYS");
+    }
+
+    #[test]
+    fn test_inject_runtime_env_without_head_tag() {
+        let html = r#"<!DOCTYPE html>
+<html>
+<body>
+    <h1>Hello</h1>
+</body>
+</html>"#;
+
+        std::env::set_var("VITE_DOMAIN", "https://example.com");
+
+        let result = inject_runtime_env(html);
+
+        // Should inject before <body>
+        assert!(result.contains("window.__ENV__"));
+        assert!(result.contains("<body>"));
+
+        std::env::remove_var("VITE_DOMAIN");
+    }
+
+    #[test]
+    fn test_inject_runtime_env_no_env_vars() {
+        let html = r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Test</title>
+</head>
+<body>
+    <h1>Hello</h1>
+</body>
+</html>"#;
+
+        // Clear all env vars that might be set from other tests
+        std::env::remove_var("VITE_DOMAIN");
+        std::env::remove_var("VITE_ALLOWED_PUBKEYS");
+        std::env::remove_var("VITE_NDK_EXPLICIT_RELAYS");
+        std::env::remove_var("VITE_NDK_BUNKER_RELAYS");
+
+        let result = inject_runtime_env(html);
+
+        // Should return original HTML unchanged
+        assert_eq!(result, html);
+        assert!(!result.contains("window.__ENV__"));
+    }
+
+    #[test]
+    fn test_inject_runtime_env_all_vars() {
+        let html = r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Test</title>
+</head>
+<body>
+    <h1>Hello</h1>
+</body>
+</html>"#;
+
+        std::env::set_var("VITE_DOMAIN", "https://example.com");
+        std::env::set_var("VITE_ALLOWED_PUBKEYS", "key1,key2");
+        std::env::set_var(
+            "VITE_NDK_EXPLICIT_RELAYS",
+            "wss://relay1.com,wss://relay2.com",
+        );
+        std::env::set_var("VITE_NDK_BUNKER_RELAYS", "wss://bunker1.com");
+
+        let result = inject_runtime_env(html);
+
+        assert!(result.contains("VITE_DOMAIN"));
+        assert!(result.contains("VITE_ALLOWED_PUBKEYS"));
+        assert!(result.contains("VITE_NDK_EXPLICIT_RELAYS"));
+        assert!(result.contains("VITE_NDK_BUNKER_RELAYS"));
+
+        std::env::remove_var("VITE_DOMAIN");
+        std::env::remove_var("VITE_ALLOWED_PUBKEYS");
+        std::env::remove_var("VITE_NDK_EXPLICIT_RELAYS");
+        std::env::remove_var("VITE_NDK_BUNKER_RELAYS");
+    }
 }
