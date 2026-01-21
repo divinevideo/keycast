@@ -38,3 +38,4 @@ uuid = { version = "1", features = ["v4"] }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+serial_test = "3.2"

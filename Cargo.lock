@@ -2660,6 +2660,7 @@ dependencies = [
  "num_cpus",
  "redis",
  "serde_json",
+ "serial_test",
  "sqlx",
  "tokio",
  "tokio-util",

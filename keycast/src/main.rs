@@ -800,8 +800,10 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_inject_runtime_env_with_head_tag() {
         let html = r#"<!DOCTYPE html>
 <html>
@@ -833,6 +835,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_inject_runtime_env_without_head_tag() {
         let html = r#"<!DOCTYPE html>
 <html>
@@ -853,6 +856,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_inject_runtime_env_no_env_vars() {
         let html = r#"<!DOCTYPE html>
 <html>
@@ -878,6 +882,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_inject_runtime_env_all_vars() {
         let html = r#"<!DOCTYPE html>
 <html>

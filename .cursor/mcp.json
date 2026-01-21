@@ -1,0 +1,12 @@
+{
+    "mcpServers": {
+      "orgbrain": {
+        "command": "node",
+        "args": ["/Users/ira/repos/orgbrain/dist/index.js"],
+        "env": {
+          "MCP_CONFIG": "/Users/ira/repos/orgbrain/config/repos.yaml"
+        }
+      }
+    }
+  }
+  
