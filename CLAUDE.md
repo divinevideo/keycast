@@ -251,7 +251,8 @@ gcloud logging read 'resource.type=cloud_run_revision AND resource.labels.servic
 
 - All sensitive keys are encrypted at rest with AES-256-GCM
 - Master encryption key must be generated before first run (`bun run key:generate`)
-- Database migrations are run manually via `tools/run-migrations.sh` (not on startup)
+- Database migrations run automatically during Cloud Build deployment (except 0001 initial schema)
+- For local development or manual runs, use `tools/run-migrations.sh`
 - Signer daemon monitors database for new/removed authorizations and adjusts connections accordingly
 - Build issues on low-memory VMs: Need 2GB+ RAM for Vite build; may require swap space or retries
 - Cloud Run uses `concurrency=50` (registration uses async bcrypt queue, enabling higher concurrency)

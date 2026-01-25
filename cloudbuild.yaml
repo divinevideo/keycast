@@ -1,4 +1,56 @@
 steps:
+  # Run database migrations BEFORE deploying new code
+  # Skips 0001 (initial schema, not idempotent) - assumes DB already initialized
+  # Migrations 0002+ are idempotent and safe to re-run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'run-migrations'
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        echo "📦 Installing PostgreSQL client..."
+        apt-get update -qq && apt-get install -y -qq postgresql-client curl > /dev/null
+
+        echo "🔌 Downloading Cloud SQL Proxy..."
+        curl -sL -o /tmp/cloud-sql-proxy https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2.14.3/cloud-sql-proxy.linux.amd64
+        chmod +x /tmp/cloud-sql-proxy
+
+        echo "🔑 Getting database credentials from Secret Manager..."
+        DATABASE_URL=$$(gcloud secrets versions access latest --secret="keycast-database-url")
+
+        # Extract password from DATABASE_URL (format: postgres://user:pass@host/db)
+        DB_PASS=$$(echo "$$DATABASE_URL" | sed -n 's|.*://[^:]*:\([^@]*\)@.*|\1|p')
+        DB_USER="postgres"
+        DB_NAME="keycast"
+
+        echo "🔌 Starting Cloud SQL Proxy..."
+        /tmp/cloud-sql-proxy openvine-co:us-central1:keycast-db-plus --port 5432 --gcloud-auth --quiet &
+        PROXY_PID=$$!
+
+        # Wait for proxy to be ready
+        for i in $$(seq 1 30); do
+          if pg_isready -h 127.0.0.1 -p 5432 > /dev/null 2>&1; then
+            echo "✅ Cloud SQL Proxy ready"
+            break
+          fi
+          sleep 1
+        done
+
+        echo "🚀 Running database migrations..."
+        export PGPASSWORD="$$DB_PASS"
+
+        # Skip 0001 (initial schema) - it's not idempotent and should only run once
+        # Migrations 0002+ are designed to be safe to re-run
+        for migration in database/migrations/000[2-9]*.sql database/migrations/00[1-9][0-9]*.sql; do
+          [ -f "$$migration" ] || continue
+          echo "  → $$(basename $$migration)"
+          psql -h 127.0.0.1 -U $$DB_USER -d $$DB_NAME -f "$$migration" -q 2>&1 | grep -v "already exists" || true
+        done
+
+        echo "✅ Migrations complete!"
+        kill $$PROXY_PID 2>/dev/null || true
+
   # Build the Docker image with correct build args
   - name: 'gcr.io/cloud-builders/docker'
     args:
