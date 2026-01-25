@@ -1290,13 +1290,7 @@ pub async fn verify_email(
         if let Some(ref device_code) = oauth_data.device_code {
             if let Some(redis) = &auth_state.state.redis {
                 let key = format!("oauth_poll:{}", device_code);
-                if let Err(e) = redis::cmd("SETEX")
-                    .arg(&key)
-                    .arg(600) // 10 minute TTL
-                    .arg(&new_code)
-                    .query_async::<()>(&mut redis.clone())
-                    .await
-                {
+                if let Err(e) = redis.setex(&key, 600, &new_code).await {
                     tracing::warn!("Failed to store OAuth code in Redis for polling: {}", e);
                     // Continue - redirect flow still works for same-device verification
                 } else {

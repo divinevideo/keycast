@@ -3725,17 +3725,10 @@ pub async fn poll(
 
     let key = format!("oauth_poll:{}", req.device_code);
 
-    match redis::cmd("GET")
-        .arg(&key)
-        .query_async::<Option<String>>(&mut redis.clone())
-        .await
-    {
+    match redis.get(&key).await {
         Ok(Some(code)) => {
             // Delete key (one-time use)
-            let _ = redis::cmd("DEL")
-                .arg(&key)
-                .query_async::<()>(&mut redis.clone())
-                .await;
+            let _ = redis.del(&key).await;
 
             Ok((StatusCode::OK, Json(PollResponse { code })).into_response())
         }

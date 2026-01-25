@@ -355,16 +355,24 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     // This handles instance registration, membership detection, and heartbeats
     // Uses Redis Pub/Sub for instant membership updates
     let redis_url = env::var("REDIS_URL")?; // Validated above
-    let coordinator = Arc::new(ClusterCoordinator::start(&redis_url).await?);
+    let redis_prefix = env::var("REDIS_KEY_PREFIX").ok();
+    let coordinator = Arc::new(
+        ClusterCoordinator::start_with_prefix(&redis_url, redis_prefix.as_deref()).await?,
+    );
     let instance_id = coordinator.instance_id();
     tracing::info!(
-        "✔︎ Cluster coordinator started: {} (Redis Pub/Sub)",
-        instance_id
+        "✔︎ Cluster coordinator started: {} (Redis Pub/Sub{})",
+        instance_id,
+        redis_prefix
+            .as_ref()
+            .map(|p| format!(", prefix: {}", p))
+            .unwrap_or_default()
     );
 
     // Create Redis connection for API (OAuth polling for multi-device email verification)
     let redis_client = redis::Client::open(redis_url.as_str())?;
     let redis_conn = redis_client.get_multiplexed_async_connection().await?;
+    let prefixed_redis = keycast_api::PrefixedRedis::new(redis_conn, redis_prefix);
     tracing::info!("✔︎ Redis connection for API initialized");
 
     // Setup key managers (one for signer, one for API - they're cheap to create)
@@ -479,7 +487,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         server_keys,
         tenant_cache,
         bcrypt_sender,
-        redis: Some(redis_conn),
+        redis: Some(prefixed_redis),
         secret_pool: secret_pool_receiver,
     });
 

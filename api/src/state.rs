@@ -1,13 +1,13 @@
 use crate::api::tenant::Tenant;
 use crate::bcrypt_queue::BcryptSender;
 use crate::handlers::http_rpc_handler::HttpHandlerCache;
+use crate::redis::PrefixedRedis;
 use keycast_core::encryption::KeyManager;
 use keycast_core::secret_pool::SecretPoolReceiver;
 use keycast_core::signing_handler::SignerHandlersCache;
 use moka::future::Cache;
 use nostr_sdk::Keys;
 use once_cell::sync::OnceCell;
-use redis::aio::MultiplexedConnection;
 use sqlx::PgPool;
 use std::sync::Arc;
 use thiserror::Error;
@@ -42,7 +42,7 @@ pub struct KeycastState {
     pub bcrypt_sender: BcryptSender,
     /// Redis connection for OAuth polling (multi-device email verification)
     /// Optional to allow graceful degradation if Redis is unavailable
-    pub redis: Option<MultiplexedConnection>,
+    pub redis: Option<PrefixedRedis>,
     /// Pre-computed secret pool for instant authorization creation
     /// Background producer generates (secret, bcrypt_hash) pairs ahead of time
     pub secret_pool: SecretPoolReceiver,

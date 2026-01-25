@@ -192,6 +192,7 @@ Required (set in `.env` or docker-compose):
 
 Optional:
 - `REDIS_URL`: Redis connection string for cluster coordination (required in production)
+- `REDIS_KEY_PREFIX`: Optional prefix for all Redis keys (e.g., `keycast` → `keycast:oauth_poll:...`). Useful for multi-app GCP Memorystore deployments.
 - `MASTER_KEY_PATH`: Path to master encryption key file (default: `./master.key`)
 - `USE_GCP_KMS`: Use Google Cloud KMS instead of file-based encryption (default: `false`)
 - `BUNKER_RELAYS`: Comma-separated relay URLs for NIP-46 communication (required, no default)
