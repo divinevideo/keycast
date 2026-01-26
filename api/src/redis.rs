@@ -121,7 +121,9 @@ impl PrefixedRedis {
                     Ok(new_conn) => {
                         let mut conn = self.conn.write().await;
                         *conn = new_conn;
-                        tracing::debug!("Refreshed PrefixedRedis connection for IAM token rotation");
+                        tracing::debug!(
+                            "Refreshed PrefixedRedis connection for IAM token rotation"
+                        );
                     }
                     Err(e) => {
                         tracing::error!("Failed to refresh connection: {:?}", e);
@@ -258,9 +260,10 @@ mod tests {
             .setex("verify_prefix", 60, "prefixed_value")
             .await
             .unwrap();
-        let raw_result: Option<String> = redis::AsyncCommands::get(&mut raw_conn, "test_prefix:verify_prefix")
-            .await
-            .unwrap();
+        let raw_result: Option<String> =
+            redis::AsyncCommands::get(&mut raw_conn, "test_prefix:verify_prefix")
+                .await
+                .unwrap();
         assert_eq!(raw_result, Some("prefixed_value".to_string()));
 
         // Cleanup

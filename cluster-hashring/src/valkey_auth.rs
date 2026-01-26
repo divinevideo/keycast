@@ -137,7 +137,9 @@ impl GcpTokenProvider {
         let expires_at = Instant::now() + duration_until_expiry;
 
         let access_token = token.as_str().to_string();
-        let ttl = expires_at.saturating_duration_since(Instant::now()).as_secs();
+        let ttl = expires_at
+            .saturating_duration_since(Instant::now())
+            .as_secs();
         tracing::debug!(ttl_secs = ttl, "Refreshed GCP access token");
 
         *cache = Some(CachedToken {

@@ -357,17 +357,12 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     // Supports GCP Memorystore Valkey with IAM authentication
     let redis_url = env::var("REDIS_URL")?; // Validated above
     let redis_prefix = env::var("REDIS_KEY_PREFIX").ok();
-    let use_valkey_iam = env::var("USE_VALKEY_IAM")
-        .unwrap_or_else(|_| "false".to_string())
-        == "true";
+    let use_valkey_iam =
+        env::var("USE_VALKEY_IAM").unwrap_or_else(|_| "false".to_string()) == "true";
 
     let coordinator = Arc::new(
-        ClusterCoordinator::start_with_config(
-            &redis_url,
-            redis_prefix.as_deref(),
-            use_valkey_iam,
-        )
-        .await?,
+        ClusterCoordinator::start_with_config(&redis_url, redis_prefix.as_deref(), use_valkey_iam)
+            .await?,
     );
     let instance_id = coordinator.instance_id();
     tracing::info!(
