@@ -959,7 +959,9 @@ version = "0.2.0"
 dependencies = [
  "anchorhash",
  "arc-swap",
+ "chrono",
  "futures-util",
+ "gcp_auth",
  "rand 0.8.5",
  "redis",
  "serde",
@@ -969,6 +971,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 
@@ -2719,6 +2722,7 @@ dependencies = [
  "blake3",
  "bs58 0.5.1",
  "chrono",
+ "cluster-hashring",
  "config",
  "crossbeam-channel",
  "dashmap",

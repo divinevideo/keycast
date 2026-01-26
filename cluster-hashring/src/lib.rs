@@ -52,8 +52,10 @@ mod coordinator;
 mod error;
 mod registry;
 mod ring;
+pub mod valkey_auth;
 
 pub use coordinator::{ClusterCoordinator, MembershipEvent};
 pub use error::Error;
 pub use registry::RedisRegistry;
 pub use ring::HashRing;
+pub use valkey_auth::ValkeyConnectionFactory;

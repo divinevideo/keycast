@@ -10,4 +10,7 @@ pub enum Error {
 
     #[error("Connection error: {0}")]
     Connection(String),
+
+    #[error("Authentication error: {0}")]
+    Auth(String),
 }

@@ -351,29 +351,52 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     let database = Database::new().await?;
     tracing::info!("✔︎ Database initialized");
 
-    // Initialize cluster coordination with Redis (Pub/Sub mode)
+    // Initialize cluster coordination with Redis/Valkey (Pub/Sub mode)
     // This handles instance registration, membership detection, and heartbeats
     // Uses Redis Pub/Sub for instant membership updates
+    // Supports GCP Memorystore Valkey with IAM authentication
     let redis_url = env::var("REDIS_URL")?; // Validated above
     let redis_prefix = env::var("REDIS_KEY_PREFIX").ok();
+    let use_valkey_iam = env::var("USE_VALKEY_IAM")
+        .unwrap_or_else(|_| "false".to_string())
+        == "true";
+
     let coordinator = Arc::new(
-        ClusterCoordinator::start_with_prefix(&redis_url, redis_prefix.as_deref()).await?,
+        ClusterCoordinator::start_with_config(
+            &redis_url,
+            redis_prefix.as_deref(),
+            use_valkey_iam,
+        )
+        .await?,
     );
     let instance_id = coordinator.instance_id();
     tracing::info!(
-        "✔︎ Cluster coordinator started: {} (Redis Pub/Sub{})",
+        "✔︎ Cluster coordinator started: {} ({}{})",
         instance_id,
+        if use_valkey_iam {
+            "Valkey IAM"
+        } else {
+            "Redis Pub/Sub"
+        },
         redis_prefix
             .as_ref()
             .map(|p| format!(", prefix: {}", p))
             .unwrap_or_default()
     );
 
-    // Create Redis connection for API (OAuth polling for multi-device email verification)
-    let redis_client = redis::Client::open(redis_url.as_str())?;
-    let redis_conn = redis_client.get_multiplexed_async_connection().await?;
-    let prefixed_redis = keycast_api::PrefixedRedis::new(redis_conn, redis_prefix);
-    tracing::info!("✔︎ Redis connection for API initialized");
+    // Create Redis connection for API using coordinator's factory (shares IAM auth)
+    let factory = coordinator.factory();
+    let redis_conn = factory.get_multiplexed_connection().await?;
+    let prefixed_redis =
+        keycast_api::PrefixedRedis::new_with_factory(redis_conn, factory, redis_prefix);
+    tracing::info!(
+        "✔︎ Redis connection for API initialized{}",
+        if use_valkey_iam {
+            " (IAM auth enabled)"
+        } else {
+            ""
+        }
+    );
 
     // Setup key managers (one for signer, one for API - they're cheap to create)
     let use_gcp_kms = env::var("USE_GCP_KMS").unwrap_or_else(|_| "false".to_string()) == "true";

@@ -1,9 +1,10 @@
+use crate::valkey_auth::ValkeyConnectionFactory;
+use crate::Error;
 use redis::aio::MultiplexedConnection;
 use redis::AsyncCommands;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
-
-use crate::Error;
 
 const DEFAULT_INSTANCES_KEY: &str = "signer_instances";
 const DEFAULT_CHANNEL: &str = "cluster:membership";
@@ -11,6 +12,7 @@ const STALE_THRESHOLD_SECS: u64 = 30;
 
 pub struct RedisRegistry {
     conn: MultiplexedConnection,
+    factory: Arc<ValkeyConnectionFactory>,
     instance_id: String,
     instances_key: String,
     channel: String,
@@ -36,8 +38,16 @@ impl RedisRegistry {
         redis_url: &str,
         prefix: Option<&str>,
     ) -> Result<Self, Error> {
-        let client = redis::Client::open(redis_url)?;
-        let mut conn = client.get_multiplexed_async_connection().await?;
+        let factory = Arc::new(ValkeyConnectionFactory::new(redis_url, false).await?);
+        Self::register_with_factory(factory, prefix).await
+    }
+
+    /// Register using a ValkeyConnectionFactory (supports IAM auth).
+    pub async fn register_with_factory(
+        factory: Arc<ValkeyConnectionFactory>,
+        prefix: Option<&str>,
+    ) -> Result<Self, Error> {
+        let mut conn = factory.get_multiplexed_connection().await?;
 
         let instance_id = Uuid::new_v4().to_string();
         let timestamp = current_timestamp_ms();
@@ -60,6 +70,7 @@ impl RedisRegistry {
         tracing::info!(%instance_id, %instances_key, "Registered instance in Redis");
         Ok(Self {
             conn,
+            factory,
             instance_id,
             instances_key,
             channel,
@@ -131,6 +142,19 @@ impl RedisRegistry {
     /// Get the Redis connection for Pub/Sub operations
     pub fn connection(&self) -> MultiplexedConnection {
         self.conn.clone()
+    }
+
+    /// Get the connection factory.
+    pub fn factory(&self) -> Arc<ValkeyConnectionFactory> {
+        self.factory.clone()
+    }
+
+    /// Refresh the Redis connection (for IAM token rotation).
+    /// This creates a new connection with fresh credentials.
+    pub async fn refresh_connection(&mut self) -> Result<(), Error> {
+        self.conn = self.factory.get_multiplexed_connection().await?;
+        tracing::debug!(instance_id = %self.instance_id, "Refreshed Redis connection");
+        Ok(())
     }
 }
 

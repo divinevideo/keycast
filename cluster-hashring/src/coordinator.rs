@@ -1,3 +1,4 @@
+use crate::valkey_auth::ValkeyConnectionFactory;
 use crate::{Error, HashRing, RedisRegistry};
 use arc_swap::ArcSwap;
 use redis::aio::PubSub;
@@ -10,6 +11,8 @@ use tokio_util::sync::CancellationToken;
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 5;
 const FULL_SYNC_INTERVAL_SECS: u64 = 30;
 const CLEANUP_PROBABILITY_PERCENT: u32 = 10;
+/// Token refresh threshold - refresh when TTL < 5 minutes
+const TOKEN_REFRESH_THRESHOLD_SECS: u64 = 300;
 
 /// Membership change event.
 #[derive(Debug, Clone, PartialEq)]
@@ -28,10 +31,11 @@ struct PubSubMessage {
 /// Orchestrates HashRing + Redis membership with Pub/Sub.
 ///
 /// Real-time membership detection via Redis Pub/Sub with periodic
-/// full sync as backup. Compatible with Google Memorystore.
+/// full sync as backup. Compatible with Google Memorystore and Valkey.
 pub struct ClusterCoordinator {
     ring: Arc<ArcSwap<HashRing>>,
     registry: Arc<tokio::sync::Mutex<RedisRegistry>>,
+    factory: Arc<ValkeyConnectionFactory>,
     cancel_token: CancellationToken,
     heartbeat_handle: Option<tokio::task::JoinHandle<()>>,
     pubsub_handle: Option<tokio::task::JoinHandle<()>>,
@@ -54,7 +58,27 @@ impl ClusterCoordinator {
     ///
     /// Returns an error if registration or initial sync fails.
     pub async fn start_with_prefix(redis_url: &str, prefix: Option<&str>) -> Result<Self, Error> {
-        let mut registry = RedisRegistry::register_with_prefix(redis_url, prefix).await?;
+        Self::start_with_config(redis_url, prefix, false).await
+    }
+
+    /// Start a coordinator with full configuration options.
+    ///
+    /// # Arguments
+    ///
+    /// * `redis_url` - Redis/Valkey connection URL
+    /// * `prefix` - Optional key prefix for namespace isolation
+    /// * `use_iam_auth` - Enable GCP IAM authentication for Memorystore Valkey
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if registration or initial sync fails.
+    pub async fn start_with_config(
+        redis_url: &str,
+        prefix: Option<&str>,
+        use_iam_auth: bool,
+    ) -> Result<Self, Error> {
+        let factory = Arc::new(ValkeyConnectionFactory::new(redis_url, use_iam_auth).await?);
+        let mut registry = RedisRegistry::register_with_factory(factory.clone(), prefix).await?;
         let instance_id = registry.instance_id().to_string();
         let channel = registry.channel().to_string();
 
@@ -71,8 +95,7 @@ impl ClusterCoordinator {
 
         // Establish Pub/Sub subscription BEFORE publishing join event.
         // This guarantees we're listening before other coordinators can see our join.
-        let client = redis::Client::open(redis_url)?;
-        let mut pubsub = client.get_async_pubsub().await?;
+        let mut pubsub = factory.get_pubsub_connection().await?;
         pubsub.subscribe(&channel).await?;
         tracing::debug!(channel = %channel, "Pub/Sub subscription established");
 
@@ -81,10 +104,11 @@ impl ClusterCoordinator {
 
         let registry = Arc::new(tokio::sync::Mutex::new(registry));
 
-        // Spawn heartbeat task
+        // Spawn heartbeat task (with token refresh for IAM)
         let heartbeat_handle = Self::spawn_heartbeat_task(
             registry.clone(),
             ring.clone(),
+            factory.clone(),
             cancel_token.clone(),
             event_tx.clone(),
         );
@@ -92,7 +116,7 @@ impl ClusterCoordinator {
         // Spawn Pub/Sub listener task with already-subscribed connection
         let pubsub_handle = Self::spawn_pubsub_listener(
             pubsub,
-            redis_url.to_string(),
+            factory.clone(),
             instance_id.clone(),
             channel,
             ring.clone(),
@@ -103,6 +127,7 @@ impl ClusterCoordinator {
         Ok(Self {
             ring,
             registry,
+            factory,
             cancel_token,
             heartbeat_handle: Some(heartbeat_handle),
             pubsub_handle: Some(pubsub_handle),
@@ -136,6 +161,7 @@ impl ClusterCoordinator {
     fn spawn_heartbeat_task(
         registry: Arc<tokio::sync::Mutex<RedisRegistry>>,
         ring: Arc<ArcSwap<HashRing>>,
+        factory: Arc<ValkeyConnectionFactory>,
         cancel_token: CancellationToken,
         event_tx: broadcast::Sender<MembershipEvent>,
     ) -> tokio::task::JoinHandle<()> {
@@ -159,6 +185,21 @@ impl ClusterCoordinator {
 
                     _ = heartbeat_interval.tick() => {
                         let mut reg = registry.lock().await;
+
+                        // Check if IAM token needs refresh (before it expires)
+                        if factory.uses_iam_auth() {
+                            let ttl = factory.token_ttl_secs().await;
+                            if ttl < TOKEN_REFRESH_THRESHOLD_SECS {
+                                tracing::debug!(
+                                    ttl_secs = ttl,
+                                    "IAM token expiring soon, refreshing connection"
+                                );
+                                if let Err(e) = reg.refresh_connection().await {
+                                    tracing::error!("Failed to refresh connection for IAM: {}", e);
+                                    // Continue with existing connection, it may still work
+                                }
+                            }
+                        }
 
                         // Send heartbeat
                         if let Err(e) = reg.heartbeat().await {
@@ -229,7 +270,7 @@ impl ClusterCoordinator {
     /// If the connection drops, the task will reconnect and resubscribe.
     fn spawn_pubsub_listener(
         initial_pubsub: PubSub,
-        redis_url: String,
+        factory: Arc<ValkeyConnectionFactory>,
         my_instance_id: String,
         channel: String,
         ring: Arc<ArcSwap<HashRing>>,
@@ -251,19 +292,8 @@ impl ClusterCoordinator {
                     first_run = false;
                     current_pubsub.take().unwrap()
                 } else {
-                    // Reconnect to Redis
-                    let client = match redis::Client::open(redis_url.as_str()) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            tracing::error!("Failed to create Redis client for Pub/Sub: {}", e);
-                            tokio::select! {
-                                _ = cancel_token.cancelled() => break,
-                                _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
-                            }
-                        }
-                    };
-
-                    let mut conn = match client.get_async_pubsub().await {
+                    // Reconnect using factory (supports IAM auth)
+                    let mut conn = match factory.get_pubsub_connection().await {
                         Ok(c) => c,
                         Err(e) => {
                             tracing::error!("Failed to get Pub/Sub connection: {}", e);
@@ -409,6 +439,11 @@ impl ClusterCoordinator {
     /// Events are broadcast AFTER the ring has been updated.
     pub fn subscribe(&self) -> broadcast::Receiver<MembershipEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Get the connection factory (for creating additional connections).
+    pub fn factory(&self) -> Arc<ValkeyConnectionFactory> {
+        self.factory.clone()
     }
 
     /// Manually refresh the hashring from Redis.

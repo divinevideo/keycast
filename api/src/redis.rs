@@ -1,15 +1,22 @@
 // ABOUTME: Wrapper around Redis connection that applies optional key prefix
 // ABOUTME: Enables multi-app GCP Memorystore deployments with isolated namespaces
 
+use cluster_hashring::ValkeyConnectionFactory;
 use redis::aio::MultiplexedConnection;
 use redis::{AsyncCommands, RedisResult};
 use std::borrow::Cow;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// A Redis connection wrapper that automatically applies a key prefix.
 /// Used for isolating keys in shared Redis instances (e.g., GCP Memorystore).
+///
+/// When created with a `ValkeyConnectionFactory`, supports automatic connection
+/// refresh for IAM token rotation.
 #[derive(Clone)]
 pub struct PrefixedRedis {
-    conn: MultiplexedConnection,
+    conn: Arc<RwLock<MultiplexedConnection>>,
+    factory: Option<Arc<ValkeyConnectionFactory>>,
     prefix: Option<String>,
 }
 
@@ -21,7 +28,30 @@ impl PrefixedRedis {
     /// * `prefix` - Optional prefix to prepend to all keys (e.g., "keycast" → "keycast:key")
     #[must_use]
     pub fn new(conn: MultiplexedConnection, prefix: Option<String>) -> Self {
-        Self { conn, prefix }
+        Self {
+            conn: Arc::new(RwLock::new(conn)),
+            factory: None,
+            prefix,
+        }
+    }
+
+    /// Create a new PrefixedRedis wrapper with a factory for connection refresh.
+    ///
+    /// # Arguments
+    /// * `conn` - The underlying Redis connection
+    /// * `factory` - Factory for creating new connections (supports IAM auth)
+    /// * `prefix` - Optional prefix to prepend to all keys
+    #[must_use]
+    pub fn new_with_factory(
+        conn: MultiplexedConnection,
+        factory: Arc<ValkeyConnectionFactory>,
+        prefix: Option<String>,
+    ) -> Self {
+        Self {
+            conn: Arc::new(RwLock::new(conn)),
+            factory: Some(factory),
+            prefix,
+        }
     }
 
     /// Apply prefix to a key if configured.
@@ -32,22 +62,46 @@ impl PrefixedRedis {
         }
     }
 
+    /// Refresh the connection (for IAM token rotation).
+    /// No-op if no factory is configured.
+    pub async fn refresh_connection(&self) -> RedisResult<()> {
+        if let Some(ref factory) = self.factory {
+            if factory.needs_token_refresh().await {
+                match factory.get_multiplexed_connection().await {
+                    Ok(new_conn) => {
+                        let mut conn = self.conn.write().await;
+                        *conn = new_conn;
+                        tracing::debug!("Refreshed PrefixedRedis connection for IAM token rotation");
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to refresh connection: {:?}", e);
+                        // Continue with existing connection
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Set a key with expiration (SETEX).
     pub async fn setex(&self, key: &str, seconds: u64, value: &str) -> RedisResult<()> {
         let prefixed = self.prefixed_key(key);
-        self.conn.clone().set_ex(prefixed, value, seconds).await
+        let conn = self.conn.read().await;
+        conn.clone().set_ex(prefixed, value, seconds).await
     }
 
     /// Get a key's value.
     pub async fn get(&self, key: &str) -> RedisResult<Option<String>> {
         let prefixed = self.prefixed_key(key);
-        self.conn.clone().get(prefixed).await
+        let conn = self.conn.read().await;
+        conn.clone().get(prefixed).await
     }
 
     /// Delete a key.
     pub async fn del(&self, key: &str) -> RedisResult<()> {
         let prefixed = self.prefixed_key(key);
-        self.conn.clone().del(prefixed).await
+        let conn = self.conn.read().await;
+        conn.clone().del(prefixed).await
     }
 }
 
