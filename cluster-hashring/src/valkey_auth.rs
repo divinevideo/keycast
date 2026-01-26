@@ -90,12 +90,15 @@ impl GcpTokenProvider {
             }
         }
 
-        // Fetch new token with retry
+        // Fetch new token with retry (exponential backoff + jitter)
         let mut last_error = None;
         let mut token = None;
         for attempt in 0..3u32 {
             if attempt > 0 {
-                let delay = Duration::from_millis(100 * 2u64.pow(attempt));
+                // Exponential backoff with jitter to avoid thundering herd
+                let base_delay = 100 * 2u64.pow(attempt);
+                let jitter = rand::random::<u64>() % 50;
+                let delay = Duration::from_millis(base_delay + jitter);
                 tokio::time::sleep(delay).await;
             }
 

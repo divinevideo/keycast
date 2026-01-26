@@ -64,11 +64,8 @@ impl PrefixedRedis {
 
     /// Check if an error indicates authentication failure.
     fn is_auth_error(e: &redis::RedisError) -> bool {
-        let msg = e.to_string();
-        msg.contains("NOAUTH")
-            || msg.contains("WRONGPASS")
-            || msg.contains("authentication")
-            || msg.contains("AUTH")
+        use redis::ErrorKind;
+        matches!(e.kind(), ErrorKind::AuthenticationFailed)
     }
 
     /// Execute operation with automatic connection refresh on auth failure.
