@@ -1,4 +1,4 @@
-use crate::valkey_auth::ValkeyConnectionFactory;
+use crate::valkey_auth::{ValkeyConnectionFactory, TOKEN_REFRESH_BUFFER_SECS};
 use crate::{Error, HashRing, RedisRegistry};
 use arc_swap::ArcSwap;
 use redis::aio::PubSub;
@@ -11,8 +11,6 @@ use tokio_util::sync::CancellationToken;
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 5;
 const FULL_SYNC_INTERVAL_SECS: u64 = 30;
 const CLEANUP_PROBABILITY_PERCENT: u32 = 10;
-/// Token refresh threshold - refresh when TTL < 5 minutes
-const TOKEN_REFRESH_THRESHOLD_SECS: u64 = 300;
 
 /// Membership change event.
 #[derive(Debug, Clone, PartialEq)]
@@ -189,7 +187,7 @@ impl ClusterCoordinator {
                         // Check if IAM token needs refresh (before it expires)
                         if factory.uses_iam_auth() {
                             let ttl = factory.token_ttl_secs().await;
-                            if ttl < TOKEN_REFRESH_THRESHOLD_SECS {
+                            if ttl < TOKEN_REFRESH_BUFFER_SECS {
                                 tracing::debug!(
                                     ttl_secs = ttl,
                                     "IAM token expiring soon, refreshing connection"

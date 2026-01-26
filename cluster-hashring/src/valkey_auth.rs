@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 /// Buffer time before token expiry to trigger refresh (5 minutes).
-const TOKEN_REFRESH_BUFFER_SECS: u64 = 300;
+pub const TOKEN_REFRESH_BUFFER_SECS: u64 = 300;
 
 /// Token with cached expiry time.
 struct CachedToken {
@@ -90,12 +90,37 @@ impl GcpTokenProvider {
             }
         }
 
-        // Fetch new token
-        let token = self
-            .provider
-            .token(&["https://www.googleapis.com/auth/cloud-platform"])
-            .await
-            .map_err(|e| Error::Auth(format!("Failed to get GCP token: {}", e)))?;
+        // Fetch new token with retry
+        let mut last_error = None;
+        let mut token = None;
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                let delay = Duration::from_millis(100 * 2u64.pow(attempt));
+                tokio::time::sleep(delay).await;
+            }
+
+            match self
+                .provider
+                .token(&["https://www.googleapis.com/auth/cloud-platform"])
+                .await
+            {
+                Ok(t) => {
+                    token = Some(t);
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(attempt = attempt + 1, "Token fetch failed: {}", e);
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        let token = token.ok_or_else(|| {
+            Error::Auth(format!(
+                "Failed to get GCP token after 3 attempts: {}",
+                last_error.map(|e| e.to_string()).unwrap_or_default()
+            ))
+        })?;
 
         // Convert chrono DateTime to Instant
         let expires_at_chrono = token.expires_at();
@@ -198,23 +223,30 @@ impl ValkeyConnectionFactory {
             let token = self
                 .token_provider
                 .as_ref()
-                .expect("token_provider should be set when use_iam_auth is true")
+                .ok_or_else(|| {
+                    Error::Config("IAM auth enabled but token provider not initialized".into())
+                })?
                 .get_token()
                 .await?;
 
-            // Parse and reconstruct URL with token as password
-            // Format: redis://default:TOKEN@host:port
-            let parsed = url::Url::parse(&self.redis_url)
+            // Parse and reconstruct URL preserving scheme, path, and query params
+            let mut parsed = url::Url::parse(&self.redis_url)
                 .map_err(|e| Error::Config(format!("Invalid Redis URL: {}", e)))?;
 
-            let host = parsed.host_str().unwrap_or("localhost");
-            let port = parsed.port().unwrap_or(6379);
+            // Set credentials while preserving everything else (scheme, path, query, etc.)
+            parsed
+                .set_username("default")
+                .map_err(|()| Error::Config("Failed to set username in URL".into()))?;
+            parsed
+                .set_password(Some(&token))
+                .map_err(|()| Error::Config("Failed to set password in URL".into()))?;
 
-            format!("redis://default:{}@{}:{}", token, host, port)
+            parsed.to_string()
         } else {
             self.redis_url.clone()
         };
 
+        // Don't log the URL - it may contain the token
         redis::Client::open(url).map_err(Error::Redis)
     }
 

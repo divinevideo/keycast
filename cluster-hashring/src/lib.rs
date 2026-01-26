@@ -58,4 +58,4 @@ pub use coordinator::{ClusterCoordinator, MembershipEvent};
 pub use error::Error;
 pub use registry::RedisRegistry;
 pub use ring::HashRing;
-pub use valkey_auth::ValkeyConnectionFactory;
+pub use valkey_auth::{ValkeyConnectionFactory, TOKEN_REFRESH_BUFFER_SECS};

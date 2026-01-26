@@ -62,6 +62,50 @@ impl PrefixedRedis {
         }
     }
 
+    /// Check if an error indicates authentication failure.
+    fn is_auth_error(e: &redis::RedisError) -> bool {
+        let msg = e.to_string();
+        msg.contains("NOAUTH")
+            || msg.contains("WRONGPASS")
+            || msg.contains("authentication")
+            || msg.contains("AUTH")
+    }
+
+    /// Execute operation with automatic connection refresh on auth failure.
+    async fn with_refresh<T, F, Fut>(&self, op: F) -> RedisResult<T>
+    where
+        F: Fn(MultiplexedConnection) -> Fut,
+        Fut: std::future::Future<Output = RedisResult<T>>,
+    {
+        let conn = self.conn.read().await.clone();
+        match op(conn).await {
+            Ok(result) => Ok(result),
+            Err(e) if Self::is_auth_error(&e) => {
+                // Token may have expired, try refresh
+                if let Some(ref factory) = self.factory {
+                    tracing::debug!("Auth error detected, attempting connection refresh");
+                    match factory.get_multiplexed_connection().await {
+                        Ok(new_conn) => {
+                            *self.conn.write().await = new_conn.clone();
+                            tracing::debug!(
+                                "Connection refreshed after auth error, retrying operation"
+                            );
+                            // Retry with new connection
+                            op(new_conn).await
+                        }
+                        Err(refresh_err) => {
+                            tracing::error!("Failed to refresh connection: {:?}", refresh_err);
+                            Err(e) // Return original error
+                        }
+                    }
+                } else {
+                    Err(e)
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Refresh the connection (for IAM token rotation).
     /// No-op if no factory is configured.
     pub async fn refresh_connection(&self) -> RedisResult<()> {
@@ -85,23 +129,34 @@ impl PrefixedRedis {
 
     /// Set a key with expiration (SETEX).
     pub async fn setex(&self, key: &str, seconds: u64, value: &str) -> RedisResult<()> {
-        let prefixed = self.prefixed_key(key);
-        let conn = self.conn.read().await;
-        conn.clone().set_ex(prefixed, value, seconds).await
+        let prefixed = self.prefixed_key(key).into_owned();
+        let value = value.to_string();
+        self.with_refresh(|mut conn| {
+            let key = prefixed.clone();
+            let val = value.clone();
+            async move { conn.set_ex(key, val, seconds).await }
+        })
+        .await
     }
 
     /// Get a key's value.
     pub async fn get(&self, key: &str) -> RedisResult<Option<String>> {
-        let prefixed = self.prefixed_key(key);
-        let conn = self.conn.read().await;
-        conn.clone().get(prefixed).await
+        let prefixed = self.prefixed_key(key).into_owned();
+        self.with_refresh(|mut conn| {
+            let key = prefixed.clone();
+            async move { conn.get(key).await }
+        })
+        .await
     }
 
     /// Delete a key.
     pub async fn del(&self, key: &str) -> RedisResult<()> {
-        let prefixed = self.prefixed_key(key);
-        let conn = self.conn.read().await;
-        conn.clone().del(prefixed).await
+        let prefixed = self.prefixed_key(key).into_owned();
+        self.with_refresh(|mut conn| {
+            let key = prefixed.clone();
+            async move { conn.del(key).await }
+        })
+        .await
     }
 }
 
