@@ -128,9 +128,12 @@ impl GcpTokenProvider {
         // Convert chrono DateTime to Instant
         let expires_at_chrono = token.expires_at();
         let now_chrono = chrono::Utc::now();
-        let duration_until_expiry = (expires_at_chrono - now_chrono)
-            .to_std()
-            .unwrap_or(Duration::from_secs(3600));
+        let duration_until_expiry = (expires_at_chrono - now_chrono).to_std().unwrap_or_else(|_| {
+            tracing::warn!(
+                "Token expiry conversion failed (token may be expired or clock skew), using 1h default"
+            );
+            Duration::from_secs(3600)
+        });
         let expires_at = Instant::now() + duration_until_expiry;
 
         let access_token = token.as_str().to_string();

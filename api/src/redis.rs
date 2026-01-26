@@ -63,9 +63,18 @@ impl PrefixedRedis {
     }
 
     /// Check if an error indicates authentication failure.
+    /// Handles various auth error patterns from Redis/Valkey including expired IAM tokens.
     fn is_auth_error(e: &redis::RedisError) -> bool {
         use redis::ErrorKind;
-        matches!(e.kind(), ErrorKind::AuthenticationFailed)
+        match e.kind() {
+            ErrorKind::AuthenticationFailed => true,
+            _ => {
+                // Check error message for auth-related patterns
+                // Expired IAM tokens may manifest as NOAUTH or connection errors
+                let msg = e.to_string().to_lowercase();
+                msg.contains("noauth") || msg.contains("wrongpass") || msg.contains("auth")
+            }
+        }
     }
 
     /// Execute operation with automatic connection refresh on auth failure.
@@ -159,6 +168,8 @@ impl PrefixedRedis {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn test_prefixed_key_with_prefix() {
         // Can't test without a real connection, but we can test the key logic
@@ -183,5 +194,96 @@ mod tests {
             None => key.to_string(),
         };
         assert_eq!(result, "oauth_poll:abc123");
+    }
+
+    #[test]
+    fn test_is_auth_error_authentication_failed() {
+        let err = redis::RedisError::from((
+            redis::ErrorKind::AuthenticationFailed,
+            "Authentication failed",
+        ));
+        assert!(PrefixedRedis::is_auth_error(&err));
+    }
+
+    #[test]
+    fn test_is_auth_error_noauth_message() {
+        let err = redis::RedisError::from((
+            redis::ErrorKind::ResponseError,
+            "NOAUTH Authentication required",
+        ));
+        assert!(PrefixedRedis::is_auth_error(&err));
+    }
+
+    #[test]
+    fn test_is_auth_error_wrongpass_message() {
+        let err = redis::RedisError::from((redis::ErrorKind::ResponseError, "WRONGPASS invalid"));
+        assert!(PrefixedRedis::is_auth_error(&err));
+    }
+
+    #[test]
+    fn test_is_auth_error_non_auth_error() {
+        let err = redis::RedisError::from((redis::ErrorKind::IoError, "Connection refused"));
+        assert!(!PrefixedRedis::is_auth_error(&err));
+    }
+
+    /// Integration test for PrefixedRedis operations.
+    /// Requires a running Redis instance at localhost:6379.
+    /// Run with: cargo test --package keycast-api test_prefixed_redis_integration -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn test_prefixed_redis_integration() {
+        let client = redis::Client::open("redis://localhost:6379").unwrap();
+        let conn = client.get_multiplexed_async_connection().await.unwrap();
+        let redis = PrefixedRedis::new(conn, Some("test_prefix".to_string()));
+
+        // Test setex and get
+        redis
+            .setex("integration_key", 60, "test_value")
+            .await
+            .unwrap();
+        let result = redis.get("integration_key").await.unwrap();
+        assert_eq!(result, Some("test_value".to_string()));
+
+        // Test del
+        redis.del("integration_key").await.unwrap();
+        let result = redis.get("integration_key").await.unwrap();
+        assert_eq!(result, None);
+
+        // Verify the key was actually prefixed by checking raw Redis
+        let client2 = redis::Client::open("redis://localhost:6379").unwrap();
+        let mut raw_conn = client2.get_multiplexed_async_connection().await.unwrap();
+
+        // Set via prefixed, check via raw
+        redis
+            .setex("verify_prefix", 60, "prefixed_value")
+            .await
+            .unwrap();
+        let raw_result: Option<String> = redis::AsyncCommands::get(&mut raw_conn, "test_prefix:verify_prefix")
+            .await
+            .unwrap();
+        assert_eq!(raw_result, Some("prefixed_value".to_string()));
+
+        // Cleanup
+        redis.del("verify_prefix").await.unwrap();
+    }
+
+    /// Integration test without prefix to verify pass-through behavior.
+    #[tokio::test]
+    #[ignore]
+    async fn test_prefixed_redis_no_prefix_integration() {
+        let client = redis::Client::open("redis://localhost:6379").unwrap();
+        let conn = client.get_multiplexed_async_connection().await.unwrap();
+        let redis = PrefixedRedis::new(conn, None);
+
+        // Test without prefix
+        redis
+            .setex("no_prefix_key", 60, "direct_value")
+            .await
+            .unwrap();
+        let result = redis.get("no_prefix_key").await.unwrap();
+        assert_eq!(result, Some("direct_value".to_string()));
+
+        // Cleanup
+        redis.del("no_prefix_key").await.unwrap();
     }
 }
