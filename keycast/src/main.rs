@@ -42,6 +42,37 @@ async fn health_check() -> impl IntoResponse {
     StatusCode::OK
 }
 
+/// Run database migrations and exit
+/// Used by Kubernetes Jobs to run migrations before app startup
+fn run_migrations() -> Result<(), Box<dyn std::error::Error>> {
+    println!("🔄 Running database migrations...");
+
+    let database_url =
+        env::var("DATABASE_URL").map_err(|_| "DATABASE_URL must be set for migrations")?;
+
+    // Build minimal runtime just for migrations
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    rt.block_on(async {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+
+        // Run migrations using SQLx's built-in migrator
+        // Uses advisory locks to prevent concurrent migrations
+        sqlx::migrate!("../database/migrations").run(&pool).await?;
+
+        pool.close().await;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+
+    println!("✅ Migrations complete!");
+    Ok(())
+}
+
 /// Inject runtime environment variables into HTML via window.__ENV__
 /// Injects a <script> tag before </head> with runtime config
 fn inject_runtime_env(html: &str) -> String {
@@ -253,6 +284,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     dotenv().ok();
+
+    // Check for --migrate flag (run migrations and exit)
+    if std::env::args().any(|arg| arg == "--migrate") {
+        return run_migrations();
+    }
 
     // Use tokio default: 1 worker thread per CPU core
     // Override with TOKIO_WORKER_THREADS env var if needed
