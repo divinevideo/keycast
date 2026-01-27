@@ -8,16 +8,26 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-/// A Redis connection wrapper that automatically applies a key prefix.
-/// Used for isolating keys in shared Redis instances (e.g., GCP Memorystore).
+/// Redis connection wrapper with automatic key prefixing.
 ///
-/// When created with a `ValkeyConnectionFactory`, supports automatic connection
-/// refresh for IAM token rotation.
+/// Used for isolating keys in shared Redis instances (e.g., GCP Memorystore).
+/// When created with a [`ValkeyConnectionFactory`], supports automatic
+/// connection refresh for IAM token rotation.
 #[derive(Clone)]
 pub struct PrefixedRedis {
     conn: Arc<RwLock<MultiplexedConnection>>,
     factory: Option<Arc<ValkeyConnectionFactory>>,
     prefix: Option<String>,
+}
+
+impl std::fmt::Debug for PrefixedRedis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrefixedRedis")
+            .field("conn", &"<connection>")
+            .field("factory", &self.factory.as_ref().map(|_| "<configured>"))
+            .field("prefix", &self.prefix)
+            .finish()
+    }
 }
 
 impl PrefixedRedis {
@@ -63,18 +73,30 @@ impl PrefixedRedis {
     }
 
     /// Check if an error indicates authentication failure.
-    /// Handles various auth error patterns from Redis/Valkey including expired IAM tokens.
+    ///
+    /// Handles various auth error patterns from Redis/Valkey including expired
+    /// IAM tokens which may manifest as NOAUTH or WRONGPASS errors.
     fn is_auth_error(e: &redis::RedisError) -> bool {
         use redis::ErrorKind;
-        match e.kind() {
-            ErrorKind::AuthenticationFailed => true,
-            _ => {
-                // Check error message for auth-related patterns
-                // Expired IAM tokens may manifest as NOAUTH or connection errors
-                let msg = e.to_string().to_lowercase();
-                msg.contains("noauth") || msg.contains("wrongpass") || msg.contains("auth")
+
+        // Check for explicit authentication failure kind (set during connection setup)
+        if e.kind() == ErrorKind::AuthenticationFailed {
+            return true;
+        }
+
+        // Check error code directly - NOAUTH/WRONGPASS come through as Extension errors
+        // with the code accessible via e.code(). This is more reliable than string matching.
+        if let Some(code) = e.code() {
+            let code_upper = code.to_uppercase();
+            if code_upper == "NOAUTH" || code_upper == "WRONGPASS" {
+                return true;
             }
         }
+
+        // Fallback: check error message for auth-related patterns.
+        // This handles edge cases where the error might not have a code set.
+        let msg = e.to_string().to_lowercase();
+        msg.contains("noauth") || msg.contains("wrongpass")
     }
 
     /// Execute operation with automatic connection refresh on auth failure.
@@ -112,30 +134,38 @@ impl PrefixedRedis {
         }
     }
 
-    /// Refresh the connection (for IAM token rotation).
-    /// No-op if no factory is configured.
-    pub async fn refresh_connection(&self) -> RedisResult<()> {
-        if let Some(ref factory) = self.factory {
-            if factory.needs_token_refresh().await {
-                match factory.get_multiplexed_connection().await {
-                    Ok(new_conn) => {
-                        let mut conn = self.conn.write().await;
-                        *conn = new_conn;
-                        tracing::debug!(
-                            "Refreshed PrefixedRedis connection for IAM token rotation"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to refresh connection: {:?}", e);
-                        // Continue with existing connection
-                    }
-                }
+    /// Refresh the connection proactively (for IAM token rotation).
+    ///
+    /// This is a best-effort operation that logs errors but does not fail.
+    /// The existing connection remains usable if refresh fails - the next
+    /// operation will trigger reactive refresh via [`Self::with_refresh`].
+    ///
+    /// No-op if no factory is configured or token doesn't need refresh yet.
+    pub async fn refresh_connection(&self) {
+        let Some(ref factory) = self.factory else {
+            return;
+        };
+
+        if !factory.needs_token_refresh().await {
+            return;
+        }
+
+        match factory.get_multiplexed_connection().await {
+            Ok(new_conn) => {
+                *self.conn.write().await = new_conn;
+                tracing::debug!("Refreshed PrefixedRedis connection for IAM token rotation");
+            }
+            Err(e) => {
+                tracing::error!("Failed to refresh connection: {:?}", e);
             }
         }
-        Ok(())
     }
 
     /// Set a key with expiration (SETEX).
+    ///
+    /// # Errors
+    ///
+    /// Returns error if Redis operation fails or connection refresh fails.
     pub async fn setex(&self, key: &str, seconds: u64, value: &str) -> RedisResult<()> {
         let prefixed = self.prefixed_key(key).into_owned();
         let value = value.to_string();
@@ -148,6 +178,10 @@ impl PrefixedRedis {
     }
 
     /// Get a key's value.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if Redis operation fails or connection refresh fails.
     pub async fn get(&self, key: &str) -> RedisResult<Option<String>> {
         let prefixed = self.prefixed_key(key).into_owned();
         self.with_refresh(|mut conn| {
@@ -158,6 +192,10 @@ impl PrefixedRedis {
     }
 
     /// Delete a key.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if Redis operation fails or connection refresh fails.
     pub async fn del(&self, key: &str) -> RedisResult<()> {
         let prefixed = self.prefixed_key(key).into_owned();
         self.with_refresh(|mut conn| {
@@ -171,6 +209,13 @@ impl PrefixedRedis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Compile-time assertion that PrefixedRedis is Send + Sync.
+    // Required for safe use across async task boundaries.
+    const _: () = {
+        const fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<PrefixedRedis>();
+    };
 
     #[test]
     fn test_prefixed_key_with_prefix() {
@@ -209,6 +254,7 @@ mod tests {
 
     #[test]
     fn test_is_auth_error_noauth_message() {
+        // Tests the string-matching fallback for NOAUTH errors
         let err = redis::RedisError::from((
             redis::ErrorKind::ResponseError,
             "NOAUTH Authentication required",
@@ -218,13 +264,25 @@ mod tests {
 
     #[test]
     fn test_is_auth_error_wrongpass_message() {
-        let err = redis::RedisError::from((redis::ErrorKind::ResponseError, "WRONGPASS invalid"));
+        // Tests the string-matching fallback for WRONGPASS errors
+        let err = redis::RedisError::from((
+            redis::ErrorKind::ResponseError,
+            "WRONGPASS invalid password",
+        ));
         assert!(PrefixedRedis::is_auth_error(&err));
     }
 
     #[test]
     fn test_is_auth_error_non_auth_error() {
         let err = redis::RedisError::from((redis::ErrorKind::IoError, "Connection refused"));
+        assert!(!PrefixedRedis::is_auth_error(&err));
+    }
+
+    #[test]
+    fn test_is_auth_error_unrelated_response_error() {
+        // Other response errors should not be treated as auth errors
+        let err =
+            redis::RedisError::from((redis::ErrorKind::ResponseError, "ERR unknown command 'foo'"));
         assert!(!PrefixedRedis::is_auth_error(&err));
     }
 

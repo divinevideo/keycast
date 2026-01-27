@@ -27,8 +27,21 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
-/// Buffer time before token expiry to trigger refresh (5 minutes).
+/// Buffer time before token expiry to trigger refresh.
+///
+/// Set to 5 minutes to allow time for connection refresh before token
+/// expires, accounting for network latency and potential retries.
+/// Too low risks auth failures mid-operation; too high wastes tokens.
 pub const TOKEN_REFRESH_BUFFER_SECS: u64 = 300;
+
+/// Maximum number of retry attempts when fetching GCP tokens.
+const TOKEN_FETCH_MAX_RETRIES: u32 = 3;
+
+/// Base delay in milliseconds for exponential backoff on token fetch retry.
+const TOKEN_FETCH_BASE_DELAY_MS: u64 = 100;
+
+/// Maximum jitter in milliseconds added to retry delay to avoid thundering herd.
+const TOKEN_FETCH_JITTER_MS: u64 = 50;
 
 /// Token with cached expiry time.
 struct CachedToken {
@@ -93,11 +106,11 @@ impl GcpTokenProvider {
         // Fetch new token with retry (exponential backoff + jitter)
         let mut last_error = None;
         let mut token = None;
-        for attempt in 0..3u32 {
+        for attempt in 0..TOKEN_FETCH_MAX_RETRIES {
             if attempt > 0 {
                 // Exponential backoff with jitter to avoid thundering herd
-                let base_delay = 100 * 2u64.pow(attempt);
-                let jitter = rand::random::<u64>() % 50;
+                let base_delay = TOKEN_FETCH_BASE_DELAY_MS * 2u64.pow(attempt);
+                let jitter = rand::random::<u64>() % TOKEN_FETCH_JITTER_MS;
                 let delay = Duration::from_millis(base_delay + jitter);
                 tokio::time::sleep(delay).await;
             }
@@ -120,7 +133,8 @@ impl GcpTokenProvider {
 
         let token = token.ok_or_else(|| {
             Error::Auth(format!(
-                "Failed to get GCP token after 3 attempts: {}",
+                "Failed to get GCP token after {} attempts: {}",
+                TOKEN_FETCH_MAX_RETRIES,
                 last_error.map(|e| e.to_string()).unwrap_or_default()
             ))
         })?;
@@ -173,6 +187,19 @@ pub struct ValkeyConnectionFactory {
     token_provider: Option<Arc<GcpTokenProvider>>,
 }
 
+impl std::fmt::Debug for ValkeyConnectionFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ValkeyConnectionFactory")
+            .field("redis_url", &"<redacted>")
+            .field("use_iam_auth", &self.use_iam_auth)
+            .field(
+                "token_provider",
+                &self.token_provider.as_ref().map(|_| "<configured>"),
+            )
+            .finish()
+    }
+}
+
 impl ValkeyConnectionFactory {
     /// Create a new connection factory.
     ///
@@ -208,7 +235,9 @@ impl ValkeyConnectionFactory {
     }
 
     /// Get the TTL of the current cached token in seconds.
+    ///
     /// Returns 0 if IAM is disabled or no token is cached.
+    #[must_use]
     pub async fn token_ttl_secs(&self) -> u64 {
         if let Some(ref provider) = self.token_provider {
             provider.token_ttl_secs().await
@@ -218,6 +247,7 @@ impl ValkeyConnectionFactory {
     }
 
     /// Check if token refresh is needed (TTL < 5 minutes).
+    #[must_use]
     pub async fn needs_token_refresh(&self) -> bool {
         if !self.use_iam_auth {
             return false;
@@ -282,7 +312,12 @@ impl ValkeyConnectionFactory {
     }
 
     /// Force a token refresh (useful before long-running operations).
+    ///
     /// No-op if IAM is disabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if token refresh fails.
     pub async fn refresh_token(&self) -> Result<(), Error> {
         if let Some(ref provider) = self.token_provider {
             provider.get_token().await?;
@@ -294,6 +329,13 @@ impl ValkeyConnectionFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Compile-time assertion that ValkeyConnectionFactory is Send + Sync.
+    // Required for safe use across async task boundaries.
+    const _: () = {
+        const fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ValkeyConnectionFactory>();
+    };
 
     #[tokio::test]
     async fn test_factory_without_iam() {
