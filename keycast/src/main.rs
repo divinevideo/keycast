@@ -42,20 +42,51 @@ async fn health_check() -> impl IntoResponse {
     StatusCode::OK
 }
 
+/// Run database migrations and exit
+/// Used by Kubernetes Jobs to run migrations before app startup
+fn run_migrations() -> Result<(), Box<dyn std::error::Error>> {
+    println!("🔄 Running database migrations...");
+
+    let database_url =
+        env::var("DATABASE_URL").map_err(|_| "DATABASE_URL must be set for migrations")?;
+
+    // Build minimal runtime just for migrations
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    rt.block_on(async {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+
+        // Run migrations using SQLx's built-in migrator
+        // Uses advisory locks to prevent concurrent migrations
+        sqlx::migrate!("../database/migrations").run(&pool).await?;
+
+        pool.close().await;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+
+    println!("✅ Migrations complete!");
+    Ok(())
+}
+
 /// Inject runtime environment variables into HTML via window.__ENV__
 /// Injects a <script> tag before </head> with runtime config
 fn inject_runtime_env(html: &str) -> String {
     // Build runtime environment object
     let mut env_obj = json!({});
 
-    // VITE_DOMAIN - API domain for frontend
-    if let Ok(domain) = env::var("VITE_DOMAIN") {
+    // VITE_DOMAIN - API domain for frontend (from APP_URL)
+    if let Ok(domain) = env::var("APP_URL") {
         env_obj["VITE_DOMAIN"] = json!(domain);
     }
 
-    // VITE_ALLOWED_PUBKEYS - comma-separated admin pubkeys
-    if let Ok(pubkeys) = env::var("VITE_ALLOWED_PUBKEYS") {
-        env_obj["VITE_ALLOWED_PUBKEYS"] = json!(pubkeys);
+    // ALLOWED_PUBKEYS - comma-separated admin pubkeys
+    if let Ok(pubkeys) = env::var("ALLOWED_PUBKEYS") {
+        env_obj["ALLOWED_PUBKEYS"] = json!(pubkeys);
     }
 
     // VITE_NDK_EXPLICIT_RELAYS - comma-separated relay URLs for reading/subscribing (optional)
@@ -253,6 +284,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     dotenv().ok();
+
+    // Check for --migrate flag (run migrations and exit)
+    if std::env::args().any(|arg| arg == "--migrate") {
+        return run_migrations();
+    }
 
     // Use tokio default: 1 worker thread per CPU core
     // Override with TOKIO_WORKER_THREADS env var if needed
@@ -816,8 +852,8 @@ mod tests {
 </html>"#;
 
         // Set environment variables
-        std::env::set_var("VITE_DOMAIN", "https://example.com");
-        std::env::set_var("VITE_ALLOWED_PUBKEYS", "pubkey1,pubkey2");
+        std::env::set_var("APP_URL", "https://example.com");
+        std::env::set_var("ALLOWED_PUBKEYS", "pubkey1,pubkey2");
 
         let result = inject_runtime_env(html);
 
@@ -825,13 +861,13 @@ mod tests {
         assert!(result.contains("window.__ENV__"));
         assert!(result.contains("VITE_DOMAIN"));
         assert!(result.contains("https://example.com"));
-        assert!(result.contains("VITE_ALLOWED_PUBKEYS"));
+        assert!(result.contains("ALLOWED_PUBKEYS"));
         assert!(result.contains("pubkey1,pubkey2"));
         assert!(result.contains("</head>"));
 
         // Clean up
-        std::env::remove_var("VITE_DOMAIN");
-        std::env::remove_var("VITE_ALLOWED_PUBKEYS");
+        std::env::remove_var("APP_URL");
+        std::env::remove_var("ALLOWED_PUBKEYS");
     }
 
     #[test]
@@ -844,7 +880,7 @@ mod tests {
 </body>
 </html>"#;
 
-        std::env::set_var("VITE_DOMAIN", "https://example.com");
+        std::env::set_var("APP_URL", "https://example.com");
 
         let result = inject_runtime_env(html);
 
@@ -852,7 +888,7 @@ mod tests {
         assert!(result.contains("window.__ENV__"));
         assert!(result.contains("<body>"));
 
-        std::env::remove_var("VITE_DOMAIN");
+        std::env::remove_var("APP_URL");
     }
 
     #[test]
@@ -869,8 +905,8 @@ mod tests {
 </html>"#;
 
         // Clear all env vars that might be set from other tests
-        std::env::remove_var("VITE_DOMAIN");
-        std::env::remove_var("VITE_ALLOWED_PUBKEYS");
+        std::env::remove_var("APP_URL");
+        std::env::remove_var("ALLOWED_PUBKEYS");
         std::env::remove_var("VITE_NDK_EXPLICIT_RELAYS");
         std::env::remove_var("VITE_NDK_BUNKER_RELAYS");
 
@@ -894,8 +930,8 @@ mod tests {
 </body>
 </html>"#;
 
-        std::env::set_var("VITE_DOMAIN", "https://example.com");
-        std::env::set_var("VITE_ALLOWED_PUBKEYS", "key1,key2");
+        std::env::set_var("APP_URL", "https://example.com");
+        std::env::set_var("ALLOWED_PUBKEYS", "key1,key2");
         std::env::set_var(
             "VITE_NDK_EXPLICIT_RELAYS",
             "wss://relay1.com,wss://relay2.com",
@@ -905,12 +941,12 @@ mod tests {
         let result = inject_runtime_env(html);
 
         assert!(result.contains("VITE_DOMAIN"));
-        assert!(result.contains("VITE_ALLOWED_PUBKEYS"));
+        assert!(result.contains("ALLOWED_PUBKEYS"));
         assert!(result.contains("VITE_NDK_EXPLICIT_RELAYS"));
         assert!(result.contains("VITE_NDK_BUNKER_RELAYS"));
 
-        std::env::remove_var("VITE_DOMAIN");
-        std::env::remove_var("VITE_ALLOWED_PUBKEYS");
+        std::env::remove_var("APP_URL");
+        std::env::remove_var("ALLOWED_PUBKEYS");
         std::env::remove_var("VITE_NDK_EXPLICIT_RELAYS");
         std::env::remove_var("VITE_NDK_BUNKER_RELAYS");
     }

@@ -207,6 +207,9 @@ async fn bcrypt_worker_loop(worker_id: usize, rx: Receiver<BcryptJob>, pool: PgP
 
 /// Spawn a cleanup task that periodically removes stale signup rows
 /// (rows with NULL password_hash older than the TTL)
+///
+/// Note: This excludes preloaded users (vine_id IS NOT NULL) which intentionally
+/// have no password_hash until the user claims their account.
 pub fn spawn_cleanup_task(pool: PgPool) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300)); // 5 minutes
@@ -216,6 +219,7 @@ pub fn spawn_cleanup_task(pool: PgPool) -> tokio::task::JoinHandle<()> {
 
             let result = sqlx::query(
                 "DELETE FROM users WHERE password_hash IS NULL
+                 AND vine_id IS NULL
                  AND created_at < NOW() - INTERVAL '10 minutes'",
             )
             .execute(&pool)

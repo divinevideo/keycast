@@ -7,7 +7,7 @@ declare global {
     interface Window {
         __ENV__?: {
             VITE_DOMAIN?: string;
-            VITE_ALLOWED_PUBKEYS?: string;
+            ALLOWED_PUBKEYS?: string;
             VITE_NDK_EXPLICIT_RELAYS?: string;
             VITE_NDK_BUNKER_RELAYS?: string;
         };
@@ -17,12 +17,12 @@ declare global {
 /**
  * Get a runtime environment variable with fallback to build-time value
  */
-export function getEnvVar(key: 'VITE_DOMAIN' | 'VITE_ALLOWED_PUBKEYS' | 'VITE_NDK_EXPLICIT_RELAYS' | 'VITE_NDK_BUNKER_RELAYS'): string | undefined {
+export function getEnvVar(key: 'VITE_DOMAIN' | 'ALLOWED_PUBKEYS' | 'VITE_NDK_EXPLICIT_RELAYS' | 'VITE_NDK_BUNKER_RELAYS'): string | undefined {
     // Check runtime injection first (from window.__ENV__)
     if (typeof window !== 'undefined' && window.__ENV__?.[key]) {
         return window.__ENV__[key];
     }
-    
+
     // Fallback to build-time value (import.meta.env)
     return import.meta.env[key];
 }
@@ -35,8 +35,8 @@ export function getViteDomain(defaultValue: string = 'http://localhost:3000'): s
 }
 
 /**
- * Get VITE_ALLOWED_PUBKEYS (comma-separated string)
+ * Get ALLOWED_PUBKEYS (comma-separated string)
  */
-export function getViteAllowedPubkeys(): string {
-    return getEnvVar('VITE_ALLOWED_PUBKEYS') || '';
+export function getAllowedPubkeys(): string {
+    return getEnvVar('ALLOWED_PUBKEYS') || '';
 }

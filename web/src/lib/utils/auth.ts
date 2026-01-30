@@ -9,7 +9,7 @@ import {
     type NDKUser,
 } from "@nostr-dev-kit/ndk";
 import toast from "svelte-hot-french-toast";
-import { getViteDomain, getViteAllowedPubkeys } from "$lib/utils/env";
+import { getViteDomain, getAllowedPubkeys } from "$lib/utils/env";
 
 export enum SigninMethod {
     Nip07 = "nip07",
@@ -19,7 +19,7 @@ export enum SigninMethod {
 }
 
 function isAllowedPubkey(pubkey: string) {
-    const allowedPubkeys = getViteAllowedPubkeys();
+    const allowedPubkeys = getAllowedPubkeys();
     return allowedPubkeys && allowedPubkeys.includes(pubkey);
 }
 

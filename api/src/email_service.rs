@@ -48,7 +48,9 @@ pub struct DevEmailSender {
 
 impl DevEmailSender {
     pub fn new() -> Self {
-        let base_url = env::var("BASE_URL").unwrap_or_else(|_| "http://localhost:5173".to_string());
+        let base_url = env::var("BASE_URL")
+            .or_else(|_| env::var("APP_URL"))
+            .unwrap_or_else(|_| "http://localhost:5173".to_string());
 
         tracing::info!("===========================================");
         tracing::info!("  EMAIL SERVICE: Development Mode");
@@ -176,6 +178,23 @@ struct SendGridEmail {
     from: EmailAddress,
     subject: String,
     content: Vec<Content>,
+    tracking_settings: TrackingSettings,
+}
+
+#[derive(Debug, Serialize)]
+struct TrackingSettings {
+    click_tracking: ClickTracking,
+    open_tracking: OpenTracking,
+}
+
+#[derive(Debug, Serialize)]
+struct ClickTracking {
+    enable: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenTracking {
+    enable: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -208,9 +227,11 @@ pub struct SendGridEmailSender {
 impl SendGridEmailSender {
     pub fn new(api_key: String) -> Self {
         let from_email =
-            env::var("FROM_EMAIL").unwrap_or_else(|_| "noreply@keycast.app".to_string());
+            env::var("FROM_EMAIL").unwrap_or_else(|_| "noreply@divine.video".to_string());
         let from_name = env::var("FROM_NAME").unwrap_or_else(|_| "diVine".to_string());
-        let base_url = env::var("BASE_URL").unwrap_or_else(|_| "http://localhost:5173".to_string());
+        let base_url = env::var("BASE_URL")
+            .or_else(|_| env::var("APP_URL"))
+            .unwrap_or_else(|_| "http://localhost:5173".to_string());
 
         tracing::info!("Email service initialized with SendGrid");
 
@@ -260,6 +281,12 @@ impl SendGridEmailSender {
                     value: html_content.to_string(),
                 },
             ],
+            // Disable tracking for security-sensitive emails (verification, password reset)
+            // to prevent tokens from passing through SendGrid's redirect servers
+            tracking_settings: TrackingSettings {
+                click_tracking: ClickTracking { enable: false },
+                open_tracking: OpenTracking { enable: false },
+            },
         };
 
         let client = reqwest::Client::new();

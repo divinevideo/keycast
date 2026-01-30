@@ -13,6 +13,7 @@ COPY ./core ./core
 COPY ./keycast ./keycast
 COPY ./cluster-hashring ./cluster-hashring
 COPY ./tools ./tools
+COPY ./database/migrations ./database/migrations
 COPY ./Cargo.toml ./Cargo.toml
 COPY ./Cargo.lock ./Cargo.lock
 
