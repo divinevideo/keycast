@@ -1776,14 +1776,17 @@ pub async fn get_account_status(
 
 /// Update username (for NIP-05) - the only profile data we store server-side
 /// Client should publish kind 0 profile events to relays via bunker URL
+/// Also syncs username to divine-name-server for NIP-05 on divine.video
 pub async fn update_profile(
     tenant: crate::api::tenant::TenantExtractor,
-    State(pool): State<PgPool>,
+    State(auth_state): State<super::routes::AuthState>,
     headers: HeaderMap,
     Json(profile): Json<ProfileData>,
 ) -> Result<Json<serde_json::Value>, AuthError> {
     let user_pubkey = extract_user_from_token(&headers).await?;
     let tenant_id = tenant.0.id;
+    let pool = &auth_state.state.db;
+    let key_manager = auth_state.state.key_manager.as_ref();
 
     tracing::info!(
         "Updating username for user: {} in tenant: {}",
@@ -1791,15 +1794,26 @@ pub async fn update_profile(
         tenant_id
     );
 
+    // Track divine-name-server sync result
+    let mut divine_names_result: Option<Result<crate::divine_names::ClaimResponse, String>> = None;
+
     // Only update username - everything else is stored on Nostr relays
     if let Some(ref username) = profile.username {
-        // Validate username (alphanumeric, dash, underscore only)
+        // Validate username (alphanumeric, dash, underscore only - matches divine-name-server ASCII rules)
+        // Note: divine-name-server also supports Unicode/IDN but we keep keycast validation simple
         if !username
             .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            .all(|c| c.is_alphanumeric() || c == '-')
         {
             return Err(AuthError::Internal(
-                "Username can only contain letters, numbers, dashes, and underscores".to_string(),
+                "Username can only contain letters, numbers, and hyphens".to_string(),
+            ));
+        }
+
+        // Cannot start or end with hyphen
+        if username.starts_with('-') || username.ends_with('-') {
+            return Err(AuthError::Internal(
+                "Username cannot start or end with a hyphen".to_string(),
             ));
         }
 
@@ -1812,7 +1826,42 @@ pub async fn update_profile(
             return Err(AuthError::Internal("Username already taken".to_string()));
         }
 
-        // Update username in users table
+        // Sync to divine-name-server (if enabled)
+        if crate::divine_names::is_enabled() {
+            // Get user's keys for NIP-98 signing
+            let personal_keys_repo = PersonalKeysRepository::new(pool.clone());
+            if let Ok(Some(encrypted_secret)) = personal_keys_repo
+                .find_encrypted_key_for_tenant(&user_pubkey, tenant_id)
+                .await
+            {
+                if let Ok(decrypted_secret) = key_manager.decrypt(&encrypted_secret).await {
+                    if let Ok(secret_key) = nostr_sdk::secp256k1::SecretKey::from_slice(&decrypted_secret) {
+                        let keys = Keys::new(secret_key.into());
+
+                        // Claim username on divine-name-server
+                        match crate::divine_names::claim_username(&keys, username, None).await {
+                            Ok(response) => {
+                                tracing::info!(
+                                    "Successfully claimed username '{}' on divine-name-server for user: {}",
+                                    username,
+                                    user_pubkey
+                                );
+                                divine_names_result = Some(Ok(response));
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to claim username on divine-name-server: {}. Continuing with local update.",
+                                    e
+                                );
+                                divine_names_result = Some(Err(e.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Update username in users table (always do local update)
         user_repo
             .update_username(&user_pubkey, username, tenant_id)
             .await?;
@@ -1824,11 +1873,31 @@ pub async fn update_profile(
         );
     }
 
-    // Client should publish profile to relays via bunker URL
-    Ok(Json(serde_json::json!({
+    // Build response with divine-names sync status
+    let mut response = serde_json::json!({
         "success": true,
         "message": "Username saved. Client should publish kind 0 event to relays via bunker."
-    })))
+    });
+
+    if let Some(result) = divine_names_result {
+        match result {
+            Ok(claim_response) => {
+                response["divine_names"] = serde_json::json!({
+                    "synced": true,
+                    "nip05": claim_response.nip05,
+                    "profile_url": claim_response.profile_url
+                });
+            }
+            Err(error) => {
+                response["divine_names"] = serde_json::json!({
+                    "synced": false,
+                    "error": error
+                });
+            }
+        }
+    }
+
+    Ok(Json(response))
 }
 
 #[derive(Debug, Serialize)]

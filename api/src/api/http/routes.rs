@@ -95,7 +95,6 @@ pub fn api_routes(
             "/user/sessions/:secret/activity",
             get(auth::get_session_activity),
         )
-        .route("/user/profile", post(auth::update_profile))
         .route("/user/sessions/disconnect", post(auth::disconnect_client))
         .route(
             "/user/verify-password",
@@ -103,6 +102,12 @@ pub fn api_routes(
         )
         .layer(auth_cors.clone())
         .with_state(pool.clone());
+
+    // Profile update route needs auth_state for key access (divine-name-server NIP-98 auth)
+    let profile_update_routes = Router::new()
+        .route("/user/profile", post(auth::update_profile))
+        .layer(auth_cors.clone())
+        .with_state(auth_state.clone());
 
     // Bunker routes (need AuthState for key_manager and auth_tx)
     let bunker_routes = Router::new()
@@ -201,6 +206,7 @@ pub fn api_routes(
     Router::new()
         .merge(first_party_routes) // Has auth_cors (credentials, needs cookies)
         .merge(user_routes) // Has auth_cors (authenticated, needs cookies)
+        .merge(profile_update_routes) // Has auth_cors (needs key_manager for divine-names)
         .merge(bunker_routes) // Has auth_cors (bunker creation)
         .merge(key_export_routes) // Has auth_cors (authenticated, needs cookies)
         .merge(change_key_route) // Has auth_cors (authenticated, needs cookies)
