@@ -143,3 +143,104 @@ pub fn is_enabled() -> bool {
     std::env::var("DIVINE_NAME_SERVER_URL").is_ok() ||
     std::env::var("ENABLE_DIVINE_NAMES").map(|v| v == "true" || v == "1").unwrap_or(false)
 }
+
+/// Response from the availability check endpoint
+#[derive(Debug, Deserialize)]
+pub struct AvailabilityResponse {
+    pub ok: bool,
+    pub available: bool,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub canonical: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Check if a username is available on divine-name-server (no auth required)
+/// Returns (available, reason) - reason is set when not available
+pub async fn check_availability(username: &str) -> Result<(bool, Option<String>), DivineNameError> {
+    let base_url = std::env::var("DIVINE_NAME_SERVER_URL")
+        .unwrap_or_else(|_| DEFAULT_NAME_SERVER_URL.to_string());
+    let url = format!("{}/api/username/check/{}", base_url.trim_end_matches('/'), username);
+
+    let client = Client::new();
+    let response = client
+        .get(&url)
+        .send()
+        .await?;
+
+    let status = response.status();
+    let response_text = response.text().await?;
+
+    let check_response: AvailabilityResponse = serde_json::from_str(&response_text)
+        .map_err(|e| DivineNameError::ResponseError(format!(
+            "Failed to parse availability response: {}. Status: {}, Body: {}",
+            e, status, response_text
+        )))?;
+
+    if !check_response.ok {
+        return Err(DivineNameError::ResponseError(
+            check_response.error.unwrap_or_else(|| "Unknown error".to_string())
+        ));
+    }
+
+    Ok((check_response.available, check_response.reason))
+}
+
+/// Response from the by-pubkey lookup endpoint
+#[derive(Debug, Deserialize)]
+pub struct PubkeyLookupResponse {
+    pub ok: bool,
+    pub found: bool,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub canonical: Option<String>,
+    #[serde(default)]
+    pub pubkey: Option<String>,
+    #[serde(default)]
+    pub profile_url: Option<String>,
+    #[serde(default)]
+    pub nip05: Option<Nip05Info>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Look up a username by pubkey on divine-name-server (no auth required)
+pub async fn lookup_by_pubkey(pubkey: &str) -> Result<Option<PubkeyLookupResponse>, DivineNameError> {
+    let base_url = std::env::var("DIVINE_NAME_SERVER_URL")
+        .unwrap_or_else(|_| DEFAULT_NAME_SERVER_URL.to_string());
+    let url = format!("{}/api/username/by-pubkey/{}", base_url.trim_end_matches('/'), pubkey);
+
+    let client = Client::new();
+    let response = client
+        .get(&url)
+        .send()
+        .await?;
+
+    let status = response.status();
+    let response_text = response.text().await?;
+
+    let lookup_response: PubkeyLookupResponse = serde_json::from_str(&response_text)
+        .map_err(|e| DivineNameError::ResponseError(format!(
+            "Failed to parse lookup response: {}. Status: {}, Body: {}",
+            e, status, response_text
+        )))?;
+
+    if !lookup_response.ok {
+        return Err(DivineNameError::ResponseError(
+            lookup_response.error.unwrap_or_else(|| "Unknown error".to_string())
+        ));
+    }
+
+    if lookup_response.found {
+        Ok(Some(lookup_response))
+    } else {
+        Ok(None)
+    }
+}

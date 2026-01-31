@@ -1817,7 +1817,33 @@ pub async fn update_profile(
             ));
         }
 
-        // Check if username is already taken in this tenant
+        // Check divine-name-server FIRST (if enabled) - this is the authoritative source
+        if crate::divine_names::is_enabled() {
+            match crate::divine_names::check_availability(username).await {
+                Ok((available, reason)) => {
+                    if !available {
+                        let error_msg = reason.unwrap_or_else(|| "Username is not available on divine.video".to_string());
+                        tracing::info!(
+                            "Username '{}' not available on divine-name-server: {}",
+                            username,
+                            error_msg
+                        );
+                        return Err(AuthError::Internal(error_msg));
+                    }
+                }
+                Err(e) => {
+                    // If we can't reach divine-name-server, log but continue with local check
+                    // This prevents divine-name-server outages from blocking all username changes
+                    tracing::warn!(
+                        "Failed to check divine-name-server availability for '{}': {}. Falling back to local check.",
+                        username,
+                        e
+                    );
+                }
+            }
+        }
+
+        // Check if username is already taken in this tenant (local check)
         let user_repo = UserRepository::new(pool.clone());
         if !user_repo
             .check_username_available(username, &user_pubkey, tenant_id)
