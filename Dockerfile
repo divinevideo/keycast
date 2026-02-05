@@ -18,6 +18,7 @@ COPY ./Cargo.toml ./Cargo.toml
 COPY ./Cargo.lock ./Cargo.lock
 
 RUN cargo build --release --bin keycast
+RUN cargo build --release --example migrate-vine-users
 
 # Build stage for Bun frontend
 FROM oven/bun:1 AS web-builder
@@ -103,8 +104,9 @@ RUN curl -fsSL https://bun.sh/install | bash
 # Create necessary directories
 RUN mkdir -p /app/database /data
 
-# Copy built artifacts - only keycast binary (unified)
+# Copy built artifacts - keycast binary and migration tool
 COPY --from=rust-builder /app/target/release/keycast ./
+COPY --from=rust-builder /app/target/release/examples/migrate-vine-users ./
 COPY --from=web-builder /app/web/build ./web
 COPY --from=web-builder /app/web/package.json ./
 COPY --from=web-builder /app/web/node_modules ./node_modules

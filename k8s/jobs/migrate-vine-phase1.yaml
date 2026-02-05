@@ -1,0 +1,42 @@
+# Phase 1: KMS Round-Trip Test
+# Tests KMS access from migration service account before attempting full migration
+#
+# Prerequisites:
+# - Run scripts/migration-setup.sh to create the keycast-migration SA
+# - Build and push the keycast image with the migrate-vine-users example
+#
+# Usage:
+#   kubectl apply -f k8s/jobs/migrate-vine-phase1.yaml
+#   kubectl logs -f job/migrate-vine-phase1 -n identity
+#   kubectl delete job migrate-vine-phase1 -n identity
+#
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate-vine-phase1
+  namespace: identity
+  labels:
+    app: keycast-migration
+    phase: "1"
+spec:
+  ttlSecondsAfterFinished: 600
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: keycast-migration
+        phase: "1"
+    spec:
+      serviceAccountName: keycast-migration
+      restartPolicy: Never
+      containers:
+      - name: migrate
+        image: us-central1-docker.pkg.dev/dv-platform-prod/keycast/keycast:latest
+        command: ["/app/migrate-vine-users"]
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"

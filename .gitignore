@@ -13,6 +13,13 @@ master.key
 # Service account credentials
 *service-account*.json
 credentials.json
+*-sa.json
+*-sa-*.json
+keycast-migration*.json
+
+# Migration artifacts
+migration-*.log
+migration-checkpoint.json
 
 # Git worktrees
 .worktrees/

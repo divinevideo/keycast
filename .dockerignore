@@ -27,6 +27,14 @@ database/*.db*
 master.key
 *.key
 *service-account*.json
+*-sa.json
+*-sa-*.json
+keycast-migration*.json
+
+# Migration artifacts
+migration-*.log
+migration-checkpoint.json
+scripts/migration-kms-setup.sh
 
 # Documentation (not needed in image)
 docs/
