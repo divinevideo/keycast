@@ -18,6 +18,10 @@
           {
             "/": "/verify-email",
             "comment": "Email verification deep link"
+          },
+          {
+            "/": "/reset-password",
+            "comment": "Password reset deep link"
           }
         ]
       },
@@ -37,6 +41,10 @@
           {
             "/": "/verify-email",
             "comment": "Email verification deep link"
+          },
+          {
+            "/": "/reset-password",
+            "comment": "Password reset deep link"
           }
         ]
       }
