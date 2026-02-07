@@ -47,8 +47,8 @@ spec:
               value: "true"
             - name: GCP_PROJECT_ID
               value: "openvine-co"
-            - name: CORS_ALLOWED_ORIGIN
-              value: "https://login.divine.video"
+            - name: ALLOWED_ORIGINS
+              value: "https://login.divine.video,https://divine.video"
             - name: APP_URL
               value: "https://login.divine.video"
             - name: FROM_EMAIL
