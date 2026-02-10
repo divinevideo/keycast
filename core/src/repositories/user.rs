@@ -227,7 +227,7 @@ impl UserRepository {
         Ok(())
     }
 
-    /// Create a new user with email/password and verified status (used during key change).
+    /// Create a new user with email/password and pre-verified status.
     pub async fn create_with_password_verified(
         &self,
         pubkey: &str,
@@ -235,16 +235,18 @@ impl UserRepository {
         email: &str,
         password_hash: &str,
         email_verified: bool,
+        email_verification_token: Option<&str>,
     ) -> Result<(), RepositoryError> {
         sqlx::query(
-            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, email_verification_token, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(pubkey)
         .bind(tenant_id)
         .bind(email)
         .bind(password_hash)
         .bind(email_verified)
+        .bind(email_verification_token)
         .bind(Utc::now())
         .bind(Utc::now())
         .execute(&self.pool)

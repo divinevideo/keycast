@@ -1191,14 +1191,15 @@ pub async fn verify_email(
             let mut tx = pool.begin().await?;
 
             sqlx::query(
-                "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, email_verification_token, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             )
             .bind(&oauth_data.user_pubkey)
             .bind(tenant_id)
             .bind(email)
             .bind(password_hash)
             .bind(true) // email_verified = true
+            .bind(&req.token) // Keep token for idempotent re-verification
             .bind(now)
             .bind(now)
             .execute(&mut *tx)
@@ -1230,7 +1231,8 @@ pub async fn verify_email(
                     tenant_id,
                     email,
                     password_hash,
-                    true, // email_verified = true
+                    true,             // email_verified = true
+                    Some(&req.token), // Keep token for idempotent re-verification
                 )
                 .await?;
 
