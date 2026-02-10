@@ -1296,7 +1296,33 @@ pub async fn verify_email(
             .delete_by_verification_token(&req.token, tenant_id)
             .await?;
 
-        // Build redirect URL
+        // For headless flows (mobile app), don't redirect — the app is polling
+        // via device_code/Redis and will pick up the code automatically.
+        // The browser just shows a success page.
+        if oauth_data.is_headless {
+            tracing::info!(
+                event = "email_verification",
+                tenant_id = tenant_id,
+                flow = "oauth_headless",
+                success = true,
+                "Email verified (headless), app will pick up code via polling"
+            );
+
+            return Ok((
+                axum::http::StatusCode::OK,
+                axum::Json(VerifyEmailResponse {
+                    success: true,
+                    message: "Email verified! Open the app to continue.".to_string(),
+                    redirect_to: None,
+                    authenticated: None,
+                    status: Some("headless".to_string()),
+                    retry_after: None,
+                }),
+            )
+                .into_response());
+        }
+
+        // Non-headless: redirect to OAuth client's callback URL
         let mut redirect_url = format!("{}?code={}", oauth_data.redirect_uri, new_code);
         if let Some(ref state) = oauth_data.state {
             redirect_url = format!("{}&state={}", redirect_url, state);

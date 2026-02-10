@@ -8,7 +8,7 @@
 
 	const api = new KeycastApi();
 
-	let status = $state<'loading' | 'processing' | 'success' | 'oauth_redirect' | 'error' | 'no-token'>('loading');
+	let status = $state<'loading' | 'processing' | 'success' | 'oauth_redirect' | 'headless_verified' | 'error' | 'no-token'>('loading');
 	let message = $state('');
 	let redirectUrl = $state('');
 
@@ -44,6 +44,14 @@
 				}
 
 				if (response.success) {
+					// Headless flow (mobile app) — app is polling, just show success
+					if (response.status === 'headless') {
+						status = 'headless_verified';
+						message = response.message || 'Email verified! Open the app to continue.';
+						toast.success('Email verified!');
+						return;
+					}
+
 					// Check if this is an OAuth flow (has redirect_to)
 					if (response.redirect_to) {
 						status = 'oauth_redirect';
@@ -177,6 +185,15 @@
 			<h1>Email Verified!</h1>
 			<p class="subtitle">{message}</p>
 			<p class="redirect-notice">Redirecting to application...</p>
+
+		{:else if status === 'headless_verified'}
+			<div class="status-icon success">
+				<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" fill="currentColor" viewBox="0 0 256 256">
+					<path d="M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24Zm45.66,85.66-56,56a8,8,0,0,1-11.32,0l-24-24a8,8,0,0,1,11.32-11.32L112,148.69l50.34-50.35a8,8,0,0,1,11.32,11.32Z"></path>
+				</svg>
+			</div>
+			<h1>Email Verified!</h1>
+			<p class="subtitle">{message}</p>
 
 		{:else if status === 'success'}
 			<div class="status-icon success">
