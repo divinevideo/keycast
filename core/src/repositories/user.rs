@@ -533,6 +533,25 @@ impl UserRepository {
         Ok(())
     }
 
+    /// Update user's password hash (for authenticated password change).
+    pub async fn update_password(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+        password_hash: &str,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "UPDATE users SET password_hash = $1, updated_at = $2 WHERE pubkey = $3 AND tenant_id = $4",
+        )
+        .bind(password_hash)
+        .bind(Utc::now())
+        .bind(pubkey)
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Find user with email, password hash, and email verified status (for key export verification).
     pub async fn find_with_password_and_verified(
         &self,

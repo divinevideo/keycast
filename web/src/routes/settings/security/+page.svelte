@@ -32,6 +32,11 @@
 	let showExportedNsec = $state(false);
 	let isExporting = $state(false);
 
+	// Change Password Section
+	let newPassword = $state('');
+	let confirmNewPassword = $state('');
+	let isChangingPassword = $state(false);
+
 	// Change Key Section
 	let newNsec = $state('');
 	let confirmText = $state('');
@@ -87,6 +92,46 @@
 			toast.error(err.message || 'Failed to export key');
 		} finally {
 			isExporting = false;
+		}
+	}
+
+	async function handleChangePassword() {
+		if (!newPassword || !confirmNewPassword) {
+			toast.error('Please fill in both password fields');
+			return;
+		}
+		if (newPassword.length < 8) {
+			toast.error('New password must be at least 8 characters');
+			return;
+		}
+		if (newPassword !== confirmNewPassword) {
+			toast.error('New passwords do not match');
+			return;
+		}
+		if (newPassword === mainPassword) {
+			toast.error('New password must be different from current password');
+			return;
+		}
+
+		try {
+			isChangingPassword = true;
+
+			await api.post('/user/change-password', {
+				current_password: mainPassword,
+				new_password: newPassword
+			});
+
+			toast.success('Password changed successfully');
+
+			// Reset and lock settings so user re-verifies with new password
+			newPassword = '';
+			confirmNewPassword = '';
+			handleLockSettings();
+		} catch (err: any) {
+			console.error('Change password error:', err);
+			toast.error(err.message || 'Failed to change password');
+		} finally {
+			isChangingPassword = false;
 		}
 	}
 
@@ -251,6 +296,47 @@
 						</div>
 					</div>
 				{/if}
+			</div>
+		</div>
+
+		<!-- Change Password Section -->
+		<div class="section">
+			<div class="section-header">
+				<h2>Change Password</h2>
+				<p>Update your account password</p>
+			</div>
+
+			<div class="form-container">
+				<div class="form-group">
+					<label for="new-password">New Password</label>
+					<input
+						id="new-password"
+						type="password"
+						bind:value={newPassword}
+						placeholder="Enter new password (min 8 characters)"
+						disabled={isChangingPassword}
+					/>
+				</div>
+
+				<div class="form-group">
+					<label for="confirm-new-password">Confirm New Password</label>
+					<input
+						id="confirm-new-password"
+						type="password"
+						bind:value={confirmNewPassword}
+						placeholder="Confirm new password"
+						disabled={isChangingPassword}
+						onkeydown={(e) => e.key === 'Enter' && handleChangePassword()}
+					/>
+				</div>
+
+				<button
+					class="btn-primary"
+					onclick={handleChangePassword}
+					disabled={isChangingPassword || !newPassword || !confirmNewPassword}
+				>
+					{isChangingPassword ? 'Changing Password...' : 'Change Password'}
+				</button>
 			</div>
 		</div>
 

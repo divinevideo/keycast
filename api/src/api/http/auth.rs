@@ -2833,6 +2833,70 @@ pub async fn verify_password_for_export(
     Ok(Json(VerifyPasswordResponse { success: true }))
 }
 
+// ===== CHANGE PASSWORD ENDPOINT =====
+
+#[derive(Debug, Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+/// Change user's password (requires authentication and current password verification)
+pub async fn change_password(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Json(req): Json<ChangePasswordRequest>,
+) -> Result<Json<serde_json::Value>, AuthError> {
+    let user_pubkey = extract_user_from_token(&headers).await?;
+    let tenant_id = tenant.0.id;
+
+    // Validate new password length
+    if req.new_password.len() < 8 {
+        return Err(AuthError::BadRequest(
+            "New password must be at least 8 characters".to_string(),
+        ));
+    }
+
+    // Get user's current password hash
+    let user_repo = UserRepository::new(pool.clone());
+    let (_email, password_hash) = user_repo
+        .get_credentials(&user_pubkey, tenant_id)
+        .await?
+        .ok_or(AuthError::UserNotFound)?;
+
+    // Verify current password
+    let current_password = req.current_password.clone();
+    let hash = password_hash.clone();
+    let valid = tokio::task::spawn_blocking(move || verify(&current_password, &hash))
+        .await
+        .map_err(|e| AuthError::Internal(format!("Task join error: {}", e)))?
+        .map_err(|_| AuthError::Internal("Password verification failed".to_string()))?;
+
+    if !valid {
+        return Err(AuthError::InvalidCredentials);
+    }
+
+    // Hash new password
+    let new_password = req.new_password.clone();
+    let new_hash = tokio::task::spawn_blocking(move || bcrypt::hash(&new_password, DEFAULT_COST))
+        .await
+        .map_err(|e| AuthError::Internal(format!("Task join error: {}", e)))?
+        .map_err(|e| AuthError::Internal(format!("Password hashing failed: {}", e)))?;
+
+    // Update password in database
+    user_repo
+        .update_password(&user_pubkey, tenant_id, &new_hash)
+        .await?;
+
+    tracing::info!(pubkey = %user_pubkey, "Password changed successfully");
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "Password changed successfully"
+    })))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ChangeKeyRequest {
     pub password: String,

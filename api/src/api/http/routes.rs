@@ -100,6 +100,10 @@ pub fn api_routes(
             "/user/verify-password",
             post(auth::verify_password_for_export),
         )
+        .route(
+            "/user/change-password",
+            post(auth::change_password),
+        )
         .layer(auth_cors.clone())
         .with_state(pool.clone());
 
