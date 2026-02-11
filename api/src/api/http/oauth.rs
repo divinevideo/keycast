@@ -580,8 +580,7 @@ pub async fn authorize_get(
         (None, false)
     };
 
-    // Check for silent re-authentication via authorization_handle
-    // This replaces the buggy origin-based auto-approve check
+    // Check for silent re-authentication via authorization_handle (primary mechanism)
     if let Some(ref pubkey) = user_pubkey {
         let previous_auth_id: Option<i32> = if let Some(ref handle) = params.authorization_handle {
             tracing::info!(
@@ -644,6 +643,57 @@ pub async fn authorize_get(
             return Ok(Redirect::to(&redirect_url).into_response());
         } else if previous_auth_id.is_some() && force_consent {
             tracing::info!("prompt=consent: skipping auto-approve, showing approval screen");
+        }
+    }
+
+    // Origin-based auto-approve fallback: if no handle was provided (or handle was invalid),
+    // check if the user already has an active authorization for this origin.
+    if let Some(ref pubkey) = user_pubkey {
+        if !force_consent {
+            let redirect_origin = extract_origin(&params.redirect_uri)?;
+            let repo = OAuthAuthorizationRepository::new(pool.clone());
+            if repo
+                .has_active_for_origin(pubkey, &redirect_origin, tenant_id)
+                .await?
+            {
+                tracing::info!(
+                    "Auto-approving via active origin authorization for user {} origin {}",
+                    pubkey,
+                    redirect_origin
+                );
+
+                let code: String = rand::thread_rng()
+                    .sample_iter(&rand::distributions::Alphanumeric)
+                    .take(32)
+                    .map(char::from)
+                    .collect();
+
+                let expires_at = Utc::now() + Duration::minutes(10);
+                let scope = params.scope.as_deref().unwrap_or("sign_event");
+
+                store_oauth_code(
+                    pool,
+                    tenant_id,
+                    &code,
+                    pubkey,
+                    &params.client_id,
+                    &params.redirect_uri,
+                    scope,
+                    params.code_challenge.as_deref(),
+                    params.code_challenge_method.as_deref(),
+                    expires_at,
+                    None,
+                    params.state.as_deref(),
+                )
+                .await?;
+
+                let redirect_url = if let Some(ref state) = params.state {
+                    format!("{}?code={}&state={}", params.redirect_uri, code, state)
+                } else {
+                    format!("{}?code={}", params.redirect_uri, code)
+                };
+                return Ok(Redirect::to(&redirect_url).into_response());
+            }
         }
     }
 

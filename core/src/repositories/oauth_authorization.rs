@@ -314,6 +314,29 @@ impl OAuthAuthorizationRepository {
         .map_err(Into::into)
     }
 
+    /// Check if any active (non-revoked) authorization exists for a user+origin.
+    pub async fn has_active_for_origin(
+        &self,
+        user_pubkey: &str,
+        redirect_origin: &str,
+        tenant_id: i64,
+    ) -> Result<bool, RepositoryError> {
+        let exists: Option<(i32,)> = sqlx::query_as(
+            "SELECT 1 FROM oauth_authorizations
+             WHERE user_pubkey = $1
+               AND redirect_origin = $2
+               AND tenant_id = $3
+               AND revoked_at IS NULL
+             LIMIT 1",
+        )
+        .bind(user_pubkey)
+        .bind(redirect_origin)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(exists.is_some())
+    }
+
     /// Find the most recent bunker pubkey for a user.
     pub async fn find_latest_bunker_pubkey(
         &self,
