@@ -63,7 +63,7 @@ const currentUrl = $derived(browser ? $page.url.href : "");
         width: 80px;
         height: 80px;
         border-radius: 50%;
-        background: rgba(0, 180, 136, 0.1);
+        background: rgba(39, 197, 139, 0.1);
         color: var(--color-divine-green);
         margin-bottom: 1.5rem;
     }

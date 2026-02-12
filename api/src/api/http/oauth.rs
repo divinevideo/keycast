@@ -772,11 +772,14 @@ pub async fn authorize_get(
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Authorize {}</title>
     <script src="https://unpkg.com/nostr-tools@2.10.0/lib/nostr.bundle.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {{
-            --divine-green: #00B488;
-            --divine-green-dark: #009A72;
-            --bg: hsl(0 0% 100%);
+            --divine-green: #27C58B;
+            --divine-green-dark: #1AA575;
+            --bg: #F9F7F6;
             --surface: hsl(0 0% 100%);
             --border: hsl(214.3 31.8% 91.4%);
             --text: hsl(222.2 84% 4.9%);
@@ -785,12 +788,12 @@ pub async fn authorize_get(
         }}
         @media (prefers-color-scheme: dark) {{
             :root {{
-                --bg: hsl(222.2 84% 4.9%);
-                --surface: hsl(222.2 84% 4.9%);
-                --border: hsl(217.2 32.6% 17.5%);
+                --bg: #072218;
+                --surface: #0F2E23;
+                --border: #1C4033;
                 --text: hsl(210 40% 98%);
                 --text-secondary: hsl(215 20.2% 65.1%);
-                --muted: hsl(217.2 32.6% 17.5%);
+                --muted: #0F2E23;
             }}
         }}
         * {{
@@ -821,6 +824,7 @@ pub async fn authorize_get(
             align-items: center;
             gap: 0.5rem;
             color: var(--divine-green);
+            font-family: 'Bricolage Grotesque', system-ui, sans-serif;
             font-size: 1.5rem;
             font-weight: 700;
             margin-bottom: 1rem;
@@ -830,6 +834,7 @@ pub async fn authorize_get(
             height: 32px;
         }}
         .header h1 {{
+            font-family: 'Bricolage Grotesque', system-ui, sans-serif;
             font-size: 1.5rem;
             font-weight: 600;
             color: var(--text);
@@ -1223,28 +1228,28 @@ pub async fn authorize_get(
     <script src="https://unpkg.com/nostr-tools@2.10.0/lib/nostr.bundle.js"></script>
     <style>
         :root {{
-            --divine-green: #00B488;
-            --divine-green-dark: #009A72;
-            --divine-green-light: #33C49F;
+            --divine-green: #27C58B;
+            --divine-green-dark: #1AA575;
+            --divine-green-light: #D0FBCB;
             --divine-purple: #8B5CF6;
-            --bg: hsl(0 0% 100%);
+            --bg: #F9F7F6;
             --surface: hsl(0 0% 100%);
             --border: hsl(214.3 31.8% 91.4%);
             --text: hsl(222.2 84% 4.9%);
             --text-secondary: hsl(215.4 16.3% 46.9%);
             --muted: hsl(210 40% 96.1%);
             --error: #EF4444;
-            --shadow-sm: 0 2px 8px rgba(0, 180, 136, 0.08);
-            --shadow-md: 0 4px 16px rgba(0, 180, 136, 0.12);
+            --shadow-sm: 0 2px 8px rgba(39, 197, 139, 0.08);
+            --shadow-md: 0 4px 16px rgba(39, 197, 139, 0.12);
         }}
         @media (prefers-color-scheme: dark) {{
             :root {{
-                --bg: hsl(222.2 84% 4.9%);
-                --surface: hsl(222.2 84% 4.9%);
-                --border: hsl(217.2 32.6% 17.5%);
+                --bg: #072218;
+                --surface: #0F2E23;
+                --border: #1C4033;
                 --text: hsl(210 40% 98%);
                 --text-secondary: hsl(215 20.2% 65.1%);
-                --muted: hsl(217.2 32.6% 17.5%);
+                --muted: #0F2E23;
             }}
         }}
         * {{
@@ -1362,7 +1367,7 @@ pub async fn authorize_get(
         input:focus {{
             outline: none;
             border-color: var(--divine-green);
-            box-shadow: 0 0 0 2px rgba(0, 180, 136, 0.2);
+            box-shadow: 0 0 0 2px rgba(39, 197, 139, 0.2);
         }}
         input::placeholder {{
             color: var(--text-secondary);
@@ -3115,18 +3120,18 @@ pub async fn connect_get(
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Bricolage+Grotesque:wght@600;700&display=swap" rel="stylesheet">
     <style>
         :root {{
-            --divine-green: #00B488;
-            --divine-green-dark: #009A72;
-            --bg: hsl(222.2 84% 4.9%);
-            --surface: hsl(222.2 84% 4.9%);
-            --border: hsl(217.2 32.6% 17.5%);
+            --divine-green: #27C58B;
+            --divine-green-dark: #1AA575;
+            --bg: #072218;
+            --surface: #0F2E23;
+            --border: #1C4033;
             --text: hsl(210 40% 98%);
             --text-secondary: hsl(215 20.2% 65.1%);
-            --muted: hsl(217.2 32.6% 17.5%);
+            --muted: #0F2E23;
         }}
         @media (prefers-color-scheme: light) {{
             :root {{
-                --bg: hsl(0 0% 100%);
+                --bg: #F9F7F6;
                 --surface: hsl(0 0% 100%);
                 --border: hsl(214.3 31.8% 91.4%);
                 --text: hsl(222.2 84% 4.9%);

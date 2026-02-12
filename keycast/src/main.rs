@@ -99,6 +99,11 @@ fn inject_runtime_env(html: &str) -> String {
         env_obj["VITE_NDK_BUNKER_RELAYS"] = json!(relays);
     }
 
+    // SHOW_TEAMS_FUNCTIONALITY - enable teams UI (optional, default: hidden)
+    if let Ok(val) = env::var("SHOW_TEAMS_FUNCTIONALITY") {
+        env_obj["SHOW_TEAMS_FUNCTIONALITY"] = json!(val);
+    }
+
     // If no env vars to inject, return original HTML
     if env_obj.as_object().is_none_or(|o| o.is_empty()) {
         return html.to_string();

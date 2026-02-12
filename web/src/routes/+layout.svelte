@@ -50,8 +50,8 @@ const showHeader = $derived(
 	<!-- Background orbs -->
     <div class="fixed inset-0 -z-10">
         <div class="absolute rounded-full mix-blend-multiply filter blur-3xl top-10 left-1/4 w-[600px] h-[600px] bg-[var(--color-divine-green)]/5 animate-blob"></div>
-        <div class="absolute rounded-full mix-blend-multiply filter blur-3xl top-1/2 -right-20 w-96 h-96 bg-teal-500/5 animate-blob animation-delay-2000"></div>
-        <div class="absolute rounded-full mix-blend-multiply filter blur-3xl bottom-20 left-32 w-72 h-72 bg-cyan-500/5 animate-blob animation-delay-5500"></div>
+        <div class="absolute rounded-full mix-blend-multiply filter blur-3xl top-1/2 -right-20 w-96 h-96 bg-[var(--color-divine-green-dark)]/5 animate-blob animation-delay-2000"></div>
+        <div class="absolute rounded-full mix-blend-multiply filter blur-3xl bottom-20 left-32 w-72 h-72 bg-[var(--color-divine-dark-green)]/10 animate-blob animation-delay-5500"></div>
     </div>
 	{@render children()}
 </div>

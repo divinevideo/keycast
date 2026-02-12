@@ -370,7 +370,7 @@
 						placeholder="nsec1... or 64-char hex"
 						disabled={isChanging}
 					/>
-					<small style="color: #999; font-size: 0.85rem;">
+					<small style="color: var(--color-divine-text-tertiary); font-size: 0.85rem;">
 						Import an existing Nostr private key. You must provide your own key.
 					</small>
 				</div>

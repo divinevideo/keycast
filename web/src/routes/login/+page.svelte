@@ -205,7 +205,7 @@
 		padding: 2rem;
 		max-width: 420px;
 		width: 100%;
-		box-shadow: 0 2px 8px rgba(0, 180, 136, 0.08);
+		box-shadow: 0 2px 8px rgba(39, 197, 139, 0.08);
 	}
 
 	.auth-branding {
@@ -270,7 +270,7 @@
 	input:focus {
 		outline: none;
 		border-color: var(--color-divine-green);
-		box-shadow: 0 0 0 2px rgba(0, 180, 136, 0.2);
+		box-shadow: 0 0 0 2px rgba(39, 197, 139, 0.2);
 	}
 
 	input::placeholder {
@@ -299,7 +299,7 @@
 
 	.btn-primary:hover:not(:disabled) {
 		background: var(--color-divine-green-dark);
-		box-shadow: 0 2px 8px rgba(0, 180, 136, 0.16);
+		box-shadow: 0 2px 8px rgba(39, 197, 139, 0.16);
 	}
 
 	.btn-primary:disabled {

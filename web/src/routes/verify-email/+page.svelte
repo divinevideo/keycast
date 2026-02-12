@@ -253,7 +253,7 @@
 		max-width: 420px;
 		width: 100%;
 		text-align: center;
-		box-shadow: 0 2px 8px rgba(0, 180, 136, 0.08);
+		box-shadow: 0 2px 8px rgba(39, 197, 139, 0.08);
 	}
 
 	.verify-branding {
@@ -346,7 +346,7 @@
 
 	.btn-primary:hover {
 		background: var(--color-divine-green-dark);
-		box-shadow: 0 2px 8px rgba(0, 180, 136, 0.16);
+		box-shadow: 0 2px 8px rgba(39, 197, 139, 0.16);
 	}
 
 	.btn-secondary {

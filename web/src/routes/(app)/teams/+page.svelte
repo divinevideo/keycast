@@ -1,11 +1,15 @@
 <script lang="ts">
+import { goto } from "$app/navigation";
 import Loader from "$lib/components/Loader.svelte";
 import TeamCard from "$lib/components/TeamCard.svelte";
 import { getCurrentUser } from "$lib/current_user.svelte";
 import { KeycastApi } from "$lib/keycast_api.svelte";
 import type { TeamWithRelations } from "$lib/types";
+import { isTeamsEnabled } from "$lib/utils/env";
 import { PlusCircle } from "phosphor-svelte";
 import { toast } from "svelte-hot-french-toast";
+
+if (!isTeamsEnabled()) goto("/", { replaceState: true });
 
 const api = new KeycastApi();
 const user = $derived(getCurrentUser()?.user);

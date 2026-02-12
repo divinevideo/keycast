@@ -9,7 +9,7 @@ import {
     type NDKUser,
 } from "@nostr-dev-kit/ndk";
 import toast from "svelte-hot-french-toast";
-import { getViteDomain, getAllowedPubkeys } from "$lib/utils/env";
+import { getViteDomain, getAllowedPubkeys, isTeamsEnabled } from "$lib/utils/env";
 
 export enum SigninMethod {
     Nip07 = "nip07",
@@ -46,8 +46,9 @@ export async function signin(
         if (!alreadySignedIn) {
             toast.success("Signed in successfully");
         }
-        // NIP-07 admins go to dashboard, regular users go to teams
-        goto(method === SigninMethod.Nip07 ? "/" : "/teams");
+        // NIP-07 admins go to dashboard, regular users go to teams (if enabled) or dashboard
+        const dest = method === SigninMethod.Nip07 ? "/" : (isTeamsEnabled() ? "/teams" : "/");
+        goto(dest);
     }
     return signedInUser;
 }

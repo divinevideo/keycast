@@ -10,6 +10,7 @@ declare global {
             ALLOWED_PUBKEYS?: string;
             VITE_NDK_EXPLICIT_RELAYS?: string;
             VITE_NDK_BUNKER_RELAYS?: string;
+            SHOW_TEAMS_FUNCTIONALITY?: string;
         };
     }
 }
@@ -17,7 +18,7 @@ declare global {
 /**
  * Get a runtime environment variable with fallback to build-time value
  */
-export function getEnvVar(key: 'VITE_DOMAIN' | 'ALLOWED_PUBKEYS' | 'VITE_NDK_EXPLICIT_RELAYS' | 'VITE_NDK_BUNKER_RELAYS'): string | undefined {
+export function getEnvVar(key: 'VITE_DOMAIN' | 'ALLOWED_PUBKEYS' | 'VITE_NDK_EXPLICIT_RELAYS' | 'VITE_NDK_BUNKER_RELAYS' | 'SHOW_TEAMS_FUNCTIONALITY'): string | undefined {
     // Check runtime injection first (from window.__ENV__)
     if (typeof window !== 'undefined' && window.__ENV__?.[key]) {
         return window.__ENV__[key];
@@ -39,4 +40,12 @@ export function getViteDomain(defaultValue: string = 'http://localhost:3000'): s
  */
 export function getAllowedPubkeys(): string {
     return getEnvVar('ALLOWED_PUBKEYS') || '';
+}
+
+/**
+ * Whether teams functionality is enabled (requires SHOW_TEAMS_FUNCTIONALITY env var)
+ */
+export function isTeamsEnabled(): boolean {
+    const val = getEnvVar('SHOW_TEAMS_FUNCTIONALITY');
+    return val === 'true' || val === '1';
 }

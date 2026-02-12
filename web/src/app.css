@@ -11,13 +11,16 @@
   --font-heading: 'Bricolage Grotesque', system-ui, -apple-system, sans-serif;
   --font-mono: 'SF Mono', 'Fira Code', monospace;
 
-  /* Divine color palette - aligned with divine.video */
+  /* Divine color palette - aligned with brand guide */
   --color-divine-purple: #8B5CF6;
   --color-divine-purple-dark: #7C3AED;
   --color-divine-purple-light: #A78BFA;
-  --color-divine-green: #00B488;
-  --color-divine-green-dark: #009A72;
-  --color-divine-green-light: #33C49F;
+  --color-divine-green: #27C58B;
+  --color-divine-green-dark: #1AA575;
+  --color-divine-green-light: #D0FBCB;
+  --color-divine-green-muted: color-mix(in srgb, #27C58B 15%, transparent);
+  --color-divine-off-white: #F9F7F6;
+  --color-divine-dark-green: #072218;
 
   /* Status colors */
   --color-divine-success: #10B981;
@@ -32,9 +35,9 @@
   --radius-xl: 1rem;
 
   /* Shadows with brand color tint */
-  --shadow-sm: 0 2px 8px rgba(0, 180, 136, 0.08);
-  --shadow-md: 0 4px 16px rgba(0, 180, 136, 0.12);
-  --shadow-lg: 0 8px 32px rgba(0, 180, 136, 0.16);
+  --shadow-sm: 0 2px 8px rgba(39, 197, 139, 0.08);
+  --shadow-md: 0 4px 16px rgba(39, 197, 139, 0.12);
+  --shadow-lg: 0 8px 32px rgba(39, 197, 139, 0.16);
 }
 
 @utility container {
@@ -80,15 +83,15 @@
     color: var(--color-divine-text);
 }
 
-/* Dark mode - matching divine.video dark theme */
+/* Dark mode - brand dark green theme (matched to divine.video) */
 :root.dark {
-    --color-divine-bg: hsl(222.2 84% 4.9%);
-    --color-divine-surface: hsl(222.2 84% 4.9%);
-    --color-divine-border: hsl(217.2 32.6% 17.5%);
-    --color-divine-text: hsl(210 40% 98%);
-    --color-divine-text-secondary: hsl(215 20.2% 65.1%);
+    --color-divine-bg: #072218;
+    --color-divine-surface: #0F2E23;
+    --color-divine-border: #1C4033;
+    --color-divine-text: #F9F7F6;
+    --color-divine-text-secondary: #BEB3A7;
     --color-divine-text-tertiary: #9CA3AF;
-    --color-divine-muted: hsl(217.2 32.6% 17.5%);
+    --color-divine-muted: #0F2E23;
 
     color-scheme: dark;
     background-color: var(--color-divine-bg);
@@ -98,13 +101,13 @@
 /* System preference dark mode */
 @media (prefers-color-scheme: dark) {
     :root:not(.light) {
-        --color-divine-bg: hsl(222.2 84% 4.9%);
-        --color-divine-surface: hsl(222.2 84% 4.9%);
-        --color-divine-border: hsl(217.2 32.6% 17.5%);
-        --color-divine-text: hsl(210 40% 98%);
-        --color-divine-text-secondary: hsl(215 20.2% 65.1%);
+        --color-divine-bg: #072218;
+        --color-divine-surface: #0F2E23;
+        --color-divine-border: #1C4033;
+        --color-divine-text: #F9F7F6;
+        --color-divine-text-secondary: #BEB3A7;
         --color-divine-text-tertiary: #9CA3AF;
-        --color-divine-muted: hsl(217.2 32.6% 17.5%);
+        --color-divine-muted: #0F2E23;
 
         color-scheme: dark;
         background-color: var(--color-divine-bg);
@@ -228,7 +231,7 @@ input[type="text"], input[type="password"], input[type="email"], select, input[t
 input[type="text"]:focus, input[type="password"]:focus, input[type="email"]:focus, select:focus, input[type="number"]:focus {
     outline: none;
     border-color: var(--color-divine-green);
-    box-shadow: 0 0 0 2px rgba(0, 180, 136, 0.2);
+    box-shadow: 0 0 0 2px rgba(39, 197, 139, 0.2);
 }
 
 .input-error {

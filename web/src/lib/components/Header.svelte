@@ -6,6 +6,7 @@ import { SigninMethod, signin, signout } from "$lib/utils/auth";
 import { Key, SignIn, SignOut } from "phosphor-svelte";
 import { onMount } from "svelte";
 import { BRAND } from "$lib/brand";
+import { isTeamsEnabled } from "$lib/utils/env";
 
 const user = $derived(getCurrentUser()?.user);
 const activePage = $derived($page.url.pathname);
@@ -45,7 +46,9 @@ onMount(async () => {
             {#if activePage !== '/'}
                 <a class="nav-link bordered" href="/">Dashboard</a>
             {/if}
+            {#if isTeamsEnabled()}
             <a class="nav-link {activePage === '/teams' ? 'active' : ''} bordered" href="/teams">Teams</a>
+            {/if}
             <button
                 onclick={() => signout(ndk)}
                 class="button button-secondary button-icon"
