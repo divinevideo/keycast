@@ -9,7 +9,7 @@
 
 	const api = new KeycastApi();
 	const currentUser = $derived(getCurrentUser());
-	const user = $derived(currentUser?.user);
+	const user = $derived(currentUser);
 	const serverUrl = getViteDomain();
 
 	// Admin status from API (single source of truth)

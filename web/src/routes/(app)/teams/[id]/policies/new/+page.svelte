@@ -16,7 +16,7 @@ import { toast } from "svelte-hot-french-toast";
 const { id } = $page.params;
 
 const api = new KeycastApi();
-const user = $derived(getCurrentUser()?.user);
+const user = $derived(getCurrentUser());
 let policyName: string = $state("");
 let permissions: Permission[] = $state([]);
 

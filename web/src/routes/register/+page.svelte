@@ -4,12 +4,20 @@
 	import { KeycastApi } from '$lib/keycast_api.svelte';
 	import { setCurrentUser } from '$lib/current_user.svelte';
 	import { BRAND } from '$lib/brand';
+	import { onMount } from 'svelte';
 
 	const api = new KeycastApi();
+	let hasExtension = $state(false);
+
+	onMount(() => {
+		hasExtension = typeof window !== 'undefined' && !!window.nostr;
+	});
 
 	let email = $state('');
 	let password = $state('');
 	let confirmPassword = $state('');
+	let nsec = $state('');
+	let showAdvanced = $state(false);
 	let isLoading = $state(false);
 	let showVerificationNotice = $state(false);
 	let registeredEmail = $state('');
@@ -33,13 +41,16 @@
 		try {
 			isLoading = true;
 
+			const body: Record<string, string> = { email, password };
+			if (nsec.trim()) body.nsec = nsec.trim();
+
 			const response = await api.post<{
 				success?: boolean;
 				verification_required?: boolean;
 				token?: string;
 				pubkey?: string;
 				email?: string;
-			}>('/auth/register', { email, password });
+			}>('/auth/register', body);
 
 			// Check if email verification is required
 			if (response.verification_required) {
@@ -72,14 +83,12 @@
 	<div class="auth-container">
 		<!-- Logo/Branding -->
 		<a href="/" class="auth-branding">
-			<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" fill="currentColor" viewBox="0 0 256 256">
-				<path d="M216.57,39.43A80,80,0,0,0,83.91,120.78L28.69,176A15.86,15.86,0,0,0,24,187.31V216a16,16,0,0,0,16,16H72a8,8,0,0,0,8-8V208H96a8,8,0,0,0,8-8V184h16a8,8,0,0,0,5.66-2.34l9.56-9.57A79.73,79.73,0,0,0,160,176h.1A80,80,0,0,0,216.57,39.43ZM180,92a16,16,0,1,1,16-16A16,16,0,0,1,180,92Z"></path>
-			</svg>
-			<span>{BRAND.name}</span>
+			<img src="/divine-logo.svg" alt="{BRAND.shortName}" class="auth-logo-img" />
+			<span class="auth-logo-sub">Login</span>
 		</a>
 
-		<h1>Create your {BRAND.name}</h1>
-		<p class="subtitle">{BRAND.tagline}</p>
+		<h1>Create your account</h1>
+		<p class="subtitle">Your Nostr identity, simplified</p>
 
 		{#if showVerificationNotice}
 			<div class="verification-notice">
@@ -133,6 +142,32 @@
 				/>
 			</div>
 
+			<button
+				type="button"
+				class="advanced-toggle"
+				onclick={() => showAdvanced = !showAdvanced}
+			>
+				Already have a Nostr account?
+				<span class="toggle-arrow" class:open={showAdvanced}>&rsaquo;</span>
+			</button>
+
+			{#if showAdvanced}
+			<div class="advanced-section">
+				<div class="form-group">
+					<label for="nsec">Your Nostr private key</label>
+					<input
+						id="nsec"
+						type="password"
+						bind:value={nsec}
+						placeholder="nsec1... or hex format"
+						autocomplete="off"
+						disabled={isLoading}
+					/>
+					<p class="field-hint">Import your existing key to use it with diVine Login. Leave empty to create a new one.</p>
+				</div>
+			</div>
+			{/if}
+
 			<button type="submit" class="btn-primary" disabled={isLoading}>
 				{isLoading ? 'Creating account...' : 'Create Account'}
 			</button>
@@ -142,9 +177,11 @@
 				Already have an account? <a href="/login">Sign in</a>
 			</p>
 
+			{#if hasExtension}
 			<p class="auth-note">
-				Team admins: Use <a href="/">NIP-07 browser extension</a> instead
+				Admin? <a href="/login">Sign in with your Nostr extension</a>
 			</p>
+			{/if}
 		{/if}
 	</div>
 </div>
@@ -171,20 +208,30 @@
 
 	.auth-branding {
 		display: flex;
-		flex-direction: row;
+		flex-direction: column;
 		align-items: center;
 		justify-content: center;
-		gap: 0.5rem;
-		font-family: var(--font-heading);
-		font-size: 1.5rem;
-		font-weight: 700;
-		color: var(--color-divine-green);
+		gap: 2px;
 		text-decoration: none;
 		margin-bottom: 1.5rem;
 	}
 
 	.auth-branding:hover {
-		color: var(--color-divine-green-dark);
+		opacity: 0.85;
+	}
+
+	.auth-logo-img {
+		height: 28px;
+	}
+
+	.auth-logo-sub {
+		font-family: 'Inter', sans-serif;
+		font-weight: 500;
+		font-size: 11px;
+		letter-spacing: 3px;
+		text-transform: uppercase;
+		color: var(--color-divine-green);
+		opacity: 0.6;
 	}
 
 	h1 {
@@ -242,6 +289,47 @@
 	input:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
+	}
+
+	.advanced-toggle {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 0.25rem;
+		width: 100%;
+		background: none;
+		border: none;
+		color: var(--color-divine-text-secondary);
+		font-size: 0.8rem;
+		cursor: pointer;
+		padding: 0.25rem 0;
+		margin-bottom: 0.5rem;
+		transition: color 0.2s;
+	}
+
+	.advanced-toggle:hover {
+		color: var(--color-divine-green);
+	}
+
+	.toggle-arrow {
+		display: inline-block;
+		transition: transform 0.2s;
+		font-size: 1rem;
+	}
+
+	.toggle-arrow.open {
+		transform: rotate(90deg);
+	}
+
+	.advanced-section {
+		margin-bottom: 0.5rem;
+	}
+
+	.field-hint {
+		font-size: 0.75rem;
+		color: var(--color-divine-text-secondary);
+		margin-top: 0.35rem;
+		line-height: 1.4;
 	}
 
 	.btn-primary {

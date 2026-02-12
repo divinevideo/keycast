@@ -8,8 +8,6 @@ declare global {
         __ENV__?: {
             VITE_DOMAIN?: string;
             ALLOWED_PUBKEYS?: string;
-            VITE_NDK_EXPLICIT_RELAYS?: string;
-            VITE_NDK_BUNKER_RELAYS?: string;
             SHOW_TEAMS_FUNCTIONALITY?: string;
         };
     }
@@ -18,7 +16,7 @@ declare global {
 /**
  * Get a runtime environment variable with fallback to build-time value
  */
-export function getEnvVar(key: 'VITE_DOMAIN' | 'ALLOWED_PUBKEYS' | 'VITE_NDK_EXPLICIT_RELAYS' | 'VITE_NDK_BUNKER_RELAYS' | 'SHOW_TEAMS_FUNCTIONALITY'): string | undefined {
+export function getEnvVar(key: 'VITE_DOMAIN' | 'ALLOWED_PUBKEYS' | 'SHOW_TEAMS_FUNCTIONALITY'): string | undefined {
     // Check runtime injection first (from window.__ENV__)
     if (typeof window !== 'undefined' && window.__ENV__?.[key]) {
         return window.__ENV__[key];

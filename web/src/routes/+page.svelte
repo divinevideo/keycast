@@ -3,19 +3,17 @@ import { getCurrentUser, setCurrentUser } from "$lib/current_user.svelte";
 import { KeycastApi } from "$lib/keycast_api.svelte";
 import { BRAND } from "$lib/brand";
 import type { TeamWithRelations, BunkerSession } from "$lib/types";
-import { Users, Key, ArrowRight, PlusCircle, Gear, Copy, Check, EnvelopeSimple, CaretDown, CaretUp, Question, ArrowSquareOut, ShieldCheck, Export, PlugsConnected } from "phosphor-svelte";
+import { Key, ArrowRight, PlusCircle, Gear, Copy, Check, EnvelopeSimple, CaretDown, CaretUp, Question, ArrowSquareOut, ShieldCheck, Export, PlugsConnected } from "phosphor-svelte";
 import Loader from "$lib/components/Loader.svelte";
 import CreateBunkerModal from "$lib/components/CreateBunkerModal.svelte";
 import { onMount } from "svelte";
 import { nip19 } from "nostr-tools";
 import { toast } from "svelte-hot-french-toast";
-import ndk from "$lib/ndk.svelte";
 import { signin, SigninMethod } from "$lib/utils/auth";
 import { getAllowedPubkeys, isTeamsEnabled } from "$lib/utils/env";
 
 const api = new KeycastApi();
 const currentUser = $derived(getCurrentUser());
-const user = $derived(currentUser?.user);
 const authMethod = $derived(currentUser?.authMethod);
 
 let teams = $state<TeamWithRelations[]>([]);
@@ -36,11 +34,16 @@ let showLearnMore = $state(false);
 let pubkeyFormat = $state<'hex' | 'npub'>('npub');
 let copiedPubkey = $state<string | null>(null);
 let isNip07Loading = $state(false);
+let hasExtension = $state(false);
+
+onMount(() => {
+	hasExtension = typeof window !== 'undefined' && !!window.nostr;
+});
 
 async function handleNip07Signin() {
 	isNip07Loading = true;
 	try {
-		await signin(ndk, undefined, SigninMethod.Nip07);
+		await signin(SigninMethod.Nip07);
 	} catch (err) {
 		console.error('NIP-07 signin error:', err);
 	} finally {
@@ -73,11 +76,11 @@ async function copyPubkey(hexPubkey: string) {
 
 // Check if user is whitelisted for team creation
 const isWhitelisted = $derived(
-	user?.pubkey ? getAllowedPubkeys().includes(user.pubkey) : false
+	currentUser?.pubkey ? getAllowedPubkeys().includes(currentUser.pubkey) : false
 );
 
 async function loadTeams() {
-	if (!user?.pubkey) return;
+	if (!currentUser?.pubkey) return;
 
 	try {
 		const response = await api.get<TeamWithRelations[]>('/teams');
@@ -92,7 +95,7 @@ async function loadTeams() {
 }
 
 async function loadSessions() {
-	if (!user?.pubkey) return;
+	if (!currentUser?.pubkey) return;
 
 	try {
 		const response = await api.get<{ sessions: BunkerSession[] }>('/user/sessions');
@@ -107,9 +110,9 @@ async function loadSessions() {
 }
 
 async function copyUserPubkey() {
-	if (!user) return;
+	if (!currentUser) return;
 	try {
-		const formatted = formatPubkey(user.pubkey);
+		const formatted = formatPubkey(currentUser.pubkey);
 		await navigator.clipboard.writeText(formatted);
 		copiedNpub = true;
 		toast.success(`${pubkeyFormat === 'npub' ? 'npub' : 'Hex pubkey'} copied!`);
@@ -153,7 +156,7 @@ async function revokeSession(bunkerPubkey: string, appName: string) {
 
 onMount(async () => {
 	// Check for cookie-based authentication first
-	if (!user) {
+	if (!currentUser) {
 		try {
 			const response = await fetch('/api/oauth/auth-status', {
 				credentials: 'include'
@@ -198,14 +201,12 @@ onMount(async () => {
 	await new Promise(resolve => setTimeout(resolve, 50));
 
 	const currentUserCheck = getCurrentUser();
-	if (currentUserCheck?.user?.pubkey) {
-		const userObj = currentUserCheck.user;
-
+	if (currentUserCheck?.pubkey) {
 		// Convert hex pubkey to npub
 		try {
-			userNpub = nip19.npubEncode(userObj.pubkey);
+			userNpub = nip19.npubEncode(currentUserCheck.pubkey);
 		} catch (e) {
-			userNpub = userObj.pubkey;
+			userNpub = currentUserCheck.pubkey;
 		}
 
 		// Load dashboard data (gracefully handles missing user records)
@@ -213,22 +214,12 @@ onMount(async () => {
 		if (isTeamsEnabled()) loads.push(loadTeams());
 		await Promise.all(loads);
 		isLoadingDashboard = false;
-
-		// Try to fetch user profile for name
-		try {
-			const profile = await userObj.fetchProfile();
-			if (profile?.name || profile?.displayName) {
-				userName = profile.displayName || profile.name || '';
-			}
-		} catch (e) {
-			console.log('Could not fetch profile:', e);
-		}
 	}
 });
 </script>
 
 <svelte:head>
-	<title>{user ? 'Dashboard' : 'Welcome'} - {BRAND.name}</title>
+	<title>{currentUser ? 'Dashboard' : 'Welcome'} - {BRAND.name}</title>
 </svelte:head>
 
 {#if isCheckingAuth}
@@ -236,7 +227,7 @@ onMount(async () => {
 	<div class="flex items-center justify-center min-h-screen">
 		<Loader />
 	</div>
-{:else if user}
+{:else if currentUser}
 	<!-- Dashboard for authenticated users -->
 	<div class="dashboard">
 		{#if isLoadingDashboard}
@@ -288,8 +279,8 @@ onMount(async () => {
 							<Key size={20} weight="fill" />
 						</div>
 						<div class="identity-info">
-							<span class="identity-value mono" title={formatPubkey(user.pubkey)}>
-								{formatPubkey(user.pubkey).slice(0, 12)}...{formatPubkey(user.pubkey).slice(-8)}
+							<span class="identity-value mono" title={formatPubkey(currentUser.pubkey)}>
+								{formatPubkey(currentUser.pubkey).slice(0, 12)}...{formatPubkey(currentUser.pubkey).slice(-8)}
 							</span>
 							<button class="copy-btn" onclick={copyUserPubkey} title="Copy pubkey">
 								{#if copiedNpub}
@@ -378,7 +369,7 @@ onMount(async () => {
 					<div class="empty-state">
 						<p>No app connections yet.</p>
 						<p class="hint">
-							Connect your diVine Login to Nostr apps to sign in without sharing your private key.
+							Connect to Nostr apps and sign in with your email and password.
 							<a href="https://nostr.how/en/get-started" target="_blank" rel="noopener noreferrer">Learn more</a>
 						</p>
 					</div>
@@ -581,14 +572,12 @@ onMount(async () => {
 		<div class="landing-content">
 			<!-- Logo/Branding -->
 			<a href="/" class="landing-logo">
-				<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" fill="currentColor" viewBox="0 0 256 256">
-					<path d="M216.57,39.43A80,80,0,0,0,83.91,120.78L28.69,176A15.86,15.86,0,0,0,24,187.31V216a16,16,0,0,0,16,16H72a8,8,0,0,0,8-8V208H96a8,8,0,0,0,8-8V184h16a8,8,0,0,0,5.66-2.34l9.56-9.57A79.73,79.73,0,0,0,160,176h.1A80,80,0,0,0,216.57,39.43ZM180,92a16,16,0,1,1,16-16A16,16,0,0,1,180,92Z"></path>
-				</svg>
-				<span>{BRAND.name}</span>
+				<img src="/divine-logo.svg" alt="{BRAND.shortName}" class="landing-logo-img" />
+				<span class="landing-logo-sub">Login</span>
 			</a>
 
-			<h1 class="landing-title">Manage Your Nostr Identity</h1>
-			<p class="landing-subtitle">Secure your keys. Connect everywhere.</p>
+			<h1 class="landing-title">One account for every Nostr app</h1>
+			<p class="landing-subtitle">We handle your Nostr keys. You just use your email and password.</p>
 
 			<!-- CTAs -->
 			<div class="landing-ctas">
@@ -596,39 +585,41 @@ onMount(async () => {
 				<a href="/login" class="button button-secondary">Sign In</a>
 			</div>
 
-			<!-- NIP-07 Admin Login -->
+			<!-- NIP-07 Admin Login (only visible with browser extension) -->
+			{#if hasExtension}
 			<button
 				class="admin-login-link"
 				onclick={handleNip07Signin}
 				disabled={isNip07Loading}
 			>
-				{isNip07Loading ? 'Connecting...' : 'NIP-07 Admin Login'}
+				{isNip07Loading ? 'Connecting...' : 'Admin access with Nostr extension'}
 			</button>
+			{/if}
 
 			<!-- Feature sections -->
 			<div class="features-grid">
 				<div class="feature-card">
 					<div class="feature-icon">
-						<Key size={24} weight="fill" />
+						<EnvelopeSimple size={24} weight="fill" />
 					</div>
-					<h3>No Extensions Needed</h3>
-					<p>Sign in without browser extensions. We manage your Nostr key so you can focus on the apps.</p>
+					<h3>Just email and password</h3>
+					<p>No technical setup. Create an account like you would on any other service.</p>
 				</div>
 
 				<div class="feature-card">
 					<div class="feature-icon">
-						<Users size={24} weight="fill" />
+						<PlugsConnected size={24} weight="fill" />
 					</div>
-					<h3>Use Any Nostr App</h3>
-					<p>Connect to apps across the Nostr ecosystem through diVine. Your key stays safe with us.</p>
+					<h3>Works across apps</h3>
+					<p>Sign in to any Nostr app that supports diVine Login. One account, everywhere.</p>
 				</div>
 
 				<div class="feature-card">
 					<div class="feature-icon">
-						<Gear size={24} weight="fill" />
+						<ShieldCheck size={24} weight="fill" />
 					</div>
-					<h3>Familiar Security</h3>
-					<p>Like iCloud or Google, we store your credentials securely. Your key is encrypted at rest.</p>
+					<h3>Secure by default</h3>
+					<p>Your keys are encrypted and stored safely, like your passwords in iCloud or Google.</p>
 				</div>
 			</div>
 
@@ -1263,17 +1254,29 @@ onMount(async () => {
 
 	.landing-logo {
 		display: inline-flex;
+		flex-direction: column;
 		align-items: center;
-		gap: 0.75rem;
-		font-size: 1.75rem;
-		font-weight: 700;
-		color: var(--color-divine-green);
+		gap: 2px;
 		text-decoration: none;
 		margin-bottom: 2rem;
 	}
 
 	.landing-logo:hover {
-		opacity: 0.9;
+		opacity: 0.85;
+	}
+
+	.landing-logo-img {
+		height: 36px;
+	}
+
+	.landing-logo-sub {
+		font-family: 'Inter', sans-serif;
+		font-weight: 500;
+		font-size: 12px;
+		letter-spacing: 3px;
+		text-transform: uppercase;
+		color: var(--color-divine-green);
+		opacity: 0.6;
 	}
 
 	.landing-title {

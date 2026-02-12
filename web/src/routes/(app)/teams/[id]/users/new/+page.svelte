@@ -4,13 +4,13 @@ import { page } from "$app/stores";
 import { getCurrentUser } from "$lib/current_user.svelte";
 import { KeycastApi } from "$lib/keycast_api.svelte";
 import type { User } from "$lib/types";
-import { userFromPubkeyOrNpub } from "$lib/utils/nostr";
+import { pubkeyFromNpubOrHex } from "$lib/utils/nostr";
 import { toast } from "svelte-hot-french-toast";
 
 const { id } = $page.params;
 
 const api = new KeycastApi();
-const user = $derived(getCurrentUser()?.user);
+const user = $derived(getCurrentUser());
 
 let pubkeyOrNpub: string = $state("");
 let role: "Admin" | "Member" = $state("Member");
@@ -23,9 +23,10 @@ async function addTeammate() {
         return;
     }
 
-    const ndkUser = userFromPubkeyOrNpub(pubkeyOrNpub);
-
-    if (!ndkUser) {
+    let resolvedPubkey: string;
+    try {
+        resolvedPubkey = pubkeyFromNpubOrHex(pubkeyOrNpub);
+    } catch {
         errorMessage = "Invalid public key or npub.";
         return;
     }
@@ -33,7 +34,7 @@ async function addTeammate() {
     api.post<User>(
         `/teams/${id}/users`,
         {
-            user_pubkey: ndkUser.pubkey,
+            user_pubkey: resolvedPubkey,
             role,
         },
     )

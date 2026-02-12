@@ -1,14 +1,13 @@
 <script lang="ts">
 import { page } from "$app/stores";
 import { getCurrentUser, setCurrentUser } from "$lib/current_user.svelte";
-import ndk from "$lib/ndk.svelte";
 import { SigninMethod, signin, signout } from "$lib/utils/auth";
-import { Key, SignIn, SignOut } from "phosphor-svelte";
+import { SignIn, SignOut } from "phosphor-svelte";
 import { onMount } from "svelte";
 import { BRAND } from "$lib/brand";
 import { isTeamsEnabled } from "$lib/utils/env";
 
-const user = $derived(getCurrentUser()?.user);
+const user = $derived(getCurrentUser());
 const activePage = $derived($page.url.pathname);
 
 // Check for cookie-based authentication on mount
@@ -34,11 +33,9 @@ onMount(async () => {
 
 
 <div class="container flex flex-row items-center justify-between mb-8">
-	<a href="/" class="flex flex-row items-center gap-2 group">
-		<h1 class="text-2xl font-bold flex flex-row gap-1.5 items-center text-[var(--color-divine-green)] group-hover:text-[var(--color-divine-green-light)] transition-colors">
-            <Key size="28" weight="fill" />
-            {BRAND.name}
-        </h1>
+	<a href="/" class="flex flex-col items-start gap-0 group transition-opacity hover:opacity-85">
+		<img src="/divine-logo.svg" alt="{BRAND.shortName}" class="h-[22px]" />
+		<span class="text-[10px] font-medium tracking-[3px] uppercase text-[var(--color-divine-green)] opacity-60">Login</span>
 	</a>
 
     <nav class="flex flex-row items-center justify-start gap-4">
@@ -50,7 +47,7 @@ onMount(async () => {
             <a class="nav-link {activePage === '/teams' ? 'active' : ''} bordered" href="/teams">Teams</a>
             {/if}
             <button
-                onclick={() => signout(ndk)}
+                onclick={() => signout()}
                 class="button button-secondary button-icon"
                 role="menuitem"
                 tabindex="-1"
@@ -61,7 +58,7 @@ onMount(async () => {
             </button>
         {:else}
             <button
-                onclick={() => signin(ndk, undefined, SigninMethod.Nip07)}
+                onclick={() => signin(SigninMethod.Nip07)}
                 class="button button-primary button-icon"
             >
                 <SignIn size="20" />

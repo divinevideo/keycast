@@ -9,7 +9,6 @@ import PageSection from "$lib/components/PageSection.svelte";
 import PolicyCard from "$lib/components/PolicyCard.svelte";
 import { getCurrentUser } from "$lib/current_user.svelte";
 import { KeycastApi } from "$lib/keycast_api.svelte";
-import ndk from "$lib/ndk.svelte";
 import type {
     PolicyWithPermissions,
     StoredKey,
@@ -23,7 +22,7 @@ import { toast } from "svelte-hot-french-toast";
 const { id } = $page.params;
 
 const api = new KeycastApi();
-const user = $derived(getCurrentUser()?.user);
+const user = $derived(getCurrentUser());
 let isLoading = $state(true);
 let hasFetched = $state(false);
 let team: TeamWithRelations | null = $state(null);
@@ -94,10 +93,10 @@ async function removeUser(userToRemove: User) {
         <div class="card-grid mb-4">
             {#each users as user}
                 <div class="card flex flex-row! gap-4 relative">
-                    <Avatar user={ndk.getUser({ pubkey: user.user_pubkey })} extraClasses="w-12 h-12" />
+                    <Avatar pubkey={user.user_pubkey} extraClasses="w-12 h-12" />
                     <div class="flex flex-col gap-1">
                         <span class="font-semibold">
-                            <Name user={ndk.getUser({ pubkey: user.user_pubkey })} />
+                            <Name pubkey={user.user_pubkey} />
                         </span>
                         <span class="font-mono text-xs text-gray-500">
                             {truncatedNpubForPubkey(user.user_pubkey)}&hellip;
@@ -123,14 +122,14 @@ async function removeUser(userToRemove: User) {
                 <div class="card-grid">
                     {#each storedKeys as key}
                         <a href={`/teams/${id}/keys/${key.pubkey}`} class="card hover-card flex flex-row! gap-4 ">
-                            <Avatar user={ndk.getUser({ pubkey: key.pubkey })} extraClasses="w-12 h-12" />
+                            <Avatar pubkey={key.pubkey} extraClasses="w-12 h-12" />
                             <div class="flex flex-col gap-1">
                                 <span class="font-semibold">
                                     {key.name}
                                 </span>
                                 <div class="flex flex-row gap-1">
                                     <span class="text-xs text-gray-500">
-                                        <Name user={ndk.getUser({ pubkey: key.pubkey })} />
+                                        <Name pubkey={key.pubkey} />
                                     </span>
                                     <span class="font-mono text-xs text-gray-500">
                                         ({truncatedNpubForPubkey(key.pubkey)}&hellip;)

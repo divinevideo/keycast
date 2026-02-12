@@ -1,21 +1,12 @@
 import { browser } from "$app/environment";
 import { goto } from "$app/navigation";
 import { getCurrentUser, setCurrentUser } from "$lib/current_user.svelte";
-import type NDK from "@nostr-dev-kit/ndk";
-import {
-    NDKEvent,
-    NDKKind,
-    NDKNip07Signer,
-    type NDKUser,
-} from "@nostr-dev-kit/ndk";
 import toast from "svelte-hot-french-toast";
 import { getViteDomain, getAllowedPubkeys, isTeamsEnabled } from "$lib/utils/env";
 
 export enum SigninMethod {
     Nip07 = "nip07",
     NostrLogin = "nostr-login",
-    // Nip46 = "nip46",
-    // PK = "pk",
 }
 
 function isAllowedPubkey(pubkey: string) {
@@ -23,81 +14,57 @@ function isAllowedPubkey(pubkey: string) {
     return allowedPubkeys && allowedPubkeys.includes(pubkey);
 }
 
-/**
- * Attempt to signin with the same method that was previously used, or default to NIP-07 extension
- * For NIP-07, performs NIP-98 authentication against /api/auth/login to get session cookie
- */
 export async function signin(
-    ndk: NDK,
-    bunkerNDK?: NDK,
     method?: SigninMethod,
-    token?: string,
-    user?: NDKUser,
-): Promise<NDKUser | null> {
-    // We only handle NIP-07 or nostr login for now
-    let signedInUser: NDKUser | null = user || null;
+): Promise<string | null> {
+    let pubkey: string | null = null;
     if (method === SigninMethod.Nip07) {
-        signedInUser = await nip07Login(ndk);
+        pubkey = await nip07Login();
     }
-    if (signedInUser) {
-        signedInUser.ndk = ndk;
-        ndk.activeUser = signedInUser;
+    if (pubkey) {
         const alreadySignedIn = !!getCurrentUser();
         if (!alreadySignedIn) {
             toast.success("Signed in successfully");
         }
-        // NIP-07 admins go to dashboard, regular users go to teams (if enabled) or dashboard
         const dest = method === SigninMethod.Nip07 ? "/" : (isTeamsEnabled() ? "/teams" : "/");
         goto(dest);
     }
-    return signedInUser;
+    return pubkey;
 }
 
-/**
- * Authenticate admin user via NIP-07 extension using NIP-98 HTTP Auth
- * Signs a kind 27235 event and sends it to /api/auth/login
- */
-async function nip07Login(ndk: NDK): Promise<NDKUser | null> {
+async function nip07Login(): Promise<string | null> {
     if (!browser || !window.nostr) {
         toast.error("NIP-07 extension not found");
         return null;
     }
 
     try {
-        // Get user from NIP-07 extension
-        const signer = new NDKNip07Signer();
-        ndk.signer = signer;
-        const user = await signer.user();
+        const pubkey = await window.nostr.getPublicKey();
 
-        // Client-side check for allowed pubkeys (server also validates)
-        if (!isAllowedPubkey(user.pubkey)) {
+        if (!isAllowedPubkey(pubkey)) {
             toast.error("Your pubkey is not authorized for admin access");
             return null;
         }
 
-        // Build NIP-98 auth event for login endpoint
         const apiBase = getViteDomain();
         const url = `${apiBase}/api/auth/login`;
 
-        const authEvent = new NDKEvent(ndk, {
-            kind: NDKKind.HttpAuth,
+        const eventTemplate = {
+            kind: 27235,
             content: "",
-            pubkey: user.pubkey,
             created_at: Math.floor(Date.now() / 1000),
             tags: [
                 ["u", url],
                 ["method", "POST"],
             ],
-        });
+        };
 
-        // Sign the event with NIP-07 extension
-        await authEvent.sign();
+        const signedEvent = await window.nostr.signEvent(eventTemplate);
 
-        // Send NIP-98 auth to login endpoint
         const response = await fetch(url, {
             method: 'POST',
             headers: {
-                'Authorization': `Nostr ${btoa(JSON.stringify(authEvent.rawEvent()))}`,
+                'Authorization': `Nostr ${btoa(JSON.stringify(signedEvent))}`,
                 'Origin': window.location.origin,
             },
             credentials: 'include',
@@ -107,7 +74,7 @@ async function nip07Login(ndk: NDK): Promise<NDKUser | null> {
             const data = await response.json();
             setCurrentUser(data.pubkey, 'nip07');
             document.cookie = `keycastUserPubkey=${data.pubkey}; max-age=1209600; SameSite=Lax; Secure; path=/`;
-            return user;
+            return data.pubkey;
         } else if (response.status === 403) {
             toast.error("Your pubkey is not authorized for admin access");
             return null;
@@ -123,11 +90,7 @@ async function nip07Login(ndk: NDK): Promise<NDKUser | null> {
     }
 }
 
-/**
- * Signs the user out.
- */
-export async function signout(ndk: NDK) {
-    // Call API logout endpoint to clear server-side session cookie
+export async function signout() {
     try {
         const response = await fetch(`${getViteDomain()}/api/auth/logout`, {
             method: 'POST',
@@ -140,10 +103,7 @@ export async function signout(ndk: NDK) {
         console.error('Error calling logout API:', error);
     }
 
-    // Clear client-side state
     setCurrentUser(null);
-    ndk.activeUser = undefined;
-    // Properly delete the client-side cookie by setting max-age=0 with the same path
     document.cookie = "keycastUserPubkey=; max-age=0; path=/; SameSite=Lax; Secure";
     toast.success("Signed out");
     goto("/");

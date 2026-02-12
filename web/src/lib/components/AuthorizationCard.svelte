@@ -14,7 +14,7 @@ let { authorization, teamId, keyPubkey, onDelete }: {
 } = $props();
 
 const api = new KeycastApi();
-const user = $derived(getCurrentUser()?.user);
+const user = $derived(getCurrentUser());
 let copyConnectionSuccess = $state(false);
 let isDeleting = $state(false);
 

@@ -13,7 +13,7 @@ let keycastCookie = $derived(data?.keycastCookie);
 initApi();
 
 $effect(() => {
-    if (keycastCookie && getCurrentUser()?.user?.pubkey !== keycastCookie) {
+    if (keycastCookie && getCurrentUser()?.pubkey !== keycastCookie) {
         const savedMethod = (localStorage.getItem('keycast_auth_method') as 'nip07' | 'cookie') || 'cookie';
         setCurrentUser(keycastCookie, savedMethod);
     }

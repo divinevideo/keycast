@@ -9,7 +9,6 @@ import Name from "$lib/components/Name.svelte";
 import PageSection from "$lib/components/PageSection.svelte";
 import { getCurrentUser } from "$lib/current_user.svelte";
 import { KeycastApi } from "$lib/keycast_api.svelte";
-import ndk from "$lib/ndk.svelte";
 import type {
     AuthorizationWithRelations,
     KeyWithRelations,
@@ -17,24 +16,20 @@ import type {
     Team,
 } from "$lib/types";
 import { formattedDate } from "$lib/utils/dates";
-import {
-    type NDKUser,
-    type NDKUserProfile,
-} from "@nostr-dev-kit/ndk";
+import { npubFromPubkey } from "$lib/utils/nostr";
 import { CaretRight } from "phosphor-svelte";
 import { toast } from "svelte-hot-french-toast";
 
 const { id, pubkey } = $page.params;
 
 const api = new KeycastApi();
-const user = $derived(getCurrentUser()?.user);
+const user = $derived(getCurrentUser());
 let isLoading = $state(true);
 let hasFetched = $state(false);
 let team: Team | null = $state(null);
 let key: StoredKey | null = $state(null);
 let authorizations: AuthorizationWithRelations[] = $state([]);
-let keyUser: NDKUser | null = ndk.getUser({ pubkey });
-let keyUserProfile: NDKUserProfile | null = $state(null);
+let keyNpub = npubFromPubkey(pubkey);
 
 $effect(() => {
     if (user?.pubkey && !hasFetched) {
@@ -49,12 +44,6 @@ $effect(() => {
             .finally(() => {
                 isLoading = false;
             });
-    }
-
-    if (key && !keyUserProfile) {
-        keyUser.fetchProfile().then((profile) => {
-            keyUserProfile = profile;
-        });
     }
 });
 
@@ -90,25 +79,21 @@ async function removeKey() {
         class="relative"
     >
         <div class="absolute inset-0 bg-cover bg-center bg-gray-800 overflow-hidden rounded-lg">
-            {#if keyUserProfile?.banner}
-                <img src={keyUserProfile.banner} alt="Banner" class="opacity-20 w-full h-full object-cover object-center rounded-lg" />
-            {:else}
-                <div class="w-full h-full bg-gray-800"></div>
-            {/if}
+            <div class="w-full h-full bg-gray-800"></div>
         </div>
         <div class="relative p-6 flex items-center gap-4">
-            <Avatar user={ndk.getUser({ pubkey })} extraClasses="w-24 h-24" />
+            <Avatar pubkey={pubkey} extraClasses="w-24 h-24" />
             <div class="flex flex-col gap-1 truncate">
                 <span class="font-semibold text-lg">
-                    <Name user={ndk.getUser({ pubkey })} />
+                    <Name pubkey={pubkey} />
                 </span>
                 <span class="text-xs font-mono text-gray-300 flex flex-row gap-2 items-center justify-between truncate">
-                    <span class="truncate">{keyUser.npub}</span>
-                    <Copy value={keyUser.npub} size="18" />
+                    <span class="truncate">{keyNpub}</span>
+                    <Copy value={keyNpub} size="18" />
                 </span>
                 <span class="text-xs font-mono text-gray-300 flex flex-row gap-2 items-center justify-between truncate">
-                    <span class="truncate">{keyUser.pubkey}</span>
-                    <Copy value={keyUser.pubkey} size="18" />
+                    <span class="truncate">{pubkey}</span>
+                    <Copy value={pubkey} size="18" />
                 </span>
                 <span class="text-xs font-mono text-gray-400 mt-2">
                     Added: {formattedDate(new Date(key.created_at))}

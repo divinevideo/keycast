@@ -89,16 +89,6 @@ fn inject_runtime_env(html: &str) -> String {
         env_obj["ALLOWED_PUBKEYS"] = json!(pubkeys);
     }
 
-    // VITE_NDK_EXPLICIT_RELAYS - comma-separated relay URLs for reading/subscribing (optional)
-    if let Ok(relays) = env::var("VITE_NDK_EXPLICIT_RELAYS") {
-        env_obj["VITE_NDK_EXPLICIT_RELAYS"] = json!(relays);
-    }
-
-    // VITE_NDK_BUNKER_RELAYS - comma-separated relay URLs for bunker NDK (optional)
-    if let Ok(relays) = env::var("VITE_NDK_BUNKER_RELAYS") {
-        env_obj["VITE_NDK_BUNKER_RELAYS"] = json!(relays);
-    }
-
     // SHOW_TEAMS_FUNCTIONALITY - enable teams UI (optional, default: hidden)
     if let Ok(val) = env::var("SHOW_TEAMS_FUNCTIONALITY") {
         env_obj["SHOW_TEAMS_FUNCTIONALITY"] = json!(val);

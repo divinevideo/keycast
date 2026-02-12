@@ -12,7 +12,7 @@ import { toast } from "svelte-hot-french-toast";
 if (!isTeamsEnabled()) goto("/", { replaceState: true });
 
 const api = new KeycastApi();
-const user = $derived(getCurrentUser()?.user);
+const user = $derived(getCurrentUser());
 let isLoading = $state(true);
 let hasFetched = $state(false);
 let teams: TeamWithRelations[] | null = $state(null);

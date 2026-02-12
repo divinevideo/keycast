@@ -1,13 +1,18 @@
-import ndk from "$lib/ndk.svelte";
-import type { NDKUser } from "@nostr-dev-kit/ndk";
+import { nip19 } from "nostr-tools";
 
 export function truncatedNpubForPubkey(pubkey?: string, maxLength = 9) {
-    return ndk.getUser({ pubkey: pubkey })?.npub.slice(0, maxLength);
+    if (!pubkey) return undefined;
+    return nip19.npubEncode(pubkey).slice(0, maxLength);
 }
 
-export function userFromPubkeyOrNpub(pubkeyOrNpub: string): NDKUser | null {
-    if (pubkeyOrNpub.startsWith("npub1")) {
-        return ndk.getUser({ npub: pubkeyOrNpub });
+export function pubkeyFromNpubOrHex(input: string): string {
+    if (input.startsWith("npub1")) {
+        const { data } = nip19.decode(input);
+        return data as string;
     }
-    return ndk.getUser({ pubkey: pubkeyOrNpub });
+    return input;
+}
+
+export function npubFromPubkey(pubkey: string): string {
+    return nip19.npubEncode(pubkey);
 }

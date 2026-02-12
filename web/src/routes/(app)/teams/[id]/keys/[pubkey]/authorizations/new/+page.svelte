@@ -18,7 +18,7 @@ import { toast } from "svelte-hot-french-toast";
 const { id, pubkey } = $page.params;
 
 const api = new KeycastApi();
-const user = $derived(getCurrentUser()?.user);
+const user = $derived(getCurrentUser());
 let isLoading = $state(true);
 let hasFetched = $state(false);
 

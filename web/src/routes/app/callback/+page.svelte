@@ -8,7 +8,7 @@ const currentUrl = $derived(browser ? $page.url.href : "");
 </script>
 
 <svelte:head>
-    <title>Returning to App - Keycast</title>
+    <title>Returning to App - diVine Login</title>
     <meta name="robots" content="noindex">
 </svelte:head>
 

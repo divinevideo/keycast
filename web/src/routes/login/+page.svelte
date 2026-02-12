@@ -4,17 +4,22 @@
 	import { KeycastApi } from '$lib/keycast_api.svelte';
 	import { setCurrentUser } from '$lib/current_user.svelte';
 	import { BRAND } from '$lib/brand';
-	import ndk from '$lib/ndk.svelte';
 	import { signin, SigninMethod } from '$lib/utils/auth';
 	import { PlugsConnected } from 'phosphor-svelte';
+	import { onMount } from 'svelte';
 
 	const api = new KeycastApi();
 	let isNip07Loading = $state(false);
+	let hasExtension = $state(false);
+
+	onMount(() => {
+		hasExtension = typeof window !== 'undefined' && !!window.nostr;
+	});
 
 	async function handleNip07Signin() {
 		isNip07Loading = true;
 		try {
-			await signin(ndk, undefined, SigninMethod.Nip07);
+			await signin(SigninMethod.Nip07);
 		} catch (err) {
 			console.error('NIP-07 signin error:', err);
 		} finally {
@@ -101,14 +106,12 @@
 	<div class="auth-container">
 		<!-- Logo/Branding -->
 		<a href="/" class="auth-branding">
-			<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" fill="currentColor" viewBox="0 0 256 256">
-				<path d="M216.57,39.43A80,80,0,0,0,83.91,120.78L28.69,176A15.86,15.86,0,0,0,24,187.31V216a16,16,0,0,0,16,16H72a8,8,0,0,0,8-8V208H96a8,8,0,0,0,8-8V184h16a8,8,0,0,0,5.66-2.34l9.56-9.57A79.73,79.73,0,0,0,160,176h.1A80,80,0,0,0,216.57,39.43ZM180,92a16,16,0,1,1,16-16A16,16,0,0,1,180,92Z"></path>
-			</svg>
-			<span>{BRAND.name}</span>
+			<img src="/divine-logo.svg" alt="{BRAND.shortName}" class="auth-logo-img" />
+			<span class="auth-logo-sub">Login</span>
 		</a>
 
-		<h1>Sign in</h1>
-		<p class="subtitle">{BRAND.tagline}</p>
+		<h1>Welcome back</h1>
+		<p class="subtitle">Manage your account and connected apps</p>
 
 		{#if showVerificationNotice}
 			<div class="verification-notice">
@@ -170,6 +173,7 @@
 			Don't have an account? <a href="/register">Create one</a>
 		</p>
 
+		{#if hasExtension}
 		<div class="auth-divider">
 			<span>or</span>
 		</div>
@@ -180,11 +184,9 @@
 			disabled={isNip07Loading}
 		>
 			<PlugsConnected size={18} />
-			{isNip07Loading ? 'Connecting...' : 'Sign in with Extension (NIP-07)'}
+			{isNip07Loading ? 'Connecting...' : 'Admin access with Nostr extension'}
 		</button>
-		<p class="auth-note">
-			Team admins only. Requires whitelisted pubkey and browser extension (Alby, nos2x, etc.)
-		</p>
+		{/if}
 	</div>
 </div>
 
@@ -210,20 +212,30 @@
 
 	.auth-branding {
 		display: flex;
-		flex-direction: row;
+		flex-direction: column;
 		align-items: center;
 		justify-content: center;
-		gap: 0.5rem;
-		font-family: var(--font-heading);
-		font-size: 1.5rem;
-		font-weight: 700;
-		color: var(--color-divine-green);
+		gap: 2px;
 		text-decoration: none;
 		margin-bottom: 1.5rem;
 	}
 
 	.auth-branding:hover {
-		color: var(--color-divine-green-dark);
+		opacity: 0.85;
+	}
+
+	.auth-logo-img {
+		height: 28px;
+	}
+
+	.auth-logo-sub {
+		font-family: 'Inter', sans-serif;
+		font-weight: 500;
+		font-size: 11px;
+		letter-spacing: 3px;
+		text-transform: uppercase;
+		color: var(--color-divine-green);
+		opacity: 0.6;
 	}
 
 	h1 {
