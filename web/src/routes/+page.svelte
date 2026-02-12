@@ -11,7 +11,7 @@ import { nip19 } from "nostr-tools";
 import { toast } from "svelte-hot-french-toast";
 import ndk from "$lib/ndk.svelte";
 import { signin, SigninMethod } from "$lib/utils/auth";
-import { getAllowedPubkeys } from "$lib/utils/env";
+import { getAllowedPubkeys, isTeamsEnabled } from "$lib/utils/env";
 
 const api = new KeycastApi();
 const currentUser = $derived(getCurrentUser());
@@ -209,7 +209,9 @@ onMount(async () => {
 		}
 
 		// Load dashboard data (gracefully handles missing user records)
-		await Promise.all([loadTeams(), loadSessions()]);
+		const loads: Promise<void>[] = [loadSessions()];
+		if (isTeamsEnabled()) loads.push(loadTeams());
+		await Promise.all(loads);
 		isLoadingDashboard = false;
 
 		// Try to fetch user profile for name
@@ -388,7 +390,7 @@ onMount(async () => {
 								<button class="app-header" onclick={() => toggleSession(session.bunker_pubkey)}>
 									<div class="app-info">
 										<p class="app-name">{session.application_name}</p>
-										<p class="app-domain">{session.redirect_origin}</p>
+										{#if session.redirect_origin}<p class="app-domain">{session.redirect_origin}</p>{/if}
 										<p class="app-meta">
 											{new Date(session.created_at).toLocaleDateString()}
 											{#if session.activity_count > 0}
@@ -498,8 +500,8 @@ onMount(async () => {
 			</section>
 			{/if}
 
-			<!-- Teams Section (only if user has teams or is whitelisted) -->
-			{#if teams.length > 0 || isWhitelisted}
+			<!-- Teams Section (only if teams feature is enabled and user has teams or is whitelisted) -->
+			{#if isTeamsEnabled() && (teams.length > 0 || isWhitelisted)}
 				<section class="teams-section">
 					<div class="section-header">
 						<h2 class="section-title">Teams</h2>
@@ -647,7 +649,7 @@ onMount(async () => {
 
 	/* Section Styles */
 	section {
-		margin-bottom: 2.5rem;
+		margin-bottom: 2rem;
 	}
 
 	.section-title {
@@ -679,6 +681,12 @@ onMount(async () => {
 		.btn-connect,
 		.btn-link {
 			justify-content: center;
+		}
+	}
+
+	@media (max-width: 480px) {
+		.identity-info {
+			flex-wrap: wrap;
 		}
 	}
 
@@ -802,8 +810,7 @@ onMount(async () => {
 
 	.identity-actions {
 		padding-top: 0.75rem;
-		margin-top: 0.5rem;
-		border-top: 1px solid var(--color-divine-border);
+		margin-top: 0;
 	}
 
 	.identity-link {
