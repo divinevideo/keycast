@@ -712,10 +712,8 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     let app = app.layer(middleware::from_fn(cache_control_middleware));
 
     // Try dual-stack [::] first (accepts both IPv4 and IPv6), fall back to 0.0.0.0
-    let dual_stack_addr =
-        std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, api_port));
-    let ipv4_addr =
-        std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, api_port));
+    let dual_stack_addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, api_port));
+    let ipv4_addr = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, api_port));
     tracing::info!("✔︎ API server ready on port {}", api_port);
 
     // Setup graceful shutdown with TaskTracker for background tasks
@@ -729,7 +727,10 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     let api_handle = tokio::spawn(async move {
         let listener = match tokio::net::TcpListener::bind(dual_stack_addr).await {
             Ok(l) => {
-                tracing::info!("🌐 API server listening on {} (dual-stack)", dual_stack_addr);
+                tracing::info!(
+                    "🌐 API server listening on {} (dual-stack)",
+                    dual_stack_addr
+                );
                 l
             }
             Err(_) => {
