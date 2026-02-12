@@ -711,8 +711,12 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     // Add Cache-Control headers for browser caching
     let app = app.layer(middleware::from_fn(cache_control_middleware));
 
-    let api_addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, api_port));
-    tracing::info!("✔︎ API server ready on {}", api_addr);
+    // Try dual-stack [::] first (accepts both IPv4 and IPv6), fall back to 0.0.0.0
+    let dual_stack_addr =
+        std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, api_port));
+    let ipv4_addr =
+        std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, api_port));
+    tracing::info!("✔︎ API server ready on port {}", api_port);
 
     // Setup graceful shutdown with TaskTracker for background tasks
     let shutdown_signal = Arc::new(Notify::new());
@@ -723,8 +727,21 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
 
     // Spawn API server with graceful shutdown
     let api_handle = tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind(api_addr).await.unwrap();
-        tracing::info!("🌐 API server listening on {}", api_addr);
+        let listener = match tokio::net::TcpListener::bind(dual_stack_addr).await {
+            Ok(l) => {
+                tracing::info!("🌐 API server listening on {} (dual-stack)", dual_stack_addr);
+                l
+            }
+            Err(_) => {
+                tracing::info!(
+                    "🌐 API server listening on {} (IPv4-only, IPv6 unavailable)",
+                    ipv4_addr
+                );
+                tokio::net::TcpListener::bind(ipv4_addr)
+                    .await
+                    .expect("Failed to bind API server")
+            }
+        };
         axum::serve(listener, app)
             .tcp_nodelay(true)
             .with_graceful_shutdown(async move {
