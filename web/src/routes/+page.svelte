@@ -336,24 +336,31 @@ onMount(async () => {
 						<div class="learn-block">
 							<h4><ShieldCheck size={16} weight="fill" /> Where Is Your Key?</h4>
 							<p>When you sign up with email and password, diVine generates a Nostr key for you and stores it on <a href="https://login.divine.video" target="_blank" rel="noopener noreferrer">login.divine.video</a>, encrypted using the same standards banks and password managers rely on (<a href="https://en.wikipedia.org/wiki/Advanced_Encryption_Standard" target="_blank" rel="noopener noreferrer">1</a>,<a href="https://cloud.google.com/security/products/security-key-management" target="_blank" rel="noopener noreferrer">2</a>). Your key is only decrypted in memory when an app needs to sign on your behalf, and is never stored in plain text.</p>
-							<p>Any Nostr app that supports diVine Login, like <a href="https://privdm.com" target="_blank" rel="noopener noreferrer">Priv DM <ArrowSquareOut size={12} /></a>, can use your identity with just your email and password. No copying keys between apps, no manual setup.</p>
+							<p>Any Nostr app that supports diVine Login, like <a href="https://privdm.com" target="_blank" rel="noopener noreferrer" class="inline-link">Priv DM <ArrowSquareOut size={12} /></a>, can use your identity with just your email and password. No copying keys between apps, no manual setup.</p>
+						</div>
 
-							<p class="learn-subtle"><strong>Already have a Nostr key?</strong></p>
+						<div class="learn-block">
+							<h4><Key size={16} weight="fill" /> Already Have a Nostr Key?</h4>
 							<p>You don't need a diVine account at all. Import your nsec into the diVine app and everything stays on your device.</p>
+						</div>
 
-							<p class="learn-subtle"><strong>Want to move your key to your own device?</strong></p>
+						<div class="learn-block">
+							<h4><Export size={16} weight="fill" /> Want Full Control of Your Key?</h4>
 							<p>If you started with email and password but want full control, export your nsec from <a href="/settings/security">Security Settings</a> and move it to:</p>
 							<ul class="learn-list">
-								<li><strong>Your phone:</strong> <a href="https://primal.net" target="_blank" rel="noopener noreferrer">Primal <ArrowSquareOut size={12} /></a> (iOS & Android), <a href="https://github.com/greenart7c3/Amber" target="_blank" rel="noopener noreferrer">Amber <ArrowSquareOut size={12} /></a> (Android), or <a href="https://nsec.app" target="_blank" rel="noopener noreferrer">nsec.app <ArrowSquareOut size={12} /></a> (any browser) turn your device into a personal signing server. When a Nostr app needs your signature, it asks your device and your key never leaves it.</li>
-								<li><strong>Your browser:</strong> Extensions like <a href="https://getalby.com" target="_blank" rel="noopener noreferrer">Alby <ArrowSquareOut size={12} /></a> or <a href="https://chromewebstore.google.com/detail/soapboxpub-signer/nnodjkgakfpkckcnbacpcjbpmlmbihdd" target="_blank" rel="noopener noreferrer">Soapbox Signer <ArrowSquareOut size={12} /></a> (Chrome, Firefox) keep your key in the browser itself. <a href="https://apps.apple.com/app/nostash/id6499558903" target="_blank" rel="noopener noreferrer">Nostash <ArrowSquareOut size={12} /></a> does the same for Safari on iOS.</li>
+								<li><strong>Your phone:</strong> <a href="https://primal.net" target="_blank" rel="noopener noreferrer" class="inline-link">Primal <ArrowSquareOut size={12} /></a> (iOS & Android), <a href="https://github.com/greenart7c3/Amber" target="_blank" rel="noopener noreferrer" class="inline-link">Amber <ArrowSquareOut size={12} /></a> (Android), or <a href="https://nsec.app" target="_blank" rel="noopener noreferrer" class="inline-link">nsec.app <ArrowSquareOut size={12} /></a> (any browser) turn your device into a personal signing server. When a Nostr app needs your signature, it asks your device and your key never leaves it.</li>
+								<li><strong>Your browser:</strong> Extensions like <a href="https://getalby.com" target="_blank" rel="noopener noreferrer" class="inline-link">Alby <ArrowSquareOut size={12} /></a> or <a href="https://chromewebstore.google.com/detail/soapboxpub-signer/nnodjkgakfpkckcnbacpcjbpmlmbihdd" target="_blank" rel="noopener noreferrer" class="inline-link">Soapbox Signer <ArrowSquareOut size={12} /></a> (Chrome, Firefox) keep your key in the browser itself. <a href="https://apps.apple.com/app/nostash/id6499558903" target="_blank" rel="noopener noreferrer" class="inline-link">Nostash <ArrowSquareOut size={12} /></a> does the same for Safari on iOS.</li>
 							</ul>
 							<p>With these options, each app that needs your signature must connect to your signer individually. diVine Login handles that for you automatically.</p>
 						</div>
 
 						<div class="learn-block highlight">
-							<h4><Export size={16} weight="fill" /> Why This Matters</h4>
+							<h4><ShieldCheck size={16} weight="fill" /> Why This Matters</h4>
 							<p>Unlike Twitter or Facebook, <strong>no company owns your Nostr identity</strong>. Even if diVine disappeared tomorrow, your identity and content would still exist on the network. Export your key and continue anywhere.</p>
 							<p class="learn-cta">That's the power of Nostr.</p>
+							<div class="learn-explore">
+								<a href="https://nostrapps.com" target="_blank" rel="noopener noreferrer">Explore Nostr apps at nostrapps.com <ArrowSquareOut size={12} /></a>
+							</div>
 						</div>
 					</div>
 				{/if}
@@ -375,7 +382,7 @@ onMount(async () => {
 					<div class="empty-state">
 						<p>No app connections yet.</p>
 						<p class="hint">
-							Apps that support diVine Login connect automatically when you sign in with your email and password. Use "Connect to Nostr App" only for apps that don't have diVine Login and accept a connection URL instead.
+							The diVine app and any app with "Sign in with diVine" already work with your email and password. Use this to connect to other Nostr apps. Browse them at <a href="https://nostrapps.com" target="_blank" rel="noopener noreferrer">nostrapps.com</a>.
 						</p>
 					</div>
 				{:else}
@@ -385,7 +392,14 @@ onMount(async () => {
 							<div class="app-card" class:expanded={isExpanded}>
 								<button class="app-header" onclick={() => toggleSession(session.bunker_pubkey)}>
 									<div class="app-info">
-										<p class="app-name">{session.application_name}</p>
+										<p class="app-name">
+											{session.application_name}
+											{#if session.redirect_origin?.trim()}
+												<span class="connection-badge oauth">diVine Login</span>
+											{:else}
+												<span class="connection-badge manual">Bunker</span>
+											{/if}
+										</p>
 										{#if session.redirect_origin}<p class="app-domain">{session.redirect_origin}</p>{/if}
 										<p class="app-meta">
 											{new Date(session.created_at).toLocaleDateString()}
@@ -904,10 +918,8 @@ onMount(async () => {
 		text-decoration: underline;
 	}
 
-	.learn-subtle {
-		color: var(--color-divine-text-tertiary) !important;
-		font-size: 0.8rem !important;
-		margin-top: 0.75rem !important;
+	.learn-block p strong {
+		color: var(--color-divine-text);
 	}
 
 	.learn-list {
@@ -919,13 +931,17 @@ onMount(async () => {
 	}
 
 	.learn-list li {
-		margin-bottom: 0.25rem;
+		margin-bottom: 0.5rem;
 	}
 
 	.learn-list a {
 		display: inline-flex;
 		align-items: center;
 		gap: 0.25rem;
+	}
+
+	.inline-link {
+		white-space: nowrap;
 	}
 
 	.learn-block.highlight {
@@ -940,6 +956,26 @@ onMount(async () => {
 		color: var(--color-divine-green) !important;
 		font-weight: 500;
 		margin-top: 0.5rem !important;
+	}
+
+	.learn-explore {
+		margin-top: 0.75rem;
+		padding-top: 0.75rem;
+		border-top: 1px solid color-mix(in srgb, var(--color-divine-green) 15%, transparent);
+	}
+
+	.learn-explore a {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.25rem;
+		color: var(--color-divine-green);
+		text-decoration: none;
+		font-size: 0.85rem;
+		font-weight: 500;
+	}
+
+	.learn-explore a:hover {
+		text-decoration: underline;
 	}
 
 	/* App Connections Section */
@@ -1044,6 +1080,29 @@ onMount(async () => {
 		color: var(--color-divine-text);
 		font-weight: 500;
 		margin: 0;
+	}
+
+	.connection-badge {
+		display: inline-block;
+		font-size: 0.65rem;
+		font-weight: 500;
+		padding: 0.125rem 0.5rem;
+		border-radius: 9999px;
+		margin-left: 0.5rem;
+		vertical-align: middle;
+		letter-spacing: 0.02em;
+	}
+
+	.connection-badge.oauth {
+		background: color-mix(in srgb, var(--color-divine-green) 15%, transparent);
+		color: var(--color-divine-green);
+		border: 1px solid color-mix(in srgb, var(--color-divine-green) 30%, transparent);
+	}
+
+	.connection-badge.manual {
+		background: color-mix(in srgb, var(--color-divine-text-tertiary) 10%, transparent);
+		color: var(--color-divine-text-secondary);
+		border: 1px solid color-mix(in srgb, var(--color-divine-text-tertiary) 25%, transparent);
 	}
 
 	.app-domain {

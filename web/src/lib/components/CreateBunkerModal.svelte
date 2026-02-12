@@ -109,27 +109,27 @@
 			{#if bunkerUrl}
 				<!-- Success state: Show bunker URL -->
 				<div class="modal-body">
-					<p class="success-message">Copy this bunker URL to your NIP-46 client:</p>
+					<p class="success-message">Copy this connection URL and paste it into your Nostr app:</p>
 
 					<div class="bunker-url-display">
 						<code>{bunkerUrl}</code>
 					</div>
 
 					<button class="btn-copy" onclick={copyBunkerUrl}>
-						{showCopySuccess ? '✓ Copied!' : 'Copy Bunker URL'}
+						{showCopySuccess ? '✓ Copied!' : 'Copy Connection URL'}
 					</button>
 
 					<div class="warning-box">
 						<strong>Save this URL now!</strong>
-						<p>This bunker URL acts like a password and is shown only once. Copy it now and paste it into your Nostr app. If you lose it, you can revoke this connection and create a new one.</p>
+						<p>This URL acts like a password and is shown only once. Copy it now and paste it into your Nostr app. If you lose it, revoke this connection and create a new one.</p>
 					</div>
 				</div>
 			{:else}
 				<!-- Form state: Create bunker -->
 				<div class="modal-body">
 					<div class="info-box">
-						<strong>Do you need this?</strong>
-						<p>If the app has a "Sign in with diVine" option, just use your email and password there. This is only for apps that accept a connection URL and don't have diVine Login integration (like Damus or Amethyst).</p>
+						<strong>You probably don't need this</strong>
+						<p>The diVine app and any app with "Sign in with diVine" already work with your email and password. This is only for Nostr apps that need a connection URL. Browse them at <a href="https://nostrapps.com" target="_blank" rel="noopener noreferrer">nostrapps.com</a>.</p>
 					</div>
 
 					<p class="description">
@@ -142,7 +142,7 @@
 							id="appName"
 							type="text"
 							bind:value={appName}
-							placeholder="e.g. Primal, Damus, Amethyst"
+							placeholder="e.g. Amethyst, YakiHonne, Habla"
 							required
 							disabled={isCreating}
 						/>
@@ -178,6 +178,16 @@
 {/if}
 
 <style>
+	@keyframes overlay-in {
+		from { opacity: 0; }
+		to { opacity: 1; }
+	}
+
+	@keyframes modal-in {
+		from { opacity: 0; transform: translateY(8px) scale(0.98); }
+		to { opacity: 1; transform: translateY(0) scale(1); }
+	}
+
 	.modal-overlay {
 		position: fixed;
 		top: 0;
@@ -190,6 +200,7 @@
 		justify-content: center;
 		z-index: 1000;
 		backdrop-filter: blur(4px);
+		animation: overlay-in 0.15s ease-out;
 	}
 
 	.modal {
@@ -200,7 +211,8 @@
 		width: 90%;
 		max-height: 90vh;
 		overflow-y: auto;
-		box-shadow: var(--shadow-lg);
+		box-shadow: 0 16px 48px rgba(0, 0, 0, 0.4);
+		animation: modal-in 0.2s ease-out;
 	}
 
 	.modal-header {
@@ -437,5 +449,36 @@
 		font-size: 0.875rem;
 		line-height: 1.5;
 		margin: 0;
+	}
+
+	.info-box {
+		background: color-mix(in srgb, var(--color-divine-green) 8%, transparent);
+		border: 1px solid color-mix(in srgb, var(--color-divine-green) 20%, transparent);
+		border-radius: 8px;
+		padding: 1rem;
+		margin-bottom: 1.25rem;
+	}
+
+	.info-box strong {
+		color: var(--color-divine-text);
+		display: block;
+		margin-bottom: 0.5rem;
+		font-size: 0.9rem;
+	}
+
+	.info-box p {
+		color: var(--color-divine-text-secondary);
+		font-size: 0.85rem;
+		line-height: 1.5;
+		margin: 0;
+	}
+
+	.info-box a {
+		color: var(--color-divine-green);
+		text-decoration: none;
+	}
+
+	.info-box a:hover {
+		text-decoration: underline;
 	}
 </style>
