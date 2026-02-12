@@ -2990,7 +2990,7 @@ pub async fn change_key(
     State(auth_state): State<super::routes::AuthState>,
     headers: HeaderMap,
     Json(req): Json<ChangeKeyRequest>,
-) -> Result<Json<ChangeKeyResponse>, AuthError> {
+) -> Result<Response, AuthError> {
     let old_pubkey = extract_user_from_token(&headers).await?;
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
@@ -3067,7 +3067,17 @@ pub async fn change_key(
         oauth_count
     );
 
-    Ok(Json(ChangeKeyResponse {
+    // Issue new UCAN session cookie signed by the new key
+    let redirect_origin = extract_origin_from_headers(&headers)?;
+    let ucan_token =
+        generate_ucan_token(&new_keys, tenant_id, &email, &redirect_origin, None).await?;
+
+    let cookie = format!(
+        "keycast_session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400",
+        ucan_token
+    );
+
+    let response = ChangeKeyResponse {
         success: true,
         new_pubkey: new_pubkey.clone(),
         message: format!(
@@ -3075,7 +3085,14 @@ pub async fn change_key(
             oauth_count,
             &old_pubkey[..16]
         ),
-    }))
+    };
+
+    Ok((
+        axum::http::StatusCode::OK,
+        [(axum::http::header::SET_COOKIE, cookie)],
+        Json(response),
+    )
+        .into_response())
 }
 
 /// Response for account deletion.
