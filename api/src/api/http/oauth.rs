@@ -574,9 +574,7 @@ pub async fn authorize_get(
                     tracing::warn!("UCAN cookie has pubkey {} but user doesn't exist in tenant {}, clearing stale cookie", pubkey, tenant_id);
                     (None, true, None) // User was deleted, clear the cookie
                 }
-                Some((email, _verified)) => {
-                    (user_pubkey, false, email)
-                }
+                Some((email, _verified)) => (user_pubkey, false, email),
             }
         }
     } else {
