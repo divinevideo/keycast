@@ -1,0 +1,16 @@
+{
+  "name": "keycast-e2e",
+  "devDependencies": {
+    "@playwright/test": "^1.50.0",
+    "@types/pg": "^8.11.0",
+    "nostr-tools": "^2.10.4",
+    "pg": "^8.13.0",
+    "serve": "^14.2.0"
+  },
+  "private": true,
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "test:ui": "playwright test --ui"
+  }
+}

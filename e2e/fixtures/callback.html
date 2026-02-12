@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>OAuth Callback</title>
+</head>
+<body>
+  <h1 id="status">Waiting...</h1>
+  <p id="code"></p>
+  <p id="error"></p>
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get('code');
+    const error = params.get('error');
+    if (code) {
+      document.getElementById('status').textContent = 'Authorization successful';
+      document.getElementById('code').textContent = code;
+    } else if (error) {
+      document.getElementById('status').textContent = 'Authorization failed';
+      document.getElementById('error').textContent = error;
+    }
+  </script>
+</body>
+</html>

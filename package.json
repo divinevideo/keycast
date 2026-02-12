@@ -6,6 +6,7 @@
 	"scripts": {
 		"predev": "cd keycast-login && bun run build",
 		"dev": "bun run deps:up && concurrently -n api,web -c blue,green \"bun run dev:api\" \"bun run dev:web\"",
+		"dev:e2e": "BUNKER_RELAYS=ws://localhost:8080 bun run dev",
 		"deps:up": "docker compose -f docker-compose.deps.yml up -d --wait",
 		"deps:down": "docker compose -f docker-compose.deps.yml down",
 		"deps:logs": "docker compose -f docker-compose.deps.yml logs -f",
