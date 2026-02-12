@@ -1,9 +1,8 @@
-import { execSync } from "node:child_process";
 import net from "node:net";
 
-const CONTAINER_NAME = "keycast-e2e-relay";
-const PORT = 8080;
-const TIMEOUT_MS = 10_000;
+const RELAY_PORT = 8080;
+const API_PORT = 3000;
+const TIMEOUT_MS = 30_000;
 
 function waitForPort(port: number, timeoutMs: number): Promise<void> {
   const start = Date.now();
@@ -28,17 +27,7 @@ function waitForPort(port: number, timeoutMs: number): Promise<void> {
 }
 
 export default async function globalSetup() {
-  // Stop any leftover container from a previous run
-  try {
-    execSync(`docker stop ${CONTAINER_NAME}`, { stdio: "ignore" });
-  } catch {
-    // Container didn't exist
-  }
-
-  execSync(
-    `docker run --rm -d --name ${CONTAINER_NAME} -p ${PORT}:${PORT} -e IDLE_TIMEOUT=0 ghcr.io/verse-pbc/relay_builder:latest`,
-    { stdio: "inherit" },
-  );
-
-  await waitForPort(PORT, TIMEOUT_MS);
+  // Verify the relay and API server are running (started by `bun run dev:e2e`)
+  await waitForPort(RELAY_PORT, TIMEOUT_MS);
+  await waitForPort(API_PORT, TIMEOUT_MS);
 }

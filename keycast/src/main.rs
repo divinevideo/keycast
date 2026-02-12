@@ -544,7 +544,10 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     let public_cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
-        .allow_headers(Any)
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+        ])
         .allow_credentials(false);
 
     // Get pure API routes (JSON endpoints only) - pass authorization sender
@@ -708,7 +711,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     // Add Cache-Control headers for browser caching
     let app = app.layer(middleware::from_fn(cache_control_middleware));
 
-    let api_addr = std::net::SocketAddr::from(([0, 0, 0, 0], api_port));
+    let api_addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, api_port));
     tracing::info!("✔︎ API server ready on {}", api_addr);
 
     // Setup graceful shutdown with TaskTracker for background tasks
@@ -902,8 +905,7 @@ mod tests {
         // Clear all env vars that might be set from other tests
         std::env::remove_var("APP_URL");
         std::env::remove_var("ALLOWED_PUBKEYS");
-        std::env::remove_var("VITE_NDK_EXPLICIT_RELAYS");
-        std::env::remove_var("VITE_NDK_BUNKER_RELAYS");
+        std::env::remove_var("SHOW_TEAMS_FUNCTIONALITY");
 
         let result = inject_runtime_env(html);
 
@@ -927,22 +929,16 @@ mod tests {
 
         std::env::set_var("APP_URL", "https://example.com");
         std::env::set_var("ALLOWED_PUBKEYS", "key1,key2");
-        std::env::set_var(
-            "VITE_NDK_EXPLICIT_RELAYS",
-            "wss://relay1.com,wss://relay2.com",
-        );
-        std::env::set_var("VITE_NDK_BUNKER_RELAYS", "wss://bunker1.com");
+        std::env::set_var("SHOW_TEAMS_FUNCTIONALITY", "true");
 
         let result = inject_runtime_env(html);
 
         assert!(result.contains("VITE_DOMAIN"));
         assert!(result.contains("ALLOWED_PUBKEYS"));
-        assert!(result.contains("VITE_NDK_EXPLICIT_RELAYS"));
-        assert!(result.contains("VITE_NDK_BUNKER_RELAYS"));
+        assert!(result.contains("SHOW_TEAMS_FUNCTIONALITY"));
 
         std::env::remove_var("APP_URL");
         std::env::remove_var("ALLOWED_PUBKEYS");
-        std::env::remove_var("VITE_NDK_EXPLICIT_RELAYS");
-        std::env::remove_var("VITE_NDK_BUNKER_RELAYS");
+        std::env::remove_var("SHOW_TEAMS_FUNCTIONALITY");
     }
 }

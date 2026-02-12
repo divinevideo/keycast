@@ -1,3 +1,10 @@
+import WebSocket from "ws";
+
+// Node.js doesn't have WebSocket global — nostr-tools needs it for relay connections
+if (typeof globalThis.WebSocket === "undefined") {
+  (globalThis as any).WebSocket = WebSocket;
+}
+
 import {
   BunkerSigner,
   parseBunkerInput,

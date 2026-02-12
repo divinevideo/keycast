@@ -1,4 +1,9 @@
 import { defineConfig } from "@playwright/test";
+import dns from "node:dns";
+
+// Force IPv4 for Node.js request context (API tests)
+// Prevents "localhost" from resolving to ::1 when server binds 0.0.0.0
+dns.setDefaultResultOrder("ipv4first");
 
 export default defineConfig({
   testDir: "./tests",
@@ -14,6 +19,10 @@ export default defineConfig({
     screenshot: "only-on-failure",
     extraHTTPHeaders: {
       Origin: process.env.API_URL || "http://localhost:3000",
+    },
+    launchOptions: {
+      // Force Chromium to resolve localhost as 127.0.0.1
+      args: ["--host-resolver-rules=MAP localhost 127.0.0.1"],
     },
   },
   projects: [

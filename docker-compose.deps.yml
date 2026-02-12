@@ -33,6 +33,16 @@ services:
       timeout: 2s
       retries: 10
 
+  relay:
+    image: ghcr.io/verse-pbc/relay_builder:latest
+    container_name: keycast-e2e-relay
+    environment:
+      IDLE_TIMEOUT: "0"
+    ports:
+      - "8080:8080"
+    profiles:
+      - e2e
+
 volumes:
   postgres_data:
   redis_data:

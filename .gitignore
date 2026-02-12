@@ -50,5 +50,10 @@ scale-test-results/
 # Local k8s test manifests (Kind clusters, target postgres, etc.)
 k8s_local_tests/
 
+# E2E test artifacts
+e2e/test-results/
+e2e/playwright-report/
+.playwright-mcp/
+
 # MCP cache
 .repo-cache/
