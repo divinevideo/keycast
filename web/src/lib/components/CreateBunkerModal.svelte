@@ -127,9 +127,13 @@
 			{:else}
 				<!-- Form state: Create bunker -->
 				<div class="modal-body">
+					<div class="info-box">
+						<strong>Do you need this?</strong>
+						<p>If the app has a "Sign in with diVine" option, just use your email and password there. This is only for apps that accept a connection URL and don't have diVine Login integration (like Damus or Amethyst).</p>
+					</div>
+
 					<p class="description">
-						Generate a connection URL to use your diVine Login with Nostr apps that support
-						NIP-46 remote signing (Damus, Primal, Amethyst, etc).
+						Generate a connection URL to use your identity with a Nostr app.
 					</p>
 
 					<div class="form-group">
@@ -233,6 +237,28 @@
 
 	.modal-body {
 		padding: 1.25rem;
+	}
+
+	.info-box {
+		background: color-mix(in srgb, var(--color-divine-green) 8%, transparent);
+		border: 1px solid color-mix(in srgb, var(--color-divine-green) 25%, transparent);
+		border-radius: 8px;
+		padding: 0.875rem;
+		margin-bottom: 1rem;
+	}
+
+	.info-box strong {
+		color: var(--color-divine-green);
+		display: block;
+		margin-bottom: 0.375rem;
+		font-size: 0.85rem;
+	}
+
+	.info-box p {
+		color: var(--color-divine-text-secondary);
+		font-size: 0.8rem;
+		line-height: 1.5;
+		margin: 0;
 	}
 
 	.description {

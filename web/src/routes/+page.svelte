@@ -329,19 +329,25 @@ onMount(async () => {
 					<div class="learn-content">
 						<div class="learn-block">
 							<h4><Key size={16} weight="fill" /> Your Keys Explained</h4>
-							<p><strong>Your npub</strong> (public key) is like a username — share it so others can find you across any Nostr app.</p>
+							<p><strong>Your npub</strong> (public key) is like a username. Share it so others can find you across any Nostr app.</p>
 							<p><strong>Your nsec</strong> (private key) proves you own this identity. Keep it safe! Find it in <a href="/settings/security">Security Settings</a> if you need to export it.</p>
 						</div>
 
 						<div class="learn-block">
 							<h4><ShieldCheck size={16} weight="fill" /> Where Is Your Key?</h4>
-							<p>diVine stores your encrypted key and signs on your behalf — similar to trusting Google or Apple with your data. This makes getting started easy.</p>
-							<p class="learn-subtle">Want more control? You can:</p>
+							<p>When you sign up with email and password, diVine generates a Nostr key for you and stores it on <a href="https://login.divine.video" target="_blank" rel="noopener noreferrer">login.divine.video</a>, encrypted using the same standards banks and password managers rely on (<a href="https://en.wikipedia.org/wiki/Advanced_Encryption_Standard" target="_blank" rel="noopener noreferrer">1</a>,<a href="https://cloud.google.com/security/products/security-key-management" target="_blank" rel="noopener noreferrer">2</a>). Your key is only decrypted in memory when an app needs to sign on your behalf, and is never stored in plain text.</p>
+							<p>Any Nostr app that supports diVine Login, like <a href="https://privdm.com" target="_blank" rel="noopener noreferrer">Priv DM <ArrowSquareOut size={12} /></a>, can use your identity with just your email and password. No copying keys between apps, no manual setup.</p>
+
+							<p class="learn-subtle"><strong>Already have a Nostr key?</strong></p>
+							<p>You don't need a diVine account at all. Import your nsec into the diVine app and everything stays on your device.</p>
+
+							<p class="learn-subtle"><strong>Want to move your key to your own device?</strong></p>
+							<p>If you started with email and password but want full control, export your nsec from <a href="/settings/security">Security Settings</a> and move it to:</p>
 							<ul class="learn-list">
-								<li><a href="https://getalby.com" target="_blank" rel="noopener noreferrer">Alby <ArrowSquareOut size={12} /></a>, <a href="https://chromewebstore.google.com/detail/soapboxpub-signer/nnodjkgakfpkckcnbacpcjbpmlmbihdd" target="_blank" rel="noopener noreferrer">Soapbox Signer (Chrome) <ArrowSquareOut size={12} /></a>, or <a href="https://addons.mozilla.org/en-US/firefox/addon/soapbox-pub-signer/" target="_blank" rel="noopener noreferrer">Soapbox Signer (Firefox) <ArrowSquareOut size={12} /></a> — browser extensions where your key never leaves your device</li>
-								<li><a href="https://apps.apple.com/app/nostash/id6499558903" target="_blank" rel="noopener noreferrer">Nostash <ArrowSquareOut size={12} /></a> — Safari extension for iOS users</li>
-								<li><a href="https://nsec.app" target="_blank" rel="noopener noreferrer">nsec.app <ArrowSquareOut size={12} /></a> — non-custodial signer, encrypted with your password</li>
+								<li><strong>Your phone:</strong> <a href="https://primal.net" target="_blank" rel="noopener noreferrer">Primal <ArrowSquareOut size={12} /></a> (iOS & Android), <a href="https://github.com/greenart7c3/Amber" target="_blank" rel="noopener noreferrer">Amber <ArrowSquareOut size={12} /></a> (Android), or <a href="https://nsec.app" target="_blank" rel="noopener noreferrer">nsec.app <ArrowSquareOut size={12} /></a> (any browser) turn your device into a personal signing server. When a Nostr app needs your signature, it asks your device and your key never leaves it.</li>
+								<li><strong>Your browser:</strong> Extensions like <a href="https://getalby.com" target="_blank" rel="noopener noreferrer">Alby <ArrowSquareOut size={12} /></a> or <a href="https://chromewebstore.google.com/detail/soapboxpub-signer/nnodjkgakfpkckcnbacpcjbpmlmbihdd" target="_blank" rel="noopener noreferrer">Soapbox Signer <ArrowSquareOut size={12} /></a> (Chrome, Firefox) keep your key in the browser itself. <a href="https://apps.apple.com/app/nostash/id6499558903" target="_blank" rel="noopener noreferrer">Nostash <ArrowSquareOut size={12} /></a> does the same for Safari on iOS.</li>
 							</ul>
+							<p>With these options, each app that needs your signature must connect to your signer individually. diVine Login handles that for you automatically.</p>
 						</div>
 
 						<div class="learn-block highlight">
@@ -369,8 +375,7 @@ onMount(async () => {
 					<div class="empty-state">
 						<p>No app connections yet.</p>
 						<p class="hint">
-							Connect to Nostr apps and sign in with your email and password.
-							<a href="https://nostr.how/en/get-started" target="_blank" rel="noopener noreferrer">Learn more</a>
+							Apps that support diVine Login connect automatically when you sign in with your email and password. Use "Connect to Nostr App" only for apps that don't have diVine Login and accept a connection URL instead.
 						</p>
 					</div>
 				{:else}
