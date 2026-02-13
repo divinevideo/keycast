@@ -518,37 +518,15 @@ pub async fn authorize_get(
     let tenant_id = tenant.0.id;
     let pool = &auth_state.state.db;
 
-    // Check if user is authenticated via cookie and extract user data (async)
-    let user_data = if let Some(token) = super::auth::extract_ucan_from_cookie(&headers) {
+    // Check if user is authenticated via cookie and extract pubkey
+    let user_pubkey = if let Some(token) = super::auth::extract_ucan_from_cookie(&headers) {
         crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), tenant_id)
             .await
             .ok()
-            .map(|(pubkey, _redirect_origin, _bunker_pubkey, ucan)| {
-                // Extract relays from UCAN facts
-                let relays: Vec<String> = ucan
-                    .facts()
-                    .iter()
-                    .filter_map(|fact| {
-                        fact.get("relays").and_then(|r| r.as_array()).map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(String::from))
-                                .collect()
-                        })
-                    })
-                    .next()
-                    .unwrap_or_default();
-
-                (pubkey, relays)
-            })
+            .map(|(pubkey, _redirect_origin, _bunker_pubkey, _ucan)| pubkey)
     } else {
         None
     };
-
-    let user_pubkey = user_data.as_ref().map(|(pk, _)| pk.clone());
-    let user_relays = user_data
-        .as_ref()
-        .map(|(_, relays)| relays.clone())
-        .unwrap_or_default();
 
     // Handle prompt=login: force fresh login by clearing cookie
     let force_login = params.prompt.as_deref() == Some("login");
@@ -749,21 +727,7 @@ pub async fn authorize_get(
             .and_then(|pk| pk.to_bech32().ok())
             .unwrap_or_else(|| pubkey.clone());
 
-        // Use user's relays or fallback to default popular relays
-        let relays_for_profile = if user_relays.is_empty() {
-            vec![
-                "wss://relay.damus.io".to_string(),
-                "wss://nos.lol".to_string(),
-                "wss://relay.nostr.band".to_string(),
-            ]
-        } else {
-            user_relays
-        };
-
-        let relays_json =
-            serde_json::to_string(&relays_for_profile).unwrap_or_else(|_| "[]".to_string());
-
-        // User is authenticated - show approval screen (Bluesky-inspired design)
+        // User is authenticated - show approval screen
         format!(
             r#"
 <!DOCTYPE html>
@@ -772,7 +736,6 @@ pub async fn authorize_get(
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Authorize {}</title>
-    <script src="https://unpkg.com/nostr-tools@2.10.0/lib/nostr.bundle.js"></script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -1017,7 +980,7 @@ pub async fn authorize_get(
                 <span class="logo-sub">Login</span>
             </div>
             <h1>Authorize App</h1>
-            <p>Grant access to <span class="user-identity"><img id="user_avatar" class="user-avatar" style="display:none" /><span id="display_name">your account</span></span></p>
+            <p>Grant access to <span class="user-identity"><img id="user_avatar" class="user-avatar" /><span id="display_name">your account</span></span></p>
         </div>
 
         <div class="card">
@@ -1057,7 +1020,6 @@ pub async fn authorize_get(
         const oauthState = '{}';
         const userPubkey = '{}';
         const userEmail = '{}';
-        const userRelays = {};
         const policyInfo = {};
 
         // Build permissions list from policy info
@@ -1111,6 +1073,11 @@ pub async fn authorize_get(
             }}
         }}
 
+        function mediaNostrBandUrl(hexPubkey) {{
+            const last4 = hexPubkey.slice(-4);
+            return 'https://media.nostr.band/thumbs/' + last4 + '/' + hexPubkey + '-picture-64';
+        }}
+
         function setIdentity(name, pictureUrl) {{
             if (name) {{
                 document.getElementById('display_name').textContent = name;
@@ -1118,13 +1085,16 @@ pub async fn authorize_get(
             const avatar = document.getElementById('user_avatar');
             if (pictureUrl) {{
                 avatar.src = pictureUrl;
-                avatar.style.display = '';
                 avatar.onerror = function() {{
-                    this.src = 'https://robohash.org/' + userPubkey + '?set=set4&size=48x48';
+                    // Try media.nostr.band as second attempt, then robohash
+                    if (!this.dataset.triedMediaBand) {{
+                        this.dataset.triedMediaBand = '1';
+                        this.src = mediaNostrBandUrl(userPubkey);
+                    }} else {{
+                        this.onerror = null;
+                        this.src = 'https://robohash.org/' + userPubkey + '?set=set4&size=48x48';
+                    }}
                 }};
-            }} else {{
-                avatar.src = 'https://robohash.org/' + userPubkey + '?set=set4&size=48x48';
-                avatar.style.display = '';
             }}
         }}
 
@@ -1133,7 +1103,9 @@ pub async fn authorize_get(
                 const raw = localStorage.getItem('nostr_profile_' + userPubkey);
                 if (!raw) return null;
                 const cached = JSON.parse(raw);
-                if (Date.now() - cached.fetched_at < 24 * 60 * 60 * 1000) return cached;
+                const age = Date.now() - cached.fetched_at;
+                cached._stale = age > 24 * 60 * 60 * 1000;
+                return cached;
             }} catch (e) {{}}
             return null;
         }}
@@ -1149,58 +1121,44 @@ pub async fn authorize_get(
             }} catch (e) {{}}
         }}
 
-        // Load profile: cached > relay > email > "your account"
-        async function loadProfile() {{
-            const npub = document.getElementById('npub_fallback').textContent;
-            console.log('Authorizing as:', npub);
+        async function fetchProfile() {{
+            const last4 = userPubkey.slice(-4);
+            const url = 'https://media.nostr.band/thumbs/' + last4 + '/' + userPubkey + '.json';
+            try {{
+                const res = await fetch(url, {{ signal: AbortSignal.timeout(5000) }});
+                if (!res.ok) return null;
+                return await res.json();
+            }} catch (e) {{
+                console.warn('Could not load profile:', e);
+            }}
+            return null;
+        }}
 
-            // 1. Check localStorage cache
+        async function loadProfile() {{
+            console.log('Authorizing as:', document.getElementById('npub_fallback').textContent);
+
+            // 1. Show cached profile immediately (even if stale)
             const cached = getCachedProfile();
             if (cached) {{
                 const name = cached.display_name || cached.name;
                 setIdentity(name || userEmail || 'your account', cached.picture);
-                if (name) return; // Fresh cache with a name, done
+                if (!cached._stale) return; // Fresh cache, no relay fetch needed
+            }} else {{
+                // No cache: show email + media.nostr.band avatar while fetching
+                setIdentity(userEmail || 'your account', mediaNostrBandUrl(userPubkey));
             }}
 
-            // 2. Show email immediately as fallback while fetching
-            if (userEmail) {{
-                setIdentity(userEmail, null);
-            }}
-
-            // 3. Fetch from relays
-            try {{
-                if (!window.NostrTools) {{
-                    console.warn('nostr-tools not loaded, skipping profile fetch');
-                    return;
+            // 2. Background fetch (stale cache or no cache)
+            const profile = await fetchProfile();
+            if (profile) {{
+                cacheProfile(profile);
+                const displayName = profile.display_name || profile.name;
+                if (displayName || profile.picture) {{
+                    setIdentity(displayName || userEmail || 'your account', profile.picture);
                 }}
-
-                const {{ SimplePool }} = window.NostrTools;
-                const pool = new SimplePool();
-
-                const events = await Promise.race([
-                    pool.querySync(userRelays, {{
-                        kinds: [0],
-                        authors: [userPubkey],
-                        limit: 1
-                    }}),
-                    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 3000))
-                ]);
-
-                pool.close(userRelays);
-
-                if (events && events.length > 0) {{
-                    const profile = JSON.parse(events[0].content);
-                    cacheProfile(profile);
-                    const displayName = profile.display_name || profile.name;
-                    if (displayName || profile.picture) {{
-                        setIdentity(displayName || userEmail || 'your account', profile.picture);
-                    }}
-                }} else {{
-                    // Cache empty result to avoid re-fetching
-                    cacheProfile({{}});
-                }}
-            }} catch (e) {{
-                console.warn('Could not load profile:', e);
+            }} else if (!cached) {{
+                // No relay result and no cache: store empty to avoid hammering relays
+                cacheProfile({{}});
             }}
         }}
 
@@ -1269,7 +1227,6 @@ pub async fn authorize_get(
             params.state.as_deref().unwrap_or(""), // JS oauthState
             pubkey,           // JS userPubkey (hex)
             user_email.as_deref().unwrap_or(""), // JS userEmail
-            relays_json,      // JS userRelays (JSON array)
             policy_info_json, // JS policyInfo (JSON object)
         )
     } else {
@@ -1285,7 +1242,6 @@ pub async fn authorize_get(
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Bricolage+Grotesque:wght@600;700&display=swap" rel="stylesheet">
-    <script src="https://unpkg.com/nostr-tools@2.10.0/lib/nostr.bundle.js"></script>
     <style>
         :root {{
             --divine-green: #27C58B;
