@@ -12,6 +12,18 @@ import { toast } from "svelte-hot-french-toast";
 import { signin, SigninMethod } from "$lib/utils/auth";
 import { getAllowedPubkeys, isTeamsEnabled } from "$lib/utils/env";
 
+interface GroupedSession {
+	key: string;
+	application_name: string;
+	redirect_origin: string;
+	isOAuth: boolean;
+	total_activity: number;
+	earliest_created: string;
+	latest_activity: string | null;
+	bunker_pubkeys: string[];
+	sessions: BunkerSession[];
+}
+
 const api = new KeycastApi();
 const currentUser = $derived(getCurrentUser());
 const authMethod = $derived(currentUser?.authMethod);
@@ -29,12 +41,47 @@ let showCreateModal = $state(false);
 let copiedNpub = $state(false);
 let expandedSessions = $state<Set<string>>(new Set());
 let showRevokeModal = $state(false);
-let sessionToRevoke = $state<BunkerSession | null>(null);
+let sessionToRevoke = $state<GroupedSession | null>(null);
 let showLearnMore = $state(false);
 let pubkeyFormat = $state<'hex' | 'npub'>('npub');
 let copiedPubkey = $state<string | null>(null);
 let isNip07Loading = $state(false);
 let hasExtension = $state(false);
+
+const groupedSessions = $derived.by(() => {
+	const groups = new Map<string, GroupedSession>();
+	for (const session of sessions) {
+		const isOAuth = !!session.redirect_origin?.trim();
+		const key = isOAuth ? session.redirect_origin : session.bunker_pubkey;
+		const existing = groups.get(key);
+		if (existing) {
+			existing.total_activity += session.activity_count;
+			if (session.created_at < existing.earliest_created) {
+				existing.earliest_created = session.created_at;
+			}
+			if (session.last_activity) {
+				if (!existing.latest_activity || session.last_activity > existing.latest_activity) {
+					existing.latest_activity = session.last_activity;
+				}
+			}
+			existing.bunker_pubkeys.push(session.bunker_pubkey);
+			existing.sessions.push(session);
+		} else {
+			groups.set(key, {
+				key,
+				application_name: session.application_name,
+				redirect_origin: session.redirect_origin,
+				isOAuth,
+				total_activity: session.activity_count,
+				earliest_created: session.created_at,
+				latest_activity: session.last_activity,
+				bunker_pubkeys: [session.bunker_pubkey],
+				sessions: [session],
+			});
+		}
+	}
+	return [...groups.values()];
+});
 
 onMount(() => {
 	hasExtension = typeof window !== 'undefined' && !!window.nostr;
@@ -122,12 +169,12 @@ async function copyUserPubkey() {
 	}
 }
 
-function toggleSession(bunkerPubkey: string) {
+function toggleSession(groupKey: string) {
 	const newSet = new Set(expandedSessions);
-	if (newSet.has(bunkerPubkey)) {
-		newSet.delete(bunkerPubkey);
+	if (newSet.has(groupKey)) {
+		newSet.delete(groupKey);
 	} else {
-		newSet.add(bunkerPubkey);
+		newSet.add(groupKey);
 	}
 	expandedSessions = newSet;
 }
@@ -137,15 +184,17 @@ function formatDate(dateStr: string): string {
 	return date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
-function confirmRevoke(session: BunkerSession) {
-	sessionToRevoke = session;
+function confirmRevoke(group: GroupedSession) {
+	sessionToRevoke = group;
 	showRevokeModal = true;
 }
 
-async function revokeSession(bunkerPubkey: string, appName: string) {
+async function revokeGroupedSession(group: GroupedSession) {
 	try {
-		await api.post('/user/sessions/revoke', { bunker_pubkey: bunkerPubkey });
-		toast.success(`Revoked access for ${appName}`);
+		for (const pubkey of group.bunker_pubkeys) {
+			await api.post('/user/sessions/revoke', { bunker_pubkey: pubkey });
+		}
+		toast.success(`Revoked access for ${group.application_name}`);
 		showRevokeModal = false;
 		sessionToRevoke = null;
 		await loadSessions();
@@ -378,7 +427,7 @@ onMount(async () => {
 					</button>
 				</div>
 
-				{#if sessions.length === 0}
+				{#if groupedSessions.length === 0}
 					<div class="empty-state">
 						<p>No app connections yet.</p>
 						<p class="hint">
@@ -387,24 +436,24 @@ onMount(async () => {
 					</div>
 				{:else}
 					<div class="apps-list">
-						{#each sessions as session}
-							{@const isExpanded = expandedSessions.has(session.bunker_pubkey)}
+						{#each groupedSessions as group}
+							{@const isExpanded = expandedSessions.has(group.key)}
 							<div class="app-card" class:expanded={isExpanded}>
-								<button class="app-header" onclick={() => toggleSession(session.bunker_pubkey)}>
+								<button class="app-header" onclick={() => toggleSession(group.key)}>
 									<div class="app-info">
 										<p class="app-name">
-											{session.application_name}
-											{#if session.redirect_origin?.trim()}
+											{group.application_name}
+											{#if group.isOAuth}
 												<span class="connection-badge oauth">diVine Login</span>
 											{:else}
 												<span class="connection-badge manual">Bunker</span>
 											{/if}
 										</p>
-										{#if session.redirect_origin}<p class="app-domain">{session.redirect_origin}</p>{/if}
+										{#if group.isOAuth}<p class="app-domain">{group.redirect_origin}</p>{/if}
 										<p class="app-meta">
-											{new Date(session.created_at).toLocaleDateString()}
-											{#if session.activity_count > 0}
-												• {session.activity_count} {session.activity_count === 1 ? 'request' : 'requests'}
+											{new Date(group.earliest_created).toLocaleDateString()}
+											{#if group.total_activity > 0}
+												• {group.total_activity} {group.total_activity === 1 ? 'request' : 'requests'}
 											{:else}
 												• Not used yet
 											{/if}
@@ -422,42 +471,90 @@ onMount(async () => {
 								{#if isExpanded}
 									<div class="app-details">
 										<div class="details-grid">
-											<div class="detail-item full-width">
-												<span class="detail-label">Domain</span>
-												<span class="detail-value">{session.redirect_origin}</span>
-											</div>
-											<div class="detail-item">
-												<span class="detail-label">Created</span>
-												<span class="detail-value">{formatDate(session.created_at)}</span>
-											</div>
-											<div class="detail-item">
-												<span class="detail-label">Last Activity</span>
-												<span class="detail-value">
-													{session.last_activity ? formatDate(session.last_activity) : 'Never'}
-												</span>
-											</div>
-											<div class="detail-item">
-												<span class="detail-label">Total Requests</span>
-												<span class="detail-value">{session.activity_count}</span>
-											</div>
-											{#if session.client_pubkey}
+											{#if group.isOAuth}
+												<div class="detail-item full-width">
+													<span class="detail-label">Domain</span>
+													<span class="detail-value">{group.redirect_origin}</span>
+												</div>
+												<div class="detail-item">
+													<span class="detail-label">Created</span>
+													<span class="detail-value">{formatDate(group.earliest_created)}</span>
+												</div>
+												<div class="detail-item">
+													<span class="detail-label">Last Activity</span>
+													<span class="detail-value">
+														{group.latest_activity ? formatDate(group.latest_activity) : 'Never'}
+													</span>
+												</div>
+												<div class="detail-item">
+													<span class="detail-label">Total Requests</span>
+													<span class="detail-value">{group.total_activity}</span>
+												</div>
+											{:else}
+												{@const session = group.sessions[0]}
+												<div class="detail-item full-width">
+													<span class="detail-label">Domain</span>
+													<span class="detail-value">{session.redirect_origin}</span>
+												</div>
+												<div class="detail-item">
+													<span class="detail-label">Created</span>
+													<span class="detail-value">{formatDate(session.created_at)}</span>
+												</div>
+												<div class="detail-item">
+													<span class="detail-label">Last Activity</span>
+													<span class="detail-value">
+														{session.last_activity ? formatDate(session.last_activity) : 'Never'}
+													</span>
+												</div>
+												<div class="detail-item">
+													<span class="detail-label">Total Requests</span>
+													<span class="detail-value">{session.activity_count}</span>
+												</div>
+												{#if session.client_pubkey}
+													<div class="detail-item full-width pubkey-row">
+														<div class="detail-header">
+															<span class="detail-label">Client Pubkey</span>
+															<button
+																class="format-toggle"
+																onclick={(e) => { e.stopPropagation(); pubkeyFormat = pubkeyFormat === 'hex' ? 'npub' : 'hex'; }}
+															>
+																{pubkeyFormat === 'hex' ? 'npub' : 'hex'}
+															</button>
+														</div>
+														<div class="pubkey-value">
+															<span class="detail-value mono">{formatPubkey(session.client_pubkey)}</span>
+															<button
+																class="copy-btn-inline"
+																onclick={(e) => { e.stopPropagation(); if (session.client_pubkey) copyPubkey(session.client_pubkey); }}
+															>
+																{#if copiedPubkey === session.client_pubkey}
+																	<Check size={14} />
+																{:else}
+																	<Copy size={14} />
+																{/if}
+															</button>
+														</div>
+													</div>
+												{/if}
 												<div class="detail-item full-width pubkey-row">
 													<div class="detail-header">
-														<span class="detail-label">Client Pubkey</span>
-														<button
-															class="format-toggle"
-															onclick={(e) => { e.stopPropagation(); pubkeyFormat = pubkeyFormat === 'hex' ? 'npub' : 'hex'; }}
-														>
-															{pubkeyFormat === 'hex' ? 'npub' : 'hex'}
-														</button>
+														<span class="detail-label">Bunker Pubkey</span>
+														{#if !session.client_pubkey}
+															<button
+																class="format-toggle"
+																onclick={(e) => { e.stopPropagation(); pubkeyFormat = pubkeyFormat === 'hex' ? 'npub' : 'hex'; }}
+															>
+																{pubkeyFormat === 'hex' ? 'npub' : 'hex'}
+															</button>
+														{/if}
 													</div>
 													<div class="pubkey-value">
-														<span class="detail-value mono">{formatPubkey(session.client_pubkey)}</span>
+														<span class="detail-value mono">{formatPubkey(session.bunker_pubkey)}</span>
 														<button
 															class="copy-btn-inline"
-															onclick={(e) => { e.stopPropagation(); if (session.client_pubkey) copyPubkey(session.client_pubkey); }}
+															onclick={(e) => { e.stopPropagation(); copyPubkey(session.bunker_pubkey); }}
 														>
-															{#if copiedPubkey === session.client_pubkey}
+															{#if copiedPubkey === session.bunker_pubkey}
 																<Check size={14} />
 															{:else}
 																<Copy size={14} />
@@ -466,37 +563,11 @@ onMount(async () => {
 													</div>
 												</div>
 											{/if}
-											<div class="detail-item full-width pubkey-row">
-												<div class="detail-header">
-													<span class="detail-label">Bunker Pubkey</span>
-													{#if !session.client_pubkey}
-														<button
-															class="format-toggle"
-															onclick={(e) => { e.stopPropagation(); pubkeyFormat = pubkeyFormat === 'hex' ? 'npub' : 'hex'; }}
-														>
-															{pubkeyFormat === 'hex' ? 'npub' : 'hex'}
-														</button>
-													{/if}
-												</div>
-												<div class="pubkey-value">
-													<span class="detail-value mono">{formatPubkey(session.bunker_pubkey)}</span>
-													<button
-														class="copy-btn-inline"
-														onclick={(e) => { e.stopPropagation(); copyPubkey(session.bunker_pubkey); }}
-													>
-														{#if copiedPubkey === session.bunker_pubkey}
-															<Check size={14} />
-														{:else}
-															<Copy size={14} />
-														{/if}
-													</button>
-												</div>
-											</div>
 										</div>
 										<div class="app-actions">
 											<button
 												class="btn-revoke"
-												onclick={(e) => { e.stopPropagation(); confirmRevoke(session); }}
+												onclick={(e) => { e.stopPropagation(); confirmRevoke(group); }}
 											>
 												Revoke Access
 											</button>
@@ -576,7 +647,7 @@ onMount(async () => {
 					</button>
 					<button
 						class="btn-confirm-revoke"
-						onclick={() => sessionToRevoke && revokeSession(sessionToRevoke.bunker_pubkey, sessionToRevoke.application_name)}
+						onclick={() => sessionToRevoke && revokeGroupedSession(sessionToRevoke)}
 					>
 						Revoke Access
 					</button>
