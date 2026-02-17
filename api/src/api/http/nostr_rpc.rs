@@ -335,22 +335,7 @@ fn compute_token_cache_key(auth_header: &str) -> Option<CacheKey> {
 
 /// Check if issuer matches server pubkey (server-signed UCAN)
 fn is_server_signed(ucan: &ucan::Ucan) -> bool {
-    use crate::ucan_auth::did_to_nostr_pubkey;
-    use once_cell::sync::Lazy;
-    use std::env;
-
-    static SERVER_PUBKEY: Lazy<String> = Lazy::new(|| {
-        env::var("SERVER_NSEC")
-            .ok()
-            .and_then(|nsec| nostr_sdk::Keys::parse(&nsec).ok())
-            .map(|k| k.public_key().to_hex())
-            .expect("SERVER_NSEC must be set and valid")
-    });
-
-    match did_to_nostr_pubkey(ucan.issuer()) {
-        Ok(issuer_pubkey) => issuer_pubkey.to_hex() == *SERVER_PUBKEY,
-        Err(_) => false,
-    }
+    crate::ucan_auth::is_server_signed(ucan)
 }
 
 /// Load handler for preloaded user (server-signed UCAN, no bunker_pubkey)

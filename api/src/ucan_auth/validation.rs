@@ -13,7 +13,7 @@ use super::key_material::NostrVerifyKeyMaterial;
 
 /// Server public key for validating server-signed UCANs
 /// Loaded from SERVER_NSEC environment variable
-static SERVER_PUBKEY: Lazy<String> = Lazy::new(|| {
+pub(crate) static SERVER_PUBKEY: Lazy<String> = Lazy::new(|| {
     env::var("SERVER_NSEC")
         .ok()
         .and_then(|nsec| nostr_sdk::Keys::parse(&nsec).ok())
@@ -139,6 +139,14 @@ pub async fn extract_user_from_ucan(
         validate_ucan_token(auth_header, expected_tenant_id).await?;
 
     Ok((pubkey, redirect_origin, bunker_pubkey))
+}
+
+/// Check if a UCAN was issued by the server (server-signed)
+pub fn is_server_signed(ucan: &Ucan) -> bool {
+    match super::did::did_to_nostr_pubkey(ucan.issuer()) {
+        Ok(issuer_pubkey) => issuer_pubkey.to_hex() == *SERVER_PUBKEY,
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]

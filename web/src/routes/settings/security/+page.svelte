@@ -47,8 +47,10 @@
 	// Use untrack to prevent infinite loops during navigation
 	$effect(() => {
 		if (authMethod && authMethod !== 'cookie') {
-			toast.error('This page is only for email/password users');
-			goto('/', { replaceState: true });
+			if (authMethod === 'nip07' || authMethod === 'cloudflare') {
+				toast.error('This page is only for email/password users');
+				goto('/', { replaceState: true });
+			}
 		}
 	});
 

@@ -347,6 +347,15 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         instance_id, cpu_count, worker_threads, pool_size
     );
 
+    // Log Cloudflare Access configuration
+    if keycast_api::cloudflare_access::is_configured() {
+        let team = env::var("CF_ACCESS_TEAM").unwrap_or_default();
+        tracing::info!(
+            "Cloudflare Access enabled: team={}, admin SSO login active",
+            team
+        );
+    }
+
     // Setup database
     let database_url = env::var("DATABASE_URL")?; // Validated above
 

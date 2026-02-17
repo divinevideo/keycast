@@ -26,7 +26,7 @@ use keycast_core::types::user::TeamUser;
 pub async fn list_teams(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    UcanAuth(user_pubkey_hex): UcanAuth,
+    UcanAuth { pubkey: user_pubkey_hex, .. }: UcanAuth,
 ) -> ApiResult<Json<Vec<TeamWithRelations>>> {
     let tenant_id = tenant.0.id;
 
@@ -47,31 +47,21 @@ pub async fn list_teams(
 pub async fn create_team(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    UcanAuth(user_pubkey_hex): UcanAuth,
+    auth: UcanAuth,
     Json(request): Json<CreateTeamRequest>,
 ) -> ApiResult<Json<TeamWithRelations>> {
     let tenant_id = tenant.0.id;
+    let user_pubkey_hex = &auth.pubkey;
 
-    // Check whitelist for team creation (if configured)
-    if let Ok(allowed_pubkeys) = std::env::var("ALLOWED_PUBKEYS") {
-        if !allowed_pubkeys.is_empty() {
-            let allowed: Vec<&str> = allowed_pubkeys.split(',').map(|s| s.trim()).collect();
-
-            if !allowed.contains(&user_pubkey_hex.as_str()) {
-                tracing::warn!(
-                    "Team creation denied for non-whitelisted pubkey: {}",
-                    user_pubkey_hex
-                );
-                return Err(ApiError::forbidden(
-                    "Team creation is restricted to authorized users. Contact admin for access.",
-                ));
-            }
-
-            tracing::info!(
-                "Team creation authorized for whitelisted pubkey: {}",
-                user_pubkey_hex
-            );
-        }
+    // Check admin access for team creation
+    if !super::admin::is_admin(&auth) {
+        tracing::warn!(
+            "Team creation denied for non-admin pubkey: {}",
+            user_pubkey_hex
+        );
+        return Err(ApiError::forbidden(
+            "Team creation is restricted to authorized users. Contact admin for access.",
+        ));
     }
 
     let allowed_kinds_config = serde_json::to_value(AllowedKindsConfig::default())
@@ -82,7 +72,7 @@ pub async fn create_team(
         .create_with_admin(
             tenant_id,
             &request.name,
-            &user_pubkey_hex,
+            user_pubkey_hex,
             allowed_kinds_config,
         )
         .await?;
@@ -93,7 +83,7 @@ pub async fn create_team(
 pub async fn get_team(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    UcanAuth(user_pubkey_hex): UcanAuth,
+    UcanAuth { pubkey: user_pubkey_hex, .. }: UcanAuth,
     Path(team_id): Path<i32>,
 ) -> ApiResult<Json<TeamWithRelations>> {
     let tenant_id = tenant.0.id;
@@ -111,7 +101,7 @@ pub async fn get_team(
 pub async fn update_team(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    UcanAuth(user_pubkey_hex): UcanAuth,
+    UcanAuth { pubkey: user_pubkey_hex, .. }: UcanAuth,
     Json(request): Json<UpdateTeamRequest>,
 ) -> ApiResult<Json<Team>> {
     let tenant_id = tenant.0.id;
@@ -129,7 +119,7 @@ pub async fn update_team(
 pub async fn delete_team(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    UcanAuth(user_pubkey_hex): UcanAuth,
+    UcanAuth { pubkey: user_pubkey_hex, .. }: UcanAuth,
     Path(team_id): Path<i32>,
 ) -> ApiResult<StatusCode> {
     let tenant_id = tenant.0.id;
@@ -147,7 +137,7 @@ pub async fn delete_team(
 pub async fn add_user(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    UcanAuth(user_pubkey_hex): UcanAuth,
+    UcanAuth { pubkey: user_pubkey_hex, .. }: UcanAuth,
     Path(team_id): Path<i32>,
     Json(request): Json<AddTeammateRequest>,
 ) -> ApiResult<Json<TeamUser>> {
@@ -186,7 +176,7 @@ pub async fn add_user(
 pub async fn remove_user(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    UcanAuth(user_pubkey_hex): UcanAuth,
+    UcanAuth { pubkey: user_pubkey_hex, .. }: UcanAuth,
     Path((team_id, user_pubkey)): Path<(i32, String)>,
 ) -> ApiResult<StatusCode> {
     let tenant_id = tenant.0.id;
@@ -222,7 +212,7 @@ pub async fn remove_user(
 pub async fn add_key(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    UcanAuth(user_pubkey_hex): UcanAuth,
+    UcanAuth { pubkey: user_pubkey_hex, .. }: UcanAuth,
     Path(team_id): Path<i32>,
     Json(request): Json<AddKeyRequest>,
 ) -> ApiResult<Json<PublicStoredKey>> {
@@ -257,7 +247,7 @@ pub async fn add_key(
 pub async fn remove_key(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    UcanAuth(user_pubkey_hex): UcanAuth,
+    UcanAuth { pubkey: user_pubkey_hex, .. }: UcanAuth,
     Path((team_id, pubkey)): Path<(i32, String)>,
 ) -> ApiResult<StatusCode> {
     let tenant_id = tenant.0.id;
@@ -278,7 +268,7 @@ pub async fn remove_key(
 pub async fn get_key(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    UcanAuth(user_pubkey_hex): UcanAuth,
+    UcanAuth { pubkey: user_pubkey_hex, .. }: UcanAuth,
     Path((team_id, pubkey)): Path<(i32, String)>,
 ) -> ApiResult<Json<KeyWithRelations>> {
     let tenant_id = tenant.0.id;
@@ -333,7 +323,7 @@ pub async fn get_key(
 pub async fn add_authorization(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    UcanAuth(user_pubkey_hex): UcanAuth,
+    UcanAuth { pubkey: user_pubkey_hex, .. }: UcanAuth,
     Path((team_id, pubkey)): Path<(i32, String)>,
     Json(request): Json<AddAuthorizationRequest>,
 ) -> ApiResult<Json<AuthorizationCreatedResponse>> {
@@ -415,7 +405,7 @@ pub async fn add_authorization(
 pub async fn delete_authorization(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    UcanAuth(user_pubkey_hex): UcanAuth,
+    UcanAuth { pubkey: user_pubkey_hex, .. }: UcanAuth,
     Path((team_id, pubkey, auth_id)): Path<(i32, String, i32)>,
 ) -> ApiResult<StatusCode> {
     let tenant_id = tenant.0.id;
@@ -449,7 +439,7 @@ pub async fn delete_authorization(
 pub async fn add_policy(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
-    UcanAuth(user_pubkey_hex): UcanAuth,
+    UcanAuth { pubkey: user_pubkey_hex, .. }: UcanAuth,
     Path(team_id): Path<i32>,
     Json(request): Json<CreatePolicyRequest>,
 ) -> ApiResult<Json<PolicyWithPermissions>> {

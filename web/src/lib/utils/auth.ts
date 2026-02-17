@@ -7,6 +7,7 @@ import { getViteDomain, getAllowedPubkeys, isTeamsEnabled } from "$lib/utils/env
 export enum SigninMethod {
     Nip07 = "nip07",
     NostrLogin = "nostr-login",
+    Cloudflare = "cloudflare",
 }
 
 function isAllowedPubkey(pubkey: string) {
@@ -86,6 +87,55 @@ async function nip07Login(): Promise<string | null> {
     } catch (error) {
         console.error("NIP-07 login error:", error);
         toast.error(error instanceof Error ? error.message : "Login failed");
+        return null;
+    }
+}
+
+/** Check if CF_Authorization cookie is present (set by Cloudflare Access) */
+export function hasCfAccessCookie(): boolean {
+    if (typeof document === 'undefined') return false;
+    return document.cookie.split(';').some(c => c.trim().startsWith('CF_Authorization='));
+}
+
+/** Extract CF_Authorization cookie value */
+function getCfAccessToken(): string | null {
+    if (typeof document === 'undefined') return null;
+    for (const cookie of document.cookie.split(';')) {
+        const trimmed = cookie.trim();
+        if (trimmed.startsWith('CF_Authorization=')) {
+            return trimmed.substring('CF_Authorization='.length);
+        }
+    }
+    return null;
+}
+
+/** Login via Cloudflare Access JWT */
+export async function cloudflareLogin(): Promise<string | null> {
+    const token = getCfAccessToken();
+    if (!token) return null;
+
+    try {
+        const apiBase = getViteDomain();
+        const response = await fetch(`${apiBase}/api/auth/login`, {
+            method: 'POST',
+            headers: {
+                'Cf-Access-Jwt-Assertion': token,
+                'Content-Type': 'application/json',
+            },
+            credentials: 'include',
+            body: '{}',
+        });
+
+        if (response.ok) {
+            const data = await response.json();
+            setCurrentUser(data.pubkey, 'cloudflare');
+            return data.pubkey;
+        } else {
+            console.warn('CF Access login failed:', response.status);
+            return null;
+        }
+    } catch (error) {
+        console.error('CF Access login error:', error);
         return null;
     }
 }

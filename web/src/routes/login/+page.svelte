@@ -4,7 +4,7 @@
 	import { KeycastApi } from '$lib/keycast_api.svelte';
 	import { setCurrentUser } from '$lib/current_user.svelte';
 	import { BRAND } from '$lib/brand';
-	import { signin, SigninMethod } from '$lib/utils/auth';
+	import { signin, SigninMethod, hasCfAccessCookie, cloudflareLogin } from '$lib/utils/auth';
 	import { PlugsConnected } from 'phosphor-svelte';
 	import { onMount } from 'svelte';
 
@@ -12,8 +12,17 @@
 	let isNip07Loading = $state(false);
 	let hasExtension = $state(false);
 
-	onMount(() => {
+	onMount(async () => {
 		hasExtension = typeof window !== 'undefined' && !!window.nostr;
+
+		// Auto-login via Cloudflare Access if cookie is present
+		if (hasCfAccessCookie()) {
+			const pubkey = await cloudflareLogin();
+			if (pubkey) {
+				goto('/');
+				return;
+			}
+		}
 	});
 
 	async function handleNip07Signin() {

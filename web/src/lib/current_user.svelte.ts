@@ -5,9 +5,9 @@ let currentUser: CurrentUser | null = $state(null);
 class CurrentUser {
     pubkey: string;
     npub: string;
-    authMethod: 'nip07' | 'cookie' | null = $state(null);
+    authMethod: 'nip07' | 'cookie' | 'cloudflare' | null = $state(null);
 
-    constructor(pubkey: string, authMethod: 'nip07' | 'cookie' | null = null) {
+    constructor(pubkey: string, authMethod: 'nip07' | 'cookie' | 'cloudflare' | null = null) {
         this.pubkey = pubkey;
         this.npub = nip19.npubEncode(pubkey);
         this.authMethod = authMethod;
@@ -20,7 +20,7 @@ export function getCurrentUser(): CurrentUser | null {
 
 export function setCurrentUser(
     pubkey: string | null,
-    authMethod: 'nip07' | 'cookie' | null = null
+    authMethod: 'nip07' | 'cookie' | 'cloudflare' | null = null
 ): CurrentUser | null {
     if (pubkey) {
         currentUser = new CurrentUser(pubkey, authMethod);

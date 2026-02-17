@@ -18,15 +18,19 @@ const ADMIN_TOKEN_EXPIRY_DAYS: i64 = 30;
 /// Preloaded user signing token expiry in days
 const PRELOAD_TOKEN_EXPIRY_DAYS: i64 = 30;
 
-/// Check if a pubkey is in the ALLOWED_PUBKEYS whitelist
-pub fn is_admin_pubkey(pubkey: &str) -> bool {
+/// Check if the authenticated user is an admin.
+/// Path 1: pubkey in ALLOWED_PUBKEYS whitelist
+/// Path 2: Cloudflare Access admin (trusted from server-signed UCAN)
+pub fn is_admin(auth: &UcanAuth) -> bool {
     if let Ok(allowed_pubkeys) = std::env::var("ALLOWED_PUBKEYS") {
         if !allowed_pubkeys.is_empty() {
             let allowed: Vec<&str> = allowed_pubkeys.split(',').map(|s| s.trim()).collect();
-            return allowed.contains(&pubkey);
+            if allowed.contains(&auth.pubkey.as_str()) {
+                return true;
+            }
         }
     }
-    false
+    auth.cf_admin_email.is_some()
 }
 
 /// Get server keys from SERVER_NSEC environment variable
@@ -49,10 +53,9 @@ pub struct AdminStatusResponse {
 /// Returns { is_admin: true/false } - never errors for valid auth.
 pub async fn get_admin_status(
     _tenant: crate::api::tenant::TenantExtractor,
-    UcanAuth(user_pubkey_hex): UcanAuth,
+    auth: UcanAuth,
 ) -> ApiResult<Json<AdminStatusResponse>> {
-    let is_admin = is_admin_pubkey(&user_pubkey_hex);
-    Ok(Json(AdminStatusResponse { is_admin }))
+    Ok(Json(AdminStatusResponse { is_admin: is_admin(&auth) }))
 }
 
 // ============================================================================
@@ -69,30 +72,28 @@ pub struct AdminTokenResponse {
 /// Requires the user to be logged in and be in the ALLOWED_PUBKEYS whitelist.
 pub async fn get_admin_token(
     tenant: crate::api::tenant::TenantExtractor,
-    UcanAuth(user_pubkey_hex): UcanAuth,
+    auth: UcanAuth,
 ) -> ApiResult<Json<AdminTokenResponse>> {
     let tenant_id = tenant.0.id;
 
-    // Check if user is in admin whitelist
-    if !is_admin_pubkey(&user_pubkey_hex) {
+    if !is_admin(&auth) {
         tracing::warn!(
-            "Admin token request denied for non-whitelisted pubkey: {}",
-            &user_pubkey_hex[..8]
+            "Admin token request denied for pubkey: {}",
+            &auth.pubkey[..8]
         );
         return Err(ApiError::forbidden("Admin access required"));
     }
 
     let server_keys = get_server_keys()?;
-    let user_pubkey = nostr_sdk::PublicKey::from_hex(&user_pubkey_hex)
+    let user_pubkey = nostr_sdk::PublicKey::from_hex(&auth.pubkey)
         .map_err(|e| ApiError::bad_request(format!("Invalid pubkey: {}", e)))?;
 
-    // Generate admin token with longer expiry
     let token = generate_admin_ucan(&user_pubkey, tenant_id, &server_keys).await?;
     let expires_at = Utc::now() + Duration::days(ADMIN_TOKEN_EXPIRY_DAYS);
 
     tracing::info!(
         "Admin token generated for pubkey: {}",
-        &user_pubkey_hex[..8]
+        &auth.pubkey[..8]
     );
 
     Ok(Json(AdminTokenResponse {
@@ -159,26 +160,24 @@ pub struct PreloadUserResponse {
 pub async fn preload_user(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
-    UcanAuth(admin_pubkey_hex): UcanAuth,
+    auth: UcanAuth,
     Json(req): Json<PreloadUserRequest>,
 ) -> ApiResult<Json<PreloadUserResponse>> {
     let tenant_id = tenant.0.id;
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
 
-    // Check if caller is admin
-    if !is_admin_pubkey(&admin_pubkey_hex) {
+    if !is_admin(&auth) {
         tracing::warn!(
-            "Preload user request denied for non-whitelisted pubkey: {}",
-            &admin_pubkey_hex[..8]
+            "Preload user request denied for pubkey: {}",
+            &auth.pubkey[..8]
         );
         return Err(ApiError::forbidden("Admin access required"));
     }
 
-    // Get server keys early since we need them for both existing and new user paths
     let server_keys = get_server_keys()?;
 
-    // Check if vine_id already exists - return existing user if found (idempotent)
+    // Check if vine_id already exists (idempotent)
     let user_repo = UserRepository::new(pool.clone());
     if let Some(existing_pubkey) = user_repo
         .find_pubkey_by_vine_id(&req.vine_id, tenant_id)
@@ -187,7 +186,10 @@ pub async fn preload_user(
         let existing_user_pubkey = nostr_sdk::PublicKey::from_hex(&existing_pubkey)
             .map_err(|e| ApiError::Internal(format!("Invalid stored pubkey: {}", e)))?;
 
-        let token = generate_preload_ucan(&existing_user_pubkey, tenant_id, &server_keys).await?;
+        let token = generate_preload_ucan(
+            &existing_user_pubkey, tenant_id, &server_keys,
+            &auth.pubkey, auth.cf_admin_email.as_deref(),
+        ).await?;
 
         tracing::info!(
             "Returning existing preloaded user for vine_id '{}': {}",
@@ -256,8 +258,10 @@ pub async fn preload_user(
         }
     }
 
-    // Generate signing token for this user (server-signed UCAN)
-    let token = generate_preload_ucan(&pubkey, tenant_id, &server_keys).await?;
+    let token = generate_preload_ucan(
+        &pubkey, tenant_id, &server_keys,
+        &auth.pubkey, auth.cf_admin_email.as_deref(),
+    ).await?;
 
     tracing::info!(
         "Preloaded user created: vine_id={}, username={}, pubkey={}",
@@ -291,22 +295,20 @@ pub struct UserTokenResponse {
 pub async fn get_user_token(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
-    UcanAuth(admin_pubkey_hex): UcanAuth,
+    auth: UcanAuth,
     Json(req): Json<UserTokenRequest>,
 ) -> ApiResult<Json<UserTokenResponse>> {
     let tenant_id = tenant.0.id;
     let pool = &auth_state.state.db;
 
-    // Check if caller is admin
-    if !is_admin_pubkey(&admin_pubkey_hex) {
+    if !is_admin(&auth) {
         tracing::warn!(
-            "User token request denied for non-whitelisted pubkey: {}",
-            &admin_pubkey_hex[..8]
+            "User token request denied for pubkey: {}",
+            &auth.pubkey[..8]
         );
         return Err(ApiError::forbidden("Admin access required"));
     }
 
-    // Validate pubkey format
     let user_pubkey = nostr_sdk::PublicKey::from_hex(&req.pubkey)
         .map_err(|e| ApiError::bad_request(format!("Invalid pubkey: {}", e)))?;
 
@@ -329,14 +331,16 @@ pub async fn get_user_token(
         Some(true) => {} // User exists and is unclaimed, proceed
     }
 
-    // Generate signing token
     let server_keys = get_server_keys()?;
-    let token = generate_preload_ucan(&user_pubkey, tenant_id, &server_keys).await?;
+    let token = generate_preload_ucan(
+        &user_pubkey, tenant_id, &server_keys,
+        &auth.pubkey, auth.cf_admin_email.as_deref(),
+    ).await?;
 
     tracing::info!(
         "User token generated for pubkey: {} by admin: {}",
         &req.pubkey[..8],
-        &admin_pubkey_hex[..8]
+        &auth.pubkey[..8]
     );
 
     Ok(Json(UserTokenResponse { token }))
@@ -347,6 +351,8 @@ async fn generate_preload_ucan(
     user_pubkey: &nostr_sdk::PublicKey,
     tenant_id: i64,
     server_keys: &Keys,
+    admin_pubkey_hex: &str,
+    admin_email: Option<&str>,
 ) -> Result<String, ApiError> {
     use crate::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
     use serde_json::json;
@@ -356,10 +362,16 @@ async fn generate_preload_ucan(
     let user_did = nostr_pubkey_to_did(user_pubkey);
 
     // No bunker_pubkey = preloaded user mode (detected in nostr_rpc.rs)
-    let facts = json!({
+    let mut facts = json!({
         "tenant_id": tenant_id,
         "redirect_origin": "preload",
+        "issued_by_admin": admin_pubkey_hex,
     });
+
+    // Include email if the issuing admin authenticated via Cloudflare Access
+    if let Some(email) = admin_email {
+        facts["issued_by_admin_email"] = json!(email);
+    }
 
     let expiry_seconds = PRELOAD_TOKEN_EXPIRY_DAYS * 24 * 3600;
 
@@ -398,17 +410,16 @@ pub struct CreateClaimTokenResponse {
 pub async fn create_claim_token(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
-    UcanAuth(admin_pubkey_hex): UcanAuth,
+    auth: UcanAuth,
     Json(req): Json<CreateClaimTokenRequest>,
 ) -> ApiResult<Json<CreateClaimTokenResponse>> {
     let tenant_id = tenant.0.id;
     let pool = &auth_state.state.db;
 
-    // Check if caller is admin
-    if !is_admin_pubkey(&admin_pubkey_hex) {
+    if !is_admin(&auth) {
         tracing::warn!(
-            "Claim token request denied for non-whitelisted pubkey: {}",
-            &admin_pubkey_hex[..8]
+            "Claim token request denied for pubkey: {}",
+            &auth.pubkey[..8]
         );
         return Err(ApiError::forbidden("Admin access required"));
     }
@@ -432,7 +443,7 @@ pub async fn create_claim_token(
     let token = generate_claim_token();
     let claim_token_repo = ClaimTokenRepository::new(pool.clone());
     let claim_token = claim_token_repo
-        .create(&token, &user_pubkey, Some(&admin_pubkey_hex), tenant_id)
+        .create(&token, &user_pubkey, Some(&auth.pubkey), tenant_id)
         .await?;
 
     // Build claim URL
@@ -442,7 +453,7 @@ pub async fn create_claim_token(
     tracing::info!(
         "Claim token created for vine_id={}, by admin={}",
         req.vine_id,
-        &admin_pubkey_hex[..8]
+        &auth.pubkey[..8]
     );
 
     Ok(Json(CreateClaimTokenResponse {
