@@ -7,6 +7,8 @@ pub struct UcanAuth {
     pub pubkey: String,
     /// Set only for Cloudflare Access admins (from server-signed UCAN facts)
     pub cf_admin_email: Option<String>,
+    /// Admin role from server-signed UCAN: "full" or "support"
+    pub admin_role: Option<String>,
 }
 
 /// Extract cf_admin_email from a server-signed UCAN's facts
@@ -17,6 +19,17 @@ fn extract_cf_admin_email(ucan: &ucan::Ucan) -> Option<String> {
     ucan.facts()
         .iter()
         .find_map(|fact| fact.get("cf_admin_email").and_then(|v| v.as_str()))
+        .map(String::from)
+}
+
+/// Extract admin_role from a server-signed UCAN's facts
+fn extract_admin_role(ucan: &ucan::Ucan) -> Option<String> {
+    if !crate::ucan_auth::is_server_signed(ucan) {
+        return None;
+    }
+    ucan.facts()
+        .iter()
+        .find_map(|fact| fact.get("admin_role").and_then(|v| v.as_str()))
         .map(String::from)
 }
 
@@ -43,12 +56,13 @@ where
                             })?;
 
                     let cf_admin_email = extract_cf_admin_email(&ucan);
+                    let admin_role = extract_admin_role(&ucan);
 
                     tracing::debug!(
                         "UcanAuth: Authenticated via Bearer token for pubkey: {}",
                         pubkey
                     );
-                    return Ok(UcanAuth { pubkey, cf_admin_email });
+                    return Ok(UcanAuth { pubkey, cf_admin_email, admin_role });
                 }
             }
         }
@@ -70,12 +84,13 @@ where
                                 })?;
 
                         let cf_admin_email = extract_cf_admin_email(&ucan);
+                        let admin_role = extract_admin_role(&ucan);
 
                         tracing::debug!(
                             "UcanAuth: Authenticated via cookie for pubkey: {}",
                             pubkey
                         );
-                        return Ok(UcanAuth { pubkey, cf_admin_email });
+                        return Ok(UcanAuth { pubkey, cf_admin_email, admin_role });
                     }
                 }
             }

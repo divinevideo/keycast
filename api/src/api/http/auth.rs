@@ -11,7 +11,7 @@ use bcrypt::{hash, verify, DEFAULT_COST};
 use chrono::{Duration, Utc};
 use secrecy::{ExposeSecret, SecretString};
 
-use super::admin::is_admin;
+use super::admin::is_full_admin;
 use crate::api::extractors::UcanAuth;
 use crate::bcrypt_queue::{BcryptJob, BcryptQueueError};
 use crate::nip98;
@@ -99,6 +99,8 @@ pub(crate) async fn generate_ucan_token(
 /// redirect_origin identifies which app/authorization this token is for
 /// bunker_pubkey uniquely identifies the authorization for direct cache lookup
 /// is_first_party: true for headless flow tokens (allows account deletion)
+/// admin_role: "full" for NIP-07 admins, "support" for CF Access admins
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn generate_server_signed_ucan(
     user_pubkey: &nostr_sdk::PublicKey,
     tenant_id: i64,
@@ -107,6 +109,7 @@ pub(crate) async fn generate_server_signed_ucan(
     bunker_pubkey: Option<&str>,
     server_keys: &Keys,
     is_first_party: bool,
+    admin_role: Option<&str>,
 ) -> Result<String, AuthError> {
     use crate::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
     use serde_json::json;
@@ -125,6 +128,9 @@ pub(crate) async fn generate_server_signed_ucan(
     }
     if is_first_party {
         facts["first_party"] = json!(true);
+    }
+    if let Some(role) = admin_role {
+        facts["admin_role"] = json!(role);
     }
 
     let ucan = UcanBuilder::default()
@@ -537,8 +543,8 @@ async fn nostr_auth_login(
     let pubkey_hex = nip98_auth.pubkey.to_hex();
 
     // Check if pubkey is in ALLOWED_PUBKEYS whitelist
-    let nip98_auth_check = UcanAuth { pubkey: pubkey_hex.clone(), cf_admin_email: None };
-    if !is_admin(&nip98_auth_check) {
+    let nip98_auth_check = UcanAuth { pubkey: pubkey_hex.clone(), cf_admin_email: None, admin_role: None };
+    if !is_full_admin(&nip98_auth_check) {
         tracing::warn!(
             "NIP-98 login denied for non-whitelisted pubkey: {}",
             &pubkey_hex[..8]
@@ -561,6 +567,7 @@ async fn nostr_auth_login(
         None, // No bunker_pubkey for admin sessions
         &server_keys,
         false, // NIP-98 admin login is not first-party OAuth
+        Some("full"),
     )
     .await?;
 
@@ -671,6 +678,7 @@ async fn generate_cf_admin_ucan(
         "email": email,
         "redirect_origin": "admin",
         "cf_admin_email": email,
+        "admin_role": "support",
     });
 
     let ucan = UcanBuilder::default()

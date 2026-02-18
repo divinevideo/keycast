@@ -2142,6 +2142,7 @@ async fn handle_refresh_token_grant(
         Some(&bunker_public_key.to_hex()),
         &auth_state.state.server_keys,
         false, // Refresh tokens are not first-party
+        None,
     )
     .await
     .map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?;
@@ -2565,6 +2566,7 @@ async fn create_oauth_authorization_and_token(
         Some(&bunker_public_key.to_hex()),
         &auth_state.state.server_keys,
         is_headless, // first_party fact for headless flow tokens
+        None,
     )
     .await
     .map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?;

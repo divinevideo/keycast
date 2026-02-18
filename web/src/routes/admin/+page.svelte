@@ -14,6 +14,7 @@
 
 	// Admin status from API (single source of truth)
 	let isAdmin = $state<boolean | null>(null);
+	let adminRole = $state<string | null>(null);
 	let isCheckingAdmin = $state(true);
 
 	// Check admin status when user is available
@@ -27,11 +28,15 @@
 		try {
 			isCheckingAdmin = true;
 
-			const response = await api.get<{ is_admin: boolean }>('/admin/status');
+			const response = await api.get<{ is_admin: boolean; role: string | null }>('/admin/status');
 			isAdmin = response.is_admin;
+			adminRole = response.role;
 			if (!response.is_admin) {
 				toast.error('Admin access required');
 				goto('/', { replaceState: true });
+			} else if (response.role !== 'full') {
+				// Support admins should use /support-admin
+				goto('/support-admin', { replaceState: true });
 			}
 		} catch (err) {
 			console.error('Failed to check admin status:', err);

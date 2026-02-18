@@ -27,4 +27,4 @@ pub use refresh_token::RefreshTokenRepository;
 pub use signing_activity::SigningActivityRepository;
 pub use stored_key::StoredKeyRepository;
 pub use team::TeamRepository;
-pub use user::{DeleteAccountResult, UserRepository, VerificationTokenData};
+pub use user::{AdminUserDetails, DeleteAccountResult, UserRepository, VerificationTokenData};

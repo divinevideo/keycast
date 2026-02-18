@@ -18,6 +18,20 @@ pub struct VerificationTokenData {
     pub email_verified: bool,
 }
 
+/// User details returned by admin lookup.
+#[derive(Debug, FromRow)]
+pub struct AdminUserDetails {
+    pub pubkey: String,
+    pub email: Option<String>,
+    pub email_verified: Option<bool>,
+    pub username: Option<String>,
+    pub display_name: Option<String>,
+    pub vine_id: Option<String>,
+    pub has_personal_key: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Repository for user-related database operations.
 #[derive(Debug, Clone)]
 pub struct UserRepository {
@@ -999,6 +1013,58 @@ impl UserRepository {
         .fetch_optional(&self.pool)
         .await?;
         Ok(result.is_some())
+    }
+
+    /// Look up a user for admin support tools.
+    /// Searches by email (if query contains @) or by hex/npub pubkey.
+    pub async fn find_user_for_admin(
+        &self,
+        query: &str,
+        tenant_id: i64,
+    ) -> Result<Option<AdminUserDetails>, RepositoryError> {
+        let pubkey_hex = if query.contains('@') {
+            // Search by email, resolve to pubkey first
+            let result: Option<(String,)> =
+                sqlx::query_as("SELECT pubkey FROM users WHERE LOWER(email) = LOWER($1) AND tenant_id = $2")
+                    .bind(query)
+                    .bind(tenant_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            match result {
+                Some((pk,)) => pk,
+                None => return Ok(None),
+            }
+        } else if query.starts_with("npub") {
+            // Decode npub to hex
+            match PublicKey::parse(query) {
+                Ok(pk) => pk.to_hex(),
+                Err(_) => return Ok(None),
+            }
+        } else {
+            query.to_string()
+        };
+
+        let row: Option<AdminUserDetails> = sqlx::query_as(
+            "SELECT
+                u.pubkey,
+                u.email,
+                u.email_verified,
+                u.username,
+                u.display_name,
+                u.vine_id,
+                (pk.user_pubkey IS NOT NULL) as \"has_personal_key!\",
+                u.created_at,
+                u.updated_at
+             FROM users u
+             LEFT JOIN personal_keys pk ON pk.user_pubkey = u.pubkey AND pk.tenant_id = u.tenant_id
+             WHERE u.pubkey = $1 AND u.tenant_id = $2",
+        )
+        .bind(&pubkey_hex)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row)
     }
 
     /// Delete a user account and all associated data.

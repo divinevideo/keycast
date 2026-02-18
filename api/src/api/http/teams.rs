@@ -54,7 +54,7 @@ pub async fn create_team(
     let user_pubkey_hex = &auth.pubkey;
 
     // Check admin access for team creation
-    if !super::admin::is_admin(&auth) {
+    if !super::admin::is_full_admin(&auth) {
         tracing::warn!(
             "Team creation denied for non-admin pubkey: {}",
             user_pubkey_hex
