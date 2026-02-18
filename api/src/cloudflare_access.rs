@@ -36,27 +36,26 @@ pub fn is_configured() -> bool {
 /// Fetches JWKS from the CF Access certs endpoint, validates the RS256 signature,
 /// checks the audience tag matches CF_ACCESS_AUD, and verifies expiry.
 pub async fn validate_cf_jwt(token: &str) -> Result<CfAccessClaims> {
-    let team = std::env::var("CF_ACCESS_TEAM")
-        .context("CF_ACCESS_TEAM not configured")?;
-    let expected_aud = std::env::var("CF_ACCESS_AUD")
-        .context("CF_ACCESS_AUD not configured")?;
+    let team = std::env::var("CF_ACCESS_TEAM").context("CF_ACCESS_TEAM not configured")?;
+    let expected_aud = std::env::var("CF_ACCESS_AUD").context("CF_ACCESS_AUD not configured")?;
 
     let certs_url = format!("https://{}.cloudflareaccess.com/cdn-cgi/access/certs", team);
 
     // Decode JWT header to find the key ID
-    let header = decode_header(token)
-        .context("Failed to decode CF JWT header")?;
-    let kid = header.kid.ok_or_else(|| anyhow!("CF JWT missing kid in header"))?;
+    let header = decode_header(token).context("Failed to decode CF JWT header")?;
+    let kid = header
+        .kid
+        .ok_or_else(|| anyhow!("CF JWT missing kid in header"))?;
 
     // Get JWKS (from cache or fetch)
     let jwks = get_jwks(&certs_url).await?;
 
     // Find the matching key
-    let jwk = find_jwk(&jwks, &kid)
-        .ok_or_else(|| anyhow!("No matching key found for kid: {}", kid))?;
+    let jwk =
+        find_jwk(&jwks, &kid).ok_or_else(|| anyhow!("No matching key found for kid: {}", kid))?;
 
-    let decoding_key = DecodingKey::from_jwk(jwk)
-        .context("Failed to create decoding key from JWK")?;
+    let decoding_key =
+        DecodingKey::from_jwk(jwk).context("Failed to create decoding key from JWK")?;
 
     // Validate: RS256, check exp, check aud
     let mut validation = Validation::new(Algorithm::RS256);
@@ -91,10 +90,9 @@ pub async fn validate_cf_jwt(token: &str) -> Result<CfAccessClaims> {
 /// Uses HKDF-SHA256 with SERVER_NSEC as input keying material, "cf-admin" as salt,
 /// and the email as info. This gives the CF admin a stable internal pubkey for UCAN audience.
 pub fn derive_synthetic_keys(email: &str) -> Result<Keys> {
-    let server_nsec = std::env::var("SERVER_NSEC")
-        .context("SERVER_NSEC not configured")?;
-    let server_keys = Keys::parse(&server_nsec)
-        .map_err(|e| anyhow!("Invalid SERVER_NSEC: {}", e))?;
+    let server_nsec = std::env::var("SERVER_NSEC").context("SERVER_NSEC not configured")?;
+    let server_keys =
+        Keys::parse(&server_nsec).map_err(|e| anyhow!("Invalid SERVER_NSEC: {}", e))?;
 
     let ikm = server_keys.secret_key().to_secret_bytes();
     let salt = b"cf-admin";
@@ -115,7 +113,9 @@ pub fn derive_synthetic_keys(email: &str) -> Result<Keys> {
 async fn get_jwks(certs_url: &str) -> Result<JwkSet> {
     // Check cache
     if let Some(cache) = JWKS_CACHE.get() {
-        let guard = cache.read().map_err(|e| anyhow!("JWKS cache lock poisoned: {}", e))?;
+        let guard = cache
+            .read()
+            .map_err(|e| anyhow!("JWKS cache lock poisoned: {}", e))?;
         if guard.0.elapsed() < JWKS_CACHE_TTL {
             return Ok(guard.1.clone());
         }
@@ -146,7 +146,7 @@ async fn fetch_jwks(certs_url: &str) -> Result<JwkSet> {
 
 /// Find a JWK by key ID
 fn find_jwk<'a>(jwks: &'a JwkSet, kid: &str) -> Option<&'a jsonwebtoken::jwk::Jwk> {
-    jwks.keys.iter().find(|k| {
-        k.common.key_id.as_deref() == Some(kid)
-    })
+    jwks.keys
+        .iter()
+        .find(|k| k.common.key_id.as_deref() == Some(kid))
 }
