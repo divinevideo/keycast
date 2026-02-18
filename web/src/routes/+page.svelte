@@ -9,7 +9,7 @@ import CreateBunkerModal from "$lib/components/CreateBunkerModal.svelte";
 import { onMount } from "svelte";
 import { nip19 } from "nostr-tools";
 import { toast } from "svelte-hot-french-toast";
-import { signin, SigninMethod, hasCfAccessCookie, cloudflareLogin } from "$lib/utils/auth";
+import { signin, SigninMethod } from "$lib/utils/auth";
 import { getAllowedPubkeys, isTeamsEnabled } from "$lib/utils/env";
 
 interface GroupedSession {
@@ -204,11 +204,6 @@ async function revokeGroupedSession(group: GroupedSession) {
 }
 
 onMount(async () => {
-	// Auto-login via Cloudflare Access if cookie is present
-	if (!currentUser && hasCfAccessCookie()) {
-		await cloudflareLogin();
-	}
-
 	// Check for cookie-based authentication first
 	if (!currentUser) {
 		try {
@@ -290,20 +285,20 @@ onMount(async () => {
 			<!-- Your Identity Section -->
 			<section class="identity-section">
 				<h2 class="section-title">
-					{#if authMethod === 'nip07' || authMethod === 'cloudflare'}
+					{#if authMethod === 'nip07'}
 						Admin Access
 					{:else}
 						Manage Your Identity
 					{/if}
 				</h2>
 				<div class="identity-card">
-					{#if authMethod === 'nip07' || authMethod === 'cloudflare'}
+					{#if authMethod === 'nip07'}
 						<div class="identity-row">
 							<div class="identity-icon">
 								<PlugsConnected size={20} weight="fill" />
 							</div>
 							<div class="identity-info">
-								<span class="identity-value">{authMethod === 'cloudflare' ? 'Signed in via Cloudflare Access' : 'Signed in via NIP-07 extension'}</span>
+								<span class="identity-value">Signed in via NIP-07 extension</span>
 								<span class="status-badge admin">Admin</span>
 							</div>
 						</div>
@@ -367,7 +362,7 @@ onMount(async () => {
 			</section>
 
 			<!-- Learn More Section (not for NIP-07 admins) -->
-			{#if authMethod !== 'nip07' && authMethod !== 'cloudflare'}
+			{#if authMethod !== 'nip07'}
 			<section class="learn-section">
 				<button class="learn-toggle" onclick={() => (showLearnMore = !showLearnMore)}>
 					<Question size={18} weight="fill" />
@@ -422,7 +417,7 @@ onMount(async () => {
 			{/if}
 
 			<!-- App Connections Section (not for NIP-07 admins) -->
-			{#if authMethod !== 'nip07' && authMethod !== 'cloudflare'}
+			{#if authMethod !== 'nip07'}
 			<section class="apps-section">
 				<div class="section-header">
 					<h2 class="section-title">App Connections</h2>

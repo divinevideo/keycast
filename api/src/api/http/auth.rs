@@ -543,7 +543,11 @@ async fn nostr_auth_login(
     let pubkey_hex = nip98_auth.pubkey.to_hex();
 
     // Check if pubkey is in ALLOWED_PUBKEYS whitelist
-    let nip98_auth_check = UcanAuth { pubkey: pubkey_hex.clone(), cf_admin_email: None, admin_role: None };
+    let nip98_auth_check = UcanAuth {
+        pubkey: pubkey_hex.clone(),
+        cf_admin_email: None,
+        admin_role: None,
+    };
     if !is_full_admin(&nip98_auth_check) {
         tracing::warn!(
             "NIP-98 login denied for non-whitelisted pubkey: {}",
@@ -601,10 +605,7 @@ async fn nostr_auth_login(
 }
 
 /// Handle Cloudflare Access admin login
-async fn cf_access_login(
-    tenant_id: i64,
-    token: &str,
-) -> Result<Response, AuthError> {
+async fn cf_access_login(tenant_id: i64, token: &str) -> Result<Response, AuthError> {
     let claims = crate::cloudflare_access::validate_cf_jwt(token)
         .await
         .map_err(|e| {
@@ -623,12 +624,8 @@ async fn cf_access_login(
 
     // Generate server-signed UCAN with cf_admin_email fact
     let server_keys = get_server_keys()?;
-    let ucan_token = generate_cf_admin_ucan(
-        &synthetic_pubkey,
-        tenant_id,
-        &email,
-        &server_keys,
-    ).await?;
+    let ucan_token =
+        generate_cf_admin_ucan(&synthetic_pubkey, tenant_id, &email, &server_keys).await?;
 
     // Track login
     keycast_core::metrics::METRICS.inc_login();

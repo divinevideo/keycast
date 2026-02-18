@@ -28,15 +28,15 @@ $effect(() => {
     }
 });
 
-// Hide header on auth pages (full-page experience)
+// Hide header on auth pages and support-admin (full-page experience)
 // Show header on homepage if authenticated (dashboard mode)
-const authOnlyPaths = ['/login', '/register', '/verify-email'];
-const isAuthPage = $derived(authOnlyPaths.includes($page.url.pathname));
+const headerHiddenPaths = ['/login', '/register', '/verify-email', '/support-admin'];
+const isHeaderHidden = $derived(headerHiddenPaths.some(p => $page.url.pathname.startsWith(p)));
 const isHomepage = $derived($page.url.pathname === '/');
 const user = $derived(getCurrentUser());
 
 const showHeader = $derived(
-	!isAuthPage && (user || !isHomepage)
+	!isHeaderHidden && (user || !isHomepage)
 );
 </script>
 

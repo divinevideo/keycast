@@ -62,7 +62,11 @@ where
                         "UcanAuth: Authenticated via Bearer token for pubkey: {}",
                         pubkey
                     );
-                    return Ok(UcanAuth { pubkey, cf_admin_email, admin_role });
+                    return Ok(UcanAuth {
+                        pubkey,
+                        cf_admin_email,
+                        admin_role,
+                    });
                 }
             }
         }
@@ -90,7 +94,11 @@ where
                             "UcanAuth: Authenticated via cookie for pubkey: {}",
                             pubkey
                         );
-                        return Ok(UcanAuth { pubkey, cf_admin_email, admin_role });
+                        return Ok(UcanAuth {
+                            pubkey,
+                            cf_admin_email,
+                            admin_role,
+                        });
                     }
                 }
             }

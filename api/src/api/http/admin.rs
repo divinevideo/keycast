@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use super::routes::AuthState;
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::extractors::UcanAuth;
-use keycast_core::repositories::{ClaimTokenRepository, OAuthAuthorizationRepository, UserRepository};
+use keycast_core::repositories::{
+    ClaimTokenRepository, OAuthAuthorizationRepository, UserRepository,
+};
 use keycast_core::types::claim_token::generate_claim_token;
 
 /// Admin token expiry in days (30 days for long-lived admin tokens)
@@ -117,10 +119,7 @@ pub async fn get_admin_token(
     let token = generate_admin_ucan(&user_pubkey, tenant_id, &server_keys).await?;
     let expires_at = Utc::now() + Duration::days(ADMIN_TOKEN_EXPIRY_DAYS);
 
-    tracing::info!(
-        "Admin token generated for pubkey: {}",
-        &auth.pubkey[..8]
-    );
+    tracing::info!("Admin token generated for pubkey: {}", &auth.pubkey[..8]);
 
     Ok(Json(AdminTokenResponse {
         token,
@@ -214,9 +213,13 @@ pub async fn preload_user(
             .map_err(|e| ApiError::Internal(format!("Invalid stored pubkey: {}", e)))?;
 
         let token = generate_preload_ucan(
-            &existing_user_pubkey, tenant_id, &server_keys,
-            &auth.pubkey, auth.cf_admin_email.as_deref(),
-        ).await?;
+            &existing_user_pubkey,
+            tenant_id,
+            &server_keys,
+            &auth.pubkey,
+            auth.cf_admin_email.as_deref(),
+        )
+        .await?;
 
         tracing::info!(
             "Returning existing preloaded user for vine_id '{}': {}",
@@ -286,9 +289,13 @@ pub async fn preload_user(
     }
 
     let token = generate_preload_ucan(
-        &pubkey, tenant_id, &server_keys,
-        &auth.pubkey, auth.cf_admin_email.as_deref(),
-    ).await?;
+        &pubkey,
+        tenant_id,
+        &server_keys,
+        &auth.pubkey,
+        auth.cf_admin_email.as_deref(),
+    )
+    .await?;
 
     tracing::info!(
         "Preloaded user created: vine_id={}, username={}, pubkey={}",
@@ -360,9 +367,13 @@ pub async fn get_user_token(
 
     let server_keys = get_server_keys()?;
     let token = generate_preload_ucan(
-        &user_pubkey, tenant_id, &server_keys,
-        &auth.pubkey, auth.cf_admin_email.as_deref(),
-    ).await?;
+        &user_pubkey,
+        tenant_id,
+        &server_keys,
+        &auth.pubkey,
+        auth.cf_admin_email.as_deref(),
+    )
+    .await?;
 
     tracing::info!(
         "User token generated for pubkey: {} by admin: {}",
@@ -542,7 +553,10 @@ pub async fn get_user_lookup(
     let result = user_repo.find_user_for_admin(q, tenant_id).await?;
 
     match result {
-        None => Ok(Json(UserLookupResponse { found: false, user: None })),
+        None => Ok(Json(UserLookupResponse {
+            found: false,
+            user: None,
+        })),
         Some(details) => {
             // Count active sessions
             let oauth_repo = OAuthAuthorizationRepository::new(pool.clone());

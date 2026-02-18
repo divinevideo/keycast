@@ -1024,12 +1024,13 @@ impl UserRepository {
     ) -> Result<Option<AdminUserDetails>, RepositoryError> {
         let pubkey_hex = if query.contains('@') {
             // Search by email, resolve to pubkey first
-            let result: Option<(String,)> =
-                sqlx::query_as("SELECT pubkey FROM users WHERE LOWER(email) = LOWER($1) AND tenant_id = $2")
-                    .bind(query)
-                    .bind(tenant_id)
-                    .fetch_optional(&self.pool)
-                    .await?;
+            let result: Option<(String,)> = sqlx::query_as(
+                "SELECT pubkey FROM users WHERE LOWER(email) = LOWER($1) AND tenant_id = $2",
+            )
+            .bind(query)
+            .bind(tenant_id)
+            .fetch_optional(&self.pool)
+            .await?;
             match result {
                 Some((pk,)) => pk,
                 None => return Ok(None),
