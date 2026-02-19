@@ -147,8 +147,7 @@ mod tests {
     use std::time::Duration;
 
     fn get_redis_url() -> String {
-        std::env::var("TEST_REDIS_URL")
-            .expect("TEST_REDIS_URL must be set to run Redis tests")
+        std::env::var("TEST_REDIS_URL").expect("TEST_REDIS_URL must be set to run Redis tests")
     }
 
     /// Generate unique test prefix to isolate test data
