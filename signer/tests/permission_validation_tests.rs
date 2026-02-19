@@ -16,8 +16,8 @@ use uuid::Uuid;
 async fn setup_test_db() -> PgPool {
     // Use development database for tests
     // TODO: Use test-specific database with isolation
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast".to_string());
+    let database_url =
+        std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run database tests");
 
     let pool = PgPool::connect(&database_url).await.expect(
         "Failed to connect to database. Make sure PostgreSQL is running and DATABASE_URL is set.",
@@ -44,9 +44,10 @@ async fn create_policy_with_permissions(
 
     if !team_exists {
         sqlx::query(
-            "INSERT INTO teams (name, tenant_id, created_at, updated_at)
-             VALUES ($1, $2, NOW(), NOW())",
+            "INSERT INTO teams (id, name, tenant_id, created_at, updated_at)
+             VALUES ($1, $2, $3, NOW(), NOW())",
         )
+        .bind(team_id)
         .bind("Test Team")
         .bind(tenant_id)
         .execute(pool)
@@ -762,9 +763,10 @@ async fn create_team_authorization_with_expiry(
 
     if !team_exists {
         sqlx::query(
-            "INSERT INTO teams (name, tenant_id, created_at, updated_at)
-             VALUES ($1, $2, NOW(), NOW())",
+            "INSERT INTO teams (id, name, tenant_id, created_at, updated_at)
+             VALUES ($1, $2, $3, NOW(), NOW())",
         )
+        .bind(team_id)
         .bind("Test Team for Expiry")
         .bind(tenant_id)
         .execute(pool)
