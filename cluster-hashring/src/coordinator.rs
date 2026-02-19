@@ -485,7 +485,8 @@ mod tests {
     use uuid::Uuid;
 
     fn get_redis_url() -> String {
-        std::env::var("TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into())
+        std::env::var("TEST_REDIS_URL")
+            .expect("TEST_REDIS_URL must be set to run Redis tests")
     }
 
     /// Generate unique test prefix to isolate test data

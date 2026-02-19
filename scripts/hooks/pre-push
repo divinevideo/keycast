@@ -60,8 +60,8 @@ fi
 
 # Override DATABASE_URL and REDIS_URL to use local test database/services
 DATABASE_URL="postgres://postgres:password@localhost/keycast_test" \
-REDIS_URL="redis://localhost:6379" \
-TEST_REDIS_URL="redis://localhost:6379" \
+REDIS_URL="redis://localhost:16379" \
+TEST_REDIS_URL="redis://localhost:16379" \
 cargo test --workspace
 
 echo "→ Building release..."
