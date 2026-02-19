@@ -628,17 +628,15 @@ pub async fn list_support_admins(
     // Look up emails for all pubkeys in one query
     let tenant_id = tenant.0.id;
     let pool = &auth_state.state.db;
-    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-        "SELECT pubkey, email FROM users WHERE pubkey = ANY($1) AND tenant_id = $2",
-    )
-    .bind(&pubkeys)
-    .bind(tenant_id)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    let rows: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT pubkey, email FROM users WHERE pubkey = ANY($1) AND tenant_id = $2")
+            .bind(&pubkeys)
+            .bind(tenant_id)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
 
-    let email_map: std::collections::HashMap<String, Option<String>> =
-        rows.into_iter().collect();
+    let email_map: std::collections::HashMap<String, Option<String>> = rows.into_iter().collect();
 
     let admins = pubkeys
         .into_iter()
