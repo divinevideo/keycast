@@ -554,7 +554,7 @@ async fn test_cleanup_preserves_team_member() {
 
     // Cleanup should not even try to delete this user (no email = not a stale signup)
     let result = sqlx::query(CLEANUP_QUERY_SCOPED)
-        .bind(&vec![pubkey])
+        .bind(vec![pubkey])
         .execute(&pool)
         .await
         .expect("Cleanup should succeed without errors");
