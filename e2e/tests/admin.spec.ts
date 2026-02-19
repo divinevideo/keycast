@@ -51,7 +51,7 @@ test.describe("Support admin management", () => {
     expect(res.status()).toBe(200);
 
     const body = await res.json();
-    expect(body.pubkeys).toEqual([]);
+    expect(body.admins).toEqual([]);
   });
 
   test("full admin can add and remove support admins", async ({ request }) => {
@@ -77,7 +77,7 @@ test.describe("Support admin management", () => {
     });
     expect(listRes.status()).toBe(200);
     const listBody = await listRes.json();
-    expect(listBody.pubkeys).toContain(targetPubkey);
+    expect(listBody.admins.map((a: any) => a.pubkey)).toContain(targetPubkey);
 
     // Remove support admin
     const removeRes = await request.delete(
@@ -95,7 +95,7 @@ test.describe("Support admin management", () => {
       headers: { Cookie: sessionCookie },
     });
     const listBody2 = await listRes2.json();
-    expect(listBody2.pubkeys).toEqual([]);
+    expect(listBody2.admins).toEqual([]);
   });
 
   test("support admin via Redis gets role: support", async ({ request }) => {

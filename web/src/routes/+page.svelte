@@ -246,23 +246,30 @@ onMount(async () => {
 	// Auth check complete
 	isCheckingAuth = false;
 
-	// Wait a tick for user to be set
-	await new Promise(resolve => setTimeout(resolve, 50));
+	// Load dashboard if user is already set (e.g. cookie recovery above)
+	await loadDashboardData();
+});
 
-	const currentUserCheck = getCurrentUser();
-	if (currentUserCheck?.pubkey) {
-		// Convert hex pubkey to npub
-		try {
-			userNpub = nip19.npubEncode(currentUserCheck.pubkey);
-		} catch (e) {
-			userNpub = currentUserCheck.pubkey;
-		}
+async function loadDashboardData() {
+	const user = getCurrentUser();
+	if (!user?.pubkey) return;
 
-		// Load dashboard data (gracefully handles missing user records)
-		const loads: Promise<void>[] = [loadSessions()];
-		if (isTeamsEnabled()) loads.push(loadTeams());
-		await Promise.all(loads);
-		isLoadingDashboard = false;
+	try {
+		userNpub = nip19.npubEncode(user.pubkey);
+	} catch (e) {
+		userNpub = user.pubkey;
+	}
+
+	const loads: Promise<void>[] = [loadSessions()];
+	if (isTeamsEnabled()) loads.push(loadTeams());
+	await Promise.all(loads);
+	isLoadingDashboard = false;
+}
+
+// Reactively load dashboard when user logs in after page mount (e.g. NIP-07)
+$effect(() => {
+	if (currentUser?.pubkey && isLoadingDashboard && !isCheckingAuth) {
+		loadDashboardData();
 	}
 });
 </script>

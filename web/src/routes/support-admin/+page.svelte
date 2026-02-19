@@ -4,7 +4,9 @@
 	import { KeycastApi } from '$lib/keycast_api.svelte';
 	import { goto } from '$app/navigation';
 	import Loader from '$lib/components/Loader.svelte';
-	import { ShieldCheck, Warning, MagnifyingGlass, User, Key, Envelope, Calendar, Globe } from 'phosphor-svelte';
+	import { ShieldCheck, Warning, MagnifyingGlass, User, Key, Calendar, Globe, Copy, Check, CheckCircle, XCircle } from 'phosphor-svelte';
+	import { nip19 } from 'nostr-tools';
+	import { toast } from 'svelte-hot-french-toast';
 
 	const api = new KeycastApi();
 
@@ -16,6 +18,10 @@
 	let isSearching = $state(false);
 	let searchResult = $state<null | { found: boolean; user?: UserDetails }>(null);
 	let searchError = $state('');
+
+	// Pubkey display state
+	let pubkeyFormat = $state<'hex' | 'npub'>('npub');
+	let copiedPubkey = $state(false);
 
 	interface UserDetails {
 		pubkey: string;
@@ -77,9 +83,32 @@
 		});
 	}
 
-	function truncatePubkey(pk: string): string {
-		if (pk.length <= 16) return pk;
-		return pk.slice(0, 8) + '...' + pk.slice(-8);
+	function formatPubkey(hexPubkey: string): string {
+		if (pubkeyFormat === 'npub') {
+			try {
+				return nip19.npubEncode(hexPubkey);
+			} catch {
+				return hexPubkey;
+			}
+		}
+		return hexPubkey;
+	}
+
+	function truncateFormatted(hexPubkey: string): string {
+		const formatted = formatPubkey(hexPubkey);
+		if (formatted.length <= 20) return formatted;
+		return formatted.slice(0, 12) + '...' + formatted.slice(-8);
+	}
+
+	async function copyPubkey(hexPubkey: string) {
+		try {
+			await navigator.clipboard.writeText(formatPubkey(hexPubkey));
+			copiedPubkey = true;
+			toast.success(`${pubkeyFormat === 'npub' ? 'npub' : 'Hex pubkey'} copied!`);
+			setTimeout(() => (copiedPubkey = false), 2000);
+		} catch {
+			toast.error('Failed to copy');
+		}
 	}
 </script>
 
@@ -143,28 +172,55 @@
 					<div class="user-card">
 						<div class="user-card-header">
 							<User size={20} weight="fill" />
-							<span class="user-name">{u.display_name || u.username || truncatePubkey(u.pubkey)}</span>
+							<div class="user-header-info">
+								<span class="user-name">{u.email || u.display_name || u.username || truncateFormatted(u.pubkey)}</span>
+								{#if u.email}
+									<span class="user-sub mono">
+										<Key size={12} />
+										<span title={formatPubkey(u.pubkey)}>{truncateFormatted(u.pubkey)}</span>
+									</span>
+								{/if}
+							</div>
+						</div>
+
+						<div class="status-strip">
+							<div class="status-item" class:status-ok={u.email_verified} class:status-warn={u.email && !u.email_verified} class:status-none={!u.email}>
+								{#if u.email_verified}
+									<CheckCircle size={14} weight="fill" />
+									<span>Email verified</span>
+								{:else if u.email}
+									<XCircle size={14} weight="fill" />
+									<span>Email unverified</span>
+								{:else}
+									<span class="status-neutral">No email</span>
+								{/if}
+							</div>
+							<div class="status-item" class:status-ok={u.active_sessions > 0} class:status-none={u.active_sessions === 0}>
+								<span>{u.active_sessions} active {u.active_sessions === 1 ? 'session' : 'sessions'}</span>
+							</div>
 						</div>
 
 						<div class="user-fields">
 							<div class="field">
 								<span class="field-label"><Key size={14} /> Pubkey</span>
-								<span class="field-value mono">{u.pubkey}</span>
-							</div>
-
-							{#if u.email}
-								<div class="field">
-									<span class="field-label"><Envelope size={14} /> Email</span>
-									<span class="field-value">
-										{u.email}
-										{#if u.email_verified}
-											<span class="badge verified">verified</span>
+								<span class="field-value mono">
+									<span title={formatPubkey(u.pubkey)}>{truncateFormatted(u.pubkey)}</span>
+									<button class="icon-btn" onclick={() => copyPubkey(u.pubkey)} title="Copy pubkey">
+										{#if copiedPubkey}
+											<Check size={14} />
 										{:else}
-											<span class="badge unverified">unverified</span>
+											<Copy size={14} />
 										{/if}
-									</span>
-								</div>
-							{/if}
+									</button>
+									<button
+										class="format-toggle"
+										onclick={() => pubkeyFormat = pubkeyFormat === 'hex' ? 'npub' : 'hex'}
+										title="Switch between npub and hex format"
+									>
+										{pubkeyFormat === 'hex' ? 'npub' : 'hex'}
+									</button>
+								</span>
+							</div>
 
 							{#if u.username}
 								<div class="field">
@@ -179,16 +235,6 @@
 									<span class="field-value">{u.vine_id}</span>
 								</div>
 							{/if}
-
-							<div class="field">
-								<span class="field-label">Personal Key</span>
-								<span class="field-value">{u.has_personal_key ? 'Yes' : 'No'}</span>
-							</div>
-
-							<div class="field">
-								<span class="field-label">Active Sessions</span>
-								<span class="field-value">{u.active_sessions}</span>
-							</div>
 
 							<div class="field">
 								<span class="field-label"><Calendar size={14} /> Created</span>
@@ -401,16 +447,72 @@
 	.user-card-header {
 		display: flex;
 		align-items: center;
-		gap: 0.5rem;
+		gap: 0.625rem;
 		padding: 1rem 1.25rem;
 		border-bottom: 1px solid var(--color-divine-border);
 		color: var(--color-divine-green);
+	}
+
+	.user-header-info {
+		display: flex;
+		flex-direction: column;
+		gap: 0.2rem;
+		min-width: 0;
 	}
 
 	.user-name {
 		color: var(--color-divine-text);
 		font-weight: 600;
 		font-size: 1rem;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.user-sub {
+		display: flex;
+		align-items: center;
+		gap: 0.25rem;
+		color: var(--color-divine-text-tertiary);
+		font-size: 0.725rem;
+	}
+
+	.status-strip {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.5rem 1rem;
+		padding: 0.75rem 1.25rem;
+		border-bottom: 1px solid var(--color-divine-border);
+		background: var(--color-divine-muted);
+	}
+
+	.status-item {
+		display: flex;
+		align-items: center;
+		gap: 0.25rem;
+		font-size: 0.75rem;
+		font-weight: 500;
+	}
+
+	.status-item + .status-item {
+		padding-left: 1rem;
+		border-left: 1px solid var(--color-divine-border);
+	}
+
+	.status-item.status-ok {
+		color: var(--color-divine-green);
+	}
+
+	.status-item.status-warn {
+		color: var(--color-divine-warning);
+	}
+
+	.status-item.status-none {
+		color: var(--color-divine-text-tertiary);
+	}
+
+	.status-neutral {
+		color: var(--color-divine-text-tertiary);
 	}
 
 	.user-fields {
@@ -456,21 +558,38 @@
 		font-size: 0.75rem;
 	}
 
-	.badge {
-		font-size: 0.675rem;
-		font-weight: 500;
-		padding: 0.1rem 0.4rem;
-		border-radius: 9999px;
+	.icon-btn {
+		background: transparent;
+		border: none;
+		color: var(--color-divine-text-tertiary);
+		cursor: pointer;
+		padding: 0.25rem;
+		border-radius: 4px;
+		transition: all 0.2s;
+		flex-shrink: 0;
 	}
 
-	.badge.verified {
-		background: color-mix(in srgb, var(--color-divine-green) 20%, transparent);
+	.icon-btn:hover {
 		color: var(--color-divine-green);
+		background: var(--color-divine-muted);
 	}
 
-	.badge.unverified {
-		background: color-mix(in srgb, var(--color-divine-warning) 20%, transparent);
-		color: var(--color-divine-warning);
+	.format-toggle {
+		font-size: 0.65rem;
+		padding: 0.125rem 0.375rem;
+		background: var(--color-divine-muted);
+		border: 1px solid var(--color-divine-border);
+		border-radius: 4px;
+		color: var(--color-divine-text-tertiary);
+		cursor: pointer;
+		transition: all 0.2s;
+		text-transform: lowercase;
+		flex-shrink: 0;
+	}
+
+	.format-toggle:hover {
+		background: color-mix(in srgb, var(--color-divine-green) 15%, transparent);
+		color: var(--color-divine-green);
 	}
 
 	.links-grid {

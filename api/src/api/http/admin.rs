@@ -591,13 +591,20 @@ pub async fn get_user_lookup(
 // ============================================================================
 
 #[derive(Debug, Serialize)]
-pub struct SupportAdminsResponse {
-    pub pubkeys: Vec<String>,
+pub struct SupportAdminEntry {
+    pub pubkey: String,
+    pub email: Option<String>,
 }
 
-/// List all support admin pubkeys. Full admin only.
+#[derive(Debug, Serialize)]
+pub struct SupportAdminsResponse {
+    pub admins: Vec<SupportAdminEntry>,
+}
+
+/// List all support admins with email info. Full admin only.
 pub async fn list_support_admins(
-    _tenant: crate::api::tenant::TenantExtractor,
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
     auth: UcanAuth,
 ) -> ApiResult<Json<SupportAdminsResponse>> {
     if !is_full_admin(&auth) {
@@ -618,7 +625,30 @@ pub async fn list_support_admins(
         .await
         .map_err(|e| ApiError::Internal(format!("Redis error: {}", e)))?;
 
-    Ok(Json(SupportAdminsResponse { pubkeys }))
+    // Look up emails for all pubkeys in one query
+    let tenant_id = tenant.0.id;
+    let pool = &auth_state.state.db;
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT pubkey, email FROM users WHERE pubkey = ANY($1) AND tenant_id = $2",
+    )
+    .bind(&pubkeys)
+    .bind(tenant_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let email_map: std::collections::HashMap<String, Option<String>> =
+        rows.into_iter().collect();
+
+    let admins = pubkeys
+        .into_iter()
+        .map(|pk| SupportAdminEntry {
+            email: email_map.get(&pk).cloned().flatten(),
+            pubkey: pk,
+        })
+        .collect();
+
+    Ok(Json(SupportAdminsResponse { admins }))
 }
 
 #[derive(Debug, Deserialize)]

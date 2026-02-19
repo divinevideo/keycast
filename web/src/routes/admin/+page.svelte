@@ -5,6 +5,7 @@
 	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
 	import { Copy, Check, Key, Terminal, Users, Link, Warning, ArrowSquareOut, ShieldCheck, Trash, Plus } from 'phosphor-svelte';
+	import { nip19 } from 'nostr-tools';
 	import { getViteDomain } from '$lib/utils/env';
 
 	const api = new KeycastApi();
@@ -124,18 +125,24 @@
   -d '{"vine_id": "12345678"}'`;
 
 	// Support admins state
-	let supportAdmins = $state<string[]>([]);
+	interface SupportAdmin {
+		pubkey: string;
+		email: string | null;
+	}
+	let supportAdmins = $state<SupportAdmin[]>([]);
 	let isLoadingSupportAdmins = $state(false);
 	let newSupportAdminId = $state('');
 	let isAddingSupportAdmin = $state(false);
 	let supportAdminError = $state('');
+	let supportAdminPubkeyFormat = $state<'hex' | 'npub'>('npub');
+	let copiedSupportAdminPubkey = $state<string | null>(null);
 
 	async function loadSupportAdmins() {
 		isLoadingSupportAdmins = true;
 		supportAdminError = '';
 		try {
-			const response = await api.get<{ pubkeys: string[] }>('/admin/support-admins');
-			supportAdmins = response.pubkeys;
+			const response = await api.get<{ admins: SupportAdmin[] }>('/admin/support-admins');
+			supportAdmins = response.admins;
 		} catch (err: any) {
 			supportAdminError = err.message || 'Failed to load support admins';
 		} finally {
@@ -169,15 +176,34 @@
 		try {
 			await api.delete(`/admin/support-admins/${pubkey}`);
 			toast.success('Support admin removed');
-			supportAdmins = supportAdmins.filter(pk => pk !== pubkey);
+			supportAdmins = supportAdmins.filter(a => a.pubkey !== pubkey);
 		} catch (err: any) {
 			toast.error(err.message || 'Failed to remove support admin');
 		}
 	}
 
-	function truncatePubkey(pk: string): string {
-		if (pk.length <= 16) return pk;
-		return pk.slice(0, 8) + '...' + pk.slice(-8);
+	function formatSupportAdminPubkey(hex: string): string {
+		if (supportAdminPubkeyFormat === 'npub') {
+			try { return nip19.npubEncode(hex); } catch { return hex; }
+		}
+		return hex;
+	}
+
+	function truncateFormatted(hex: string): string {
+		const formatted = formatSupportAdminPubkey(hex);
+		if (formatted.length <= 20) return formatted;
+		return formatted.slice(0, 10) + '...' + formatted.slice(-8);
+	}
+
+	async function copySupportAdminPubkey(hex: string) {
+		try {
+			await navigator.clipboard.writeText(formatSupportAdminPubkey(hex));
+			copiedSupportAdminPubkey = hex;
+			toast.success(`${supportAdminPubkeyFormat === 'npub' ? 'npub' : 'Hex pubkey'} copied!`);
+			setTimeout(() => (copiedSupportAdminPubkey = null), 2000);
+		} catch {
+			toast.error('Failed to copy');
+		}
 	}
 
 	// Load support admins when admin status confirmed
@@ -438,10 +464,30 @@
 				<p class="empty-text">No support admins configured.</p>
 			{:else}
 				<div class="admin-list">
-					{#each supportAdmins as pubkey}
+					{#each supportAdmins as admin}
 						<div class="admin-list-item">
-							<span class="admin-pubkey" title={pubkey}>{truncatePubkey(pubkey)}</span>
-							<button class="btn-remove" onclick={() => removeSupportAdmin(pubkey)} title="Remove">
+							<div class="admin-info">
+								<div class="admin-pubkey-row">
+									<Key size={16} />
+									<span class="admin-pubkey-value" title={formatSupportAdminPubkey(admin.pubkey)}>
+										{truncateFormatted(admin.pubkey)}
+									</span>
+									<button class="btn-icon-sm" onclick={() => copySupportAdminPubkey(admin.pubkey)} title="Copy pubkey">
+										{#if copiedSupportAdminPubkey === admin.pubkey}
+											<Check size={14} weight="bold" />
+										{:else}
+											<Copy size={14} />
+										{/if}
+									</button>
+									<button class="format-toggle" onclick={() => supportAdminPubkeyFormat = supportAdminPubkeyFormat === 'hex' ? 'npub' : 'hex'}>
+										{supportAdminPubkeyFormat === 'hex' ? 'npub' : 'hex'}
+									</button>
+								</div>
+								{#if admin.email}
+									<span class="admin-email">{admin.email}</span>
+								{/if}
+							</div>
+							<button class="btn-remove" onclick={() => removeSupportAdmin(admin.pubkey)} title="Remove">
 								<Trash size={16} />
 							</button>
 						</div>
@@ -869,10 +915,64 @@
 		background: var(--color-divine-bg);
 	}
 
-	.admin-pubkey {
+	.admin-info {
+		display: flex;
+		flex-direction: column;
+		gap: 0.25rem;
+		min-width: 0;
+	}
+
+	.admin-pubkey-row {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		color: var(--color-divine-text);
+	}
+
+	.admin-pubkey-value {
 		font-family: var(--font-mono);
 		font-size: 0.825rem;
+		font-weight: 500;
+	}
+
+	.admin-email {
+		font-size: 0.75rem;
+		color: var(--color-divine-text-secondary);
+		padding-left: 1.75rem;
+	}
+
+	.btn-icon-sm {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding: 0.3rem;
+		background: transparent;
+		border: 1px solid transparent;
+		border-radius: 4px;
+		color: var(--color-divine-text-tertiary);
+		cursor: pointer;
+		transition: all 0.2s;
+	}
+
+	.btn-icon-sm:hover {
 		color: var(--color-divine-text);
+		background: var(--color-divine-bg);
+	}
+
+	.format-toggle {
+		background: var(--color-divine-bg);
+		border: 1px solid var(--color-divine-border);
+		color: var(--color-divine-text-secondary);
+		font-size: 0.7rem;
+		cursor: pointer;
+		padding: 0.15rem 0.4rem;
+		border-radius: 4px;
+		transition: all 0.2s;
+	}
+
+	.format-toggle:hover {
+		color: var(--color-divine-text);
+		border-color: var(--color-divine-text-secondary);
 	}
 
 	.btn-remove {

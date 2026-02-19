@@ -26,7 +26,7 @@ export async function signin(
         if (!alreadySignedIn) {
             toast.success("Signed in successfully");
         }
-        const dest = method === SigninMethod.Nip07 ? "/" : (isTeamsEnabled() ? "/teams" : "/");
+        const dest = method === SigninMethod.Nip07 ? "/admin" : (isTeamsEnabled() ? "/teams" : "/");
         goto(dest);
     }
     return pubkey;

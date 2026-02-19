@@ -23,7 +23,8 @@ export function getEnvVar(key: 'VITE_DOMAIN' | 'ALLOWED_PUBKEYS' | 'SHOW_TEAMS_F
     }
 
     // Fallback to build-time value (import.meta.env)
-    return import.meta.env[key];
+    // Vite only exposes VITE_-prefixed vars, so check both forms
+    return import.meta.env[key] || import.meta.env[`VITE_${key}`];
 }
 
 /**
