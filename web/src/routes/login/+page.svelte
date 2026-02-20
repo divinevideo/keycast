@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
+	import { page } from '$app/stores';
 	import { toast } from 'svelte-hot-french-toast';
 	import { KeycastApi } from '$lib/keycast_api.svelte';
 	import { setCurrentUser } from '$lib/current_user.svelte';
@@ -61,8 +62,9 @@
 			// Set current user for UI state (Header, navigation, etc.)
 			setCurrentUser(response.pubkey, 'cookie');
 
-			// UCAN token cookie is set, redirect to dashboard
-			goto('/');
+			// Redirect to original page or dashboard
+			const redirect = $page.url.searchParams.get('redirect');
+			goto(redirect && redirect.startsWith('/') ? redirect : '/');
 		} catch (err: any) {
 			console.error('Login error:', err);
 

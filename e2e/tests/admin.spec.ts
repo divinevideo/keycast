@@ -188,11 +188,50 @@ test.describe("Support admin management", () => {
     expect(tokenRes.status()).toBe(403);
   });
 
-  test("support-admin page redirects unauthenticated", async ({ page }) => {
+  test("support-admin page redirects unauthenticated to login with redirect param", async ({
+    page,
+  }) => {
     await page.goto("http://localhost:3000/support-admin");
 
-    // Should redirect away (unauthenticated users can't access admin pages)
-    await page.waitForURL((url) => url.pathname !== "/support-admin");
+    // Should redirect to /login with redirect param
+    await page.waitForURL(
+      (url) =>
+        url.pathname === "/login" &&
+        url.searchParams.get("redirect") === "/support-admin",
+    );
+  });
+
+  test("login redirects back to support-admin after authentication", async ({
+    page,
+    request,
+  }) => {
+    test.setTimeout(60000);
+
+    // Register a support admin via API
+    const email = `e2e-redirect-${Date.now()}@test.local`;
+    const { cookie } = await registerAndVerify(request, email, "TestPass123!");
+    const sessionCookie = `keycast_session=${parseCookieValue(cookie)}`;
+
+    // Get pubkey and make support admin
+    const accountRes = await request.get("/api/user/account", {
+      headers: { Cookie: sessionCookie },
+    });
+    const account = await accountRes.json();
+    await addSupportAdmin(account.public_key);
+
+    // Visit /login?redirect=/support-admin and log in via form
+    await page.goto("http://localhost:3000/login?redirect=/support-admin");
+    await page.fill('input[type="email"]', email);
+    await page.fill('input[type="password"]', "TestPass123!");
+    await page.click('button[type="submit"]');
+
+    // Should redirect back to /support-admin after login
+    await page.waitForURL("http://localhost:3000/support-admin", {
+      timeout: 15000,
+    });
+    await expect(page.locator("text=Support Admin")).toBeVisible({
+      timeout: 10000,
+    });
   });
 
   test("full admin can access support-admin page via browser", async ({

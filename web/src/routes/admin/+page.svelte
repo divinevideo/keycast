@@ -38,7 +38,7 @@
 		} catch (err) {
 			console.error('Failed to check admin status:', err);
 			isAdmin = false;
-			goto('/login', { replaceState: true });
+			goto('/login?redirect=/admin', { replaceState: true });
 		} finally {
 			isCheckingAdmin = false;
 		}
