@@ -9,7 +9,6 @@ mod oauth_code;
 mod personal_keys;
 mod policy;
 mod refresh_token;
-mod signing_activity;
 mod stored_key;
 mod team;
 mod user;
@@ -24,7 +23,6 @@ pub use oauth_code::{
 pub use personal_keys::PersonalKeysRepository;
 pub use policy::PolicyRepository;
 pub use refresh_token::RefreshTokenRepository;
-pub use signing_activity::SigningActivityRepository;
 pub use stored_key::StoredKeyRepository;
 pub use team::TeamRepository;
 pub use user::{AdminUserDetails, DeleteAccountResult, UserRepository, VerificationTokenData};

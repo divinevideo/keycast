@@ -310,8 +310,12 @@ async fn test_soft_delete_revoke() {
     .await
     .unwrap();
 
-    // Soft-delete (revoke)
-    let before_revoke = Utc::now();
+    // Capture DB time before revoke to avoid host/container clock skew
+    let before_revoke: chrono::DateTime<Utc> = sqlx::query_scalar("SELECT NOW()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
     sqlx::query("UPDATE oauth_authorizations SET revoked_at = NOW() WHERE id = $1")
         .bind(auth_id)
         .execute(&pool)

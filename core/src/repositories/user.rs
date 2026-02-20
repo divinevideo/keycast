@@ -1117,7 +1117,7 @@ impl UserRepository {
             .await?;
 
         // 3. Delete user (cascades to personal_keys, oauth_authorizations -> refresh_tokens,
-        //    email_verification_tokens, password_reset_tokens, signing_activity, user_profiles,
+        //    email_verification_tokens, password_reset_tokens, user_profiles,
         //    account_claim_tokens)
         let result = sqlx::query("DELETE FROM users WHERE pubkey = $1 AND tenant_id = $2")
             .bind(pubkey)

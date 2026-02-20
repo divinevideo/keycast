@@ -91,10 +91,6 @@ pub fn api_routes(
         .route("/user/profile", get(auth::get_profile))
         .route("/user/sessions", get(auth::list_sessions))
         .route("/user/permissions", get(auth::list_permissions))
-        .route(
-            "/user/sessions/:secret/activity",
-            get(auth::get_session_activity),
-        )
         .route("/user/sessions/disconnect", post(auth::disconnect_client))
         .route(
             "/user/verify-password",

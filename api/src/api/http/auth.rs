@@ -18,7 +18,7 @@ use crate::nip98;
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
     CreateOAuthAuthorizationParams, OAuthAuthorizationRepository, OAuthCodeRepository,
-    PersonalKeysRepository, PolicyRepository, SigningActivityRepository, UserRepository,
+    PersonalKeysRepository, PolicyRepository, UserRepository,
 };
 use keycast_core::traits::CustomPermission;
 use nostr_sdk::{Keys, PublicKey, ToBech32, UnsignedEvent};
@@ -2051,64 +2051,6 @@ pub async fn list_sessions(
         .collect();
 
     Ok(Json(BunkerSessionsResponse { sessions }))
-}
-
-#[derive(Debug, Serialize)]
-pub struct SessionActivity {
-    pub event_kind: i64,
-    pub event_content: Option<String>,
-    pub event_id: Option<String>,
-    pub created_at: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SessionActivityResponse {
-    pub activities: Vec<SessionActivity>,
-}
-
-/// Get activity log for a specific bunker session
-pub async fn get_session_activity(
-    tenant: crate::api::tenant::TenantExtractor,
-    State(pool): State<PgPool>,
-    headers: HeaderMap,
-    axum::extract::Path(bunker_pubkey): axum::extract::Path<String>,
-) -> Result<Json<SessionActivityResponse>, AuthError> {
-    let user_pubkey = extract_user_from_token(&headers).await?;
-    let tenant_id = tenant.0.id;
-    tracing::info!(
-        "Fetching activity for bunker pubkey: {} in tenant: {}",
-        bunker_pubkey,
-        tenant_id
-    );
-
-    // Verify this bunker session belongs to the user in this tenant
-    let oauth_auth_repo = OAuthAuthorizationRepository::new(pool.clone());
-    let session_pubkey = oauth_auth_repo
-        .verify_session_ownership(&bunker_pubkey, tenant_id)
-        .await?;
-
-    match session_pubkey {
-        Some(pubkey) if pubkey == user_pubkey => {}
-        _ => return Err(AuthError::InvalidToken),
-    }
-
-    // Get activity log
-    let signing_activity_repo = SigningActivityRepository::new(pool.clone());
-    let activities = signing_activity_repo
-        .list_recent(&bunker_pubkey, 100)
-        .await?;
-
-    let activities = activities
-        .into_iter()
-        .map(|(kind, content, event_id, created_at)| SessionActivity {
-            event_kind: kind,
-            event_content: content,
-            event_id,
-            created_at,
-        })
-        .collect();
-
-    Ok(Json(SessionActivityResponse { activities }))
 }
 
 #[derive(Debug, Deserialize)]

@@ -1553,9 +1553,7 @@ impl SigningHandler for Nip46Handler {
         &self,
         unsigned_event: UnsignedEvent,
     ) -> Result<Event, Box<dyn std::error::Error + Send + Sync>> {
-        // Extract event details for logging
         let kind = unsigned_event.kind.as_u16();
-        let content = unsigned_event.content.clone();
 
         tracing::info!(
             "Direct signing event kind {} for authorization {}",
@@ -1574,8 +1572,7 @@ impl SigningHandler for Nip46Handler {
 
         tracing::debug!("Successfully signed event: {}", signed_event.id);
 
-        // Log signing activity in background (non-blocking)
-        self.spawn_log_activity(kind, content, signed_event.id.to_hex());
+        self.spawn_update_activity();
 
         Ok(signed_event)
     }
@@ -1679,8 +1676,7 @@ impl Nip46Handler {
 
         tracing::debug!("Successfully signed event: {}", signed_event.id);
 
-        // Log signing activity in background (non-blocking)
-        self.spawn_log_activity(kind, content.to_string(), signed_event.id.to_hex());
+        self.spawn_update_activity();
 
         // Extract request ID to include in response
         let request_id = request["id"].clone();
@@ -1691,103 +1687,7 @@ impl Nip46Handler {
         }))
     }
 
-    /// Spawn activity logging in background (non-blocking)
-    /// This logs signing activity and updates oauth_authorizations stats without blocking the response
-    fn spawn_log_activity(&self, event_kind: u16, event_content: String, event_id: String) {
-        let pool = self.pool.clone();
-        let is_oauth = self.is_oauth;
-        let tenant_id = self.tenant_id;
-        let authorization_id = self.authorization_id as i64;
-
-        tokio::spawn(async move {
-            // For OAuth, get user_pubkey and bunker_pubkey from oauth_authorizations
-            // For regular auth, get from authorizations + stored_keys
-            let auth_info: Result<(String, Option<String>, String), _> = if is_oauth {
-                sqlx::query_as(
-                    "SELECT user_pubkey, client_pubkey, bunker_public_key
-                     FROM oauth_authorizations
-                     WHERE tenant_id = $1 AND id = $2",
-                )
-                .bind(tenant_id)
-                .bind(authorization_id)
-                .fetch_one(&pool)
-                .await
-            } else {
-                // For regular authorizations, join through stored_keys
-                sqlx::query_as(
-                    "SELECT sk.pubkey, NULL::text, a.bunker_public_key
-                     FROM authorizations a
-                     JOIN stored_keys sk ON a.stored_key_id = sk.id
-                     WHERE a.tenant_id = $1 AND a.id = $2",
-                )
-                .bind(tenant_id)
-                .bind(authorization_id)
-                .fetch_one(&pool)
-                .await
-            };
-
-            let (user_pubkey, client_pubkey, bunker_pubkey) = match auth_info {
-                Ok(info) => info,
-                Err(e) => {
-                    tracing::error!("Failed to fetch auth info for activity logging: {}", e);
-                    return;
-                }
-            };
-
-            // Update activity stats on oauth_authorizations FIRST (critical for UI)
-            // This must succeed even if the detailed signing_activity log fails
-            if is_oauth {
-                if let Err(e) = sqlx::query(
-                    "UPDATE oauth_authorizations
-                     SET last_activity = NOW(), activity_count = activity_count + 1
-                     WHERE id = $1 AND tenant_id = $2",
-                )
-                .bind(authorization_id)
-                .bind(tenant_id)
-                .execute(&pool)
-                .await
-                {
-                    tracing::error!("Failed to update oauth_authorizations activity: {}", e);
-                }
-            }
-
-            // Truncate content for storage
-            let truncated_content = if event_content.len() > 500 {
-                format!("{}... (truncated)", &event_content[..500])
-            } else {
-                event_content
-            };
-
-            // Insert detailed signing activity log (non-critical, FK may fail if user not in users table)
-            if let Err(e) = sqlx::query(
-                "INSERT INTO signing_activity
-                 (user_pubkey, bunker_pubkey, event_kind, event_content, event_id, client_pubkey, tenant_id, source, created_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, 'relay', NOW())",
-            )
-            .bind(&user_pubkey)
-            .bind(&bunker_pubkey)
-            .bind(event_kind as i32)
-            .bind(&truncated_content)
-            .bind(&event_id)
-            .bind(&client_pubkey)
-            .bind(tenant_id)
-            .execute(&pool)
-            .await
-            {
-                tracing::warn!("Failed to log signing activity (user may not exist in users table): {}", e);
-            }
-
-            tracing::debug!(
-                "Logged signing activity for tenant {} user {} kind {}",
-                tenant_id,
-                user_pubkey,
-                event_kind
-            );
-        });
-    }
-
-    /// Spawn simple activity update in background (for encrypt/decrypt operations)
-    /// Only updates oauth_authorizations stats without detailed signing_activity log
+    /// Spawn activity stats update in background (non-blocking)
     fn spawn_update_activity(&self) {
         if !self.is_oauth {
             return;
