@@ -233,7 +233,13 @@
 {:else}
 	<div class="admin-page">
 		<div class="header">
-			<h1>Admin Dashboard</h1>
+			<div class="header-row">
+				<h1>Admin Dashboard</h1>
+				<a href="/support-admin" class="header-link">
+					<ArrowSquareOut size={16} />
+					Support Tools
+				</a>
+			</div>
 			<p class="subtitle">Manage preloaded accounts and generate API tokens for import scripts</p>
 		</div>
 
@@ -285,12 +291,81 @@
 			</div>
 		</div>
 
+		<!-- Support Admins Section -->
+		<div class="section">
+			<div class="section-header">
+				<div class="section-icon"><ShieldCheck size={24} weight="duotone" /></div>
+				<div>
+					<h2>Support Admins</h2>
+					<p>Manage users who can access the support admin tools (user lookup)</p>
+				</div>
+			</div>
+
+			{#if supportAdminError}
+				<div class="support-admin-error">
+					<Warning size={16} />
+					<span>{supportAdminError}</span>
+				</div>
+			{/if}
+
+			<form class="add-admin-form" onsubmit={(e) => { e.preventDefault(); addSupportAdmin(); }}>
+				<input
+					type="text"
+					bind:value={newSupportAdminId}
+					placeholder="npub, hex pubkey, or email..."
+					class="add-admin-input"
+					disabled={isAddingSupportAdmin}
+				/>
+				<button type="submit" class="btn-add-admin" disabled={isAddingSupportAdmin || !newSupportAdminId.trim()}>
+					<Plus size={16} />
+					{isAddingSupportAdmin ? 'Adding...' : 'Add'}
+				</button>
+			</form>
+
+			{#if isLoadingSupportAdmins}
+				<p class="loading-text">Loading support admins...</p>
+			{:else if supportAdmins.length === 0}
+				<p class="empty-text">No support admins configured.</p>
+			{:else}
+				<div class="admin-list">
+					{#each supportAdmins as admin}
+						<div class="admin-list-item">
+							<div class="admin-info">
+								<div class="admin-pubkey-row">
+									<Key size={16} />
+									<span class="admin-pubkey-value" title={formatSupportAdminPubkey(admin.pubkey)}>
+										{truncateFormatted(admin.pubkey)}
+									</span>
+									<button class="btn-icon-sm" onclick={() => copySupportAdminPubkey(admin.pubkey)} title="Copy pubkey">
+										{#if copiedSupportAdminPubkey === admin.pubkey}
+											<Check size={14} weight="bold" />
+										{:else}
+											<Copy size={14} />
+										{/if}
+									</button>
+									<button class="format-toggle" onclick={() => supportAdminPubkeyFormat = supportAdminPubkeyFormat === 'hex' ? 'npub' : 'hex'}>
+										{supportAdminPubkeyFormat === 'hex' ? 'npub' : 'hex'}
+									</button>
+								</div>
+								{#if admin.email}
+									<span class="admin-email">{admin.email}</span>
+								{/if}
+							</div>
+							<button class="btn-remove" onclick={() => removeSupportAdmin(admin.pubkey)} title="Remove">
+								<Trash size={16} />
+							</button>
+						</div>
+					{/each}
+				</div>
+			{/if}
+		</div>
+
 		<!-- Documentation Section -->
 		<div class="section docs-section">
 			<div class="section-header">
 				<div class="section-icon"><Terminal size={24} weight="duotone" /></div>
 				<div>
-					<h2>API Documentation</h2>
+					<h2>Admin API Documentation</h2>
 					<p>How to use the admin APIs for Vine user import</p>
 				</div>
 			</div>
@@ -426,92 +501,6 @@
 				{/if}
 			</div>
 		</div>
-
-		<!-- Support Admins Section -->
-		<div class="section">
-			<div class="section-header">
-				<div class="section-icon"><ShieldCheck size={24} weight="duotone" /></div>
-				<div>
-					<h2>Support Admins</h2>
-					<p>Manage users who can access the support admin tools (user lookup)</p>
-				</div>
-			</div>
-
-			{#if supportAdminError}
-				<div class="support-admin-error">
-					<Warning size={16} />
-					<span>{supportAdminError}</span>
-				</div>
-			{/if}
-
-			<form class="add-admin-form" onsubmit={(e) => { e.preventDefault(); addSupportAdmin(); }}>
-				<input
-					type="text"
-					bind:value={newSupportAdminId}
-					placeholder="npub, hex pubkey, or email..."
-					class="add-admin-input"
-					disabled={isAddingSupportAdmin}
-				/>
-				<button type="submit" class="btn-add-admin" disabled={isAddingSupportAdmin || !newSupportAdminId.trim()}>
-					<Plus size={16} />
-					{isAddingSupportAdmin ? 'Adding...' : 'Add'}
-				</button>
-			</form>
-
-			{#if isLoadingSupportAdmins}
-				<p class="loading-text">Loading support admins...</p>
-			{:else if supportAdmins.length === 0}
-				<p class="empty-text">No support admins configured.</p>
-			{:else}
-				<div class="admin-list">
-					{#each supportAdmins as admin}
-						<div class="admin-list-item">
-							<div class="admin-info">
-								<div class="admin-pubkey-row">
-									<Key size={16} />
-									<span class="admin-pubkey-value" title={formatSupportAdminPubkey(admin.pubkey)}>
-										{truncateFormatted(admin.pubkey)}
-									</span>
-									<button class="btn-icon-sm" onclick={() => copySupportAdminPubkey(admin.pubkey)} title="Copy pubkey">
-										{#if copiedSupportAdminPubkey === admin.pubkey}
-											<Check size={14} weight="bold" />
-										{:else}
-											<Copy size={14} />
-										{/if}
-									</button>
-									<button class="format-toggle" onclick={() => supportAdminPubkeyFormat = supportAdminPubkeyFormat === 'hex' ? 'npub' : 'hex'}>
-										{supportAdminPubkeyFormat === 'hex' ? 'npub' : 'hex'}
-									</button>
-								</div>
-								{#if admin.email}
-									<span class="admin-email">{admin.email}</span>
-								{/if}
-							</div>
-							<button class="btn-remove" onclick={() => removeSupportAdmin(admin.pubkey)} title="Remove">
-								<Trash size={16} />
-							</button>
-						</div>
-					{/each}
-				</div>
-			{/if}
-		</div>
-
-		<!-- Future Features Placeholder -->
-		<div class="section future-section">
-			<div class="section-header">
-				<div class="section-icon">🚀</div>
-				<div>
-					<h2>Coming Soon</h2>
-					<p>Additional admin features planned for future releases</p>
-				</div>
-			</div>
-			<ul class="future-list">
-				<li>Bulk user import via CSV</li>
-				<li>User management dashboard</li>
-				<li>Activity logs and analytics</li>
-				<li>Claim link status tracking</li>
-			</ul>
-		</div>
 	</div>
 {/if}
 
@@ -540,11 +529,38 @@
 		margin-bottom: 2rem;
 	}
 
+	.header-row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 1rem;
+	}
+
 	.header h1 {
 		font-size: 1.5rem;
 		font-weight: 600;
 		margin: 0 0 0.5rem 0;
 		color: var(--color-divine-text);
+	}
+
+	.header-link {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.375rem;
+		font-size: 0.825rem;
+		font-weight: 500;
+		color: var(--color-divine-text-secondary);
+		text-decoration: none;
+		padding: 0.375rem 0.75rem;
+		border: 1px solid var(--color-divine-border);
+		border-radius: 6px;
+		transition: all 0.2s;
+		white-space: nowrap;
+	}
+
+	.header-link:hover {
+		color: var(--color-divine-green);
+		border-color: var(--color-divine-green);
 	}
 
 	.subtitle {
@@ -994,20 +1010,4 @@
 		background: color-mix(in srgb, var(--color-divine-error) 10%, transparent);
 	}
 
-	/* Future features */
-	.future-section {
-		border-style: dashed;
-		opacity: 0.8;
-	}
-
-	.future-list {
-		margin: 0;
-		padding-left: 1.25rem;
-		color: var(--color-divine-text-secondary);
-		font-size: 0.9rem;
-	}
-
-	.future-list li {
-		margin-bottom: 0.5rem;
-	}
 </style>

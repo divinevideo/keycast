@@ -47,6 +47,7 @@ let pubkeyFormat = $state<'hex' | 'npub'>('npub');
 let copiedPubkey = $state<string | null>(null);
 let isNip07Loading = $state(false);
 let hasExtension = $state(false);
+let adminRole = $state<string | null>(null);
 
 const groupedSessions = $derived.by(() => {
 	const groups = new Map<string, GroupedSession>();
@@ -138,6 +139,15 @@ async function loadTeams() {
 			console.error('Failed to load teams:', err);
 		}
 		teams = [];
+	}
+}
+
+async function checkAdminStatus() {
+	try {
+		const response = await api.get<{ is_admin: boolean; role: string | null }>('/admin/status');
+		adminRole = response.is_admin ? response.role : null;
+	} catch {
+		adminRole = null;
 	}
 }
 
@@ -262,6 +272,7 @@ async function loadDashboardData() {
 
 	const loads: Promise<void>[] = [loadSessions()];
 	if (isTeamsEnabled()) loads.push(loadTeams());
+	loads.push(checkAdminStatus());
 	await Promise.all(loads);
 	isLoadingDashboard = false;
 }
@@ -312,7 +323,11 @@ $effect(() => {
 						<div class="identity-actions">
 							<a href="/admin" class="identity-link">
 								<Key size={16} />
-								<span>Admin Dashboard & API Token</span>
+								<span>Admin Dashboard</span>
+							</a>
+							<a href="/support-admin" class="identity-link">
+								<ShieldCheck size={16} />
+								<span>Support Tools</span>
 							</a>
 						</div>
 					{:else if userEmail}
@@ -359,6 +374,18 @@ $effect(() => {
 					</div>
 					{#if authMethod === 'cookie'}
 						<div class="identity-actions">
+							{#if adminRole === 'full'}
+								<a href="/admin" class="identity-link">
+									<Key size={16} />
+									<span>Admin Dashboard</span>
+								</a>
+							{/if}
+							{#if adminRole === 'full' || adminRole === 'support'}
+								<a href="/support-admin" class="identity-link">
+									<ShieldCheck size={16} />
+									<span>Support Tools</span>
+								</a>
+							{/if}
 							<a href="/settings/security" class="identity-link">
 								<Gear size={16} />
 								<span>Security Settings</span>
