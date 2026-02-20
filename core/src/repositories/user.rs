@@ -1015,7 +1015,7 @@ impl UserRepository {
     }
 
     /// Look up a user for admin support tools.
-    /// Searches by email (if query contains @) or by hex/npub pubkey.
+    /// Searches by email (if query contains @), npub, username, vine_id, or hex pubkey.
     pub async fn find_user_for_admin(
         &self,
         query: &str,
@@ -1040,7 +1040,29 @@ impl UserRepository {
                 Err(_) => return Ok(None),
             }
         } else {
-            query.to_string()
+            // Try username, then vine_id, then fall through to hex pubkey
+            let by_username: Option<(String,)> =
+                sqlx::query_as("SELECT pubkey FROM users WHERE username = $1 AND tenant_id = $2")
+                    .bind(query)
+                    .bind(tenant_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            if let Some((pk,)) = by_username {
+                pk
+            } else {
+                let by_vine_id: Option<(String,)> = sqlx::query_as(
+                    "SELECT pubkey FROM users WHERE vine_id = $1 AND tenant_id = $2",
+                )
+                .bind(query)
+                .bind(tenant_id)
+                .fetch_optional(&self.pool)
+                .await?;
+                if let Some((pk,)) = by_vine_id {
+                    pk
+                } else {
+                    query.to_string()
+                }
+            }
         };
 
         let row: Option<AdminUserDetails> = sqlx::query_as(

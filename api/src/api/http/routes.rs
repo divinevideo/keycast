@@ -153,7 +153,10 @@ pub fn api_routes(
         .route("/admin/token", get(admin::get_admin_token))
         .route("/admin/preload-user", post(admin::preload_user))
         .route("/admin/user-token", post(admin::get_user_token))
-        .route("/admin/claim-tokens", post(admin::create_claim_token))
+        .route(
+            "/admin/claim-tokens",
+            get(admin::get_claim_token).post(admin::create_claim_token),
+        )
         .route("/admin/user-lookup", get(admin::get_user_lookup))
         .route(
             "/admin/support-admins",

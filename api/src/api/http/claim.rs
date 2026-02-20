@@ -75,8 +75,8 @@ pub async fn claim_get(
     <style>
         * {{ box-sizing: border-box; }}
         body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            background: #072218;
             min-height: 100vh;
             margin: 0;
             display: flex;
@@ -85,85 +85,100 @@ pub async fn claim_get(
             padding: 20px;
         }}
         .container {{
-            background: white;
+            background: #0F2E23;
+            border: 1px solid #1C4033;
             border-radius: 12px;
             padding: 40px;
             max-width: 400px;
             width: 100%;
-            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+            box-shadow: 0 8px 32px rgba(39, 197, 139, 0.08);
         }}
         h1 {{
-            margin: 0 0 10px 0;
-            color: #1a1a2e;
-            font-size: 24px;
+            margin: 0 0 8px 0;
+            color: #F9F7F6;
+            font-size: 22px;
+            font-weight: 600;
         }}
         .welcome {{
-            color: #666;
-            margin-bottom: 30px;
+            color: #BEB3A7;
+            font-size: 14px;
+            margin: 0 0 28px 0;
+            line-height: 1.5;
         }}
         .user-info {{
-            background: #f8f9fa;
+            background: #072218;
+            border: 1px solid #1C4033;
             border-radius: 8px;
-            padding: 15px;
-            margin-bottom: 25px;
+            padding: 14px 16px;
+            margin-bottom: 24px;
         }}
         .user-info .name {{
             font-weight: 600;
-            color: #1a1a2e;
-            font-size: 18px;
+            color: #F9F7F6;
+            font-size: 16px;
         }}
         .user-info .username {{
-            color: #666;
-            font-size: 14px;
+            color: #9CA3AF;
+            font-size: 13px;
+            margin-top: 2px;
         }}
         label {{
             display: block;
-            margin-bottom: 5px;
-            color: #333;
+            margin-bottom: 6px;
+            color: #BEB3A7;
+            font-size: 13px;
             font-weight: 500;
         }}
         input {{
             width: 100%;
-            padding: 12px;
-            border: 1px solid #ddd;
+            padding: 11px 14px;
+            background: #072218;
+            border: 1px solid #1C4033;
             border-radius: 8px;
-            font-size: 16px;
-            margin-bottom: 20px;
+            font-size: 15px;
+            color: #F9F7F6;
+            margin-bottom: 18px;
+            transition: border-color 0.2s;
+        }}
+        input::placeholder {{
+            color: #9CA3AF;
         }}
         input:focus {{
             outline: none;
-            border-color: #667eea;
-            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+            border-color: #27C58B;
+            box-shadow: 0 0 0 3px rgba(39, 197, 139, 0.1);
         }}
         button {{
             width: 100%;
-            padding: 14px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
+            padding: 12px;
+            background: #27C58B;
+            color: #072218;
             border: none;
             border-radius: 8px;
-            font-size: 16px;
+            font-size: 15px;
             font-weight: 600;
             cursor: pointer;
-            transition: transform 0.2s, box-shadow 0.2s;
+            transition: background 0.2s;
+            margin-top: 4px;
         }}
         button:hover {{
-            transform: translateY(-2px);
-            box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
+            background: #1AA575;
         }}
         .error {{
-            background: #fee2e2;
-            color: #dc2626;
-            padding: 12px;
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid rgba(239, 68, 68, 0.25);
+            color: #EF4444;
+            padding: 10px 14px;
             border-radius: 8px;
-            margin-bottom: 20px;
+            margin-bottom: 18px;
             display: none;
+            font-size: 14px;
         }}
         .requirements {{
             font-size: 12px;
-            color: #666;
-            margin-top: -15px;
-            margin-bottom: 20px;
+            color: #9CA3AF;
+            margin-top: -14px;
+            margin-bottom: 18px;
         }}
     </style>
 </head>
@@ -403,9 +418,10 @@ impl IntoResponse for ClaimError {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{title}</title>
     <style>
+        * {{ box-sizing: border-box; }}
         body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            background: #072218;
             min-height: 100vh;
             margin: 0;
             display: flex;
@@ -414,29 +430,37 @@ impl IntoResponse for ClaimError {
             padding: 20px;
         }}
         .container {{
-            background: white;
+            background: #0F2E23;
+            border: 1px solid #1C4033;
             border-radius: 12px;
             padding: 40px;
             max-width: 400px;
             text-align: center;
-            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+            box-shadow: 0 8px 32px rgba(39, 197, 139, 0.08);
         }}
         h1 {{
-            color: #dc2626;
-            margin: 0 0 15px 0;
+            color: #EF4444;
+            margin: 0 0 12px 0;
+            font-size: 20px;
+            font-weight: 600;
         }}
         p {{
-            color: #666;
+            color: #BEB3A7;
             line-height: 1.6;
+            font-size: 14px;
+            margin: 0;
         }}
         a {{
             display: inline-block;
-            margin-top: 20px;
-            color: #667eea;
+            margin-top: 24px;
+            color: #27C58B;
             text-decoration: none;
+            font-size: 14px;
+            font-weight: 500;
+            transition: color 0.2s;
         }}
         a:hover {{
-            text-decoration: underline;
+            color: #1AA575;
         }}
     </style>
 </head>
@@ -444,7 +468,7 @@ impl IntoResponse for ClaimError {
     <div class="container">
         <h1>{title}</h1>
         <p>{message}</p>
-        <a href="javascript:history.back()">← Go Back</a>
+        <a href="javascript:history.back()">Go Back</a>
     </div>
 </body>
 </html>"#,

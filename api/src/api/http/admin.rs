@@ -445,8 +445,64 @@ pub struct CreateClaimTokenResponse {
     pub expires_at: String,
 }
 
+// ============================================================================
+// GET /api/admin/claim-tokens?pubkey=... - Check existing valid claim token
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct GetClaimTokenQuery {
+    pub pubkey: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GetClaimTokenResponse {
+    pub has_token: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claim_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+}
+
+pub async fn get_claim_token(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    auth: UcanAuth,
+    axum::extract::Query(query): axum::extract::Query<GetClaimTokenQuery>,
+) -> ApiResult<Json<GetClaimTokenResponse>> {
+    let tenant_id = tenant.0.id;
+    let pool = &auth_state.state.db;
+
+    if !is_support_admin(&auth).await {
+        return Err(ApiError::forbidden("Admin access required"));
+    }
+
+    let claim_token_repo = ClaimTokenRepository::new(pool.clone());
+    let token = claim_token_repo
+        .find_valid_by_user_pubkey(&query.pubkey, tenant_id)
+        .await?;
+
+    match token {
+        Some(ct) => {
+            let app_url =
+                std::env::var("APP_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
+            let claim_url = format!("{}/api/claim?token={}", app_url, ct.token);
+
+            Ok(Json(GetClaimTokenResponse {
+                has_token: true,
+                claim_url: Some(claim_url),
+                expires_at: Some(ct.expires_at.to_rfc3339()),
+            }))
+        }
+        None => Ok(Json(GetClaimTokenResponse {
+            has_token: false,
+            claim_url: None,
+            expires_at: None,
+        })),
+    }
+}
+
 /// Generate a claim link for a preloaded user.
-/// Requires admin authentication.
+/// Requires support admin or above.
 pub async fn create_claim_token(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
@@ -456,7 +512,7 @@ pub async fn create_claim_token(
     let tenant_id = tenant.0.id;
     let pool = &auth_state.state.db;
 
-    if !is_full_admin(&auth) {
+    if !is_support_admin(&auth).await {
         tracing::warn!(
             "Claim token request denied for pubkey: {}",
             &auth.pubkey[..8]
@@ -529,7 +585,7 @@ pub struct UserLookupDetails {
     pub has_personal_key: bool,
     pub active_sessions: i64,
     pub created_at: String,
-    pub updated_at: String,
+    pub last_active: Option<String>,
 }
 
 /// Look up a user by email or pubkey. Available to support admins and above.
@@ -560,12 +616,18 @@ pub async fn get_user_lookup(
             user: None,
         })),
         Some(details) => {
-            // Count active sessions
+            // Count active sessions and find most recent activity
             let oauth_repo = OAuthAuthorizationRepository::new(pool.clone());
             let sessions = oauth_repo
                 .list_active_sessions(&details.pubkey, tenant_id)
                 .await
                 .unwrap_or_default();
+
+            let last_active = sessions
+                .iter()
+                .filter_map(|s| s.5.as_deref())
+                .max()
+                .map(String::from);
 
             Ok(Json(UserLookupResponse {
                 found: true,
@@ -579,7 +641,7 @@ pub async fn get_user_lookup(
                     has_personal_key: details.has_personal_key,
                     active_sessions: sessions.len() as i64,
                     created_at: details.created_at.to_rfc3339(),
-                    updated_at: details.updated_at.to_rfc3339(),
+                    last_active,
                 }),
             }))
         }

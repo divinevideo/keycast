@@ -4,7 +4,7 @@
 	import { KeycastApi } from '$lib/keycast_api.svelte';
 	import { goto } from '$app/navigation';
 	import Loader from '$lib/components/Loader.svelte';
-	import { ShieldCheck, Warning, MagnifyingGlass, User, Key, Calendar, Globe, Copy, Check, CheckCircle, XCircle } from 'phosphor-svelte';
+	import { ShieldCheck, Warning, MagnifyingGlass, User, Key, Calendar, Globe, Copy, Check, CheckCircle, XCircle, Link } from 'phosphor-svelte';
 	import { nip19 } from 'nostr-tools';
 	import { toast } from 'svelte-hot-french-toast';
 
@@ -23,6 +23,12 @@
 	let pubkeyFormat = $state<'hex' | 'npub'>('npub');
 	let copiedPubkey = $state(false);
 
+	// Claim link state
+	let claimToken = $state<{ claim_url: string; expires_at: string } | null>(null);
+	let isLoadingClaimToken = $state(false);
+	let isGeneratingClaimToken = $state(false);
+	let copiedClaimUrl = $state(false);
+
 	interface UserDetails {
 		pubkey: string;
 		email: string | null;
@@ -33,7 +39,7 @@
 		has_personal_key: boolean;
 		active_sessions: number;
 		created_at: string;
-		updated_at: string;
+		last_active: string | null;
 	}
 
 	onMount(async () => {
@@ -110,6 +116,59 @@
 			toast.error('Failed to copy');
 		}
 	}
+
+	async function loadClaimToken(pubkey: string) {
+		isLoadingClaimToken = true;
+		claimToken = null;
+		try {
+			const result = await api.get<{ has_token: boolean; claim_url?: string; expires_at?: string }>(
+				`/admin/claim-tokens?pubkey=${encodeURIComponent(pubkey)}`
+			);
+			if (result.has_token && result.claim_url && result.expires_at) {
+				claimToken = { claim_url: result.claim_url, expires_at: result.expires_at };
+			}
+		} catch {
+			// Silently ignore - user may not have claim token access
+		} finally {
+			isLoadingClaimToken = false;
+		}
+	}
+
+	async function generateClaimToken(vineId: string) {
+		isGeneratingClaimToken = true;
+		try {
+			const result = await api.post<{ claim_url: string; expires_at: string }>(
+				'/admin/claim-tokens',
+				{ vine_id: vineId }
+			);
+			claimToken = result;
+			toast.success('Claim link generated');
+		} catch (err: any) {
+			toast.error(err.message || 'Failed to generate claim link');
+		} finally {
+			isGeneratingClaimToken = false;
+		}
+	}
+
+	async function copyClaimUrl() {
+		if (!claimToken) return;
+		try {
+			await navigator.clipboard.writeText(claimToken.claim_url);
+			copiedClaimUrl = true;
+			toast.success('Claim URL copied!');
+			setTimeout(() => (copiedClaimUrl = false), 2000);
+		} catch {
+			toast.error('Failed to copy');
+		}
+	}
+
+	$effect(() => {
+		if (searchResult?.found && searchResult.user?.vine_id && !searchResult.user?.email) {
+			loadClaimToken(searchResult.user.pubkey);
+		} else {
+			claimToken = null;
+		}
+	});
 </script>
 
 <svelte:head>
@@ -145,7 +204,7 @@
 					<input
 						type="text"
 						bind:value={searchQuery}
-						placeholder="Email address, hex pubkey, or npub..."
+						placeholder="Search for a user..."
 						class="search-input"
 						disabled={isSearching}
 					/>
@@ -154,6 +213,7 @@
 					{isSearching ? 'Searching...' : 'Search'}
 				</button>
 			</form>
+			<p class="search-hint">Search by email, Vine username, vine_id, hex pubkey, or npub</p>
 
 			{#if searchError}
 				<div class="search-error">
@@ -242,10 +302,51 @@
 							</div>
 
 							<div class="field">
-								<span class="field-label"><Calendar size={14} /> Updated</span>
-								<span class="field-value">{formatDate(u.updated_at)}</span>
+								<span class="field-label"><Calendar size={14} /> Last active</span>
+								<span class="field-value">{u.last_active ? formatDate(u.last_active) : 'Never'}</span>
 							</div>
 						</div>
+
+						{#if u.vine_id && !u.email}
+							<div class="claim-section">
+								<div class="claim-header">
+									<Link size={16} />
+									<span class="claim-title">Claim Link</span>
+								</div>
+								{#if isLoadingClaimToken}
+									<p class="claim-loading">Checking for existing claim link...</p>
+								{:else if claimToken}
+									<div class="claim-url-display">
+										<div class="claim-url-row">
+											<input
+												type="text"
+												value={claimToken.claim_url}
+												readonly
+												class="claim-url-input"
+											/>
+											<button class="icon-btn" onclick={copyClaimUrl} title="Copy claim URL">
+												{#if copiedClaimUrl}
+													<Check size={14} />
+												{:else}
+													<Copy size={14} />
+												{/if}
+											</button>
+										</div>
+										<span class="claim-expiry">
+											Expires {formatDate(claimToken.expires_at)}
+										</span>
+									</div>
+								{:else}
+									<button
+										class="btn-generate-claim"
+										onclick={() => generateClaimToken(u.vine_id!)}
+										disabled={isGeneratingClaimToken}
+									>
+										{isGeneratingClaimToken ? 'Generating...' : 'Generate Claim Link'}
+									</button>
+								{/if}
+							</div>
+						{/if}
 					</div>
 				{/if}
 			{/if}
@@ -385,6 +486,12 @@
 
 	.search-input::placeholder {
 		color: var(--color-divine-text-tertiary);
+	}
+
+	.search-hint {
+		font-size: 0.725rem;
+		color: var(--color-divine-text-tertiary);
+		margin: -0.5rem 0 1rem 0.25rem;
 	}
 
 	.btn-search {
@@ -590,6 +697,83 @@
 	.format-toggle:hover {
 		background: color-mix(in srgb, var(--color-divine-green) 15%, transparent);
 		color: var(--color-divine-green);
+	}
+
+	/* Claim link section */
+	.claim-section {
+		padding: 0.75rem 1.25rem;
+		border-top: 1px solid var(--color-divine-border);
+		background: color-mix(in srgb, var(--color-divine-green) 5%, var(--color-divine-surface));
+	}
+
+	.claim-header {
+		display: flex;
+		align-items: center;
+		gap: 0.375rem;
+		color: var(--color-divine-green);
+		margin-bottom: 0.5rem;
+	}
+
+	.claim-title {
+		font-size: 0.825rem;
+		font-weight: 600;
+		color: var(--color-divine-text);
+	}
+
+	.claim-loading {
+		font-size: 0.8rem;
+		color: var(--color-divine-text-tertiary);
+		margin: 0;
+	}
+
+	.claim-url-display {
+		display: flex;
+		flex-direction: column;
+		gap: 0.375rem;
+	}
+
+	.claim-url-row {
+		display: flex;
+		gap: 0.375rem;
+		align-items: center;
+	}
+
+	.claim-url-input {
+		flex: 1;
+		padding: 0.5rem 0.625rem;
+		background: var(--color-divine-bg);
+		border: 1px solid var(--color-divine-border);
+		border-radius: 6px;
+		color: var(--color-divine-text);
+		font-family: var(--font-mono);
+		font-size: 0.725rem;
+		outline: none;
+	}
+
+	.claim-expiry {
+		font-size: 0.725rem;
+		color: var(--color-divine-text-tertiary);
+	}
+
+	.btn-generate-claim {
+		padding: 0.5rem 1rem;
+		background: var(--color-divine-green);
+		color: #fff;
+		border: none;
+		border-radius: 6px;
+		font-size: 0.825rem;
+		font-weight: 600;
+		cursor: pointer;
+		transition: opacity 0.2s;
+	}
+
+	.btn-generate-claim:hover:not(:disabled) {
+		opacity: 0.9;
+	}
+
+	.btn-generate-claim:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
 	}
 
 	.links-grid {

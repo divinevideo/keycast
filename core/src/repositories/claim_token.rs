@@ -75,6 +75,29 @@ impl ClaimTokenRepository {
         .map_err(Into::into)
     }
 
+    /// Find a valid (not expired, not used) claim token for a specific user.
+    /// Returns the most recently created valid token, if any.
+    pub async fn find_valid_by_user_pubkey(
+        &self,
+        user_pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<Option<ClaimToken>, RepositoryError> {
+        sqlx::query_as::<_, ClaimToken>(
+            "SELECT * FROM account_claim_tokens
+             WHERE user_pubkey = $1
+               AND tenant_id = $2
+               AND expires_at > NOW()
+               AND used_at IS NULL
+             ORDER BY created_at DESC
+             LIMIT 1",
+        )
+        .bind(user_pubkey)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Find all claim tokens for a user (for admin viewing).
     pub async fn find_by_user_pubkey(
         &self,
