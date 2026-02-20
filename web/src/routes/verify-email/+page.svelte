@@ -282,6 +282,8 @@
 	}
 
 	.status-icon {
+		display: flex;
+		justify-content: center;
 		margin-bottom: 1.25rem;
 	}
 

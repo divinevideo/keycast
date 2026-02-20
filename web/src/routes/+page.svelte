@@ -924,6 +924,9 @@ $effect(() => {
 	}
 
 	.identity-actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.75rem 1.25rem;
 		padding-top: 0.75rem;
 		margin-top: 0;
 	}

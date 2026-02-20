@@ -348,10 +348,8 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     );
 
     // Setup database
-    let database_url = env::var("DATABASE_URL")?; // Validated above
-
     let database = Database::new().await?;
-    tracing::info!("✔︎ Database initialized at {:?}", database_url);
+    tracing::info!("✔︎ Database initialized");
 
     // Initialize cluster coordination with Redis (Pub/Sub mode)
     // This handles instance registration, membership detection, and heartbeats

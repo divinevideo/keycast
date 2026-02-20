@@ -99,7 +99,7 @@
 				</div>
 				<h2>Check your email</h2>
 				<p>We've sent a verification link to <strong>{registeredEmail}</strong></p>
-				<p class="subtext">Click the link in the email to verify your account and sign in.</p>
+				<p class="subtext">Click the link in the email to verify your account and sign&nbsp;in.</p>
 				<a href="/login" class="btn-secondary">Go to Login</a>
 			</div>
 		{:else}
@@ -397,6 +397,8 @@
 	}
 
 	.verification-notice .notice-icon {
+		display: flex;
+		justify-content: center;
 		margin-bottom: 1rem;
 	}
 
