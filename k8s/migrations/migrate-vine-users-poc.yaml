@@ -1,0 +1,98 @@
+# Migration Job for POC: migrates users from openvine-co to POC
+# Uses Cloud SQL Proxy sidecar for source DB access with IAM auth
+# Target DB is in-cluster CloudNativePG
+#
+# Apply: CLOUDSDK_ACTIVE_CONFIG_NAME=divine kubectl --context connectgateway_rich-compiler-479518-d2_us-central1_gke-poc-membership apply -f k8s/migrations/migrate-vine-users-poc.yaml
+# Logs:  CLOUDSDK_ACTIVE_CONFIG_NAME=divine kubectl --context connectgateway_rich-compiler-479518-d2_us-central1_gke-poc-membership logs job/migrate-vine-users -n identity -c migrate -f
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate-vine-users
+  namespace: identity
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      annotations:
+        linkerd.io/inject: disabled
+    spec:
+      serviceAccountName: keycast
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: us-central1-docker.pkg.dev/rich-compiler-479518-d2/containers-poc/keycast:2c87cd6db5c9731950f4ce3265e480e5644919e4
+          command: ["./migrate-vine-users"]
+          env:
+            # Source: openvine-co Cloud SQL via proxy sidecar (IAM auth, no password)
+            - name: SOURCE_DATABASE_URL
+              value: "postgres://keycast-poc@rich-compiler-479518-d2.iam@127.0.0.1:5431/keycast?sslmode=disable"
+            # Target: in-cluster CloudNativePG
+            - name: TARGET_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: keycast-db-credentials
+                  key: DATABASE_URL
+            # Source KMS (openvine-co)
+            - name: SOURCE_GCP_PROJECT_ID
+              value: "openvine-co"
+            - name: SOURCE_GCP_KMS_LOCATION
+              value: "global"
+            - name: SOURCE_GCP_KMS_KEY_RING
+              value: "keycast-keys"
+            - name: SOURCE_GCP_KMS_KEY_NAME
+              value: "master-key"
+            # Target KMS (POC)
+            - name: TARGET_GCP_PROJECT_ID
+              value: "rich-compiler-479518-d2"
+            - name: TARGET_GCP_KMS_LOCATION
+              value: "us-central1"
+            - name: TARGET_GCP_KMS_KEY_RING
+              value: "app-keys-poc"
+            - name: TARGET_GCP_KMS_KEY_NAME
+              value: "keycast-master-key"
+            # Migration config
+            - name: TENANT_ID
+              value: "1"
+            - name: DRY_RUN
+              value: "true"
+            - name: CONCURRENCY
+              value: "10"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+        - name: cloud-sql-proxy
+          image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.14.3
+          args:
+            - "openvine-co:us-central1:keycast-db-plus"
+            - "--port=5431"
+            - "--auto-iam-authn"
+            - "--structured-logs"
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "200m"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
