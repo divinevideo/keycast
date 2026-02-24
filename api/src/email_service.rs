@@ -29,6 +29,13 @@ pub trait EmailSender: Send + Sync {
         reset_token: &str,
     ) -> Result<(), String>;
 
+    /// Send a claim link email for a preloaded Vine account.
+    async fn send_claim_email(
+        &self,
+        to_email: &str,
+        claim_url: &str,
+    ) -> Result<(), String>;
+
     /// Get captured emails (only available in dev/test mode)
     fn get_captured_emails(&self) -> Vec<CapturedEmail> {
         vec![]
@@ -151,6 +158,40 @@ impl EmailSender for DevEmailSender {
                 subject: "Reset your diVine password".to_string(),
                 verification_url: None,
                 reset_url: Some(reset_url),
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn send_claim_email(
+        &self,
+        to_email: &str,
+        claim_url: &str,
+    ) -> Result<(), String> {
+        tracing::info!("");
+        tracing::info!("==================================================");
+        tracing::info!("  VINE CLAIM EMAIL");
+        tracing::info!("==================================================");
+        tracing::info!("  To: {}", to_email);
+        tracing::info!("  Subject: Your Vine account on diVine is ready to claim");
+        tracing::info!("");
+        tracing::info!("  Claim link:");
+        tracing::info!("  {}", claim_url);
+        tracing::info!("==================================================");
+        tracing::info!("");
+
+        eprintln!(
+            "\n\x1b[36m[DEV EMAIL]\x1b[0m Vine claim link for {}: \x1b[4m{}\x1b[0m\n",
+            to_email, claim_url
+        );
+
+        if let Ok(mut captured) = self.captured.lock() {
+            captured.push(CapturedEmail {
+                to: to_email.to_string(),
+                subject: "Your Vine account on diVine is ready to claim".to_string(),
+                verification_url: Some(claim_url.to_string()),
+                reset_url: None,
             });
         }
 
@@ -402,6 +443,46 @@ impl EmailSender for SendGridEmailSender {
         self.send_email(to_email, &subject, &html_content, &text_content)
             .await
     }
+
+    async fn send_claim_email(
+        &self,
+        to_email: &str,
+        claim_url: &str,
+    ) -> Result<(), String> {
+        let subject = "Your Vine account on diVine is ready to claim".to_string();
+        let html_content = format!(
+            r#"
+            <html>
+            <body style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+                <h1 style="color: #00B488;">Your Vine account is ready!</h1>
+                <p>Your Vine account has been migrated to diVine. Click the button below to claim it and set up your login:</p>
+                <div style="margin: 30px 0;">
+                    <a href="{}"
+                       style="background: #00B488; color: #fff; padding: 12px 24px; text-decoration: none; border-radius: 4px; display: inline-block; font-weight: bold;">
+                        Claim Your Account
+                    </a>
+                </div>
+                <p style="color: #666; font-size: 14px;">
+                    Or copy and paste this link into your browser:<br>
+                    <a href="{}" style="color: #00B488;">{}</a>
+                </p>
+                <p style="color: #666; font-size: 14px; margin-top: 30px;">
+                    This link will expire in 7 days. If you didn't request this, you can safely ignore this email.
+                </p>
+            </body>
+            </html>
+            "#,
+            claim_url, claim_url, claim_url
+        );
+
+        let text_content = format!(
+            "Your Vine account has been migrated to diVine. Click this link to claim it:\n\n{}\n\nThis link will expire in 7 days. If you didn't request this, you can safely ignore this email.",
+            claim_url
+        );
+
+        self.send_email(to_email, &subject, &html_content, &text_content)
+            .await
+    }
 }
 
 /// Create the appropriate email sender based on environment
@@ -448,5 +529,13 @@ impl EmailService {
         self.inner
             .send_password_reset_email(to_email, reset_token)
             .await
+    }
+
+    pub async fn send_claim_email(
+        &self,
+        to_email: &str,
+        claim_url: &str,
+    ) -> Result<(), String> {
+        self.inner.send_claim_email(to_email, claim_url).await
     }
 }

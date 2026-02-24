@@ -157,6 +157,14 @@ pub fn api_routes(
             "/admin/claim-tokens",
             get(admin::get_claim_token).post(admin::create_claim_token),
         )
+        .route(
+            "/admin/claim-tokens/batch",
+            post(admin::batch_create_claim_tokens),
+        )
+        .route(
+            "/admin/claim-tokens/stats",
+            get(admin::get_claim_token_stats),
+        )
         .route("/admin/user-lookup", get(admin::get_user_lookup))
         .route(
             "/admin/support-admins",

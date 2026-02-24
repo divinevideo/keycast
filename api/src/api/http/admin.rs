@@ -559,6 +559,204 @@ pub async fn create_claim_token(
 }
 
 // ============================================================================
+// POST /api/admin/claim-tokens/batch - Generate claim links in bulk
+// ============================================================================
+
+/// Maximum number of vine_ids allowed in a single batch request
+const BATCH_CLAIM_LIMIT: usize = 100;
+
+#[derive(Debug, Deserialize)]
+pub struct BatchCreateClaimTokensRequest {
+    pub vine_ids: Vec<String>,
+    /// If provided, send claim links to this email address for all tokens
+    pub delivery_email: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchClaimTokenEntry {
+    pub vine_id: String,
+    pub pubkey: String,
+    pub claim_url: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchSkippedEntry {
+    pub vine_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchCreateClaimTokensResponse {
+    pub tokens: Vec<BatchClaimTokenEntry>,
+    pub skipped: Vec<BatchSkippedEntry>,
+    pub errors: Vec<String>,
+}
+
+pub async fn batch_create_claim_tokens(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    auth: UcanAuth,
+    Json(req): Json<BatchCreateClaimTokensRequest>,
+) -> ApiResult<Json<BatchCreateClaimTokensResponse>> {
+    let tenant_id = tenant.0.id;
+    let pool = &auth_state.state.db;
+
+    if !is_support_admin(&auth).await {
+        tracing::warn!(
+            "Batch claim token request denied for pubkey: {}",
+            &auth.pubkey[..8]
+        );
+        return Err(ApiError::forbidden("Admin access required"));
+    }
+
+    if req.vine_ids.is_empty() {
+        return Err(ApiError::bad_request("vine_ids must not be empty"));
+    }
+
+    if req.vine_ids.len() > BATCH_CLAIM_LIMIT {
+        return Err(ApiError::bad_request(format!(
+            "vine_ids exceeds maximum batch size of {}",
+            BATCH_CLAIM_LIMIT
+        )));
+    }
+
+    let app_url = std::env::var("APP_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
+    let user_repo = UserRepository::new(pool.clone());
+    let claim_token_repo = ClaimTokenRepository::new(pool.clone());
+
+    let mut tokens = Vec::new();
+    let mut skipped = Vec::new();
+    let mut errors = Vec::new();
+
+    for vine_id in &req.vine_ids {
+        // Find user by vine_id
+        let user_pubkey = match user_repo.find_pubkey_by_vine_id(vine_id, tenant_id).await {
+            Ok(Some(pk)) => pk,
+            Ok(None) => {
+                skipped.push(BatchSkippedEntry {
+                    vine_id: vine_id.clone(),
+                    reason: "user not found".to_string(),
+                });
+                continue;
+            }
+            Err(e) => {
+                errors.push(format!("vine_id {}: database error: {}", vine_id, e));
+                continue;
+            }
+        };
+
+        // Skip already-claimed users
+        match user_repo.is_unclaimed(&user_pubkey, tenant_id).await {
+            Ok(Some(true)) => {} // unclaimed - proceed
+            Ok(_) => {
+                skipped.push(BatchSkippedEntry {
+                    vine_id: vine_id.clone(),
+                    reason: "already claimed".to_string(),
+                });
+                continue;
+            }
+            Err(e) => {
+                errors.push(format!("vine_id {}: failed to check claim status: {}", vine_id, e));
+                continue;
+            }
+        }
+
+        // Generate and persist claim token
+        let token = generate_claim_token();
+        let claim_token = match claim_token_repo
+            .create(&token, &user_pubkey, Some(&auth.pubkey), tenant_id)
+            .await
+        {
+            Ok(ct) => ct,
+            Err(e) => {
+                errors.push(format!("vine_id {}: failed to create token: {}", vine_id, e));
+                continue;
+            }
+        };
+
+        let claim_url = format!("{}/api/claim?token={}", app_url, token);
+
+        // Send email if requested
+        if let Some(email) = &req.delivery_email {
+            match crate::email_service::EmailService::new() {
+                Ok(email_service) => {
+                    if let Err(e) = email_service.send_claim_email(email, &claim_url).await {
+                        tracing::warn!(
+                            "Failed to send claim email for vine_id={} to {}: {}",
+                            vine_id,
+                            email,
+                            e
+                        );
+                        errors.push(format!("vine_id {}: email delivery failed: {}", vine_id, e));
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to create email service: {}", e);
+                    errors.push(format!("vine_id {}: email service unavailable: {}", vine_id, e));
+                }
+            }
+        }
+
+        tokens.push(BatchClaimTokenEntry {
+            vine_id: vine_id.clone(),
+            pubkey: user_pubkey,
+            claim_url,
+            expires_at: claim_token.expires_at.to_rfc3339(),
+        });
+    }
+
+    tracing::info!(
+        "Batch claim tokens: generated={}, skipped={}, errors={}, by admin={}",
+        tokens.len(),
+        skipped.len(),
+        errors.len(),
+        &auth.pubkey[..8]
+    );
+
+    Ok(Json(BatchCreateClaimTokensResponse {
+        tokens,
+        skipped,
+        errors,
+    }))
+}
+
+// ============================================================================
+// GET /api/admin/claim-tokens/stats - Aggregate claim token statistics
+// ============================================================================
+
+#[derive(Debug, Serialize)]
+pub struct ClaimTokenStatsResponse {
+    pub total_generated: i64,
+    pub total_claimed: i64,
+    pub total_expired: i64,
+    pub total_pending: i64,
+}
+
+pub async fn get_claim_token_stats(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    auth: UcanAuth,
+) -> ApiResult<Json<ClaimTokenStatsResponse>> {
+    let tenant_id = tenant.0.id;
+    let pool = &auth_state.state.db;
+
+    if !is_support_admin(&auth).await {
+        return Err(ApiError::forbidden("Admin access required"));
+    }
+
+    let claim_token_repo = ClaimTokenRepository::new(pool.clone());
+    let stats = claim_token_repo.get_stats(tenant_id).await?;
+
+    Ok(Json(ClaimTokenStatsResponse {
+        total_generated: stats.total_generated,
+        total_claimed: stats.total_claimed,
+        total_expired: stats.total_expired,
+        total_pending: stats.total_pending,
+    }))
+}
+
+// ============================================================================
 // GET /api/admin/user-lookup?q=<email_or_pubkey> - Look up user details
 // ============================================================================
 

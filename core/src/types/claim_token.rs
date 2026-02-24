@@ -19,6 +19,15 @@ pub struct ClaimToken {
     pub tenant_id: i64,
 }
 
+/// Aggregate statistics for claim tokens in a tenant
+#[derive(Debug)]
+pub struct ClaimTokenStats {
+    pub total_generated: i64,
+    pub total_claimed: i64,
+    pub total_expired: i64,
+    pub total_pending: i64,
+}
+
 /// Generate a cryptographically random claim token (256 bits, base64url encoded)
 pub fn generate_claim_token() -> String {
     let bytes: [u8; 32] = rand::thread_rng().gen();

@@ -2,7 +2,7 @@ use chrono::{Duration, Utc};
 use sqlx::PgPool;
 
 use crate::repositories::RepositoryError;
-use crate::types::claim_token::{ClaimToken, CLAIM_TOKEN_EXPIRY_DAYS};
+use crate::types::claim_token::{ClaimToken, ClaimTokenStats, CLAIM_TOKEN_EXPIRY_DAYS};
 
 /// Repository for account claim token operations.
 /// Used for preloaded users to claim their accounts by setting email/password.
@@ -114,6 +114,32 @@ impl ClaimTokenRepository {
         .fetch_all(&self.pool)
         .await
         .map_err(Into::into)
+    }
+
+    /// Get aggregate statistics for claim tokens in a tenant.
+    pub async fn get_stats(
+        &self,
+        tenant_id: i64,
+    ) -> Result<ClaimTokenStats, RepositoryError> {
+        let row: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT
+               COUNT(*)::bigint AS total_generated,
+               COUNT(*) FILTER (WHERE used_at IS NOT NULL)::bigint AS total_claimed,
+               COUNT(*) FILTER (WHERE expires_at < NOW() AND used_at IS NULL)::bigint AS total_expired,
+               COUNT(*) FILTER (WHERE expires_at >= NOW() AND used_at IS NULL)::bigint AS total_pending
+             FROM account_claim_tokens
+             WHERE tenant_id = $1",
+        )
+        .bind(tenant_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(ClaimTokenStats {
+            total_generated: row.0,
+            total_claimed: row.1,
+            total_expired: row.2,
+            total_pending: row.3,
+        })
     }
 
     /// Clean up expired and used tokens (for maintenance).
