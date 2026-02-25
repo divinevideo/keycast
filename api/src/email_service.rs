@@ -30,11 +30,7 @@ pub trait EmailSender: Send + Sync {
     ) -> Result<(), String>;
 
     /// Send a claim link email for a preloaded Vine account.
-    async fn send_claim_email(
-        &self,
-        to_email: &str,
-        claim_url: &str,
-    ) -> Result<(), String>;
+    async fn send_claim_email(&self, to_email: &str, claim_url: &str) -> Result<(), String>;
 
     /// Get captured emails (only available in dev/test mode)
     fn get_captured_emails(&self) -> Vec<CapturedEmail> {
@@ -164,11 +160,7 @@ impl EmailSender for DevEmailSender {
         Ok(())
     }
 
-    async fn send_claim_email(
-        &self,
-        to_email: &str,
-        claim_url: &str,
-    ) -> Result<(), String> {
+    async fn send_claim_email(&self, to_email: &str, claim_url: &str) -> Result<(), String> {
         tracing::info!("");
         tracing::info!("==================================================");
         tracing::info!("  VINE CLAIM EMAIL");
@@ -444,11 +436,7 @@ impl EmailSender for SendGridEmailSender {
             .await
     }
 
-    async fn send_claim_email(
-        &self,
-        to_email: &str,
-        claim_url: &str,
-    ) -> Result<(), String> {
+    async fn send_claim_email(&self, to_email: &str, claim_url: &str) -> Result<(), String> {
         let subject = "Your Vine account on diVine is ready to claim".to_string();
         let html_content = format!(
             r#"
@@ -531,11 +519,7 @@ impl EmailService {
             .await
     }
 
-    pub async fn send_claim_email(
-        &self,
-        to_email: &str,
-        claim_url: &str,
-    ) -> Result<(), String> {
+    pub async fn send_claim_email(&self, to_email: &str, claim_url: &str) -> Result<(), String> {
         self.inner.send_claim_email(to_email, claim_url).await
     }
 }

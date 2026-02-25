@@ -149,8 +149,7 @@ async fn test_batch_all_valid_users() {
     let (pubkey3, vine_id3) = create_unclaimed_user(&pool, tenant_id).await;
 
     let vine_ids: Vec<&str> = vec![&vine_id1, &vine_id2, &vine_id3];
-    let (created, skipped) =
-        run_batch_logic(&pool, &vine_ids, &admin_pubkey, tenant_id).await;
+    let (created, skipped) = run_batch_logic(&pool, &vine_ids, &admin_pubkey, tenant_id).await;
 
     assert_eq!(created.len(), 3, "all three users should get tokens");
     assert_eq!(skipped.len(), 0, "no users should be skipped");
@@ -162,7 +161,11 @@ async fn test_batch_all_valid_users() {
             .find_valid_by_user_pubkey(pubkey, tenant_id)
             .await
             .expect("query should succeed");
-        assert!(token.is_some(), "token should exist for pubkey {}", &pubkey[..8]);
+        assert!(
+            token.is_some(),
+            "token should exist for pubkey {}",
+            &pubkey[..8]
+        );
     }
 
     cleanup_by_pubkey(&pool, &pubkey1).await;
@@ -181,8 +184,7 @@ async fn test_batch_skips_already_claimed_users() {
     let (pubkey_claimed, vine_id_claimed) = create_claimed_user(&pool, tenant_id).await;
 
     let vine_ids: Vec<&str> = vec![&vine_id_unclaimed, &vine_id_claimed];
-    let (created, skipped) =
-        run_batch_logic(&pool, &vine_ids, &admin_pubkey, tenant_id).await;
+    let (created, skipped) = run_batch_logic(&pool, &vine_ids, &admin_pubkey, tenant_id).await;
 
     assert_eq!(created.len(), 1, "only unclaimed user should get a token");
     assert_eq!(skipped.len(), 1, "claimed user should be skipped");
@@ -218,8 +220,7 @@ async fn test_batch_skips_nonexistent_vine_ids() {
     let fake_vine_id = format!("vine_nonexistent_{}", Uuid::new_v4());
 
     let vine_ids: Vec<&str> = vec![&vine_id_valid, &fake_vine_id];
-    let (created, skipped) =
-        run_batch_logic(&pool, &vine_ids, &admin_pubkey, tenant_id).await;
+    let (created, skipped) = run_batch_logic(&pool, &vine_ids, &admin_pubkey, tenant_id).await;
 
     assert_eq!(created.len(), 1, "only the valid user should get a token");
     assert_eq!(skipped.len(), 1, "nonexistent vine_id should be skipped");
@@ -235,8 +236,7 @@ async fn test_batch_empty_input_no_tokens_created() {
     let admin_keys = Keys::generate();
     let admin_pubkey = admin_keys.public_key().to_hex();
 
-    let (created, skipped) =
-        run_batch_logic(&pool, &[], &admin_pubkey, tenant_id).await;
+    let (created, skipped) = run_batch_logic(&pool, &[], &admin_pubkey, tenant_id).await;
 
     assert_eq!(created.len(), 0);
     assert_eq!(skipped.len(), 0);
@@ -283,14 +283,24 @@ async fn test_claim_token_stats_counts_correctly() {
     // 1. Create a pending (valid, not used) token
     let pending_token = generate_claim_token();
     claim_repo
-        .create(&pending_token, &pubkey_pending, Some(&admin_pubkey), tenant_id)
+        .create(
+            &pending_token,
+            &pubkey_pending,
+            Some(&admin_pubkey),
+            tenant_id,
+        )
         .await
         .expect("create pending token");
 
     // 2. Create a used/claimed token
     let used_token = generate_claim_token();
     claim_repo
-        .create(&used_token, &pubkey_claimed_token, Some(&admin_pubkey), tenant_id)
+        .create(
+            &used_token,
+            &pubkey_claimed_token,
+            Some(&admin_pubkey),
+            tenant_id,
+        )
         .await
         .expect("create used token");
     claim_repo

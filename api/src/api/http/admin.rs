@@ -640,15 +640,16 @@ pub async fn batch_create_claim_tokens(
     let claim_token_repo = ClaimTokenRepository::new(pool.clone());
 
     // Create email service once outside the loop
-    let email_service = req.delivery_email.as_ref().and_then(|_| {
-        match crate::email_service::EmailService::new() {
-            Ok(svc) => Some(svc),
-            Err(e) => {
-                tracing::error!("Failed to create email service: {}", e);
-                None
-            }
-        }
-    });
+    let email_service =
+        req.delivery_email
+            .as_ref()
+            .and_then(|_| match crate::email_service::EmailService::new() {
+                Ok(svc) => Some(svc),
+                Err(e) => {
+                    tracing::error!("Failed to create email service: {}", e);
+                    None
+                }
+            });
 
     let mut tokens = Vec::new();
     let mut skipped = Vec::new();
@@ -682,13 +683,19 @@ pub async fn batch_create_claim_tokens(
                 continue;
             }
             Err(e) => {
-                errors.push(format!("vine_id {}: failed to check claim status: {}", vine_id, e));
+                errors.push(format!(
+                    "vine_id {}: failed to check claim status: {}",
+                    vine_id, e
+                ));
                 continue;
             }
         }
 
         // Skip if user already has a valid (unexpired, unused) claim token
-        match claim_token_repo.find_valid_by_user_pubkey(&user_pubkey, tenant_id).await {
+        match claim_token_repo
+            .find_valid_by_user_pubkey(&user_pubkey, tenant_id)
+            .await
+        {
             Ok(Some(_)) => {
                 skipped.push(BatchSkippedEntry {
                     vine_id: vine_id.clone(),
@@ -698,7 +705,10 @@ pub async fn batch_create_claim_tokens(
             }
             Ok(None) => {} // no existing token - proceed
             Err(e) => {
-                errors.push(format!("vine_id {}: failed to check existing tokens: {}", vine_id, e));
+                errors.push(format!(
+                    "vine_id {}: failed to check existing tokens: {}",
+                    vine_id, e
+                ));
                 continue;
             }
         }
@@ -711,7 +721,10 @@ pub async fn batch_create_claim_tokens(
         {
             Ok(ct) => ct,
             Err(e) => {
-                errors.push(format!("vine_id {}: failed to create token: {}", vine_id, e));
+                errors.push(format!(
+                    "vine_id {}: failed to create token: {}",
+                    vine_id, e
+                ));
                 continue;
             }
         };

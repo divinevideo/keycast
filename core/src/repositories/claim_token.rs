@@ -117,10 +117,7 @@ impl ClaimTokenRepository {
     }
 
     /// Get aggregate statistics for claim tokens in a tenant.
-    pub async fn get_stats(
-        &self,
-        tenant_id: i64,
-    ) -> Result<ClaimTokenStats, RepositoryError> {
+    pub async fn get_stats(&self, tenant_id: i64) -> Result<ClaimTokenStats, RepositoryError> {
         let row: (i64, i64, i64, i64) = sqlx::query_as(
             "SELECT
                COUNT(*)::bigint AS total_generated,
