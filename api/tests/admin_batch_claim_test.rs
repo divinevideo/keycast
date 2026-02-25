@@ -336,6 +336,10 @@ async fn test_claim_token_stats_counts_correctly() {
         .bind(tenant_id)
         .execute(&pool)
         .await;
+    let _ = sqlx::query("DELETE FROM tenants WHERE id = $1")
+        .bind(tenant_id)
+        .execute(&pool)
+        .await;
 
     // Suppress unused variable warning for vine_id_pending
     let _ = vine_id_pending;
@@ -367,6 +371,17 @@ async fn create_unclaimed_user_in_tenant(pool: &PgPool, tenant_id: i64) -> (Stri
     let pubkey = keys.public_key().to_hex();
     let vine_id = format!("vine_stats_{}", Uuid::new_v4());
     let username = format!("statsuser_{}", &Uuid::new_v4().to_string()[..8]);
+
+    // Ensure the tenant exists (idempotent)
+    sqlx::query(
+        "INSERT INTO tenants (id, name, domain, created_at, updated_at)
+         VALUES ($1, 'Stats Test Tenant', 'stats-test.example.com', NOW(), NOW())
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(tenant_id)
+    .execute(pool)
+    .await
+    .expect("ensure tenant exists for stats test");
 
     // Use direct SQL because create_preloaded_user may require tenant to exist
     sqlx::query(
