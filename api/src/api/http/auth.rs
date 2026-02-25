@@ -11,7 +11,7 @@ use bcrypt::{hash, verify, DEFAULT_COST};
 use chrono::{Duration, Utc};
 use secrecy::{ExposeSecret, SecretString};
 
-use super::admin::is_full_admin;
+use super::admin::{is_full_admin, is_support_admin};
 use crate::api::extractors::UcanAuth;
 use crate::bcrypt_queue::{BcryptJob, BcryptQueueError};
 use crate::nip98;
@@ -542,20 +542,24 @@ async fn nostr_auth_login(
 
     let pubkey_hex = nip98_auth.pubkey.to_hex();
 
-    // Check if pubkey is in ALLOWED_PUBKEYS whitelist
+    // Check if pubkey is a full admin or support admin (checks ALLOWED_PUBKEYS and Redis)
     let nip98_auth_check = UcanAuth {
         pubkey: pubkey_hex.clone(),
         admin_role: None,
     };
-    if !is_full_admin(&nip98_auth_check) {
+    let admin_role = if is_full_admin(&nip98_auth_check) {
+        "full"
+    } else if is_support_admin(&nip98_auth_check).await {
+        "support"
+    } else {
         tracing::warn!(
-            "NIP-98 login denied for non-whitelisted pubkey: {}",
+            "NIP-98 login denied for non-admin pubkey: {}",
             &pubkey_hex[..8]
         );
         return Err(AuthError::Forbidden(
             "Pubkey not authorized for admin access".to_string(),
         ));
-    }
+    };
 
     // Get redirect_origin from headers (required for UCAN)
     let redirect_origin = extract_origin_from_headers(headers)?;
@@ -570,7 +574,7 @@ async fn nostr_auth_login(
         None, // No bunker_pubkey for admin sessions
         &server_keys,
         false, // NIP-98 admin login is not first-party OAuth
-        Some("full"),
+        Some(admin_role),
     )
     .await?;
 

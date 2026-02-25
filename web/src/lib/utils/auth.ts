@@ -2,16 +2,11 @@ import { browser } from "$app/environment";
 import { goto } from "$app/navigation";
 import { getCurrentUser, setCurrentUser } from "$lib/current_user.svelte";
 import toast from "svelte-hot-french-toast";
-import { getViteDomain, getAllowedPubkeys, isTeamsEnabled } from "$lib/utils/env";
+import { getViteDomain, isTeamsEnabled } from "$lib/utils/env";
 
 export enum SigninMethod {
     Nip07 = "nip07",
     NostrLogin = "nostr-login",
-}
-
-function isAllowedPubkey(pubkey: string) {
-    const allowedPubkeys = getAllowedPubkeys();
-    return allowedPubkeys && allowedPubkeys.includes(pubkey);
 }
 
 export async function signin(
@@ -26,7 +21,19 @@ export async function signin(
         if (!alreadySignedIn) {
             toast.success("Signed in successfully");
         }
-        const dest = method === SigninMethod.Nip07 ? "/admin" : (isTeamsEnabled() ? "/teams" : "/");
+        let dest = isTeamsEnabled() ? "/teams" : "/";
+        if (method === SigninMethod.Nip07) {
+            // Check actual admin role to redirect to the right page
+            try {
+                const statusRes = await fetch(`${getViteDomain()}/api/admin/status`, { credentials: 'include' });
+                if (statusRes.ok) {
+                    const status = await statusRes.json();
+                    dest = status.role === "full" ? "/admin" : "/support-admin";
+                }
+            } catch {
+                dest = "/admin";
+            }
+        }
         goto(dest);
     }
     return pubkey;
@@ -40,11 +47,6 @@ async function nip07Login(): Promise<string | null> {
 
     try {
         const pubkey = await window.nostr.getPublicKey();
-
-        if (!isAllowedPubkey(pubkey)) {
-            toast.error("Your pubkey is not authorized for admin access");
-            return null;
-        }
 
         const apiBase = getViteDomain();
         const url = `${apiBase}/api/auth/login`;
