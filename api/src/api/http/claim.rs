@@ -541,11 +541,7 @@ pub async fn claim_post(
         display_name = html_escape(&display_name_str),
     );
 
-    Ok((
-        [(header::SET_COOKIE, cookie_value)],
-        Html(html),
-    )
-        .into_response())
+    Ok(([(header::SET_COOKIE, cookie_value)], Html(html)).into_response())
 }
 
 /// HTML-escape a string to prevent XSS
