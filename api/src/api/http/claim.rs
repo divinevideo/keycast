@@ -334,21 +334,216 @@ pub async fn claim_post(
     .await
     .map_err(|e| ClaimError::Internal(format!("Failed to generate session: {:?}", e)))?;
 
-    // Set session cookie and redirect to dashboard
+    // Set session cookie
     let cookie_value = format!(
         "keycast_session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={}",
         token,
         60 * 60 * 24 * 7 // 7 days
     );
 
-    let app_url = std::env::var("APP_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
+    // Get user info for success page
+    let user_repo = UserRepository::new(pool.clone());
+    let (username, display_name) = user_repo
+        .get_claim_info(&claim_token.user_pubkey, tenant_id)
+        .await
+        .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?
+        .unwrap_or((None, None));
+
+    let display_name_str = display_name.unwrap_or_else(|| username.clone().unwrap_or_default());
+
+    // Show success page with app download instructions
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Account Claimed!</title>
+    <style>
+        * {{ box-sizing: border-box; }}
+        body {{
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            background: #072218;
+            min-height: 100vh;
+            margin: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }}
+        .container {{
+            background: #0F2E23;
+            border: 1px solid #1C4033;
+            border-radius: 12px;
+            padding: 40px;
+            max-width: 440px;
+            width: 100%;
+            text-align: center;
+            box-shadow: 0 8px 32px rgba(39, 197, 139, 0.08);
+        }}
+        .checkmark {{
+            width: 56px;
+            height: 56px;
+            background: rgba(39, 197, 139, 0.15);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 20px;
+            font-size: 28px;
+        }}
+        h1 {{
+            margin: 0 0 8px 0;
+            color: #F9F7F6;
+            font-size: 22px;
+            font-weight: 600;
+        }}
+        .subtitle {{
+            color: #BEB3A7;
+            font-size: 14px;
+            margin: 0 0 28px 0;
+            line-height: 1.5;
+        }}
+        .steps {{
+            text-align: left;
+            margin-bottom: 28px;
+        }}
+        .step {{
+            display: flex;
+            gap: 14px;
+            align-items: flex-start;
+            margin-bottom: 18px;
+        }}
+        .step-num {{
+            flex-shrink: 0;
+            width: 28px;
+            height: 28px;
+            background: rgba(39, 197, 139, 0.15);
+            color: #27C58B;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 13px;
+            font-weight: 700;
+        }}
+        .step-content {{
+            flex: 1;
+        }}
+        .step-title {{
+            color: #F9F7F6;
+            font-weight: 600;
+            font-size: 14px;
+            margin-bottom: 3px;
+        }}
+        .step-desc {{
+            color: #9CA3AF;
+            font-size: 13px;
+            line-height: 1.4;
+        }}
+        .app-links {{
+            display: flex;
+            gap: 10px;
+            margin-top: 8px;
+        }}
+        .app-link {{
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 8px 14px;
+            background: #072218;
+            border: 1px solid #1C4033;
+            border-radius: 8px;
+            color: #F9F7F6;
+            text-decoration: none;
+            font-size: 13px;
+            font-weight: 500;
+            transition: border-color 0.2s;
+        }}
+        .app-link:hover {{
+            border-color: #27C58B;
+        }}
+        .divider {{
+            border-top: 1px solid #1C4033;
+            margin: 0 0 20px 0;
+        }}
+        .web-link {{
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 24px;
+            background: #27C58B;
+            color: #072218;
+            text-decoration: none;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 14px;
+            transition: background 0.2s;
+        }}
+        .web-link:hover {{
+            background: #1AA575;
+        }}
+        .note {{
+            color: #9CA3AF;
+            font-size: 12px;
+            margin-top: 16px;
+            line-height: 1.4;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="checkmark">&#10003;</div>
+        <h1>Account Claimed!</h1>
+        <p class="subtitle">Welcome, {display_name}. Your credentials have been set.</p>
+
+        <div class="steps">
+            <div class="step">
+                <div class="step-num">1</div>
+                <div class="step-content">
+                    <div class="step-title">Get the App</div>
+                    <div class="step-desc">Download diVine for the best experience.</div>
+                    <div class="app-links">
+                        <a class="app-link" href="https://apps.apple.com/app/divine-video/id6744577425" target="_blank">
+                            &#63743; App Store
+                        </a>
+                        <a class="app-link" href="https://play.google.com/store/apps/details?id=com.openvine.divine" target="_blank">
+                            &#9654; Google Play
+                        </a>
+                    </div>
+                </div>
+            </div>
+            <div class="step">
+                <div class="step-num">2</div>
+                <div class="step-content">
+                    <div class="step-title">Sign In</div>
+                    <div class="step-desc">Use the email and password you just set to sign in.</div>
+                </div>
+            </div>
+            <div class="step">
+                <div class="step-num">3</div>
+                <div class="step-content">
+                    <div class="step-title">Your Content is Waiting</div>
+                    <div class="step-desc">Your videos and profile are ready to go.</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <a class="web-link" href="https://divine.video" target="_blank">
+            Open diVine on Web
+        </a>
+        <p class="note">You can also access your account at divine.video</p>
+    </div>
+</body>
+</html>"#,
+        display_name = html_escape(&display_name_str),
+    );
 
     Ok((
-        [
-            (header::SET_COOKIE, cookie_value),
-            (header::LOCATION, format!("{}/", app_url)),
-        ],
-        axum::http::StatusCode::SEE_OTHER,
+        [(header::SET_COOKIE, cookie_value)],
+        Html(html),
     )
         .into_response())
 }
