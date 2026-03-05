@@ -855,6 +855,19 @@ pub async fn get_user_lookup(
     let user_repo = UserRepository::new(pool.clone());
     let result = user_repo.find_user_for_admin(q, tenant_id).await?;
 
+    // If no local match and query looks like a plain username, try NIP-05 name server
+    let result = match result {
+        Some(_) => result,
+        None if !q.contains('@') && !q.starts_with("npub") && q.len() < 64 => {
+            if let Some(pubkey) = crate::divine_names::lookup_pubkey_by_nip05(q).await {
+                user_repo.find_user_for_admin(&pubkey, tenant_id).await?
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+
     match result {
         None => Ok(Json(UserLookupResponse {
             found: false,

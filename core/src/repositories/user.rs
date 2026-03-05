@@ -1040,13 +1040,29 @@ impl UserRepository {
                 Err(_) => return Ok(None),
             }
         } else {
-            // Try username, then vine_id, then fall through to hex pubkey
+            // Try username (case-insensitive, then punctuation-normalized),
+            // then vine_id, then fall through to hex pubkey
             let by_username: Option<(String,)> =
-                sqlx::query_as("SELECT pubkey FROM users WHERE username = $1 AND tenant_id = $2")
+                sqlx::query_as("SELECT pubkey FROM users WHERE LOWER(username) = LOWER($1) AND tenant_id = $2")
                     .bind(query)
                     .bind(tenant_id)
                     .fetch_optional(&self.pool)
                     .await?;
+            // If no case-insensitive match, try punctuation-normalized
+            // (strip dots/hyphens/underscores from both sides so "lelepons" finds "Lele.Pons")
+            let by_username = match by_username {
+                Some(row) => Some(row),
+                None => {
+                    let normalized: String = query.chars().filter(|c| c.is_alphanumeric()).collect();
+                    sqlx::query_as(
+                        "SELECT pubkey FROM users WHERE LOWER(REPLACE(REPLACE(REPLACE(username, '.', ''), '-', ''), '_', '')) = LOWER($1) AND tenant_id = $2"
+                    )
+                    .bind(&normalized)
+                    .bind(tenant_id)
+                    .fetch_optional(&self.pool)
+                    .await?
+                }
+            };
             if let Some((pk,)) = by_username {
                 pk
             } else {
@@ -1525,5 +1541,78 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_none(), "Should return None for nonexistent user");
+    }
+
+    async fn create_user_with_username(pool: &PgPool, pubkey: &str, username: &str) {
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, username, created_at, updated_at)
+             VALUES ($1, 1, $2, NOW(), NOW())",
+        )
+        .bind(pubkey)
+        .bind(username)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_find_user_for_admin_username_case_insensitive() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let keys = Keys::generate();
+        let hex = keys.public_key().to_hex();
+        let suffix = test_suffix();
+        let username = format!("TestUser{}", suffix);
+
+        create_user_with_username(&pool, &hex, &username).await;
+
+        // Lowercase search should find mixed-case username
+        let result = repo
+            .find_user_for_admin(&username.to_lowercase(), 1)
+            .await
+            .unwrap();
+        assert!(result.is_some(), "Should find user by case-insensitive username");
+        assert_eq!(result.unwrap().pubkey, hex);
+
+        cleanup_user(&pool, &hex).await;
+    }
+
+    #[tokio::test]
+    async fn test_find_user_for_admin_username_normalized() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let keys = Keys::generate();
+        let hex = keys.public_key().to_hex();
+        let suffix = test_suffix();
+        let username = format!("Lele.Pons{}", suffix);
+
+        create_user_with_username(&pool, &hex, &username).await;
+
+        // Search without dot and in lowercase should find dotted username
+        let search = format!("lelepons{}", suffix);
+        let result = repo.find_user_for_admin(&search, 1).await.unwrap();
+        assert!(result.is_some(), "Should find user by normalized username");
+        assert_eq!(result.unwrap().pubkey, hex);
+
+        cleanup_user(&pool, &hex).await;
+    }
+
+    #[tokio::test]
+    async fn test_find_user_for_admin_username_exact_still_works() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let keys = Keys::generate();
+        let hex = keys.public_key().to_hex();
+        let suffix = test_suffix();
+        let username = format!("ExactUser{}", suffix);
+
+        create_user_with_username(&pool, &hex, &username).await;
+
+        // Exact match should still work
+        let result = repo.find_user_for_admin(&username, 1).await.unwrap();
+        assert!(result.is_some(), "Should find user by exact username");
+        assert_eq!(result.unwrap().pubkey, hex);
+
+        cleanup_user(&pool, &hex).await;
     }
 }

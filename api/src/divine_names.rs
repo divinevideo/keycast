@@ -264,3 +264,43 @@ pub async fn lookup_by_pubkey(
         Ok(None)
     }
 }
+
+/// Resolve a username to a pubkey via NIP-05 (/.well-known/nostr.json).
+/// Returns None on any error (network, parse, not found, or not configured). No auth required.
+/// Requires DIVINE_NIP05_DOMAIN env var to be set (e.g. "https://divine.video").
+pub async fn lookup_pubkey_by_nip05(username: &str) -> Option<String> {
+    let base_url = std::env::var("DIVINE_NIP05_DOMAIN").ok()?;
+    let nostr_json_url = format!(
+        "{}/.well-known/nostr.json",
+        base_url.trim_end_matches('/')
+    );
+
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .ok()?;
+
+    let response = client
+        .get(&nostr_json_url)
+        .query(&[("name", username)])
+        .send()
+        .await
+        .ok()?;
+    let body: serde_json::Value = response.json().await.ok()?;
+
+    // NIP-05 response: { "names": { "<username>": "<hex-pubkey>" } }
+    let names = body.get("names")?.as_object()?;
+
+    // Try exact match first, then case-insensitive
+    if let Some(pubkey) = names.get(username).and_then(|v| v.as_str()) {
+        return Some(pubkey.to_string());
+    }
+    let lower = username.to_lowercase();
+    for (name, pubkey) in names {
+        if name.to_lowercase() == lower {
+            return pubkey.as_str().map(|s| s.to_string());
+        }
+    }
+
+    None
+}
