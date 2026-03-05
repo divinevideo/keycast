@@ -1042,18 +1042,20 @@ impl UserRepository {
         } else {
             // Try username (case-insensitive, then punctuation-normalized),
             // then vine_id, then fall through to hex pubkey
-            let by_username: Option<(String,)> =
-                sqlx::query_as("SELECT pubkey FROM users WHERE LOWER(username) = LOWER($1) AND tenant_id = $2")
-                    .bind(query)
-                    .bind(tenant_id)
-                    .fetch_optional(&self.pool)
-                    .await?;
+            let by_username: Option<(String,)> = sqlx::query_as(
+                "SELECT pubkey FROM users WHERE LOWER(username) = LOWER($1) AND tenant_id = $2",
+            )
+            .bind(query)
+            .bind(tenant_id)
+            .fetch_optional(&self.pool)
+            .await?;
             // If no case-insensitive match, try punctuation-normalized
             // (strip dots/hyphens/underscores from both sides so "lelepons" finds "Lele.Pons")
             let by_username = match by_username {
                 Some(row) => Some(row),
                 None => {
-                    let normalized: String = query.chars().filter(|c| c.is_alphanumeric()).collect();
+                    let normalized: String =
+                        query.chars().filter(|c| c.is_alphanumeric()).collect();
                     sqlx::query_as(
                         "SELECT pubkey FROM users WHERE LOWER(REPLACE(REPLACE(REPLACE(username, '.', ''), '-', ''), '_', '')) = LOWER($1) AND tenant_id = $2"
                     )
@@ -1571,7 +1573,10 @@ mod tests {
             .find_user_for_admin(&username.to_lowercase(), 1)
             .await
             .unwrap();
-        assert!(result.is_some(), "Should find user by case-insensitive username");
+        assert!(
+            result.is_some(),
+            "Should find user by case-insensitive username"
+        );
         assert_eq!(result.unwrap().pubkey, hex);
 
         cleanup_user(&pool, &hex).await;

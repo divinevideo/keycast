@@ -270,10 +270,7 @@ pub async fn lookup_by_pubkey(
 /// Requires DIVINE_NIP05_DOMAIN env var to be set (e.g. "https://divine.video").
 pub async fn lookup_pubkey_by_nip05(username: &str) -> Option<String> {
     let base_url = std::env::var("DIVINE_NIP05_DOMAIN").ok()?;
-    let nostr_json_url = format!(
-        "{}/.well-known/nostr.json",
-        base_url.trim_end_matches('/')
-    );
+    let nostr_json_url = format!("{}/.well-known/nostr.json", base_url.trim_end_matches('/'));
 
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(3))
