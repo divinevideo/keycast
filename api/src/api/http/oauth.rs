@@ -518,6 +518,25 @@ pub async fn authorize_get(
     let tenant_id = tenant.0.id;
     let pool = &auth_state.state.db;
 
+    // Validate redirect_uri against registered client patterns (if client is registered)
+    {
+        let client_repo = keycast_core::repositories::RegisteredClientRepository::new(pool.clone());
+        if let Err(e) = client_repo
+            .validate_redirect_uri(&params.client_id, &params.redirect_uri, tenant_id)
+            .await
+        {
+            tracing::warn!(
+                "Redirect URI validation failed for client '{}': {}",
+                params.client_id,
+                e
+            );
+            return Err(OAuthError::InvalidRequest(format!(
+                "redirect_uri is not allowed for this client: {}",
+                e
+            )));
+        }
+    }
+
     // Check if user is authenticated via cookie and extract pubkey
     let user_pubkey = if let Some(token) = super::auth::extract_ucan_from_cookie(&headers) {
         crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), tenant_id)

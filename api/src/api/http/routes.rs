@@ -38,10 +38,15 @@ pub fn api_routes(
     let first_party_routes = Router::new()
         .route("/auth/register", post(auth::register))
         .route("/auth/login", post(auth::login))
-        .route("/auth/logout", post(auth::logout))
         .route("/oauth/login", post(oauth::oauth_login))
         .route("/oauth/register", post(oauth::oauth_register))
         .layer(auth_cors.clone())
+        .with_state(auth_state.clone());
+
+    // Logout route - public CORS so third-party OAuth apps can revoke sessions
+    // Protected by Bearer token (UCAN), not cookies
+    let logout_route = Router::new()
+        .route("/auth/logout", post(auth::logout))
         .with_state(auth_state.clone());
 
     // verify_email needs auth_state for key_manager (to decrypt keys and issue UCAN)
@@ -110,8 +115,13 @@ pub fn api_routes(
     let bunker_routes = Router::new()
         .route("/user/bunker/create", post(auth::create_bunker))
         .route("/user/sessions/revoke", post(auth::revoke_session))
-        .route("/user/account", delete(auth::delete_account))
         .layer(auth_cors.clone())
+        .with_state(auth_state.clone());
+
+    // Account deletion - public CORS so third-party OAuth apps can delete accounts
+    // Protected by Bearer token (UCAN), not cookies
+    let account_delete_route = Router::new()
+        .route("/user/account", delete(auth::delete_account))
         .with_state(auth_state.clone());
 
     // Key export route (needs AuthState for key_manager)
@@ -137,13 +147,12 @@ pub fn api_routes(
         .route("/policies/:slug", get(policies::get_policy))
         .with_state(pool.clone());
 
-    // Headless auth routes (for native mobile apps like Flutter)
-    // Restricted CORS - first-party only, these endpoints accept passwords
+    // Headless auth routes (embedded flow for web + native mobile apps)
+    // Public CORS - token exchange still requires PKCE for security
     let headless_routes = Router::new()
         .route("/headless/register", post(headless::headless_register))
         .route("/headless/login", post(headless::headless_login))
         .route("/headless/authorize", post(headless::headless_authorize))
-        .layer(auth_cors.clone())
         .with_state(auth_state.clone());
 
     // Admin routes (for preloaded accounts and claim tokens)
@@ -221,13 +230,15 @@ pub fn api_routes(
     // Authenticated routes have restricted CORS (need cookies)
     // Public routes have wildcard CORS (third-party safe, no credentials)
     Router::new()
-        .merge(first_party_routes) // Has auth_cors (credentials, needs cookies)
+        .merge(first_party_routes) // Has auth_cors (credentials, accepts passwords)
         .merge(user_routes) // Has auth_cors (authenticated, needs cookies)
         .merge(profile_update_routes) // Has auth_cors (needs key_manager for divine-names)
         .merge(bunker_routes) // Has auth_cors (bunker creation)
         .merge(key_export_routes) // Has auth_cors (authenticated, needs cookies)
         .merge(change_key_route) // Has auth_cors (authenticated, needs cookies)
-        .merge(verify_email_route.layer(auth_cors.clone())) // Email verification (sets session cookie, needs credentials)
+        .merge(logout_route.layer(public_cors.clone())) // Public CORS - Bearer token auth, third-party apps
+        .merge(account_delete_route.layer(public_cors.clone())) // Public CORS - Bearer token auth, third-party apps
+        .merge(verify_email_route.layer(public_cors.clone())) // Public CORS - same-origin sets cookie, cross-origin uses Bearer
         .merge(email_routes.layer(public_cors.clone()))
         .merge(oauth_routes) // Has public_cors (third-party safe)
         .merge(connect_routes.layer(public_cors.clone()))
@@ -236,7 +247,7 @@ pub fn api_routes(
         .merge(team_routes.layer(auth_cors.clone())) // Team routes need credentials
         .merge(discovery_route.layer(public_cors.clone()))
         .merge(policy_routes.layer(public_cors.clone())) // Public - available to third-party OAuth apps
-        .merge(headless_routes) // Headless auth for native mobile apps (has auth_cors - accepts passwords)
+        .merge(headless_routes.layer(public_cors.clone())) // Public CORS - embedded flow for web + mobile (PKCE protects token exchange)
         .merge(admin_routes) // Admin routes for preloaded accounts (has auth_cors)
         .merge(claim_routes.layer(public_cors.clone())) // Public - claim preloaded accounts
         .merge(metrics_route.layer(public_cors.clone())) // Public - Prometheus metrics

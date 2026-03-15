@@ -537,7 +537,8 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
             axum::http::header::CONTENT_TYPE,
             axum::http::header::AUTHORIZATION,
         ])
-        .allow_credentials(true);
+        .allow_credentials(true)
+        .max_age(std::time::Duration::from_secs(86400));
 
     let public_cors = CorsLayer::new()
         .allow_origin(Any)
@@ -546,7 +547,8 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
             axum::http::header::CONTENT_TYPE,
             axum::http::header::AUTHORIZATION,
         ])
-        .allow_credentials(false);
+        .allow_credentials(false)
+        .max_age(std::time::Duration::from_secs(86400));
 
     // Get pure API routes (JSON endpoints only) - pass authorization sender
     let api_routes = keycast_api::api::http::routes::api_routes(
