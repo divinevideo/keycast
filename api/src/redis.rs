@@ -204,6 +204,68 @@ impl PrefixedRedis {
         })
         .await
     }
+
+    /// Check if a value is a member of a set (SISMEMBER).
+    ///
+    /// # Errors
+    ///
+    /// Returns error if Redis operation fails or connection refresh fails.
+    pub async fn sismember(&self, key: &str, member: &str) -> RedisResult<bool> {
+        let prefixed = self.prefixed_key(key).into_owned();
+        let member = member.to_string();
+        self.with_refresh(|mut conn| {
+            let key = prefixed.clone();
+            let member = member.clone();
+            async move { conn.sismember(key, member).await }
+        })
+        .await
+    }
+
+    /// Get all members of a set (SMEMBERS).
+    ///
+    /// # Errors
+    ///
+    /// Returns error if Redis operation fails or connection refresh fails.
+    pub async fn smembers(&self, key: &str) -> RedisResult<Vec<String>> {
+        let prefixed = self.prefixed_key(key).into_owned();
+        self.with_refresh(|mut conn| {
+            let key = prefixed.clone();
+            async move { conn.smembers(key).await }
+        })
+        .await
+    }
+
+    /// Add a member to a set (SADD). Returns the number of members added.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if Redis operation fails or connection refresh fails.
+    pub async fn sadd(&self, key: &str, member: &str) -> RedisResult<i64> {
+        let prefixed = self.prefixed_key(key).into_owned();
+        let member = member.to_string();
+        self.with_refresh(|mut conn| {
+            let key = prefixed.clone();
+            let member = member.clone();
+            async move { conn.sadd(key, member).await }
+        })
+        .await
+    }
+
+    /// Remove a member from a set (SREM). Returns the number of members removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if Redis operation fails or connection refresh fails.
+    pub async fn srem(&self, key: &str, member: &str) -> RedisResult<i64> {
+        let prefixed = self.prefixed_key(key).into_owned();
+        let member = member.to_string();
+        self.with_refresh(|mut conn| {
+            let key = prefixed.clone();
+            let member = member.clone();
+            async move { conn.srem(key, member).await }
+        })
+        .await
+    }
 }
 
 #[cfg(test)]

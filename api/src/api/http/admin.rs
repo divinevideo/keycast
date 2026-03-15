@@ -54,12 +54,7 @@ pub async fn is_support_admin(auth: &UcanAuth) -> bool {
     // Check Redis
     if let Ok(state) = crate::state::get_keycast_state() {
         if let Some(redis) = &state.redis {
-            match redis::cmd("SISMEMBER")
-                .arg(SUPPORT_ADMINS_KEY)
-                .arg(&auth.pubkey)
-                .query_async::<bool>(&mut redis.clone())
-                .await
-            {
+            match redis.sismember(SUPPORT_ADMINS_KEY, &auth.pubkey).await {
                 Ok(true) => return true,
                 Ok(false) => {}
                 Err(e) => {
@@ -935,9 +930,8 @@ pub async fn list_support_admins(
         .as_ref()
         .ok_or_else(|| ApiError::Internal("Redis not available".to_string()))?;
 
-    let pubkeys: Vec<String> = redis::cmd("SMEMBERS")
-        .arg(SUPPORT_ADMINS_KEY)
-        .query_async(&mut redis.clone())
+    let pubkeys: Vec<String> = redis
+        .smembers(SUPPORT_ADMINS_KEY)
         .await
         .map_err(|e| ApiError::Internal(format!("Redis error: {}", e)))?;
 
@@ -1004,10 +998,8 @@ pub async fn add_support_admin(
         .as_ref()
         .ok_or_else(|| ApiError::Internal("Redis not available".to_string()))?;
 
-    let added: i64 = redis::cmd("SADD")
-        .arg(SUPPORT_ADMINS_KEY)
-        .arg(&pubkey_hex)
-        .query_async(&mut redis.clone())
+    let added: i64 = redis
+        .sadd(SUPPORT_ADMINS_KEY, &pubkey_hex)
         .await
         .map_err(|e| ApiError::Internal(format!("Redis error: {}", e)))?;
 
@@ -1041,10 +1033,8 @@ pub async fn remove_support_admin(
         .as_ref()
         .ok_or_else(|| ApiError::Internal("Redis not available".to_string()))?;
 
-    let removed: i64 = redis::cmd("SREM")
-        .arg(SUPPORT_ADMINS_KEY)
-        .arg(&pubkey)
-        .query_async(&mut redis.clone())
+    let removed: i64 = redis
+        .srem(SUPPORT_ADMINS_KEY, &pubkey)
         .await
         .map_err(|e| ApiError::Internal(format!("Redis error: {}", e)))?;
 

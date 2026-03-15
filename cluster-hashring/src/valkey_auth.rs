@@ -1,7 +1,7 @@
 //! Valkey/Redis connection factory with optional GCP IAM authentication.
 //!
 //! This module provides authenticated connections to GCP Memorystore Valkey
-//! when `AUTH_MODE_IAM` is enabled, while also supporting standard Redis
+//! when `USE_VALKEY_IAM` is enabled, while also supporting standard Redis
 //! connections for local development.
 //!
 //! # Usage
@@ -51,7 +51,9 @@ struct CachedToken {
 
 impl CachedToken {
     fn is_expired(&self) -> bool {
-        Instant::now() >= self.expires_at - Duration::from_secs(TOKEN_REFRESH_BUFFER_SECS)
+        self.expires_at
+            .checked_sub(Duration::from_secs(TOKEN_REFRESH_BUFFER_SECS))
+            .map_or(true, |t| Instant::now() >= t)
     }
 
     fn ttl_secs(&self) -> u64 {
