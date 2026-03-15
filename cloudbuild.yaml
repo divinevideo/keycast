@@ -100,7 +100,7 @@ steps:
       - '--subnet=default'
       - '--vpc-egress=private-ranges-only'
       - '--set-secrets=DATABASE_URL=keycast-database-url:latest,SERVER_NSEC=keycast-ucan-secret:latest,SENDGRID_API_KEY=keycast-sendgrid-api-key:latest,REDIS_URL=keycast-redis-url:latest'
-      - '--set-env-vars=^;^NODE_ENV=production;USE_GCP_KMS=true;GCP_PROJECT_ID=${PROJECT_ID};ALLOWED_ORIGINS=https://login.divine.video,https://divine.video;APP_URL=https://login.divine.video;FROM_EMAIL=noreply@divine.video;RUST_LOG=info;ENABLE_EXAMPLES=true;SQLX_STATEMENT_CACHE=100;SQLX_POOL_SIZE=50;ALLOWED_PUBKEYS=89ef92b9ebe6dc1e4ea398f6477f227e95429627b0a33dc89b640e137b256be5,76c71aae3a491f1d9eec47cba17e229cda4113a0bbb6e6ae1776d7643e29cafa;BUNKER_RELAYS=wss://relay.divine.video,wss://relay.primal.net,wss://relay.nsec.app,wss://nos.lol;ENABLE_DIVINE_NAMES=true'
+      - '--set-env-vars=^;^NODE_ENV=production;USE_GCP_KMS=true;GCP_PROJECT_ID=${PROJECT_ID};ALLOWED_ORIGINS=https://login.divine.video,https://divine.video,https://*.openvine-app.pages.dev;APP_URL=https://login.divine.video;FROM_EMAIL=noreply@divine.video;RUST_LOG=info;ENABLE_EXAMPLES=true;SQLX_STATEMENT_CACHE=100;SQLX_POOL_SIZE=50;ALLOWED_PUBKEYS=89ef92b9ebe6dc1e4ea398f6477f227e95429627b0a33dc89b640e137b256be5,76c71aae3a491f1d9eec47cba17e229cda4113a0bbb6e6ae1776d7643e29cafa;BUNKER_RELAYS=wss://relay.divine.video,wss://relay.primal.net,wss://relay.nsec.app,wss://nos.lol;ENABLE_DIVINE_NAMES=true'
 
   # Smoke tests - verify deployment
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
@@ -121,19 +121,49 @@ steps:
         fi
         echo "✅ Health check passed"
 
-        echo "🔍 Testing CORS preflight for /api/auth/register..."
-        HTTP_CODE=$$(curl -s -o /dev/null -w "%{http_code}" \
-          -H "Origin: https://login.divine.video" \
+        PREVIEW_ORIGIN="https://preview.openvine-app.pages.dev"
+
+        echo "🔍 Testing CORS preflight for /api/auth/register from $$PREVIEW_ORIGIN..."
+        REGISTER_HEADERS=$$(mktemp)
+        HTTP_CODE=$$(curl -s -D "$$REGISTER_HEADERS" -o /dev/null -w "%{http_code}" \
+          -H "Origin: $$PREVIEW_ORIGIN" \
           -H "Access-Control-Request-Method: POST" \
           -H "Access-Control-Request-Headers: Content-Type" \
           -X OPTIONS \
           "$$SERVICE_URL/api/auth/register")
 
         if [ "$$HTTP_CODE" != "200" ]; then
-          echo "❌ CORS preflight failed with HTTP $$HTTP_CODE"
+          echo "❌ Register CORS preflight failed with HTTP $$HTTP_CODE"
           exit 1
         fi
-        echo "✅ CORS preflight passed"
+
+        REGISTER_ALLOW_ORIGIN=$$(awk 'BEGIN{IGNORECASE=1}/^Access-Control-Allow-Origin:/ {print $$2}' "$$REGISTER_HEADERS" | tr -d '\r')
+        if [ "$$REGISTER_ALLOW_ORIGIN" != "$$PREVIEW_ORIGIN" ]; then
+          echo "❌ Register CORS preflight returned Access-Control-Allow-Origin=$$REGISTER_ALLOW_ORIGIN"
+          exit 1
+        fi
+        echo "✅ Register CORS preflight passed"
+
+        echo "🔍 Testing CORS preflight for /api/headless/login from $$PREVIEW_ORIGIN..."
+        LOGIN_HEADERS=$$(mktemp)
+        HTTP_CODE=$$(curl -s -D "$$LOGIN_HEADERS" -o /dev/null -w "%{http_code}" \
+          -H "Origin: $$PREVIEW_ORIGIN" \
+          -H "Access-Control-Request-Method: POST" \
+          -H "Access-Control-Request-Headers: Content-Type" \
+          -X OPTIONS \
+          "$$SERVICE_URL/api/headless/login")
+
+        if [ "$$HTTP_CODE" != "200" ]; then
+          echo "❌ Headless login CORS preflight failed with HTTP $$HTTP_CODE"
+          exit 1
+        fi
+
+        LOGIN_ALLOW_ORIGIN=$$(awk 'BEGIN{IGNORECASE=1}/^Access-Control-Allow-Origin:/ {print $$2}' "$$LOGIN_HEADERS" | tr -d '\r')
+        if [ "$$LOGIN_ALLOW_ORIGIN" != "$$PREVIEW_ORIGIN" ]; then
+          echo "❌ Headless login CORS preflight returned Access-Control-Allow-Origin=$$LOGIN_ALLOW_ORIGIN"
+          exit 1
+        fi
+        echo "✅ Headless login CORS preflight passed"
 
         echo "🎉 All smoke tests passed!"
 

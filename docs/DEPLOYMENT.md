@@ -125,7 +125,7 @@ This allows 5x higher concurrency without blocking request threads on bcrypt.
 |----------|-------|
 | `USE_GCP_KMS` | `true` |
 | `GCP_PROJECT_ID` | `openvine-co` |
-| `ALLOWED_ORIGINS` | `https://login.divine.video` |
+| `ALLOWED_ORIGINS` | `https://login.divine.video,https://divine.video,https://*.openvine-app.pages.dev` |
 | `RUST_LOG` | `info` |
 | `SQLX_POOL_SIZE` | `50` |
 | `SQLX_STATEMENT_CACHE` | `100` |

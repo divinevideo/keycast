@@ -125,6 +125,50 @@ fn inject_runtime_env(html: &str) -> String {
     }
 }
 
+fn origin_is_allowed(origin: &str, allowed_origins: &str) -> bool {
+    if origin.starts_with("http://localhost:") || origin == "http://localhost" {
+        return true;
+    }
+
+    allowed_origins
+        .split(',')
+        .map(|value| value.trim())
+        .any(|allowed| origin_matches_allowed_pattern(origin, allowed))
+}
+
+fn origin_matches_allowed_pattern(origin: &str, allowed: &str) -> bool {
+    if !allowed.contains('*') {
+        return origin == allowed;
+    }
+
+    let Some((origin_scheme, origin_host)) = parse_origin(origin) else {
+        return false;
+    };
+    let Some((allowed_scheme, allowed_host)) = parse_origin(allowed) else {
+        return false;
+    };
+
+    if origin_scheme != allowed_scheme {
+        return false;
+    }
+
+    let Some(host_suffix) = allowed_host.strip_prefix("*.") else {
+        return false;
+    };
+
+    origin_host.len() > host_suffix.len()
+        && origin_host.ends_with(host_suffix)
+        && origin_host
+            .strip_suffix(host_suffix)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+fn parse_origin(origin: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = origin.split_once("://")?;
+    let host = rest.split('/').next()?;
+    Some((scheme, host))
+}
+
 /// Serve Apple App Site Association file with correct content type
 async fn apple_app_site_association(
     axum::extract::State(web_build_dir): axum::extract::State<String>,
@@ -518,13 +562,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     let auth_cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(move |origin, _| {
             let origin_str = origin.to_str().unwrap_or("");
-            if origin_str.starts_with("http://localhost:") || origin_str == "http://localhost" {
-                return true;
-            }
-            allowed_origins_for_closure
-                .split(',')
-                .map(|s| s.trim())
-                .any(|allowed| origin_str == allowed)
+            origin_is_allowed(origin_str, &allowed_origins_for_closure)
         }))
         .allow_methods([
             axum::http::Method::POST,
@@ -958,5 +996,33 @@ mod tests {
         std::env::remove_var("APP_URL");
         std::env::remove_var("ALLOWED_PUBKEYS");
         std::env::remove_var("SHOW_TEAMS_FUNCTIONALITY");
+    }
+
+    #[test]
+    fn test_origin_is_allowed_for_exact_match() {
+        assert!(origin_is_allowed(
+            "https://login.divine.video",
+            "https://login.divine.video,https://divine.video"
+        ));
+    }
+
+    #[test]
+    fn test_origin_is_allowed_for_pages_preview_wildcard() {
+        assert!(origin_is_allowed(
+            "https://f582401d.openvine-app.pages.dev",
+            "https://login.divine.video,https://*.openvine-app.pages.dev"
+        ));
+    }
+
+    #[test]
+    fn test_origin_is_not_allowed_for_non_matching_wildcard_host() {
+        assert!(!origin_is_allowed(
+            "https://openvine-app.pages.dev",
+            "https://login.divine.video,https://*.openvine-app.pages.dev"
+        ));
+        assert!(!origin_is_allowed(
+            "https://evil.pages.dev",
+            "https://login.divine.video,https://*.openvine-app.pages.dev"
+        ));
     }
 }
