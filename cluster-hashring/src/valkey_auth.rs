@@ -53,7 +53,7 @@ impl CachedToken {
     fn is_expired(&self) -> bool {
         self.expires_at
             .checked_sub(Duration::from_secs(TOKEN_REFRESH_BUFFER_SECS))
-            .map_or(true, |t| Instant::now() >= t)
+            .is_none_or(|t| Instant::now() >= t)
     }
 
     fn ttl_secs(&self) -> u64 {
