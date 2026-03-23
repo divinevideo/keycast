@@ -1,61 +1,32 @@
-# ABOUTME: GitHub Actions workflow for building, testing, and pushing Docker images to GCP Artifact Registry
-# ABOUTME: Uses Workload Identity Federation for secure keyless authentication with GCP
-# ABOUTME: Builds once, then pushes to dev registries (poc/test/staging) automatically on push
-# ABOUTME: Production push only occurs on version tags (v*)
+# Builds once, pushes to all GCP Artifact Registry environments via docker-push-gcp.
+# Production push only on version tags (v*). Dispatch to IAC repo triggers ArgoCD sync.
 #
-# Required GitHub Secrets (configured per environment):
-#   Each environment (poc, test, staging, production) needs:
-#   - GCP_PROJECT_ID: GCP project ID
-#   - GCP_PROJECT_NUMBER: GCP project number (numeric)
-#   - GCP_SERVICE_ACCOUNT: Service account email for Workload Identity
-#   - GCP_WORKLOAD_IDENTITY_POOL: Workload Identity pool name
-#   - GCP_WORKLOAD_IDENTITY_PROVIDER: Workload Identity provider name
-#   - GCP_ARTIFACT_REGISTRY: Artifact Registry hostname (e.g., us-central1-docker.pkg.dev)
-#   - GCP_ARTIFACT_REPOSITORY: Repository path within project (e.g., docker/keycast)
+# Required GitHub Variables (repo-level):
+#   Per environment: WORKLOAD_IDENTITY_PROVIDER_{ENV}, SERVICE_ACCOUNT_{ENV}, GCP_PROJECT_ID_{ENV}
 #
-# Required GitHub Secrets (organization level, for coreconfig dispatch):
-#   - CORECONFIG_DISPATCH_APP_ID: GitHub App ID for cross-repo dispatch
-#   - CORECONFIG_DISPATCH_APP_PRIVATE_KEY: GitHub App private key
-#
-# GitHub Environments (configure at: Settings → Environments):
-#   - poc: GCP secrets for POC registry push
-#   - test: GCP secrets for Test registry push
-#   - staging: GCP secrets for Staging registry push + dispatch secrets
-#   - production: GCP secrets for Production registry push + dispatch secrets
-#
-# See .github/ENVIRONMENT_SETUP.md for complete setup instructions
-#
-# Recommended: Add protection rules to 'production' environment:
-#   - Required reviewers (1+)
-#   - Wait timer (optional, e.g., 5 minutes)
-#   - Deployment branches: restrict to tags matching 'v*'
+# Required GitHub Secrets (staging environment):
+#   CORECONFIG_DISPATCH_APP_ID, CORECONFIG_DISPATCH_APP_PRIVATE_KEY
 
 name: Build, Test & Push
 
 on:
   push:
-    branches: [master, main]
+    branches: [main]
     tags:
-      - 'v*'  # Deploy to production on version tags (e.g., v1.0.0)
+      - 'v*'
   pull_request:
-    branches: [master, main]
-  workflow_dispatch:  # Allow manual triggering for testing
+    branches: [main]
+  workflow_dispatch:
     inputs:
-      deploy_environment:
-        description: 'Environment to deploy to (poc, test, staging, production, or "all" for all dev environments)'
+      include_production:
+        description: 'Also push to production registry'
         required: false
-        default: 'all'
-        type: choice
-        options:
-          - all
-          - poc
-          - test
-          - staging
-          - production
+        default: false
+        type: boolean
 
 env:
   CARGO_TERM_COLOR: always
-  ARTIFACT_REGISTRY: us-central1-docker.pkg.dev
+  GCP_REGION: us-central1
 
 jobs:
   test:
@@ -119,15 +90,17 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-  build:
-    name: Build Docker Image
+  docker:
+    name: Build & Push
     needs: test
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
     permissions:
+      id-token: write
       contents: read
+      packages: write
     outputs:
-      image_tag: ${{ github.sha }}
-      image_name: keycast
+      tags: ${{ steps.tags.outputs.tags }}
 
     steps:
       - uses: actions/checkout@v6
@@ -135,42 +108,85 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Determine image tags
+      - name: Generate image tags
         id: tags
-        run: |
-          if [ "${{ github.event_name }}" == "pull_request" ]; then
-            echo "tags=keycast:pr-${{ github.event.pull_request.number }}-ci" >> $GITHUB_OUTPUT
-          else
-            echo "tags=keycast:latest,keycast:${{ github.sha }}" >> $GITHUB_OUTPUT
-          fi
+        uses: divinevideo/divine-github-actions/generate-docker-tags@v1
 
-      - name: Build Docker image (local)
+      - name: Build Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: false
           load: true
-          tags: ${{ steps.tags.outputs.tags }}
+          tags: keycast:local
           build-args: |
             BUILD_VERSION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Push to GHCR (public, for E2E testing in divine-mobile)
-  push-ghcr:
-    name: Push to GHCR (public)
-    needs: build
-    runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
-    permissions:
-      contents: read
-      packages: write
+      - name: Push to POC
+        uses: divinevideo/divine-github-actions/docker-push-gcp@v1
+        with:
+          image-name: keycast:local
+          registry-image: keycast
+          tags: ${{ steps.tags.outputs.tags }}
+          wif-provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER_POC }}
+          service-account: ${{ vars.SERVICE_ACCOUNT_POC }}
+          project-id: ${{ vars.GCP_PROJECT_ID_POC }}
+          repository: containers-poc
+          region: ${{ env.GCP_REGION }}
 
-    steps:
-      - uses: actions/checkout@v6
+      - name: Push to Test
+        uses: divinevideo/divine-github-actions/docker-push-gcp@v1
+        with:
+          image-name: keycast:local
+          registry-image: keycast
+          tags: ${{ steps.tags.outputs.tags }}
+          wif-provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER_TEST }}
+          service-account: ${{ vars.SERVICE_ACCOUNT_TEST }}
+          project-id: ${{ vars.GCP_PROJECT_ID_TEST }}
+          repository: containers-test
+          region: ${{ env.GCP_REGION }}
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Push to Staging
+        uses: divinevideo/divine-github-actions/docker-push-gcp@v1
+        with:
+          image-name: keycast:local
+          registry-image: keycast
+          tags: ${{ steps.tags.outputs.tags }}
+          wif-provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER_STAGING }}
+          service-account: ${{ vars.SERVICE_ACCOUNT_STAGING }}
+          project-id: ${{ vars.GCP_PROJECT_ID_STAGING }}
+          repository: containers-staging
+          region: ${{ env.GCP_REGION }}
+
+      - name: Push to Production
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.include_production)
+        uses: divinevideo/divine-github-actions/docker-push-gcp@v1
+        with:
+          image-name: keycast:local
+          registry-image: keycast
+          tags: ${{ steps.tags.outputs.tags }}
+          wif-provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER_PRODUCTION }}
+          service-account: ${{ vars.SERVICE_ACCOUNT_PRODUCTION }}
+          project-id: ${{ vars.GCP_PROJECT_ID_PRODUCTION }}
+          repository: containers-production
+          region: ${{ env.GCP_REGION }}
+
+      - name: Summary
+        run: |
+          echo "### Docker Image Published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** keycast" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags:** ${{ steps.tags.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environments:**" >> $GITHUB_STEP_SUMMARY
+          echo "- POC: \`${{ env.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_POC }}/containers-poc/keycast\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Test: \`${{ env.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_TEST }}/containers-test/keycast\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Staging: \`${{ env.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_STAGING }}/containers-staging/keycast\`" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ github.ref }}" == refs/tags/v* ]] || [[ "${{ inputs.include_production }}" == "true" ]]; then
+            echo "- Production: \`${{ env.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_PRODUCTION }}/containers-production/keycast\`" >> $GITHUB_STEP_SUMMARY
+          fi
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -179,329 +195,30 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push to GHCR
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: |
-            ghcr.io/divinevideo/keycast:latest
-            ghcr.io/divinevideo/keycast:${{ github.sha }}
-          build-args: |
-            BUILD_VERSION=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  # Push to POC registry (always on push/PR)
-  push-poc:
-    name: Push to POC Registry
-    needs: build
-    runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    environment: poc
-    permissions:
-      contents: read
-      id-token: write
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Authenticate to GCP (POC)
-        uses: google-github-actions/auth@v3
-        with:
-          workload_identity_provider: projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ secrets.GCP_WORKLOAD_IDENTITY_POOL }}/providers/${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-
-      - name: Configure Docker for Artifact Registry
-        run: gcloud auth configure-docker ${{ env.ARTIFACT_REGISTRY }} --quiet
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Determine image tags
-        id: tags
+      - name: Push to GHCR (public)
+        continue-on-error: true
         run: |
-          FULL_IMAGE="${{ env.ARTIFACT_REGISTRY }}/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.GCP_ARTIFACT_REPOSITORY }}"
-          if [ "${{ github.event_name }}" == "pull_request" ]; then
-            echo "tags=${FULL_IMAGE}:pr-${{ github.event.pull_request.number }}-ci" >> $GITHUB_OUTPUT
-          else
-            echo "tags=${FULL_IMAGE}:latest,${FULL_IMAGE}:${{ github.sha }}" >> $GITHUB_OUTPUT
-          fi
+          GHCR_IMAGE="ghcr.io/divinevideo/keycast"
+          docker tag keycast:local "${GHCR_IMAGE}:latest"
+          docker tag keycast:local "${GHCR_IMAGE}:${{ github.sha }}"
+          docker push "${GHCR_IMAGE}:latest"
+          docker push "${GHCR_IMAGE}:${{ github.sha }}"
 
-      - name: Build and push to POC registry
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.tags.outputs.tags }}
-          build-args: |
-            BUILD_VERSION=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  # Push to Test registry (on push to main/master or manual dispatch selecting test/all)
-  # Note: This job always runs but skips actual push when not needed, to avoid blocking dispatch-dev
-  push-test:
-    name: Push to Test Registry
-    needs: build
+  deploy:
+    name: Trigger Deploy
+    needs: docker
     runs-on: ubuntu-latest
-    # Always run on non-PR events so dispatch-dev isn't blocked by skipped status
-    if: github.event_name != 'pull_request'
-    environment: test
-    continue-on-error: true  # Don't fail workflow if test environment isn't configured
-    permissions:
-      contents: read
-      id-token: write
-    outputs:
-      pushed: ${{ steps.check.outputs.should_push }}
-
-    steps:
-      - name: Check if push is needed
-        id: check
-        run: |
-          SHOULD_PUSH="false"
-          if [ "${{ github.event_name }}" == "push" ] && [ "${{ github.ref }}" == "refs/heads/main" -o "${{ github.ref }}" == "refs/heads/master" ]; then
-            SHOULD_PUSH="true"
-          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            DEPLOY_ENV="${{ github.event.inputs.deploy_environment }}"
-            if [ "$DEPLOY_ENV" == "test" ] || [ "$DEPLOY_ENV" == "all" ]; then
-              SHOULD_PUSH="true"
-            fi
-          fi
-          echo "should_push=$SHOULD_PUSH" >> $GITHUB_OUTPUT
-          echo "Should push to test: $SHOULD_PUSH"
-
-      - uses: actions/checkout@v6
-        if: steps.check.outputs.should_push == 'true'
-
-      - name: Authenticate to GCP (Test)
-        if: steps.check.outputs.should_push == 'true'
-        uses: google-github-actions/auth@v3
-        with:
-          workload_identity_provider: projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ secrets.GCP_WORKLOAD_IDENTITY_POOL }}/providers/${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-
-      - name: Configure Docker for Artifact Registry
-        if: steps.check.outputs.should_push == 'true'
-        run: gcloud auth configure-docker ${{ env.ARTIFACT_REGISTRY }} --quiet
-
-      - name: Set up Docker Buildx
-        if: steps.check.outputs.should_push == 'true'
-        uses: docker/setup-buildx-action@v3
-
-      - name: Determine image tags
-        if: steps.check.outputs.should_push == 'true'
-        id: tags
-        run: |
-          FULL_IMAGE="${{ env.ARTIFACT_REGISTRY }}/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.GCP_ARTIFACT_REPOSITORY }}"
-          echo "tags=${FULL_IMAGE}:latest,${FULL_IMAGE}:${{ github.sha }}" >> $GITHUB_OUTPUT
-
-      - name: Build and push to Test registry
-        if: steps.check.outputs.should_push == 'true'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.tags.outputs.tags }}
-          build-args: |
-            BUILD_VERSION=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Skip notification
-        if: steps.check.outputs.should_push != 'true'
-        run: echo "Skipping test push - not selected for this deployment"
-
-  # Push to Staging registry (on push to main/master or manual dispatch selecting staging/all)
-  # Note: This job always runs but skips actual push when not needed, to avoid blocking dispatch-dev
-  push-staging:
-    name: Push to Staging Registry
-    needs: build
-    runs-on: ubuntu-latest
-    # Always run on non-PR events so dispatch-dev isn't blocked by skipped status
     if: github.event_name != 'pull_request'
     environment: staging
-    continue-on-error: true  # Don't fail workflow if staging environment isn't configured
-    permissions:
-      contents: read
-      id-token: write
-    outputs:
-      pushed: ${{ steps.check.outputs.should_push }}
 
     steps:
-      - name: Check if push is needed
-        id: check
-        run: |
-          SHOULD_PUSH="false"
-          if [ "${{ github.event_name }}" == "push" ] && [ "${{ github.ref }}" == "refs/heads/main" -o "${{ github.ref }}" == "refs/heads/master" ]; then
-            SHOULD_PUSH="true"
-          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            DEPLOY_ENV="${{ github.event.inputs.deploy_environment }}"
-            if [ "$DEPLOY_ENV" == "staging" ] || [ "$DEPLOY_ENV" == "all" ]; then
-              SHOULD_PUSH="true"
-            fi
-          fi
-          echo "should_push=$SHOULD_PUSH" >> $GITHUB_OUTPUT
-          echo "Should push to staging: $SHOULD_PUSH"
-
-      - uses: actions/checkout@v6
-        if: steps.check.outputs.should_push == 'true'
-
-      - name: Authenticate to GCP (Staging)
-        if: steps.check.outputs.should_push == 'true'
-        uses: google-github-actions/auth@v3
-        with:
-          workload_identity_provider: projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ secrets.GCP_WORKLOAD_IDENTITY_POOL }}/providers/${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-
-      - name: Configure Docker for Artifact Registry
-        if: steps.check.outputs.should_push == 'true'
-        run: gcloud auth configure-docker ${{ env.ARTIFACT_REGISTRY }} --quiet
-
-      - name: Set up Docker Buildx
-        if: steps.check.outputs.should_push == 'true'
-        uses: docker/setup-buildx-action@v3
-
-      - name: Determine image tags
-        if: steps.check.outputs.should_push == 'true'
-        id: tags
-        run: |
-          FULL_IMAGE="${{ env.ARTIFACT_REGISTRY }}/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.GCP_ARTIFACT_REPOSITORY }}"
-          echo "tags=${FULL_IMAGE}:latest,${FULL_IMAGE}:${{ github.sha }}" >> $GITHUB_OUTPUT
-
-      - name: Build and push to Staging registry
-        if: steps.check.outputs.should_push == 'true'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.tags.outputs.tags }}
-          build-args: |
-            BUILD_VERSION=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Skip notification
-        if: steps.check.outputs.should_push != 'true'
-        run: echo "Skipping staging push - not selected for this deployment"
-
-  # Push to Production registry (only on version tags)
-  push-production:
-    name: Push to Production Registry
-    needs: build
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
-    environment: production
-    permissions:
-      contents: read
-      id-token: write
-
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Authenticate to GCP (Production)
-        uses: google-github-actions/auth@v3
-        with:
-          workload_identity_provider: projects/${{ secrets.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ secrets.GCP_WORKLOAD_IDENTITY_POOL }}/providers/${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-
-      - name: Configure Docker for Artifact Registry
-        run: gcloud auth configure-docker ${{ env.ARTIFACT_REGISTRY }} --quiet
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Determine image tags
-        id: tags
-        run: |
-          FULL_IMAGE="${{ env.ARTIFACT_REGISTRY }}/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.GCP_ARTIFACT_REPOSITORY }}"
-          TAG_NAME="${GITHUB_REF#refs/tags/}"
-          echo "tags=${FULL_IMAGE}:${TAG_NAME},${FULL_IMAGE}:latest,${FULL_IMAGE}:${{ github.sha }}" >> $GITHUB_OUTPUT
-
-      - name: Build and push to Production registry
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.tags.outputs.tags }}
-          build-args: |
-            BUILD_VERSION=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  # Deploy via coreconfig
-  # - poc, test, staging: automatic on push to main/master (uses 'staging' environment)
-  # - production: on version tags (v*) or manual dispatch (uses 'production' environment)
-  dispatch-dev:
-    name: Deploy to Dev Environments
-    needs: [build, push-poc, push-test, push-staging]
-    runs-on: ubuntu-latest
-    if: |
-      always() &&
-      needs.build.result == 'success' &&
-      needs.push-poc.result == 'success' &&
-      ((github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) ||
-       (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_environment != 'production'))
-    environment: staging  # Use staging environment for non-production deployments
-
-    steps:
-      - name: Determine target environments
+      - name: Determine environments
         id: envs
         run: |
-          ENVS=()
-          ENV_DISPLAY=()
-          
-          # Always include POC if it succeeded
-          if [ "${{ needs.push-poc.result }}" == "success" ]; then
-            ENVS+=("\"poc\"")
-            ENV_DISPLAY+=("poc")
-          fi
-          
-          # Include test if it actually pushed (check output, not just job success)
-          if [ "${{ needs.push-test.outputs.pushed }}" == "true" ]; then
-            ENVS+=("\"test\"")
-            ENV_DISPLAY+=("test")
-          fi
-          
-          # Include staging if it actually pushed (check output, not just job success)
-          if [ "${{ needs.push-staging.outputs.pushed }}" == "true" ]; then
-            ENVS+=("\"staging\"")
-            ENV_DISPLAY+=("staging")
-          fi
-          
-          if [ "${{ github.event_name }}" == "push" ]; then
-            # Automatic deployment on push to main/master - use available environments
-            echo "environments=[$(IFS=,; echo "${ENVS[*]}")]" >> $GITHUB_OUTPUT
-            echo "env_display=$(IFS=', '; echo "${ENV_DISPLAY[*]}")" >> $GITHUB_OUTPUT
+          if [[ "${{ github.ref }}" == refs/tags/v* ]] || [[ "${{ inputs.include_production }}" == "true" ]]; then
+            echo 'environments=["poc","test","staging","production"]' >> $GITHUB_OUTPUT
           else
-            # Manual dispatch
-            DEPLOY_ENV="${{ github.event.inputs.deploy_environment }}"
-            if [ "$DEPLOY_ENV" == "all" ]; then
-              # Use available environments
-              echo "environments=[$(IFS=,; echo "${ENVS[*]}")]" >> $GITHUB_OUTPUT
-              echo "env_display=$(IFS=', '; echo "${ENV_DISPLAY[*]}")" >> $GITHUB_OUTPUT
-            else
-              # Single environment - only include if push job succeeded
-              if [ "$DEPLOY_ENV" == "poc" ] && [ "${{ needs.push-poc.result }}" == "success" ]; then
-                echo "environments=[\"poc\"]" >> $GITHUB_OUTPUT
-                echo "env_display=poc" >> $GITHUB_OUTPUT
-              elif [ "$DEPLOY_ENV" == "test" ] && [ "${{ needs.push-test.outputs.pushed }}" == "true" ]; then
-                echo "environments=[\"test\"]" >> $GITHUB_OUTPUT
-                echo "env_display=test" >> $GITHUB_OUTPUT
-              elif [ "$DEPLOY_ENV" == "staging" ] && [ "${{ needs.push-staging.outputs.pushed }}" == "true" ]; then
-                echo "environments=[\"staging\"]" >> $GITHUB_OUTPUT
-                echo "env_display=staging" >> $GITHUB_OUTPUT
-              else
-                echo "::error::Requested environment '$DEPLOY_ENV' push job did not succeed or environment not configured"
-                exit 1
-              fi
-            fi
-          fi
-          
-          # Ensure at least one environment is included
-          if [ ${#ENVS[@]} -eq 0 ] && [ "${{ github.event_name }}" == "push" ]; then
-            echo "::error::No environments available for deployment."
-            exit 1
+            echo 'environments=["poc","test","staging"]' >> $GITHUB_OUTPUT
           fi
 
       - name: Generate GitHub App token
@@ -513,75 +230,29 @@ jobs:
           owner: divinevideo
           repositories: divine-iac-coreconfig
 
-      - name: Dispatch image deploy to coreconfig
+      - name: Trigger image deploy
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
           cat <<EOF | gh api repos/divinevideo/divine-iac-coreconfig/dispatches --input -
           {
             "event_type": "image-deploy",
             "client_payload": {
               "application": "keycast",
               "environments": ${{ steps.envs.outputs.environments }},
-              "images": [{"name": "keycast", "tag": "${{ github.sha }}"}],
+              "images": [{"name": "keycast", "tag": "${SHORT_SHA}"}],
               "source_repo": "${{ github.repository }}",
-              "source_sha": "${{ github.sha }}",
+              "source_sha": "${SHORT_SHA}",
               "source_ref": "${{ github.ref_name }}"
             }
           }
           EOF
-          
-          echo "## 🚀 Deploy Dispatched to Dev Environments" >> $GITHUB_STEP_SUMMARY
+
+          echo "## Deploy Dispatched" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Application | keycast |" >> $GITHUB_STEP_SUMMARY
-          echo "| Image Tag | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Environments | ${{ steps.envs.outputs.env_display }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Target | [divine-iac-coreconfig](https://github.com/divinevideo/divine-iac-coreconfig/actions) |" >> $GITHUB_STEP_SUMMARY
-
-  dispatch-production:
-    name: Deploy to Production
-    needs: [build, push-production]
-    runs-on: ubuntu-latest
-    if: |
-      startsWith(github.ref, 'refs/tags/v') || 
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_environment == 'production')
-    environment: production  # Uses production environment with protection rules
-
-    steps:
-      - name: Generate GitHub App token
-        id: app-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.CORECONFIG_DISPATCH_APP_ID }}
-          private-key: ${{ secrets.CORECONFIG_DISPATCH_APP_PRIVATE_KEY }}
-          owner: divinevideo
-          repositories: divine-iac-coreconfig
-
-      - name: Dispatch image deploy to coreconfig
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          cat <<EOF | gh api repos/divinevideo/divine-iac-coreconfig/dispatches --input -
-          {
-            "event_type": "image-deploy",
-            "client_payload": {
-              "application": "keycast",
-              "environments": ["production"],
-              "images": [{"name": "keycast", "tag": "${{ github.sha }}"}],
-              "source_repo": "${{ github.repository }}",
-              "source_sha": "${{ github.sha }}",
-              "source_ref": "${{ github.ref_name }}"
-            }
-          }
-          EOF
-          
-          echo "## 🚀 Deploy Dispatched to Production" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Application | keycast |" >> $GITHUB_STEP_SUMMARY
-          echo "| Image Tag | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Environment | production |" >> $GITHUB_STEP_SUMMARY
-          echo "| Target | [divine-iac-coreconfig](https://github.com/divinevideo/divine-iac-coreconfig/actions) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image Tag | \`${SHORT_SHA}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Environments | ${{ steps.envs.outputs.environments }} |" >> $GITHUB_STEP_SUMMARY
