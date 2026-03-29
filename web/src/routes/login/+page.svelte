@@ -5,16 +5,37 @@
 	import { KeycastApi } from '$lib/keycast_api.svelte';
 	import { setCurrentUser } from '$lib/current_user.svelte';
 	import { BRAND } from '$lib/brand';
-	import { signin, SigninMethod } from '$lib/utils/auth';
+	import { signin, SigninMethod, signout } from '$lib/utils/auth';
 	import { PlugsConnected } from 'phosphor-svelte';
 	import { onMount } from 'svelte';
 
 	const api = new KeycastApi();
 	let isNip07Loading = $state(false);
 	let hasExtension = $state(false);
+	let checkingSession = $state(true);
+	let hasExistingSession = $state(false);
+	let currentSessionEmail = $state('');
+	let currentSessionPubkey = $state('');
+	let isSwitchingAccount = $state(false);
 
-	onMount(() => {
+	onMount(async () => {
 		hasExtension = typeof window !== 'undefined' && !!window.nostr;
+
+		try {
+			const status = await api.get<{
+				authenticated: boolean;
+				email?: string;
+				pubkey?: string;
+			}>('/oauth/auth-status');
+
+			hasExistingSession = !!status.authenticated;
+			currentSessionEmail = status.email || status.pubkey || '';
+			currentSessionPubkey = status.pubkey || '';
+		} catch (err) {
+			console.error('Session status check failed:', err);
+		} finally {
+			checkingSession = false;
+		}
 	});
 
 	async function handleNip07Signin() {
@@ -34,6 +55,34 @@
 	let showVerificationNotice = $state(false);
 	let unverifiedEmail = $state('');
 	let isResending = $state(false);
+
+	function resolveRedirectTarget() {
+		const redirect = $page.url.searchParams.get('redirect');
+		return redirect && redirect.startsWith('/') ? redirect : '/';
+	}
+
+	async function handleContinueAsCurrentAccount() {
+		if (currentSessionPubkey) {
+			setCurrentUser(currentSessionPubkey, 'cookie');
+		}
+		goto(resolveRedirectTarget());
+	}
+
+	async function handleUseDifferentAccount() {
+		try {
+			isSwitchingAccount = true;
+			await signout({ redirectTo: null, showToast: false });
+			hasExistingSession = false;
+			currentSessionEmail = '';
+			currentSessionPubkey = '';
+			email = '';
+			password = '';
+			showVerificationNotice = false;
+			unverifiedEmail = '';
+		} finally {
+			isSwitchingAccount = false;
+		}
+	}
 
 	async function handleLogin() {
 		if (!email || !password) {
@@ -115,7 +164,7 @@
 		<h1>Welcome back</h1>
 		<p class="subtitle">Manage your account and connected apps</p>
 
-		{#if showVerificationNotice}
+		{#if !checkingSession && showVerificationNotice && !hasExistingSession}
 			<div class="verification-notice">
 				<div class="notice-icon">
 					<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" viewBox="0 0 256 256">
@@ -137,57 +186,80 @@
 			</div>
 		{/if}
 
-		<form onsubmit={(e) => { e.preventDefault(); handleLogin(); }}>
-			<div class="form-group">
-				<label for="email">Email</label>
-				<input
-					id="email"
-					type="email"
-					bind:value={email}
-					placeholder="you@example.com"
-					required
-					disabled={isLoading}
-				/>
+		{#if checkingSession}
+			<p class="auth-note">Checking your session...</p>
+		{:else if hasExistingSession}
+			<div class="session-chooser">
+				<div class="session-card">
+					<span class="session-label">Signed in as</span>
+					<div class="session-email">{currentSessionEmail}</div>
+				</div>
+
+				<button type="button" class="btn-primary" onclick={handleContinueAsCurrentAccount}>
+					Continue as
+				</button>
+				<button
+					type="button"
+					class="btn-secondary"
+					onclick={handleUseDifferentAccount}
+					disabled={isSwitchingAccount}
+				>
+					{isSwitchingAccount ? 'Switching...' : 'Use a different account'}
+				</button>
+			</div>
+		{:else}
+			<form onsubmit={(e) => { e.preventDefault(); handleLogin(); }}>
+				<div class="form-group">
+					<label for="email">Email</label>
+					<input
+						id="email"
+						type="email"
+						bind:value={email}
+						placeholder="you@example.com"
+						required
+						disabled={isLoading}
+					/>
+				</div>
+
+				<div class="form-group">
+					<label for="password">Password</label>
+					<input
+						id="password"
+						type="password"
+						bind:value={password}
+						placeholder="••••••••"
+						required
+						disabled={isLoading}
+					/>
+				</div>
+
+				<button type="submit" class="btn-primary" disabled={isLoading}>
+					{isLoading ? 'Signing in...' : 'Sign In'}
+				</button>
+			</form>
+
+			<p class="auth-link">
+				<a href="/forgot-password">Forgot password?</a>
+			</p>
+
+			<p class="auth-link">
+				Don't have an account? <a href="/register">Create one</a>
+			</p>
+
+			{#if hasExtension}
+			<div class="auth-divider">
+				<span>or</span>
 			</div>
 
-			<div class="form-group">
-				<label for="password">Password</label>
-				<input
-					id="password"
-					type="password"
-					bind:value={password}
-					placeholder="••••••••"
-					required
-					disabled={isLoading}
-				/>
-			</div>
-
-			<button type="submit" class="btn-primary" disabled={isLoading}>
-				{isLoading ? 'Signing in...' : 'Sign In'}
+			<button
+				class="btn-extension"
+				onclick={handleNip07Signin}
+				disabled={isNip07Loading}
+			>
+				<PlugsConnected size={18} />
+				{isNip07Loading ? 'Connecting...' : 'Admin access with Nostr extension'}
 			</button>
-		</form>
-
-		<p class="auth-link">
-			<a href="/forgot-password">Forgot password?</a>
-		</p>
-
-		<p class="auth-link">
-			Don't have an account? <a href="/register">Create one</a>
-		</p>
-
-		{#if hasExtension}
-		<div class="auth-divider">
-			<span>or</span>
-		</div>
-
-		<button
-			class="btn-extension"
-			onclick={handleNip07Signin}
-			disabled={isNip07Loading}
-		>
-			<PlugsConnected size={18} />
-			{isNip07Loading ? 'Connecting...' : 'Admin access with Nostr extension'}
-		</button>
+			{/if}
 		{/if}
 	</div>
 </div>
@@ -319,6 +391,56 @@
 	.btn-primary:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
+	}
+
+	.btn-secondary {
+		width: 100%;
+		padding: 0.75rem 1.5rem;
+		background: transparent;
+		color: var(--color-divine-text);
+		border: 1px solid var(--color-divine-border);
+		border-radius: 9999px;
+		font-size: 1rem;
+		font-weight: 600;
+		cursor: pointer;
+		transition: all 0.2s;
+		margin-top: 0.75rem;
+	}
+
+	.btn-secondary:hover:not(:disabled) {
+		background: var(--color-divine-muted);
+		border-color: var(--color-divine-green);
+	}
+
+	.session-chooser {
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
+	}
+
+	.session-card {
+		padding: 1rem;
+		background: var(--color-divine-muted);
+		border: 1px solid var(--color-divine-border);
+		border-radius: 0.75rem;
+		margin-bottom: 0.25rem;
+	}
+
+	.session-label {
+		display: block;
+		font-size: 0.75rem;
+		font-weight: 600;
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
+		color: var(--color-divine-text-secondary);
+		margin-bottom: 0.35rem;
+	}
+
+	.session-email {
+		font-size: 1rem;
+		font-weight: 600;
+		color: var(--color-divine-text);
+		word-break: break-word;
 	}
 
 	.auth-link {

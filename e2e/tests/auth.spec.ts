@@ -100,6 +100,98 @@ test.describe("Authentication flows", () => {
     expect(setCookie).toContain("Max-Age=0");
   });
 
+  test("login page shows chooser when session cookie exists", async ({
+    page,
+    request,
+    context,
+  }) => {
+    const email = `e2e-login-chooser-${Date.now()}@test.local`;
+    const password = "TestPass123!";
+    const { cookie } = await registerAndVerify(request, email, password);
+    const sessionValue = parseCookieValue(cookie);
+
+    const baseURL = process.env.API_URL || "http://localhost:3000";
+    const url = new URL(baseURL);
+    await context.addCookies([
+      {
+        name: "keycast_session",
+        value: sessionValue,
+        domain: url.hostname,
+        path: "/",
+        httpOnly: true,
+        sameSite: "Lax",
+      },
+    ]);
+
+    await page.goto("/login");
+
+    await expect(page.locator("text=Continue as")).toBeVisible();
+    await expect(page.locator(`text=${email}`)).toBeVisible();
+    await expect(page.locator("text=Use a different account")).toBeVisible();
+    await expect(page.locator("input#email")).toHaveCount(0);
+  });
+
+  test("login chooser continue follows the existing redirect logic", async ({
+    page,
+    request,
+    context,
+  }) => {
+    const email = `e2e-login-continue-${Date.now()}@test.local`;
+    const password = "TestPass123!";
+    const { cookie } = await registerAndVerify(request, email, password);
+    const sessionValue = parseCookieValue(cookie);
+
+    const baseURL = process.env.API_URL || "http://localhost:3000";
+    const url = new URL(baseURL);
+    await context.addCookies([
+      {
+        name: "keycast_session",
+        value: sessionValue,
+        domain: url.hostname,
+        path: "/",
+        httpOnly: true,
+        sameSite: "Lax",
+      },
+    ]);
+
+    await page.goto("/login?redirect=%2Fsettings%2Fsecurity");
+
+    await page.locator("text=Continue as").click();
+
+    await page.waitForURL("**/settings/security");
+  });
+
+  test("login chooser switch account clears the session and shows the form", async ({
+    page,
+    request,
+    context,
+  }) => {
+    const email = `e2e-login-switch-${Date.now()}@test.local`;
+    const password = "TestPass123!";
+    const { cookie } = await registerAndVerify(request, email, password);
+    const sessionValue = parseCookieValue(cookie);
+
+    const baseURL = process.env.API_URL || "http://localhost:3000";
+    const url = new URL(baseURL);
+    await context.addCookies([
+      {
+        name: "keycast_session",
+        value: sessionValue,
+        domain: url.hostname,
+        path: "/",
+        httpOnly: true,
+        sameSite: "Lax",
+      },
+    ]);
+
+    await page.goto("/login");
+
+    await page.locator("text=Use a different account").click();
+
+    await expect(page.locator("input#email")).toBeVisible();
+    await expect(page.locator("text=Continue as")).toHaveCount(0);
+  });
+
   test("change password", async ({ request }) => {
     const email = `e2e-chpw-${Date.now()}@test.local`;
     const oldPassword = "OldPass123!";

@@ -9,6 +9,11 @@ export enum SigninMethod {
     NostrLogin = "nostr-login",
 }
 
+interface SignoutOptions {
+    redirectTo?: string | null;
+    showToast?: boolean;
+}
+
 export async function signin(
     method?: SigninMethod,
 ): Promise<string | null> {
@@ -91,7 +96,9 @@ async function nip07Login(): Promise<string | null> {
     }
 }
 
-export async function signout() {
+export async function signout(options: SignoutOptions = {}) {
+    const { redirectTo = "/", showToast = true } = options;
+
     try {
         const response = await fetch(`${getViteDomain()}/api/auth/logout`, {
             method: 'POST',
@@ -105,6 +112,10 @@ export async function signout() {
     }
 
     setCurrentUser(null);
-    toast.success("Signed out");
-    goto("/");
+    if (showToast) {
+        toast.success("Signed out");
+    }
+    if (redirectTo) {
+        goto(redirectTo);
+    }
 }
