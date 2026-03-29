@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { test, expect } from "@playwright/test";
 import { registerAndVerify, parseCookieValue } from "../helpers/auth";
 import {
@@ -18,7 +19,219 @@ async function setupUser(request: any) {
   return { email, cookie: `keycast_session=${parseCookieValue(cookie)}` };
 }
 
+async function setupBrowserUser(request: any) {
+  const email = `e2e-oauth-${Date.now()}-${Math.random().toString(36).slice(2, 6)}@test.local`;
+  const registerRes = await request.post("/api/auth/register", {
+    data: { email, password: PASSWORD },
+  });
+  if (!registerRes.ok()) {
+    const body = await registerRes.text();
+    throw new Error(`Registration failed (${registerRes.status()}): ${body}`);
+  }
+
+  let token = "";
+  for (let attempt = 0; attempt < 10; attempt++) {
+    token = execFileSync(
+      "docker",
+      [
+        "exec",
+        "keycast-postgres",
+        "psql",
+        "-U",
+        "postgres",
+        "-d",
+        "keycast_chooser",
+        "-t",
+        "-A",
+        "-c",
+        `SELECT email_verification_token FROM users WHERE email = '${email}'`,
+      ],
+      { encoding: "utf8" },
+    ).trim();
+
+    if (token) {
+      break;
+    }
+
+    await new Promise((r) => setTimeout(r, 300));
+  }
+
+  if (!token) {
+    throw new Error(`Could not find verification token for ${email}`);
+  }
+
+  const apiUrl = process.env.API_URL || "http://localhost:3000";
+  let setCookie: string | null = null;
+
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const response = execFileSync(
+      "curl",
+      [
+        "-sS",
+        "-D",
+        "-",
+        "-H",
+        "Content-Type: application/json",
+        "-H",
+        `Origin: ${apiUrl}`,
+        "-X",
+        "POST",
+        `${apiUrl}/api/auth/verify-email`,
+        "--data",
+        JSON.stringify({ token }),
+      ],
+      { encoding: "utf8" },
+    );
+
+    const headerEnd = response.indexOf("\r\n\r\n");
+    const headers = headerEnd === -1 ? response : response.slice(0, headerEnd);
+    const body = headerEnd === -1 ? "" : response.slice(headerEnd + 4);
+
+    const cookieMatch = headers.match(/^set-cookie:\s*(.+)$/im);
+    if (cookieMatch?.[1]?.includes("keycast_session=")) {
+      setCookie = cookieMatch[1];
+      break;
+    }
+
+    if (!body.includes('"status":"processing"')) {
+      throw new Error(`Email verification did not return a session cookie: ${body}`);
+    }
+
+    await new Promise((r) => setTimeout(r, 500));
+  }
+
+  if (!setCookie || !setCookie.includes("keycast_session=")) {
+    throw new Error("No keycast_session cookie in verify-email response");
+  }
+
+  return { email, cookie: `keycast_session=${parseCookieValue(setCookie)}` };
+}
+
 test.describe("OAuth consent flow", () => {
+  test("authenticated new app shows account chooser before consent", async ({
+    page,
+    request,
+    context,
+  }) => {
+    const { email, cookie } = await setupBrowserUser(request);
+    const sessionValue = cookie.replace("keycast_session=", "");
+
+    const baseURL = process.env.API_URL || "http://localhost:3000";
+    const url = new URL(baseURL);
+    await context.addCookies([
+      {
+        name: "keycast_session",
+        value: sessionValue,
+        domain: url.hostname,
+        path: "/",
+        httpOnly: true,
+        sameSite: "Lax",
+      },
+    ]);
+
+    const authorizeURL = `/api/oauth/authorize?client_id=e2e-chooser&redirect_uri=${encodeURIComponent(CALLBACK_URL)}&scope=policy:full`;
+    await page.goto(authorizeURL, { timeout: 60000 });
+
+    await expect(page.locator("text=Continue as")).toBeVisible();
+    await expect(page.locator(`text=${email}`)).toBeVisible();
+    await expect(page.locator("text=Use a different account")).toBeVisible();
+    await expect(page.locator(".btn_approve")).toHaveCount(0);
+  });
+
+  test("chooser continue renders consent for the same account", async ({
+    page,
+    request,
+    context,
+  }) => {
+    const { cookie } = await setupBrowserUser(request);
+    const sessionValue = cookie.replace("keycast_session=", "");
+
+    const baseURL = process.env.API_URL || "http://localhost:3000";
+    const url = new URL(baseURL);
+    await context.addCookies([
+      {
+        name: "keycast_session",
+        value: sessionValue,
+        domain: url.hostname,
+        path: "/",
+        httpOnly: true,
+        sameSite: "Lax",
+      },
+    ]);
+
+    const authorizeURL = `/api/oauth/authorize?client_id=e2e-chooser&redirect_uri=${encodeURIComponent(CALLBACK_URL)}&scope=policy:full`;
+    await page.goto(authorizeURL, { timeout: 60000 });
+
+    await page.locator("text=Continue as").click();
+
+    await expect(page.locator("h1")).toContainText("Authorize");
+    await expect(page.locator(".btn_approve")).toBeVisible();
+  });
+
+  test("chooser switch account clears session and shows login", async ({
+    page,
+    request,
+    context,
+  }) => {
+    const { cookie } = await setupBrowserUser(request);
+    const sessionValue = cookie.replace("keycast_session=", "");
+
+    const baseURL = process.env.API_URL || "http://localhost:3000";
+    const url = new URL(baseURL);
+    await context.addCookies([
+      {
+        name: "keycast_session",
+        value: sessionValue,
+        domain: url.hostname,
+        path: "/",
+        httpOnly: true,
+        sameSite: "Lax",
+      },
+    ]);
+
+    const authorizeURL = `/api/oauth/authorize?client_id=e2e-chooser&redirect_uri=${encodeURIComponent(CALLBACK_URL)}&scope=policy:full`;
+    await page.goto(authorizeURL, { timeout: 60000 });
+
+    await page.locator("text=Use a different account").click();
+
+    await expect(page.locator("h1")).toContainText("Sign in");
+    await expect(page.locator("input#login_email")).toBeVisible();
+  });
+
+  test("consent keeps the chosen account explicit and allows switching", async ({
+    page,
+    request,
+    context,
+  }) => {
+    const { email, cookie } = await setupBrowserUser(request);
+    const sessionValue = cookie.replace("keycast_session=", "");
+
+    const baseURL = process.env.API_URL || "http://localhost:3000";
+    const url = new URL(baseURL);
+    await context.addCookies([
+      {
+        name: "keycast_session",
+        value: sessionValue,
+        domain: url.hostname,
+        path: "/",
+        httpOnly: true,
+        sameSite: "Lax",
+      },
+    ]);
+
+    const authorizeURL = `/api/oauth/authorize?client_id=e2e-chooser&redirect_uri=${encodeURIComponent(CALLBACK_URL)}&scope=policy:full`;
+    await page.goto(authorizeURL, { timeout: 60000 });
+
+    await page.locator("text=Continue as").click();
+
+    await expect(page.locator("text=Signed in as")).toBeVisible();
+    await expect(page.locator(`text=${email}`)).toBeVisible();
+    await page.locator("text=Use a different account").click();
+
+    await expect(page.locator("h1")).toContainText("Sign in");
+    await expect(page.locator("input#login_email")).toBeVisible();
+  });
+
   test("consent approve redirects with code", async ({
     page,
     request,
@@ -43,6 +256,7 @@ test.describe("OAuth consent flow", () => {
     const authorizeURL = `/api/oauth/authorize?client_id=e2e-test&redirect_uri=${encodeURIComponent(CALLBACK_URL)}&scope=policy:full`;
     await page.goto(authorizeURL, { timeout: 60000 });
 
+    await page.locator("text=Continue as").click();
     await expect(page.locator("h1")).toContainText("Authorize");
     await expect(page.locator("#display_name")).toBeVisible();
     await page.locator(".btn_approve").click();
@@ -81,6 +295,7 @@ test.describe("OAuth consent flow", () => {
     const authorizeURL = `/api/oauth/authorize?client_id=e2e-deny-test&redirect_uri=${encodeURIComponent(CALLBACK_URL)}&scope=policy:full`;
     await page.goto(authorizeURL);
 
+    await page.locator("text=Continue as").click();
     await expect(page.locator("h1")).toContainText("Authorize");
     await page.locator(".btn_deny").click();
 

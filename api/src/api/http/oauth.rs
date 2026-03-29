@@ -203,6 +203,7 @@ pub struct AuthorizeRequest {
     pub byok_pubkey: Option<String>, // BYOK: force registration with this pubkey
     pub default_register: Option<bool>, // Legacy: show register form by default
     pub authorization_handle: Option<String>, // For silent re-authentication
+    pub screen: Option<String>, // Internal auth-server UI state, e.g. "consent"
 }
 
 #[derive(Debug, Deserialize)]
@@ -578,6 +579,8 @@ pub async fn authorize_get(
         (None, false, None)
     };
 
+    let mut has_existing_authorization = false;
+
     // Check for silent re-authentication via authorization_handle (primary mechanism)
     if let Some(ref pubkey) = user_pubkey {
         let previous_auth_id: Option<i32> = if let Some(ref handle) = params.authorization_handle {
@@ -597,6 +600,7 @@ pub async fn authorize_get(
             "Authorization handle lookup: found={}",
             previous_auth_id.is_some()
         );
+        has_existing_authorization = previous_auth_id.is_some();
 
         // Skip auto-approve if prompt=consent (always show approval screen)
         if previous_auth_id.is_some() && !force_consent {
@@ -647,13 +651,16 @@ pub async fn authorize_get(
     // Origin-based auto-approve fallback: if no handle was provided (or handle was invalid),
     // check if the user already has an active authorization for this origin.
     if let Some(ref pubkey) = user_pubkey {
-        if !force_consent {
-            let redirect_origin = extract_origin(&params.redirect_uri)?;
-            let repo = OAuthAuthorizationRepository::new(pool.clone());
-            if repo
-                .has_active_for_origin(pubkey, &redirect_origin, tenant_id)
-                .await?
-            {
+        let redirect_origin = extract_origin(&params.redirect_uri)?;
+        let repo = OAuthAuthorizationRepository::new(pool.clone());
+        let has_active_origin_authorization = repo
+            .has_active_for_origin(pubkey, &redirect_origin, tenant_id)
+            .await?;
+
+        if has_active_origin_authorization {
+            has_existing_authorization = true;
+
+            if !force_consent {
                 tracing::info!(
                     "Auto-approving via active origin authorization for user {} origin {}",
                     pubkey,
@@ -739,6 +746,8 @@ pub async fn authorize_get(
         }
     };
 
+    let chooser_confirmed = params.screen.as_deref() == Some("consent");
+
     let html = if let Some(pubkey) = user_pubkey {
         // Convert pubkey to npub for display
         let npub = nostr_sdk::PublicKey::from_hex(&pubkey)
@@ -746,9 +755,162 @@ pub async fn authorize_get(
             .and_then(|pk| pk.to_bech32().ok())
             .unwrap_or_else(|| pubkey.clone());
 
-        // User is authenticated - show approval screen
-        format!(
-            r#"
+        if !chooser_confirmed && !has_existing_authorization {
+            let identity_label = user_email.as_deref().unwrap_or(npub.as_str());
+            format!(
+                r#"
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Choose Account</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {{
+            --divine-green: #27C58B;
+            --divine-green-dark: #1AA575;
+            --bg: #F9F7F6;
+            --surface: hsl(0 0% 100%);
+            --border: hsl(214.3 31.8% 91.4%);
+            --text: hsl(222.2 84% 4.9%);
+            --text-secondary: hsl(215.4 16.3% 46.9%);
+            --muted: hsl(210 40% 96.1%);
+        }}
+        * {{
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }}
+        body {{
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 1rem;
+        }}
+        .container {{
+            width: 100%;
+            max-width: 420px;
+        }}
+        .header {{
+            text-align: center;
+            margin-bottom: 1.5rem;
+        }}
+        .header h1 {{
+            font-family: 'Bricolage Grotesque', system-ui, sans-serif;
+            font-size: 1.75rem;
+            margin-bottom: 0.5rem;
+        }}
+        .header p {{
+            color: var(--text-secondary);
+            line-height: 1.5;
+        }}
+        .card {{
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 1.5rem;
+            box-shadow: 0 18px 60px rgba(11, 18, 32, 0.08);
+        }}
+        .account {{
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 1rem;
+            margin-bottom: 1rem;
+        }}
+        .account-label {{
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.35rem;
+        }}
+        .account-value {{
+            font-size: 1rem;
+            font-weight: 600;
+            word-break: break-word;
+        }}
+        .app-context {{
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            line-height: 1.5;
+            margin-bottom: 1rem;
+        }}
+        .actions {{
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }}
+        button {{
+            width: 100%;
+            border: none;
+            border-radius: 9999px;
+            padding: 0.9rem 1.1rem;
+            font-size: 0.95rem;
+            font-weight: 600;
+            cursor: pointer;
+        }}
+        .continue {{
+            background: var(--divine-green);
+            color: white;
+        }}
+        .switch {{
+            background: var(--muted);
+            color: var(--text);
+            border: 1px solid var(--border);
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Choose an account</h1>
+            <p>{} wants to connect to your Keycast account. Confirm which account you want to use before reviewing access.</p>
+        </div>
+        <div class="card">
+            <div class="account">
+                <div class="account-label">Signed in as</div>
+                <div class="account-value">{}</div>
+            </div>
+            <p class="app-context">You’re already signed in on this browser, but this app hasn’t been authorized yet.</p>
+            <div class="actions">
+                <button type="button" class="continue" onclick="continueAsCurrentAccount()">Continue as</button>
+                <button type="button" class="switch" onclick="useDifferentAccount()">Use a different account</button>
+            </div>
+        </div>
+    </div>
+    <script>
+        function continueAsCurrentAccount() {{
+            const url = new URL(window.location.href);
+            url.searchParams.set('screen', 'consent');
+            window.location.href = url.toString();
+        }}
+
+        async function useDifferentAccount() {{
+            await fetch('/api/auth/logout', {{
+                method: 'POST',
+                credentials: 'include',
+            }});
+
+            const url = new URL(window.location.href);
+            url.searchParams.delete('screen');
+            window.location.href = url.toString();
+        }}
+    </script>
+</body>
+</html>
+        "#,
+                params.client_id, // header app context
+                identity_label,   // signed-in identity
+            )
+        } else {
+            // User is authenticated - show approval screen
+            format!(
+                r#"
 <!DOCTYPE html>
 <html>
 <head>
@@ -882,6 +1044,42 @@ pub async fn authorize_get(
             font-weight: 600;
             color: var(--text);
         }}
+        .session_notice {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
+            padding: 0.9rem 1rem;
+            margin-bottom: 1rem;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            background: color-mix(in srgb, var(--divine-green) 8%, var(--surface));
+        }}
+        .session_label {{
+            display: block;
+            font-size: 0.75rem;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            color: var(--text-secondary);
+            margin-bottom: 0.2rem;
+        }}
+        .session_identity {{
+            font-size: 0.95rem;
+            font-weight: 600;
+            color: var(--text);
+            word-break: break-word;
+        }}
+        .switch_account {{
+            flex: 0 0 auto;
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 0.7rem 0.95rem;
+        }}
+        .switch_account:hover {{
+            background: var(--muted);
+        }}
         .permissions_list {{
             margin-bottom: 1rem;
         }}
@@ -1011,6 +1209,14 @@ pub async fn authorize_get(
                     <div class="app_domain" id="app_domain"></div>
                     <h2 id="app_name">{}</h2>
                 </div>
+            </div>
+
+            <div class="session_notice">
+                <div class="session_copy">
+                    <span class="session_label">Signed in as</span>
+                    <div class="session_identity">{}</div>
+                </div>
+                <button type="button" class="switch_account" onclick="useDifferentAccount()">Use a different account</button>
             </div>
 
             <div class="permissions_list" id="permissions_list">
@@ -1220,6 +1426,17 @@ pub async fn authorize_get(
             }}
         }}
 
+        async function useDifferentAccount() {{
+            await fetch('/api/auth/logout', {{
+                method: 'POST',
+                credentials: 'include',
+            }});
+
+            const url = new URL(window.location.href);
+            url.searchParams.delete('screen');
+            window.location.href = url.toString();
+        }}
+
         function deny() {{
             let url = `${{redirectUri}}?error=access_denied`;
             if (oauthState) url += `&state=${{encodeURIComponent(oauthState)}}`;
@@ -1229,25 +1446,27 @@ pub async fn authorize_get(
 </body>
 </html>
         "#,
-            params.client_id, // <title>
-            params
-                .client_id
-                .chars()
-                .next()
-                .unwrap_or('A')
-                .to_uppercase(), // app icon letter
-            params.client_id, // app name
-            npub,             // npub_fallback display (hidden)
-            params.client_id, // JS clientId
-            params.redirect_uri, // JS redirectUri
-            scope_str,        // JS scope
-            params.code_challenge.as_deref().unwrap_or(""), // JS codeChallenge
-            params.code_challenge_method.as_deref().unwrap_or(""), // JS codeChallengeMethod
-            params.state.as_deref().unwrap_or(""), // JS oauthState
-            pubkey,           // JS userPubkey (hex)
-            user_email.as_deref().unwrap_or(""), // JS userEmail
-            policy_info_json, // JS policyInfo (JSON object)
-        )
+                params.client_id, // <title>
+                params
+                    .client_id
+                    .chars()
+                    .next()
+                    .unwrap_or('A')
+                    .to_uppercase(), // app icon letter
+                params.client_id, // app name
+                user_email.as_deref().unwrap_or(npub.as_str()), // explicit session identity
+                npub,             // npub_fallback display (hidden)
+                params.client_id, // JS clientId
+                params.redirect_uri, // JS redirectUri
+                scope_str,        // JS scope
+                params.code_challenge.as_deref().unwrap_or(""), // JS codeChallenge
+                params.code_challenge_method.as_deref().unwrap_or(""), // JS codeChallengeMethod
+                params.state.as_deref().unwrap_or(""), // JS oauthState
+                pubkey,           // JS userPubkey (hex)
+                user_email.as_deref().unwrap_or(""), // JS userEmail
+                policy_info_json, // JS policyInfo (JSON object)
+            )
+        }
     } else {
         // User not authenticated - show login/register form (divine.video-inspired design)
         format!(
