@@ -35,8 +35,10 @@ info:
   license:
     name: MIT
 servers:
+  - url: https://entryway.divine.video/api
+    description: Production ATProto Authorization Server
   - url: https://login.divine.video/api
-    description: Production server
+    description: Production DiVine and Nostr login server
   - url: http://localhost:3000/api
     description: Local development
 

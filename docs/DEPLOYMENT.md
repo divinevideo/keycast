@@ -235,6 +235,33 @@ GKE/ArgoCD deploys roll back by reverting the pinned image tag in `divine-iac-co
 
 **Key insight:** The app degrades gracefully for Redis/KMS partial failures but has no circuit breaker for database issues.
 
+## ATProto Entryway Groundwork
+
+The ATProto entryway surface is intentionally gated off by default.
+
+Required env vars to enable it:
+
+- `ATPROTO_ENTRYWAY_ENABLED=true`
+- `ATPROTO_ENTRYWAY_ORIGIN=https://entryway.divine.video`
+
+`entryway.divine.video` is the only public ATProto Authorization Server host in this setup. `login.divine.video` remains the human-facing DiVine and Nostr login surface.
+
+Optional:
+
+- `ATPROTO_ENTRYWAY_HOSTS=entryway.divine.video`
+
+Current safety boundary:
+
+- host matching uses the incoming `Host` or `:authority` value only
+- the metadata origin is normalized from `ATPROTO_ENTRYWAY_ORIGIN` as scheme + host + optional port only, and invalid values fail closed with no metadata response
+- PAR request state is process-local in memory
+- the discovery document only advertises the token capabilities this slice actually supports
+
+Operational constraint for this groundwork slice:
+
+- only enable this on a single instance while the PAR store remains in-process
+- do not treat it as horizontally safe until PAR state is moved to shared persistence
+
 ---
 
 ## Secrets and Config Reload
