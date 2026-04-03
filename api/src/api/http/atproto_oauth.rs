@@ -1045,7 +1045,7 @@ pub async fn authorize(
         return Err(AuthError::BadRequest("Expired request_uri".to_string()));
     }
 
-    let user_pubkey = match extract_user_from_token(&headers).await {
+    let user_pubkey = match extract_user_from_token(&headers, session.tenant_id).await {
         Ok(user_pubkey) => user_pubkey,
         Err(AuthError::MissingToken | AuthError::InvalidToken) => {
             return Ok(redirect_to_login(&request.request_uri).into_response());

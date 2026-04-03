@@ -1483,6 +1483,7 @@ pub async fn authorize_get(
             user_email_js = js_string_literal(&user_email.as_deref().unwrap_or("")),
             policy_info_json = policy_info_json, // already JSON-serialized
         )
+        }
     } else {
         // User not authenticated - show login/register form (divine.video-inspired design)
         format!(
