@@ -155,9 +155,10 @@ pub fn verify_dpop_proof(
     // This prevents an attacker from poisoning the cache with a forged JTI
     if alg == "ES256" {
         verify_es256_signature(parts[0], parts[1], parts[2], jwk)?;
+    } else {
+        // EdDSA verification requires ed25519-dalek dependency — reject until implemented
+        return Err(anyhow!("DPoP algorithm '{}' is not yet supported (only ES256)", alg));
     }
-    // Note: EdDSA signature verification would require ed25519-dalek dependency
-    // For now, EdDSA proofs are parsed but not cryptographically verified
 
     // Periodically clean expired JTI entries
     maybe_cleanup_jtis();
