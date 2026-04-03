@@ -1466,23 +1466,31 @@ pub async fn authorize_get(
 </body>
 </html>
         "#,
-            client_id_html = escape_html(&params.client_id),
-            app_icon_letter = escape_html(
-                &params.client_id.chars().next().unwrap_or('A').to_uppercase().to_string()
-            ),
-            client_id_html2 = escape_html(&params.client_id),
-            session_identity_html = escape_html(user_email.as_deref().unwrap_or(npub.as_str())),
-            npub_html = escape_html(&npub),
-            client_id_js = js_string_literal(&params.client_id),
-            redirect_uri_js = js_string_literal(&params.redirect_uri),
-            scope_js = js_string_literal(&scope_str),
-            code_challenge_js = js_string_literal(&params.code_challenge.as_deref().unwrap_or("")),
-            code_challenge_method_js = js_string_literal(&params.code_challenge_method.as_deref().unwrap_or("")),
-            oauth_state_js = js_string_literal(&params.state.as_deref().unwrap_or("")),
-            user_pubkey_js = js_string_literal(&pubkey),
-            user_email_js = js_string_literal(&user_email.as_deref().unwrap_or("")),
-            policy_info_json = policy_info_json, // already JSON-serialized
-        )
+                client_id_html = escape_html(&params.client_id),
+                app_icon_letter = escape_html(
+                    &params
+                        .client_id
+                        .chars()
+                        .next()
+                        .unwrap_or('A')
+                        .to_uppercase()
+                        .to_string()
+                ),
+                client_id_html2 = escape_html(&params.client_id),
+                session_identity_html = escape_html(user_email.as_deref().unwrap_or(npub.as_str())),
+                npub_html = escape_html(&npub),
+                client_id_js = js_string_literal(&params.client_id),
+                redirect_uri_js = js_string_literal(&params.redirect_uri),
+                scope_js = js_string_literal(&scope_str),
+                code_challenge_js =
+                    js_string_literal(&params.code_challenge.as_deref().unwrap_or("")),
+                code_challenge_method_js =
+                    js_string_literal(&params.code_challenge_method.as_deref().unwrap_or("")),
+                oauth_state_js = js_string_literal(&params.state.as_deref().unwrap_or("")),
+                user_pubkey_js = js_string_literal(&pubkey),
+                user_email_js = js_string_literal(&user_email.as_deref().unwrap_or("")),
+                policy_info_json = policy_info_json, // already JSON-serialized
+            )
         }
     } else {
         // User not authenticated - show login/register form (divine.video-inspired design)
@@ -2159,14 +2167,21 @@ pub async fn authorize_get(
         "#,
             client_id_html = escape_html(&params.client_id),
             app_icon_letter = escape_html(
-                &params.client_id.chars().next().unwrap_or('A').to_uppercase().to_string()
+                &params
+                    .client_id
+                    .chars()
+                    .next()
+                    .unwrap_or('A')
+                    .to_uppercase()
+                    .to_string()
             ),
             client_id_html2 = escape_html(&params.client_id),
             client_id_js = js_string_literal(&params.client_id),
             redirect_uri_js = js_string_literal(&params.redirect_uri),
             scope_js = js_string_literal(&scope_str),
             code_challenge_js = js_string_literal(&params.code_challenge.as_deref().unwrap_or("")),
-            code_challenge_method_js = js_string_literal(&params.code_challenge_method.as_deref().unwrap_or("")),
+            code_challenge_method_js =
+                js_string_literal(&params.code_challenge_method.as_deref().unwrap_or("")),
         )
     };
 
@@ -2202,7 +2217,9 @@ pub async fn authorize_post(
 
     // In strict mode, reject unregistered client_ids (defense-in-depth, mirrors authorize_get check)
     {
-        let client_repo = keycast_core::repositories::RegisteredClientRepository::new(auth_state.state.db.clone());
+        let client_repo = keycast_core::repositories::RegisteredClientRepository::new(
+            auth_state.state.db.clone(),
+        );
 
         if let Err(e) = client_repo
             .require_registered_client(&req.client_id, tenant_id)
@@ -3739,7 +3756,14 @@ pub async fn connect_get(
 </html>
     "#,
         app_name_html = escape_html(app_name),
-        app_icon_html = escape_html(&app_name.chars().next().unwrap_or('A').to_uppercase().to_string()),
+        app_icon_html = escape_html(
+            &app_name
+                .chars()
+                .next()
+                .unwrap_or('A')
+                .to_uppercase()
+                .to_string()
+        ),
         relay_html = escape_html(&params.relay),
         client_pubkey_attr = escape_attr(&client_pubkey),
         relay_attr = escape_attr(&params.relay),

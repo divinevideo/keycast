@@ -473,7 +473,10 @@ mod tests {
 
         // Validate against tenant 2 - should fail with tenant mismatch
         let result = validate_ucan_token(&auth_header, 2).await;
-        assert!(result.is_err(), "Token for tenant 1 should be rejected by tenant 2");
+        assert!(
+            result.is_err(),
+            "Token for tenant 1 should be rejected by tenant 2"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("Tenant mismatch"),
@@ -497,7 +500,10 @@ mod tests {
 
         // Validate against tenant 1 - should fail
         let result = validate_ucan_token(&auth_header, 1).await;
-        assert!(result.is_err(), "Token for tenant 2 should be rejected by tenant 1");
+        assert!(
+            result.is_err(),
+            "Token for tenant 2 should be rejected by tenant 1"
+        );
         assert!(
             result.unwrap_err().to_string().contains("Tenant mismatch"),
             "Error should mention tenant mismatch"

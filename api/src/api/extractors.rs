@@ -37,21 +37,20 @@ fn extract_admin_role(ucan: &ucan::Ucan) -> Option<String> {
 
 /// Enforce DPoP binding if the UCAN has a cnf.jkt claim.
 /// Constructs the htu from the request method and path.
-fn enforce_dpop_if_bound(
-    parts: &Parts,
-    ucan: &ucan::Ucan,
-) -> Result<(), AuthError> {
+fn enforce_dpop_if_bound(parts: &Parts, ucan: &ucan::Ucan) -> Result<(), AuthError> {
     let cnf_jkt = crate::ucan_auth::extract_cnf_jkt_from_ucan(ucan);
     if cnf_jkt.is_none() {
         return Ok(()); // No DPoP binding, nothing to enforce
     }
 
     let method = parts.method.as_str();
-    let scheme = parts.headers
+    let scheme = parts
+        .headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("http");
-    let host = parts.headers
+    let host = parts
+        .headers
         .get("host")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("localhost");

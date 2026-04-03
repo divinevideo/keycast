@@ -157,7 +157,10 @@ pub fn verify_dpop_proof(
         verify_es256_signature(parts[0], parts[1], parts[2], jwk)?;
     } else {
         // EdDSA verification requires ed25519-dalek dependency — reject until implemented
-        return Err(anyhow!("DPoP algorithm '{}' is not yet supported (only ES256)", alg));
+        return Err(anyhow!(
+            "DPoP algorithm '{}' is not yet supported (only ES256)",
+            alg
+        ));
     }
 
     // Periodically clean expired JTI entries
@@ -351,8 +354,8 @@ pub fn enforce_dpop_binding(
 mod tests {
     use super::*;
     use axum::http::HeaderMap;
-    use p256::ecdsa::SigningKey;
     use p256::ecdsa::signature::Signer;
+    use p256::ecdsa::SigningKey;
     use rand::rngs::OsRng;
 
     /// Helper to create a DPoP proof JWT signed with ES256
@@ -434,12 +437,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("DPoP", proof.parse().unwrap());
 
-        let result = verify_dpop_proof(
-            &headers,
-            "POST",
-            "https://example.com/api/nostr",
-            None,
-        );
+        let result = verify_dpop_proof(&headers, "POST", "https://example.com/api/nostr", None);
 
         assert!(result.is_ok());
         let verified = result.unwrap();
@@ -490,12 +488,7 @@ mod tests {
     #[test]
     fn test_no_dpop_header_returns_none() {
         let headers = HeaderMap::new();
-        let result = verify_dpop_proof(
-            &headers,
-            "POST",
-            "https://example.com/api/nostr",
-            None,
-        );
+        let result = verify_dpop_proof(&headers, "POST", "https://example.com/api/nostr", None);
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }
@@ -542,22 +535,12 @@ mod tests {
         headers.insert("DPoP", proof.parse().unwrap());
 
         // First use should succeed
-        let result = verify_dpop_proof(
-            &headers,
-            "POST",
-            "https://example.com/api/nostr",
-            None,
-        );
+        let result = verify_dpop_proof(&headers, "POST", "https://example.com/api/nostr", None);
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
 
         // Second use with same JTI should fail
-        let result2 = verify_dpop_proof(
-            &headers,
-            "POST",
-            "https://example.com/api/nostr",
-            None,
-        );
+        let result2 = verify_dpop_proof(&headers, "POST", "https://example.com/api/nostr", None);
         assert!(result2.is_err());
         let err = result2.unwrap_err().to_string();
         assert!(
@@ -583,12 +566,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("DPoP", proof.parse().unwrap());
 
-        let result = verify_dpop_proof(
-            &headers,
-            "POST",
-            "https://example.com/api/nostr",
-            None,
-        );
+        let result = verify_dpop_proof(&headers, "POST", "https://example.com/api/nostr", None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -614,12 +592,7 @@ mod tests {
         headers.insert("DPoP", proof.parse().unwrap());
 
         // But we expect POST
-        let result = verify_dpop_proof(
-            &headers,
-            "POST",
-            "https://example.com/api/nostr",
-            None,
-        );
+        let result = verify_dpop_proof(&headers, "POST", "https://example.com/api/nostr", None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -644,12 +617,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("DPoP", proof.parse().unwrap());
 
-        let result = verify_dpop_proof(
-            &headers,
-            "POST",
-            "https://example.com/api/nostr",
-            None,
-        );
+        let result = verify_dpop_proof(&headers, "POST", "https://example.com/api/nostr", None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -664,12 +632,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("DPoP", "not-a-jwt".parse().unwrap());
 
-        let result = verify_dpop_proof(
-            &headers,
-            "POST",
-            "https://example.com/api/nostr",
-            None,
-        );
+        let result = verify_dpop_proof(&headers, "POST", "https://example.com/api/nostr", None);
         assert!(result.is_err());
     }
 }

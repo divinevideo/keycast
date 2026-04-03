@@ -471,7 +471,12 @@ async fn get_handler(
         {
             if let Some(expected_jkt) = crate::ucan_auth::extract_cnf_jkt_from_ucan(&ucan) {
                 let htu = construct_htu(headers);
-                match crate::ucan_auth::verify_dpop_proof(headers, "POST", &htu, Some(&expected_jkt)) {
+                match crate::ucan_auth::verify_dpop_proof(
+                    headers,
+                    "POST",
+                    &htu,
+                    Some(&expected_jkt),
+                ) {
                     Ok(Some(_)) => {
                         tracing::debug!("RPC: DPoP binding verified on cache hit");
                     }
@@ -510,7 +515,7 @@ async fn get_handler(
     if let Some(expected_jkt) = crate::ucan_auth::extract_cnf_jkt_from_ucan(&ucan) {
         // RFC 9449 requires htu to be the absolute URI (scheme + host + path)
         let htu = construct_htu(headers);
-        match crate::ucan_auth::verify_dpop_proof(&headers, "POST", &htu, Some(&expected_jkt)) {
+        match crate::ucan_auth::verify_dpop_proof(headers, "POST", &htu, Some(&expected_jkt)) {
             Ok(Some(_)) => {
                 tracing::debug!("RPC: DPoP binding verified for cnf.jkt");
             }

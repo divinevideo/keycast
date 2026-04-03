@@ -72,16 +72,16 @@ mod tests {
 
     #[test]
     fn js_string_literal_escapes_quotes_and_backslash() {
-        assert_eq!(
-            js_string_literal(&r#"a"b\c"#),
-            r#""a\"b\\c""#
-        );
+        assert_eq!(js_string_literal(&r#"a"b\c"#), r#""a\"b\\c""#);
     }
 
     #[test]
     fn js_string_literal_escapes_script_close_tag() {
         let result = js_string_literal(&"</script><img src=x onerror=alert(1)>");
-        assert!(!result.contains("</script>"), "must not contain literal </script>");
+        assert!(
+            !result.contains("</script>"),
+            "must not contain literal </script>"
+        );
         assert!(result.contains("<\\/script>"));
     }
 

@@ -552,18 +552,27 @@ mod tests {
             .find_by_bunker_pubkey_for_tenant(&bunker_pubkey, tenant_id)
             .await
             .unwrap();
-        assert!(result.is_some(), "Should find authorization for correct tenant");
+        assert!(
+            result.is_some(),
+            "Should find authorization for correct tenant"
+        );
 
         // Different tenant should NOT find the authorization
         let result = repo
             .find_by_bunker_pubkey_for_tenant(&bunker_pubkey, wrong_tenant_id)
             .await
             .unwrap();
-        assert!(result.is_none(), "Should not find authorization for wrong tenant");
+        assert!(
+            result.is_none(),
+            "Should not find authorization for wrong tenant"
+        );
 
         // Unscoped version should still find it (for signer daemon use)
         let result = repo.find_by_bunker_pubkey(&bunker_pubkey).await.unwrap();
-        assert!(result.is_some(), "Unscoped version should find authorization");
+        assert!(
+            result.is_some(),
+            "Unscoped version should find authorization"
+        );
     }
 
     #[tokio::test]
