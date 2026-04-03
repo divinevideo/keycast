@@ -234,7 +234,20 @@ fn validate_domain(domain: &str) -> Result<(), TenantError> {
         return Ok(());
     }
 
-    // No allowlist configured - fall back to format validation (auto-provisioning enabled)
+    // No allowlist configured - check if auto-provisioning is explicitly enabled
+    let auto_provisioning_enabled = std::env::var("ENABLE_TENANT_AUTO_PROVISIONING")
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if !auto_provisioning_enabled {
+        // Auto-provisioning disabled (production default) - reject unknown domains
+        return Err(TenantError::ValidationFailed(format!(
+            "Domain '{}' not allowed. Set ALLOWED_TENANT_DOMAINS or ENABLE_TENANT_AUTO_PROVISIONING=true",
+            domain
+        )));
+    }
+
+    // Auto-provisioning enabled - fall back to format validation
 
     // Length check (max 253 chars per DNS spec)
     if domain.len() > 253 {
@@ -511,9 +524,23 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_validate_domain_no_allowlist_uses_format_validation() {
-        // Ensure no allowlist is set
+    fn test_validate_domain_no_allowlist_no_auto_provisioning_rejects_all() {
+        // Ensure no allowlist and no auto-provisioning
         std::env::remove_var("ALLOWED_TENANT_DOMAINS");
+        std::env::remove_var("ENABLE_TENANT_AUTO_PROVISIONING");
+
+        // All domains should be rejected when neither is configured
+        assert!(validate_domain("example.com").is_err());
+        assert!(validate_domain("localhost").is_err());
+        assert!(validate_domain("any-domain.io").is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_validate_domain_auto_provisioning_uses_format_validation() {
+        // Enable auto-provisioning but no allowlist
+        std::env::remove_var("ALLOWED_TENANT_DOMAINS");
+        std::env::set_var("ENABLE_TENANT_AUTO_PROVISIONING", "true");
 
         // Valid domains pass format validation
         assert!(validate_domain("example.com").is_ok());
@@ -523,5 +550,26 @@ mod tests {
         assert!(validate_domain("").is_err());
         assert!(validate_domain("no-dot").is_err());
         assert!(validate_domain("192.168.1.1").is_err());
+
+        // Clean up
+        std::env::remove_var("ENABLE_TENANT_AUTO_PROVISIONING");
+    }
+
+    #[test]
+    #[serial]
+    fn test_auto_provisioning_blocked_by_default() {
+        // Ensure clean state
+        std::env::remove_var("ALLOWED_TENANT_DOMAINS");
+        std::env::remove_var("ENABLE_TENANT_AUTO_PROVISIONING");
+
+        // Even valid-looking domains should be rejected
+        let result = validate_domain("totally-valid.example.com");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not allowed"),
+            "Error should mention domain not allowed: {}",
+            err_msg
+        );
     }
 }

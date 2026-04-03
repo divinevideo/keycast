@@ -89,11 +89,32 @@ impl PersonalKeysRepository {
 
     /// Delete all personal keys for a user.
     /// Used when user changes their key identity.
+    ///
+    /// WARNING: Not tenant-scoped. Prefer `delete_by_user_for_tenant` for request paths.
     pub async fn delete_by_user(&self, user_pubkey: &str) -> Result<(), RepositoryError> {
         sqlx::query("DELETE FROM personal_keys WHERE user_pubkey = $1")
             .bind(user_pubkey)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    /// Delete personal keys for a user within a specific tenant.
+    /// Ensures tenant isolation by joining with users table.
+    pub async fn delete_by_user_for_tenant(
+        &self,
+        user_pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "DELETE FROM personal_keys
+             WHERE user_pubkey = $1
+               AND tenant_id = $2",
+        )
+        .bind(user_pubkey)
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 }

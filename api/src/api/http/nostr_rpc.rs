@@ -244,14 +244,15 @@ async fn load_handler_on_demand(
     auth_state: &AuthState,
     pool: &sqlx::PgPool,
     bunker_pubkey_hex: &str,
+    tenant_id: i64,
 ) -> Result<Arc<HttpRpcHandler>, RpcError> {
     let key_manager = auth_state.state.key_manager.as_ref();
 
-    // Query oauth_authorization for this bunker_pubkey
+    // Query oauth_authorization for this bunker_pubkey, scoped to tenant
     // Includes: expires_at, revoked_at (for validity), policy_id (for permissions)
     let oauth_auth_repo = OAuthAuthorizationRepository::new(pool.clone());
     let auth_data = oauth_auth_repo
-        .find_by_bunker_pubkey(bunker_pubkey_hex)
+        .find_by_bunker_pubkey_for_tenant(bunker_pubkey_hex, tenant_id)
         .await
         .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?;
 
@@ -275,10 +276,10 @@ async fn load_handler_on_demand(
         vec![]
     };
 
-    // Get user's encrypted secret key
+    // Get user's encrypted secret key, scoped to tenant
     let personal_keys_repo = PersonalKeysRepository::new(pool.clone());
     let encrypted_secret: Vec<u8> = personal_keys_repo
-        .find_encrypted_key(&user_pubkey)
+        .find_encrypted_key_for_tenant(&user_pubkey, tenant_id)
         .await
         .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?
         .ok_or_else(|| RpcError::Internal("Personal keys not found".to_string()))?;
@@ -365,10 +366,10 @@ async fn load_preloaded_user_handler(
         return Err(RpcError::Auth(AuthError::InvalidToken));
     }
 
-    // Get user's encrypted secret key directly from personal_keys
+    // Get user's encrypted secret key, scoped to tenant
     let personal_keys_repo = PersonalKeysRepository::new(pool.clone());
     let encrypted_secret: Vec<u8> = personal_keys_repo
-        .find_encrypted_key(user_pubkey_hex)
+        .find_encrypted_key_for_tenant(user_pubkey_hex, tenant_id)
         .await
         .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?
         .ok_or_else(|| {
@@ -464,8 +465,8 @@ async fn get_handler(
 
     // Determine which authentication mode to use
     let handler = if let Some(bunker_key_hex) = bunker_pubkey {
-        // MODE 1: OAuth token with bunker_pubkey - load from oauth_authorizations
-        let h = load_handler_on_demand(auth_state, pool, &bunker_key_hex).await?;
+        // MODE 1: OAuth token with bunker_pubkey - load from oauth_authorizations (tenant-scoped)
+        let h = load_handler_on_demand(auth_state, pool, &bunker_key_hex, tenant_id).await?;
         tracing::debug!(
             "RPC: Loaded OAuth handler for bunker {}",
             &bunker_key_hex[..8]

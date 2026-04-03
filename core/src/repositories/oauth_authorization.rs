@@ -360,6 +360,8 @@ impl OAuthAuthorizationRepository {
 
     /// Find authorization details by bunker public key.
     /// Returns (id, user_pubkey, authorization_handle, expires_at, revoked_at, policy_id).
+    ///
+    /// WARNING: Not tenant-scoped. Prefer `find_by_bunker_pubkey_for_tenant` for request paths.
     #[allow(clippy::type_complexity)]
     pub async fn find_by_bunker_pubkey(
         &self,
@@ -381,6 +383,39 @@ impl OAuthAuthorizationRepository {
              WHERE bunker_public_key = $1",
         )
         .bind(bunker_pubkey)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Find authorization details by bunker public key, scoped to a specific tenant.
+    /// Returns (id, user_pubkey, authorization_handle, expires_at, revoked_at, policy_id).
+    ///
+    /// This is the tenant-safe version that should be used on all request paths
+    /// to prevent cross-tenant data access.
+    #[allow(clippy::type_complexity)]
+    pub async fn find_by_bunker_pubkey_for_tenant(
+        &self,
+        bunker_pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<
+        Option<(
+            i32,
+            String,
+            Option<String>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            Option<i32>,
+        )>,
+        RepositoryError,
+    > {
+        sqlx::query_as(
+            "SELECT id, user_pubkey, authorization_handle, expires_at, revoked_at, policy_id
+             FROM oauth_authorizations
+             WHERE bunker_public_key = $1 AND tenant_id = $2",
+        )
+        .bind(bunker_pubkey)
+        .bind(tenant_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(Into::into)
@@ -475,6 +510,60 @@ mod tests {
 
         let result = repo.find(1, 999999).await;
         assert!(matches!(result, Err(RepositoryError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_find_by_bunker_pubkey_for_tenant_isolates_tenants() {
+        use nostr_sdk::Keys;
+        use uuid::Uuid;
+
+        let pool = setup_pool().await;
+        let repo = OAuthAuthorizationRepository::new(pool.clone());
+
+        let user = Keys::generate().public_key().to_hex();
+        let bunker_pubkey = Keys::generate().public_key().to_hex();
+        let origin = format!("https://test-{}.example.com", Uuid::new_v4());
+        let tenant_id: i64 = 1;
+        let wrong_tenant_id: i64 = 999999;
+
+        // Create user
+        sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, $2, NOW(), NOW()) ON CONFLICT (pubkey) DO NOTHING")
+            .bind(&user)
+            .bind(tenant_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Create authorization for tenant 1
+        sqlx::query(
+            "INSERT INTO oauth_authorizations (user_pubkey, redirect_origin, client_id, bunker_public_key, secret_hash, relays, tenant_id, authorization_handle, handle_expires_at, created_at, updated_at)
+             VALUES ($1, $2, 'Test', $3, '$2b$10$test_hash', '[]', $4, NULL, NOW() + INTERVAL '30 days', NOW(), NOW())"
+        )
+        .bind(&user)
+        .bind(&origin)
+        .bind(&bunker_pubkey)
+        .bind(tenant_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Same tenant should find the authorization
+        let result = repo
+            .find_by_bunker_pubkey_for_tenant(&bunker_pubkey, tenant_id)
+            .await
+            .unwrap();
+        assert!(result.is_some(), "Should find authorization for correct tenant");
+
+        // Different tenant should NOT find the authorization
+        let result = repo
+            .find_by_bunker_pubkey_for_tenant(&bunker_pubkey, wrong_tenant_id)
+            .await
+            .unwrap();
+        assert!(result.is_none(), "Should not find authorization for wrong tenant");
+
+        // Unscoped version should still find it (for signer daemon use)
+        let result = repo.find_by_bunker_pubkey(&bunker_pubkey).await.unwrap();
+        assert!(result.is_some(), "Unscoped version should find authorization");
     }
 
     #[tokio::test]

@@ -853,10 +853,10 @@ pub async fn login(
         return Err(AuthError::EmailNotVerified);
     }
 
-    // Get user's Nostr keys from personal_keys
+    // Get user's Nostr keys from personal_keys (tenant-scoped)
     let personal_keys_repo = PersonalKeysRepository::new(pool.clone());
     let encrypted_secret: Vec<u8> = personal_keys_repo
-        .find_encrypted_key(&public_key)
+        .find_encrypted_key_for_tenant(&public_key, tenant_id)
         .await?
         .ok_or_else(|| AuthError::Internal("Personal keys not found".to_string()))?;
 
@@ -987,10 +987,10 @@ pub async fn create_bunker(
         redirect_origin
     );
 
-    // Get user's encrypted secret key
+    // Get user's encrypted secret key (tenant-scoped)
     let personal_keys_repo = PersonalKeysRepository::new(pool.clone());
     let encrypted_secret: Vec<u8> = personal_keys_repo
-        .find_encrypted_key(&user_pubkey)
+        .find_encrypted_key_for_tenant(&user_pubkey, tenant_id)
         .await?
         .ok_or(AuthError::Internal("Personal keys not found".to_string()))?;
 
@@ -1507,10 +1507,10 @@ pub async fn verify_email(
     // Get user's email for UCAN
     let email = user_repo.get_email(&public_key, tenant_id).await?;
 
-    // Get user's keys to generate UCAN
+    // Get user's keys to generate UCAN (tenant-scoped)
     let personal_keys_repo = PersonalKeysRepository::new(pool.clone());
     let encrypted_secret = personal_keys_repo
-        .find_encrypted_key(&public_key)
+        .find_encrypted_key_for_tenant(&public_key, tenant_id)
         .await?
         .ok_or_else(|| AuthError::Internal("Personal keys not found".to_string()))?;
 
