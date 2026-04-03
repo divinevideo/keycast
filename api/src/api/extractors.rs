@@ -46,9 +46,18 @@ fn enforce_dpop_if_bound(
     }
 
     let method = parts.method.as_str();
-    // Reconstruct the request URL for htu verification
-    // Use the path as-is; the DPoP proof htu should match the full URL
-    let htu = parts.uri.to_string();
+    // Reconstruct the absolute request URL for htu verification per RFC 9449
+    // RFC 9449 requires htu to be the full URI (scheme + host + path)
+    let scheme = parts.headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("http");
+    let host = parts.headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+    let path = parts.uri.path();
+    let htu = format!("{}://{}{}", scheme, host, path);
 
     crate::ucan_auth::enforce_dpop_binding(&parts.headers, ucan, method, &htu).map_err(|e| {
         let msg = format!("DPoP binding enforcement failed: {}", e);

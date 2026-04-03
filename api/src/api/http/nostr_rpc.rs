@@ -327,6 +327,20 @@ async fn load_handler_on_demand(
     Ok(handler)
 }
 
+/// Construct the absolute htu (HTTP Target URI) from request headers per RFC 9449.
+/// Uses x-forwarded-proto for scheme and Host header for host.
+fn construct_htu(headers: &HeaderMap) -> String {
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("http");
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+    format!("{}://{}/api/nostr", scheme, host)
+}
+
 /// Compute BLAKE3 hash of token for cache lookup
 /// BLAKE3 is ~500ns for 500-byte token vs ~1-2ms for Schnorr verification (2000-4000x faster)
 fn compute_token_cache_key(auth_header: &str) -> Option<CacheKey> {
@@ -449,7 +463,34 @@ async fn get_handler(
                 .await;
             return Err(RpcError::Auth(AuthError::InvalidToken));
         }
-        // Cache hit! Skip UCAN verification entirely
+
+        // Even on cache hit, we must enforce DPoP binding if the token has cnf.jkt
+        // Parse the UCAN to check for DPoP binding (lightweight compared to full verification)
+        if let Ok((_user_pubkey, _redirect_origin, _bunker_pubkey, ucan)) =
+            crate::ucan_auth::validate_ucan_token(auth_header, 0).await
+        {
+            if let Some(expected_jkt) = crate::ucan_auth::extract_cnf_jkt_from_ucan(&ucan) {
+                let htu = construct_htu(headers);
+                match crate::ucan_auth::verify_dpop_proof(headers, "POST", &htu, Some(&expected_jkt)) {
+                    Ok(Some(_)) => {
+                        tracing::debug!("RPC: DPoP binding verified on cache hit");
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            "RPC: DPoP-bound token used without DPoP proof on cache hit (jkt={})",
+                            &expected_jkt[..8.min(expected_jkt.len())]
+                        );
+                        return Err(RpcError::Auth(AuthError::InvalidToken));
+                    }
+                    Err(e) => {
+                        tracing::warn!("RPC: DPoP verification failed on cache hit: {}", e);
+                        return Err(RpcError::Auth(AuthError::InvalidToken));
+                    }
+                }
+            }
+        }
+
+        // Cache hit! Skip full UCAN verification
         METRICS.inc_http_rpc_cache_hit();
         tracing::trace!("RPC: Cache hit (BLAKE3)");
         return Ok(handler);
@@ -467,10 +508,9 @@ async fn get_handler(
     // Enforce DPoP binding if the UCAN contains cnf.jkt
     // The DPoP proof must match the bound key for resource access
     if let Some(expected_jkt) = crate::ucan_auth::extract_cnf_jkt_from_ucan(&ucan) {
-        // For POST /api/nostr, use the request URL as htu
-        // Clients must include a DPoP proof header with matching method and URL
-        let htu = "/api/nostr";
-        match crate::ucan_auth::verify_dpop_proof(&headers, "POST", htu, Some(&expected_jkt)) {
+        // RFC 9449 requires htu to be the absolute URI (scheme + host + path)
+        let htu = construct_htu(headers);
+        match crate::ucan_auth::verify_dpop_proof(&headers, "POST", &htu, Some(&expected_jkt)) {
             Ok(Some(_)) => {
                 tracing::debug!("RPC: DPoP binding verified for cnf.jkt");
             }

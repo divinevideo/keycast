@@ -138,21 +138,12 @@ pub fn verify_dpop_proof(
         ));
     }
 
-    // Verify jti (JWT ID) for replay protection
+    // Extract jti (JWT ID) for replay protection - parsed early, inserted after signature check
     let jti = payload_json
         .get("jti")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("DPoP proof must include jti for replay protection"))?
         .to_string();
-
-    // Periodically clean expired JTI entries
-    maybe_cleanup_jtis();
-
-    // Check for JTI replay
-    let expiry = Instant::now() + Duration::from_secs(DPOP_MAX_AGE_SECS);
-    if JTI_CACHE.insert(jti.clone(), expiry).is_some() {
-        return Err(anyhow!("DPoP proof JTI has already been used (replay)"));
-    }
 
     // Extract JWK from header
     let jwk = header_json
@@ -160,12 +151,22 @@ pub fn verify_dpop_proof(
         .and_then(Value::as_object)
         .ok_or_else(|| anyhow!("DPoP proof must include a JWK"))?;
 
-    // Verify signature (currently only ES256 is verified cryptographically)
+    // Verify signature BEFORE inserting JTI into replay cache
+    // This prevents an attacker from poisoning the cache with a forged JTI
     if alg == "ES256" {
         verify_es256_signature(parts[0], parts[1], parts[2], jwk)?;
     }
     // Note: EdDSA signature verification would require ed25519-dalek dependency
     // For now, EdDSA proofs are parsed but not cryptographically verified
+
+    // Periodically clean expired JTI entries
+    maybe_cleanup_jtis();
+
+    // Check for JTI replay (inserted AFTER signature verification to prevent cache poisoning)
+    let expiry = Instant::now() + Duration::from_secs(DPOP_MAX_AGE_SECS);
+    if JTI_CACHE.insert(jti.clone(), expiry).is_some() {
+        return Err(anyhow!("DPoP proof JTI has already been used (replay)"));
+    }
 
     // Compute JWK thumbprint
     let thumbprint = jwk_thumbprint(jwk)?;
