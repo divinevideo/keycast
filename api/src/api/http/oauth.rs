@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 
 // Import constants and helpers from auth module
 use super::auth::{generate_secure_token, token_expiry_seconds, EMAIL_VERIFICATION_EXPIRY_HOURS};
+use super::html_safety::{escape_attr, escape_html, js_string_literal};
 
 /// Generate a 256-bit random authorization handle (64 hex characters)
 /// Used for silent re-authentication in OAuth flows
@@ -916,7 +917,7 @@ pub async fn authorize_get(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Authorize {}</title>
+    <title>Authorize {client_id_html}</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -1203,18 +1204,18 @@ pub async fn authorize_get(
         <div class="card">
             <div class="app_header">
                 <div class="app_icon">
-                    <span id="app_icon_letter">{}</span>
+                    <span id="app_icon_letter">{app_icon_letter}</span>
                 </div>
                 <div class="app_info">
                     <div class="app_domain" id="app_domain"></div>
-                    <h2 id="app_name">{}</h2>
+                    <h2 id="app_name">{client_id_html2}</h2>
                 </div>
             </div>
 
             <div class="session_notice">
                 <div class="session_copy">
                     <span class="session_label">Signed in as</span>
-                    <div class="session_identity">{}</div>
+                    <div class="session_identity">{session_identity_html}</div>
                 </div>
                 <button type="button" class="switch_account" onclick="useDifferentAccount()">Use a different account</button>
             </div>
@@ -1234,18 +1235,18 @@ pub async fn authorize_get(
         </div>
     </div>
 
-    <div id="npub_fallback">{}</div>
+    <div id="npub_fallback">{npub_html}</div>
 
     <script>
-        const clientId = '{}';
-        const redirectUri = '{}';
-        const scope = '{}';
-        const codeChallenge = '{}';
-        const codeChallengeMethod = '{}';
-        const oauthState = '{}';
-        const userPubkey = '{}';
-        const userEmail = '{}';
-        const policyInfo = {};
+        const clientId = {client_id_js};
+        const redirectUri = {redirect_uri_js};
+        const scope = {scope_js};
+        const codeChallenge = {code_challenge_js};
+        const codeChallengeMethod = {code_challenge_method_js};
+        const oauthState = {oauth_state_js};
+        const userPubkey = {user_pubkey_js};
+        const userEmail = {user_email_js};
+        const policyInfo = {policy_info_json};
 
         // Build permissions list from policy info
         function buildPermissionsList() {{
@@ -1446,27 +1447,23 @@ pub async fn authorize_get(
 </body>
 </html>
         "#,
-                params.client_id, // <title>
-                params
-                    .client_id
-                    .chars()
-                    .next()
-                    .unwrap_or('A')
-                    .to_uppercase(), // app icon letter
-                params.client_id, // app name
-                user_email.as_deref().unwrap_or(npub.as_str()), // explicit session identity
-                npub,             // npub_fallback display (hidden)
-                params.client_id, // JS clientId
-                params.redirect_uri, // JS redirectUri
-                scope_str,        // JS scope
-                params.code_challenge.as_deref().unwrap_or(""), // JS codeChallenge
-                params.code_challenge_method.as_deref().unwrap_or(""), // JS codeChallengeMethod
-                params.state.as_deref().unwrap_or(""), // JS oauthState
-                pubkey,           // JS userPubkey (hex)
-                user_email.as_deref().unwrap_or(""), // JS userEmail
-                policy_info_json, // JS policyInfo (JSON object)
-            )
-        }
+            client_id_html = escape_html(&params.client_id),
+            app_icon_letter = escape_html(
+                &params.client_id.chars().next().unwrap_or('A').to_uppercase().to_string()
+            ),
+            client_id_html2 = escape_html(&params.client_id),
+            session_identity_html = escape_html(user_email.as_deref().unwrap_or(npub.as_str())),
+            npub_html = escape_html(&npub),
+            client_id_js = js_string_literal(&params.client_id),
+            redirect_uri_js = js_string_literal(&params.redirect_uri),
+            scope_js = js_string_literal(&scope_str),
+            code_challenge_js = js_string_literal(&params.code_challenge.as_deref().unwrap_or("")),
+            code_challenge_method_js = js_string_literal(&params.code_challenge_method.as_deref().unwrap_or("")),
+            oauth_state_js = js_string_literal(&params.state.as_deref().unwrap_or("")),
+            user_pubkey_js = js_string_literal(&pubkey),
+            user_email_js = js_string_literal(&user_email.as_deref().unwrap_or("")),
+            policy_info_json = policy_info_json, // already JSON-serialized
+        )
     } else {
         // User not authenticated - show login/register form (divine.video-inspired design)
         format!(
@@ -1790,17 +1787,17 @@ pub async fn authorize_get(
                 <span class="logo-sub">Login</span>
             </div>
             <h1>Sign in</h1>
-            <p>to continue to <strong id="app_name_display">{}</strong></p>
+            <p>to continue to <strong id="app_name_display">{client_id_html}</strong></p>
         </div>
 
         <div class="card">
             <div class="app_header">
                 <div class="app_icon">
-                    <span id="app_icon_letter">{}</span>
+                    <span id="app_icon_letter">{app_icon_letter}</span>
                 </div>
                 <div class="app_info">
                     <div class="app_domain" id="app_domain"></div>
-                    <h2 id="app_name">{}</h2>
+                    <h2 id="app_name">{client_id_html2}</h2>
                 </div>
             </div>
 
@@ -1876,11 +1873,11 @@ pub async fn authorize_get(
     </div>
 
     <script>
-        const clientId = '{}';
-        const redirectUri = '{}';
-        const scope = '{}';
-        const codeChallenge = '{}';
-        const codeChallengeMethod = '{}';
+        const clientId = {client_id_js};
+        const redirectUri = {redirect_uri_js};
+        const scope = {scope_js};
+        const codeChallenge = {code_challenge_js};
+        const codeChallengeMethod = {code_challenge_method_js};
         const defaultRegister = new URLSearchParams(window.location.search).get('default_register') === 'true';
         const byokPubkey = new URLSearchParams(window.location.search).get('byok_pubkey');
         const state = new URLSearchParams(window.location.search).get('state');
@@ -2140,19 +2137,16 @@ pub async fn authorize_get(
 </body>
 </html>
         "#,
-            params.client_id, // app_name_display in header
-            params
-                .client_id
-                .chars()
-                .next()
-                .unwrap_or('A')
-                .to_uppercase(), // app icon letter
-            params.client_id, // app name in card
-            params.client_id, // JS clientId
-            params.redirect_uri, // JS redirectUri
-            scope_str,        // JS scope
-            params.code_challenge.as_deref().unwrap_or(""), // JS codeChallenge
-            params.code_challenge_method.as_deref().unwrap_or(""), // JS codeChallengeMethod
+            client_id_html = escape_html(&params.client_id),
+            app_icon_letter = escape_html(
+                &params.client_id.chars().next().unwrap_or('A').to_uppercase().to_string()
+            ),
+            client_id_html2 = escape_html(&params.client_id),
+            client_id_js = js_string_literal(&params.client_id),
+            redirect_uri_js = js_string_literal(&params.redirect_uri),
+            scope_js = js_string_literal(&scope_str),
+            code_challenge_js = js_string_literal(&params.code_challenge.as_deref().unwrap_or("")),
+            code_challenge_method_js = js_string_literal(&params.code_challenge_method.as_deref().unwrap_or("")),
         )
     };
 
@@ -3607,10 +3601,10 @@ pub async fn connect_get(
 
         <div class="card">
             <div class="app_header">
-                <div class="app_icon" id="app_icon">{app_icon}</div>
+                <div class="app_icon" id="app_icon">{app_icon_html}</div>
                 <div class="app_info">
-                    <div class="app_domain">{relay}</div>
-                    <h2>{app_name}</h2>
+                    <div class="app_domain">{relay_html}</div>
+                    <h2>{app_name_html}</h2>
                 </div>
             </div>
 
@@ -3624,10 +3618,10 @@ pub async fn connect_get(
         </div>
 
         <form method="POST" action="/api/oauth/connect">
-            <input type="hidden" name="client_pubkey" value="{client_pubkey}">
-            <input type="hidden" name="relay" value="{relay}">
-            <input type="hidden" name="secret" value="{secret}">
-            <input type="hidden" name="perms" value="{perms}">
+            <input type="hidden" name="client_pubkey" value="{client_pubkey_attr}">
+            <input type="hidden" name="relay" value="{relay_attr}">
+            <input type="hidden" name="secret" value="{secret_attr}">
+            <input type="hidden" name="perms" value="{perms_attr}">
             <div class="buttons">
                 <button type="submit" name="approved" value="false" class="deny">Deny</button>
                 <button type="submit" name="approved" value="true" class="approve">Authorize</button>
@@ -3636,7 +3630,7 @@ pub async fn connect_get(
     </div>
 
     <script>
-        const permissions = '{permissions_raw}';
+        const permissions = {permissions_raw_js};
         const permissionMeta = {{
             'sign_event': {{
                 icon: '✍️',
@@ -3704,13 +3698,14 @@ pub async fn connect_get(
 </body>
 </html>
     "#,
-        app_name = app_name,
-        app_icon = app_name.chars().next().unwrap_or('A').to_uppercase(),
-        permissions_raw = permissions_raw,
-        relay = params.relay,
-        client_pubkey = client_pubkey,
-        secret = params.secret,
-        perms = params.perms.as_deref().unwrap_or("")
+        app_name_html = escape_html(app_name),
+        app_icon_html = escape_html(&app_name.chars().next().unwrap_or('A').to_uppercase().to_string()),
+        relay_html = escape_html(&params.relay),
+        client_pubkey_attr = escape_attr(&client_pubkey),
+        relay_attr = escape_attr(&params.relay),
+        secret_attr = escape_attr(&params.secret),
+        perms_attr = escape_attr(params.perms.as_deref().unwrap_or("")),
+        permissions_raw_js = js_string_literal(&permissions_raw),
     );
 
     Ok(Html(html).into_response())

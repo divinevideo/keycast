@@ -10,6 +10,7 @@ use axum::{
 use nostr_sdk::Keys;
 use serde::Deserialize;
 
+use super::html_safety::escape_html;
 use super::routes::AuthState;
 use keycast_core::repositories::{ClaimTokenRepository, UserRepository};
 
@@ -234,9 +235,9 @@ pub async fn claim_get(
     </script>
 </body>
 </html>"#,
-        display_name = html_escape(&display_name_str),
-        username = html_escape(&username_str),
-        token = html_escape(&params.token),
+        display_name = escape_html(&display_name_str),
+        username = escape_html(&username_str),
+        token = escape_html(&params.token),
     );
 
     Ok(Html(html).into_response())
@@ -538,19 +539,10 @@ pub async fn claim_post(
     </div>
 </body>
 </html>"#,
-        display_name = html_escape(&display_name_str),
+        display_name = escape_html(&display_name_str),
     );
 
     Ok(([(header::SET_COOKIE, cookie_value)], Html(html)).into_response())
-}
-
-/// HTML-escape a string to prevent XSS
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
 }
 
 /// Claim-specific errors
