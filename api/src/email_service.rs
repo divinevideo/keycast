@@ -474,16 +474,33 @@ impl EmailSender for SendGridEmailSender {
 }
 
 /// Create the appropriate email sender based on environment
-/// - If SENDGRID_API_KEY is set: use SendGrid (production)
-/// - Otherwise: use DevEmailSender (development/testing)
-pub fn create_email_sender() -> Arc<dyn EmailSender> {
-    match env::var("SENDGRID_API_KEY") {
-        Ok(api_key) if !api_key.is_empty() => Arc::new(SendGridEmailSender::new(api_key)),
-        _ => {
-            tracing::warn!("SENDGRID_API_KEY not set - using development email sender");
-            Arc::new(DevEmailSender::new())
+/// - If SENDGRID_API_KEY is set and non-empty: use SendGrid (production)
+/// - If running in production without SENDGRID_API_KEY and without DISABLE_EMAILS: fail with error
+/// - Otherwise (development): use DevEmailSender as fallback
+pub fn create_email_sender() -> Result<Arc<dyn EmailSender>, String> {
+    if let Ok(api_key) = env::var("SENDGRID_API_KEY") {
+        if !api_key.is_empty() {
+            return Ok(Arc::new(SendGridEmailSender::new(api_key)));
         }
     }
+
+    let env_mode = env::var("RUST_ENV")
+        .or_else(|_| env::var("NODE_ENV"))
+        .unwrap_or_else(|_| "development".to_string());
+    if env_mode == "production"
+        && env::var("DISABLE_EMAILS")
+            .ok()
+            .filter(|v| v == "true")
+            .is_none()
+    {
+        return Err(
+            "SENDGRID_API_KEY required in production (set DISABLE_EMAILS=true to override)"
+                .to_string(),
+        );
+    }
+
+    tracing::warn!("SENDGRID_API_KEY not set - using development email sender");
+    Ok(Arc::new(DevEmailSender::new()))
 }
 
 /// Legacy EmailService for backward compatibility during migration
@@ -495,7 +512,7 @@ pub struct EmailService {
 impl EmailService {
     pub fn new() -> Result<Self, String> {
         Ok(Self {
-            inner: create_email_sender(),
+            inner: create_email_sender()?,
         })
     }
 
@@ -521,5 +538,144 @@ impl EmailService {
 
     pub async fn send_claim_email(&self, to_email: &str, claim_url: &str) -> Result<(), String> {
         self.inner.send_claim_email(to_email, claim_url).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Serial test lock to prevent env var races between tests
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Helper to run a closure with specific env vars set, restoring originals afterward
+    fn with_env_vars<F, R>(vars: &[(&str, Option<&str>)], f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let mut originals = Vec::new();
+        for (key, val) in vars {
+            originals.push((*key, env::var(key).ok()));
+            match val {
+                Some(v) => env::set_var(key, v),
+                None => env::remove_var(key),
+            }
+        }
+        let result = f();
+        for (key, original) in originals {
+            match original {
+                Some(v) => env::set_var(key, v),
+                None => env::remove_var(key),
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn test_production_without_sendgrid_key_fails() {
+        let result = with_env_vars(
+            &[
+                ("SENDGRID_API_KEY", None),
+                ("RUST_ENV", Some("production")),
+                ("NODE_ENV", None),
+                ("DISABLE_EMAILS", None),
+            ],
+            create_email_sender,
+        );
+        let err = result.err().expect("expected an error");
+        assert!(
+            err.contains("SENDGRID_API_KEY required in production"),
+            "unexpected error message: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_production_with_disable_emails_ok() {
+        let result = with_env_vars(
+            &[
+                ("SENDGRID_API_KEY", None),
+                ("RUST_ENV", Some("production")),
+                ("NODE_ENV", None),
+                ("DISABLE_EMAILS", Some("true")),
+            ],
+            create_email_sender,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_production_with_sendgrid_key_ok() {
+        let result = with_env_vars(
+            &[
+                ("SENDGRID_API_KEY", Some("SG.test-key-value")),
+                ("RUST_ENV", Some("production")),
+                ("NODE_ENV", None),
+                ("DISABLE_EMAILS", None),
+            ],
+            create_email_sender,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_development_without_sendgrid_key_ok() {
+        let result = with_env_vars(
+            &[
+                ("SENDGRID_API_KEY", None),
+                ("RUST_ENV", None),
+                ("NODE_ENV", None),
+                ("DISABLE_EMAILS", None),
+            ],
+            create_email_sender,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_production_via_node_env_without_sendgrid_key_fails() {
+        let result = with_env_vars(
+            &[
+                ("SENDGRID_API_KEY", None),
+                ("RUST_ENV", None),
+                ("NODE_ENV", Some("production")),
+                ("DISABLE_EMAILS", None),
+            ],
+            create_email_sender,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_empty_sendgrid_key_treated_as_unset() {
+        let result = with_env_vars(
+            &[
+                ("SENDGRID_API_KEY", Some("")),
+                ("RUST_ENV", Some("production")),
+                ("NODE_ENV", None),
+                ("DISABLE_EMAILS", None),
+            ],
+            create_email_sender,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_empty_disable_emails_still_requires_sendgrid_in_production() {
+        let result = with_env_vars(
+            &[
+                ("SENDGRID_API_KEY", None),
+                ("RUST_ENV", Some("production")),
+                ("NODE_ENV", None),
+                ("DISABLE_EMAILS", Some("")),
+            ],
+            create_email_sender,
+        );
+        assert!(
+            result.is_err(),
+            "Empty DISABLE_EMAILS should not bypass production check"
+        );
     }
 }

@@ -300,6 +300,11 @@ fn validate_environment() -> Result<(), String> {
         tracing::warn!("POSTGRES_PASSWORD not set (required for docker-compose deployments)");
     }
 
+    // Validate email configuration (fail-closed in production)
+    if let Err(e) = keycast_api::email_service::create_email_sender() {
+        errors.push(Box::leak(e.into_boxed_str()));
+    }
+
     if !errors.is_empty() {
         return Err(format!(
             "Missing required environment variables:\n  - {}\n\nSee .env.example for configuration guide.",
