@@ -2,7 +2,7 @@
 
 ## Architecture Overview
 
-**Current Status:** Fully hosted on Google Cloud Platform (GCP).
+**Current Status:** Production runs on GKE via `divine-iac-coreconfig`; the legacy Cloud Run notes below are historical context only.
 **Region:** `us-central1` (Primary)
 
 Keycast is a Nostr key custody service. Users store their cryptographic keys here; apps request signing operations.
@@ -30,17 +30,17 @@ The system currently relies on these specific GCP managed services.
 
 | Resource | Name | Region/Location |
 |----------|------|-----------------|
-| Cloud Run | `keycast` | us-central1 |
+| GKE / ArgoCD | `keycast` | us-central1 |
 | Cloud SQL | `keycast-db-plus` | us-central1 |
 | Cloud KMS | `keycast-keys/master-key` | global |
 | Memorystore | `keycast-redis` | us-central1 |
 | Artifact Registry | `docker` | us-central1 |
 
-### Cloud Run Service
+### GKE Service
 *The application runtime environment.*
 ```
 Service: keycast
-Image: us-central1-docker.pkg.dev/openvine-co/docker/keycast:latest
+Image: us-central1-docker.pkg.dev/dv-platform-prod/containers-production/keycast:<pinned-tag>
 
 Current settings:
   CPU: 4 vCPU
@@ -134,22 +134,21 @@ This allows 5x higher concurrency without blocking request threads on bcrypt.
 
 ## DNS
 
-```
-login.divine.video → CNAME → ghs.googlehosted.com (Cloudflare)
-```
+Production login traffic is routed through the GKE Gateway and external DNS entries managed in `divine-iac-coreconfig`.
 
 ---
 
 ## Deployment Workflow
 
-**Current state:** Manual only via `bun run deploy`. Git push triggers not configured.
+**Current state:** Production deploys are GitOps-managed through `divine-iac-coreconfig` and ArgoCD. The legacy Cloud Run workflow below no longer describes the live path.
 
 **What happens:**
 1. Cloud Build runs on E2_HIGHCPU_8 (~20 min)
 2. Multi-stage Docker build (Rust + Bun frontend)
 3. Push to Artifact Registry
-4. Deploy to Cloud Run
-5. Smoke tests (health check, CORS preflight)
+4. Update the `divine-iac-coreconfig` overlay to the new image tag
+5. Let ArgoCD reconcile to GKE
+6. Smoke tests (health check, CORS preflight, ATProto entryway surfaces if enabled)
 
 ---
 
@@ -204,16 +203,11 @@ gcloud sql instances clone keycast-db-plus keycast-db-restored \
 ```
 
 ### Application Rollback
-Cloud Run maintains revision history for quick rollback:
+GKE/ArgoCD deploys roll back by reverting the pinned image tag in `divine-iac-coreconfig` and resyncing:
 
 ```bash
-# List recent revisions
-gcloud run revisions list --service=keycast --region=us-central1 --project=openvine-co
-
-# Rollback to previous revision
-gcloud run services update-traffic keycast \
-  --to-revisions=keycast-00150-abc=100 \
-  --region=us-central1 --project=openvine-co
+# Roll back by restoring the previous pinned image tag in the overlay
+# and allowing ArgoCD to sync the manifest again.
 ```
 
 ---
