@@ -5,6 +5,7 @@ use keycast_api::api::http::atproto::{
     disable_user_atproto, disable_user_atproto_and_revoke_sessions,
     disable_user_atproto_with_trigger, enable_user_atproto, enable_user_atproto_with_trigger,
     get_user_atproto_status, set_user_atproto_crosspost, sync_user_atproto_state_by_pubkey,
+    SetCrosspostContext,
 };
 use keycast_api::api::http::auth::AuthError;
 use keycast_core::repositories::{
@@ -379,12 +380,14 @@ async fn crosspost_enable_uses_opt_in_trigger_for_initial_enable() {
     let disable_seen = disable_calls.clone();
 
     let response = set_user_atproto_crosspost(
-        &repo,
-        &session_repo,
-        tenant_id,
-        &user_pubkey,
-        &user_pubkey,
-        true,
+        SetCrosspostContext {
+            user_repo: &repo,
+            session_repo: &session_repo,
+            tenant_id,
+            authenticated_user_pubkey: &user_pubkey,
+            requested_pubkey: &user_pubkey,
+            enabled: true,
+        },
         move |pubkey, requested_username, crosspost_enabled| {
             let opt_in_seen = opt_in_seen.clone();
             let expected_pubkey = expected_pubkey.clone();
@@ -454,12 +457,14 @@ async fn crosspost_enable_uses_reenable_trigger_when_current_state_is_disabled()
     let disable_seen = disable_calls.clone();
 
     let response = set_user_atproto_crosspost(
-        &repo,
-        &session_repo,
-        tenant_id,
-        &user_pubkey,
-        &user_pubkey,
-        true,
+        SetCrosspostContext {
+            user_repo: &repo,
+            session_repo: &session_repo,
+            tenant_id,
+            authenticated_user_pubkey: &user_pubkey,
+            requested_pubkey: &user_pubkey,
+            enabled: true,
+        },
         move |_pubkey, _requested_username, _crosspost_enabled| {
             let opt_in_seen = opt_in_seen.clone();
             async move {
@@ -526,12 +531,14 @@ async fn crosspost_disable_uses_disable_trigger() {
     let disable_seen = disable_calls.clone();
 
     let response = set_user_atproto_crosspost(
-        &repo,
-        &session_repo,
-        tenant_id,
-        &user_pubkey,
-        &user_pubkey,
-        false,
+        SetCrosspostContext {
+            user_repo: &repo,
+            session_repo: &session_repo,
+            tenant_id,
+            authenticated_user_pubkey: &user_pubkey,
+            requested_pubkey: &user_pubkey,
+            enabled: false,
+        },
         move |_pubkey, _requested_username, _crosspost_enabled| {
             let opt_in_seen = opt_in_seen.clone();
             async move {
@@ -590,12 +597,14 @@ async fn crosspost_toggle_rejects_pubkey_mismatch() {
     .expect("failed to insert user");
 
     let error = set_user_atproto_crosspost(
-        &repo,
-        &session_repo,
-        tenant_id,
-        &user_pubkey,
-        &other_pubkey,
-        true,
+        SetCrosspostContext {
+            user_repo: &repo,
+            session_repo: &session_repo,
+            tenant_id,
+            authenticated_user_pubkey: &user_pubkey,
+            requested_pubkey: &other_pubkey,
+            enabled: true,
+        },
         |_pubkey, _requested_username, _crosspost_enabled| async { Ok(()) },
         |_pubkey| async { Ok(()) },
         |_pubkey| async { Ok(()) },

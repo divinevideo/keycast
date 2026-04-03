@@ -20,6 +20,15 @@ pub struct SetCrosspostRequest {
     pub enabled: bool,
 }
 
+pub struct SetCrosspostContext<'a> {
+    pub user_repo: &'a UserRepository,
+    pub session_repo: &'a AtprotoOAuthSessionRepository,
+    pub tenant_id: i64,
+    pub authenticated_user_pubkey: &'a str,
+    pub requested_pubkey: &'a str,
+    pub enabled: bool,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct InternalAtprotoSyncRequest {
     pub nostr_pubkey: String,
@@ -311,12 +320,7 @@ pub async fn set_user_atproto_crosspost<
     FDisable,
     FutDisable,
 >(
-    user_repo: &UserRepository,
-    session_repo: &AtprotoOAuthSessionRepository,
-    tenant_id: i64,
-    authenticated_user_pubkey: &str,
-    requested_pubkey: &str,
-    enabled: bool,
+    context: SetCrosspostContext<'_>,
     opt_in_trigger: FOptIn,
     reenable_trigger: FReenable,
     disable_trigger: FDisable,
@@ -329,6 +333,15 @@ where
     FDisable: FnOnce(String) -> FutDisable,
     FutDisable: Future<Output = Result<(), crate::atproto_provisioning::AtprotoProvisioningError>>,
 {
+    let SetCrosspostContext {
+        user_repo,
+        session_repo,
+        tenant_id,
+        authenticated_user_pubkey,
+        requested_pubkey,
+        enabled,
+    } = context;
+
     if authenticated_user_pubkey != requested_pubkey {
         return Err(AuthError::Forbidden(
             "You can only manage Bluesky publishing for your own account".to_string(),
@@ -511,12 +524,14 @@ pub async fn account_crosspost(
     let session_repo = AtprotoOAuthSessionRepository::new(pool);
 
     let response = set_user_atproto_crosspost(
-        &user_repo,
-        &session_repo,
-        tenant_id,
-        &authenticated_user_pubkey,
-        &requested_pubkey,
-        request.enabled,
+        SetCrosspostContext {
+            user_repo: &user_repo,
+            session_repo: &session_repo,
+            tenant_id,
+            authenticated_user_pubkey: &authenticated_user_pubkey,
+            requested_pubkey: &requested_pubkey,
+            enabled: request.enabled,
+        },
         |pubkey, username, crosspost_enabled| async move {
             crate::atproto_provisioning::request_enable(&pubkey, &username, crosspost_enabled).await
         },
