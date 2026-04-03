@@ -130,6 +130,16 @@ This allows 5x higher concurrency without blocking request threads on bcrypt.
 | `SQLX_POOL_SIZE` | `50` |
 | `SQLX_STATEMENT_CACHE` | `100` |
 
+### Security Variables (added 2026-04-04)
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `SENDGRID_API_KEY` | Production | — | Email delivery. Production fails to start without this unless `DISABLE_EMAILS=true`. |
+| `DISABLE_EMAILS` | No | — | Set to `true` to explicitly disable email delivery in production. |
+| `ALLOWED_TENANT_DOMAINS` | Production | — | Comma-separated list of allowed tenant domains. |
+| `ENABLE_TENANT_AUTO_PROVISIONING` | No | `false` | Set to `true` to allow automatic tenant creation for unknown domains (dev only). |
+| `REQUIRE_REGISTERED_OAUTH_CLIENTS` | No | `true` (release) | Set to `false` to allow unregistered OAuth clients (dev only). |
+
 ---
 
 ## DNS
