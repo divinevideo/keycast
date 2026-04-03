@@ -25,7 +25,7 @@
 				],
 				layout: 'StandaloneLayout',
 				tryItOutEnabled: true,
-				persistAuthorization: true
+				persistAuthorization: false
 			});
 		}
 	});

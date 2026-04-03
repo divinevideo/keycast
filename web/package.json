@@ -13,16 +13,20 @@
 	"devDependencies": {
 		"@biomejs/biome": "1.9.4",
 		"@sveltejs/adapter-static": "^3.0.10",
-		"@sveltejs/kit": "^2.19.0",
+		"@sveltejs/kit": "^2.21.1",
 		"@sveltejs/vite-plugin-svelte": "^5.0.3",
 		"@tailwindcss/postcss": "^4.0.14",
-		"svelte": "^5.23.0",
+		"svelte": "^5.28.2",
 		"svelte-adapter-bun": "^0.5.2",
 		"svelte-check": "^4.1.5",
 		"svelte-hot-french-toast": "^1.0.0",
 		"tailwindcss": "^4.0.14",
 		"typescript": "^5.8.2",
-		"vite": "6.2.2"
+		"vite": "^6.4.1"
+	},
+	"overrides": {
+		"rollup": "^4.40.0",
+		"esbuild": "^0.25.0"
 	},
 	"dependencies": {
 		"@tailwindcss/forms": "^0.5.10",
