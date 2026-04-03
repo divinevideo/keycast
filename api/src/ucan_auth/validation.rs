@@ -80,15 +80,19 @@ pub async fn validate_ucan_token(
         .find_map(|fact| fact.get("bunker_pubkey").and_then(|v| v.as_str()))
         .map(String::from);
 
-    // Validate tenant_id from facts (if expected_tenant_id != 0)
-    if expected_tenant_id != 0 {
+    // Validate tenant_id from facts - always required
+    {
         // Look for tenant_id in facts array
         let mut found_tenant = false;
         for fact in facts {
             if let Some(tenant_value) = fact.get("tenant_id") {
                 if let Some(tenant_int) = tenant_value.as_i64() {
                     if tenant_int != expected_tenant_id {
-                        return Err(anyhow!("Tenant mismatch"));
+                        return Err(anyhow!(
+                            "Tenant mismatch: token issued for tenant {} but validated against tenant {}",
+                            tenant_int,
+                            expected_tenant_id
+                        ));
                     }
                     found_tenant = true;
                     break;
@@ -96,9 +100,11 @@ pub async fn validate_ucan_token(
             }
         }
 
-        if !found_tenant && expected_tenant_id != 0 {
-            tracing::warn!("UCAN missing tenant_id fact, but tenant validation required");
-            // Allow for now - tenant validation will happen at DB query level
+        if !found_tenant {
+            return Err(anyhow::anyhow!(
+                "UCAN missing tenant_id fact — tokens must include tenant_id for tenant {}",
+                expected_tenant_id
+            ));
         }
     }
 
@@ -422,5 +428,97 @@ mod tests {
 
         // Schnorr signatures are always 64 bytes
         assert_eq!(sig_bytes.len(), 64, "Schnorr signature should be 64 bytes");
+    }
+
+    /// Helper to build a signed UCAN token with specified tenant_id
+    async fn build_ucan_with_tenant(tenant_id: i64) -> (String, Keys) {
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        let user_did = nostr_pubkey_to_did(&pubkey);
+        let key_material = NostrKeyMaterial::from_keys(keys.clone());
+
+        let facts = serde_json::json!({
+            "tenant_id": tenant_id,
+            "email": "test@example.com",
+            "redirect_origin": "https://test.example.com"
+        });
+
+        let ucan = UcanBuilder::default()
+            .issued_by(&key_material)
+            .for_audience(&user_did)
+            .with_lifetime(3600)
+            .with_fact(facts)
+            .build()
+            .unwrap()
+            .sign()
+            .await
+            .unwrap();
+
+        let token = ucan.encode().unwrap();
+        (format!("Bearer {}", token), keys)
+    }
+
+    #[tokio::test]
+    async fn test_tenant_1_token_rejected_by_tenant_2() {
+        let _server_keys = ensure_server_nsec();
+
+        // Create a token for tenant 1
+        let (auth_header, _keys) = build_ucan_with_tenant(1).await;
+
+        // Validate against tenant 1 - should succeed
+        assert!(
+            validate_ucan_token(&auth_header, 1).await.is_ok(),
+            "Token for tenant 1 should be accepted by tenant 1"
+        );
+
+        // Validate against tenant 2 - should fail with tenant mismatch
+        let result = validate_ucan_token(&auth_header, 2).await;
+        assert!(result.is_err(), "Token for tenant 1 should be rejected by tenant 2");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Tenant mismatch"),
+            "Error should mention tenant mismatch, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tenant_2_token_rejected_by_tenant_1() {
+        let _server_keys = ensure_server_nsec();
+
+        // Create a token for tenant 2
+        let (auth_header, _keys) = build_ucan_with_tenant(2).await;
+
+        // Validate against tenant 2 - should succeed
+        assert!(
+            validate_ucan_token(&auth_header, 2).await.is_ok(),
+            "Token for tenant 2 should be accepted by tenant 2"
+        );
+
+        // Validate against tenant 1 - should fail
+        let result = validate_ucan_token(&auth_header, 1).await;
+        assert!(result.is_err(), "Token for tenant 2 should be rejected by tenant 1");
+        assert!(
+            result.unwrap_err().to_string().contains("Tenant mismatch"),
+            "Error should mention tenant mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tenant_mismatch_includes_tenant_ids_in_error() {
+        let _server_keys = ensure_server_nsec();
+
+        // Create a token for tenant 5
+        let (auth_header, _keys) = build_ucan_with_tenant(5).await;
+
+        // Validate against tenant 10 - error should include both IDs
+        let result = validate_ucan_token(&auth_header, 10).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("5") && err_msg.contains("10"),
+            "Error should mention both tenant IDs, got: {}",
+            err_msg
+        );
     }
 }

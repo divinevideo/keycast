@@ -450,8 +450,8 @@ pub async fn headless_authorize(
     let pool = &auth_state.state.db;
     let tenant_id = tenant.0.id;
 
-    // Extract user from UCAN Bearer token
-    let user_pubkey = super::auth::extract_user_from_token(&headers)
+    // Extract user from UCAN Bearer token with tenant validation
+    let user_pubkey = super::auth::extract_user_from_token(&headers, tenant_id)
         .await
         .map_err(|_| HeadlessError::Unauthorized)?;
 

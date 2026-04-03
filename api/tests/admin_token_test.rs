@@ -191,7 +191,7 @@ async fn test_admin_ucan_has_full_admin_role() {
     let auth_header = format!("Bearer {}", token);
 
     let (_pubkey, _redirect_origin, _bunker_pubkey, ucan) =
-        keycast_api::ucan_auth::validate_ucan_token(&auth_header, 0)
+        keycast_api::ucan_auth::validate_ucan_token(&auth_header, 1)
             .await
             .unwrap();
 
@@ -225,7 +225,7 @@ async fn test_regular_ucan_not_admin() {
     let auth_header = format!("Bearer {}", token);
 
     let (_pubkey, _redirect_origin, _bunker_pubkey, ucan) =
-        keycast_api::ucan_auth::validate_ucan_token(&auth_header, 0)
+        keycast_api::ucan_auth::validate_ucan_token(&auth_header, 1)
             .await
             .unwrap();
 
@@ -278,7 +278,7 @@ async fn test_admin_ucan_expired() {
     let token = ucan.encode().unwrap();
     let auth_header = format!("Bearer {}", token);
 
-    let result = keycast_api::ucan_auth::validate_ucan_token(&auth_header, 0).await;
+    let result = keycast_api::ucan_auth::validate_ucan_token(&auth_header, 1).await;
     assert!(result.is_err());
     assert!(
         result.unwrap_err().to_string().contains("expired"),
@@ -337,7 +337,7 @@ async fn test_preload_ucan_no_bunker_pubkey() {
     let auth_header = format!("Bearer {}", token);
 
     let (_pubkey, _redirect_origin, bunker_pubkey, _ucan) =
-        keycast_api::ucan_auth::validate_ucan_token(&auth_header, 0)
+        keycast_api::ucan_auth::validate_ucan_token(&auth_header, 1)
             .await
             .unwrap();
 
@@ -361,7 +361,7 @@ async fn test_preload_ucan_issued_by_admin_fact() {
     let auth_header = format!("Bearer {}", token);
 
     let (_pubkey, _redirect_origin, _bunker_pubkey, ucan) =
-        keycast_api::ucan_auth::validate_ucan_token(&auth_header, 0)
+        keycast_api::ucan_auth::validate_ucan_token(&auth_header, 1)
             .await
             .unwrap();
 
@@ -392,7 +392,7 @@ async fn test_preload_ucan_is_server_signed() {
     let auth_header = format!("Bearer {}", token);
 
     let (_pubkey, _redirect_origin, _bunker_pubkey, ucan) =
-        keycast_api::ucan_auth::validate_ucan_token(&auth_header, 0)
+        keycast_api::ucan_auth::validate_ucan_token(&auth_header, 1)
             .await
             .unwrap();
 

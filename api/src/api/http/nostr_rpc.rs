@@ -467,7 +467,7 @@ async fn get_handler(
         // Even on cache hit, we must enforce DPoP binding if the token has cnf.jkt
         // Parse the UCAN to check for DPoP binding (lightweight compared to full verification)
         if let Ok((_user_pubkey, _redirect_origin, _bunker_pubkey, ucan)) =
-            crate::ucan_auth::validate_ucan_token(auth_header, 0).await
+            crate::ucan_auth::validate_ucan_token(auth_header, tenant_id).await
         {
             if let Some(expected_jkt) = crate::ucan_auth::extract_cnf_jkt_from_ucan(&ucan) {
                 let htu = construct_htu(headers);
@@ -501,7 +501,7 @@ async fn get_handler(
 
     // Verify UCAN and extract bunker_pubkey (Schnorr signature verification ~1-2ms)
     let (user_pubkey, _redirect_origin, bunker_pubkey, ucan) =
-        crate::ucan_auth::validate_ucan_token(auth_header, 0)
+        crate::ucan_auth::validate_ucan_token(auth_header, tenant_id)
             .await
             .map_err(|_| RpcError::Auth(AuthError::InvalidToken))?;
 

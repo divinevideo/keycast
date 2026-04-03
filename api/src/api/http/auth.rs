@@ -409,17 +409,23 @@ impl From<bcrypt::BcryptError> for AuthError {
 }
 
 /// Extract user public key from UCAN token in Authorization header or cookie
-pub(crate) async fn extract_user_from_token(headers: &HeaderMap) -> Result<String, AuthError> {
+/// tenant_id is required to validate the token was issued for this tenant
+pub(crate) async fn extract_user_from_token(
+    headers: &HeaderMap,
+    tenant_id: i64,
+) -> Result<String, AuthError> {
     let (pubkey, _redirect_origin, _bunker_pubkey) =
-        extract_user_and_origin_from_token(headers).await?;
+        extract_user_and_origin_from_token(headers, tenant_id).await?;
     Ok(pubkey)
 }
 
 /// Extract user public key, redirect_origin, and bunker_pubkey from UCAN token in Authorization header or cookie
 /// redirect_origin identifies which app/authorization this token is for
 /// bunker_pubkey uniquely identifies the authorization for direct cache lookup (optional)
+/// tenant_id is required to validate the token was issued for this tenant
 pub(crate) async fn extract_user_and_origin_from_token(
     headers: &HeaderMap,
+    tenant_id: i64,
 ) -> Result<(String, String, Option<String>), AuthError> {
     // Try Bearer token first
     if let Some(auth_header) = headers.get("Authorization") {
@@ -427,7 +433,7 @@ pub(crate) async fn extract_user_and_origin_from_token(
 
         if auth_str.starts_with("Bearer ") {
             // Validate UCAN token and extract user pubkey, redirect_origin, and bunker_pubkey
-            return crate::ucan_auth::extract_user_from_ucan(headers, 0)
+            return crate::ucan_auth::extract_user_from_ucan(headers, tenant_id)
                 .await
                 .map_err(|_| AuthError::InvalidToken);
         }
@@ -435,9 +441,9 @@ pub(crate) async fn extract_user_and_origin_from_token(
 
     // Fall back to cookie-based UCAN
     if let Some(token) = extract_ucan_from_cookie(headers) {
-        // Parse UCAN from string using ucan_auth helper (tenant validation done by caller)
+        // Parse UCAN from string using ucan_auth helper with tenant validation
         let (pubkey, redirect_origin, bunker_pubkey, _ucan) =
-            crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), 0)
+            crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), tenant_id)
                 .await
                 .map_err(|e| {
                     tracing::warn!("UCAN parse error from cookie: {}", e);
@@ -966,9 +972,9 @@ pub async fn create_bunker(
     headers: HeaderMap,
     Json(req): Json<CreateBunkerRequest>,
 ) -> Result<Json<CreateBunkerResponse>, AuthError> {
-    let user_pubkey = extract_user_from_token(&headers).await?;
-    let pool = &auth_state.state.db;
     let tenant_id = tenant.0.id;
+    let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
+    let pool = &auth_state.state.db;
 
     // Validate origin if provided (must be HTTPS)
     if let Some(ref origin) = req.origin {
@@ -1114,9 +1120,9 @@ pub async fn get_bunker_url(
     headers: HeaderMap,
 ) -> Result<Json<BunkerUrlResponse>, AuthError> {
     // Extract user pubkey AND redirect_origin from UCAN token
-    let (user_pubkey, redirect_origin, _bunker_pubkey) =
-        extract_user_and_origin_from_token(&headers).await?;
     let tenant_id = tenant.0.id;
+    let (user_pubkey, redirect_origin, _bunker_pubkey) =
+        extract_user_and_origin_from_token(&headers, tenant_id).await?;
     tracing::info!(
         "get_bunker_url called for user: {} origin: {} in tenant: {}",
         user_pubkey,
@@ -1592,7 +1598,7 @@ pub async fn resend_verification(
 
     // Try to get user identity from token first, then fall back to email
     let lookup_result: Option<(String, String, bool, Option<chrono::DateTime<chrono::Utc>>)> =
-        if let Ok(user_pubkey) = extract_user_from_token(&headers).await {
+        if let Ok(user_pubkey) = extract_user_from_token(&headers, tenant_id).await {
             // Authenticated: look up by pubkey
             let user_repo = UserRepository::new(pool.clone());
             match user_repo
@@ -1839,8 +1845,8 @@ pub async fn get_profile(
     State(pool): State<PgPool>,
     headers: HeaderMap,
 ) -> Result<Json<ProfileData>, AuthError> {
-    let user_pubkey = extract_user_from_token(&headers).await?;
     let tenant_id = tenant.0.id;
+    let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
     tracing::info!(
         "Fetching username for user: {} in tenant: {}",
         user_pubkey,
@@ -1874,8 +1880,8 @@ pub async fn get_account_status(
     State(pool): State<PgPool>,
     headers: HeaderMap,
 ) -> Result<Json<AccountStatusResponse>, AuthError> {
-    let user_pubkey = extract_user_from_token(&headers).await?;
     let tenant_id = tenant.0.id;
+    let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
     tracing::debug!(
         "Fetching account status for user: {} in tenant: {}",
         user_pubkey,
@@ -1906,8 +1912,8 @@ pub async fn update_profile(
     headers: HeaderMap,
     Json(profile): Json<ProfileData>,
 ) -> Result<Json<serde_json::Value>, AuthError> {
-    let user_pubkey = extract_user_from_token(&headers).await?;
     let tenant_id = tenant.0.id;
+    let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
 
@@ -2073,8 +2079,8 @@ pub async fn list_sessions(
     headers: HeaderMap,
 ) -> Result<Json<BunkerSessionsResponse>, AuthError> {
     // Extract user from UCAN (supports both cookie and Bearer token)
-    let user_pubkey = extract_user_from_token(&headers).await?;
     let tenant_id = tenant.0.id;
+    let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
     tracing::info!(
         "Listing bunker sessions for user: {} in tenant: {}",
         user_pubkey,
@@ -2135,8 +2141,8 @@ pub async fn revoke_session(
 ) -> Result<Json<RevokeSessionResponse>, AuthError> {
     let pool = &auth_state.state.db;
     // Extract user from UCAN (supports both cookie and Bearer token)
-    let user_pubkey = extract_user_from_token(&headers).await?;
     let tenant_id = tenant.0.id;
+    let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
     tracing::info!(
         "Revoking bunker session for user: {} in tenant: {}",
         user_pubkey,
@@ -2207,8 +2213,8 @@ pub async fn disconnect_client(
     headers: HeaderMap,
     Json(req): Json<DisconnectClientRequest>,
 ) -> Result<Json<DisconnectClientResponse>, AuthError> {
-    let user_pubkey = extract_user_from_token(&headers).await?;
     let tenant_id = tenant.0.id;
+    let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
     tracing::info!(
         "Disconnecting NIP-46 client for user: {} in tenant: {}",
         user_pubkey,
@@ -2270,8 +2276,8 @@ pub async fn list_permissions(
     State(pool): State<PgPool>,
     headers: HeaderMap,
 ) -> Result<Json<PermissionsResponse>, AuthError> {
-    let user_pubkey = extract_user_from_token(&headers).await?;
     let tenant_id = tenant.0.id;
+    let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
     tracing::info!(
         "Listing permissions for user: {} in tenant: {}",
         user_pubkey,
@@ -2665,11 +2671,11 @@ pub async fn sign_event(
     headers: HeaderMap,
     Json(req): Json<SignEventRequest>,
 ) -> Result<Json<SignEventResponse>, AuthError> {
+    let tenant_id = tenant.0.id;
     let (user_pubkey, redirect_origin, _bunker_pubkey) =
-        extract_user_and_origin_from_token(&headers).await?;
+        extract_user_and_origin_from_token(&headers, tenant_id).await?;
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
-    let tenant_id = tenant.0.id;
 
     // Parse unsigned event first for validation
     let unsigned_event: UnsignedEvent = serde_json::from_value(req.event.clone())
@@ -2776,8 +2782,8 @@ pub async fn get_pubkey(
     State(pool): State<PgPool>,
     headers: HeaderMap,
 ) -> Result<Json<PubkeyResponse>, AuthError> {
-    let user_pubkey = extract_user_from_token(&headers).await?;
     let tenant_id = tenant.0.id;
+    let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
 
     tracing::info!(
         "Fetching pubkey for user: {} in tenant: {}",
@@ -2829,8 +2835,8 @@ pub async fn verify_password_for_export(
     headers: HeaderMap,
     Json(req): Json<VerifyPasswordRequest>,
 ) -> Result<Json<VerifyPasswordResponse>, AuthError> {
-    let user_pubkey = extract_user_from_token(&headers).await?;
     let tenant_id = tenant.0.id;
+    let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
 
     // Get user's email and password hash
     let user_repo = UserRepository::new(pool.clone());
@@ -2869,8 +2875,8 @@ pub async fn change_password(
     headers: HeaderMap,
     Json(req): Json<ChangePasswordRequest>,
 ) -> Result<Json<serde_json::Value>, AuthError> {
-    let user_pubkey = extract_user_from_token(&headers).await?;
     let tenant_id = tenant.0.id;
+    let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
 
     // Validate new password length
     if req.new_password.len() < 8 {
@@ -2938,10 +2944,10 @@ pub async fn export_key(
     headers: HeaderMap,
     Json(req): Json<serde_json::Value>,
 ) -> Result<Json<ExportKeyResponse>, AuthError> {
-    let user_pubkey = extract_user_from_token(&headers).await?;
+    let tenant_id = tenant.0.id;
+    let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
-    let tenant_id = tenant.0.id;
 
     // Extract password and format from request
     let password = req
@@ -3012,10 +3018,10 @@ pub async fn change_key(
     headers: HeaderMap,
     Json(req): Json<ChangeKeyRequest>,
 ) -> Result<Response, AuthError> {
-    let old_pubkey = extract_user_from_token(&headers).await?;
+    let tenant_id = tenant.0.id;
+    let old_pubkey = extract_user_from_token(&headers, tenant_id).await?;
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
-    let tenant_id = tenant.0.id;
 
     // Get user's email and verify password
     let user_repo = UserRepository::new(pool.clone());

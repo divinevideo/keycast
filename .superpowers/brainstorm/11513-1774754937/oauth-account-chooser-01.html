@@ -1,0 +1,92 @@
+<h2>Third-Party OAuth: Already Signed In</h2>
+<p class="subtitle">Which interaction should Keycast use when the browser already has a session cookie and the user starts OAuth for a new app?</p>
+
+<div class="cards">
+  <div class="card" data-choice="inline-banner" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup">
+        <div class="mockup-header">A. Consent First, Account Callout Inline</div>
+        <div class="mockup-body" style="display:grid;gap:12px;">
+          <div style="padding:12px;border:2px solid #27C58B;border-radius:12px;background:rgba(39,197,139,0.08);">
+            <div class="label">Signed in as</div>
+            <div style="font-weight:700;margin-top:4px;">alice@example.com</div>
+            <div style="font-size:13px;color:#666;margin-top:6px;">This app will connect to this account.</div>
+            <div style="margin-top:10px;color:#27C58B;font-weight:600;">Use a different account</div>
+          </div>
+          <div class="placeholder" style="height:150px;">Existing consent card below</div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>Inline Banner</h3>
+      <p>Minimal change. Keep the consent page, but make the active account obvious and add a switch-account link at the top.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="chooser-then-consent" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup">
+        <div class="mockup-header">B. Account Chooser, Then Consent</div>
+        <div class="mockup-body" style="display:grid;gap:12px;">
+          <div style="padding:12px;border:2px solid #27C58B;border-radius:12px;background:rgba(39,197,139,0.08);display:flex;justify-content:space-between;align-items:center;">
+            <div>
+              <div class="label">Continue as</div>
+              <div style="font-weight:700;margin-top:4px;">alice@example.com</div>
+            </div>
+            <div style="font-weight:700;">Selected</div>
+          </div>
+          <div style="padding:12px;border:1px solid #cfd6dd;border-radius:12px;background:#fff;">
+            <div style="font-weight:700;">Use a different account</div>
+            <div style="font-size:13px;color:#666;margin-top:6px;">Sign in with another email or create one</div>
+          </div>
+          <div class="placeholder" style="height:92px;">Consent screen appears after selection</div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>Chooser Then Consent</h3>
+      <p>Google-style. First choose the account explicitly, then show permissions for the selected account.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="single-screen-chooser" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup">
+        <div class="mockup-header">C. Combined Account + Consent</div>
+        <div class="mockup-body" style="display:grid;gap:12px;">
+          <div style="padding:12px;border:2px solid #27C58B;border-radius:12px;background:rgba(39,197,139,0.08);">
+            <div class="label">Connecting as</div>
+            <div style="font-weight:700;margin-top:4px;">alice@example.com</div>
+          </div>
+          <div class="placeholder" style="height:92px;">Permissions list for this app</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+            <div class="mock-button" style="text-align:center;">Continue</div>
+            <div class="mock-button" style="text-align:center;background:#f3f4f6;color:#111;">Switch account</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>Combined Screen</h3>
+      <p>Fastest path. Show the chosen account and permissions on one screen with a secondary switch-account action.</p>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top:24px;">
+  <div class="pros-cons">
+    <div class="pros">
+      <h4>What I’m leaning toward</h4>
+      <ul>
+        <li><strong>B</strong> if we want the account choice to feel explicit and Google-like.</li>
+        <li><strong>C</strong> if we want fewer steps while still making the account unmistakable.</li>
+      </ul>
+    </div>
+    <div class="cons">
+      <h4>Tradeoff to watch</h4>
+      <ul>
+        <li><strong>A</strong> is easiest to ship, but it still risks users skimming past the account identity.</li>
+      </ul>
+    </div>
+  </div>
+</div>

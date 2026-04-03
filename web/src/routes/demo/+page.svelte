@@ -16,8 +16,8 @@
     Code,
   } from "phosphor-svelte";
 
-  // Import keycast-login library
-  import { createKeycastClient, KeycastRpc, generatePkce } from "keycast-login";
+  // Import @divinevideo/login library
+  import { createKeycastClient, KeycastRpc, generatePkce } from "@divinevideo/login";
   import { getViteDomain } from "$lib/utils/env";
 
   // Configuration
@@ -646,7 +646,7 @@
     <!-- Code Examples -->
     <DemoSection
       title="Code Examples"
-      description="Using keycast-login library"
+      description="Using @divinevideo/login library"
     >
       <div class="code-example">
         <div class="code-header">
@@ -654,7 +654,7 @@
           <span>1. Setup OAuth Client</span>
         </div>
         <pre><code
-            >import {"{"} createKeycastClient {"}"} from 'keycast-login';
+            >import {"{"} createKeycastClient {"}"} from '@divinevideo/login';
 
 const client = createKeycastClient({"{"}
   serverUrl: '${SERVER_URL}',
@@ -694,7 +694,7 @@ const tokens = await client.oauth.exchangeCode(code);
 const rpc = client.createRpc(tokens);
 
 // Or create directly
-import {"{"} KeycastRpc {"}"} from 'keycast-login';
+import {"{"} KeycastRpc {"}"} from '@divinevideo/login';
 const rpc = new KeycastRpc({"{"}
   nostrApi: '${SERVER_URL}/api/nostr',
   accessToken: tokens.access_token,
@@ -730,11 +730,11 @@ const signed = await signer.signEvent(unsignedEvent);</code
 
   <!-- Library Info -->
   <aside class="library-info">
-    <h3>Using keycast-login</h3>
+    <h3>Using @divinevideo/login</h3>
     <p>Install the TypeScript client for easier integration:</p>
-    <code class="install-command">npm install keycast-login</code>
+    <code class="install-command">npm install @divinevideo/login</code>
     <a
-      href="https://github.com/divinevideo/keycast/tree/main/keycast-login"
+      href="https://github.com/divinevideo/keycast/tree/main/@divinevideo/login"
       class="text-link"
     >
       View documentation on GitHub →

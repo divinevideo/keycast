@@ -422,8 +422,8 @@ pub async fn enable_atproto(
     headers: HeaderMap,
     Json(request): Json<EnableAtprotoRequest>,
 ) -> Result<(StatusCode, Json<AtprotoStatusResponse>), AuthError> {
-    let user_pubkey = extract_user_from_token(&headers).await?;
     let tenant_id = tenant.0.id;
+    let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
     let repo = UserRepository::new(pool);
 
     let response = enable_user_atproto_with_trigger(
@@ -446,8 +446,8 @@ pub async fn atproto_status(
     State(pool): State<PgPool>,
     headers: HeaderMap,
 ) -> Result<Json<AtprotoStatusResponse>, AuthError> {
-    let user_pubkey = extract_user_from_token(&headers).await?;
     let tenant_id = tenant.0.id;
+    let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
     let repo = UserRepository::new(pool);
 
     let response = get_user_atproto_status(&repo, tenant_id, &user_pubkey)
@@ -493,8 +493,8 @@ pub async fn disable_atproto(
     State(pool): State<PgPool>,
     headers: HeaderMap,
 ) -> Result<Json<AtprotoStatusResponse>, AuthError> {
-    let user_pubkey = extract_user_from_token(&headers).await?;
     let tenant_id = tenant.0.id;
+    let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
     let user_repo = UserRepository::new(pool.clone());
     let session_repo = AtprotoOAuthSessionRepository::new(pool);
 
@@ -518,8 +518,8 @@ pub async fn account_crosspost(
     Path(requested_pubkey): Path<String>,
     Json(request): Json<SetCrosspostRequest>,
 ) -> Result<Json<AtprotoStatusResponse>, AuthError> {
-    let authenticated_user_pubkey = extract_user_from_token(&headers).await?;
     let tenant_id = tenant.0.id;
+    let authenticated_user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
     let user_repo = UserRepository::new(pool.clone());
     let session_repo = AtprotoOAuthSessionRepository::new(pool);
 
