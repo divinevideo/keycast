@@ -4,8 +4,9 @@ use chrono::{Duration, Utc};
 use keycast_api::api::http::atproto::{
     disable_user_atproto, disable_user_atproto_and_revoke_sessions,
     disable_user_atproto_with_trigger, enable_user_atproto, enable_user_atproto_with_trigger,
-    get_user_atproto_status, sync_user_atproto_state_by_pubkey,
+    get_user_atproto_status, set_user_atproto_crosspost, sync_user_atproto_state_by_pubkey,
 };
+use keycast_api::api::http::auth::AuthError;
 use keycast_core::repositories::{
     AtprotoOAuthSessionRepository, CreateAtprotoOAuthSessionParams, IssueAtprotoTokensParams,
     UserRepository,
@@ -13,6 +14,10 @@ use keycast_core::repositories::{
 use keycast_core::types::refresh_token::hash_refresh_token;
 use nostr_sdk::Keys;
 use reqwest::StatusCode;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use uuid::Uuid;
 
 #[tokio::test]
@@ -339,4 +344,264 @@ async fn disable_path_revokes_atproto_oauth_refresh_sessions() {
     .await
     .expect("failed to load refresh revocation marker");
     assert!(revoked_at.is_some());
+}
+
+#[tokio::test]
+async fn crosspost_enable_uses_opt_in_trigger_for_initial_enable() {
+    let pool = common::setup_test_db().await;
+    let repo = UserRepository::new(pool.clone());
+    let session_repo = AtprotoOAuthSessionRepository::new(pool.clone());
+    let tenant_id = 1_i64;
+
+    let keys = Keys::generate();
+    let user_pubkey = keys.public_key().to_hex();
+    let username = format!("alice-crosspost-{}", &user_pubkey[..8]);
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, username, atproto_enabled, atproto_state, created_at, updated_at)
+         VALUES ($1, $2, $3, false, NULL, NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .bind(&username)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    let opt_in_calls = Arc::new(AtomicUsize::new(0));
+    let reenable_calls = Arc::new(AtomicUsize::new(0));
+    let disable_calls = Arc::new(AtomicUsize::new(0));
+
+    let expected_pubkey = user_pubkey.clone();
+    let expected_username = username.clone();
+    let opt_in_seen = opt_in_calls.clone();
+    let reenable_seen = reenable_calls.clone();
+    let disable_seen = disable_calls.clone();
+
+    let response = set_user_atproto_crosspost(
+        &repo,
+        &session_repo,
+        tenant_id,
+        &user_pubkey,
+        &user_pubkey,
+        true,
+        move |pubkey, requested_username, crosspost_enabled| {
+            let opt_in_seen = opt_in_seen.clone();
+            let expected_pubkey = expected_pubkey.clone();
+            let expected_username = expected_username.clone();
+            async move {
+                opt_in_seen.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(pubkey, expected_pubkey);
+                assert_eq!(requested_username, expected_username);
+                assert!(crosspost_enabled);
+                Ok(())
+            }
+        },
+        move |_pubkey| {
+            let reenable_seen = reenable_seen.clone();
+            async move {
+                reenable_seen.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        },
+        move |_pubkey| {
+            let disable_seen = disable_seen.clone();
+            async move {
+                disable_seen.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        },
+    )
+    .await
+    .expect("crosspost enable should succeed");
+
+    assert!(response.enabled);
+    assert_eq!(response.state.as_deref(), Some("pending"));
+    assert_eq!(opt_in_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(reenable_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(disable_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn crosspost_enable_uses_reenable_trigger_when_current_state_is_disabled() {
+    let pool = common::setup_test_db().await;
+    let repo = UserRepository::new(pool.clone());
+    let session_repo = AtprotoOAuthSessionRepository::new(pool.clone());
+    let tenant_id = 1_i64;
+
+    let keys = Keys::generate();
+    let user_pubkey = keys.public_key().to_hex();
+    let username = format!("alice-reenable-{}", &user_pubkey[..8]);
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, username, atproto_enabled, atproto_state, atproto_did, created_at, updated_at)
+         VALUES ($1, $2, $3, false, 'disabled', 'did:plc:disabledalice', NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .bind(&username)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    let opt_in_calls = Arc::new(AtomicUsize::new(0));
+    let reenable_calls = Arc::new(AtomicUsize::new(0));
+    let disable_calls = Arc::new(AtomicUsize::new(0));
+
+    let expected_pubkey = user_pubkey.clone();
+    let opt_in_seen = opt_in_calls.clone();
+    let reenable_seen = reenable_calls.clone();
+    let disable_seen = disable_calls.clone();
+
+    let response = set_user_atproto_crosspost(
+        &repo,
+        &session_repo,
+        tenant_id,
+        &user_pubkey,
+        &user_pubkey,
+        true,
+        move |_pubkey, _requested_username, _crosspost_enabled| {
+            let opt_in_seen = opt_in_seen.clone();
+            async move {
+                opt_in_seen.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        },
+        move |pubkey| {
+            let reenable_seen = reenable_seen.clone();
+            let expected_pubkey = expected_pubkey.clone();
+            async move {
+                reenable_seen.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(pubkey, expected_pubkey);
+                Ok(())
+            }
+        },
+        move |_pubkey| {
+            let disable_seen = disable_seen.clone();
+            async move {
+                disable_seen.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        },
+    )
+    .await
+    .expect("crosspost re-enable should succeed");
+
+    assert!(response.enabled);
+    assert_eq!(response.state.as_deref(), Some("pending"));
+    assert_eq!(opt_in_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(reenable_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(disable_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn crosspost_disable_uses_disable_trigger() {
+    let pool = common::setup_test_db().await;
+    let repo = UserRepository::new(pool.clone());
+    let session_repo = AtprotoOAuthSessionRepository::new(pool.clone());
+    let tenant_id = 1_i64;
+
+    let keys = Keys::generate();
+    let user_pubkey = keys.public_key().to_hex();
+    let username = format!("alice-disable-crosspost-{}", &user_pubkey[..8]);
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, username, atproto_enabled, atproto_state, atproto_did, created_at, updated_at)
+         VALUES ($1, $2, $3, true, 'ready', 'did:plc:readyalice', NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .bind(&username)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    let opt_in_calls = Arc::new(AtomicUsize::new(0));
+    let reenable_calls = Arc::new(AtomicUsize::new(0));
+    let disable_calls = Arc::new(AtomicUsize::new(0));
+
+    let expected_pubkey = user_pubkey.clone();
+    let opt_in_seen = opt_in_calls.clone();
+    let reenable_seen = reenable_calls.clone();
+    let disable_seen = disable_calls.clone();
+
+    let response = set_user_atproto_crosspost(
+        &repo,
+        &session_repo,
+        tenant_id,
+        &user_pubkey,
+        &user_pubkey,
+        false,
+        move |_pubkey, _requested_username, _crosspost_enabled| {
+            let opt_in_seen = opt_in_seen.clone();
+            async move {
+                opt_in_seen.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        },
+        move |_pubkey| {
+            let reenable_seen = reenable_seen.clone();
+            async move {
+                reenable_seen.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        },
+        move |pubkey| {
+            let disable_seen = disable_seen.clone();
+            let expected_pubkey = expected_pubkey.clone();
+            async move {
+                disable_seen.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(pubkey, expected_pubkey);
+                Ok(())
+            }
+        },
+    )
+    .await
+    .expect("crosspost disable should succeed");
+
+    assert!(!response.enabled);
+    assert_eq!(response.state.as_deref(), Some("disabled"));
+    assert_eq!(opt_in_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(reenable_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(disable_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn crosspost_toggle_rejects_pubkey_mismatch() {
+    let pool = common::setup_test_db().await;
+    let repo = UserRepository::new(pool.clone());
+    let session_repo = AtprotoOAuthSessionRepository::new(pool.clone());
+    let tenant_id = 1_i64;
+
+    let owner_keys = Keys::generate();
+    let user_pubkey = owner_keys.public_key().to_hex();
+    let other_pubkey = Keys::generate().public_key().to_hex();
+    let username = format!("alice-mismatch-{}", &user_pubkey[..8]);
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, username, created_at, updated_at)
+         VALUES ($1, $2, $3, NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .bind(&username)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    let error = set_user_atproto_crosspost(
+        &repo,
+        &session_repo,
+        tenant_id,
+        &user_pubkey,
+        &other_pubkey,
+        true,
+        |_pubkey, _requested_username, _crosspost_enabled| async { Ok(()) },
+        |_pubkey| async { Ok(()) },
+        |_pubkey| async { Ok(()) },
+    )
+    .await
+    .expect_err("mismatched pubkey should be rejected");
+
+    assert!(matches!(error, AuthError::Forbidden(_)));
 }

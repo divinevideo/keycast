@@ -263,6 +263,14 @@ components:
       required:
         - username
 
+    AtprotoCrosspostRequest:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+      required:
+        - enabled
+
     AtprotoStatusResponse:
       type: object
       properties:
@@ -627,6 +635,53 @@ paths:
                 $ref: '#/components/schemas/AtprotoStatusResponse'
         '401':
           description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /account/{pubkey}/crosspost:
+    put:
+      summary: Toggle Bluesky crossposting
+      description: Enable or disable Bluesky publishing for the authenticated user's account.
+      tags:
+        - User
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema:
+            type: string
+          description: Authenticated user's hex pubkey.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AtprotoCrosspostRequest'
+      responses:
+        '200':
+          description: Updated ATProto publishing status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AtprotoStatusResponse'
+        '400':
+          description: Username missing or request invalid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Authenticated user does not own the requested pubkey
           content:
             application/json:
               schema:

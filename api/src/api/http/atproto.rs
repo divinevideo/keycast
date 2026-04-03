@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
@@ -13,6 +13,11 @@ use super::auth::{extract_user_from_token, AuthError};
 #[derive(Debug, Deserialize)]
 pub struct EnableAtprotoRequest {
     pub username: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetCrosspostRequest {
+    pub enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,6 +156,57 @@ where
     Ok(response)
 }
 
+pub async fn reenable_user_atproto(
+    repo: &UserRepository,
+    tenant_id: i64,
+    user_pubkey: &str,
+) -> Result<AtprotoStatusResponse, AtprotoControlError> {
+    let claimed_username = repo
+        .get_username(user_pubkey, tenant_id)
+        .await?
+        .ok_or(AtprotoControlError::UserNotFound)?
+        .ok_or(AtprotoControlError::UsernameNotClaimed)?;
+
+    repo.set_atproto_state(user_pubkey, tenant_id, true, Some("pending"), None, None)
+        .await?;
+
+    let state = repo
+        .get_atproto_state(user_pubkey, tenant_id)
+        .await?
+        .ok_or(AtprotoControlError::UserNotFound)?;
+
+    Ok(map_state_to_response(Some(claimed_username), state))
+}
+
+pub async fn reenable_user_atproto_with_trigger<F, Fut>(
+    repo: &UserRepository,
+    tenant_id: i64,
+    user_pubkey: &str,
+    trigger: F,
+) -> Result<AtprotoStatusResponse, AtprotoControlError>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Result<(), crate::atproto_provisioning::AtprotoProvisioningError>>,
+{
+    let response = reenable_user_atproto(repo, tenant_id, user_pubkey).await?;
+
+    if let Err(error) = trigger(user_pubkey.to_string()).await {
+        let error_message = error.to_string();
+        repo.set_atproto_state(
+            user_pubkey,
+            tenant_id,
+            true,
+            Some("failed"),
+            None,
+            Some(&error_message),
+        )
+        .await?;
+        return Err(AtprotoControlError::ProvisioningTrigger(error_message));
+    }
+
+    Ok(response)
+}
+
 pub async fn get_user_atproto_status(
     repo: &UserRepository,
     tenant_id: i64,
@@ -247,6 +303,92 @@ where
     disable_user_atproto_and_revoke_sessions(user_repo, session_repo, tenant_id, user_pubkey).await
 }
 
+pub async fn set_user_atproto_crosspost<
+    FOptIn,
+    FutOptIn,
+    FReenable,
+    FutReenable,
+    FDisable,
+    FutDisable,
+>(
+    user_repo: &UserRepository,
+    session_repo: &AtprotoOAuthSessionRepository,
+    tenant_id: i64,
+    authenticated_user_pubkey: &str,
+    requested_pubkey: &str,
+    enabled: bool,
+    opt_in_trigger: FOptIn,
+    reenable_trigger: FReenable,
+    disable_trigger: FDisable,
+) -> Result<AtprotoStatusResponse, AuthError>
+where
+    FOptIn: FnOnce(String, String, bool) -> FutOptIn,
+    FutOptIn: Future<Output = Result<(), crate::atproto_provisioning::AtprotoProvisioningError>>,
+    FReenable: FnOnce(String) -> FutReenable,
+    FutReenable: Future<Output = Result<(), crate::atproto_provisioning::AtprotoProvisioningError>>,
+    FDisable: FnOnce(String) -> FutDisable,
+    FutDisable: Future<Output = Result<(), crate::atproto_provisioning::AtprotoProvisioningError>>,
+{
+    if authenticated_user_pubkey != requested_pubkey {
+        return Err(AuthError::Forbidden(
+            "You can only manage Bluesky publishing for your own account".to_string(),
+        ));
+    }
+
+    let current = get_user_atproto_status(user_repo, tenant_id, authenticated_user_pubkey)
+        .await
+        .map_err(map_control_error)?;
+
+    if enabled {
+        if current.enabled && matches!(current.state.as_deref(), Some("pending" | "ready")) {
+            return Ok(current);
+        }
+
+        if current.state.as_deref() == Some("disabled") {
+            return reenable_user_atproto_with_trigger(
+                user_repo,
+                tenant_id,
+                authenticated_user_pubkey,
+                reenable_trigger,
+            )
+            .await
+            .map_err(map_control_error);
+        }
+
+        let username = current
+            .username
+            .clone()
+            .ok_or(AtprotoControlError::UsernameNotClaimed)
+            .map_err(map_control_error)?;
+
+        return enable_user_atproto_with_trigger(
+            user_repo,
+            tenant_id,
+            authenticated_user_pubkey,
+            &username,
+            |pubkey, requested_username| async move {
+                opt_in_trigger(pubkey, requested_username, true).await
+            },
+        )
+        .await
+        .map_err(map_control_error);
+    }
+
+    if !current.enabled && matches!(current.state.as_deref(), None | Some("disabled")) {
+        return Ok(current);
+    }
+
+    disable_user_atproto_with_trigger(
+        user_repo,
+        session_repo,
+        tenant_id,
+        authenticated_user_pubkey,
+        disable_trigger,
+    )
+    .await
+    .map_err(map_control_error)
+}
+
 fn map_control_error(error: AtprotoControlError) -> AuthError {
     match error {
         AtprotoControlError::UserNotFound => AuthError::UserNotFound,
@@ -277,7 +419,7 @@ pub async fn enable_atproto(
         &user_pubkey,
         &request.username,
         |pubkey, username| async move {
-            crate::atproto_provisioning::request_enable(&pubkey, &username).await
+            crate::atproto_provisioning::request_enable(&pubkey, &username, true).await
         },
     )
     .await
@@ -352,6 +494,36 @@ pub async fn disable_atproto(
     )
     .await
     .map_err(map_control_error)?;
+
+    Ok(Json(response))
+}
+
+pub async fn account_crosspost(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Path(requested_pubkey): Path<String>,
+    Json(request): Json<SetCrosspostRequest>,
+) -> Result<Json<AtprotoStatusResponse>, AuthError> {
+    let authenticated_user_pubkey = extract_user_from_token(&headers).await?;
+    let tenant_id = tenant.0.id;
+    let user_repo = UserRepository::new(pool.clone());
+    let session_repo = AtprotoOAuthSessionRepository::new(pool);
+
+    let response = set_user_atproto_crosspost(
+        &user_repo,
+        &session_repo,
+        tenant_id,
+        &authenticated_user_pubkey,
+        &requested_pubkey,
+        request.enabled,
+        |pubkey, username, crosspost_enabled| async move {
+            crate::atproto_provisioning::request_enable(&pubkey, &username, crosspost_enabled).await
+        },
+        |pubkey| async move { crate::atproto_provisioning::request_reenable(&pubkey).await },
+        |pubkey| async move { crate::atproto_provisioning::request_disable(&pubkey).await },
+    )
+    .await?;
 
     Ok(Json(response))
 }

@@ -19,6 +19,7 @@ pub enum AtprotoProvisioningError {
 struct EnableProvisioningRequest {
     nostr_pubkey: String,
     handle: String,
+    crosspost_enabled: bool,
 }
 
 fn control_plane_base_url() -> String {
@@ -43,6 +44,7 @@ fn maybe_apply_service_auth(request: reqwest::RequestBuilder) -> reqwest::Reques
 pub async fn request_enable(
     nostr_pubkey: &str,
     username: &str,
+    crosspost_enabled: bool,
 ) -> Result<(), AtprotoProvisioningError> {
     let base = control_plane_base_url();
     let domain = handle_domain();
@@ -52,12 +54,34 @@ pub async fn request_enable(
     let body = EnableProvisioningRequest {
         nostr_pubkey: nostr_pubkey.to_string(),
         handle,
+        crosspost_enabled,
     };
 
     let client = Client::new();
     let response = maybe_apply_service_auth(client.post(url).json(&body))
         .send()
         .await?;
+
+    if response.status().is_success() {
+        return Ok(());
+    }
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    Err(AtprotoProvisioningError::UnexpectedStatus { status, body })
+}
+
+pub async fn request_reenable(nostr_pubkey: &str) -> Result<(), AtprotoProvisioningError> {
+    let base = control_plane_base_url();
+    let encoded_pubkey = urlencoding::encode(nostr_pubkey);
+    let url = format!(
+        "{}/api/account-links/{}/enable",
+        base.trim_end_matches('/'),
+        encoded_pubkey
+    );
+
+    let client = Client::new();
+    let response = maybe_apply_service_auth(client.post(url)).send().await?;
 
     if response.status().is_success() {
         return Ok(());

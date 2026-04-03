@@ -111,6 +111,10 @@ pub fn api_routes(
         .route("/user/atproto/enable", post(atproto::enable_atproto))
         .route("/user/atproto/disable", post(atproto::disable_atproto))
         .route(
+            "/account/:pubkey/crosspost",
+            put(atproto::account_crosspost),
+        )
+        .route(
             "/user/verify-password",
             post(auth::verify_password_for_export),
         )
