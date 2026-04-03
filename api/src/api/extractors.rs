@@ -4,6 +4,7 @@ use axum::{async_trait, extract::FromRequestParts, http::request::Parts};
 
 /// UCAN authentication extractor - extracts user pubkey from UCAN token
 /// Accepts Bearer token or keycast_session cookie
+/// Enforces DPoP binding when UCAN contains cnf.jkt
 pub struct UcanAuth {
     pub pubkey: String,
     /// Admin role from server-signed UCAN: "full" or "support"
@@ -33,6 +34,32 @@ fn extract_admin_role(ucan: &ucan::Ucan) -> Option<String> {
         .map(String::from)
 }
 
+/// Enforce DPoP binding if the UCAN has a cnf.jkt claim.
+/// Constructs the htu from the request method and path.
+fn enforce_dpop_if_bound(
+    parts: &Parts,
+    ucan: &ucan::Ucan,
+) -> Result<(), AuthError> {
+    let cnf_jkt = crate::ucan_auth::extract_cnf_jkt_from_ucan(ucan);
+    if cnf_jkt.is_none() {
+        return Ok(()); // No DPoP binding, nothing to enforce
+    }
+
+    let method = parts.method.as_str();
+    // Reconstruct the request URL for htu verification
+    // Use the path as-is; the DPoP proof htu should match the full URL
+    let htu = parts.uri.to_string();
+
+    crate::ucan_auth::enforce_dpop_binding(&parts.headers, ucan, method, &htu).map_err(|e| {
+        let msg = format!("DPoP binding enforcement failed: {}", e);
+        tracing::warn!("{} (path: {})", msg, parts.uri.path());
+        AuthError {
+            status: StatusCode::UNAUTHORIZED,
+            message: msg,
+        }
+    })
+}
+
 #[async_trait]
 impl<S> FromRequestParts<S> for UcanAuth
 where
@@ -59,6 +86,9 @@ where
                                 }
                             })?;
 
+                    // Enforce DPoP binding if UCAN contains cnf.jkt
+                    enforce_dpop_if_bound(parts, &ucan)?;
+
                     let admin_role = extract_admin_role(&ucan);
 
                     tracing::debug!(
@@ -70,7 +100,7 @@ where
             }
         }
 
-        // Try 2: UCAN Cookie
+        // Try 2: UCAN Cookie (cookies are not DPoP-bound, skip DPoP check)
         if let Some(cookie_header) = parts.headers.get("Cookie") {
             if let Ok(cookie_str) = cookie_header.to_str() {
                 for cookie in cookie_str.split(';') {

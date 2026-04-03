@@ -141,7 +141,7 @@ pub async fn nostr_rpc(
     // Get cached handler using BLAKE3(token) as cache key
     // On cache hit: skips UCAN verification entirely (~25% CPU savings)
     // On cache miss: verifies UCAN, loads from DB, caches result
-    let handler = match get_handler(&auth_state, pool, auth_header, tenant_id).await {
+    let handler = match get_handler(&auth_state, pool, auth_header, tenant_id, &headers).await {
         Ok(h) => h,
         Err(e) => {
             METRICS.inc_http_rpc_auth_error();
@@ -431,6 +431,7 @@ async fn get_handler(
     pool: &sqlx::PgPool,
     auth_header: &str,
     tenant_id: i64,
+    headers: &HeaderMap,
 ) -> Result<Arc<HttpRpcHandler>, RpcError> {
     // Compute BLAKE3 hash for cache lookup (~500ns)
     let blake3_key =
@@ -462,6 +463,30 @@ async fn get_handler(
         crate::ucan_auth::validate_ucan_token(auth_header, 0)
             .await
             .map_err(|_| RpcError::Auth(AuthError::InvalidToken))?;
+
+    // Enforce DPoP binding if the UCAN contains cnf.jkt
+    // The DPoP proof must match the bound key for resource access
+    if let Some(expected_jkt) = crate::ucan_auth::extract_cnf_jkt_from_ucan(&ucan) {
+        // For POST /api/nostr, use the request URL as htu
+        // Clients must include a DPoP proof header with matching method and URL
+        let htu = "/api/nostr";
+        match crate::ucan_auth::verify_dpop_proof(&headers, "POST", htu, Some(&expected_jkt)) {
+            Ok(Some(_)) => {
+                tracing::debug!("RPC: DPoP binding verified for cnf.jkt");
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    "RPC: DPoP-bound token used without DPoP proof (jkt={})",
+                    &expected_jkt[..8.min(expected_jkt.len())]
+                );
+                return Err(RpcError::Auth(AuthError::InvalidToken));
+            }
+            Err(e) => {
+                tracing::warn!("RPC: DPoP verification failed: {}", e);
+                return Err(RpcError::Auth(AuthError::InvalidToken));
+            }
+        }
+    }
 
     // Determine which authentication mode to use
     let handler = if let Some(bunker_key_hex) = bunker_pubkey {
