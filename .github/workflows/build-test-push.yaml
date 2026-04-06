@@ -221,9 +221,9 @@ jobs:
         id: envs
         run: |
           if [[ "${{ github.ref }}" == refs/tags/v* ]] || [[ "${{ inputs.include_production }}" == "true" ]]; then
-            echo 'environments=["poc","test","staging","production"]' >> $GITHUB_OUTPUT
+            echo 'environments=["poc","staging","production"]' >> $GITHUB_OUTPUT
           else
-            echo 'environments=["poc","test","staging"]' >> $GITHUB_OUTPUT
+            echo 'environments=["poc","staging"]' >> $GITHUB_OUTPUT
           fi
 
       - name: Generate GitHub App token
