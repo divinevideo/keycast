@@ -31,6 +31,7 @@ use sqlx::PgPool;
 const DEFAULT_TOKEN_EXPIRY_HOURS: i64 = 24;
 pub const EMAIL_VERIFICATION_EXPIRY_HOURS: i64 = 24;
 const PASSWORD_RESET_EXPIRY_HOURS: i64 = 1;
+const DEFAULT_NIP05_DOMAIN: &str = "divine.video";
 
 /// Get token expiry in seconds. Uses `TOKEN_EXPIRY_SECONDS` env var if set,
 /// otherwise defaults to 24 hours (86400 seconds).
@@ -48,6 +49,45 @@ pub fn generate_secure_token() -> String {
         .take(64)
         .map(char::from)
         .collect()
+}
+
+fn resolve_nip05_domain(tenant_domain: &str) -> String {
+    std::env::var("NIP05_DOMAIN")
+        .ok()
+        .or_else(|| std::env::var("DOMAIN").ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            if tenant_domain == "localhost" || tenant_domain == "127.0.0.1" {
+                DEFAULT_NIP05_DOMAIN.to_string()
+            } else {
+                tenant_domain.to_string()
+            }
+        })
+}
+
+fn normalize_nip05_username(raw_username: &str) -> Result<String, AuthError> {
+    let username = raw_username.trim().to_lowercase();
+
+    if username.is_empty() {
+        return Err(AuthError::Internal("Username cannot be empty".to_string()));
+    }
+
+    if !username
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(AuthError::Internal(
+            "Username can only contain a-z, 0-9, hyphens, underscores, and dots".to_string(),
+        ));
+    }
+
+    if username.starts_with('-') || username.ends_with('-') {
+        return Err(AuthError::Internal(
+            "Username cannot start or end with a hyphen".to_string(),
+        ));
+    }
+
+    Ok(username)
 }
 
 /// Generate UCAN token signed by user's key (self-signed)
@@ -1854,6 +1894,10 @@ pub async fn get_profile(
         .get_username(&user_pubkey, tenant_id)
         .await?
         .flatten();
+    let nip05_domain = resolve_nip05_domain(&tenant.0.domain);
+    let nip05 = username
+        .as_ref()
+        .map(|username| format!("{}@{}", username, nip05_domain));
 
     // Return only username - client fetches rest from relays
     Ok(Json(ProfileData {
@@ -1862,7 +1906,7 @@ pub async fn get_profile(
         about: None,
         picture: None,
         banner: None,
-        nip05: None,
+        nip05,
         website: None,
         lud16: None,
     }))
@@ -1921,25 +1965,12 @@ pub async fn update_profile(
     let mut divine_names_result: Option<Result<crate::divine_names::ClaimResponse, String>> = None;
 
     // Only update username - everything else is stored on Nostr relays
-    if let Some(ref username) = profile.username {
-        // Validate username (alphanumeric, dash, underscore only - matches divine-name-server ASCII rules)
-        // Note: divine-name-server also supports Unicode/IDN but we keep keycast validation simple
-        if !username.chars().all(|c| c.is_alphanumeric() || c == '-') {
-            return Err(AuthError::Internal(
-                "Username can only contain letters, numbers, and hyphens".to_string(),
-            ));
-        }
-
-        // Cannot start or end with hyphen
-        if username.starts_with('-') || username.ends_with('-') {
-            return Err(AuthError::Internal(
-                "Username cannot start or end with a hyphen".to_string(),
-            ));
-        }
+    if let Some(ref username_raw) = profile.username {
+        let username = normalize_nip05_username(username_raw)?;
 
         // Check divine-name-server FIRST (if enabled) - this is the authoritative source
         if crate::divine_names::is_enabled() {
-            match crate::divine_names::check_availability(username).await {
+            match crate::divine_names::check_availability(&username).await {
                 Ok((available, reason)) => {
                     if !available {
                         let error_msg = reason.unwrap_or_else(|| {
@@ -1968,7 +1999,7 @@ pub async fn update_profile(
         // Check if username is already taken in this tenant (local check)
         let user_repo = UserRepository::new(pool.clone());
         if !user_repo
-            .check_username_available(username, &user_pubkey, tenant_id)
+            .check_username_available(&username, &user_pubkey, tenant_id)
             .await?
         {
             return Err(AuthError::Internal("Username already taken".to_string()));
@@ -1989,7 +2020,7 @@ pub async fn update_profile(
                         let keys = Keys::new(secret_key.into());
 
                         // Claim username on divine-name-server
-                        match crate::divine_names::claim_username(&keys, username, None).await {
+                        match crate::divine_names::claim_username(&keys, &username, None).await {
                             Ok(response) => {
                                 tracing::info!(
                                     "Successfully claimed username '{}' on divine-name-server for user: {}",
@@ -2013,7 +2044,7 @@ pub async fn update_profile(
 
         // Update username in users table (always do local update)
         user_repo
-            .update_username(&user_pubkey, username, tenant_id)
+            .update_username(&user_pubkey, &username, tenant_id)
             .await?;
 
         tracing::info!(
@@ -3796,5 +3827,33 @@ mod tests {
         // NOTE: Content length validation not implemented yet (would need new permission type)
         // Current permissions: allowed_kinds, content_filter (word blocking), encrypt_to_self
         println!("✅ Content length validation tested");
+    }
+
+    #[test]
+    fn test_normalize_nip05_username_accepts_required_charset_and_lowercases() {
+        let normalized = super::normalize_nip05_username("Alice.Name_123")
+            .expect("username should normalize successfully");
+        assert_eq!(normalized, "alice.name_123");
+    }
+
+    #[test]
+    fn test_normalize_nip05_username_rejects_invalid_chars() {
+        let result = super::normalize_nip05_username("alice+name");
+        assert!(result.is_err(), "plus sign is not allowed in NIP-05 local-part");
+    }
+
+    #[test]
+    fn test_normalize_nip05_username_rejects_non_ascii() {
+        let result = super::normalize_nip05_username("álîce");
+        assert!(
+            result.is_err(),
+            "non-ascii usernames should be rejected for NIP-05 local-part compliance"
+        );
+    }
+
+    #[test]
+    fn test_normalize_nip05_username_rejects_hyphen_edges() {
+        assert!(super::normalize_nip05_username("-alice").is_err());
+        assert!(super::normalize_nip05_username("alice-").is_err());
     }
 }
