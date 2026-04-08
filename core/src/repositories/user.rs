@@ -185,10 +185,11 @@ impl UserRepository {
         username: &str,
         tenant_id: i64,
     ) -> Result<Option<String>, RepositoryError> {
-        let result: Option<(String,)> =
-            sqlx::query_as("SELECT pubkey FROM users WHERE username = $1 AND tenant_id = $2")
-                .bind(username)
-                .bind(tenant_id)
+        let result: Option<(String,)> = sqlx::query_as(
+            "SELECT pubkey FROM users WHERE LOWER(username) = LOWER($1) AND tenant_id = $2",
+        )
+        .bind(username)
+        .bind(tenant_id)
                 .fetch_optional(&self.pool)
                 .await?;
         Ok(result.map(|r| r.0))
@@ -639,7 +640,7 @@ impl UserRepository {
         tenant_id: i64,
     ) -> Result<bool, RepositoryError> {
         let result: Option<(String,)> = sqlx::query_as(
-            "SELECT pubkey FROM users WHERE username = $1 AND pubkey != $2 AND tenant_id = $3",
+            "SELECT pubkey FROM users WHERE LOWER(username) = LOWER($1) AND pubkey != $2 AND tenant_id = $3",
         )
         .bind(username)
         .bind(exclude_pubkey)

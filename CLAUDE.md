@@ -197,6 +197,7 @@ Optional:
 - `USE_GCP_KMS`: Use Google Cloud KMS instead of file-based encryption (default: `false`)
 - `USE_VALKEY_IAM`: Enable GCP IAM authentication for Memorystore Valkey (default: `false`). When enabled, uses Workload Identity to obtain access tokens for Redis authentication. Tokens are cached and refreshed automatically before expiry.
 - `BUNKER_RELAYS`: Comma-separated relay URLs for NIP-46 communication (required, no default)
+- `NIP05_DOMAIN`: When the tenant host is `localhost` or `127.0.0.1` only, overrides the domain used in profile `nip05` (with `DOMAIN` as second choice); does **not** override the tenant domain for real hosts—profile and `/.well-known/nostr.json` must stay on the same host
 - `RUST_LOG`: Log level configuration (default: `info`)
 - `SQLX_POOL_SIZE`: Database connection pool size (should match Cloud Run concurrency, default: `50`)
 - `VITE_ALLOWED_PUBKEYS`: Comma-separated pubkeys for whitelist access (web frontend)

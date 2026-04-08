@@ -36,6 +36,7 @@ let error = $state('');
 let userNpub = $state('');
 let userName = $state('');
 let userEmail = $state('');
+let userNip05 = $state('');
 let emailVerified = $state(false);
 let showCreateModal = $state(false);
 let copiedNpub = $state(false);
@@ -270,11 +271,28 @@ async function loadDashboardData() {
 		userNpub = user.pubkey;
 	}
 
-	const loads: Promise<void>[] = [loadSessions()];
+	const loads: Promise<void>[] = [loadSessions(), loadProfile()];
 	if (isTeamsEnabled()) loads.push(loadTeams());
 	loads.push(checkAdminStatus());
 	await Promise.all(loads);
 	isLoadingDashboard = false;
+}
+
+async function loadProfile() {
+	if (!currentUser?.pubkey) return;
+
+	try {
+		const profile = await api.get<{ username?: string | null; nip05?: string | null }>('/user/profile');
+		userName = profile.username || '';
+		userNip05 = profile.nip05 || '';
+	} catch (err: any) {
+		// 404 is expected for NIP-07 admins without user records
+		if (err?.status !== 404) {
+			console.error('Failed to load profile:', err);
+		}
+		userName = '';
+		userNip05 = '';
+	}
 }
 
 // Reactively load dashboard when user logs in after page mount (e.g. NIP-07)
@@ -372,6 +390,17 @@ $effect(() => {
 							</a>
 						</div>
 					</div>
+					{#if userNip05}
+						<div class="identity-row">
+							<div class="identity-icon">
+								<Check size={20} weight="fill" />
+							</div>
+							<div class="identity-info">
+								<span class="identity-value">{userNip05}</span>
+								<span class="status-badge success">NIP-05 Verified</span>
+							</div>
+						</div>
+					{/if}
 					{#if authMethod === 'cookie'}
 						<div class="identity-actions">
 							{#if adminRole === 'full'}

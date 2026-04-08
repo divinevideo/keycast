@@ -310,29 +310,37 @@ pub async fn nostr_discovery_public(
 
     // Check if "name" query parameter is provided
     if let Some(name) = params.get("name") {
-        // Look up user by username in this tenant
+        let name_trimmed = name.trim();
+        let canonical_name = name_trimmed.to_lowercase();
+        // Look up user by username in this tenant (case-insensitive; JSON key is canonical lowercase)
         let user_repo = UserRepository::new(pool.clone());
-        let result = user_repo
-            .find_pubkey_by_username(name, tenant_id)
-            .await
-            .ok()
-            .flatten();
-
-        if let Some(pubkey) = result {
-            // Return NIP-05 response with user's pubkey
-            let response = serde_json::json!({
+        let result = if canonical_name.is_empty() {
+            None
+        } else {
+            user_repo
+                .find_pubkey_by_username(&canonical_name, tenant_id)
+                .await
+                .ok()
+                .flatten()
+        };
+        let response = if let Some(pubkey) = result {
+            serde_json::json!({
                 "names": {
-                    name: pubkey
+                    canonical_name: pubkey
                 }
-            });
+            })
+        } else {
+            serde_json::json!({
+                "names": {}
+            })
+        };
 
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .body(Body::from(serde_json::to_string(&response).unwrap()))
-                .unwrap();
-        }
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .body(Body::from(serde_json::to_string(&response).unwrap()))
+            .unwrap();
     }
 
     // Get relay URL from tenant settings or BUNKER_RELAYS env var
@@ -360,8 +368,9 @@ pub async fn nostr_discovery_public(
         .or_else(|| std::env::var("VITE_DOMAIN").ok())
         .unwrap_or_else(|| "http://localhost:3000".to_string());
 
-    // Return default nostr-login discovery info if no name or name not found
+    // Return default nostr-login discovery info if no name is requested.
     let discovery = serde_json::json!({
+        "names": {},
         "nip46": {
             "relay": relay_url,
             "nostrconnect_url": format!("{}/api/connect/<nostrconnect>", api_base_url.trim_end_matches('/'))
