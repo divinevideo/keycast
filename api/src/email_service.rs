@@ -96,7 +96,7 @@ impl EmailSender for DevEmailSender {
         tracing::info!("  VERIFICATION EMAIL");
         tracing::info!("==================================================");
         tracing::info!("  To: {}", to_email);
-        tracing::info!("  Subject: Verify your diVine email address");
+        tracing::info!("  Subject: Verify your Divine email address");
         tracing::info!("");
         tracing::info!("  Click to verify:");
         tracing::info!("  {}", verification_url);
@@ -113,7 +113,7 @@ impl EmailSender for DevEmailSender {
         if let Ok(mut captured) = self.captured.lock() {
             captured.push(CapturedEmail {
                 to: to_email.to_string(),
-                subject: "Verify your diVine email address".to_string(),
+                subject: "Verify your Divine email address".to_string(),
                 verification_url: Some(verification_url),
                 reset_url: None,
             });
@@ -134,7 +134,7 @@ impl EmailSender for DevEmailSender {
         tracing::info!("  PASSWORD RESET EMAIL");
         tracing::info!("==================================================");
         tracing::info!("  To: {}", to_email);
-        tracing::info!("  Subject: Reset your diVine password");
+        tracing::info!("  Subject: Reset your Divine password");
         tracing::info!("");
         tracing::info!("  Click to reset password:");
         tracing::info!("  {}", reset_url);
@@ -151,7 +151,7 @@ impl EmailSender for DevEmailSender {
         if let Ok(mut captured) = self.captured.lock() {
             captured.push(CapturedEmail {
                 to: to_email.to_string(),
-                subject: "Reset your diVine password".to_string(),
+                subject: "Reset your Divine password".to_string(),
                 verification_url: None,
                 reset_url: Some(reset_url),
             });
@@ -166,7 +166,7 @@ impl EmailSender for DevEmailSender {
         tracing::info!("  VINE CLAIM EMAIL");
         tracing::info!("==================================================");
         tracing::info!("  To: {}", to_email);
-        tracing::info!("  Subject: Your Vine account on diVine is ready to claim");
+        tracing::info!("  Subject: Your Vine account on Divine is ready to claim");
         tracing::info!("");
         tracing::info!("  Claim link:");
         tracing::info!("  {}", claim_url);
@@ -181,7 +181,7 @@ impl EmailSender for DevEmailSender {
         if let Ok(mut captured) = self.captured.lock() {
             captured.push(CapturedEmail {
                 to: to_email.to_string(),
-                subject: "Your Vine account on diVine is ready to claim".to_string(),
+                subject: "Your Vine account on Divine is ready to claim".to_string(),
                 verification_url: Some(claim_url.to_string()),
                 reset_url: None,
             });
@@ -261,7 +261,7 @@ impl SendGridEmailSender {
     pub fn new(api_key: String) -> Self {
         let from_email =
             env::var("FROM_EMAIL").unwrap_or_else(|_| "noreply@divine.video".to_string());
-        let from_name = env::var("FROM_NAME").unwrap_or_else(|_| "diVine".to_string());
+        let from_name = env::var("FROM_NAME").unwrap_or_else(|_| "Divine".to_string());
         let base_url = env::var("BASE_URL")
             .or_else(|_| env::var("APP_URL"))
             .unwrap_or_else(|_| "http://localhost:5173".to_string());
@@ -359,12 +359,12 @@ impl EmailSender for SendGridEmailSender {
             self.base_url, verification_token
         );
 
-        let subject = "Verify your diVine email address".to_string();
+        let subject = "Verify your Divine email address".to_string();
         let html_content = format!(
             r#"
             <html>
             <body style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-                <h1 style="color: #00B488;">Verify your diVine email</h1>
+                <h1 style="color: #00B488;">Verify your Divine email</h1>
                 <p>Thanks for signing up! Please verify your email address by clicking the button below:</p>
                 <div style="margin: 30px 0;">
                     <a href="{}"
@@ -377,7 +377,7 @@ impl EmailSender for SendGridEmailSender {
                     <a href="{}" style="color: #00B488;">{}</a>
                 </p>
                 <p style="color: #666; font-size: 14px; margin-top: 30px;">
-                    If you didn't sign up for diVine, you can safely ignore this email.
+                    If you didn't sign up for Divine, you can safely ignore this email.
                 </p>
             </body>
             </html>
@@ -386,7 +386,7 @@ impl EmailSender for SendGridEmailSender {
         );
 
         let text_content = format!(
-            "Thanks for signing up! Please verify your email address by clicking this link:\n\n{}\n\nIf you didn't sign up for diVine, you can safely ignore this email.",
+            "Thanks for signing up! Please verify your email address by clicking this link:\n\n{}\n\nIf you didn't sign up for Divine, you can safely ignore this email.",
             verification_url
         );
 
@@ -401,12 +401,12 @@ impl EmailSender for SendGridEmailSender {
     ) -> Result<(), String> {
         let reset_url = format!("{}/reset-password?token={}", self.base_url, reset_token);
 
-        let subject = "Reset your diVine password".to_string();
+        let subject = "Reset your Divine password".to_string();
         let html_content = format!(
             r#"
             <html>
             <body style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-                <h1 style="color: #00B488;">Reset your diVine password</h1>
+                <h1 style="color: #00B488;">Reset your Divine password</h1>
                 <p>We received a request to reset your password. Click the button below to set a new password:</p>
                 <div style="margin: 30px 0;">
                     <a href="{}"
@@ -437,13 +437,13 @@ impl EmailSender for SendGridEmailSender {
     }
 
     async fn send_claim_email(&self, to_email: &str, claim_url: &str) -> Result<(), String> {
-        let subject = "Your Vine account on diVine is ready to claim".to_string();
+        let subject = "Your Vine account on Divine is ready to claim".to_string();
         let html_content = format!(
             r#"
             <html>
             <body style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
                 <h1 style="color: #00B488;">Your Vine account is ready!</h1>
-                <p>Your Vine account has been migrated to diVine. Click the button below to claim it and set up your login:</p>
+                <p>Your Vine account has been migrated to Divine. Click the button below to claim it and set up your login:</p>
                 <div style="margin: 30px 0;">
                     <a href="{}"
                        style="background: #00B488; color: #fff; padding: 12px 24px; text-decoration: none; border-radius: 4px; display: inline-block; font-weight: bold;">
@@ -464,7 +464,7 @@ impl EmailSender for SendGridEmailSender {
         );
 
         let text_content = format!(
-            "Your Vine account has been migrated to diVine. Click this link to claim it:\n\n{}\n\nThis link will expire in 7 days. If you didn't request this, you can safely ignore this email.",
+            "Your Vine account has been migrated to Divine. Click this link to claim it:\n\n{}\n\nThis link will expire in 7 days. If you didn't request this, you can safely ignore this email.",
             claim_url
         );
 
