@@ -84,7 +84,7 @@ services:
       # Email configuration
       SENDGRID_API_KEY: ${SENDGRID_API_KEY:-}
       FROM_EMAIL: ${FROM_EMAIL:-noreply@divine.video}
-      FROM_NAME: ${FROM_NAME:-diVine}
+      FROM_NAME: ${FROM_NAME:-Divine}
       BASE_URL: ${BASE_URL:-http://localhost:5173}
       # DISABLE_EMAILS: ${DISABLE_EMAILS:-}
       # Server configuration
