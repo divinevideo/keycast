@@ -22,7 +22,7 @@
 
   // Configuration
   const SERVER_URL = getViteDomain();
-  const CLIENT_ID = "diVine Login Demo";
+  const CLIENT_ID = "Divine Login Demo";
   console.log(
     "SERVER_URL:",
     SERVER_URL,
@@ -437,7 +437,7 @@
       <p class="hint-text">
         To test the OAuth approval flow again, first <a
           href="/"
-          class="text-link">revoke the "diVine Login Demo" authorization</a
+          class="text-link">revoke the "Divine Login Demo" authorization</a
         > in your dashboard, then click Disconnect above.
       </p>
 

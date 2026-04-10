@@ -163,7 +163,7 @@
 						autocomplete="off"
 						disabled={isLoading}
 					/>
-					<p class="field-hint">Import your existing key to use it with diVine Login. Leave empty to create a new one.</p>
+					<p class="field-hint">Import your existing key to use it with Divine Login. Leave empty to create a new one.</p>
 				</div>
 			</div>
 			{/if}

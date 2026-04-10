@@ -129,7 +129,7 @@
 				<div class="modal-body">
 					<div class="info-box">
 						<strong>You probably don't need this</strong>
-						<p>The diVine app and any app with "Sign in with diVine" already work with your email and password. This is only for Nostr apps that need a connection URL. Browse them at <a href="https://nostrapps.com" target="_blank" rel="noopener noreferrer">nostrapps.com</a>.</p>
+						<p>The Divine app and any app with "Sign in with Divine" already work with your email and password. This is only for Nostr apps that need a connection URL. Browse them at <a href="https://nostrapps.com" target="_blank" rel="noopener noreferrer">nostrapps.com</a>.</p>
 					</div>
 
 					<p class="description">

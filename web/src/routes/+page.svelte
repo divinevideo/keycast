@@ -418,13 +418,13 @@ $effect(() => {
 
 						<div class="learn-block">
 							<h4><ShieldCheck size={16} weight="fill" /> Where Is Your Key?</h4>
-							<p>When you sign up with email and password, diVine generates a Nostr key for you and stores it on <a href="https://login.divine.video" target="_blank" rel="noopener noreferrer">login.divine.video</a>, encrypted using the same standards banks and password managers rely on (<a href="https://en.wikipedia.org/wiki/Advanced_Encryption_Standard" target="_blank" rel="noopener noreferrer">1</a>,<a href="https://cloud.google.com/security/products/security-key-management" target="_blank" rel="noopener noreferrer">2</a>). Your key is only decrypted in memory when an app needs to sign on your behalf, and is never stored in plain text.</p>
-							<p>Any Nostr app that supports diVine Login, like <a href="https://privdm.com" target="_blank" rel="noopener noreferrer" class="inline-link">Priv DM <ArrowSquareOut size={12} /></a>, can use your identity with just your email and password. No copying keys between apps, no manual setup.</p>
+							<p>When you sign up with email and password, Divine generates a Nostr key for you and stores it on <a href="https://login.divine.video" target="_blank" rel="noopener noreferrer">login.divine.video</a>, encrypted using the same standards banks and password managers rely on (<a href="https://en.wikipedia.org/wiki/Advanced_Encryption_Standard" target="_blank" rel="noopener noreferrer">1</a>,<a href="https://cloud.google.com/security/products/security-key-management" target="_blank" rel="noopener noreferrer">2</a>). Your key is only decrypted in memory when an app needs to sign on your behalf, and is never stored in plain text.</p>
+							<p>Any Nostr app that supports Divine Login, like <a href="https://privdm.com" target="_blank" rel="noopener noreferrer" class="inline-link">Priv DM <ArrowSquareOut size={12} /></a>, can use your identity with just your email and password. No copying keys between apps, no manual setup.</p>
 						</div>
 
 						<div class="learn-block">
 							<h4><Key size={16} weight="fill" /> Already Have a Nostr Key?</h4>
-							<p>You don't need a diVine account at all. Import your nsec into the diVine app and everything stays on your device.</p>
+							<p>You don't need a Divine account at all. Import your nsec into the Divine app and everything stays on your device.</p>
 						</div>
 
 						<div class="learn-block">
@@ -434,12 +434,12 @@ $effect(() => {
 								<li><strong>Your phone:</strong> <a href="https://primal.net" target="_blank" rel="noopener noreferrer" class="inline-link">Primal <ArrowSquareOut size={12} /></a> (iOS & Android), <a href="https://github.com/greenart7c3/Amber" target="_blank" rel="noopener noreferrer" class="inline-link">Amber <ArrowSquareOut size={12} /></a> (Android), or <a href="https://nsec.app" target="_blank" rel="noopener noreferrer" class="inline-link">nsec.app <ArrowSquareOut size={12} /></a> (any browser) turn your device into a personal signing server. When a Nostr app needs your signature, it asks your device and your key never leaves it.</li>
 								<li><strong>Your browser:</strong> Extensions like <a href="https://getalby.com" target="_blank" rel="noopener noreferrer" class="inline-link">Alby <ArrowSquareOut size={12} /></a> or <a href="https://chromewebstore.google.com/detail/soapboxpub-signer/nnodjkgakfpkckcnbacpcjbpmlmbihdd" target="_blank" rel="noopener noreferrer" class="inline-link">Soapbox Signer <ArrowSquareOut size={12} /></a> (Chrome, Firefox) keep your key in the browser itself. <a href="https://apps.apple.com/app/nostash/id6499558903" target="_blank" rel="noopener noreferrer" class="inline-link">Nostash <ArrowSquareOut size={12} /></a> does the same for Safari on iOS.</li>
 							</ul>
-							<p>With these options, each app that needs your signature must connect to your signer individually. diVine Login handles that for you automatically.</p>
+							<p>With these options, each app that needs your signature must connect to your signer individually. Divine Login handles that for you automatically.</p>
 						</div>
 
 						<div class="learn-block highlight">
 							<h4><ShieldCheck size={16} weight="fill" /> Why This Matters</h4>
-							<p>Unlike Twitter or Facebook, <strong>no company owns your Nostr identity</strong>. Even if diVine disappeared tomorrow, your identity and content would still exist on the network. Export your key and continue anywhere.</p>
+							<p>Unlike Twitter or Facebook, <strong>no company owns your Nostr identity</strong>. Even if Divine disappeared tomorrow, your identity and content would still exist on the network. Export your key and continue anywhere.</p>
 							<p class="learn-cta">That's the power of Nostr.</p>
 							<div class="learn-explore">
 								<a href="https://nostrapps.com" target="_blank" rel="noopener noreferrer">Explore Nostr apps at nostrapps.com <ArrowSquareOut size={12} /></a>
@@ -465,7 +465,7 @@ $effect(() => {
 					<div class="empty-state">
 						<p>No app connections yet.</p>
 						<p class="hint">
-							The diVine app and any app with "Sign in with diVine" already work with your email and password. Use this to connect to other Nostr apps. Browse them at <a href="https://nostrapps.com" target="_blank" rel="noopener noreferrer">nostrapps.com</a>.
+							The Divine app and any app with "Sign in with Divine" already work with your email and password. Use this to connect to other Nostr apps. Browse them at <a href="https://nostrapps.com" target="_blank" rel="noopener noreferrer">nostrapps.com</a>.
 						</p>
 					</div>
 				{:else}
@@ -478,7 +478,7 @@ $effect(() => {
 										<p class="app-name">
 											{group.application_name}
 											{#if group.isOAuth}
-												<span class="connection-badge oauth">diVine Login</span>
+												<span class="connection-badge oauth">Divine Login</span>
 											{:else}
 												<span class="connection-badge manual">Bunker</span>
 											{/if}
@@ -735,7 +735,7 @@ $effect(() => {
 						<PlugsConnected size={24} weight="fill" />
 					</div>
 					<h3>Works across apps</h3>
-					<p>Sign in to any Nostr app that supports diVine Login. One account, everywhere.</p>
+					<p>Sign in to any Nostr app that supports Divine Login. One account, everywhere.</p>
 				</div>
 
 				<div class="feature-card">
