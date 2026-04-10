@@ -502,7 +502,7 @@ pub async fn claim_post(
                 <div class="step-num">1</div>
                 <div class="step-content">
                     <div class="step-title">Get the App</div>
-                    <div class="step-desc">Download diVine for the best experience.</div>
+                    <div class="step-desc">Download Divine for the best experience.</div>
                     <div class="app-links">
                         <a class="app-link" href="https://apps.apple.com/app/divine-video/id6744577425" target="_blank">
                             &#63743; App Store
@@ -532,7 +532,7 @@ pub async fn claim_post(
         <div class="divider"></div>
 
         <a class="web-link" href="https://divine.video" target="_blank">
-            Open diVine on Web
+            Open Divine on Web
         </a>
         <p class="note">You can also access your account at divine.video</p>
     </div>
