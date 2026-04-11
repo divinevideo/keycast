@@ -245,6 +245,8 @@ async fn create_test_tenant(pool: &sqlx::PgPool, domain: &str) -> i64 {
 fn configure_atproto_env() -> Keys {
     unsafe {
         std::env::set_var("APP_URL", "https://login.divine.video");
+        std::env::set_var("ALLOWED_TENANT_DOMAINS", "login.divine.video");
+        std::env::remove_var("ENABLE_TENANT_AUTO_PROVISIONING");
         std::env::set_var(
             "ATPROTO_OAUTH_JWT_PRIVATE_KEY_HEX",
             TEST_ATPROTO_JWT_KEY_HEX,
@@ -541,6 +543,12 @@ async fn par_uses_request_host_tenant_for_authorize_flow() {
     let app = app(pool.clone());
 
     let tenant_domain = format!("tenant-{}.example.com", Uuid::new_v4());
+    unsafe {
+        std::env::set_var(
+            "ALLOWED_TENANT_DOMAINS",
+            format!("login.divine.video,{tenant_domain}"),
+        );
+    }
     let tenant_id = create_test_tenant(&pool, &tenant_domain).await;
 
     let user_keys = Keys::generate();
