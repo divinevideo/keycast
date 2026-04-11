@@ -924,8 +924,8 @@ pub async fn authorize_get(
 </body>
 </html>
         "#,
-                params.client_id, // header app context
-                identity_label,   // signed-in identity
+                escape_html(&params.client_id), // header app context
+                escape_html(identity_label),    // signed-in identity
             )
         } else {
             // User is authenticated - show approval screen

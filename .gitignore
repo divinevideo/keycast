@@ -5,6 +5,7 @@ master.key
 *.db
 *.db-shm
 *.db-wal
+firebase-debug.log
 .env
 .env.*
 !.env.example
@@ -27,6 +28,8 @@ migration-checkpoint.json
 # Claude Code local files
 .claude/
 .claude/settings.local.json
+.private-journal/
+.superpowers/brainstorm/
 .specify/
 api/oauth-ui/
 specs/
@@ -39,6 +42,8 @@ scripts/deploy-to-pi.sh
 .tms-create
 tests/qa/target/
 keycast-login/dist/
+keycast-login/package-lock.json
+web/package-lock.json
 .claude/settings.local.json
 
 # Load testing artifacts
