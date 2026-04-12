@@ -1,5 +1,5 @@
 # Build stage for Rust API
-FROM rust:1.93-slim AS rust-builder
+FROM rust:1.93-slim-bookworm AS rust-builder
 
 RUN apt-get update && apt-get install -y \
     pkg-config \

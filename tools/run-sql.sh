@@ -23,7 +23,7 @@ CONNECTION_NAME="$PROJECT_ID:$REGION:$INSTANCE_NAME"
 
 DB_USER="postgres"
 DB_NAME="keycast"
-DB_PORT="15432"  # Non-standard port to avoid conflicts with local PostgreSQL
+DB_PORT="${DB_PORT:-15432}"  # Non-standard port to avoid conflicts with local PostgreSQL
 # ---------------------
 
 # Find cloud-sql-proxy binary
@@ -34,17 +34,18 @@ if [ ! -x "$PROXY_BIN" ]; then
     exit 1
 fi
 
-# 1. Auto-Detect Password from Secret Manager
-if [ -z "$DB_PASS" ]; then
+# 1. Auto-Detect DATABASE_URL from Secret Manager
+# Use the full URL (rewritten to proxy host) instead of extracting password,
+# which avoids shell escaping issues with special characters in passwords.
+if [ -z "$DB_URL" ]; then
     echo "🔍 Auto-detecting database credentials..." >&2
 
     DB_URL=$(gcloud secrets versions access latest --secret="keycast-database-url" --project=$PROJECT_ID 2>/dev/null || true)
 
-    if [[ "$DB_URL" =~ ://[^:]+:([^@]+)@ ]]; then
-        DB_PASS="${BASH_REMATCH[1]}"
-        echo "✅ Found password from Secret Manager!" >&2
+    if [ -n "$DB_URL" ]; then
+        echo "✅ Found DATABASE_URL from Secret Manager!" >&2
     else
-        echo "⚠️  Could not auto-detect password." >&2
+        echo "⚠️  Could not auto-detect credentials." >&2
         read -s -p "🔑 Enter DB Password manually: " DB_PASS
         echo "" >&2
     fi
@@ -69,7 +70,7 @@ fi
 # 3. Start Cloud SQL Auth Proxy in the background
 echo "🔌 Starting Cloud SQL Auth Proxy..." >&2
 
-"$PROXY_BIN" "$CONNECTION_NAME" --port $DB_PORT --gcloud-auth --quiet 2>&1 >&2 &
+"$PROXY_BIN" "$CONNECTION_NAME" --port $DB_PORT --quiet 2>&1 >&2 &
 PROXY_PID=$!
 
 # Cleanup function to stop proxy on exit
@@ -90,7 +91,13 @@ done
 
 # 5. Execute SQL
 echo "🚀 Executing SQL..." >&2
-export PGPASSWORD="$DB_PASS"
-echo "$SQL_QUERY" | psql -h 127.0.0.1 -p $DB_PORT -U $DB_USER -d $DB_NAME -f -
+if [ -n "$DB_URL" ]; then
+    # Rewrite host in DATABASE_URL to point at the local proxy
+    PROXY_URL=$(echo "$DB_URL" | sed -E "s/@[^/]+\//@127.0.0.1:$DB_PORT\//")
+    echo "$SQL_QUERY" | psql "$PROXY_URL" -f -
+else
+    export PGPASSWORD="$DB_PASS"
+    echo "$SQL_QUERY" | psql -h 127.0.0.1 -p $DB_PORT -U $DB_USER -d $DB_NAME -f -
+fi
 
 echo "✨ Done!" >&2

@@ -14,7 +14,7 @@ CONNECTION_NAME="$PROJECT_ID:$REGION:$INSTANCE_NAME"
 
 DB_USER="postgres"
 DB_NAME="keycast"
-DB_PORT="15432"  # Non-standard port to avoid conflicts with local PostgreSQL
+DB_PORT="${DB_PORT:-15432}"  # Non-standard port to avoid conflicts with local PostgreSQL
 # ---------------------
 
 # Find cloud-sql-proxy binary
@@ -25,17 +25,18 @@ if [ ! -x "$PROXY_BIN" ]; then
     exit 1
 fi
 
-# 1. Auto-Detect Password from Secret Manager
-if [ -z "$DB_PASS" ]; then
+# 1. Auto-Detect DATABASE_URL from Secret Manager
+# Use the full URL (rewritten to proxy host) instead of extracting password,
+# which avoids shell escaping issues with special characters in passwords.
+if [ -z "$DB_URL" ]; then
     echo "🔍 Auto-detecting database credentials..."
 
     DB_URL=$(gcloud secrets versions access latest --secret="keycast-database-url" --project=$PROJECT_ID 2>/dev/null || true)
 
-    if [[ "$DB_URL" =~ ://[^:]+:([^@]+)@ ]]; then
-        DB_PASS="${BASH_REMATCH[1]}"
-        echo "✅ Found password from Secret Manager!"
+    if [ -n "$DB_URL" ]; then
+        echo "✅ Found DATABASE_URL from Secret Manager!"
     else
-        echo "⚠️  Could not auto-detect password."
+        echo "⚠️  Could not auto-detect credentials."
         read -s -p "🔑 Enter DB Password manually: " DB_PASS
         echo ""
     fi
@@ -44,7 +45,7 @@ fi
 # 2. Start Cloud SQL Auth Proxy in the background
 echo "🔌 Starting Cloud SQL Auth Proxy for [$CONNECTION_NAME]..."
 
-"$PROXY_BIN" "$CONNECTION_NAME" --port $DB_PORT --gcloud-auth --quiet 2>&1 >&2 &
+"$PROXY_BIN" "$CONNECTION_NAME" --port $DB_PORT --quiet 2>&1 >&2 &
 PROXY_PID=$!
 
 # Cleanup function to stop proxy on exit
@@ -67,7 +68,12 @@ done
 # 4. Run the SQLx Migration
 echo "🚀 Running SQLx Migrations..."
 
-export DATABASE_URL="postgres://$DB_USER:$DB_PASS@127.0.0.1:$DB_PORT/$DB_NAME?sslmode=disable"
+if [ -n "$DB_URL" ]; then
+    # Rewrite host in DATABASE_URL to point at the local proxy
+    export DATABASE_URL=$(echo "$DB_URL" | sed -E "s/@[^/]+\//@127.0.0.1:$DB_PORT\//")
+else
+    export DATABASE_URL="postgres://$DB_USER:$DB_PASS@127.0.0.1:$DB_PORT/$DB_NAME?sslmode=disable"
+fi
 
 # Change to project root to find migrations
 cd "$(dirname "$0")/.."

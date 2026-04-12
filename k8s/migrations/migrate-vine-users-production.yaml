@@ -21,8 +21,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: migrate
-          # TODO: update tag once CI production push is fixed
-          image: us-central1-docker.pkg.dev/dv-platform-prod/containers-production/keycast:IMAGE_TAG
+          image: us-central1-docker.pkg.dev/dv-platform-prod/containers-production/keycast:a5d3261
           command: ["./migrate-vine-users"]
           env:
             # Source: openvine-co Cloud SQL via proxy sidecar (IAM auth, no password)
@@ -61,11 +60,11 @@ spec:
               value: "10"
           resources:
             requests:
-              memory: "128Mi"
-              cpu: "100m"
+              memory: "512Mi"
+              cpu: "200m"
             limits:
-              memory: "256Mi"
-              cpu: "500m"
+              memory: "1Gi"
+              cpu: "1000m"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
