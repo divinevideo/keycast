@@ -3,6 +3,7 @@ pub mod atproto;
 pub mod atproto_oauth;
 pub mod atproto_oauth_metadata;
 pub mod auth;
+pub mod auth_observability;
 pub mod claim;
 pub mod headless;
 pub mod html_safety;

@@ -198,6 +198,7 @@ pub fn api_routes(
             "/admin/claim-tokens/stats",
             get(admin::get_claim_token_stats),
         )
+        .route("/admin/auth-debug", get(admin::get_auth_debug))
         .route("/admin/user-lookup", get(admin::get_user_lookup))
         .route(
             "/admin/support-admins",

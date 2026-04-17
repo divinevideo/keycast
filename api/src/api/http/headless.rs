@@ -3,7 +3,7 @@
 
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -289,10 +289,12 @@ pub struct HeadlessLoginResponse {
 pub async fn headless_login(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
+    headers: HeaderMap,
     Json(mut req): Json<HeadlessLoginRequest>,
 ) -> Result<impl IntoResponse, HeadlessError> {
     let pool = &auth_state.state.db;
     let tenant_id = tenant.0.id;
+    let endpoint = "/api/headless/login";
 
     req.email = req.email.to_lowercase();
 
@@ -304,8 +306,36 @@ pub async fn headless_login(
     );
 
     // Validate redirect_uri
-    let _redirect_origin = extract_origin(&req.redirect_uri)
-        .map_err(|e| HeadlessError::InvalidRequest(format!("Invalid redirect_uri: {:?}", e)))?;
+    let redirect_origin = match extract_origin(&req.redirect_uri) {
+        Ok(origin) => origin,
+        Err(e) => {
+            super::auth_observability::record_auth_event_and_log(
+                pool,
+                &headers,
+                None,
+                super::auth_observability::AuthEvent {
+                    tenant_id,
+                    endpoint,
+                    event_type: "login",
+                    outcome: "failure",
+                    reason_code: Some("invalid_request"),
+                    http_status: 400,
+                    email: Some(&req.email),
+                    pubkey: None,
+                    client_id: Some(&req.client_id),
+                    redirect_origin: None,
+                    metadata_json: serde_json::json!({
+                        "error": format!("Invalid redirect_uri: {:?}", e),
+                    }),
+                },
+            )
+            .await;
+            return Err(HeadlessError::InvalidRequest(format!(
+                "Invalid redirect_uri: {:?}",
+                e
+            )));
+        }
+    };
 
     // Fetch user with password hash
     let user_repo = UserRepository::new(pool.clone());
@@ -314,6 +344,25 @@ pub async fn headless_login(
     let (public_key, password_hash, email_verified) = match user {
         Some(u) => u,
         None => {
+            super::auth_observability::record_auth_event_and_log(
+                pool,
+                &headers,
+                None,
+                super::auth_observability::AuthEvent {
+                    tenant_id,
+                    endpoint,
+                    event_type: "login",
+                    outcome: "failure",
+                    reason_code: Some("user_not_found"),
+                    http_status: 401,
+                    email: Some(&req.email),
+                    pubkey: None,
+                    client_id: Some(&req.client_id),
+                    redirect_origin: Some(&redirect_origin),
+                    metadata_json: serde_json::json!({}),
+                },
+            )
+            .await;
             tracing::warn!(
                 event = "headless_login",
                 tenant_id = tenant_id,
@@ -334,6 +383,25 @@ pub async fn headless_login(
         .map_err(|_| HeadlessError::Internal("Password verification failed".to_string()))?;
 
     if !valid {
+        super::auth_observability::record_auth_event_and_log(
+            pool,
+            &headers,
+            None,
+            super::auth_observability::AuthEvent {
+                tenant_id,
+                endpoint,
+                event_type: "login",
+                outcome: "failure",
+                reason_code: Some("invalid_password"),
+                http_status: 401,
+                email: Some(&req.email),
+                pubkey: Some(&public_key),
+                client_id: Some(&req.client_id),
+                redirect_origin: Some(&redirect_origin),
+                metadata_json: serde_json::json!({}),
+            },
+        )
+        .await;
         tracing::warn!(
             event = "headless_login",
             tenant_id = tenant_id,
@@ -347,6 +415,25 @@ pub async fn headless_login(
 
     // Check if email is verified
     if !email_verified {
+        super::auth_observability::record_auth_event_and_log(
+            pool,
+            &headers,
+            None,
+            super::auth_observability::AuthEvent {
+                tenant_id,
+                endpoint,
+                event_type: "login",
+                outcome: "failure",
+                reason_code: Some("email_not_verified"),
+                http_status: 403,
+                email: Some(&req.email),
+                pubkey: Some(&public_key),
+                client_id: Some(&req.client_id),
+                redirect_origin: Some(&redirect_origin),
+                metadata_json: serde_json::json!({}),
+            },
+        )
+        .await;
         tracing::warn!(
             event = "headless_login",
             tenant_id = tenant_id,
@@ -395,6 +482,26 @@ pub async fn headless_login(
         success = true,
         "Headless login successful"
     );
+
+    super::auth_observability::record_auth_event_and_log(
+        pool,
+        &headers,
+        None,
+        super::auth_observability::AuthEvent {
+            tenant_id,
+            endpoint,
+            event_type: "login",
+            outcome: "success",
+            reason_code: None,
+            http_status: 200,
+            email: Some(&req.email),
+            pubkey: Some(&public_key),
+            client_id: Some(&req.client_id),
+            redirect_origin: Some(&redirect_origin),
+            metadata_json: serde_json::json!({}),
+        },
+    )
+    .await;
 
     Ok(Json(HeadlessLoginResponse {
         success: true,

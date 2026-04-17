@@ -2986,12 +2986,14 @@ pub struct OAuthLoginRequest {
 pub async fn oauth_login(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
+    headers: HeaderMap,
     Json(mut req): Json<OAuthLoginRequest>,
 ) -> Result<impl IntoResponse, OAuthError> {
     use super::auth::generate_ucan_token;
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
     let tenant_id = tenant.0.id;
+    let endpoint = "/api/oauth/login";
 
     req.email = req.email.to_lowercase();
 
@@ -3003,10 +3005,32 @@ pub async fn oauth_login(
 
     // Validate credentials
     let user_repo = UserRepository::new(pool.clone());
-    let (public_key, password_hash, email_verified) = user_repo
-        .find_with_password(&req.email, tenant_id)
-        .await?
-        .ok_or(OAuthError::Unauthorized)?;
+    let (public_key, password_hash, email_verified) =
+        match user_repo.find_with_password(&req.email, tenant_id).await? {
+            Some(user) => user,
+            None => {
+                super::auth_observability::record_auth_event_and_log(
+                    pool,
+                    &headers,
+                    None,
+                    super::auth_observability::AuthEvent {
+                        tenant_id,
+                        endpoint,
+                        event_type: "login",
+                        outcome: "failure",
+                        reason_code: Some("user_not_found"),
+                        http_status: 401,
+                        email: Some(&req.email),
+                        pubkey: None,
+                        client_id: Some(&req.client_id),
+                        redirect_origin: None,
+                        metadata_json: serde_json::json!({}),
+                    },
+                )
+                .await;
+                return Err(OAuthError::Unauthorized);
+            }
+        };
 
     // Verify password (spawn_blocking to avoid blocking async runtime)
     let password = req.password.clone();
@@ -3017,11 +3041,49 @@ pub async fn oauth_login(
         .map_err(|_| OAuthError::InvalidRequest("Password verification failed".to_string()))?;
 
     if !valid {
+        super::auth_observability::record_auth_event_and_log(
+            pool,
+            &headers,
+            None,
+            super::auth_observability::AuthEvent {
+                tenant_id,
+                endpoint,
+                event_type: "login",
+                outcome: "failure",
+                reason_code: Some("invalid_password"),
+                http_status: 401,
+                email: Some(&req.email),
+                pubkey: Some(&public_key),
+                client_id: Some(&req.client_id),
+                redirect_origin: None,
+                metadata_json: serde_json::json!({}),
+            },
+        )
+        .await;
         return Err(OAuthError::Unauthorized);
     }
 
     // Check if email is verified
     if !email_verified {
+        super::auth_observability::record_auth_event_and_log(
+            pool,
+            &headers,
+            None,
+            super::auth_observability::AuthEvent {
+                tenant_id,
+                endpoint,
+                event_type: "login",
+                outcome: "failure",
+                reason_code: Some("email_not_verified"),
+                http_status: 400,
+                email: Some(&req.email),
+                pubkey: Some(&public_key),
+                client_id: Some(&req.client_id),
+                redirect_origin: None,
+                metadata_json: serde_json::json!({}),
+            },
+        )
+        .await;
         tracing::warn!("OAuth login failed: email not verified for {}", req.email);
         return Err(OAuthError::InvalidRequest(
             "Please verify your email address before signing in. Check your inbox for the verification link.".to_string(),
@@ -3048,7 +3110,33 @@ pub async fn oauth_login(
     let keys = Keys::new(secret_key.into());
 
     // Extract redirect_origin from redirect_uri for UCAN
-    let redirect_origin = extract_origin(&req.redirect_uri)?;
+    let redirect_origin = match extract_origin(&req.redirect_uri) {
+        Ok(origin) => origin,
+        Err(error) => {
+            super::auth_observability::record_auth_event_and_log(
+                pool,
+                &headers,
+                None,
+                super::auth_observability::AuthEvent {
+                    tenant_id,
+                    endpoint,
+                    event_type: "login",
+                    outcome: "failure",
+                    reason_code: Some("invalid_request"),
+                    http_status: 400,
+                    email: Some(&req.email),
+                    pubkey: Some(&public_key),
+                    client_id: Some(&req.client_id),
+                    redirect_origin: None,
+                    metadata_json: serde_json::json!({
+                        "error": format!("{:?}", error),
+                    }),
+                },
+            )
+            .await;
+            return Err(error);
+        }
+    };
 
     // Generate UCAN token with redirect_origin
     let ucan_token = generate_ucan_token(&keys, tenant_id, &req.email, &redirect_origin, None)
@@ -3058,6 +3146,26 @@ pub async fn oauth_login(
     // OAuth popup login: bunker authorization will be created manually by user if needed
 
     tracing::info!("OAuth popup login successful for user: {}", public_key);
+
+    super::auth_observability::record_auth_event_and_log(
+        pool,
+        &headers,
+        None,
+        super::auth_observability::AuthEvent {
+            tenant_id,
+            endpoint,
+            event_type: "login",
+            outcome: "success",
+            reason_code: None,
+            http_status: 200,
+            email: Some(&req.email),
+            pubkey: Some(&public_key),
+            client_id: Some(&req.client_id),
+            redirect_origin: Some(&redirect_origin),
+            metadata_json: serde_json::json!({}),
+        },
+    )
+    .await;
 
     // Set cookie and return success - page will reload to show approval
     let cookie = format!(

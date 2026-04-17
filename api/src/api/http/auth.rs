@@ -784,6 +784,7 @@ pub async fn login(
     body: String,
 ) -> Result<Response, AuthError> {
     let tenant_id = tenant.0.id;
+    let endpoint = "/api/auth/login";
 
     // Check for NIP-98 Authorization header first
     if let Some(auth_header) = headers.get("Authorization") {
@@ -802,7 +803,35 @@ pub async fn login(
     let pool = &auth_state.state.db;
 
     // Extract redirect_origin from HTTP Origin header (required for UCAN)
-    let redirect_origin = extract_origin_from_headers(&headers)?;
+    let redirect_origin = match extract_origin_from_headers(&headers) {
+        Ok(origin) => origin,
+        Err(error) => {
+            let message = match &error {
+                AuthError::BadRequest(message) => message.clone(),
+                _ => "Invalid origin".to_string(),
+            };
+            super::auth_observability::record_auth_event_and_log(
+                &auth_state.state.db,
+                &headers,
+                None,
+                super::auth_observability::AuthEvent {
+                    tenant_id,
+                    endpoint,
+                    event_type: "login",
+                    outcome: "failure",
+                    reason_code: Some("invalid_request"),
+                    http_status: 400,
+                    email: None,
+                    pubkey: None,
+                    client_id: None,
+                    redirect_origin: None,
+                    metadata_json: serde_json::json!({ "error": message }),
+                },
+            )
+            .await;
+            return Err(error);
+        }
+    };
 
     tracing::info!(
         event = "login_attempt",
@@ -818,6 +847,25 @@ pub async fn login(
     let (public_key, password_hash, email_verified) = match user {
         Some(u) => u,
         None => {
+            super::auth_observability::record_auth_event_and_log(
+                pool,
+                &headers,
+                None,
+                super::auth_observability::AuthEvent {
+                    tenant_id,
+                    endpoint,
+                    event_type: "login",
+                    outcome: "failure",
+                    reason_code: Some("user_not_found"),
+                    http_status: 401,
+                    email: Some(&req.email),
+                    pubkey: None,
+                    client_id: None,
+                    redirect_origin: Some(&redirect_origin),
+                    metadata_json: serde_json::json!({}),
+                },
+            )
+            .await;
             tracing::warn!(
                 event = "login",
                 tenant_id = tenant_id,
@@ -836,6 +884,25 @@ pub async fn login(
         .await
         .map_err(|e| AuthError::Internal(format!("Task join error: {}", e)))??;
     if !valid {
+        super::auth_observability::record_auth_event_and_log(
+            pool,
+            &headers,
+            None,
+            super::auth_observability::AuthEvent {
+                tenant_id,
+                endpoint,
+                event_type: "login",
+                outcome: "failure",
+                reason_code: Some("invalid_password"),
+                http_status: 401,
+                email: Some(&req.email),
+                pubkey: Some(&public_key),
+                client_id: None,
+                redirect_origin: Some(&redirect_origin),
+                metadata_json: serde_json::json!({}),
+            },
+        )
+        .await;
         tracing::warn!(
             event = "login",
             tenant_id = tenant_id,
@@ -849,6 +916,25 @@ pub async fn login(
 
     // Check if email is verified
     if !email_verified {
+        super::auth_observability::record_auth_event_and_log(
+            pool,
+            &headers,
+            None,
+            super::auth_observability::AuthEvent {
+                tenant_id,
+                endpoint,
+                event_type: "login",
+                outcome: "failure",
+                reason_code: Some("email_not_verified"),
+                http_status: 403,
+                email: Some(&req.email),
+                pubkey: Some(&public_key),
+                client_id: None,
+                redirect_origin: Some(&redirect_origin),
+                metadata_json: serde_json::json!({}),
+            },
+        )
+        .await;
         tracing::warn!(
             event = "login",
             tenant_id = tenant_id,
@@ -889,6 +975,26 @@ pub async fn login(
         success = true,
         "User logged in successfully"
     );
+
+    super::auth_observability::record_auth_event_and_log(
+        pool,
+        &headers,
+        None,
+        super::auth_observability::AuthEvent {
+            tenant_id,
+            endpoint,
+            event_type: "login",
+            outcome: "success",
+            reason_code: None,
+            http_status: 200,
+            email: Some(&req.email),
+            pubkey: Some(&public_key),
+            client_id: None,
+            redirect_origin: Some(&redirect_origin),
+            metadata_json: serde_json::json!({}),
+        },
+    )
+    .await;
 
     // Create response with UCAN session cookie
     let cookie = format!(
@@ -1709,9 +1815,11 @@ pub async fn resend_verification(
 pub async fn forgot_password(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
+    headers: HeaderMap,
     Json(mut req): Json<ForgotPasswordRequest>,
 ) -> Result<Json<ForgotPasswordResponse>, AuthError> {
     let tenant_id = tenant.0.id;
+    let endpoint = "/api/auth/forgot-password";
     req.email = req.email.to_lowercase();
     tracing::info!(
         "Password reset requested for email: {} in tenant: {}",
@@ -1729,6 +1837,25 @@ pub async fn forgot_password(
     let public_key = match user_pubkey {
         Some(pubkey) => pubkey,
         None => {
+            super::auth_observability::record_auth_event_and_log(
+                &pool,
+                &headers,
+                None,
+                super::auth_observability::AuthEvent {
+                    tenant_id,
+                    endpoint,
+                    event_type: "password_reset_request",
+                    outcome: "accepted",
+                    reason_code: Some("user_not_found"),
+                    http_status: 200,
+                    email: Some(&req.email),
+                    pubkey: None,
+                    client_id: None,
+                    redirect_origin: None,
+                    metadata_json: serde_json::json!({}),
+                },
+            )
+            .await;
             tracing::info!(
                 "Password reset requested for non-existent email: {}",
                 req.email
@@ -1741,6 +1868,8 @@ pub async fn forgot_password(
             }));
         }
     };
+
+    let mut reason_code = None;
 
     // Generate reset token
     let reset_token = generate_secure_token();
@@ -1758,6 +1887,8 @@ pub async fn forgot_password(
                 .send_password_reset_email(&req.email, &reset_token)
                 .await
             {
+                METRICS.inc_auth_email_send_failure("password_reset");
+                reason_code = Some("email_send_failed");
                 tracing::error!(
                     "Failed to send password reset email to {}: {}",
                     req.email,
@@ -1768,12 +1899,34 @@ pub async fn forgot_password(
             }
         }
         Err(e) => {
+            METRICS.inc_auth_email_send_failure("password_reset");
+            reason_code = Some("email_send_failed");
             tracing::warn!(
                 "Email service unavailable, skipping password reset email: {}",
                 e
             );
         }
     }
+
+    super::auth_observability::record_auth_event_and_log(
+        &pool,
+        &headers,
+        None,
+        super::auth_observability::AuthEvent {
+            tenant_id,
+            endpoint,
+            event_type: "password_reset_request",
+            outcome: "accepted",
+            reason_code,
+            http_status: 200,
+            email: Some(&req.email),
+            pubkey: Some(&public_key),
+            client_id: None,
+            redirect_origin: None,
+            metadata_json: serde_json::json!({}),
+        },
+    )
+    .await;
 
     Ok(Json(ForgotPasswordResponse {
         success: true,
@@ -1786,9 +1939,11 @@ pub async fn forgot_password(
 pub async fn reset_password(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
+    headers: HeaderMap,
     Json(req): Json<ResetPasswordRequest>,
 ) -> Result<Json<ResetPasswordResponse>, AuthError> {
     let tenant_id = tenant.0.id;
+    let endpoint = "/api/auth/reset-password";
     tracing::info!(
         "Password reset attempt with token: {}... for tenant: {}",
         &req.token[..10],
@@ -1797,14 +1952,64 @@ pub async fn reset_password(
 
     // Find user with this reset token in this tenant
     let user_repo = UserRepository::new(pool.clone());
-    let (public_key, expires_at) = user_repo
-        .find_by_reset_token(&req.token, tenant_id)
-        .await?
-        .ok_or(AuthError::InvalidToken)?;
+    let (public_key, expires_at) =
+        match user_repo.find_by_reset_token(&req.token, tenant_id).await? {
+            Some(data) => data,
+            None => {
+                super::auth_observability::record_auth_event_and_log(
+                    &pool,
+                    &headers,
+                    None,
+                    super::auth_observability::AuthEvent {
+                        tenant_id,
+                        endpoint,
+                        event_type: "password_reset",
+                        outcome: "failure",
+                        reason_code: Some("invalid_token"),
+                        http_status: 401,
+                        email: None,
+                        pubkey: None,
+                        client_id: None,
+                        redirect_origin: None,
+                        metadata_json: serde_json::json!({}),
+                    },
+                )
+                .await;
+                return Err(AuthError::InvalidToken);
+            }
+        };
+    let account_email: Option<String> = sqlx::query_scalar::<_, String>(
+        "SELECT email FROM users WHERE pubkey = $1 AND tenant_id = $2",
+    )
+    .bind(&public_key)
+    .bind(tenant_id)
+    .fetch_optional(&pool)
+    .await
+    .ok()
+    .flatten();
 
     // Check if token is expired
     if let Some(expires) = expires_at {
         if expires < Utc::now() {
+            super::auth_observability::record_auth_event_and_log(
+                &pool,
+                &headers,
+                None,
+                super::auth_observability::AuthEvent {
+                    tenant_id,
+                    endpoint,
+                    event_type: "password_reset",
+                    outcome: "failure",
+                    reason_code: Some("token_expired"),
+                    http_status: 200,
+                    email: account_email.as_deref(),
+                    pubkey: Some(&public_key),
+                    client_id: None,
+                    redirect_origin: None,
+                    metadata_json: serde_json::json!({}),
+                },
+            )
+            .await;
             return Ok(Json(ResetPasswordResponse {
                 success: false,
                 message: "Password reset link has expired. Please request a new one.".to_string(),
@@ -1824,6 +2029,26 @@ pub async fn reset_password(
     user_repo
         .reset_password(&public_key, tenant_id, &password_hash)
         .await?;
+
+    super::auth_observability::record_auth_event_and_log(
+        &pool,
+        &headers,
+        None,
+        super::auth_observability::AuthEvent {
+            tenant_id,
+            endpoint,
+            event_type: "password_reset",
+            outcome: "success",
+            reason_code: Some("password_hash_updated"),
+            http_status: 200,
+            email: account_email.as_deref(),
+            pubkey: Some(&public_key),
+            client_id: None,
+            redirect_origin: None,
+            metadata_json: serde_json::json!({}),
+        },
+    )
+    .await;
 
     tracing::info!(
         event = "password_reset",

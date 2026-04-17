@@ -3,10 +3,38 @@
 // ABOUTME: Integration tests for headless authentication endpoints
 // ABOUTME: Tests the pure JSON API flow for native mobile apps (Flutter, etc.)
 
+use axum::{
+    body::Body,
+    extract::State,
+    http::{Request, StatusCode},
+    middleware,
+    routing::post,
+    Json, Router,
+};
 use chrono::{Duration, Utc};
+use keycast_api::{
+    api::{
+        http::{
+            auth_observability::request_id_middleware,
+            headless::{headless_login, HeadlessLoginRequest},
+        },
+        tenant::{Tenant, TenantExtractor},
+    },
+    bcrypt_queue::BcryptQueue,
+    handlers::http_rpc_handler::new_http_handler_cache,
+    state::KeycastState,
+};
+use keycast_core::{
+    encryption::{KeyManager, KeyManagerError},
+    secret_pool::SecretPool,
+};
+use moka::future::Cache;
 use nostr_sdk::Keys;
 use sqlx::PgPool;
+use std::sync::Arc;
+use tower::ServiceExt;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 mod common;
 
@@ -21,6 +49,10 @@ async fn setup_pool() -> PgPool {
 
 /// Clean up test data
 async fn cleanup_test_user(pool: &PgPool, pubkey: &str) {
+    let _ = sqlx::query("DELETE FROM auth_events WHERE pubkey = $1")
+        .bind(pubkey)
+        .execute(pool)
+        .await;
     let _ = sqlx::query("DELETE FROM oauth_authorizations WHERE user_pubkey = $1")
         .bind(pubkey)
         .execute(pool)
@@ -37,6 +69,55 @@ async fn cleanup_test_user(pool: &PgPool, pubkey: &str) {
         .bind(pubkey)
         .execute(pool)
         .await;
+}
+
+struct TestKeyManager;
+
+#[async_trait::async_trait]
+impl KeyManager for TestKeyManager {
+    async fn encrypt(&self, plaintext_bytes: &[u8]) -> Result<Vec<u8>, KeyManagerError> {
+        Ok(plaintext_bytes.to_vec())
+    }
+
+    async fn decrypt(
+        &self,
+        ciphertext_bytes: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, KeyManagerError> {
+        Ok(Zeroizing::new(ciphertext_bytes.to_vec()))
+    }
+}
+
+fn create_test_auth_state(pool: PgPool) -> keycast_api::api::http::routes::AuthState {
+    let bcrypt_queue = BcryptQueue::new();
+    let secret_pool = SecretPool::new(1);
+    let tenant_cache = Cache::builder().max_capacity(10).build();
+    let key_manager: Arc<Box<dyn KeyManager>> = Arc::new(Box::new(TestKeyManager));
+
+    keycast_api::api::http::routes::AuthState {
+        state: Arc::new(KeycastState {
+            db: pool,
+            key_manager,
+            signer_handlers: None,
+            http_handler_cache: new_http_handler_cache(),
+            server_keys: Keys::generate(),
+            tenant_cache,
+            bcrypt_sender: bcrypt_queue.sender(),
+            redis: None,
+            secret_pool: secret_pool.receiver(),
+        }),
+        auth_tx: None,
+    }
+}
+
+fn create_test_tenant() -> TenantExtractor {
+    TenantExtractor(Arc::new(Tenant {
+        id: 1,
+        domain: "localhost".to_string(),
+        name: "Test Tenant".to_string(),
+        settings: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }))
 }
 
 // ============================================================================
@@ -225,6 +306,97 @@ async fn test_headless_login_fails_unverified_email() {
 
     // Cleanup
     cleanup_test_user(&pool, &pubkey).await;
+}
+
+#[tokio::test]
+async fn test_headless_login_records_auth_event_and_echoes_request_id_on_failure() {
+    let pool = setup_pool().await;
+    let auth_state = create_test_auth_state(pool.clone());
+    let test_email = format!("headless-missing-{}@example.com", Uuid::new_v4());
+    let request_id = format!("trace-{}", Uuid::new_v4());
+
+    let _ = sqlx::query("DELETE FROM auth_events WHERE email = $1")
+        .bind(&test_email)
+        .execute(&pool)
+        .await;
+
+    let app = {
+        let auth_state = auth_state.clone();
+        Router::new()
+            .route(
+                "/headless/login",
+                post(
+                    move |headers: axum::http::HeaderMap, Json(req): Json<HeadlessLoginRequest>| {
+                        let auth_state = auth_state.clone();
+                        async move {
+                            headless_login(
+                                create_test_tenant(),
+                                State(auth_state),
+                                headers,
+                                Json(req),
+                            )
+                            .await
+                        }
+                    },
+                ),
+            )
+            .layer(middleware::from_fn(request_id_middleware))
+    };
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/headless/login")
+                .header("host", "localhost")
+                .header("content-type", "application/json")
+                .header("x-trace-id", &request_id)
+                .body(Body::from(
+                    serde_json::json!({
+                        "email": test_email,
+                        "password": "wrong-password",
+                        "client_id": "DivineMobileTest",
+                        "redirect_uri": "https://app.divine.video/callback"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.headers().get("x-request-id").unwrap(), &request_id);
+
+    let event: Option<(String, String, String, Option<String>, String, Option<i32>)> =
+        sqlx::query_as(
+            "SELECT endpoint, event_type, outcome, reason_code, request_id, http_status
+             FROM auth_events
+             WHERE tenant_id = 1 AND email = $1
+             ORDER BY occurred_at DESC, id DESC
+             LIMIT 1",
+        )
+        .bind(&test_email)
+        .fetch_optional(&pool)
+        .await
+        .expect("auth event query should succeed");
+
+    assert_eq!(
+        event,
+        Some((
+            "/api/headless/login".to_string(),
+            "login".to_string(),
+            "failure".to_string(),
+            Some("user_not_found".to_string()),
+            request_id,
+            Some(401),
+        ))
+    );
+
+    let _ = sqlx::query("DELETE FROM auth_events WHERE email = $1")
+        .bind(&test_email)
+        .execute(&pool)
+        .await;
 }
 
 // ============================================================================

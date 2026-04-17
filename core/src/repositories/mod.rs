@@ -2,6 +2,7 @@
 // ABOUTME: Provides abstraction layer between handlers and database
 
 mod atproto_oauth_session;
+mod auth_event;
 mod authorization;
 mod claim_token;
 mod error;
@@ -19,6 +20,7 @@ pub use atproto_oauth_session::{
     AtprotoOAuthSession, AtprotoOAuthSessionRepository, CreateAtprotoOAuthSessionParams,
     IssueAtprotoTokensParams,
 };
+pub use auth_event::{AuthEventRecord, AuthEventRepository, AuthEventRow};
 pub use authorization::AuthorizationRepository;
 pub use claim_token::ClaimTokenRepository;
 pub use error::RepositoryError;

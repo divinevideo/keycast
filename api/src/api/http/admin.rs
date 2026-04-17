@@ -1,17 +1,18 @@
 // ABOUTME: Admin endpoints for preloaded accounts, claim token generation, and support admin management
 // ABOUTME: Used for Vine import and support workflows
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::Json;
 use chrono::{Duration, Utc};
 use nostr_sdk::{FromBech32, Keys};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::routes::AuthState;
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::extractors::UcanAuth;
 use keycast_core::repositories::{
-    ClaimTokenRepository, OAuthAuthorizationRepository, UserRepository,
+    AuthEventRepository, ClaimTokenRepository, OAuthAuthorizationRepository, UserRepository,
 };
 use keycast_core::types::claim_token::generate_claim_token;
 
@@ -895,6 +896,331 @@ pub async fn get_user_lookup(
     }
 
     Ok(Json(UserLookupResponse { results, total }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuthDebugQuery {
+    pub email: Option<String>,
+    pub pubkey: Option<String>,
+    pub npub: Option<String>,
+    pub request_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuthDebugAccount {
+    pub pubkey: String,
+    pub email: Option<String>,
+    pub email_verified: Option<bool>,
+    pub password_hash_present: bool,
+    pub password_reset_pending: bool,
+    pub active_sessions: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuthDebugDuplicate {
+    pub pubkey: String,
+    pub email: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuthDebugEvent {
+    pub occurred_at: String,
+    pub request_id: String,
+    pub endpoint: String,
+    pub event_type: String,
+    pub outcome: String,
+    pub reason_code: Option<String>,
+    pub http_status: Option<i32>,
+    pub email: Option<String>,
+    pub pubkey: Option<String>,
+    pub client_id: Option<String>,
+    pub redirect_origin: Option<String>,
+    pub user_agent: Option<String>,
+    pub metadata_json: Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuthDebugResponse {
+    pub diagnosis: String,
+    pub account: Option<AuthDebugAccount>,
+    pub duplicates: Vec<AuthDebugDuplicate>,
+    pub events: Vec<AuthDebugEvent>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct AuthDebugAccountRow {
+    pub pubkey: String,
+    pub email: Option<String>,
+    pub email_verified: Option<bool>,
+    pub password_hash_present: bool,
+    pub password_reset_pending: bool,
+    pub created_at: chrono::DateTime<Utc>,
+    pub updated_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct AuthDebugDuplicateRow {
+    pub pubkey: String,
+    pub email: Option<String>,
+    pub created_at: chrono::DateTime<Utc>,
+}
+
+/// Engineer-facing auth debugging endpoint. Support admin or above.
+pub async fn get_auth_debug(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    auth: UcanAuth,
+    Query(query): Query<AuthDebugQuery>,
+) -> ApiResult<Json<AuthDebugResponse>> {
+    if !is_support_admin(&auth).await {
+        return Err(ApiError::forbidden("Admin access required"));
+    }
+
+    if query.email.as_deref().is_none_or(str::is_empty)
+        && query.pubkey.as_deref().is_none_or(str::is_empty)
+        && query.npub.as_deref().is_none_or(str::is_empty)
+        && query.request_id.as_deref().is_none_or(str::is_empty)
+    {
+        return Err(ApiError::bad_request(
+            "Provide email, pubkey, npub, or request_id",
+        ));
+    }
+
+    let tenant_id = tenant.0.id;
+    let pool = &auth_state.state.db;
+    let auth_event_repo = AuthEventRepository::new(pool.clone());
+
+    let mut target_email = query
+        .email
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|email| email.trim().to_lowercase());
+    let mut target_pubkey = match query.pubkey.as_deref() {
+        Some(pubkey) if !pubkey.trim().is_empty() => Some(
+            nostr_sdk::PublicKey::from_hex(pubkey.trim())
+                .map_err(|e| ApiError::bad_request(format!("Invalid pubkey: {}", e)))?
+                .to_hex(),
+        ),
+        _ => None,
+    };
+
+    if target_pubkey.is_none() {
+        if let Some(npub) = query
+            .npub
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            target_pubkey = Some(
+                nostr_sdk::PublicKey::from_bech32(npub.trim())
+                    .map_err(|e| ApiError::bad_request(format!("Invalid npub: {}", e)))?
+                    .to_hex(),
+            );
+        }
+    }
+
+    let mut auth_events = if let Some(request_id) = query.request_id.as_deref() {
+        auth_event_repo
+            .list_recent_by_request_id(tenant_id, request_id.trim(), 50)
+            .await
+            .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?
+    } else {
+        Vec::new()
+    };
+
+    if target_email.is_none() {
+        target_email = auth_events.iter().find_map(|event| event.email.clone());
+    }
+    if target_pubkey.is_none() {
+        target_pubkey = auth_events.iter().find_map(|event| event.pubkey.clone());
+    }
+
+    if auth_events.is_empty() {
+        if let Some(email) = target_email.as_deref() {
+            auth_events = auth_event_repo
+                .list_recent_by_email(tenant_id, email, 50)
+                .await
+                .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+        } else if let Some(pubkey) = target_pubkey.as_deref() {
+            auth_events = auth_event_repo
+                .list_recent_by_pubkey(tenant_id, pubkey, 50)
+                .await
+                .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+        }
+    }
+
+    if target_pubkey.is_none() {
+        if let Some(email) = target_email.as_deref() {
+            let user_repo = UserRepository::new(pool.clone());
+            target_pubkey = user_repo
+                .find_pubkey_by_email(email, tenant_id)
+                .await
+                .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+        }
+    }
+
+    if target_email.is_none() {
+        if let Some(pubkey) = target_pubkey.as_deref() {
+            target_email = sqlx::query_scalar::<_, String>(
+                "SELECT email FROM users WHERE tenant_id = $1 AND pubkey = $2",
+            )
+            .bind(tenant_id)
+            .bind(pubkey)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+        }
+    }
+
+    let account = if let Some(pubkey) = target_pubkey.as_deref() {
+        let row = sqlx::query_as::<_, AuthDebugAccountRow>(
+            "SELECT
+                pubkey,
+                email,
+                email_verified,
+                password_hash IS NOT NULL AS password_hash_present,
+                password_reset_token IS NOT NULL
+                    AND (password_reset_expires_at IS NULL OR password_reset_expires_at > NOW())
+                    AS password_reset_pending,
+                created_at,
+                updated_at
+             FROM users
+             WHERE tenant_id = $1 AND pubkey = $2",
+        )
+        .bind(tenant_id)
+        .bind(pubkey)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?;
+
+        match row {
+            Some(row) => {
+                let active_sessions = OAuthAuthorizationRepository::new(pool.clone())
+                    .list_active_sessions(&row.pubkey, tenant_id)
+                    .await
+                    .unwrap_or_default()
+                    .len() as i64;
+                Some(AuthDebugAccount {
+                    pubkey: row.pubkey,
+                    email: row.email,
+                    email_verified: row.email_verified,
+                    password_hash_present: row.password_hash_present,
+                    password_reset_pending: row.password_reset_pending,
+                    active_sessions,
+                    created_at: row.created_at.to_rfc3339(),
+                    updated_at: row.updated_at.to_rfc3339(),
+                })
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    let duplicates = if let Some(email) = target_email.as_deref() {
+        sqlx::query_as::<_, AuthDebugDuplicateRow>(
+            "SELECT pubkey, email, created_at
+             FROM users
+             WHERE tenant_id = $1
+               AND LOWER(TRIM(email)) = LOWER(TRIM($2))
+             ORDER BY created_at DESC",
+        )
+        .bind(tenant_id)
+        .bind(email)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Database error: {}", e)))?
+        .into_iter()
+        .map(|row| AuthDebugDuplicate {
+            pubkey: row.pubkey,
+            email: row.email,
+            created_at: row.created_at.to_rfc3339(),
+        })
+        .collect()
+    } else {
+        Vec::new()
+    };
+
+    let events = auth_events
+        .into_iter()
+        .map(|row| AuthDebugEvent {
+            occurred_at: row.occurred_at.to_rfc3339(),
+            request_id: row.request_id,
+            endpoint: row.endpoint,
+            event_type: row.event_type,
+            outcome: row.outcome,
+            reason_code: row.reason_code,
+            http_status: row.http_status,
+            email: row.email,
+            pubkey: row.pubkey,
+            client_id: row.client_id,
+            redirect_origin: row.redirect_origin,
+            user_agent: row.user_agent,
+            metadata_json: row.metadata_json,
+        })
+        .collect::<Vec<_>>();
+
+    let diagnosis = diagnose_auth_debug(account.as_ref(), &duplicates, &events);
+
+    Ok(Json(AuthDebugResponse {
+        diagnosis,
+        account,
+        duplicates,
+        events,
+    }))
+}
+
+fn diagnose_auth_debug(
+    account: Option<&AuthDebugAccount>,
+    duplicates: &[AuthDebugDuplicate],
+    events: &[AuthDebugEvent],
+) -> String {
+    if duplicates.len() > 1 {
+        return "multiple_normalized_email_rows".to_string();
+    }
+
+    if let Some(reset_success) = events.iter().find(|event| {
+        event.endpoint == "/api/auth/reset-password"
+            && event.outcome == "success"
+            && event.reason_code.as_deref() == Some("password_hash_updated")
+    }) {
+        if events.iter().any(|event| {
+            event.occurred_at > reset_success.occurred_at
+                && event.event_type == "login"
+                && event.outcome == "failure"
+                && event.reason_code.as_deref() == Some("invalid_password")
+        }) {
+            return "password_reset_persisted_but_login_failed_invalid_password".to_string();
+        }
+    }
+
+    if account.is_none() {
+        return "no_users_row_found".to_string();
+    }
+
+    if account.is_some_and(|account| account.email_verified == Some(false))
+        || events
+            .iter()
+            .any(|event| event.reason_code.as_deref() == Some("email_not_verified"))
+    {
+        return "email_not_verified".to_string();
+    }
+
+    if account.is_some_and(|account| !account.password_hash_present) {
+        return "password_not_set".to_string();
+    }
+
+    if let Some(reason_code) = events
+        .iter()
+        .find(|event| event.outcome == "failure")
+        .and_then(|event| event.reason_code.clone())
+    {
+        return reason_code;
+    }
+
+    "no_obvious_auth_gate".to_string()
 }
 
 // ============================================================================

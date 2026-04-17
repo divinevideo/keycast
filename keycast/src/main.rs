@@ -35,7 +35,6 @@ use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use tracing::Level;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use uuid::Uuid;
 use zeroize::Zeroizing;
 
 async fn health_check() -> impl IntoResponse {
@@ -784,13 +783,14 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     // All logs within the request will automatically include these fields
     let app = app.layer(
         TraceLayer::new_for_http().make_span_with(|request: &Request<Body>| {
-            // Use incoming x-trace-id header or generate new 8-char UUID
-            let trace_id = request
-                .headers()
-                .get("x-trace-id")
-                .and_then(|v| v.to_str().ok())
-                .map(String::from)
-                .unwrap_or_else(|| Uuid::new_v4().to_string()[..8].to_string());
+            let trace_id = keycast_api::api::http::auth_observability::request_context(request)
+                .map(|context| context.request_id.clone())
+                .or_else(|| {
+                    keycast_api::api::http::auth_observability::request_id_from_headers(
+                        request.headers(),
+                    )
+                })
+                .unwrap_or_else(|| "missing-request-id".to_string());
 
             tracing::span!(
                 Level::INFO,
@@ -801,6 +801,10 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
             )
         }),
     );
+
+    let app = app.layer(middleware::from_fn(
+        keycast_api::api::http::auth_observability::request_id_middleware,
+    ));
 
     // Add Cache-Control headers for browser caching
     let app = app.layer(middleware::from_fn(cache_control_middleware));
@@ -946,7 +950,10 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{body::Body, http::Request, routing::get, Router};
+    use keycast_api::api::http::auth_observability::request_id_middleware;
     use serial_test::serial;
+    use tower::ServiceExt;
 
     #[test]
     #[serial]
@@ -1080,5 +1087,43 @@ mod tests {
             "https://evil.pages.dev",
             "https://login.divine.video,https://*.openvine-app.pages.dev"
         ));
+    }
+
+    #[tokio::test]
+    async fn test_request_id_middleware_echoes_trace_header() {
+        let app = Router::new()
+            .route("/ok", get(|| async { "ok" }))
+            .layer(middleware::from_fn(request_id_middleware));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ok")
+                    .header("x-trace-id", "trace-1234")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.headers().get("x-request-id").unwrap(),
+            "trace-1234"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_id_middleware_generates_request_id() {
+        let app = Router::new()
+            .route("/ok", get(|| async { "ok" }))
+            .layer(middleware::from_fn(request_id_middleware));
+
+        let response = app
+            .oneshot(Request::builder().uri("/ok").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let request_id = response.headers().get("x-request-id").unwrap();
+        assert!(!request_id.is_empty());
     }
 }
