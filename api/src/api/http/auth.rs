@@ -3843,7 +3843,10 @@ mod tests {
     #[test]
     fn test_normalize_nip05_username_rejects_invalid_chars() {
         let result = super::normalize_nip05_username("alice+name");
-        assert!(result.is_err(), "plus sign is not allowed in NIP-05 local-part");
+        assert!(
+            result.is_err(),
+            "plus sign is not allowed in NIP-05 local-part"
+        );
     }
 
     #[test]

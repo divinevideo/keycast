@@ -74,7 +74,10 @@ async fn username_conflict_is_detected_in_local_repository_check() {
         .check_username_available(&username, &second_user, tenant_id)
         .await
         .expect("failed to check username availability");
-    assert!(!available_for_second, "username should be marked unavailable");
+    assert!(
+        !available_for_second,
+        "username should be marked unavailable"
+    );
 }
 
 #[tokio::test]
