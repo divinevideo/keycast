@@ -107,18 +107,17 @@ async fn test_forgot_password_records_accepted_event_for_missing_email() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers().get("x-request-id").unwrap(), &request_id);
 
-    let event: Option<(String, String, String, Option<String>, String, Option<i32>)> =
-        sqlx::query_as(
-            "SELECT endpoint, event_type, outcome, reason_code, request_id, http_status
+    let event: Option<common::AuthEventRow> = sqlx::query_as(
+        "SELECT endpoint, event_type, outcome, reason_code, request_id, http_status
              FROM auth_events
              WHERE tenant_id = 1 AND email = $1
              ORDER BY occurred_at DESC, id DESC
              LIMIT 1",
-        )
-        .bind(&email)
-        .fetch_optional(&pool)
-        .await
-        .expect("auth event query should succeed");
+    )
+    .bind(&email)
+    .fetch_optional(&pool)
+    .await
+    .expect("auth event query should succeed");
 
     assert_eq!(
         event,
@@ -216,18 +215,17 @@ async fn test_reset_password_records_success_event_and_updates_hash() {
     assert!(user_row.1);
     assert!(user_row.2.is_none());
 
-    let event: Option<(String, String, String, Option<String>, String, Option<i32>)> =
-        sqlx::query_as(
-            "SELECT endpoint, event_type, outcome, reason_code, request_id, http_status
+    let event: Option<common::AuthEventRow> = sqlx::query_as(
+        "SELECT endpoint, event_type, outcome, reason_code, request_id, http_status
              FROM auth_events
              WHERE tenant_id = 1 AND email = $1
              ORDER BY occurred_at DESC, id DESC
              LIMIT 1",
-        )
-        .bind(&email)
-        .fetch_optional(&pool)
-        .await
-        .expect("auth event query should succeed");
+    )
+    .bind(&email)
+    .fetch_optional(&pool)
+    .await
+    .expect("auth event query should succeed");
 
     assert_eq!(
         event,

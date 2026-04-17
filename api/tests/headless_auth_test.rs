@@ -368,18 +368,17 @@ async fn test_headless_login_records_auth_event_and_echoes_request_id_on_failure
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(response.headers().get("x-request-id").unwrap(), &request_id);
 
-    let event: Option<(String, String, String, Option<String>, String, Option<i32>)> =
-        sqlx::query_as(
-            "SELECT endpoint, event_type, outcome, reason_code, request_id, http_status
+    let event: Option<common::AuthEventRow> = sqlx::query_as(
+        "SELECT endpoint, event_type, outcome, reason_code, request_id, http_status
              FROM auth_events
              WHERE tenant_id = 1 AND email = $1
              ORDER BY occurred_at DESC, id DESC
              LIMIT 1",
-        )
-        .bind(&test_email)
-        .fetch_optional(&pool)
-        .await
-        .expect("auth event query should succeed");
+    )
+    .bind(&test_email)
+    .fetch_optional(&pool)
+    .await
+    .expect("auth event query should succeed");
 
     assert_eq!(
         event,

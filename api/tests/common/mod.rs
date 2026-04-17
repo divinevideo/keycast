@@ -3,6 +3,9 @@
 
 use sqlx::PgPool;
 
+#[allow(dead_code)]
+pub type AuthEventRow = (String, String, String, Option<String>, String, Option<i32>);
+
 /// CRITICAL: Validates that DATABASE_URL points to a local/dev database only.
 /// This prevents accidental execution of tests against production databases.
 ///

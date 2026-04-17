@@ -158,18 +158,17 @@ async fn test_login_records_auth_event_for_missing_user() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(response.headers().get("x-request-id").unwrap(), &request_id);
 
-    let event: Option<(String, String, String, Option<String>, String, Option<i32>)> =
-        sqlx::query_as(
-            "SELECT endpoint, event_type, outcome, reason_code, request_id, http_status
+    let event: Option<common::AuthEventRow> = sqlx::query_as(
+        "SELECT endpoint, event_type, outcome, reason_code, request_id, http_status
              FROM auth_events
              WHERE tenant_id = 1 AND email = $1
              ORDER BY occurred_at DESC, id DESC
              LIMIT 1",
-        )
-        .bind(&email)
-        .fetch_optional(&pool)
-        .await
-        .expect("auth event query should succeed");
+    )
+    .bind(&email)
+    .fetch_optional(&pool)
+    .await
+    .expect("auth event query should succeed");
 
     assert_eq!(
         event,
@@ -251,18 +250,17 @@ async fn test_oauth_login_records_auth_event_for_unverified_user() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(response.headers().get("x-request-id").unwrap(), &request_id);
 
-    let event: Option<(String, String, String, Option<String>, String, Option<i32>)> =
-        sqlx::query_as(
-            "SELECT endpoint, event_type, outcome, reason_code, request_id, http_status
+    let event: Option<common::AuthEventRow> = sqlx::query_as(
+        "SELECT endpoint, event_type, outcome, reason_code, request_id, http_status
              FROM auth_events
              WHERE tenant_id = 1 AND email = $1
              ORDER BY occurred_at DESC, id DESC
              LIMIT 1",
-        )
-        .bind(&email)
-        .fetch_optional(&pool)
-        .await
-        .expect("auth event query should succeed");
+    )
+    .bind(&email)
+    .fetch_optional(&pool)
+    .await
+    .expect("auth event query should succeed");
 
     assert_eq!(
         event,
