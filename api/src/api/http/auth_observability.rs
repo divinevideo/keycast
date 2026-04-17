@@ -14,11 +14,12 @@ use keycast_core::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
 pub const TRACE_ID_HEADER: &str = "x-trace-id";
+pub const REQUEST_START_HEADER: &str = "x-keycast-request-start-ms";
 
 #[derive(Clone, Debug)]
 pub struct RequestContext {
@@ -88,6 +89,15 @@ fn user_agent(headers: &HeaderMap) -> Option<String> {
         .map(str::to_string)
 }
 
+fn latency_from_headers(headers: &HeaderMap) -> Option<Duration> {
+    let started_at_ms = headers
+        .get(REQUEST_START_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())?;
+    let started_at = UNIX_EPOCH.checked_add(Duration::from_millis(started_at_ms))?;
+    SystemTime::now().duration_since(started_at).ok()
+}
+
 pub struct AuthEvent<'a> {
     pub tenant_id: i64,
     pub endpoint: &'static str,
@@ -114,6 +124,7 @@ pub async fn record_auth_event_and_log(
         .unwrap_or_else(generate_request_id);
     let latency = request_context
         .map(|context| context.started_at.elapsed())
+        .or_else(|| latency_from_headers(headers))
         .unwrap_or_default();
     let email_hash = hash_email(event.email);
     let pubkey_prefix = pubkey_prefix(event.pubkey);
@@ -208,6 +219,13 @@ pub async fn request_id_middleware(mut request: Request<Body>, next: Next) -> Re
     let request_context = RequestContext::new(request_id.clone());
     let request_id_value =
         HeaderValue::from_str(&request_id).expect("generated request id must be ASCII");
+    let started_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after epoch")
+        .as_millis()
+        .to_string();
+    let started_at_value =
+        HeaderValue::from_str(&started_at_ms).expect("request start header must be ASCII digits");
 
     request.headers_mut().insert(
         HeaderName::from_static(REQUEST_ID_HEADER),
@@ -216,6 +234,10 @@ pub async fn request_id_middleware(mut request: Request<Body>, next: Next) -> Re
     request.headers_mut().insert(
         HeaderName::from_static(TRACE_ID_HEADER),
         request_id_value.clone(),
+    );
+    request.headers_mut().insert(
+        HeaderName::from_static(REQUEST_START_HEADER),
+        started_at_value,
     );
     request.extensions_mut().insert(request_context);
 
@@ -228,4 +250,87 @@ pub async fn request_id_middleware(mut request: Request<Body>, next: Next) -> Re
     headers.insert(HeaderName::from_static(TRACE_ID_HEADER), request_id_value);
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    fn metric_value(output: &str, metric: &str) -> u64 {
+        output
+            .lines()
+            .find(|line| line.starts_with(metric))
+            .and_then(|line| line.split_whitespace().last())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn test_record_auth_event_uses_request_start_header_for_latency_metrics() {
+        let pool = PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(25))
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/keycast_test")
+            .expect("lazy pool should parse");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static(REQUEST_ID_HEADER),
+            HeaderValue::from_static("req-latency-test"),
+        );
+
+        let started_at_ms = SystemTime::now()
+            .checked_sub(Duration::from_millis(120))
+            .expect("system time should support subtraction")
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_millis()
+            .to_string();
+        headers.insert(
+            HeaderName::from_static(REQUEST_START_HEADER),
+            HeaderValue::from_str(&started_at_ms).expect("request start header should be valid"),
+        );
+
+        let before = METRICS.to_prometheus();
+        let before_small_bucket = metric_value(
+            &before,
+            "keycast_auth_request_duration_seconds_bucket{endpoint=\"/api/admin/auth-debug\",outcome=\"success\",le=\"0.05\"}",
+        );
+        let before_medium_bucket = metric_value(
+            &before,
+            "keycast_auth_request_duration_seconds_bucket{endpoint=\"/api/admin/auth-debug\",outcome=\"success\",le=\"0.25\"}",
+        );
+
+        record_auth_event_and_log(
+            &pool,
+            &headers,
+            None,
+            AuthEvent {
+                tenant_id: 1,
+                endpoint: "/api/admin/auth-debug",
+                event_type: "debug_lookup",
+                outcome: "success",
+                reason_code: None,
+                http_status: 200,
+                email: None,
+                pubkey: None,
+                client_id: None,
+                redirect_origin: None,
+                metadata_json: serde_json::json!({}),
+            },
+        )
+        .await;
+
+        let after = METRICS.to_prometheus();
+        let after_small_bucket = metric_value(
+            &after,
+            "keycast_auth_request_duration_seconds_bucket{endpoint=\"/api/admin/auth-debug\",outcome=\"success\",le=\"0.05\"}",
+        );
+        let after_medium_bucket = metric_value(
+            &after,
+            "keycast_auth_request_duration_seconds_bucket{endpoint=\"/api/admin/auth-debug\",outcome=\"success\",le=\"0.25\"}",
+        );
+
+        assert_eq!(after_small_bucket - before_small_bucket, 0);
+        assert_eq!(after_medium_bucket - before_medium_bucket, 1);
+    }
 }
