@@ -25,7 +25,10 @@ use nostr_sdk::Keys;
 use serde_json::json;
 use std::env;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use tokio::signal;
 use tokio::sync::Notify;
@@ -37,8 +40,56 @@ use tracing::Level;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use zeroize::Zeroizing;
 
+#[derive(Clone)]
+struct HealthState {
+    pool: sqlx::PgPool,
+    shutting_down: Arc<AtomicBool>,
+}
+
+fn readiness_response(is_shutting_down: bool, database_ready: bool) -> (StatusCode, &'static str) {
+    if is_shutting_down {
+        (StatusCode::SERVICE_UNAVAILABLE, "Shutting down")
+    } else if database_ready {
+        (StatusCode::OK, "OK")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "Database unavailable")
+    }
+}
+
 async fn health_check() -> impl IntoResponse {
-    StatusCode::OK
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        axum::Json(json!({
+            "status": "ok",
+            "service": "keycast",
+        })),
+    )
+}
+
+async fn livez(health_state: Arc<HealthState>) -> impl IntoResponse {
+    if health_state.shutting_down.load(Ordering::Relaxed) {
+        (StatusCode::OK, "OK (shutting down)")
+    } else {
+        (StatusCode::OK, "OK")
+    }
+}
+
+async fn startupz() -> impl IntoResponse {
+    (StatusCode::OK, "OK")
+}
+
+async fn readyz(health_state: Arc<HealthState>) -> impl IntoResponse {
+    let is_shutting_down = health_state.shutting_down.load(Ordering::Relaxed);
+    let database_ready = if is_shutting_down {
+        false
+    } else {
+        sqlx::query_scalar::<_, i32>("SELECT 1")
+            .fetch_one(&health_state.pool)
+            .await
+            .is_ok()
+    };
+
+    readiness_response(is_shutting_down, database_ready)
 }
 
 /// Run database migrations and exit
@@ -214,7 +265,11 @@ async fn cache_control_middleware(request: Request<Body>, next: Next) -> Respons
     let cache_value = if path.starts_with("/_app/") {
         // SvelteKit hash-versioned assets - cache forever (1 year)
         "public, max-age=31536000, immutable"
-    } else if path.starts_with("/api/") || path.starts_with("/health") {
+    } else if path.starts_with("/api/")
+        || path.starts_with("/health")
+        || path == "/livez"
+        || path == "/readyz"
+    {
         // Dynamic content - no caching
         "no-store"
     } else if path == "/index.html" || path == "/" {
@@ -639,6 +694,14 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         .allow_credentials(false)
         .max_age(std::time::Duration::from_secs(86400));
 
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let health_state = Arc::new(HealthState {
+        pool: database.pool.clone(),
+        shutting_down: shutting_down.clone(),
+    });
+    let livez_state = health_state.clone();
+    let readyz_state = health_state.clone();
+
     // Get pure API routes (JSON endpoints only) - pass authorization sender
     let api_routes = keycast_api::api::http::routes::api_routes(
         database.pool.clone(),
@@ -670,8 +733,9 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     let mut app = Router::new()
         // Health checks at root level (for k8s/Cloud Run)
         .route("/health", get(health_check))
-        .route("/healthz/startup", get(health_check))
-        .route("/healthz/ready", get(health_check))
+        .route("/livez", get(move || livez(livez_state.clone())))
+        .route("/healthz/startup", get(startupz))
+        .route("/healthz/ready", get(move || readyz(readyz_state.clone())))
         // NIP-05 discovery at root level
         .route(
             "/.well-known/nostr.json",
@@ -905,6 +969,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
 
     // Wait for shutdown signal
     wait_for_shutdown_signal().await;
+    shutting_down.store(true, Ordering::Relaxed);
     shutdown_signal.notify_waiters();
 
     tracing::info!("Shutting down gracefully...");
@@ -950,7 +1015,12 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::Body, http::Request, routing::get, Router};
+    use axum::{
+        body::{to_bytes, Body},
+        http::{header, Request, StatusCode},
+        routing::get,
+        Router,
+    };
     use keycast_api::api::http::auth_observability::request_id_middleware;
     use serial_test::serial;
     use tower::ServiceExt;
@@ -1125,5 +1195,41 @@ mod tests {
 
         let request_id = response.headers().get("x-request-id").unwrap();
         assert!(!request_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_health_check_returns_json_body() {
+        let response = health_check().await.into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["status"], "ok");
+        assert_eq!(payload["service"], "keycast");
+    }
+
+    #[test]
+    fn test_readiness_response_reports_shutdown_as_unavailable() {
+        let (status, body) = readiness_response(true, true);
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, "Shutting down");
+    }
+
+    #[test]
+    fn test_readiness_response_reports_database_failures_as_unavailable() {
+        let (status, body) = readiness_response(false, false);
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, "Database unavailable");
     }
 }

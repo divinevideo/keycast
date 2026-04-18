@@ -33,7 +33,7 @@ impl TestServer {
 
         while start.elapsed() < timeout {
             match client
-                .get(&format!("{}/health", self.base_url))
+                .get(&format!("{}/healthz/ready", self.base_url))
                 .send()
                 .await
             {

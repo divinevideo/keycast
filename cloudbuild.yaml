@@ -93,8 +93,8 @@ steps:
       - '--cpu-boost'
       - '--session-affinity'
       - '--use-http2'
-      - '--startup-probe=httpGet.path=/health,httpGet.port=3000,initialDelaySeconds=0,periodSeconds=3,failureThreshold=20,timeoutSeconds=2'
-      - '--liveness-probe=httpGet.path=/health,httpGet.port=3000,periodSeconds=30,timeoutSeconds=5,failureThreshold=3'
+      - '--startup-probe=httpGet.path=/healthz/startup,httpGet.port=3000,initialDelaySeconds=0,periodSeconds=3,failureThreshold=20,timeoutSeconds=2'
+      - '--liveness-probe=httpGet.path=/livez,httpGet.port=3000,periodSeconds=30,timeoutSeconds=5,failureThreshold=3'
       - '--add-cloudsql-instances=openvine-co:us-central1:keycast-db-plus'
       - '--network=default'
       - '--subnet=default'
@@ -114,12 +114,12 @@ steps:
         SERVICE_URL=$$(gcloud run services describe keycast --region=us-central1 --format='value(status.url)')
         echo "Service URL: $$SERVICE_URL"
 
-        echo "🔍 Testing API health endpoint..."
-        if ! curl -f -s "$$SERVICE_URL/health"; then
-          echo "❌ Health check failed"
+        echo "🔍 Testing API readiness endpoint..."
+        if ! curl -f -s "$$SERVICE_URL/healthz/ready"; then
+          echo "❌ Readiness check failed"
           exit 1
         fi
-        echo "✅ Health check passed"
+        echo "✅ Readiness check passed"
 
         PREVIEW_ORIGIN="https://preview.openvine-app.pages.dev"
 
