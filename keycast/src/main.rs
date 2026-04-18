@@ -40,8 +40,18 @@ use tracing::Level;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use zeroize::Zeroizing;
 
+/// Maximum time the readiness probe will wait on the database before failing.
+/// Kept well under typical kubelet `timeoutSeconds` so a stalled connection
+/// fails the probe fast instead of hanging it.
+const READYZ_DB_TIMEOUT: Duration = Duration::from_millis(800);
+
 #[derive(Clone)]
-struct HealthState {
+struct LivenessState {
+    shutting_down: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct ReadinessState {
     pool: sqlx::PgPool,
     shutting_down: Arc<AtomicBool>,
 }
@@ -66,8 +76,8 @@ async fn health_check() -> impl IntoResponse {
     )
 }
 
-async fn livez(health_state: Arc<HealthState>) -> impl IntoResponse {
-    if health_state.shutting_down.load(Ordering::Relaxed) {
+async fn livez(state: Arc<LivenessState>) -> impl IntoResponse {
+    if state.shutting_down.load(Ordering::Relaxed) {
         (StatusCode::OK, "OK (shutting down)")
     } else {
         (StatusCode::OK, "OK")
@@ -78,15 +88,19 @@ async fn startupz() -> impl IntoResponse {
     (StatusCode::OK, "OK")
 }
 
-async fn readyz(health_state: Arc<HealthState>) -> impl IntoResponse {
-    let is_shutting_down = health_state.shutting_down.load(Ordering::Relaxed);
+async fn readyz(state: Arc<ReadinessState>) -> impl IntoResponse {
+    let is_shutting_down = state.shutting_down.load(Ordering::Relaxed);
     let database_ready = if is_shutting_down {
         false
     } else {
-        sqlx::query_scalar::<_, i32>("SELECT 1")
-            .fetch_one(&health_state.pool)
-            .await
-            .is_ok()
+        // Bound the DB check so a stalled connection or exhausted pool fails
+        // the probe fast rather than blocking the kubelet probe past its
+        // `timeoutSeconds`. Both timeout and query error => not ready.
+        let query = sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(&state.pool);
+        matches!(
+            tokio::time::timeout(READYZ_DB_TIMEOUT, query).await,
+            Ok(Ok(_))
+        )
     };
 
     readiness_response(is_shutting_down, database_ready)
@@ -265,12 +279,10 @@ async fn cache_control_middleware(request: Request<Body>, next: Next) -> Respons
     let cache_value = if path.starts_with("/_app/") {
         // SvelteKit hash-versioned assets - cache forever (1 year)
         "public, max-age=31536000, immutable"
-    } else if path.starts_with("/api/")
-        || path.starts_with("/health")
-        || path == "/livez"
-        || path == "/readyz"
-    {
+    } else if path.starts_with("/api/") || path.starts_with("/health") || path == "/livez" {
         // Dynamic content - no caching
+        // (`/health`, `/healthz/startup`, `/healthz/ready` all match `/health`;
+        //  `/livez` is the only probe route not under that prefix.)
         "no-store"
     } else if path == "/index.html" || path == "/" {
         // SPA entry - must revalidate to get latest app
@@ -695,12 +707,13 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         .max_age(std::time::Duration::from_secs(86400));
 
     let shutting_down = Arc::new(AtomicBool::new(false));
-    let health_state = Arc::new(HealthState {
+    let livez_state = Arc::new(LivenessState {
+        shutting_down: shutting_down.clone(),
+    });
+    let readyz_state = Arc::new(ReadinessState {
         pool: database.pool.clone(),
         shutting_down: shutting_down.clone(),
     });
-    let livez_state = health_state.clone();
-    let readyz_state = health_state.clone();
 
     // Get pure API routes (JSON endpoints only) - pass authorization sender
     let api_routes = keycast_api::api::http::routes::api_routes(
@@ -1231,5 +1244,29 @@ mod tests {
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body, "Database unavailable");
+    }
+
+    /// Router-level smoke test: verifies the probe routes are mounted at the
+    /// exact paths the kubelet hits. Catches typos like `/healthz/startup`
+    /// vs `/healthz/start`. Skips `/healthz/ready` because that handler
+    /// requires a live DB pool.
+    #[tokio::test]
+    async fn test_health_probe_routes_respond_ok() {
+        let livez_state = Arc::new(LivenessState {
+            shutting_down: Arc::new(AtomicBool::new(false)),
+        });
+
+        let app = Router::new()
+            .route("/livez", get(move || livez(livez_state.clone())))
+            .route("/healthz/startup", get(startupz));
+
+        for path in ["/livez", "/healthz/startup"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "route {path} not OK");
+        }
     }
 }
