@@ -87,6 +87,8 @@ jobs:
           cargo test -p keycast_core --features integration-tests --lib --verbose
           cargo test -p keycast_api --features integration-tests --lib --tests --verbose
           cargo test -p keycast_signer --features integration-tests --lib --tests --verbose
+          cargo test -p keycast_core --features aws --verbose
+          cargo test -p keycast --features aws --verbose
           cargo test -p cluster-hashring --lib -- --ignored
 
       - name: Run clippy
