@@ -69,20 +69,20 @@ fn normalize_nip05_username(raw_username: &str) -> Result<String, AuthError> {
     let username = raw_username.trim().to_lowercase();
 
     if username.is_empty() {
-        return Err(AuthError::Internal("Username cannot be empty".to_string()));
+        return Err(AuthError::BadRequest("Username cannot be empty".to_string()));
     }
 
     if !username
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' || c == '.')
     {
-        return Err(AuthError::Internal(
+        return Err(AuthError::BadRequest(
             "Username can only contain a-z, 0-9, hyphens, underscores, and dots".to_string(),
         ));
     }
 
     if username.starts_with('-') || username.ends_with('-') {
-        return Err(AuthError::Internal(
+        return Err(AuthError::BadRequest(
             "Username cannot start or end with a hyphen".to_string(),
         ));
     }
@@ -1981,7 +1981,7 @@ pub async fn update_profile(
                             username,
                             error_msg
                         );
-                        return Err(AuthError::Internal(error_msg));
+                        return Err(AuthError::BadRequest(error_msg));
                     }
                 }
                 Err(e) => {
@@ -2002,7 +2002,7 @@ pub async fn update_profile(
             .check_username_available(&username, &user_pubkey, tenant_id)
             .await?
         {
-            return Err(AuthError::Internal("Username already taken".to_string()));
+            return Err(AuthError::BadRequest("Username already taken".to_string()));
         }
 
         // Sync to divine-name-server (if enabled)
@@ -3839,21 +3839,24 @@ mod tests {
     #[test]
     fn test_normalize_nip05_username_rejects_invalid_chars() {
         let result = super::normalize_nip05_username("alice+name");
-        assert!(result.is_err(), "plus sign is not allowed in NIP-05 local-part");
+        assert!(matches!(result, Err(super::AuthError::BadRequest(_))));
     }
 
     #[test]
     fn test_normalize_nip05_username_rejects_non_ascii() {
         let result = super::normalize_nip05_username("álîce");
-        assert!(
-            result.is_err(),
-            "non-ascii usernames should be rejected for NIP-05 local-part compliance"
-        );
+        assert!(matches!(result, Err(super::AuthError::BadRequest(_))));
     }
 
     #[test]
     fn test_normalize_nip05_username_rejects_hyphen_edges() {
-        assert!(super::normalize_nip05_username("-alice").is_err());
-        assert!(super::normalize_nip05_username("alice-").is_err());
+        assert!(matches!(
+            super::normalize_nip05_username("-alice"),
+            Err(super::AuthError::BadRequest(_))
+        ));
+        assert!(matches!(
+            super::normalize_nip05_username("alice-"),
+            Err(super::AuthError::BadRequest(_))
+        ));
     }
 }
