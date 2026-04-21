@@ -7,6 +7,9 @@ test.describe("NIP-05 profile badge", () => {
     request,
     context,
   }) => {
+    const nip05Domain = process.env.NIP05_DOMAIN;
+    expect(nip05Domain).toBeTruthy();
+
     const email = `e2e-nip05-${Date.now()}@test.local`;
     const password = "TestPass123!";
     const { cookie } = await registerAndVerify(request, email, password);
@@ -25,7 +28,7 @@ test.describe("NIP-05 profile badge", () => {
     expect(profileRes.status()).toBe(200);
     const profile = await profileRes.json();
     expect(profile.username).toBe("alice.name_123");
-    expect(profile.nip05).toBe("alice.name_123@divine.video");
+    expect(profile.nip05).toBe(`alice.name_123@${nip05Domain}`);
 
     const baseURL = process.env.API_URL || "http://localhost:3000";
     const url = new URL(baseURL);
@@ -42,6 +45,6 @@ test.describe("NIP-05 profile badge", () => {
 
     await page.goto("/");
     await expect(page.locator("text=NIP-05 Verified")).toBeVisible();
-    await expect(page.locator("text=alice.name_123@divine.video")).toBeVisible();
+    await expect(page.locator(`text=alice.name_123@${nip05Domain}`)).toBeVisible();
   });
 });

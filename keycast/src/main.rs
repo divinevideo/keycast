@@ -259,6 +259,16 @@ fn validate_environment() -> Result<(), String> {
         errors.push("SERVER_NSEC must be set (server's Nostr secret key for signing UCANs)");
     }
 
+    match env::var("NIP05_DOMAIN") {
+        Ok(value) if value.trim().is_empty() => {
+            errors.push("NIP05_DOMAIN must be set and non-empty (domain used for NIP-05 identifiers)");
+        }
+        Err(_) => {
+            errors.push("NIP05_DOMAIN must be set (domain used for NIP-05 identifiers)");
+        }
+        _ => {}
+    }
+
     if env::var("REDIS_URL").is_err() {
         errors.push("REDIS_URL must be set (Redis/Memorystore URL for cluster coordination)");
     }

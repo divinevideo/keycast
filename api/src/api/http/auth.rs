@@ -31,7 +31,6 @@ use sqlx::PgPool;
 const DEFAULT_TOKEN_EXPIRY_HOURS: i64 = 24;
 pub const EMAIL_VERIFICATION_EXPIRY_HOURS: i64 = 24;
 const PASSWORD_RESET_EXPIRY_HOURS: i64 = 1;
-const DEFAULT_NIP05_DOMAIN: &str = "divine.video";
 
 /// Get token expiry in seconds. Uses `TOKEN_EXPIRY_SECONDS` env var if set,
 /// otherwise defaults to 24 hours (86400 seconds).
@@ -51,18 +50,16 @@ pub fn generate_secure_token() -> String {
         .collect()
 }
 
-fn resolve_nip05_domain(tenant_domain: &str) -> String {
-    std::env::var("NIP05_DOMAIN")
-        .ok()
-        .or_else(|| std::env::var("DOMAIN").ok())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| {
-            if tenant_domain == "localhost" || tenant_domain == "127.0.0.1" {
-                DEFAULT_NIP05_DOMAIN.to_string()
-            } else {
-                tenant_domain.to_string()
-            }
-        })
+fn resolve_nip05_domain() -> Result<String, AuthError> {
+    let value = std::env::var("NIP05_DOMAIN")
+        .map_err(|_| AuthError::Internal("NIP05_DOMAIN must be set".to_string()))?;
+    let domain = value.trim();
+    if domain.is_empty() {
+        return Err(AuthError::Internal(
+            "NIP05_DOMAIN must be set and non-empty".to_string(),
+        ));
+    }
+    Ok(domain.to_string())
 }
 
 fn normalize_nip05_username(raw_username: &str) -> Result<String, AuthError> {
@@ -1894,7 +1891,7 @@ pub async fn get_profile(
         .get_username(&user_pubkey, tenant_id)
         .await?
         .flatten();
-    let nip05_domain = resolve_nip05_domain(&tenant.0.domain);
+    let nip05_domain = resolve_nip05_domain()?;
     let nip05 = username
         .as_ref()
         .map(|username| format!("{}@{}", username, nip05_domain));
@@ -3855,5 +3852,35 @@ mod tests {
     fn test_normalize_nip05_username_rejects_hyphen_edges() {
         assert!(super::normalize_nip05_username("-alice").is_err());
         assert!(super::normalize_nip05_username("alice-").is_err());
+    }
+
+    #[test]
+    fn test_resolve_nip05_domain_reads_explicit_env_var() {
+        std::env::set_var("NIP05_DOMAIN", "example.com");
+        let domain =
+            super::resolve_nip05_domain().expect("NIP05_DOMAIN should resolve when explicitly set");
+        assert_eq!(domain, "example.com");
+        std::env::remove_var("NIP05_DOMAIN");
+    }
+
+    #[test]
+    fn test_resolve_nip05_domain_rejects_missing_env_var() {
+        std::env::remove_var("NIP05_DOMAIN");
+        let err = super::resolve_nip05_domain().expect_err("missing NIP05_DOMAIN should fail");
+        assert!(
+            matches!(err, super::AuthError::Internal(msg) if msg.contains("NIP05_DOMAIN must be set")),
+            "missing NIP05_DOMAIN should return an explicit internal error"
+        );
+    }
+
+    #[test]
+    fn test_resolve_nip05_domain_rejects_empty_env_var() {
+        std::env::set_var("NIP05_DOMAIN", "   ");
+        let err = super::resolve_nip05_domain().expect_err("empty NIP05_DOMAIN should fail");
+        assert!(
+            matches!(err, super::AuthError::Internal(msg) if msg.contains("non-empty")),
+            "empty NIP05_DOMAIN should return an explicit internal error"
+        );
+        std::env::remove_var("NIP05_DOMAIN");
     }
 }

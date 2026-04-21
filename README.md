@@ -172,7 +172,7 @@ bun run key:generate
 
 # Configure environment
 cp .env.example .env
-# Edit DATABASE_URL, SERVER_NSEC, ALLOWED_ORIGINS
+# Edit DATABASE_URL, SERVER_NSEC, ALLOWED_ORIGINS, NIP05_DOMAIN
 
 # Run with Docker
 docker compose up -d --build
@@ -188,6 +188,7 @@ See [DEVELOPMENT.md](./docs/DEVELOPMENT.md) for local development setup.
 |----------|-------------|
 | `DATABASE_URL` | PostgreSQL connection string |
 | `SERVER_NSEC` | Server's Nostr secret key for signing tokens |
+| `NIP05_DOMAIN` | Domain used to build user NIP-05 identifiers (`<username>@<domain>`) |
 | `MASTER_KEY_PATH` | Path to encryption key file |
 
 #### Email (SendGrid)
@@ -206,6 +207,7 @@ See [DEVELOPMENT.md](./docs/DEVELOPMENT.md) for local development setup.
 |----------|---------|-------------|
 | `TOKEN_EXPIRY_SECONDS` | `86400` (24 hours) | JWT token expiry |
 | `APP_URL` | `https://login.divine.video` | Fallback URL for OAuth callbacks |
+| `NIP05_DOMAIN` | *(required)* | Domain used in NIP-05 profile identifier responses |
 | `ALLOWED_PUBKEYS` | *(none)* | Comma-separated admin pubkeys whitelist |
 | `ALLOWED_ORIGINS` | *(none)* | CORS origins (comma-separated) |
 

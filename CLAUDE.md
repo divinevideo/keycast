@@ -188,6 +188,7 @@ Required (set in `.env` or docker-compose):
 - `POSTGRES_PASSWORD`: PostgreSQL password (for docker-compose)
 - `ALLOWED_ORIGINS`: Comma-separated CORS origins (e.g., `https://app.keycast.com,http://localhost:5173`)
 - `SERVER_NSEC`: Server Nostr secret key for signing UCANs (hex 64 chars or nsec bech32). Generate with `openssl rand -hex 32`. Used for server-signed session tokens for users without personal keys yet.
+- `NIP05_DOMAIN`: Domain used for generated NIP-05 identifiers (e.g., `login.divine.video` for `username@login.divine.video`)
 - `DOMAIN`: Domain name for production deployment (docker-compose only)
 
 Optional:

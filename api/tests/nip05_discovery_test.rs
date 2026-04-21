@@ -28,8 +28,8 @@ fn test_tenant(tenant_id: i64, domain: &str) -> TenantExtractor {
 async fn nostr_discovery_returns_names_mapping_for_existing_user() {
     let pool = common::setup_test_db().await;
     let tenant_id = 1_i64;
-    let username = "nip05lookup";
     let pubkey = Keys::generate().public_key().to_hex();
+    let username = format!("nip05lookup-{}", &pubkey[..8]);
 
     sqlx::query(
         "INSERT INTO users (pubkey, tenant_id, username, created_at, updated_at)
@@ -37,13 +37,13 @@ async fn nostr_discovery_returns_names_mapping_for_existing_user() {
     )
     .bind(&pubkey)
     .bind(tenant_id)
-    .bind(username)
+    .bind(&username)
     .execute(&pool)
     .await
     .expect("failed to insert user");
 
     let mut params = HashMap::new();
-    params.insert("name".to_string(), username.to_string());
+    params.insert("name".to_string(), username.clone());
 
     let response = nostr_discovery_public(
         test_tenant(tenant_id, "login.divine.video"),
@@ -57,7 +57,7 @@ async fn nostr_discovery_returns_names_mapping_for_existing_user() {
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let payload: Value = serde_json::from_slice(&body).expect("response must be valid JSON");
 
-    assert_eq!(payload["names"][username], pubkey);
+    assert_eq!(payload["names"][&username], pubkey);
 }
 
 #[tokio::test]
