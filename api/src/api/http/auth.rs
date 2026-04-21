@@ -87,6 +87,18 @@ fn normalize_nip05_username(raw_username: &str) -> Result<String, AuthError> {
         ));
     }
 
+    if username.starts_with('.') || username.ends_with('.') {
+        return Err(AuthError::Internal(
+            "Username cannot start or end with a dot".to_string(),
+        ));
+    }
+
+    if username.contains("..") {
+        return Err(AuthError::Internal(
+            "Username cannot contain consecutive dots".to_string(),
+        ));
+    }
+
     Ok(username)
 }
 
@@ -3855,5 +3867,21 @@ mod tests {
     fn test_normalize_nip05_username_rejects_hyphen_edges() {
         assert!(super::normalize_nip05_username("-alice").is_err());
         assert!(super::normalize_nip05_username("alice-").is_err());
+    }
+
+    #[test]
+    fn test_normalize_nip05_username_accepts_single_dots_between_segments() {
+        assert_eq!(
+            super::normalize_nip05_username("alice.name").unwrap(),
+            "alice.name"
+        );
+        assert_eq!(super::normalize_nip05_username("a.b.c").unwrap(), "a.b.c");
+    }
+
+    #[test]
+    fn test_normalize_nip05_username_rejects_dot_edges_and_consecutive_dots() {
+        assert!(super::normalize_nip05_username(".alice").is_err());
+        assert!(super::normalize_nip05_username("alice.").is_err());
+        assert!(super::normalize_nip05_username("a..b").is_err());
     }
 }
