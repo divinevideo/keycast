@@ -498,6 +498,17 @@ Response:
   }
 }</code></pre>
 
+    <h4>GET /.well-known/nostr.json</h4>
+    <p>Return nostr-login discovery metadata. The <code>names</code> field is always present.</p>
+    <pre><code>Response:
+{
+  "names": {},
+  "nip46": {
+    "relay": "wss://relay.example.com",
+    "nostrconnect_url": "https://login.divine.video/api/connect/&lt;nostrconnect&gt;"
+  }
+}</code></pre>
+
     <h2>Performance Metrics</h2>
     <ul>
         <li><strong>OAuth authorization:</strong> ~500ms (includes DB write)</li>

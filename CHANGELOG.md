@@ -22,6 +22,7 @@ All notable changes to this project will be documented in this file.
 - **Relay Architecture**: Refactored from per-user subscriptions to single global subscription with in-memory filtering by bunker pubkey.
 - **Landing Page Content**: Simplified above-the-fold messaging to focus on ease of use rather than technical details. Technical content moved to `/docs`.
 - **Landing Page Links**: Updated all example client links to use https://login.divine.video instead of localhost.
+- **NIP-05 Discovery Response Shape (PR #72)**: Documented that `GET /.well-known/nostr.json` without a `name` query returns `names: {}` alongside existing `nip46` discovery fields. This is a non-breaking additive response-field change for clients that ignore unknown fields.
 
 ### Performance
 - **Signer daemon**: Single kind 24133 subscription for all 74+ users (was 74+ separate subscriptions)

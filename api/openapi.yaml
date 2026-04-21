@@ -756,9 +756,13 @@ paths:
     get:
       summary: NIP-05 discovery
       description: |
-        NIP-05 identifier verification endpoint.
+        NIP-05 identifier verification endpoint and nostr-login discovery metadata.
 
         Query by username: `/.well-known/nostr.json?name=alice`
+
+        Response behavior:
+        - With `name` query: returns `names` mapping for lookup
+        - Without `name` query: returns `names: {}` and `nip46` discovery data
       tags:
         - Discovery
       parameters:
@@ -783,14 +787,21 @@ paths:
                       type: string
                     example:
                       alice: "abc123..."
-                  relays:
+                  nip46:
                     type: object
-                    additionalProperties:
-                      type: array
-                      items:
+                    description: Present when `name` query is omitted.
+                    properties:
+                      relay:
                         type: string
+                        description: Relay URL used for NIP-46 communication
+                        example: "wss://relay.example.com"
+                      nostrconnect_url:
+                        type: string
+                        description: URL template with `<nostrconnect>` placeholder
+                        example: "https://login.divine.video/api/connect/<nostrconnect>"
                     example:
-                      "abc123...": ["wss://relay.example.com"]
+                      relay: "wss://relay.example.com"
+                      nostrconnect_url: "https://login.divine.video/api/connect/<nostrconnect>"
 
   /.well-known/oauth-authorization-server:
     get:
