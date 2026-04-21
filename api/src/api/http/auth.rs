@@ -32,6 +32,7 @@ const DEFAULT_TOKEN_EXPIRY_HOURS: i64 = 24;
 pub const EMAIL_VERIFICATION_EXPIRY_HOURS: i64 = 24;
 const PASSWORD_RESET_EXPIRY_HOURS: i64 = 1;
 const DEFAULT_NIP05_DOMAIN: &str = "divine.video";
+const MAX_NIP05_USERNAME_LENGTH: usize = 64;
 
 /// Get token expiry in seconds. Uses `TOKEN_EXPIRY_SECONDS` env var if set,
 /// otherwise defaults to 24 hours (86400 seconds).
@@ -85,6 +86,13 @@ fn normalize_nip05_username(raw_username: &str) -> Result<String, AuthError> {
         return Err(AuthError::Internal(
             "Username cannot start or end with a hyphen".to_string(),
         ));
+    }
+
+    if username.len() > MAX_NIP05_USERNAME_LENGTH {
+        return Err(AuthError::Internal(format!(
+            "Username must be at most {} characters",
+            MAX_NIP05_USERNAME_LENGTH
+        )));
     }
 
     Ok(username)
@@ -3855,5 +3863,20 @@ mod tests {
     fn test_normalize_nip05_username_rejects_hyphen_edges() {
         assert!(super::normalize_nip05_username("-alice").is_err());
         assert!(super::normalize_nip05_username("alice-").is_err());
+    }
+
+    #[test]
+    fn test_normalize_nip05_username_accepts_max_length_boundary() {
+        let username = "a".repeat(super::MAX_NIP05_USERNAME_LENGTH);
+        let normalized = super::normalize_nip05_username(&username)
+            .expect("username with max allowed length should normalize");
+        assert_eq!(normalized, username);
+    }
+
+    #[test]
+    fn test_normalize_nip05_username_rejects_length_above_boundary() {
+        let username = "a".repeat(super::MAX_NIP05_USERNAME_LENGTH + 1);
+        let result = super::normalize_nip05_username(&username);
+        assert!(result.is_err(), "username longer than max boundary should be rejected");
     }
 }
