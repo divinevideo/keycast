@@ -1037,7 +1037,7 @@ pub async fn logout() -> Result<impl axum::response::IntoResponse, AuthError> {
 #[derive(Debug, Deserialize)]
 pub struct CreateBunkerRequest {
     pub app_name: String,            // Required: friendly display name
-    pub origin: Option<String>,      // Optional: the app's origin URL (must be HTTPS if provided)
+    pub origin: Option<String>,      // Optional: the app's origin URL (HTTPS, or http://localhost / *.localhost / 127.0.0.1 / [::1] for local dev)
     pub policy_slug: Option<String>, // Optional: null = full access
 }
 
@@ -1059,12 +1059,14 @@ fn validate_origin(origin: &str) -> Result<(), AuthError> {
         .host_str()
         .ok_or_else(|| AuthError::BadRequest("Origin must have a host".to_string()))?;
 
-    // Allow http:// only for localhost (development). Accepts RFC 6761
-    // `.localhost` subdomains so multiple local dev services can coexist
-    // on distinct hostnames. The subdomain match requires a non-empty label
-    // before `.localhost`.
+    // Allow http:// only for localhost (development). Accepts IPv4, IPv6, and
+    // RFC 6761 `.localhost` subdomains so multiple local dev services can
+    // coexist on distinct hostnames. The subdomain match requires a non-empty
+    // label before `.localhost`. Kept in sync with `extract_origin` in oauth.rs.
     let is_localhost = host == "localhost"
         || host == "127.0.0.1"
+        || host == "[::1]"
+        || host == "::1"
         || (host.ends_with(".localhost") && host.len() > ".localhost".len());
     if url.scheme() != "https" && !is_localhost {
         return Err(AuthError::BadRequest("Origin must be HTTPS".to_string()));
@@ -1087,7 +1089,7 @@ pub async fn create_bunker(
     let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
     let pool = &auth_state.state.db;
 
-    // Validate origin if provided (must be HTTPS)
+    // Validate origin if provided (HTTPS, or http:// for localhost variants)
     if let Some(ref origin) = req.origin {
         validate_origin(origin)?;
     }
@@ -3492,6 +3494,9 @@ mod tests {
         assert!(validate_origin("http://localhost").is_ok());
         assert!(validate_origin("http://localhost:3000").is_ok());
         assert!(validate_origin("http://127.0.0.1:3000").is_ok());
+        // IPv6 loopback, matching extract_origin in oauth.rs
+        assert!(validate_origin("http://[::1]").is_ok());
+        assert!(validate_origin("http://[::1]:3000").is_ok());
     }
 
     #[test]
