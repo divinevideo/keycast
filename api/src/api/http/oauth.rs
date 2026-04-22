@@ -68,8 +68,17 @@ pub fn extract_origin(redirect_uri: &str) -> Result<String, OAuthError> {
 
     // For http/https schemes, apply web security rules
     if scheme == "http" || scheme == "https" {
-        let is_localhost =
-            host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "::1";
+        // RFC 6761 reserves `localhost.` and every `*.localhost.` subdomain as
+        // loopback; browsers and OS resolvers honor this. Accepting `.localhost`
+        // subdomains here lets multiple local dev services coexist on distinct
+        // hostnames (e.g. admin.localhost, api.localhost) without each claiming
+        // the bare `localhost`. The subdomain match requires a non-empty label
+        // before `.localhost` so `xxxlocalhost` or the empty prefix are rejected.
+        let is_localhost = host == "localhost"
+            || host == "127.0.0.1"
+            || host == "[::1]"
+            || host == "::1"
+            || (host.ends_with(".localhost") && host.len() > ".localhost".len());
         if scheme == "http" && !is_localhost {
             return Err(OAuthError::InvalidRequest(
                 "HTTPS required for non-localhost redirect_uri".to_string(),
@@ -4169,9 +4178,47 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_origin_http_localhost_subdomain() {
+        // RFC 6761 reserves *.localhost as loopback; browsers resolve these to 127.0.0.1.
+        // Accepting them here lets multiple local dev services coexist on distinct hostnames.
+        assert_eq!(
+            extract_origin("http://admin.localhost:8787/callback").unwrap(),
+            "http://admin.localhost:8787"
+        );
+        assert_eq!(
+            extract_origin("http://api.localhost:3000/auth").unwrap(),
+            "http://api.localhost:3000"
+        );
+        // Nested subdomain
+        assert_eq!(
+            extract_origin("http://admin.app.localhost:8080/callback").unwrap(),
+            "http://admin.app.localhost:8080"
+        );
+    }
+
+    #[test]
     fn test_extract_origin_http_non_localhost_rejected() {
         let err = extract_origin("http://example.com/callback").unwrap_err();
         assert!(matches!(err, OAuthError::InvalidRequest(msg) if msg.contains("HTTPS required")));
+    }
+
+    #[test]
+    fn test_extract_origin_http_localhost_lookalike_rejected() {
+        // Hosts that merely contain "localhost" as a substring must not be treated as loopback.
+        // The subdomain match requires a `.` before `localhost`, so these are rejected.
+        for lookalike in [
+            "http://xxxlocalhost/callback",
+            "http://localhost.evil.com/callback",
+            "http://.localhost/callback", // empty label before .localhost
+        ] {
+            let err = extract_origin(lookalike).unwrap_err();
+            assert!(
+                matches!(&err, OAuthError::InvalidRequest(msg) if msg.contains("HTTPS required") || msg.contains("Invalid redirect_uri")),
+                "{} should be rejected, got {:?}",
+                lookalike,
+                err
+            );
+        }
     }
 
     #[test]
