@@ -531,12 +531,22 @@ pub async fn create_claim_token(
         return Err(ApiError::conflict("User has already claimed their account"));
     }
 
-    // Generate claim token
+    // Generate claim token. Invalidates prior valid tokens for the user in
+    // the same transaction so Regenerate replaces cleanly and doesn't leave
+    // stale credentials in circulation.
     let token = generate_claim_token();
     let claim_token_repo = ClaimTokenRepository::new(pool.clone());
-    let claim_token = claim_token_repo
-        .create(&token, &user_pubkey, Some(&auth.pubkey), tenant_id)
+    let (claim_token, invalidated_prior) = claim_token_repo
+        .create_with_prior_invalidation(&token, &user_pubkey, Some(&auth.pubkey), tenant_id)
         .await?;
+
+    if invalidated_prior > 0 {
+        tracing::info!(
+            "Claim token regenerate: {} prior token(s) invalidated for vine_id={}",
+            invalidated_prior,
+            req.vine_id,
+        );
+    }
 
     // Build claim URL
     let app_url = std::env::var("APP_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
