@@ -17,6 +17,37 @@ pub struct ClaimToken {
     pub created_at: DateTime<Utc>,
     pub created_by_pubkey: Option<String>,
     pub tenant_id: i64,
+    // Set by admin Invalidate or by Regenerate when it replaces prior tokens.
+    // When set, the claim handler treats the token as AdminInvalidated rather
+    // than Expired.
+    pub invalidated_at: Option<DateTime<Utc>>,
+    pub invalidated_by: Option<String>,
+    pub invalidation_reason: Option<String>,
+}
+
+/// Discriminated state of a claim token, derived from its row + peers.
+/// Used by the claim HTTP handler to choose the correct error page when a
+/// token string doesn't validate on first pass.
+#[derive(Debug)]
+pub enum ClaimTokenState {
+    /// Token exists, is unused, is not admin-invalidated, and has not yet expired.
+    Valid(ClaimToken),
+    /// No row matches the token string.
+    Unrecognized,
+    /// Token row exists and `used_at IS NOT NULL`.
+    AlreadyClaimed(ClaimToken),
+    /// Token row exists and `invalidated_at IS NOT NULL` (set by admin
+    /// Invalidate or by Regenerate replacing the token).
+    AdminInvalidated(ClaimToken),
+    /// Token is past `expires_at`, was not admin-invalidated, and a newer
+    /// valid token exists for the same user.
+    Replaced {
+        current: ClaimToken,
+        newer: ClaimToken,
+    },
+    /// Token is past `expires_at`, was not admin-invalidated, and no newer
+    /// valid token exists.
+    Expired(ClaimToken),
 }
 
 /// Aggregate statistics for claim tokens in a tenant
