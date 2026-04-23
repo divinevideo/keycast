@@ -775,6 +775,69 @@ pub async fn batch_create_claim_tokens(
 }
 
 // ============================================================================
+// POST /api/admin/claim-tokens/invalidate - Invalidate claim token without replacement
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct InvalidateClaimTokenRequest {
+    pub vine_id: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InvalidateClaimTokenResponse {
+    pub invalidated_count: u64,
+    pub invalidated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Invalidate all valid claim tokens for a preloaded user without issuing a
+/// replacement. Requires support admin. Idempotent: returns count=0 when
+/// nothing is currently valid.
+pub async fn invalidate_claim_token(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    auth: UcanAuth,
+    Json(req): Json<InvalidateClaimTokenRequest>,
+) -> ApiResult<Json<InvalidateClaimTokenResponse>> {
+    let tenant_id = tenant.0.id;
+    let pool = &auth_state.state.db;
+
+    if !is_support_admin(&auth).await {
+        tracing::warn!("Claim token invalidate denied (not support admin)");
+        return Err(ApiError::forbidden("Admin access required"));
+    }
+
+    let user_repo = UserRepository::new(pool.clone());
+    let user_pubkey = user_repo
+        .find_pubkey_by_vine_id(&req.vine_id, tenant_id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::not_found(format!("User with vine_id {} not found", req.vine_id))
+        })?;
+
+    let claim_token_repo = ClaimTokenRepository::new(pool.clone());
+    let count = claim_token_repo
+        .invalidate_valid_for_user(&user_pubkey, tenant_id, &auth.pubkey, req.reason.as_deref())
+        .await?;
+
+    tracing::info!(
+        "Claim token invalidated: vine_id={} count={} reason={:?}",
+        req.vine_id,
+        count,
+        req.reason,
+    );
+
+    Ok(Json(InvalidateClaimTokenResponse {
+        invalidated_count: count,
+        invalidated_at: if count > 0 {
+            Some(chrono::Utc::now())
+        } else {
+            None
+        },
+    }))
+}
+
+// ============================================================================
 // GET /api/admin/claim-tokens/stats - Aggregate claim token statistics
 // ============================================================================
 

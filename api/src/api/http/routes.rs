@@ -195,6 +195,10 @@ pub fn api_routes(
             post(admin::batch_create_claim_tokens),
         )
         .route(
+            "/admin/claim-tokens/invalidate",
+            post(admin::invalidate_claim_token),
+        )
+        .route(
             "/admin/claim-tokens/stats",
             get(admin::get_claim_token_stats),
         )
