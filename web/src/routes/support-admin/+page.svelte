@@ -157,6 +157,22 @@
 		}
 	}
 
+	async function regenerateClaimToken(vineId: string) {
+		isGeneratingClaimToken = true;
+		try {
+			const result = await api.post<{ claim_url: string; expires_at: string }>(
+				'/admin/claim-tokens',
+				{ vine_id: vineId }
+			);
+			claimToken = result;
+			toast.success('Claim link regenerated. Prior link is now invalidated.');
+		} catch (err: any) {
+			toast.error(err.message || 'Failed to regenerate claim link');
+		} finally {
+			isGeneratingClaimToken = false;
+		}
+	}
+
 	async function copyClaimUrl() {
 		if (!claimToken) return;
 		try {
@@ -376,6 +392,15 @@
 														<span class="claim-expiry">
 															Expires {formatDate(claimToken.expires_at)}
 														</span>
+														<div class="claim-actions">
+															<button
+																class="btn-generate-claim"
+																onclick={() => regenerateClaimToken(u.vine_id!)}
+																disabled={isGeneratingClaimToken}
+															>
+																{isGeneratingClaimToken ? 'Regenerating...' : 'Regenerate'}
+															</button>
+														</div>
 													</div>
 												{:else}
 													<button
@@ -874,6 +899,12 @@
 	.btn-generate-claim:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
+	}
+
+	.claim-actions {
+		display: flex;
+		gap: 0.5rem;
+		margin-top: 0.75rem;
 	}
 
 	.links-grid {
