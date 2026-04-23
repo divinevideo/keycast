@@ -46,14 +46,23 @@ impl ClaimTokenRepository {
         .map_err(Into::into)
     }
 
-    /// Find a valid (not expired, not used) claim token.
-    /// Returns None if token doesn't exist, is expired, or already used.
+    /// Find a valid (not expired, not used, not admin-invalidated) claim token.
+    /// Returns None if token doesn't exist, is expired, already used, or has
+    /// been administratively invalidated.
+    ///
+    /// Note: this filters on `invalidated_at IS NULL` as defense-in-depth even
+    /// though `invalidate_valid_for_user` and `create_with_prior_invalidation`
+    /// both also set `expires_at = NOW()` (which the `expires_at > NOW()`
+    /// predicate would catch). The explicit `invalidated_at IS NULL` check
+    /// prevents a future code path that sets `invalidated_at` without also
+    /// clamping `expires_at` from surfacing invalidated tokens.
     pub async fn find_valid(&self, token: &str) -> Result<Option<ClaimToken>, RepositoryError> {
         sqlx::query_as::<_, ClaimToken>(
             "SELECT * FROM account_claim_tokens
              WHERE token = $1
                AND expires_at > NOW()
-               AND used_at IS NULL",
+               AND used_at IS NULL
+               AND invalidated_at IS NULL",
         )
         .bind(token)
         .fetch_optional(&self.pool)
@@ -77,8 +86,9 @@ impl ClaimTokenRepository {
         .map_err(Into::into)
     }
 
-    /// Find a valid (not expired, not used) claim token for a specific user.
-    /// Returns the most recently created valid token, if any.
+    /// Find a valid (not expired, not used, not admin-invalidated) claim token
+    /// for a specific user. Returns the most recently created valid token, if
+    /// any. Same defense-in-depth filter as `find_valid`.
     pub async fn find_valid_by_user_pubkey(
         &self,
         user_pubkey: &str,
@@ -90,6 +100,7 @@ impl ClaimTokenRepository {
                AND tenant_id = $2
                AND expires_at > NOW()
                AND used_at IS NULL
+               AND invalidated_at IS NULL
              ORDER BY created_at DESC
              LIMIT 1",
         )
@@ -160,6 +171,13 @@ impl ClaimTokenRepository {
     /// Create a new claim token and, in the same transaction, invalidate any
     /// prior valid token for the same user. Used by the Regenerate admin
     /// action. Returns (new_token, count_of_priors_invalidated).
+    ///
+    /// The invalidation UPDATE's WHERE clause (`used_at IS NULL AND
+    /// invalidated_at IS NULL AND expires_at > NOW()`) is the safety guard:
+    /// it won't clobber an already-claimed, already-invalidated, or
+    /// already-expired row's timestamps. Wrapping the UPDATE and the INSERT
+    /// in one transaction means a Regenerate either swaps both (old dead,
+    /// new alive) or neither — no "neither valid" window.
     pub async fn create_with_prior_invalidation(
         &self,
         token: &str,
@@ -214,6 +232,13 @@ impl ClaimTokenRepository {
     /// tokens for a user. Sets expires_at = NOW() and invalidated_at = NOW(),
     /// records admin pubkey and optional reason. Returns the count of rows
     /// updated. Idempotent: returns 0 when nothing valid exists.
+    ///
+    /// The WHERE clause (`used_at IS NULL AND invalidated_at IS NULL AND
+    /// expires_at > NOW()`) is the safety guard: it atomically excludes
+    /// already-claimed, already-invalidated, and already-expired rows.
+    /// Callers do not need a separate pre-flight check against races with
+    /// concurrent claim / invalidate / expiry transitions — the update either
+    /// matches a valid row or is a no-op.
     pub async fn invalidate_valid_for_user(
         &self,
         user_pubkey: &str,

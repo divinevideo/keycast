@@ -698,8 +698,14 @@ impl IntoResponse for ClaimError {
     </div>
 </body>
 </html>"#,
-            title = title,
-            message = message,
+            // All current title/message values are hardcoded string literals,
+            // but route every interpolation through escape_html() to match the
+            // escape-everywhere pattern established in PR #67 and applied in
+            // claim_get's success-page template above. This defends against a
+            // future dev adding dynamic content to a ClaimError variant
+            // without remembering to escape it at the call site.
+            title = escape_html(title),
+            message = escape_html(message),
         );
 
         (axum::http::StatusCode::BAD_REQUEST, Html(html)).into_response()
