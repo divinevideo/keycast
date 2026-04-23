@@ -4,6 +4,7 @@
 	import { KeycastApi } from '$lib/keycast_api.svelte';
 	import { goto } from '$app/navigation';
 	import Loader from '$lib/components/Loader.svelte';
+	import InvalidateClaimTokenModal from '$lib/components/InvalidateClaimTokenModal.svelte';
 	import { ShieldCheck, Warning, MagnifyingGlass, User, Key, Calendar, Globe, Copy, Check, CheckCircle, XCircle, Link, CaretDown, CaretRight } from 'phosphor-svelte';
 	import { nip19 } from 'nostr-tools';
 	import { toast } from 'svelte-hot-french-toast';
@@ -31,6 +32,23 @@
 	let isLoadingClaimToken = $state(false);
 	let isGeneratingClaimToken = $state(false);
 	let copiedClaimUrl = $state(false);
+
+	// Invalidate modal state
+	let showInvalidateModal = $state(false);
+	let invalidateModalVineId = $state('');
+	let invalidateModalUserName = $state('');
+
+	function openInvalidateModal(vineId: string, userName: string) {
+		invalidateModalVineId = vineId;
+		invalidateModalUserName = userName;
+		showInvalidateModal = true;
+	}
+
+	function handleInvalidateSuccess() {
+		// Clear displayed claim link; the {:else} branch will render
+		// "Generate Claim Link" on the next render cycle.
+		claimToken = null;
+	}
 
 	interface UserDetails {
 		pubkey: string;
@@ -400,6 +418,13 @@
 															>
 																{isGeneratingClaimToken ? 'Regenerating...' : 'Regenerate'}
 															</button>
+															<button
+																class="btn-destructive-inline"
+																onclick={() => openInvalidateModal(u.vine_id!, u.display_name || u.username || u.vine_id!)}
+																disabled={isGeneratingClaimToken}
+															>
+																Invalidate
+															</button>
 														</div>
 													</div>
 												{:else}
@@ -435,6 +460,14 @@
 		{/if}
 	{/if}
 </div>
+
+<InvalidateClaimTokenModal
+	bind:show={showInvalidateModal}
+	vineId={invalidateModalVineId}
+	userDisplayName={invalidateModalUserName}
+	onClose={() => (showInvalidateModal = false)}
+	onSuccess={handleInvalidateSuccess}
+/>
 
 <style>
 	.support-page {
@@ -905,6 +938,24 @@
 		display: flex;
 		gap: 0.5rem;
 		margin-top: 0.75rem;
+	}
+
+	.btn-destructive-inline {
+		padding: 0.5rem 0.875rem;
+		background: transparent;
+		border: 1px solid #7f1d1d;
+		color: #fca5a5;
+		border-radius: 6px;
+		font-size: 0.875rem;
+		cursor: pointer;
+	}
+	.btn-destructive-inline:hover:not(:disabled) {
+		background: #7f1d1d;
+		color: #fee2e2;
+	}
+	.btn-destructive-inline:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
 	}
 
 	.links-grid {
