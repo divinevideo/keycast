@@ -157,6 +157,38 @@ impl ClaimTokenRepository {
         Ok(result.rows_affected())
     }
 
+    /// Invalidate all valid (unused, unexpired, not-already-invalidated) claim
+    /// tokens for a user. Sets expires_at = NOW() and invalidated_at = NOW(),
+    /// records admin pubkey and optional reason. Returns the count of rows
+    /// updated. Idempotent: returns 0 when nothing valid exists.
+    pub async fn invalidate_valid_for_user(
+        &self,
+        user_pubkey: &str,
+        tenant_id: i64,
+        invalidated_by: &str,
+        reason: Option<&str>,
+    ) -> Result<u64, RepositoryError> {
+        let result = sqlx::query(
+            "UPDATE account_claim_tokens
+             SET expires_at = NOW(),
+                 invalidated_at = NOW(),
+                 invalidated_by = $3,
+                 invalidation_reason = $4
+             WHERE user_pubkey = $1
+               AND tenant_id = $2
+               AND used_at IS NULL
+               AND invalidated_at IS NULL
+               AND expires_at > NOW()",
+        )
+        .bind(user_pubkey)
+        .bind(tenant_id)
+        .bind(invalidated_by)
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Classify a token string into one of the ClaimTokenState variants by
     /// inspecting the row and, for expired rows, checking for a newer valid
     /// replacement. Used by the `/claim` HTTP handler to pick the right
