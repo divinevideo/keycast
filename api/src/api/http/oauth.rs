@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 // Import constants and helpers from auth module
 use super::auth::{generate_secure_token, token_expiry_seconds, EMAIL_VERIFICATION_EXPIRY_HOURS};
 use super::html_safety::{escape_attr, escape_html, js_string_literal};
+use crate::brand::BRAND_NAME;
 
 /// Generate a 256-bit random authorization handle (64 hex characters)
 /// Used for silent re-authentication in OAuth flows
@@ -1222,7 +1223,7 @@ pub async fn authorize_get(
     <div class="container">
         <div class="header">
             <div class="logo">
-                <img src="/divine-logo.svg" alt="Divine" />
+                <img src="/divine-logo.svg" alt="{brand}" />
                 <span class="logo-sub">Login</span>
             </div>
             <h1>Authorize App</h1>
@@ -1253,7 +1254,7 @@ pub async fn authorize_get(
             </div>
 
             <p class="disclaimer">
-                By authorizing, you agree to Divine's <a href="https://divine.video/terms" target="_blank">terms</a> and <a href="https://divine.video/privacy" target="_blank">privacy policy</a>.
+                By authorizing, you agree to {brand}'s <a href="https://divine.video/terms" target="_blank">terms</a> and <a href="https://divine.video/privacy" target="_blank">privacy policy</a>.
             </p>
 
             <div class="buttons">
@@ -1499,6 +1500,7 @@ pub async fn authorize_get(
                 user_pubkey_js = js_string_literal(&pubkey),
                 user_email_js = js_string_literal(&user_email.as_deref().unwrap_or("")),
                 policy_info_json = policy_info_json, // already JSON-serialized
+                brand = BRAND_NAME,
             )
         }
     } else {
@@ -1510,7 +1512,7 @@ pub async fn authorize_get(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Sign in - Divine Login</title>
+    <title>Sign in - {brand} Login</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Bricolage+Grotesque:wght@600;700&display=swap" rel="stylesheet">
@@ -1820,7 +1822,7 @@ pub async fn authorize_get(
     <div class="container">
         <div class="header">
             <div class="logo">
-                <img src="/divine-logo.svg" alt="Divine" />
+                <img src="/divine-logo.svg" alt="{brand}" />
                 <span class="logo-sub">Login</span>
             </div>
             <h1>Sign in</h1>
@@ -1937,11 +1939,11 @@ pub async fn authorize_get(
             if (form === 'login') {{
                 document.getElementById('login_view').classList.add('active');
                 if (headerTitle) headerTitle.textContent = 'Sign in';
-                document.title = 'Sign in - Divine Login';
+                document.title = 'Sign in - {brand} Login';
             }} else {{
                 document.getElementById('register_view').classList.add('active');
                 if (headerTitle) headerTitle.textContent = 'Create account';
-                document.title = 'Create account - Divine Login';
+                document.title = 'Create account - {brand} Login';
             }}
 
             hideError();
@@ -2191,6 +2193,7 @@ pub async fn authorize_get(
             code_challenge_js = js_string_literal(&params.code_challenge.as_deref().unwrap_or("")),
             code_challenge_method_js =
                 js_string_literal(&params.code_challenge_method.as_deref().unwrap_or("")),
+            brand = BRAND_NAME,
         )
     };
 
@@ -3544,7 +3547,7 @@ pub async fn connect_get(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Authorize Connection - Divine Login</title>
+    <title>Authorize Connection - {brand} Login</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Bricolage+Grotesque:wght@600;700&display=swap" rel="stylesheet">
@@ -3766,7 +3769,7 @@ pub async fn connect_get(
     <div class="container">
         <div class="header">
             <div class="logo">
-                <img src="/divine-logo.svg" alt="Divine" />
+                <img src="/divine-logo.svg" alt="{brand}" />
                 <span class="logo-sub">Login</span>
             </div>
             <h1>Authorize Connection</h1>
@@ -3788,7 +3791,7 @@ pub async fn connect_get(
         </div>
 
         <div class="warning">
-            This will allow the app to sign events on your behalf using your Divine-managed keys.
+            This will allow the app to sign events on your behalf using your {brand}-managed keys.
         </div>
 
         <form method="POST" action="/api/oauth/connect">
@@ -3887,6 +3890,7 @@ pub async fn connect_get(
         secret_attr = escape_attr(&params.secret),
         perms_attr = escape_attr(params.perms.as_deref().unwrap_or("")),
         permissions_raw_js = js_string_literal(&permissions_raw),
+        brand = BRAND_NAME,
     );
 
     Ok(Html(html).into_response())
