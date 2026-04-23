@@ -1037,7 +1037,7 @@ pub async fn logout() -> Result<impl axum::response::IntoResponse, AuthError> {
 #[derive(Debug, Deserialize)]
 pub struct CreateBunkerRequest {
     pub app_name: String,            // Required: friendly display name
-    pub origin: Option<String>,      // Optional: the app's origin URL (HTTPS, or http://localhost / *.localhost / 127.0.0.1 / [::1] for local dev)
+    pub origin: Option<String>, // Optional: the app's origin URL (HTTPS, or http://localhost / *.localhost / 127.0.0.1 / [::1] for local dev)
     pub policy_slug: Option<String>, // Optional: null = full access
 }
 
