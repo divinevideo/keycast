@@ -2,7 +2,9 @@ use chrono::{Duration, Utc};
 use sqlx::PgPool;
 
 use crate::repositories::RepositoryError;
-use crate::types::claim_token::{ClaimToken, ClaimTokenStats, CLAIM_TOKEN_EXPIRY_DAYS};
+use crate::types::claim_token::{
+    ClaimToken, ClaimTokenState, ClaimTokenStats, CLAIM_TOKEN_EXPIRY_DAYS,
+};
 
 /// Repository for account claim token operations.
 /// Used for preloaded users to claim their accounts by setting email/password.
@@ -153,5 +155,65 @@ impl ClaimTokenRepository {
         .await?;
 
         Ok(result.rows_affected())
+    }
+
+    /// Classify a token string into one of the ClaimTokenState variants by
+    /// inspecting the row and, for expired rows, checking for a newer valid
+    /// replacement. Used by the `/claim` HTTP handler to pick the right
+    /// error page.
+    pub async fn classify(
+        &self,
+        token: &str,
+        tenant_id: i64,
+    ) -> Result<ClaimTokenState, RepositoryError> {
+        let ct = sqlx::query_as::<_, ClaimToken>(
+            "SELECT * FROM account_claim_tokens
+             WHERE token = $1 AND tenant_id = $2",
+        )
+        .bind(token)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let ct = match ct {
+            None => return Ok(ClaimTokenState::Unrecognized),
+            Some(t) => t,
+        };
+
+        if ct.used_at.is_some() {
+            return Ok(ClaimTokenState::AlreadyClaimed(ct));
+        }
+        if ct.invalidated_at.is_some() {
+            return Ok(ClaimTokenState::AdminInvalidated(ct));
+        }
+        if ct.expires_at > Utc::now() {
+            return Ok(ClaimTokenState::Valid(ct));
+        }
+
+        // Expired, not admin-invalidated; check for newer valid token for same user.
+        let newer = sqlx::query_as::<_, ClaimToken>(
+            "SELECT * FROM account_claim_tokens
+             WHERE user_pubkey = $1
+               AND tenant_id = $2
+               AND created_at > $3
+               AND used_at IS NULL
+               AND invalidated_at IS NULL
+               AND expires_at > NOW()
+             ORDER BY created_at DESC
+             LIMIT 1",
+        )
+        .bind(&ct.user_pubkey)
+        .bind(tenant_id)
+        .bind(ct.created_at)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(match newer {
+            Some(n) => ClaimTokenState::Replaced {
+                current: ct,
+                newer: n,
+            },
+            None => ClaimTokenState::Expired(ct),
+        })
     }
 }
