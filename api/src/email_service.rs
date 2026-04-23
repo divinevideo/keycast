@@ -455,7 +455,7 @@ impl EmailSender for SendGridEmailSender {
                     <a href="{}" style="color: #00B488;">{}</a>
                 </p>
                 <p style="color: #666; font-size: 14px; margin-top: 30px;">
-                    This link will expire in 7 days. If you didn't request this, you can safely ignore this email.
+                    This link will expire in 14 days. If you didn't request this, you can safely ignore this email.
                 </p>
             </body>
             </html>
@@ -464,7 +464,7 @@ impl EmailSender for SendGridEmailSender {
         );
 
         let text_content = format!(
-            "Your Vine account has been migrated to Divine. Click this link to claim it:\n\n{}\n\nThis link will expire in 7 days. If you didn't request this, you can safely ignore this email.",
+            "Your Vine account has been migrated to Divine. Click this link to claim it:\n\n{}\n\nThis link will expire in 14 days. If you didn't request this, you can safely ignore this email.",
             claim_url
         );
 

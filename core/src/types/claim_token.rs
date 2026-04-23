@@ -3,8 +3,15 @@ use chrono::{DateTime, Utc};
 use rand::Rng;
 use sqlx::FromRow;
 
-/// Claim token expiry in days (7 days)
-pub const CLAIM_TOKEN_EXPIRY_DAYS: i64 = 7;
+/// Claim token expiry in days (14 days).
+///
+/// Extended from 7 to 14 days in response to marketing/support feedback
+/// from early onboarding conversations with OG Vine creators: the original
+/// 7-day window frequently expired before the creator actually tried to
+/// claim (travel, busy weeks, missed email). 14 days more realistically
+/// matches the rhythm of those handoffs without extending credential
+/// exposure unreasonably.
+pub const CLAIM_TOKEN_EXPIRY_DAYS: i64 = 14;
 
 /// Account claim token for preloaded users to claim their accounts
 #[derive(Debug, FromRow)]

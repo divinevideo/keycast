@@ -487,7 +487,7 @@
 						<table class="params-table">
 							<tbody>
 								<tr><td><code>claim_url</code></td><td>URL to send to the user</td></tr>
-								<tr><td><code>expires_at</code></td><td>Link expiration (7 days)</td></tr>
+								<tr><td><code>expires_at</code></td><td>Link expiration (14 days)</td></tr>
 							</tbody>
 						</table>
 
@@ -495,7 +495,7 @@
 						<pre class="code-block">{claimTokenExample}</pre>
 
 						<p class="doc-note">
-							Claim links are single-use and expire after 7 days. You can generate new links for the same user if needed.
+							Claim links are single-use and expire after 14 days. You can generate new links for the same user if needed.
 						</p>
 					</div>
 				{/if}
