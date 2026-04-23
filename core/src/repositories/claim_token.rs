@@ -157,6 +157,59 @@ impl ClaimTokenRepository {
         Ok(result.rows_affected())
     }
 
+    /// Create a new claim token and, in the same transaction, invalidate any
+    /// prior valid token for the same user. Used by the Regenerate admin
+    /// action. Returns (new_token, count_of_priors_invalidated).
+    pub async fn create_with_prior_invalidation(
+        &self,
+        token: &str,
+        user_pubkey: &str,
+        created_by_pubkey: Option<&str>,
+        tenant_id: i64,
+    ) -> Result<(ClaimToken, u64), RepositoryError> {
+        let now = Utc::now();
+        let expires_at = now + Duration::days(CLAIM_TOKEN_EXPIRY_DAYS);
+
+        let mut tx = self.pool.begin().await?;
+
+        let invalidated_count = sqlx::query(
+            "UPDATE account_claim_tokens
+             SET expires_at = NOW(),
+                 invalidated_at = NOW(),
+                 invalidated_by = $1,
+                 invalidation_reason = 'replaced_by_regenerate'
+             WHERE user_pubkey = $2
+               AND tenant_id = $3
+               AND used_at IS NULL
+               AND invalidated_at IS NULL
+               AND expires_at > NOW()",
+        )
+        .bind(created_by_pubkey)
+        .bind(user_pubkey)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        let new_token = sqlx::query_as::<_, ClaimToken>(
+            "INSERT INTO account_claim_tokens
+             (token, user_pubkey, expires_at, created_at, created_by_pubkey, tenant_id)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             RETURNING *",
+        )
+        .bind(token)
+        .bind(user_pubkey)
+        .bind(expires_at)
+        .bind(now)
+        .bind(created_by_pubkey)
+        .bind(tenant_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok((new_token, invalidated_count))
+    }
+
     /// Invalidate all valid (unused, unexpired, not-already-invalidated) claim
     /// tokens for a user. Sets expires_at = NOW() and invalidated_at = NOW(),
     /// records admin pubkey and optional reason. Returns the count of rows
