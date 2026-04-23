@@ -14,6 +14,7 @@ use secrecy::{ExposeSecret, SecretString};
 use super::admin::{is_full_admin, is_support_admin};
 use crate::api::extractors::UcanAuth;
 use crate::bcrypt_queue::{BcryptJob, BcryptQueueError};
+use crate::brand::BRAND_NAME;
 use crate::nip98;
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
@@ -3414,8 +3415,7 @@ pub async fn delete_account(
             "Denied: not user-signed and not first-party"
         );
         return Err(AuthError::Forbidden(
-            "Account deletion requires the Divine app or web login with your private key"
-                .to_string(),
+            format!("Account deletion requires the {} app or web login with your private key", BRAND_NAME),
         ));
     }
 
