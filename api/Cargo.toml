@@ -9,6 +9,7 @@ edition = "2021"
 # Feature flag to enable SQLite-based tests (disabled until migrated to PostgreSQL)
 sqlite-tests = []
 integration-tests = []
+aws = ["dep:aws-config", "dep:aws-sdk-sesv2"]
 
 [dependencies]
 aes-gcm = "0.10"
@@ -60,6 +61,8 @@ secrecy = { workspace = true }
 zeroize = { workspace = true }
 redis = { version = "0.27", features = ["tokio-comp", "aio"] }
 cluster-hashring = { path = "../cluster-hashring" }
+aws-config = { version = "1", optional = true }
+aws-sdk-sesv2 = { version = "1", optional = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -7,6 +7,9 @@ edition = "2021"
 name = "keycast"
 path = "src/main.rs"
 
+[features]
+aws = ["keycast_api/aws"]
+
 [dependencies]
 keycast_core = { path = "../core" }
 keycast_api = { path = "../api" }

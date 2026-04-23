@@ -17,7 +17,7 @@ COPY ./database/migrations ./database/migrations
 COPY ./Cargo.toml ./Cargo.toml
 COPY ./Cargo.lock ./Cargo.lock
 
-RUN cargo build --release --bin keycast
+RUN cargo build --release --features aws --bin keycast
 RUN cargo build --release --example migrate-vine-users
 
 # Build stage for Bun frontend

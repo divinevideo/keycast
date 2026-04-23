@@ -195,6 +195,7 @@ Optional:
 - `REDIS_KEY_PREFIX`: Optional prefix for all Redis keys (e.g., `keycast` → `keycast:oauth_poll:...`). Useful for multi-app GCP Memorystore deployments.
 - `MASTER_KEY_PATH`: Path to master encryption key file (default: `./master.key`)
 - `USE_GCP_KMS`: Use Google Cloud KMS instead of file-based encryption (default: `false`)
+- Build with `cargo build --features aws --bin keycast` to enable AWS integrations in the unified binary (including `EMAIL_PROVIDER=ses`; without this feature, explicit SES config fails at startup)
 - `USE_VALKEY_IAM`: Enable GCP IAM authentication for Memorystore Valkey (default: `false`). When enabled, uses Workload Identity to obtain access tokens for Redis authentication. Tokens are cached and refreshed automatically before expiry.
 - `BUNKER_RELAYS`: Comma-separated relay URLs for NIP-46 communication (required, no default)
 - `RUST_LOG`: Log level configuration (default: `info`)

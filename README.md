@@ -190,15 +190,19 @@ See [DEVELOPMENT.md](./docs/DEVELOPMENT.md) for local development setup.
 | `SERVER_NSEC` | Server's Nostr secret key for signing tokens |
 | `MASTER_KEY_PATH` | Path to encryption key file |
 
-#### Email (SendGrid)
+#### Email (SendGrid/SES/Dev)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SENDGRID_API_KEY` | *(none)* | If set, uses SendGrid; otherwise logs emails to console |
+| `EMAIL_PROVIDER` | auto-detect | Explicit provider: `sendgrid`, `ses`, or `dev` (`ses` requires an `aws` feature build) |
+| `SENDGRID_API_KEY` | *(none)* | SendGrid API key (auto-detect uses SendGrid when set) |
+| `AWS_REGION` | AWS SDK default | Region used by SES when `EMAIL_PROVIDER=ses` and built with `--features aws` |
 | `FROM_EMAIL` | `noreply@keycast.app` | Sender email address |
 | `FROM_NAME` | `Divine` | Sender display name |
 | `BASE_URL` | `https://login.divine.video` | Base URL for email verification links |
 | `DISABLE_EMAILS` | *(none)* | If set (any value), skips sending emails |
+
+If `EMAIL_PROVIDER` is explicitly set to `ses` in a non-`aws` build, startup fails with a configuration error instead of falling back to development email logging.
 
 #### Authentication & OAuth
 
