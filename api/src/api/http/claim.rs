@@ -47,13 +47,22 @@ pub async fn claim_get(
     let tenant_id = tenant.0.id;
     let pool = &auth_state.state.db;
 
-    // Validate token
+    // Classify token into one of the five terminal states so we can render a
+    // state-specific error page when it's not valid.
+    use keycast_core::types::claim_token::ClaimTokenState;
     let claim_token_repo = ClaimTokenRepository::new(pool.clone());
-    let claim_token = claim_token_repo
-        .find_valid(&params.token)
+    let claim_token = match claim_token_repo
+        .classify(&params.token, tenant_id)
         .await
         .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?
-        .ok_or(ClaimError::InvalidToken)?;
+    {
+        ClaimTokenState::Valid(ct) => ct,
+        ClaimTokenState::Unrecognized => return Err(ClaimError::TokenUnrecognized),
+        ClaimTokenState::AlreadyClaimed(_) => return Err(ClaimError::TokenAlreadyClaimed),
+        ClaimTokenState::AdminInvalidated(_) => return Err(ClaimError::TokenAdminInvalidated),
+        ClaimTokenState::Replaced { .. } => return Err(ClaimError::TokenReplaced),
+        ClaimTokenState::Expired(_) => return Err(ClaimError::TokenExpired),
+    };
 
     // Get user info (username, display_name)
     let user_repo = UserRepository::new(pool.clone());
@@ -255,13 +264,22 @@ pub async fn claim_post(
 
     form.email = form.email.to_lowercase();
 
-    // Validate token
+    // Classify token into one of the five terminal states; on anything but
+    // Valid, bail with the state-specific error page.
+    use keycast_core::types::claim_token::ClaimTokenState;
     let claim_token_repo = ClaimTokenRepository::new(pool.clone());
-    let claim_token = claim_token_repo
-        .find_valid(&form.token)
+    let claim_token = match claim_token_repo
+        .classify(&form.token, tenant_id)
         .await
         .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?
-        .ok_or(ClaimError::InvalidToken)?;
+    {
+        ClaimTokenState::Valid(ct) => ct,
+        ClaimTokenState::Unrecognized => return Err(ClaimError::TokenUnrecognized),
+        ClaimTokenState::AlreadyClaimed(_) => return Err(ClaimError::TokenAlreadyClaimed),
+        ClaimTokenState::AdminInvalidated(_) => return Err(ClaimError::TokenAdminInvalidated),
+        ClaimTokenState::Replaced { .. } => return Err(ClaimError::TokenReplaced),
+        ClaimTokenState::Expired(_) => return Err(ClaimError::TokenExpired),
+    };
 
     // Validate passwords match
     if form.password != form.password_confirmation {
@@ -548,7 +566,16 @@ pub async fn claim_post(
 /// Claim-specific errors
 #[derive(Debug)]
 pub enum ClaimError {
-    InvalidToken,
+    /// No row matches the token string.
+    TokenUnrecognized,
+    /// Token row exists and `used_at IS NOT NULL`.
+    TokenAlreadyClaimed,
+    /// Token row exists and `invalidated_at IS NOT NULL` (admin-killed).
+    TokenAdminInvalidated,
+    /// Token is past `expires_at` and a newer valid token exists for same user.
+    TokenReplaced,
+    /// Token is past `expires_at`, no newer valid token, no admin invalidation.
+    TokenExpired,
     UserNotFound,
     PasswordMismatch,
     WeakPassword,
@@ -560,9 +587,25 @@ pub enum ClaimError {
 impl IntoResponse for ClaimError {
     fn into_response(self) -> Response {
         let (title, message) = match self {
-            ClaimError::InvalidToken => (
-                "Invalid or Expired Link",
-                "This claim link is invalid or has already been used. Please contact support for a new link.",
+            ClaimError::TokenUnrecognized => (
+                "Link not recognized",
+                "We don't recognize this claim link. Double-check the URL you received, or contact the person who sent it for help.",
+            ),
+            ClaimError::TokenAlreadyClaimed => (
+                "Account already claimed",
+                "This account has already been claimed. If you set it up, sign in at divine.video. If you didn't, contact support — someone else may have used this link.",
+            ),
+            ClaimError::TokenAdminInvalidated => (
+                "Link has been deactivated",
+                "This claim link was deactivated by Divine support. Contact the person who sent it, or email support@divine.video, to learn more.",
+            ),
+            ClaimError::TokenReplaced => (
+                "Link has been replaced",
+                "A newer claim link has been issued for this account. Check your email for the most recent message from Divine support, or contact the person who sent it for the current link.",
+            ),
+            ClaimError::TokenExpired => (
+                "Link has expired",
+                "Claim links are valid for 7 days. This one is past its expiration. Contact the person who sent it, or email support@divine.video, for a fresh link.",
             ),
             ClaimError::UserNotFound => (
                 "Account Not Found",
