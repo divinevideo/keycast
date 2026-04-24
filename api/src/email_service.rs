@@ -168,7 +168,10 @@ impl EmailSender for DevEmailSender {
         tracing::info!("  VINE CLAIM EMAIL");
         tracing::info!("==================================================");
         tracing::info!("  To: {}", to_email);
-        tracing::info!("  Subject: Your Vine account on {} is ready to claim", BRAND_NAME);
+        tracing::info!(
+            "  Subject: Your Vine account on {} is ready to claim",
+            BRAND_NAME
+        );
         tracing::info!("");
         tracing::info!("  Claim link:");
         tracing::info!("  {}", claim_url);
@@ -384,7 +387,8 @@ impl EmailSender for SendGridEmailSender {
             </body>
             </html>
             "#,
-            url = verification_url, brand = BRAND_NAME
+            url = verification_url,
+            brand = BRAND_NAME
         );
 
         let text_content = format!(
@@ -426,7 +430,8 @@ impl EmailSender for SendGridEmailSender {
             </body>
             </html>
             "#,
-            url = reset_url, brand = BRAND_NAME
+            url = reset_url,
+            brand = BRAND_NAME
         );
 
         let text_content = format!(
@@ -462,7 +467,8 @@ impl EmailSender for SendGridEmailSender {
             </body>
             </html>
             "#,
-            url = claim_url, brand = BRAND_NAME
+            url = claim_url,
+            brand = BRAND_NAME
         );
 
         let text_content = format!(

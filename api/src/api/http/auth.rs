@@ -3414,9 +3414,10 @@ pub async fn delete_account(
             redirect_origin = %redirect_origin,
             "Denied: not user-signed and not first-party"
         );
-        return Err(AuthError::Forbidden(
-            format!("Account deletion requires the {} app or web login with your private key", BRAND_NAME),
-        ));
+        return Err(AuthError::Forbidden(format!(
+            "Account deletion requires the {} app or web login with your private key",
+            BRAND_NAME
+        )));
     }
 
     tracing::info!(
