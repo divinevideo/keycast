@@ -122,57 +122,62 @@ steps:
         echo "✅ Readiness check passed"
 
         PREVIEW_ORIGIN="https://preview.openvine-app.pages.dev"
+        HEADLESS_PUBLIC_ORIGIN="https://keycast-cors-smoke.invalid"
 
-        # Helper: read the Access-Control-Allow-Origin header from a CORS preflight.
+        # Helper: verify the Access-Control-Allow-Origin header from a CORS preflight.
         # Retries to ride out the brief warm-up window where requests can still land
         # on the previous revision after Cloud Run reports 100% traffic on the new one.
-        # First arg = endpoint path, prints the observed allow-origin value (or empty).
-        cors_preflight_allow_origin() {
+        # Args: endpoint path, request Origin, expected allow-origin.
+        # Prints the observed allow-origin value once it matches the expected value.
+        cors_preflight_expect_allow_origin() {
           local path="$$1"
+          local origin="$$2"
+          local expected_allow_origin="$$3"
           local headers
           local allow_origin=""
           for attempt in 1 2 3 4 5 6; do
+            allow_origin=""
             headers=$$(mktemp)
             local http_code
             http_code=$$(curl -s -D "$$headers" -o /dev/null -w "%{http_code}" \
-              -H "Origin: $$PREVIEW_ORIGIN" \
+              -H "Origin: $$origin" \
               -H "Access-Control-Request-Method: POST" \
               -H "Access-Control-Request-Headers: Content-Type" \
               -X OPTIONS \
               "$$SERVICE_URL$$path")
             if [ "$$http_code" = "200" ]; then
               allow_origin=$$(awk 'BEGIN{IGNORECASE=1}/^Access-Control-Allow-Origin:/ {print $$2}' "$$headers" | tr -d '\r')
-              if [ -n "$$allow_origin" ]; then
+              if [ "$$allow_origin" = "$$expected_allow_origin" ]; then
                 rm -f "$$headers"
                 echo "$$allow_origin"
                 return 0
               fi
             fi
             rm -f "$$headers"
-            echo "  attempt $$attempt: http=$$http_code allow_origin='$$allow_origin', retrying in 10s..." >&2
+            echo "  attempt $$attempt: http=$$http_code origin='$$origin' allow_origin='$$allow_origin' expected='$$expected_allow_origin', retrying in 10s..." >&2
             sleep 10
           done
-          echo ""
+          echo "$$allow_origin"
           return 1
         }
 
         echo "🔍 Testing CORS preflight for /api/auth/register from $$PREVIEW_ORIGIN..."
         # /api/auth/register uses the predicate-based CORS (auth_cors) and echoes the
         # specific request origin back when allowed.
-        REGISTER_ALLOW_ORIGIN=$$(cors_preflight_allow_origin "/api/auth/register")
+        REGISTER_ALLOW_ORIGIN=$$(cors_preflight_expect_allow_origin "/api/auth/register" "$$PREVIEW_ORIGIN" "$$PREVIEW_ORIGIN")
         if [ "$$REGISTER_ALLOW_ORIGIN" != "$$PREVIEW_ORIGIN" ]; then
           echo "❌ Register CORS preflight returned Access-Control-Allow-Origin='$$REGISTER_ALLOW_ORIGIN' (expected '$$PREVIEW_ORIGIN')"
           exit 1
         fi
         echo "✅ Register CORS preflight passed"
 
-        echo "🔍 Testing CORS preflight for /api/headless/login from $$PREVIEW_ORIGIN..."
+        echo "🔍 Testing CORS preflight for /api/headless/login from $$HEADLESS_PUBLIC_ORIGIN..."
         # /api/headless/login uses public_cors (allow_origin = Any) so the server
-        # responds with '*' rather than echoing the request origin. PKCE handles
-        # auth without cookies, so credentialed CORS isn't required here.
-        LOGIN_ALLOW_ORIGIN=$$(cors_preflight_allow_origin "/api/headless/login")
-        if [ "$$LOGIN_ALLOW_ORIGIN" != "*" ] && [ "$$LOGIN_ALLOW_ORIGIN" != "$$PREVIEW_ORIGIN" ]; then
-          echo "❌ Headless login CORS preflight returned Access-Control-Allow-Origin='$$LOGIN_ALLOW_ORIGIN' (expected '*' or '$$PREVIEW_ORIGIN')"
+        # responds with '*' for arbitrary origins. Using an unallowlisted origin here
+        # ensures a regression back to auth_cors cannot pass by echoing PREVIEW_ORIGIN.
+        LOGIN_ALLOW_ORIGIN=$$(cors_preflight_expect_allow_origin "/api/headless/login" "$$HEADLESS_PUBLIC_ORIGIN" "*")
+        if [ "$$LOGIN_ALLOW_ORIGIN" != "*" ]; then
+          echo "❌ Headless login CORS preflight returned Access-Control-Allow-Origin='$$LOGIN_ALLOW_ORIGIN' (expected '*')"
           exit 1
         fi
         echo "✅ Headless login CORS preflight passed (allow-origin='$$LOGIN_ALLOW_ORIGIN')"
