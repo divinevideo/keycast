@@ -4165,6 +4165,9 @@ mod tests {
     fn test_normalize_nip05_username_rejects_length_above_boundary() {
         let username = "a".repeat(super::MAX_NIP05_USERNAME_LENGTH + 1);
         let result = super::normalize_nip05_username(&username);
-        assert!(result.is_err(), "username longer than max boundary should be rejected");
+        assert!(
+            result.is_err(),
+            "username longer than max boundary should be rejected"
+        );
     }
 }
