@@ -151,7 +151,6 @@ This allows 5x higher concurrency without blocking request threads on bcrypt.
 | `DISABLE_EMAILS` | No | — | Set to `true` to explicitly disable email delivery in production. |
 | `ALLOWED_TENANT_DOMAINS` | Production | — | Comma-separated list of allowed tenant domains. |
 | `ENABLE_TENANT_AUTO_PROVISIONING` | No | `false` | Set to `true` to allow automatic tenant creation for unknown domains (dev only). |
-| `REQUIRE_REGISTERED_OAUTH_CLIENTS` | No | `true` (release) | Set to `false` to allow unregistered OAuth clients (dev only). |
 
 ---
 

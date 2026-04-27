@@ -530,28 +530,11 @@ pub async fn authorize_get(
     let tenant_id = tenant.0.id;
     let pool = &auth_state.state.db;
 
-    // In strict mode, reject unregistered client_ids (production security)
-    // Then validate redirect_uri against registered client patterns
+    // Validate redirect_uri against registered client patterns (only if client is registered).
+    // Open OAuth: unregistered client_ids are permitted; registration only narrows redirect URIs.
     {
         let client_repo = keycast_core::repositories::RegisteredClientRepository::new(pool.clone());
 
-        // Check if the client is registered (required in strict/production mode)
-        if let Err(e) = client_repo
-            .require_registered_client(&params.client_id, tenant_id)
-            .await
-        {
-            tracing::warn!(
-                "Unregistered client_id '{}' rejected in strict mode: {}",
-                params.client_id,
-                e
-            );
-            return Err(OAuthError::InvalidRequest(format!(
-                "Unregistered client: {}",
-                e
-            )));
-        }
-
-        // Validate redirect_uri against registered client patterns (if client is registered)
         if let Err(e) = client_repo
             .validate_redirect_uri(&params.client_id, &params.redirect_uri, tenant_id)
             .await
@@ -2226,28 +2209,6 @@ pub async fn authorize_post(
     }
 
     let tenant_id = tenant.0.id;
-
-    // In strict mode, reject unregistered client_ids (defense-in-depth, mirrors authorize_get check)
-    {
-        let client_repo = keycast_core::repositories::RegisteredClientRepository::new(
-            auth_state.state.db.clone(),
-        );
-
-        if let Err(e) = client_repo
-            .require_registered_client(&req.client_id, tenant_id)
-            .await
-        {
-            tracing::warn!(
-                "Unregistered client_id '{}' rejected in strict mode (POST): {}",
-                req.client_id,
-                e
-            );
-            return Err(OAuthError::InvalidRequest(format!(
-                "Unregistered client: {}",
-                e
-            )));
-        }
-    }
 
     // Extract user public key from UCAN cookie (async)
     let user_pubkey = if let Some(token) = super::auth::extract_ucan_from_cookie(&headers) {

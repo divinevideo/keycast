@@ -37,47 +37,6 @@ impl RegisteredClientRepository {
         Ok(result)
     }
 
-    /// Check if a client_id is registered in the database.
-    /// Returns true if the client is registered, false otherwise.
-    pub async fn is_client_registered(
-        &self,
-        client_id: &str,
-        tenant_id: i64,
-    ) -> Result<bool, RepositoryError> {
-        let result = self.get_allowed_redirect_uris(client_id, tenant_id).await?;
-        Ok(result.is_some())
-    }
-
-    /// Check whether strict client admission is enabled.
-    /// In strict mode, only registered OAuth clients can initiate authorization flows.
-    /// Controlled by `REQUIRE_REGISTERED_OAUTH_CLIENTS` env var.
-    /// Defaults to `true` in release builds and `false` in debug builds.
-    pub fn is_strict_client_mode() -> bool {
-        std::env::var("REQUIRE_REGISTERED_OAUTH_CLIENTS")
-            .map(|v| v == "true")
-            .unwrap_or(cfg!(not(debug_assertions)))
-    }
-
-    /// In strict mode, verify the client_id is registered. Returns Err if not.
-    /// In non-strict mode, always returns Ok(()).
-    pub async fn require_registered_client(
-        &self,
-        client_id: &str,
-        tenant_id: i64,
-    ) -> Result<(), RepositoryError> {
-        if !Self::is_strict_client_mode() {
-            return Ok(());
-        }
-        if self.is_client_registered(client_id, tenant_id).await? {
-            Ok(())
-        } else {
-            Err(RepositoryError::NotFound(format!(
-                "client_id '{}' is not registered. In production, only registered OAuth clients are allowed.",
-                client_id
-            )))
-        }
-    }
-
     /// Validate a redirect_uri against a registered client's allowed patterns.
     /// Returns Ok(()) if valid, Err if the redirect_uri is not allowed.
     /// If the client_id is not registered, returns Ok(()) (backward compatible).
@@ -150,32 +109,6 @@ fn matches_redirect_pattern(pattern: &str, uri: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_strict_client_mode_env_true() {
-        std::env::set_var("REQUIRE_REGISTERED_OAUTH_CLIENTS", "true");
-        assert!(RegisteredClientRepository::is_strict_client_mode());
-        std::env::remove_var("REQUIRE_REGISTERED_OAUTH_CLIENTS");
-    }
-
-    #[test]
-    fn test_strict_client_mode_env_false() {
-        std::env::set_var("REQUIRE_REGISTERED_OAUTH_CLIENTS", "false");
-        assert!(!RegisteredClientRepository::is_strict_client_mode());
-        std::env::remove_var("REQUIRE_REGISTERED_OAUTH_CLIENTS");
-    }
-
-    #[test]
-    fn test_strict_client_mode_default() {
-        // When env var is not set, defaults based on build profile
-        std::env::remove_var("REQUIRE_REGISTERED_OAUTH_CLIENTS");
-        let result = RegisteredClientRepository::is_strict_client_mode();
-        if cfg!(debug_assertions) {
-            assert!(!result, "Should default to false in debug builds");
-        } else {
-            assert!(result, "Should default to true in release builds");
-        }
-    }
 
     #[test]
     fn test_exact_match() {
