@@ -12,7 +12,8 @@ use super::routes::AuthState;
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::extractors::UcanAuth;
 use keycast_core::repositories::{
-    AuthEventRepository, ClaimTokenRepository, OAuthAuthorizationRepository, UserRepository,
+    test_redirect_pattern, AuthEventRepository, ClaimTokenRepository, OAuthAuthorizationRepository,
+    RegisteredClient, RegisteredClientRepository, RepositoryError, UserRepository,
 };
 use keycast_core::types::claim_token::generate_claim_token;
 
@@ -1485,4 +1486,207 @@ async fn resolve_identifier(
     Err(ApiError::bad_request(
         "Identifier must be an npub, 64-char hex pubkey, or email address",
     ))
+}
+
+// ============================================================================
+// Registered OAuth Clients (admin CRUD)
+// ============================================================================
+//
+// These endpoints let a full admin manage the per-tenant OAuth client allowlist
+// stored in `registered_clients`. They mirror the same auth gate (is_full_admin
+// + TenantExtractor) used by the support-admin endpoints above.
+
+#[derive(Debug, Serialize)]
+pub struct RegisteredClientView {
+    pub id: i32,
+    pub client_id: String,
+    pub name: String,
+    pub allowed_redirect_uris: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl From<RegisteredClient> for RegisteredClientView {
+    fn from(c: RegisteredClient) -> Self {
+        Self {
+            id: c.id,
+            client_id: c.client_id,
+            name: c.name,
+            allowed_redirect_uris: c.allowed_redirect_uris,
+            created_at: c.created_at.to_rfc3339(),
+            updated_at: c.updated_at.to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegisteredClientsResponse {
+    pub clients: Vec<RegisteredClientView>,
+}
+
+/// Map a repository error to an HTTP-shaped ApiError. Conflict for unique
+/// violations, NotFound for missing rows, BadRequest for validation failures.
+fn map_repo_error(err: RepositoryError) -> ApiError {
+    match err {
+        RepositoryError::Duplicate => {
+            ApiError::conflict("A client with this client_id already exists for this tenant")
+        }
+        RepositoryError::NotFound(msg) => ApiError::not_found(msg),
+        RepositoryError::Integrity(msg) => ApiError::bad_request(msg),
+        RepositoryError::Database(msg) => ApiError::Internal(msg),
+    }
+}
+
+/// GET /api/admin/registered-clients
+/// List all registered OAuth clients for the current tenant.
+pub async fn list_registered_clients(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    auth: UcanAuth,
+) -> ApiResult<Json<RegisteredClientsResponse>> {
+    if !is_full_admin(&auth) {
+        return Err(ApiError::forbidden("Full admin access required"));
+    }
+
+    let repo = RegisteredClientRepository::new(auth_state.state.db.clone());
+    let clients = repo.list(tenant.0.id).await.map_err(map_repo_error)?;
+    Ok(Json(RegisteredClientsResponse {
+        clients: clients.into_iter().map(Into::into).collect(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateRegisteredClientRequest {
+    pub client_id: String,
+    pub name: String,
+    pub allowed_redirect_uris: Vec<String>,
+}
+
+/// POST /api/admin/registered-clients
+/// Create a new registered OAuth client for the current tenant.
+pub async fn create_registered_client(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    auth: UcanAuth,
+    Json(req): Json<CreateRegisteredClientRequest>,
+) -> ApiResult<Json<RegisteredClientView>> {
+    if !is_full_admin(&auth) {
+        return Err(ApiError::forbidden("Full admin access required"));
+    }
+
+    let repo = RegisteredClientRepository::new(auth_state.state.db.clone());
+    let created = repo
+        .create(
+            tenant.0.id,
+            req.client_id.trim(),
+            req.name.trim(),
+            &req.allowed_redirect_uris,
+        )
+        .await
+        .map_err(map_repo_error)?;
+
+    tracing::info!(
+        "Registered client created: {} (by admin {})",
+        created.client_id,
+        &auth.pubkey[..8]
+    );
+    Ok(Json(created.into()))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateRegisteredClientRequest {
+    /// New display name. Omit to keep the existing name.
+    pub name: Option<String>,
+    /// Replacement set of allowed redirect URI patterns. Omit to keep existing.
+    /// When provided, this REPLACES the current list — patterns not present in
+    /// the new list are removed.
+    pub allowed_redirect_uris: Option<Vec<String>>,
+}
+
+/// PATCH /api/admin/registered-clients/:id
+pub async fn update_registered_client(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    auth: UcanAuth,
+    Path(id): Path<i32>,
+    Json(req): Json<UpdateRegisteredClientRequest>,
+) -> ApiResult<Json<RegisteredClientView>> {
+    if !is_full_admin(&auth) {
+        return Err(ApiError::forbidden("Full admin access required"));
+    }
+
+    if req.name.is_none() && req.allowed_redirect_uris.is_none() {
+        return Err(ApiError::bad_request(
+            "Provide at least one of: name, allowed_redirect_uris",
+        ));
+    }
+
+    let repo = RegisteredClientRepository::new(auth_state.state.db.clone());
+    let updated = repo
+        .update(
+            id,
+            tenant.0.id,
+            req.name.as_deref(),
+            req.allowed_redirect_uris.as_deref(),
+        )
+        .await
+        .map_err(map_repo_error)?;
+
+    tracing::info!(
+        "Registered client updated: id={} client_id={} (by admin {})",
+        updated.id,
+        updated.client_id,
+        &auth.pubkey[..8]
+    );
+    Ok(Json(updated.into()))
+}
+
+/// DELETE /api/admin/registered-clients/:id
+pub async fn delete_registered_client(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    auth: UcanAuth,
+    Path(id): Path<i32>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if !is_full_admin(&auth) {
+        return Err(ApiError::forbidden("Full admin access required"));
+    }
+
+    let repo = RegisteredClientRepository::new(auth_state.state.db.clone());
+    repo.delete(id, tenant.0.id).await.map_err(map_repo_error)?;
+
+    tracing::info!(
+        "Registered client deleted: id={} (by admin {})",
+        id,
+        &auth.pubkey[..8]
+    );
+    Ok(Json(serde_json::json!({ "deleted": true })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TestRedirectPatternRequest {
+    pub pattern: String,
+    pub uri: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TestRedirectPatternResponse {
+    pub matches: bool,
+}
+
+/// POST /api/admin/registered-clients/test
+/// Inline pattern tester: returns whether `uri` matches `pattern` according to
+/// the same matcher used by the OAuth validator.
+pub async fn test_registered_client_pattern(
+    _tenant: crate::api::tenant::TenantExtractor,
+    auth: UcanAuth,
+    Json(req): Json<TestRedirectPatternRequest>,
+) -> ApiResult<Json<TestRedirectPatternResponse>> {
+    if !is_full_admin(&auth) {
+        return Err(ApiError::forbidden("Full admin access required"));
+    }
+
+    Ok(Json(TestRedirectPatternResponse {
+        matches: test_redirect_pattern(&req.pattern, &req.uri),
+    }))
 }

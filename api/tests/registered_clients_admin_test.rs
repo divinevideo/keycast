@@ -33,10 +33,8 @@ async fn create_then_list_returns_row_for_tenant() {
             TENANT_A,
             "test-client-1",
             "Test Client 1",
-            &vec![
-                "https://app.example.com/cb".to_string(),
-                "https://*.preview.example.com/cb".to_string(),
-            ],
+            &["https://app.example.com/cb".to_string(),
+                "https://*.preview.example.com/cb".to_string()],
         )
         .await
         .unwrap();
@@ -61,7 +59,7 @@ async fn list_is_scoped_per_tenant() {
         TENANT_A,
         "test-tenant-a-client",
         "A",
-        &vec!["https://a.example.com/cb".to_string()],
+        &["https://a.example.com/cb".to_string()],
     )
     .await
     .unwrap();
@@ -69,7 +67,7 @@ async fn list_is_scoped_per_tenant() {
         TENANT_B,
         "test-tenant-b-client",
         "B",
-        &vec!["https://b.example.com/cb".to_string()],
+        &["https://b.example.com/cb".to_string()],
     )
     .await
     .unwrap();
@@ -92,7 +90,7 @@ async fn create_duplicate_client_id_for_same_tenant_errors() {
         TENANT_A,
         "test-dup",
         "First",
-        &vec!["https://example.com/cb".to_string()],
+        &["https://example.com/cb".to_string()],
     )
     .await
     .unwrap();
@@ -102,7 +100,7 @@ async fn create_duplicate_client_id_for_same_tenant_errors() {
             TENANT_A,
             "test-dup",
             "Second",
-            &vec!["https://example.com/cb".to_string()],
+            &["https://example.com/cb".to_string()],
         )
         .await
         .unwrap_err();
@@ -121,7 +119,7 @@ async fn create_same_client_id_different_tenants_succeeds() {
         TENANT_A,
         "test-shared-id",
         "A version",
-        &vec!["https://a.example.com/cb".to_string()],
+        &["https://a.example.com/cb".to_string()],
     )
     .await
     .unwrap();
@@ -129,7 +127,7 @@ async fn create_same_client_id_different_tenants_succeeds() {
         TENANT_B,
         "test-shared-id",
         "B version",
-        &vec!["https://b.example.com/cb".to_string()],
+        &["https://b.example.com/cb".to_string()],
     )
     .await
     .expect("same client_id under a different tenant must be allowed");
@@ -159,7 +157,7 @@ async fn create_rejects_empty_client_id() {
             TENANT_A,
             "",
             "X",
-            &vec!["https://example.com/cb".to_string()],
+            &["https://example.com/cb".to_string()],
         )
         .await
         .unwrap_err();
@@ -179,7 +177,7 @@ async fn update_renames_and_replaces_uris() {
             TENANT_A,
             "test-update",
             "Original",
-            &vec!["https://example.com/cb".to_string()],
+            &["https://example.com/cb".to_string()],
         )
         .await
         .unwrap();
@@ -189,10 +187,8 @@ async fn update_renames_and_replaces_uris() {
             created.id,
             TENANT_A,
             Some("Renamed"),
-            Some(&vec![
-                "https://example.com/cb".to_string(),
-                "https://*.preview.example.com/cb".to_string(),
-            ]),
+            Some(&["https://example.com/cb".to_string(),
+                "https://*.preview.example.com/cb".to_string()]),
         )
         .await
         .unwrap();
@@ -211,7 +207,7 @@ async fn update_cannot_cross_tenants() {
             TENANT_A,
             "test-cross-tenant",
             "A",
-            &vec!["https://a.example.com/cb".to_string()],
+            &["https://a.example.com/cb".to_string()],
         )
         .await
         .unwrap();
@@ -237,7 +233,7 @@ async fn update_rejects_empty_redirect_uris() {
             TENANT_A,
             "test-update-empty",
             "X",
-            &vec!["https://example.com/cb".to_string()],
+            &["https://example.com/cb".to_string()],
         )
         .await
         .unwrap();
@@ -262,7 +258,7 @@ async fn delete_removes_row_and_is_tenant_scoped() {
             TENANT_A,
             "test-delete",
             "X",
-            &vec!["https://example.com/cb".to_string()],
+            &["https://example.com/cb".to_string()],
         )
         .await
         .unwrap();

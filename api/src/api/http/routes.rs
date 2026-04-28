@@ -1,7 +1,7 @@
 use axum::{
     http::StatusCode,
     response::IntoResponse,
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use keycast_core::authorization_channel::AuthorizationSender;
@@ -211,6 +211,18 @@ pub fn api_routes(
         .route(
             "/admin/support-admins/:pubkey",
             delete(admin::remove_support_admin),
+        )
+        .route(
+            "/admin/registered-clients",
+            get(admin::list_registered_clients).post(admin::create_registered_client),
+        )
+        .route(
+            "/admin/registered-clients/test",
+            post(admin::test_registered_client_pattern),
+        )
+        .route(
+            "/admin/registered-clients/:id",
+            patch(admin::update_registered_client).delete(admin::delete_registered_client),
         )
         .layer(auth_cors.clone())
         .with_state(auth_state.clone());
