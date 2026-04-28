@@ -169,6 +169,26 @@ async fn create_rejects_empty_client_id() {
 }
 
 #[tokio::test]
+async fn create_rejects_empty_name() {
+    let repo = fresh_repo("test-empty-name").await;
+
+    let err = repo
+        .create(
+            TENANT_A,
+            "test-empty-name",
+            "   ", // whitespace-only name
+            &["https://example.com/cb".to_string()],
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RepositoryError::Integrity(_)),
+        "expected Integrity (validation) error for empty-after-trim name, got {:?}",
+        err
+    );
+}
+
+#[tokio::test]
 async fn update_renames_and_replaces_uris() {
     let repo = fresh_repo("test-update").await;
 

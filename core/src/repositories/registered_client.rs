@@ -140,6 +140,7 @@ impl RegisteredClientRepository {
         allowed_redirect_uris: &[String],
     ) -> Result<RegisteredClient, RepositoryError> {
         validate_client_id(client_id)?;
+        validate_name(name)?;
         validate_redirect_uri_list(allowed_redirect_uris)?;
 
         // Trim each redirect URI before persisting to ensure consistent matching.
@@ -177,11 +178,7 @@ impl RegisteredClientRepository {
             validate_redirect_uri_list(uris)?;
         }
         if let Some(n) = name {
-            if n.trim().is_empty() {
-                return Err(RepositoryError::Integrity(
-                    "name must not be empty".to_string(),
-                ));
-            }
+            validate_name(n)?;
         }
 
         // Trim each redirect URI before persisting to ensure consistent matching.
@@ -241,6 +238,15 @@ fn validate_client_id(client_id: &str) -> Result<(), RepositoryError> {
     if client_id.trim().is_empty() {
         return Err(RepositoryError::Integrity(
             "client_id must not be empty".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_name(name: &str) -> Result<(), RepositoryError> {
+    if name.trim().is_empty() {
+        return Err(RepositoryError::Integrity(
+            "name must not be empty".to_string(),
         ));
     }
     Ok(())
