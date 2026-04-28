@@ -97,6 +97,18 @@ export class KeycastApi {
         });
     }
 
+    async patch<T>(
+        endpoint: string,
+        data?: unknown,
+        options: { headers?: HeadersInit } = {},
+    ): Promise<T> {
+        return this.request<T>(endpoint, {
+            method: "PATCH",
+            body: data ? JSON.stringify(data) : undefined,
+            headers: options.headers,
+        });
+    }
+
     async delete<T>(
         endpoint: string,
         options: { headers?: HeadersInit } = {},
