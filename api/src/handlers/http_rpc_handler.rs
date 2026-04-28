@@ -214,12 +214,31 @@ impl HttpRpcHandler {
     /// Returns an error if:
     /// - Authorization has expired or been revoked
     /// - Permission policy denies this event kind
+    ///
+    /// Note: if `unsigned.pubkey` disagrees with the signer's pubkey, this
+    /// emits a structured warning before delegating to `SigningSession`, which
+    /// canonicalizes the field. The warning gives us telemetry to confirm the
+    /// previous "Invalid signature" outage is no longer firing — see
+    /// `signing_session.rs::sign_event` for the canonicalization itself.
     pub async fn sign_event(&self, unsigned: UnsignedEvent) -> Result<Event, HandlerError> {
         if !self.is_valid() {
             return Err(HandlerError::AuthorizationInvalid);
         }
 
         self.validate_sign_permission(&unsigned)?;
+
+        let signer_pubkey = self.signing.public_key();
+        if unsigned.pubkey != signer_pubkey {
+            tracing::warn!(
+                event = "http_rpc.sign_event.pubkey_mismatch",
+                authorization_id = self.authorization_id,
+                is_oauth = self.is_oauth,
+                supplied_pubkey = %unsigned.pubkey,
+                signer_pubkey = %signer_pubkey,
+                kind = unsigned.kind.as_u16(),
+                "sign_event: client unsigned.pubkey differs from signer pubkey; SigningSession will canonicalize"
+            );
+        }
 
         self.signing
             .sign_event(unsigned)

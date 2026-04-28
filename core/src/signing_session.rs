@@ -57,8 +57,32 @@ impl SigningSession {
     }
 
     /// Sign an unsigned event (CPU-bound crypto runs on spawn_blocking)
-    pub async fn sign_event(&self, unsigned: UnsignedEvent) -> Result<Event, SessionError> {
+    ///
+    /// **Canonicalizes the event's `pubkey` field to `self.keys.public_key()` before
+    /// signing.** This matches NIP-46 bunker semantics where the signer is the source
+    /// of truth for the author's pubkey; the client-supplied `pubkey` field is
+    /// advisory. Without this, nostr-sdk's `sign_with_keys` would happily produce an
+    /// `Event` whose `pubkey` field disagrees with the keypair that produced its
+    /// `sig`, breaking downstream Schnorr verification (e.g. divine-blossom viewer
+    /// auth). Any client-supplied `id` is cleared in the same step so the event id
+    /// is recomputed over the canonical pubkey.
+    pub async fn sign_event(&self, mut unsigned: UnsignedEvent) -> Result<Event, SessionError> {
         let keys = self.keys.clone();
+        let signer_pubkey = keys.public_key();
+
+        if unsigned.pubkey != signer_pubkey {
+            tracing::warn!(
+                event = "signing_session.pubkey_canonicalized",
+                supplied_pubkey = %unsigned.pubkey,
+                signer_pubkey = %signer_pubkey,
+                kind = unsigned.kind.as_u16(),
+                "sign_event: client-supplied unsigned.pubkey != signer pubkey; canonicalizing to signer pubkey"
+            );
+            unsigned.pubkey = signer_pubkey;
+            // The supplied id (if any) was computed over the old pubkey; force
+            // recomputation so signing produces a self-consistent event.
+            unsigned.id = None;
+        }
 
         tokio::task::spawn_blocking(move || {
             // Run the async sign on the blocking thread pool
@@ -130,5 +154,109 @@ mod tests {
         let hex = "not_valid_hex_string_at_all_definitely_not_valid_hex_string!!";
         let result = parse_cache_key(hex);
         assert!(matches!(result, Err(SessionError::HexDecode(_))));
+    }
+
+    // -- sign_event pubkey canonicalization --------------------------------
+    //
+    // Regression for divine-blossom 401 "Invalid signature" on viewer auth.
+    // nostr-sdk 0.44 `UnsignedEvent::sign` preserves whatever `pubkey` field the
+    // caller passed in and does NOT verify the produced sig against it; if the
+    // client-supplied pubkey disagrees with the signing keys (e.g. stale client
+    // cache after re-OAuth), the resulting event has `event.pubkey` not matching
+    // `event.sig` and Schnorr verify fails downstream. SigningSession::sign_event
+    // canonicalizes the pubkey field to `self.keys.public_key()` to keep the
+    // bunker as the source of truth (NIP-46 semantics).
+
+    use nostr_sdk::{EventBuilder, JsonUtil, Kind, Tag, Timestamp, UnsignedEvent};
+
+    #[tokio::test]
+    async fn sign_event_passthrough_when_pubkey_matches() {
+        let keys = Keys::generate();
+        let session = SigningSession::new(keys.clone());
+
+        let unsigned = EventBuilder::text_note("hello").build(keys.public_key());
+
+        let signed = session
+            .sign_event(unsigned)
+            .await
+            .expect("sign should succeed");
+
+        assert_eq!(signed.pubkey, keys.public_key());
+        signed
+            .verify()
+            .expect("signature must verify against signer's pubkey");
+    }
+
+    #[tokio::test]
+    async fn sign_event_canonicalizes_mismatched_pubkey() {
+        let signer_keys = Keys::generate();
+        let stale_keys = Keys::generate();
+        assert_ne!(signer_keys.public_key(), stale_keys.public_key());
+
+        let session = SigningSession::new(signer_keys.clone());
+
+        // Simulate the production failure: client cached an old pubkey
+        // (`stale_keys.public_key()`) and built the unsigned event around it,
+        // but the signer's actual keypair is `signer_keys`.
+        let unsigned = UnsignedEvent::new(
+            stale_keys.public_key(),
+            Timestamp::now(),
+            Kind::TextNote,
+            Vec::<Tag>::new(),
+            "hello",
+        );
+
+        let signed = session
+            .sign_event(unsigned)
+            .await
+            .expect("sign should succeed after canonicalization");
+
+        assert_eq!(
+            signed.pubkey,
+            signer_keys.public_key(),
+            "event.pubkey must match the keypair that produced the signature"
+        );
+        signed
+            .verify()
+            .expect("Schnorr verify must succeed after canonicalization");
+    }
+
+    #[tokio::test]
+    async fn sign_event_recovers_when_client_supplied_stale_id_too() {
+        // Defense for the "client computed event id over its old pubkey AND
+        // forwarded the id" path. Without clearing `unsigned.id`, nostr-sdk's
+        // internal_add_signature would fail with InvalidId because the id was
+        // computed over the wrong pubkey.
+        let signer_keys = Keys::generate();
+        let stale_keys = Keys::generate();
+        let session = SigningSession::new(signer_keys.clone());
+
+        let mut unsigned = UnsignedEvent::new(
+            stale_keys.public_key(),
+            Timestamp::now(),
+            Kind::TextNote,
+            Vec::<Tag>::new(),
+            "hello",
+        );
+        // Force the id to be precomputed over the stale pubkey.
+        let stale_id = unsigned.id();
+        assert!(unsigned.id.is_some());
+
+        let signed = session
+            .sign_event(unsigned)
+            .await
+            .expect("sign should succeed even with a stale precomputed id");
+
+        assert_eq!(signed.pubkey, signer_keys.public_key());
+        assert_ne!(
+            signed.id, stale_id,
+            "event id must be recomputed over the canonical pubkey"
+        );
+        signed
+            .verify()
+            .expect("Schnorr verify must succeed after id recomputation");
+        // Sanity: the produced JSON parses back to itself.
+        let json = signed.as_json();
+        assert!(json.contains(&signer_keys.public_key().to_hex()));
     }
 }
