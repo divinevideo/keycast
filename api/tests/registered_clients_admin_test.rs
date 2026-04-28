@@ -292,15 +292,71 @@ fn test_pattern_matches_exact_uri() {
 }
 
 #[test]
-fn test_pattern_matches_wildcard_subdomain() {
-    use keycast_core::repositories::test_redirect_pattern;
-    assert!(test_redirect_pattern(
-        "https://*.example.com/cb",
-        "https://staging.example.com/cb"
-    ));
-    // Wildcard segment cannot contain '/'
-    assert!(!test_redirect_pattern(
-        "https://*.example.com/cb",
-        "https://evil.com/.example.com/cb"
-    ));
+    fn test_pattern_matches_wildcard_subdomain() {
+        use keycast_core::repositories::test_redirect_pattern;
+        assert!(test_redirect_pattern(
+            "https://*.example.com/cb",
+            "https://staging.example.com/cb"
+        ));
+        // Wildcard segment cannot contain '/'
+        assert!(!test_redirect_pattern(
+            "https://*.example.com/cb",
+            "https://evil.com/.example.com/cb"
+        ));
+    }
+
+#[tokio::test]
+async fn create_trims_redirect_uri_whitespace() {
+    let repo = fresh_repo("test-whitespace-").await;
+
+    // Create with whitespace around URI - should be trimmed automatically
+    let created = repo
+        .create(
+            TENANT_A,
+            "test-whitespace-client",
+            "Test",
+            &[" https://app.example.com/cb ".to_string()],
+        )
+        .await
+        .unwrap();
+
+    // The stored URI should be trimmed (not have surrounding whitespace)
+    assert_eq!(created.allowed_redirect_uris.len(), 1);
+    assert_eq!(
+        created.allowed_redirect_uris[0], "https://app.example.com/cb",
+        "redirect URIs should be trimmed before persisting"
+    );
+}
+
+#[tokio::test]
+async fn update_trims_redirect_uri_whitespace() {
+    let repo = fresh_repo("test-update-trim-").await;
+
+    // Create with proper URIs
+    let created = repo
+        .create(
+            TENANT_A,
+            "test-update-trim-client",
+            "Test",
+            &["https://app.example.com/cb".to_string()],
+        )
+        .await
+        .unwrap();
+
+    // Update with whitespace URI - should be trimmed automatically
+    let updated = repo
+        .update(
+            created.id,
+            TENANT_A,
+            None,
+            Some(&[" https://new.example.com/cb ".to_string()]),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(updated.allowed_redirect_uris.len(), 1);
+    assert_eq!(
+        updated.allowed_redirect_uris[0], "https://new.example.com/cb",
+        "redirect URIs should be trimmed on update"
+    );
 }

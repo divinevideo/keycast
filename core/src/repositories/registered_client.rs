@@ -142,6 +142,12 @@ impl RegisteredClientRepository {
         validate_client_id(client_id)?;
         validate_redirect_uri_list(allowed_redirect_uris)?;
 
+        // Trim each redirect URI before persisting to ensure consistent matching.
+        let trimmed_uris: Vec<String> = allowed_redirect_uris
+            .iter()
+            .map(|s| s.trim().to_string())
+            .collect();
+
         let row = sqlx::query_as::<_, RegisteredClient>(
             "INSERT INTO registered_clients
                  (tenant_id, client_id, name, allowed_redirect_uris)
@@ -152,7 +158,7 @@ impl RegisteredClientRepository {
         .bind(tenant_id)
         .bind(client_id.trim())
         .bind(name.trim())
-        .bind(allowed_redirect_uris)
+        .bind(&trimmed_uris)
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
@@ -178,6 +184,11 @@ impl RegisteredClientRepository {
             }
         }
 
+        // Trim each redirect URI before persisting to ensure consistent matching.
+        let trimmed_uris: Option<Vec<String>> = allowed_redirect_uris.map(|uris| {
+            uris.iter().map(|s| s.trim().to_string()).collect()
+        });
+
         // COALESCE pattern lets us patch either field without separate queries.
         let row = sqlx::query_as::<_, RegisteredClient>(
             "UPDATE registered_clients
@@ -191,7 +202,7 @@ impl RegisteredClientRepository {
         .bind(id)
         .bind(tenant_id)
         .bind(name.map(str::trim))
-        .bind(allowed_redirect_uris)
+        .bind(trimmed_uris.as_deref())
         .fetch_optional(&self.pool)
         .await?;
 
@@ -281,6 +292,12 @@ fn matches_redirect_pattern(pattern: &str, uri: &str) -> bool {
         return false;
     }
 
+    // Bounds check: if prefix + suffix exceeds uri.len(), slicing would panic.
+    // This happens with patterns like "aaa*aaa" and uri="aaaa".
+    if prefix.len() + suffix.len() > uri.len() {
+        return false;
+    }
+
     // The wildcard segment must not contain '/' (prevents path traversal)
     let matched_segment = &uri[prefix.len()..uri.len() - suffix.len()];
     !matched_segment.contains('/')
@@ -357,5 +374,21 @@ mod tests {
             "https://*.example.com/callback",
             "https://sub/domain.example.com/callback"
         ));
+    }
+
+    #[test]
+    fn test_overlapping_prefix_suffix_no_panic() {
+        // Pattern "aaa*aaa" with uri "aaaa" should NOT panic.
+        // prefix="aaa", suffix="aaa", but uri.len()=4, so slice [3..1] would panic.
+        assert!(!matches_redirect_pattern("aaa*aaa", "aaaa"));
+        assert!(!matches_redirect_pattern("abc*bc", "abcc"));
+    }
+
+    #[test]
+    fn test_overlapping_equal_length() {
+        // prefix.len() + suffix.len() == uri.len() is valid (empty middle)
+        assert!(matches_redirect_pattern("abc*xyz", "abcxyz"));
+        // prefix.len() + suffix.len() > uri.len() is invalid
+        assert!(!matches_redirect_pattern("abc*xyz", "abcz"));
     }
 }
