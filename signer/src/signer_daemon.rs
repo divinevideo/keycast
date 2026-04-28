@@ -9,6 +9,7 @@ use keycast_core::authorization_channel::{AuthorizationCommand, AuthorizationRec
 use keycast_core::encryption::KeyManager;
 use keycast_core::metrics::METRICS;
 use keycast_core::signing_handler::SigningHandler;
+use keycast_core::signing_session::canonicalize_event_author;
 use keycast_core::types::authorization::Authorization;
 use keycast_core::types::oauth_authorization::OAuthAuthorization;
 use moka::future::Cache;
@@ -1677,18 +1678,7 @@ impl SigningHandler for Nip46Handler {
         // Canonicalize the pubkey to match the signer keys, matching SigningSession::sign_event behavior.
         // This prevents producing an event where event.pubkey disagrees with the keypair that signed it.
         let signer_pubkey = self.user_keys.public_key();
-        if unsigned_event.pubkey != signer_pubkey {
-            tracing::warn!(
-                event = "signer_daemon.pubkey_canonicalized",
-                authorization_id = self.authorization_id,
-                supplied_pubkey = %unsigned_event.pubkey,
-                signer_pubkey = %signer_pubkey,
-                kind,
-                "sign_event_direct: client-supplied unsigned.pubkey != signer pubkey; canonicalizing to signer pubkey"
-            );
-            unsigned_event.pubkey = signer_pubkey;
-            unsigned_event.id = None; // Force recomputation with canonical pubkey
-        }
+        canonicalize_event_author(&mut unsigned_event, signer_pubkey, "signer_daemon.pubkey_canonicalized");
 
         // Sign the event with user keys (consumes unsigned_event)
         let signed_event = unsigned_event

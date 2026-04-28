@@ -10,6 +10,26 @@ use tokio::task::JoinError;
 
 use crate::secret_types::DecryptedPlaintext;
 
+/// Canonicalize an UnsignedEvent's author pubkey to match the signer keys.
+/// If the supplied pubkey differs from the signer pubkey, this updates the
+/// event's pubkey and clears its id so it's recomputed over the canonical pubkey.
+/// This prevents producing events where event.pubkey disagrees with the keypair
+/// that signed it, breaking downstream Schnorr verification.
+/// The `event_name` is used in the log event field for telemetry distinction.
+pub fn canonicalize_event_author(unsigned: &mut UnsignedEvent, signer_pubkey: PublicKey, event_name: &str) {
+    if unsigned.pubkey != signer_pubkey {
+        tracing::warn!(
+            event = event_name,
+            supplied_pubkey = %unsigned.pubkey,
+            signer_pubkey = %signer_pubkey,
+            kind = unsigned.kind.as_u16(),
+            "canonicalize_event_author: client-supplied pubkey != signer pubkey; canonicalizing"
+        );
+        unsigned.pubkey = signer_pubkey;
+        unsigned.id = None; // Force recomputation with canonical pubkey
+    }
+}
+
 /// 32-byte key for efficient cache lookups (stack-only, no heap allocation)
 pub type CacheKey = [u8; 32];
 
@@ -70,19 +90,7 @@ impl SigningSession {
         let keys = self.keys.clone();
         let signer_pubkey = keys.public_key();
 
-        if unsigned.pubkey != signer_pubkey {
-            tracing::warn!(
-                event = "signing_session.pubkey_canonicalized",
-                supplied_pubkey = %unsigned.pubkey,
-                signer_pubkey = %signer_pubkey,
-                kind = unsigned.kind.as_u16(),
-                "sign_event: client-supplied unsigned.pubkey != signer pubkey; canonicalizing to signer pubkey"
-            );
-            unsigned.pubkey = signer_pubkey;
-            // The supplied id (if any) was computed over the old pubkey; force
-            // recomputation so signing produces a self-consistent event.
-            unsigned.id = None;
-        }
+        canonicalize_event_author(&mut unsigned, signer_pubkey, "signing_session.pubkey_canonicalized");
 
         tokio::task::spawn_blocking(move || {
             // Run the async sign on the blocking thread pool
