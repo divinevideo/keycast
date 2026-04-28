@@ -2001,6 +2001,47 @@ mod tests {
         assert!(tags_vec.contains(&tag2));
     }
 
+    // Regression: ensures the NIP-46 relay path (sign_event_direct) keeps
+    // calling canonicalize_event_author. If a future edit removes the call,
+    // this test fails because the produced signature would not verify against
+    // the (canonicalized) event.pubkey, mirroring the divine-blossom
+    // "Invalid signature" failure mode.
+    #[tokio::test]
+    async fn test_sign_event_direct_canonicalizes_mismatched_pubkey() {
+        let pool = create_test_db().await;
+        let handler = create_test_handler_with_db(pool).await;
+
+        let stale_keys = Keys::generate();
+        assert_ne!(
+            stale_keys.public_key(),
+            handler.user_keys.public_key(),
+            "test setup should pick distinct keys",
+        );
+
+        // Client supplied a stale pubkey (different from the signer's keys).
+        let unsigned_event = UnsignedEvent::new(
+            stale_keys.public_key(),
+            Timestamp::now(),
+            Kind::from(1),
+            vec![],
+            "stale-pubkey content",
+        );
+
+        let signed_event = handler
+            .sign_event_direct(unsigned_event)
+            .await
+            .expect("sign should succeed after canonicalization");
+
+        assert_eq!(
+            signed_event.pubkey,
+            handler.user_keys.public_key(),
+            "event.pubkey must be canonicalized to the signer keypair",
+        );
+        signed_event
+            .verify()
+            .expect("signature must verify after canonicalization");
+    }
+
     #[tokio::test]
     async fn test_get_handler_for_user_returns_none_when_not_cached() {
         // Arrange
