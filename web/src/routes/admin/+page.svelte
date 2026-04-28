@@ -235,6 +235,10 @@
 		<div class="header">
 			<div class="header-row">
 				<h1>Admin Dashboard</h1>
+				<a href="/admin/registered-clients" class="header-link">
+					<ArrowSquareOut size={16} />
+					Registered OAuth Clients
+				</a>
 				<a href="/support-admin" class="header-link">
 					<ArrowSquareOut size={16} />
 					Support Tools
@@ -358,6 +362,22 @@
 					{/each}
 				</div>
 			{/if}
+		</div>
+
+		<!-- Registered OAuth Clients Section -->
+		<div class="section">
+			<div class="section-header">
+				<div class="section-icon"><Link size={24} weight="duotone" /></div>
+				<div>
+					<h2>Registered OAuth Clients</h2>
+					<p>Manage which third-party OAuth clients are recognized for this tenant and which redirect URIs they may use.</p>
+				</div>
+			</div>
+
+			<a href="/admin/registered-clients" class="btn-primary" style="text-decoration: none; display: inline-flex; align-items: center; gap: 0.5rem;">
+				<ArrowSquareOut size={16} />
+				Open Registered Clients
+			</a>
 		</div>
 
 		<!-- Documentation Section -->
