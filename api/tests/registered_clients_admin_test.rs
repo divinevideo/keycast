@@ -189,6 +189,26 @@ async fn create_rejects_empty_name() {
 }
 
 #[tokio::test]
+async fn create_rejects_multiple_asterisks_in_pattern() {
+    let repo = fresh_repo("test-multi-star").await;
+
+    let err = repo
+        .create(
+            TENANT_A,
+            "test-multi-star",
+            "Test",
+            &["https://*.foo.com/*/cb".to_string()],
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RepositoryError::Integrity(_)),
+        "expected Integrity for multiple asterisks, got {:?}",
+        err
+    );
+}
+
+#[tokio::test]
 async fn update_renames_and_replaces_uris() {
     let repo = fresh_repo("test-update").await;
 

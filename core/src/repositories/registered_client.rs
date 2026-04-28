@@ -264,6 +264,16 @@ fn validate_redirect_uri_list(uris: &[String]) -> Result<(), RepositoryError> {
                 "allowed_redirect_uris entries must not be empty".to_string(),
             ));
         }
+        // Must have 0 or 1 asterisk (wildcard), not multiple.
+        let asterisk_count = uri.matches('*').count();
+        if asterisk_count > 1 {
+            return Err(RepositoryError::Integrity(
+                format!(
+                    "pattern '{}' has {} wildcards; expected 0 (exact) or 1 (wildcard)",
+                    uri, asterisk_count
+                ),
+            ));
+        }
     }
     Ok(())
 }
