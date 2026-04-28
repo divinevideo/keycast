@@ -1,9 +1,27 @@
 // ABOUTME: Repository for registered OAuth client operations
-// ABOUTME: Validates redirect URIs against registered client patterns
+// ABOUTME: Validates redirect URIs against registered client patterns and provides admin CRUD
 
-use sqlx::PgPool;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::{FromRow, PgPool};
 
 use crate::repositories::RepositoryError;
+
+/// A registered OAuth client row.
+///
+/// Note: the database column `tenant_id` is `INTEGER NOT NULL` (i32) but is
+/// surfaced as `i64` here for consistency with the rest of the codebase. PostgreSQL
+/// performs the implicit widening on read.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct RegisteredClient {
+    pub id: i32,
+    pub tenant_id: i64,
+    pub client_id: String,
+    pub name: String,
+    pub allowed_redirect_uris: Vec<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
 
 /// Repository for registered OAuth client operations.
 /// When a client_id is registered, only its allowed redirect URIs are accepted.
@@ -69,6 +87,168 @@ impl RegisteredClientRepository {
             }
         }
     }
+
+    // ---- Admin CRUD ----------------------------------------------------------
+
+    /// List all registered clients for a tenant, ordered by client_id.
+    pub async fn list(&self, tenant_id: i64) -> Result<Vec<RegisteredClient>, RepositoryError> {
+        let rows = sqlx::query_as::<_, RegisteredClient>(
+            "SELECT id, tenant_id::BIGINT AS tenant_id, client_id, name,
+                    allowed_redirect_uris, created_at, updated_at
+             FROM registered_clients
+             WHERE tenant_id = $1
+             ORDER BY client_id",
+        )
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Get a single registered client by id, scoped to a tenant.
+    pub async fn get(
+        &self,
+        id: i32,
+        tenant_id: i64,
+    ) -> Result<RegisteredClient, RepositoryError> {
+        let row = sqlx::query_as::<_, RegisteredClient>(
+            "SELECT id, tenant_id::BIGINT AS tenant_id, client_id, name,
+                    allowed_redirect_uris, created_at, updated_at
+             FROM registered_clients
+             WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.ok_or_else(|| {
+            RepositoryError::NotFound(format!(
+                "registered_client id={} for tenant {}",
+                id, tenant_id
+            ))
+        })
+    }
+
+    /// Create a new registered client.
+    /// Validates: non-empty trimmed client_id, at least one redirect URI.
+    /// Returns Duplicate on (tenant_id, client_id) collision.
+    pub async fn create(
+        &self,
+        tenant_id: i64,
+        client_id: &str,
+        name: &str,
+        allowed_redirect_uris: &[String],
+    ) -> Result<RegisteredClient, RepositoryError> {
+        validate_client_id(client_id)?;
+        validate_redirect_uri_list(allowed_redirect_uris)?;
+
+        let row = sqlx::query_as::<_, RegisteredClient>(
+            "INSERT INTO registered_clients
+                 (tenant_id, client_id, name, allowed_redirect_uris)
+             VALUES ($1, $2, $3, $4)
+             RETURNING id, tenant_id::BIGINT AS tenant_id, client_id, name,
+                       allowed_redirect_uris, created_at, updated_at",
+        )
+        .bind(tenant_id)
+        .bind(client_id.trim())
+        .bind(name.trim())
+        .bind(allowed_redirect_uris)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Update name and/or allowed_redirect_uris for a registered client.
+    /// Tenant-scoped: returns NotFound when (id, tenant_id) does not match.
+    pub async fn update(
+        &self,
+        id: i32,
+        tenant_id: i64,
+        name: Option<&str>,
+        allowed_redirect_uris: Option<&[String]>,
+    ) -> Result<RegisteredClient, RepositoryError> {
+        if let Some(uris) = allowed_redirect_uris {
+            validate_redirect_uri_list(uris)?;
+        }
+        if let Some(n) = name {
+            if n.trim().is_empty() {
+                return Err(RepositoryError::Integrity(
+                    "name must not be empty".to_string(),
+                ));
+            }
+        }
+
+        // COALESCE pattern lets us patch either field without separate queries.
+        let row = sqlx::query_as::<_, RegisteredClient>(
+            "UPDATE registered_clients
+             SET name = COALESCE($3, name),
+                 allowed_redirect_uris = COALESCE($4, allowed_redirect_uris),
+                 updated_at = NOW()
+             WHERE id = $1 AND tenant_id = $2
+             RETURNING id, tenant_id::BIGINT AS tenant_id, client_id, name,
+                       allowed_redirect_uris, created_at, updated_at",
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .bind(name.map(str::trim))
+        .bind(allowed_redirect_uris)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.ok_or_else(|| {
+            RepositoryError::NotFound(format!(
+                "registered_client id={} for tenant {}",
+                id, tenant_id
+            ))
+        })
+    }
+
+    /// Delete a registered client. Tenant-scoped.
+    /// Returns NotFound if no row matches (id, tenant_id).
+    pub async fn delete(&self, id: i32, tenant_id: i64) -> Result<(), RepositoryError> {
+        let result = sqlx::query(
+            "DELETE FROM registered_clients WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound(format!(
+                "registered_client id={} for tenant {}",
+                id, tenant_id
+            )));
+        }
+        Ok(())
+    }
+}
+
+// ---- Validation helpers ------------------------------------------------------
+
+fn validate_client_id(client_id: &str) -> Result<(), RepositoryError> {
+    if client_id.trim().is_empty() {
+        return Err(RepositoryError::Integrity(
+            "client_id must not be empty".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_redirect_uri_list(uris: &[String]) -> Result<(), RepositoryError> {
+    if uris.is_empty() {
+        return Err(RepositoryError::Integrity(
+            "allowed_redirect_uris must contain at least one entry".to_string(),
+        ));
+    }
+    for uri in uris {
+        if uri.trim().is_empty() {
+            return Err(RepositoryError::Integrity(
+                "allowed_redirect_uris entries must not be empty".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Match a redirect URI against an allowed pattern.
@@ -104,6 +284,13 @@ fn matches_redirect_pattern(pattern: &str, uri: &str) -> bool {
     // The wildcard segment must not contain '/' (prevents path traversal)
     let matched_segment = &uri[prefix.len()..uri.len() - suffix.len()];
     !matched_segment.contains('/')
+}
+
+/// Public entry point that mirrors `matches_redirect_pattern`.
+/// Used by the admin "test this URI" endpoint so the inline tester reports
+/// exactly the same result the OAuth validator will produce.
+pub fn test_redirect_pattern(pattern: &str, uri: &str) -> bool {
+    matches_redirect_pattern(pattern, uri)
 }
 
 #[cfg(test)]

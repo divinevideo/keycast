@@ -31,7 +31,9 @@ pub use oauth_code::{
 pub use personal_keys::PersonalKeysRepository;
 pub use policy::PolicyRepository;
 pub use refresh_token::RefreshTokenRepository;
-pub use registered_client::RegisteredClientRepository;
+pub use registered_client::{
+    test_redirect_pattern, RegisteredClient, RegisteredClientRepository,
+};
 pub use stored_key::StoredKeyRepository;
 pub use team::TeamRepository;
 pub use user::{AdminUserDetails, DeleteAccountResult, UserRepository, VerificationTokenData};
