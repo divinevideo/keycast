@@ -10,6 +10,7 @@ pub mod html_safety;
 pub mod metrics;
 pub mod nostr_rpc;
 pub mod oauth;
+pub mod openid_configuration;
 pub mod policies;
 pub mod routes;
 pub mod teams;
