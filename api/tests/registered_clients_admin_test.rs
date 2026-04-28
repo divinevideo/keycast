@@ -11,22 +11,27 @@ const TENANT_A: i64 = 1;
 // so any integer is acceptable here.
 const TENANT_B: i64 = 999;
 
-/// Build a repository whose test setup clears a specific client_id.
-/// This prevents cross-test interference in parallel test execution against
-/// a shared database: each test cleans up exactly what it will create.
-async fn fresh_repo(client_id: &str) -> RegisteredClientRepository {
+/// Build a repository whose test setup clears the listed client_ids.
+/// This prevents cross-test interference in parallel/repeated test execution
+/// against a shared database: each test cleans up exactly what it will create.
+/// Callers pass every client_id they will insert so that re-running the suite
+/// (which leaves rows behind) does not collide on the unique (tenant_id,
+/// client_id) constraint.
+async fn fresh_repo(client_ids: &[&str]) -> RegisteredClientRepository {
     let pool = common::setup_test_db().await;
-    sqlx::query("DELETE FROM registered_clients WHERE client_id = $1")
-        .bind(client_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    for cid in client_ids {
+        sqlx::query("DELETE FROM registered_clients WHERE client_id = $1")
+            .bind(cid)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
     RegisteredClientRepository::new(pool)
 }
 
 #[tokio::test]
 async fn create_then_list_returns_row_for_tenant() {
-    let repo = fresh_repo("test-client-1").await;
+    let repo = fresh_repo(&["test-client-1"]).await;
 
     let created = repo
         .create(
@@ -53,7 +58,7 @@ async fn create_then_list_returns_row_for_tenant() {
 
 #[tokio::test]
 async fn list_is_scoped_per_tenant() {
-    let repo = fresh_repo("tenant-scope-x").await;
+    let repo = fresh_repo(&["tenant-a-client-x", "tenant-b-client-x"]).await;
 
     repo.create(
         TENANT_A,
@@ -84,7 +89,7 @@ async fn list_is_scoped_per_tenant() {
 
 #[tokio::test]
 async fn create_duplicate_client_id_for_same_tenant_errors() {
-    let repo = fresh_repo("test-dup").await;
+    let repo = fresh_repo(&["test-dup"]).await;
 
     repo.create(
         TENANT_A,
@@ -113,7 +118,7 @@ async fn create_duplicate_client_id_for_same_tenant_errors() {
 
 #[tokio::test]
 async fn create_same_client_id_different_tenants_succeeds() {
-    let repo = fresh_repo("test-shared-id").await;
+    let repo = fresh_repo(&["test-shared-id"]).await;
 
     repo.create(
         TENANT_A,
@@ -135,7 +140,7 @@ async fn create_same_client_id_different_tenants_succeeds() {
 
 #[tokio::test]
 async fn create_rejects_empty_redirect_uris() {
-    let repo = fresh_repo("test-empty-uris").await;
+    let repo = fresh_repo(&["test-empty-uris"]).await;
 
     let err = repo
         .create(TENANT_A, "test-empty-uris", "X", &Vec::<String>::new())
@@ -150,7 +155,7 @@ async fn create_rejects_empty_redirect_uris() {
 
 #[tokio::test]
 async fn create_rejects_empty_client_id() {
-    let repo = fresh_repo("test-empty-id").await;
+    let repo = fresh_repo(&["test-empty-id"]).await;
 
     let err = repo
         .create(
@@ -170,7 +175,7 @@ async fn create_rejects_empty_client_id() {
 
 #[tokio::test]
 async fn create_rejects_empty_name() {
-    let repo = fresh_repo("test-empty-name").await;
+    let repo = fresh_repo(&["test-empty-name"]).await;
 
     let err = repo
         .create(
@@ -190,7 +195,7 @@ async fn create_rejects_empty_name() {
 
 #[tokio::test]
 async fn create_rejects_multiple_asterisks_in_pattern() {
-    let repo = fresh_repo("test-multi-star").await;
+    let repo = fresh_repo(&["test-multi-star"]).await;
 
     let err = repo
         .create(
@@ -210,7 +215,7 @@ async fn create_rejects_multiple_asterisks_in_pattern() {
 
 #[tokio::test]
 async fn update_renames_and_replaces_uris() {
-    let repo = fresh_repo("test-update").await;
+    let repo = fresh_repo(&["test-update"]).await;
 
     let created = repo
         .create(
@@ -240,7 +245,7 @@ async fn update_renames_and_replaces_uris() {
 
 #[tokio::test]
 async fn update_cannot_cross_tenants() {
-    let repo = fresh_repo("test-cross-tenant").await;
+    let repo = fresh_repo(&["test-cross-tenant"]).await;
 
     let created = repo
         .create(
@@ -266,7 +271,7 @@ async fn update_cannot_cross_tenants() {
 
 #[tokio::test]
 async fn update_rejects_empty_redirect_uris() {
-    let repo = fresh_repo("test-update-empty").await;
+    let repo = fresh_repo(&["test-update-empty"]).await;
 
     let created = repo
         .create(
@@ -291,7 +296,7 @@ async fn update_rejects_empty_redirect_uris() {
 
 #[tokio::test]
 async fn delete_removes_row_and_is_tenant_scoped() {
-    let repo = fresh_repo("test-delete").await;
+    let repo = fresh_repo(&["test-delete"]).await;
 
     let created = repo
         .create(
@@ -347,7 +352,7 @@ fn test_pattern_matches_exact_uri() {
 
 #[tokio::test]
 async fn create_trims_redirect_uri_whitespace() {
-    let repo = fresh_repo("test-whitespace-client").await;
+    let repo = fresh_repo(&["test-whitespace-client"]).await;
 
     // Create with whitespace around URI - should be trimmed automatically
     let created = repo
@@ -370,7 +375,7 @@ async fn create_trims_redirect_uri_whitespace() {
 
 #[tokio::test]
 async fn update_trims_redirect_uri_whitespace() {
-    let repo = fresh_repo("test-update-trim-client").await;
+    let repo = fresh_repo(&["test-update-trim-client"]).await;
 
     // Create with proper URIs
     let created = repo
