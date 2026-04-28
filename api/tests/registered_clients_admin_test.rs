@@ -11,13 +11,13 @@ const TENANT_A: i64 = 1;
 // so any integer is acceptable here.
 const TENANT_B: i64 = 999;
 
-/// Build a repository whose helper methods only see rows for `prefix`.
-/// Each test passes a unique prefix to avoid cross-test interference when
-/// the test runner executes tests in parallel against a shared database.
-async fn fresh_repo(prefix: &str) -> RegisteredClientRepository {
+/// Build a repository whose test setup clears a specific client_id.
+/// This prevents cross-test interference in parallel test execution against
+/// a shared database: each test cleans up exactly what it will create.
+async fn fresh_repo(client_id: &str) -> RegisteredClientRepository {
     let pool = common::setup_test_db().await;
-    sqlx::query("DELETE FROM registered_clients WHERE client_id LIKE $1")
-        .bind(format!("{}%", prefix))
+    sqlx::query("DELETE FROM registered_clients WHERE client_id = $1")
+        .bind(client_id)
         .execute(&pool)
         .await
         .unwrap();
@@ -53,11 +53,11 @@ async fn create_then_list_returns_row_for_tenant() {
 
 #[tokio::test]
 async fn list_is_scoped_per_tenant() {
-    let repo = fresh_repo("test-tenant-").await;
+    let repo = fresh_repo("tenant-scope-x").await;
 
     repo.create(
         TENANT_A,
-        "test-tenant-a-client",
+        "tenant-a-client-x",
         "A",
         &["https://a.example.com/cb".to_string()],
     )
@@ -65,7 +65,7 @@ async fn list_is_scoped_per_tenant() {
     .unwrap();
     repo.create(
         TENANT_B,
-        "test-tenant-b-client",
+        "tenant-b-client-x",
         "B",
         &["https://b.example.com/cb".to_string()],
     )
@@ -75,11 +75,11 @@ async fn list_is_scoped_per_tenant() {
     let a_list = repo.list(TENANT_A).await.unwrap();
     let b_list = repo.list(TENANT_B).await.unwrap();
 
-    assert!(a_list.iter().any(|c| c.client_id == "test-tenant-a-client"));
-    assert!(!a_list.iter().any(|c| c.client_id == "test-tenant-b-client"));
+    assert!(a_list.iter().any(|c| c.client_id == "tenant-a-client-x"));
+    assert!(!a_list.iter().any(|c| c.client_id == "tenant-b-client-x"));
 
-    assert!(b_list.iter().any(|c| c.client_id == "test-tenant-b-client"));
-    assert!(!b_list.iter().any(|c| c.client_id == "test-tenant-a-client"));
+    assert!(b_list.iter().any(|c| c.client_id == "tenant-b-client-x"));
+    assert!(!b_list.iter().any(|c| c.client_id == "tenant-a-client-x"));
 }
 
 #[tokio::test]
@@ -347,7 +347,7 @@ fn test_pattern_matches_exact_uri() {
 
 #[tokio::test]
 async fn create_trims_redirect_uri_whitespace() {
-    let repo = fresh_repo("test-whitespace-").await;
+    let repo = fresh_repo("test-whitespace-client").await;
 
     // Create with whitespace around URI - should be trimmed automatically
     let created = repo
@@ -370,7 +370,7 @@ async fn create_trims_redirect_uri_whitespace() {
 
 #[tokio::test]
 async fn update_trims_redirect_uri_whitespace() {
-    let repo = fresh_repo("test-update-trim-").await;
+    let repo = fresh_repo("test-update-trim-client").await;
 
     // Create with proper URIs
     let created = repo
