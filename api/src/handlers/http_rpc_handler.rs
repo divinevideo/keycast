@@ -239,7 +239,7 @@ impl HttpRpcHandler {
 
         let signer_pubkey = self.signing.public_key();
         if unsigned.pubkey != signer_pubkey {
-            tracing::warn!(
+            tracing::debug!(
                 event = "http_rpc.sign_event.pubkey_mismatch",
                 authorization_id = self.authorization_id,
                 is_oauth = self.is_oauth,

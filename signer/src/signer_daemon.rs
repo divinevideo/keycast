@@ -1661,7 +1661,7 @@ impl UnifiedSigner {
 impl SigningHandler for Nip46Handler {
     async fn sign_event_direct(
         &self,
-        unsigned_event: UnsignedEvent,
+        mut unsigned_event: UnsignedEvent,
     ) -> Result<Event, Box<dyn std::error::Error + Send + Sync>> {
         let kind = unsigned_event.kind.as_u16();
 
@@ -1673,6 +1673,22 @@ impl SigningHandler for Nip46Handler {
 
         // VALIDATE PERMISSIONS BEFORE SIGNING
         self.validate_permissions_for_sign(&unsigned_event).await?;
+
+        // Canonicalize the pubkey to match the signer keys, matching SigningSession::sign_event behavior.
+        // This prevents producing an event where event.pubkey disagrees with the keypair that signed it.
+        let signer_pubkey = self.user_keys.public_key();
+        if unsigned_event.pubkey != signer_pubkey {
+            tracing::warn!(
+                event = "signer_daemon.pubkey_canonicalized",
+                authorization_id = self.authorization_id,
+                supplied_pubkey = %unsigned_event.pubkey,
+                signer_pubkey = %signer_pubkey,
+                kind,
+                "sign_event_direct: client-supplied unsigned.pubkey != signer pubkey; canonicalizing to signer pubkey"
+            );
+            unsigned_event.pubkey = signer_pubkey;
+            unsigned_event.id = None; // Force recomputation with canonical pubkey
+        }
 
         // Sign the event with user keys (consumes unsigned_event)
         let signed_event = unsigned_event
