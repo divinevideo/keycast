@@ -115,15 +115,29 @@ steps:
               -X OPTIONS \
               "$$SERVICE_URL$$path")
             if [ "$$http_code" = "200" ]; then
-              allow_origin=$$(awk 'BEGIN{IGNORECASE=1}/^Access-Control-Allow-Origin:/ {print $$2}' "$$headers" | tr -d '\r')
+              # grep -i is POSIX (case-insensitive line match). awk's
+              # IGNORECASE is a gawk extension and the cloud-sdk image ships
+              # mawk, which silently ignores it. HTTP/2 emits header names in
+              # lowercase, so a case-sensitive awk regex would never match
+              # access-control-allow-origin and the parsed value would always
+              # be empty (every retry returns ''), making this whole loop
+              # silently useless.
+              allow_origin=$$(grep -i '^Access-Control-Allow-Origin:' "$$headers" | awk '{print $$2}' | tr -d '\r')
               if [ "$$allow_origin" = "$$expected_allow_origin" ]; then
                 rm -f "$$headers"
                 echo "$$allow_origin"
                 return 0
               fi
             fi
-            rm -f "$$headers"
             echo "  attempt $$attempt: http=$$http_code origin='$$origin' allow_origin='$$allow_origin' expected='$$expected_allow_origin', retrying in 10s..." >&2
+            if [ "$$attempt" = "6" ]; then
+              # Final retry exhausted; dump the last response's headers so
+              # a post-mortem doesn't need to re-run a deploy to see what
+              # the server actually sent.
+              echo "  final response headers from attempt 6:" >&2
+              sed 's/^/    /' "$$headers" >&2
+            fi
+            rm -f "$$headers"
             sleep 10
           done
           echo "$$allow_origin"
