@@ -12,8 +12,9 @@ use super::routes::AuthState;
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::extractors::UcanAuth;
 use keycast_core::repositories::{
-    test_redirect_pattern, AuthEventRepository, ClaimTokenRepository, OAuthAuthorizationRepository,
-    RegisteredClient, RegisteredClientRepository, RepositoryError, UserRepository,
+    test_redirect_pattern, AdminAuditEventRecord, AdminAuditEventRepository, AuthEventRepository,
+    ClaimTokenRepository, OAuthAuthorizationRepository, RegisteredClient,
+    RegisteredClientRepository, RepositoryError, UserRepository,
 };
 use keycast_core::types::claim_token::generate_claim_token;
 
@@ -1537,6 +1538,41 @@ fn map_repo_error(err: RepositoryError) -> ApiError {
     }
 }
 
+/// Best-effort audit-trail write for a registered_client mutation.
+/// A failed insert logs an error and returns; it never fails the admin action.
+async fn record_registered_client_audit(
+    pool: &sqlx::PgPool,
+    actor_pubkey: &str,
+    action: &'static str,
+    client: &RegisteredClient,
+) {
+    let metadata = serde_json::json!({
+        "name": client.name,
+        "allowed_redirect_uris": client.allowed_redirect_uris,
+    });
+    let repo = AdminAuditEventRepository::new(pool.clone());
+    if let Err(error) = repo
+        .record(AdminAuditEventRecord {
+            tenant_id: client.tenant_id,
+            actor_pubkey: actor_pubkey.to_string(),
+            action: action.to_string(),
+            target_resource_type: "registered_client".to_string(),
+            target_resource_id: Some(client.id.to_string()),
+            target_client_id: Some(client.client_id.clone()),
+            metadata_json: metadata,
+        })
+        .await
+    {
+        tracing::error!(
+            action = action,
+            client_id = %client.client_id,
+            tenant_id = client.tenant_id,
+            error = %error,
+            "Failed to write admin_audit_events row for registered_client"
+        );
+    }
+}
+
 /// GET /api/admin/registered-clients
 /// List all registered OAuth clients for the current tenant.
 pub async fn list_registered_clients(
@@ -1585,6 +1621,14 @@ pub async fn create_registered_client(
         .await
         .map_err(map_repo_error)?;
 
+    record_registered_client_audit(
+        &auth_state.state.db,
+        &auth.pubkey,
+        "registered_client.create",
+        &created,
+    )
+    .await;
+
     tracing::info!(
         "Registered client created: {} (by admin {})",
         created.client_id,
@@ -1632,6 +1676,14 @@ pub async fn update_registered_client(
         .await
         .map_err(map_repo_error)?;
 
+    record_registered_client_audit(
+        &auth_state.state.db,
+        &auth.pubkey,
+        "registered_client.update",
+        &updated,
+    )
+    .await;
+
     tracing::info!(
         "Registered client updated: id={} client_id={} (by admin {})",
         updated.id,
@@ -1653,12 +1705,20 @@ pub async fn delete_registered_client(
     }
 
     let repo = RegisteredClientRepository::new(auth_state.state.db.clone());
-    repo.delete(id, tenant.0.id).await.map_err(map_repo_error)?;
+    let deleted = repo.delete(id, tenant.0.id).await.map_err(map_repo_error)?;
+
+    record_registered_client_audit(
+        &auth_state.state.db,
+        &auth.pubkey,
+        "registered_client.delete",
+        &deleted,
+    )
+    .await;
 
     tracing::info!(
-        "Registered client deleted: id={} (by admin {})",
-        id,
-        &auth.pubkey[..8]
+        "Registered client deleted: id={} client_id={}",
+        deleted.id,
+        deleted.client_id
     );
     Ok(Json(serde_json::json!({ "deleted": true })))
 }

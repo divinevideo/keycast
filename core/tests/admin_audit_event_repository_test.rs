@@ -62,7 +62,10 @@ async fn records_and_lists_admin_audit_event() {
     assert_eq!(inserted.action, "registered_client.create");
     assert_eq!(inserted.target_resource_type, "registered_client");
     assert_eq!(inserted.target_resource_id.as_deref(), Some("123"));
-    assert_eq!(inserted.target_client_id.as_deref(), Some(target_client_id.as_str()));
+    assert_eq!(
+        inserted.target_client_id.as_deref(),
+        Some(target_client_id.as_str())
+    );
     assert_eq!(inserted.metadata_json["name"], "Audit Test");
 
     let listed = repo
