@@ -8,10 +8,6 @@ use sqlx::{FromRow, PgPool};
 use crate::repositories::RepositoryError;
 
 /// A registered OAuth client row.
-///
-/// Note: the database column `tenant_id` is `INTEGER NOT NULL` (i32) but is
-/// surfaced as `i64` here for consistency with the rest of the codebase. PostgreSQL
-/// performs the implicit widening on read.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct RegisteredClient {
     pub id: i32,
@@ -93,7 +89,7 @@ impl RegisteredClientRepository {
     /// List all registered clients for a tenant, ordered by client_id.
     pub async fn list(&self, tenant_id: i64) -> Result<Vec<RegisteredClient>, RepositoryError> {
         let rows = sqlx::query_as::<_, RegisteredClient>(
-            "SELECT id, tenant_id::BIGINT AS tenant_id, client_id, name,
+            "SELECT id, tenant_id, client_id, name,
                     allowed_redirect_uris, created_at, updated_at
              FROM registered_clients
              WHERE tenant_id = $1
@@ -108,7 +104,7 @@ impl RegisteredClientRepository {
     /// Get a single registered client by id, scoped to a tenant.
     pub async fn get(&self, id: i32, tenant_id: i64) -> Result<RegisteredClient, RepositoryError> {
         let row = sqlx::query_as::<_, RegisteredClient>(
-            "SELECT id, tenant_id::BIGINT AS tenant_id, client_id, name,
+            "SELECT id, tenant_id, client_id, name,
                     allowed_redirect_uris, created_at, updated_at
              FROM registered_clients
              WHERE id = $1 AND tenant_id = $2",
@@ -149,7 +145,7 @@ impl RegisteredClientRepository {
             "INSERT INTO registered_clients
                  (tenant_id, client_id, name, allowed_redirect_uris)
              VALUES ($1, $2, $3, $4)
-             RETURNING id, tenant_id::BIGINT AS tenant_id, client_id, name,
+             RETURNING id, tenant_id, client_id, name,
                        allowed_redirect_uris, created_at, updated_at",
         )
         .bind(tenant_id)
@@ -188,7 +184,7 @@ impl RegisteredClientRepository {
                  allowed_redirect_uris = COALESCE($4, allowed_redirect_uris),
                  updated_at = NOW()
              WHERE id = $1 AND tenant_id = $2
-             RETURNING id, tenant_id::BIGINT AS tenant_id, client_id, name,
+             RETURNING id, tenant_id, client_id, name,
                        allowed_redirect_uris, created_at, updated_at",
         )
         .bind(id)
