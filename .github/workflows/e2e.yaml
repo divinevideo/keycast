@@ -1,0 +1,150 @@
+# Runs the Playwright e2e suite (including the OAuth security regressions
+# from PR #127) on a nightly schedule plus on manual dispatch.
+#
+# Scheduled-only initially per issue #145. Promote to `pull_request` once the
+# suite is stable enough to gate merges.
+
+name: E2E Tests
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: keycast
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 16379:6379
+
+      relay:
+        image: ghcr.io/verse-pbc/relay_builder:latest
+        env:
+          IDLE_TIMEOUT: "0"
+        ports:
+          - 8080:8080
+
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/keycast
+      REDIS_URL: redis://localhost:16379
+      MASTER_KEY_PATH: ./master.key
+      SERVER_NSEC: "0000000000000000000000000000000000000000000000000000000000000001"
+      ALLOWED_ORIGINS: "http://localhost:3000,http://localhost:5173,http://localhost:5174"
+      ALLOWED_TENANT_DOMAINS: "localhost,tenant-a.localhost,tenant-b.localhost"
+      BUNKER_RELAYS: ws://localhost:8080
+      ATPROTO_OAUTH_JWT_PRIVATE_KEY_HEX: "8f2a55949068468ad5d670dfd0c0a33d5b9e7e1a2c0d2059f0f8f8779d4d078d"
+      ATPROTO_OAUTH_PDS_DID: "did:web:pds.divine.test"
+      ENABLE_TENANT_AUTO_PROVISIONING: "true"
+      API_URL: http://localhost:3000
+      KEYCAST_BINARY: ./target/debug/keycast
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e
+          cache-on-failure: true
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Build keycast (debug)
+        run: cargo build --bin keycast
+
+      - name: Generate master encryption key
+        run: |
+          chmod +x scripts/generate_key.sh
+          ./scripts/generate_key.sh
+
+      - name: Run database migrations
+        run: ./target/debug/keycast --migrate
+
+      - name: Install e2e dependencies
+        working-directory: e2e
+        run: bun install --frozen-lockfile
+
+      - name: Install Playwright browsers
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+
+      - name: Start keycast in background
+        env:
+          PORT: "3000"
+          RUST_LOG: "info,sqlx=warn,nostr_relay_pool=warn"
+        run: |
+          mkdir -p e2e/test-results
+          nohup ./target/debug/keycast \
+            > e2e/test-results/keycast.log 2>&1 < /dev/null &
+          echo $! > .keycast.pid
+          disown
+
+          for i in $(seq 1 60); do
+            if curl --silent --fail --max-time 2 \
+                 http://localhost:3000/livez >/dev/null 2>&1; then
+              echo "keycast ready after ${i}s"
+              exit 0
+            fi
+            if ! kill -0 "$(cat .keycast.pid)" 2>/dev/null; then
+              echo "keycast process exited before becoming ready" >&2
+              tail -n 200 e2e/test-results/keycast.log >&2 || true
+              exit 1
+            fi
+            sleep 1
+          done
+
+          echo "keycast did not become ready within 60s" >&2
+          tail -n 200 e2e/test-results/keycast.log >&2 || true
+          exit 1
+
+      - name: Run Playwright tests
+        working-directory: e2e
+        run: npx playwright test
+
+      - name: Stop keycast
+        if: always()
+        run: |
+          if [ -f .keycast.pid ]; then
+            kill "$(cat .keycast.pid)" 2>/dev/null || true
+          fi
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            e2e/playwright-report/
+            e2e/test-results/
+          retention-days: 14
+          if-no-files-found: ignore
