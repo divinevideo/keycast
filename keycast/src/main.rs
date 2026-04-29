@@ -47,6 +47,91 @@ use zeroize::Zeroizing;
 /// fails the probe fast instead of hanging it.
 const READYZ_DB_TIMEOUT: Duration = Duration::from_millis(800);
 
+/// Duration the process pauses between flipping the readiness probe to 503
+/// and starting to drain accepted connections. This is the window during which
+/// Kubernetes observes the failing probe and removes the pod from the Service
+/// EndpointSlice so the load balancer stops routing new traffic to us. Keeping
+/// this out of the drain budget is critical — otherwise new NIP-46 sign
+/// requests arriving during these seconds would be rejected mid-request and
+/// trigger client-side reconnect storms on scale-down. Override with
+/// `SHUTDOWN_PRE_DRAIN_SECS` (e.g. `0` in local dev / tests).
+const DEFAULT_SHUTDOWN_PRE_DRAIN_SECS: u64 = 10;
+
+/// Maximum time we wait for axum to drain in-flight HTTP requests after we
+/// stop accepting new connections. The sum of `pre_drain + http_drain +
+/// signer_drain` plus ~5–10s of teardown headroom must fit inside the
+/// Deployment's `terminationGracePeriodSeconds` — otherwise the kubelet
+/// SIGKILLs us mid-drain. Default sized for `terminationGracePeriodSeconds: 75`.
+/// Override with `SHUTDOWN_HTTP_DRAIN_SECS`.
+const DEFAULT_SHUTDOWN_HTTP_DRAIN_SECS: u64 = 45;
+
+/// Maximum time we wait for the NIP-46 signer + tracked background tasks to
+/// finish after we tear down the relay client. Override with
+/// `SHUTDOWN_SIGNER_DRAIN_SECS`.
+const DEFAULT_SHUTDOWN_SIGNER_DRAIN_SECS: u64 = 10;
+
+/// Parsed shutdown phase timings. See the `DEFAULT_SHUTDOWN_*` constants and
+/// the graceful-shutdown sequence in `async_main` for the phase breakdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShutdownTimings {
+    /// Sleep between setting readiness=503 and closing the accept loop.
+    pre_drain: Duration,
+    /// Maximum wait for axum HTTP drain.
+    http_drain: Duration,
+    /// Maximum wait for signer + tracked background tasks.
+    signer_drain: Duration,
+}
+
+/// Read a non-negative integer duration (in seconds) from the given env var,
+/// falling back to `default_secs` if unset or unparseable. Zero is a valid
+/// value and is respected (not treated as "use default").
+fn parse_duration_secs_env(var: &str, default_secs: u64) -> Duration {
+    match env::var(var) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) => Duration::from_secs(secs),
+            Err(_) => {
+                tracing::warn!(
+                    env_var = var,
+                    value = %raw,
+                    default_secs,
+                    "Invalid value for shutdown timing env var; using default"
+                );
+                Duration::from_secs(default_secs)
+            }
+        },
+        Err(_) => Duration::from_secs(default_secs),
+    }
+}
+
+/// Parse all three shutdown phase durations from the environment.
+fn parse_shutdown_timings() -> ShutdownTimings {
+    ShutdownTimings {
+        pre_drain: parse_duration_secs_env(
+            "SHUTDOWN_PRE_DRAIN_SECS",
+            DEFAULT_SHUTDOWN_PRE_DRAIN_SECS,
+        ),
+        http_drain: parse_duration_secs_env(
+            "SHUTDOWN_HTTP_DRAIN_SECS",
+            DEFAULT_SHUTDOWN_HTTP_DRAIN_SECS,
+        ),
+        signer_drain: parse_duration_secs_env(
+            "SHUTDOWN_SIGNER_DRAIN_SECS",
+            DEFAULT_SHUTDOWN_SIGNER_DRAIN_SECS,
+        ),
+    }
+}
+
+/// Flip the unready flag (so `/healthz/ready` returns 503) and then sleep for
+/// `duration` to give Kubernetes time to remove us from the Service
+/// EndpointSlice before we close the accept loop. Must set the flag **before**
+/// awaiting anything so the next readiness probe sees the new value.
+async fn pre_drain_pause(unready: &Arc<AtomicBool>, duration: Duration) {
+    unready.store(true, Ordering::Relaxed);
+    if duration > Duration::ZERO {
+        tokio::time::sleep(duration).await;
+    }
+}
+
 #[derive(Clone)]
 struct LivenessState {
     shutting_down: Arc<AtomicBool>,
@@ -1093,45 +1178,99 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
 
     // Wait for shutdown signal
     wait_for_shutdown_signal().await;
-    shutting_down.store(true, Ordering::Relaxed);
+
+    // --- Graceful shutdown ---
+    //
+    // Phase ordering matters. On scale-down events Kubernetes sends SIGTERM
+    // and *also* starts removing the pod from the Service EndpointSlice based
+    // on the readiness probe, but endpoint-slice propagation is asynchronous.
+    // If we stop accepting connections the instant we see SIGTERM, the LB may
+    // still be routing new NIP-46 / HTTP requests to us for several seconds
+    // and those requests fail mid-flight — the exact client-reconnect storm
+    // that issue #692 targets.
+    //
+    // So the sequence is:
+    //   1. Flip `/healthz/ready` to 503 and sleep `pre_drain`. Kubelet observes
+    //      the failing probe; the Service controller removes us from endpoints.
+    //   2. Stop accepting new HTTP connections (axum `.with_graceful_shutdown`
+    //      future resolves) and wait up to `http_drain` for in-flight requests.
+    //   3. Tear down the NIP-46 relay client (which stops `signer.run()` and
+    //      drains the relay worker queue) and wait up to `signer_drain` for
+    //      tracked background tasks.
+    //   4. Close the DB pool.
+    //
+    // Sum of `pre_drain + http_drain + signer_drain` + DB-pool-close headroom
+    // must fit inside the Deployment's `terminationGracePeriodSeconds` or the
+    // kubelet SIGKILLs us mid-drain.
+    let timings = parse_shutdown_timings();
+    let shutdown_started_at = std::time::Instant::now();
+    tracing::info!(
+        pre_drain_secs = timings.pre_drain.as_secs(),
+        http_drain_secs = timings.http_drain.as_secs(),
+        signer_drain_secs = timings.signer_drain.as_secs(),
+        "Graceful shutdown: starting pre-drain phase (readiness now 503)"
+    );
+
+    // Phase 1: flip readiness and sleep so K8s can remove us from the Service
+    // endpoints before we stop accepting.
+    pre_drain_pause(&shutting_down, timings.pre_drain).await;
+
+    // Phase 2: tell axum to stop accepting new HTTP connections and wait for
+    // in-flight requests to finish.
     shutdown_signal.notify_waiters();
-
-    tracing::info!("Shutting down gracefully...");
-
-    // Close task tracker to prevent new tasks from being spawned
+    // Close task tracker to prevent new tracked tasks from being spawned.
     task_tracker.close();
 
-    // Shutdown signer client (disconnect from relays)
-    // Note: ClusterCoordinator will be dropped automatically, triggering deregister
-    client_for_shutdown.shutdown().await;
-
-    // Wait for API server to drain (max 15s to leave buffer before Cloud Run's 30s timeout)
-    match tokio::time::timeout(Duration::from_secs(15), api_handle).await {
+    tracing::info!(
+        elapsed_secs = shutdown_started_at.elapsed().as_secs(),
+        "Graceful shutdown: draining HTTP (axum with_graceful_shutdown)"
+    );
+    match tokio::time::timeout(timings.http_drain, api_handle).await {
         Ok(result) => {
             if let Err(e) = result {
                 tracing::warn!("API server task error: {:?}", e);
             }
         }
         Err(_) => {
-            tracing::warn!("API server shutdown timed out after 15s");
+            tracing::warn!(
+                http_drain_secs = timings.http_drain.as_secs(),
+                "API server shutdown timed out"
+            );
         }
     }
 
-    // Wait for signer and other tracked tasks to complete (max 10s)
-    match tokio::time::timeout(Duration::from_secs(10), task_tracker.wait()).await {
+    // Phase 3: tear down the relay client (stops signer.run() subscription)
+    // and wait for signer + other tracked tasks. We do this **after** HTTP
+    // drain so NIP-46 requests that arrived before SIGTERM have a chance to
+    // complete and publish responses back to the requesting client before we
+    // disconnect from the relays. `ClusterCoordinator` will be dropped
+    // automatically on return, triggering deregister.
+    tracing::info!(
+        elapsed_secs = shutdown_started_at.elapsed().as_secs(),
+        "Graceful shutdown: tearing down NIP-46 relay client"
+    );
+    client_for_shutdown.shutdown().await;
+
+    match tokio::time::timeout(timings.signer_drain, task_tracker.wait()).await {
         Ok(()) => {
             tracing::info!("All tracked tasks completed");
         }
         Err(_) => {
-            tracing::warn!("Task tracker wait timed out after 10s, aborting signer");
+            tracing::warn!(
+                signer_drain_secs = timings.signer_drain.as_secs(),
+                "Task tracker wait timed out, aborting signer"
+            );
             signer_handle.abort();
         }
     }
 
-    // Close database pool
+    // Phase 4: close database pool.
     pool_for_shutdown.close().await;
 
-    tracing::info!("Graceful shutdown complete");
+    tracing::info!(
+        total_shutdown_secs = shutdown_started_at.elapsed().as_secs(),
+        "Graceful shutdown complete"
+    );
 
     Ok(())
 }
@@ -1535,5 +1674,129 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "route {path} not OK");
         }
+    }
+
+    // --- Shutdown timings ---
+    //
+    // These tests exercise the env-var-driven shutdown phase durations used by
+    // the graceful-shutdown sequence in `async_main`. Values must be stable
+    // because the iac repo's `terminationGracePeriodSeconds` is tuned against
+    // them: PRE_DRAIN + HTTP_DRAIN + SIGNER_DRAIN must fit inside the grace
+    // period with margin for process teardown.
+
+    fn clear_shutdown_env() {
+        std::env::remove_var("SHUTDOWN_PRE_DRAIN_SECS");
+        std::env::remove_var("SHUTDOWN_HTTP_DRAIN_SECS");
+        std::env::remove_var("SHUTDOWN_SIGNER_DRAIN_SECS");
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_shutdown_timings_defaults() {
+        clear_shutdown_env();
+
+        let timings = parse_shutdown_timings();
+
+        // Documented defaults — see main.rs docs on graceful shutdown.
+        assert_eq!(timings.pre_drain, Duration::from_secs(10));
+        assert_eq!(timings.http_drain, Duration::from_secs(45));
+        assert_eq!(timings.signer_drain, Duration::from_secs(10));
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_shutdown_timings_overrides_each_field() {
+        clear_shutdown_env();
+        std::env::set_var("SHUTDOWN_PRE_DRAIN_SECS", "3");
+        std::env::set_var("SHUTDOWN_HTTP_DRAIN_SECS", "20");
+        std::env::set_var("SHUTDOWN_SIGNER_DRAIN_SECS", "5");
+
+        let timings = parse_shutdown_timings();
+
+        assert_eq!(timings.pre_drain, Duration::from_secs(3));
+        assert_eq!(timings.http_drain, Duration::from_secs(20));
+        assert_eq!(timings.signer_drain, Duration::from_secs(5));
+
+        clear_shutdown_env();
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_shutdown_timings_accepts_zero() {
+        // Zero is a legitimate value for tests and local dev: skip the
+        // endpoint-propagation wait, drain as fast as possible. It must NOT
+        // collapse back to the default.
+        clear_shutdown_env();
+        std::env::set_var("SHUTDOWN_PRE_DRAIN_SECS", "0");
+        std::env::set_var("SHUTDOWN_HTTP_DRAIN_SECS", "0");
+        std::env::set_var("SHUTDOWN_SIGNER_DRAIN_SECS", "0");
+
+        let timings = parse_shutdown_timings();
+
+        assert_eq!(timings.pre_drain, Duration::ZERO);
+        assert_eq!(timings.http_drain, Duration::ZERO);
+        assert_eq!(timings.signer_drain, Duration::ZERO);
+
+        clear_shutdown_env();
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_shutdown_timings_invalid_value_falls_back_to_default() {
+        // An unparseable value should fall through to the default rather than
+        // panic at startup — we'd rather ship with a sane default than crash.
+        clear_shutdown_env();
+        std::env::set_var("SHUTDOWN_PRE_DRAIN_SECS", "not-a-number");
+
+        let timings = parse_shutdown_timings();
+
+        assert_eq!(timings.pre_drain, Duration::from_secs(10));
+
+        clear_shutdown_env();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_pre_drain_pause_flips_unready_before_sleeping() {
+        // The pre-drain pause exists so K8s can remove the pod from the
+        // Service EndpointSlice (readiness probe failing) BEFORE we stop
+        // accepting new connections. The AtomicBool MUST be set to true
+        // before the sleep — otherwise the probe never fails and the grace
+        // window is wasted.
+
+        let unready = Arc::new(AtomicBool::new(false));
+        let unready_for_task = unready.clone();
+
+        let pause_handle = tokio::spawn(async move {
+            pre_drain_pause(&unready_for_task, Duration::from_secs(5)).await
+        });
+
+        // Yield once so the spawned task gets a chance to set the flag before
+        // the `tokio::time` pause machinery advances. With start_paused=true
+        // real time is frozen; only `tokio::time::advance` or awaiting a
+        // sleep moves it. The flag is set synchronously before the first
+        // `.await` inside `pre_drain_pause`, so a yield is enough.
+        tokio::task::yield_now().await;
+
+        assert!(
+            unready.load(Ordering::Relaxed),
+            "pre_drain_pause must flip unready before sleeping so /healthz/ready starts returning 503 immediately"
+        );
+
+        // Now advance virtual time past the sleep and confirm the function
+        // returns (no hang, no early return before the sleep).
+        tokio::time::advance(Duration::from_secs(5)).await;
+        pause_handle.await.expect("pre_drain_pause panicked");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_pre_drain_pause_with_zero_duration_returns_immediately() {
+        // Local dev / tests set SHUTDOWN_PRE_DRAIN_SECS=0 to skip the wait.
+        // The function must still set the flag and then return without
+        // requiring any time to pass.
+        let unready = Arc::new(AtomicBool::new(false));
+
+        pre_drain_pause(&unready, Duration::ZERO).await;
+
+        assert!(unready.load(Ordering::Relaxed));
     }
 }
