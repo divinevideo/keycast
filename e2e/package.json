@@ -9,9 +9,9 @@
   },
   "private": true,
   "scripts": {
-    "test": "playwright test",
-    "test:headed": "playwright test --headed",
-    "test:ui": "playwright test --ui"
+    "test": "NIP05_DOMAIN=${NIP05_DOMAIN:-divine.video} playwright test",
+    "test:headed": "NIP05_DOMAIN=${NIP05_DOMAIN:-divine.video} playwright test --headed",
+    "test:ui": "NIP05_DOMAIN=${NIP05_DOMAIN:-divine.video} playwright test --ui"
   },
   "dependencies": {
     "@types/ws": "^8.18.1",

@@ -36,6 +36,7 @@ services:
       BUNKER_RELAYS: ${BUNKER_RELAYS:?Set BUNKER_RELAYS in .env}
       WEB_BUILD_DIR: /app/web
       FROM_EMAIL: test@localhost
+      NIP05_DOMAIN: divine.video
       SENDGRID_API_KEY: ${SENDGRID_API_KEY:-}
       VITE_DOMAIN: http://localhost:3000
       VITE_ALLOWED_PUBKEYS: ${VITE_ALLOWED_PUBKEYS:-}

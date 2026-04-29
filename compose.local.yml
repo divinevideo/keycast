@@ -40,6 +40,7 @@ services:
       ALLOWED_ORIGINS: https://peek.verse.app,http://localhost:5173,http://localhost:5174
       BUNKER_RELAYS: ${BUNKER_RELAYS:?Set BUNKER_RELAYS in .env}
       WEB_BUILD_DIR: /app/web
+      NIP05_DOMAIN: divine.video
     depends_on:
       postgres:
         condition: service_healthy

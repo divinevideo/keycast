@@ -86,6 +86,7 @@ services:
       FROM_EMAIL: ${FROM_EMAIL:-noreply@divine.video}
       FROM_NAME: ${FROM_NAME:-Divine}
       BASE_URL: ${BASE_URL:-http://localhost:5173}
+      NIP05_DOMAIN: ${NIP05_DOMAIN:-divine.video}
       # DISABLE_EMAILS: ${DISABLE_EMAILS:-}
       # Server configuration
       PORT: ${PORT:-3000}
