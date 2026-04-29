@@ -222,8 +222,28 @@ async fn create_update_delete_each_writes_admin_audit_event() {
     }
 
     // Spot-check metadata payloads carry the state we expect.
+    // create: flat snapshot of the just-created row.
     assert_eq!(rows[0].metadata_json["name"], "Audit HTTP");
-    assert_eq!(rows[1].metadata_json["name"], "Audit HTTP renamed");
+    assert_eq!(
+        rows[0].metadata_json["allowed_redirect_uris"][0],
+        "https://example.com/cb"
+    );
+
+    // update: {before, after} captured atomically by the CTE in
+    // RegisteredClientRepository::update. before holds the pre-update
+    // snapshot; after holds the post-update snapshot.
+    assert_eq!(rows[1].metadata_json["before"]["name"], "Audit HTTP");
+    assert_eq!(
+        rows[1].metadata_json["before"]["allowed_redirect_uris"][0],
+        "https://example.com/cb"
+    );
+    assert_eq!(rows[1].metadata_json["after"]["name"], "Audit HTTP renamed");
+    assert_eq!(
+        rows[1].metadata_json["after"]["allowed_redirect_uris"][0],
+        "https://example.com/cb2"
+    );
+
+    // delete: flat snapshot of the row at the moment of deletion.
     assert_eq!(rows[2].metadata_json["name"], "Audit HTTP renamed");
     assert_eq!(
         rows[2].metadata_json["allowed_redirect_uris"][0],

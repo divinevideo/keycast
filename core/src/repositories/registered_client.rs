@@ -23,6 +23,19 @@ pub struct RegisteredClient {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Pre- and post-update snapshots returned by `RegisteredClientRepository::update`.
+///
+/// Captured atomically via a CTE: a non-data-modifying SELECT (`pre`) reads the
+/// snapshot before the UPDATE applies, and the data-modifying CTE (`upd`) returns
+/// the post-update row. Both run against the same Postgres snapshot, so callers
+/// (e.g. the admin audit log) see a consistent before/after pair with no TOCTOU
+/// window.
+#[derive(Debug, Clone)]
+pub struct RegisteredClientUpdate {
+    pub before: RegisteredClient,
+    pub after: RegisteredClient,
+}
+
 /// Repository for registered OAuth client operations.
 /// When a client_id is registered, only its allowed redirect URIs are accepted.
 /// Unregistered client_ids fall back to accepting any HTTPS redirect_uri.
@@ -163,13 +176,17 @@ impl RegisteredClientRepository {
 
     /// Update name and/or allowed_redirect_uris for a registered client.
     /// Tenant-scoped: returns NotFound when (id, tenant_id) does not match.
+    ///
+    /// Returns both the pre-update and post-update snapshots so callers (e.g.
+    /// the admin audit log) can record a single before/after entry. The
+    /// snapshots are captured atomically by a CTE: see `RegisteredClientUpdate`.
     pub async fn update(
         &self,
         id: i32,
         tenant_id: i64,
         name: Option<&str>,
         allowed_redirect_uris: Option<&[String]>,
-    ) -> Result<RegisteredClient, RepositoryError> {
+    ) -> Result<RegisteredClientUpdate, RepositoryError> {
         if let Some(uris) = allowed_redirect_uris {
             validate_redirect_uri_list(uris)?;
         }
@@ -181,15 +198,51 @@ impl RegisteredClientRepository {
         let trimmed_uris: Option<Vec<String>> =
             allowed_redirect_uris.map(|uris| uris.iter().map(|s| s.trim().to_string()).collect());
 
-        // COALESCE pattern lets us patch either field without separate queries.
-        let row = sqlx::query_as::<_, RegisteredClient>(
-            "UPDATE registered_clients
-             SET name = COALESCE($3, name),
-                 allowed_redirect_uris = COALESCE($4, allowed_redirect_uris),
-                 updated_at = NOW()
-             WHERE id = $1 AND tenant_id = $2
-             RETURNING id, tenant_id::BIGINT AS tenant_id, client_id, name,
-                       allowed_redirect_uris, created_at, updated_at",
+        // CTE captures pre- and post-update snapshots in a single statement.
+        // `pre` reads the original row from the statement snapshot; `upd`
+        // performs the UPDATE and returns the new row. Postgres runs both CTEs
+        // against the same snapshot, so `pre` does not see `upd`'s changes
+        // (Postgres docs: data-modifying WITH statements). The outer SELECT
+        // joins them on id, yielding one row with both states; if the target
+        // doesn't exist (or the tenant doesn't match), neither CTE produces a
+        // row and fetch_optional returns None.
+        let row: Option<UpdateRow> = sqlx::query_as::<_, UpdateRow>(
+            "WITH pre AS (
+                 SELECT id,
+                        tenant_id::BIGINT AS tenant_id,
+                        client_id, name, allowed_redirect_uris,
+                        created_at, updated_at
+                 FROM registered_clients
+                 WHERE id = $1 AND tenant_id = $2
+             ),
+             upd AS (
+                 UPDATE registered_clients
+                 SET name = COALESCE($3, name),
+                     allowed_redirect_uris = COALESCE($4, allowed_redirect_uris),
+                     updated_at = NOW()
+                 WHERE id = $1 AND tenant_id = $2
+                 RETURNING id,
+                           tenant_id::BIGINT AS tenant_id,
+                           client_id, name, allowed_redirect_uris,
+                           created_at, updated_at
+             )
+             SELECT
+                 pre.id                    AS before_id,
+                 pre.tenant_id             AS before_tenant_id,
+                 pre.client_id             AS before_client_id,
+                 pre.name                  AS before_name,
+                 pre.allowed_redirect_uris AS before_allowed_redirect_uris,
+                 pre.created_at            AS before_created_at,
+                 pre.updated_at            AS before_updated_at,
+                 upd.id                    AS after_id,
+                 upd.tenant_id             AS after_tenant_id,
+                 upd.client_id             AS after_client_id,
+                 upd.name                  AS after_name,
+                 upd.allowed_redirect_uris AS after_allowed_redirect_uris,
+                 upd.created_at            AS after_created_at,
+                 upd.updated_at            AS after_updated_at
+             FROM pre
+             JOIN upd ON upd.id = pre.id",
         )
         .bind(id)
         .bind(tenant_id)
@@ -198,7 +251,7 @@ impl RegisteredClientRepository {
         .fetch_optional(&self.pool)
         .await?;
 
-        row.ok_or_else(|| {
+        row.map(Into::into).ok_or_else(|| {
             RepositoryError::NotFound(format!(
                 "registered_client id={} for tenant {}",
                 id, tenant_id
@@ -231,6 +284,52 @@ impl RegisteredClientRepository {
                 id, tenant_id
             ))
         })
+    }
+}
+
+// ---- Update CTE row mapping --------------------------------------------------
+
+/// Flat row returned by the `update` CTE; converted into `RegisteredClientUpdate`.
+#[derive(FromRow)]
+struct UpdateRow {
+    before_id: i32,
+    before_tenant_id: i64,
+    before_client_id: String,
+    before_name: String,
+    before_allowed_redirect_uris: Vec<String>,
+    before_created_at: DateTime<Utc>,
+    before_updated_at: DateTime<Utc>,
+    after_id: i32,
+    after_tenant_id: i64,
+    after_client_id: String,
+    after_name: String,
+    after_allowed_redirect_uris: Vec<String>,
+    after_created_at: DateTime<Utc>,
+    after_updated_at: DateTime<Utc>,
+}
+
+impl From<UpdateRow> for RegisteredClientUpdate {
+    fn from(r: UpdateRow) -> Self {
+        Self {
+            before: RegisteredClient {
+                id: r.before_id,
+                tenant_id: r.before_tenant_id,
+                client_id: r.before_client_id,
+                name: r.before_name,
+                allowed_redirect_uris: r.before_allowed_redirect_uris,
+                created_at: r.before_created_at,
+                updated_at: r.before_updated_at,
+            },
+            after: RegisteredClient {
+                id: r.after_id,
+                tenant_id: r.after_tenant_id,
+                client_id: r.after_client_id,
+                name: r.after_name,
+                allowed_redirect_uris: r.after_allowed_redirect_uris,
+                created_at: r.after_created_at,
+                updated_at: r.after_updated_at,
+            },
+        }
     }
 }
 
