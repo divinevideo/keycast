@@ -25,11 +25,13 @@ pub struct RegisteredClient {
 
 /// Pre- and post-update snapshots returned by `RegisteredClientRepository::update`.
 ///
-/// Captured atomically via a CTE: a non-data-modifying SELECT (`pre`) reads the
-/// snapshot before the UPDATE applies, and the data-modifying CTE (`upd`) returns
-/// the post-update row. Both run against the same Postgres snapshot, so callers
-/// (e.g. the admin audit log) see a consistent before/after pair with no TOCTOU
-/// window.
+/// Captured by holding a row-level lock for the duration of the update
+/// transaction: the repository runs `SELECT ... FOR UPDATE` on the target row,
+/// then `UPDATE` within the same transaction. Under READ COMMITTED (the
+/// default), `FOR UPDATE` waits for any concurrent updater and then re-anchors
+/// on the latest committed version of the row, so `before` reflects the actual
+/// immediately-prior state and `after` reflects the row after this admin's
+/// update — even when other admins are updating concurrently.
 #[derive(Debug, Clone)]
 pub struct RegisteredClientUpdate {
     pub before: RegisteredClient,
@@ -179,7 +181,10 @@ impl RegisteredClientRepository {
     ///
     /// Returns both the pre-update and post-update snapshots so callers (e.g.
     /// the admin audit log) can record a single before/after entry. The
-    /// snapshots are captured atomically by a CTE: see `RegisteredClientUpdate`.
+    /// repository takes a row lock via `SELECT ... FOR UPDATE`, then performs
+    /// the `UPDATE` in the same transaction, so `before` and `after` describe
+    /// the actual transition this caller produced — concurrent updaters are
+    /// serialized through the row lock.
     pub async fn update(
         &self,
         id: i32,
@@ -198,65 +203,50 @@ impl RegisteredClientRepository {
         let trimmed_uris: Option<Vec<String>> =
             allowed_redirect_uris.map(|uris| uris.iter().map(|s| s.trim().to_string()).collect());
 
-        // CTE captures pre- and post-update snapshots in a single statement.
-        // `pre` reads the original row from the statement snapshot; `upd`
-        // performs the UPDATE and returns the new row. Postgres runs both CTEs
-        // against the same snapshot, so `pre` does not see `upd`'s changes
-        // (Postgres docs: data-modifying WITH statements). The outer SELECT
-        // joins them on id, yielding one row with both states; if the target
-        // doesn't exist (or the tenant doesn't match), neither CTE produces a
-        // row and fetch_optional returns None.
-        let row: Option<UpdateRow> = sqlx::query_as::<_, UpdateRow>(
-            "WITH pre AS (
-                 SELECT id,
-                        tenant_id::BIGINT AS tenant_id,
-                        client_id, name, allowed_redirect_uris,
-                        created_at, updated_at
-                 FROM registered_clients
-                 WHERE id = $1 AND tenant_id = $2
-             ),
-             upd AS (
-                 UPDATE registered_clients
-                 SET name = COALESCE($3, name),
-                     allowed_redirect_uris = COALESCE($4, allowed_redirect_uris),
-                     updated_at = NOW()
-                 WHERE id = $1 AND tenant_id = $2
-                 RETURNING id,
-                           tenant_id::BIGINT AS tenant_id,
-                           client_id, name, allowed_redirect_uris,
-                           created_at, updated_at
-             )
-             SELECT
-                 pre.id                    AS before_id,
-                 pre.tenant_id             AS before_tenant_id,
-                 pre.client_id             AS before_client_id,
-                 pre.name                  AS before_name,
-                 pre.allowed_redirect_uris AS before_allowed_redirect_uris,
-                 pre.created_at            AS before_created_at,
-                 pre.updated_at            AS before_updated_at,
-                 upd.id                    AS after_id,
-                 upd.tenant_id             AS after_tenant_id,
-                 upd.client_id             AS after_client_id,
-                 upd.name                  AS after_name,
-                 upd.allowed_redirect_uris AS after_allowed_redirect_uris,
-                 upd.created_at            AS after_created_at,
-                 upd.updated_at            AS after_updated_at
-             FROM pre
-             JOIN upd ON upd.id = pre.id",
+        // Hold a row lock for the entire transaction so `before` and `after`
+        // describe the actual transition this caller produced. Under READ
+        // COMMITTED, SELECT FOR UPDATE waits for any concurrent updater and
+        // then re-reads against the latest committed version; the subsequent
+        // UPDATE then runs on top of that locked row with no interleaving.
+        let mut tx = self.pool.begin().await?;
+
+        let before = sqlx::query_as::<_, RegisteredClient>(
+            "SELECT id, tenant_id::BIGINT AS tenant_id, client_id, name,
+                    allowed_redirect_uris, created_at, updated_at
+             FROM registered_clients
+             WHERE id = $1 AND tenant_id = $2
+             FOR UPDATE",
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            RepositoryError::NotFound(format!(
+                "registered_client id={} for tenant {}",
+                id, tenant_id
+            ))
+        })?;
+
+        let after = sqlx::query_as::<_, RegisteredClient>(
+            "UPDATE registered_clients
+             SET name = COALESCE($3, name),
+                 allowed_redirect_uris = COALESCE($4, allowed_redirect_uris),
+                 updated_at = NOW()
+             WHERE id = $1 AND tenant_id = $2
+             RETURNING id, tenant_id::BIGINT AS tenant_id, client_id, name,
+                       allowed_redirect_uris, created_at, updated_at",
         )
         .bind(id)
         .bind(tenant_id)
         .bind(name.map(str::trim))
         .bind(trimmed_uris.as_deref())
-        .fetch_optional(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
 
-        row.map(Into::into).ok_or_else(|| {
-            RepositoryError::NotFound(format!(
-                "registered_client id={} for tenant {}",
-                id, tenant_id
-            ))
-        })
+        tx.commit().await?;
+
+        Ok(RegisteredClientUpdate { before, after })
     }
 
     /// Delete a registered client. Tenant-scoped.
@@ -284,52 +274,6 @@ impl RegisteredClientRepository {
                 id, tenant_id
             ))
         })
-    }
-}
-
-// ---- Update CTE row mapping --------------------------------------------------
-
-/// Flat row returned by the `update` CTE; converted into `RegisteredClientUpdate`.
-#[derive(FromRow)]
-struct UpdateRow {
-    before_id: i32,
-    before_tenant_id: i64,
-    before_client_id: String,
-    before_name: String,
-    before_allowed_redirect_uris: Vec<String>,
-    before_created_at: DateTime<Utc>,
-    before_updated_at: DateTime<Utc>,
-    after_id: i32,
-    after_tenant_id: i64,
-    after_client_id: String,
-    after_name: String,
-    after_allowed_redirect_uris: Vec<String>,
-    after_created_at: DateTime<Utc>,
-    after_updated_at: DateTime<Utc>,
-}
-
-impl From<UpdateRow> for RegisteredClientUpdate {
-    fn from(r: UpdateRow) -> Self {
-        Self {
-            before: RegisteredClient {
-                id: r.before_id,
-                tenant_id: r.before_tenant_id,
-                client_id: r.before_client_id,
-                name: r.before_name,
-                allowed_redirect_uris: r.before_allowed_redirect_uris,
-                created_at: r.before_created_at,
-                updated_at: r.before_updated_at,
-            },
-            after: RegisteredClient {
-                id: r.after_id,
-                tenant_id: r.after_tenant_id,
-                client_id: r.after_client_id,
-                name: r.after_name,
-                allowed_redirect_uris: r.after_allowed_redirect_uris,
-                created_at: r.after_created_at,
-                updated_at: r.after_updated_at,
-            },
-        }
     }
 }
 
