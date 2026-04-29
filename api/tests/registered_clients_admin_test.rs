@@ -404,3 +404,33 @@ async fn update_trims_redirect_uri_whitespace() {
         "redirect URIs should be trimmed on update"
     );
 }
+
+#[tokio::test]
+async fn delete_returns_deleted_row_for_audit() {
+    let repo = fresh_repo(&["test-delete-returning"]).await;
+
+    let created = repo
+        .create(
+            TENANT_A,
+            "test-delete-returning",
+            "Returning Test",
+            &["https://example.com/cb".to_string()],
+        )
+        .await
+        .unwrap();
+
+    let deleted = repo.delete(created.id, TENANT_A).await.unwrap();
+
+    assert_eq!(deleted.id, created.id);
+    assert_eq!(deleted.tenant_id, TENANT_A);
+    assert_eq!(deleted.client_id, "test-delete-returning");
+    assert_eq!(deleted.name, "Returning Test");
+    assert_eq!(
+        deleted.allowed_redirect_uris,
+        vec!["https://example.com/cb".to_string()]
+    );
+
+    // And the row really is gone.
+    let listed = repo.list(TENANT_A).await.unwrap();
+    assert!(!listed.iter().any(|c| c.id == created.id));
+}

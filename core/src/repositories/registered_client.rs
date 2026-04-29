@@ -207,21 +207,30 @@ impl RegisteredClientRepository {
     }
 
     /// Delete a registered client. Tenant-scoped.
+    /// Returns the deleted row so callers can audit-log the removed state.
     /// Returns NotFound if no row matches (id, tenant_id).
-    pub async fn delete(&self, id: i32, tenant_id: i64) -> Result<(), RepositoryError> {
-        let result = sqlx::query("DELETE FROM registered_clients WHERE id = $1 AND tenant_id = $2")
-            .bind(id)
-            .bind(tenant_id)
-            .execute(&self.pool)
-            .await?;
+    pub async fn delete(
+        &self,
+        id: i32,
+        tenant_id: i64,
+    ) -> Result<RegisteredClient, RepositoryError> {
+        let row = sqlx::query_as::<_, RegisteredClient>(
+            "DELETE FROM registered_clients
+             WHERE id = $1 AND tenant_id = $2
+             RETURNING id, tenant_id::BIGINT AS tenant_id, client_id, name,
+                       allowed_redirect_uris, created_at, updated_at",
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await?;
 
-        if result.rows_affected() == 0 {
-            return Err(RepositoryError::NotFound(format!(
+        row.ok_or_else(|| {
+            RepositoryError::NotFound(format!(
                 "registered_client id={} for tenant {}",
                 id, tenant_id
-            )));
-        }
-        Ok(())
+            ))
+        })
     }
 }
 
