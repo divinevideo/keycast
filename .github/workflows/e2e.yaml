@@ -47,6 +47,15 @@ jobs:
         image: ghcr.io/verse-pbc/relay_builder:latest
         env:
           IDLE_TIMEOUT: "0"
+        # relay_builder is debian:bookworm-slim with only ca-certificates added
+        # (see verse-pbc/relay_builder Dockerfile) — no nc/curl/wget. bash 5.2
+        # is present, so use its /dev/tcp pseudo-device to gate readiness on
+        # actual port-8080 acceptance, not just container start.
+        options: >-
+          --health-cmd "bash -c 'exec 3<>/dev/tcp/localhost/8080 && exec 3<&- && exec 3>&-'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
         ports:
           - 8080:8080
 
