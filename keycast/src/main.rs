@@ -70,6 +70,21 @@ const DEFAULT_SHUTDOWN_HTTP_DRAIN_SECS: u64 = 45;
 /// `SHUTDOWN_SIGNER_DRAIN_SECS`.
 const DEFAULT_SHUTDOWN_SIGNER_DRAIN_SECS: u64 = 10;
 
+/// Conservative upper bound on the Deployment's `terminationGracePeriodSeconds`
+/// used at startup to sanity-check the shutdown phase budgets. The iac repo
+/// (TODO(#692): track in divinevideo/divine-iac-coreconfig sibling PR) targets
+/// 75s but the issue spec accepts 60–90s; 120s covers the full range with
+/// headroom. If an operator bumps grace higher they can raise this via
+/// `SHUTDOWN_GRACE_PERIOD_CEILING_SECS`. This constant does NOT change the
+/// kubelet behavior — it is purely a misconfig guardrail.
+const DEFAULT_SHUTDOWN_GRACE_CEILING_SECS: u64 = 120;
+
+/// Headroom reserved between the end of the phased drain and the kubelet
+/// SIGKILL for DB pool close, tracing flush, and other post-drain cleanup.
+/// Subtracted from the ceiling when validating that the configured phase
+/// budgets fit.
+const SHUTDOWN_TEARDOWN_MARGIN: Duration = Duration::from_secs(10);
+
 /// Parsed shutdown phase timings. See the `DEFAULT_SHUTDOWN_*` constants and
 /// the graceful-shutdown sequence in `async_main` for the phase breakdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +95,15 @@ struct ShutdownTimings {
     http_drain: Duration,
     /// Maximum wait for signer + tracked background tasks.
     signer_drain: Duration,
+}
+
+impl ShutdownTimings {
+    /// Sum of all three phase durations. Does NOT include
+    /// `SHUTDOWN_TEARDOWN_MARGIN` — add that separately when comparing
+    /// against a grace-period ceiling.
+    fn total_budget(&self) -> Duration {
+        self.pre_drain + self.http_drain + self.signer_drain
+    }
 }
 
 /// Read a non-negative integer duration (in seconds) from the given env var,
@@ -118,6 +142,54 @@ fn parse_shutdown_timings() -> ShutdownTimings {
             "SHUTDOWN_SIGNER_DRAIN_SECS",
             DEFAULT_SHUTDOWN_SIGNER_DRAIN_SECS,
         ),
+    }
+}
+
+/// Parse the configured `terminationGracePeriodSeconds` ceiling against
+/// which the phased shutdown budget is validated at startup. Override with
+/// `SHUTDOWN_GRACE_PERIOD_CEILING_SECS` when the Deployment's grace period
+/// changes without a keycast release.
+fn parse_shutdown_grace_ceiling() -> Duration {
+    parse_duration_secs_env(
+        "SHUTDOWN_GRACE_PERIOD_CEILING_SECS",
+        DEFAULT_SHUTDOWN_GRACE_CEILING_SECS,
+    )
+}
+
+/// Check that `timings.total_budget() + SHUTDOWN_TEARDOWN_MARGIN <= ceiling`.
+/// The margin is the reserved headroom for DB pool close, tracing flush, and
+/// process teardown between the end of the phased drain and the kubelet
+/// SIGKILL at `terminationGracePeriodSeconds`. Exact equality is accepted
+/// (the margin fully fits); anything larger is rejected.
+///
+/// Returned `Err(String)` is operator-actionable and includes the current
+/// budget, margin, and ceiling so it can be dropped straight into a log
+/// line. We deliberately warn (not abort) on violation at the call site:
+/// the ceiling is cross-repo-coupled to the iac repo, and an operator may
+/// legitimately need to boot ahead of an iac-side grace bump.
+///
+/// TODO(#692): remove the soft-warning fallback in `async_main` once the
+/// sibling divinevideo/divine-iac-coreconfig PR lands and `terminationGracePeriodSeconds`
+/// is pinned at ≥75s in all environments.
+fn validate_shutdown_timings(timings: &ShutdownTimings, ceiling: Duration) -> Result<(), String> {
+    let total = timings.total_budget();
+    let required = total + SHUTDOWN_TEARDOWN_MARGIN;
+    if required > ceiling {
+        Err(format!(
+            "shutdown phase budget ({total_secs}s) + teardown margin ({margin_secs}s) \
+             = {required_secs}s does not fit inside SHUTDOWN_GRACE_PERIOD_CEILING_SECS \
+             = {ceiling_secs}s (pre_drain={pre}s, http_drain={http}s, signer_drain={sig}s); \
+             the kubelet will SIGKILL mid-drain on terminationGracePeriodSeconds",
+            total_secs = total.as_secs(),
+            margin_secs = SHUTDOWN_TEARDOWN_MARGIN.as_secs(),
+            required_secs = required.as_secs(),
+            ceiling_secs = ceiling.as_secs(),
+            pre = timings.pre_drain.as_secs(),
+            http = timings.http_drain.as_secs(),
+            sig = timings.signer_drain.as_secs(),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -684,6 +756,43 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         "Instance starting: id={} cpus={} workers={} pool={}",
         instance_id, cpu_count, worker_threads, pool_size
     );
+
+    // Validate the shutdown phase budget against the configured grace-period
+    // ceiling as a startup-time sanity check. This is defense in depth against
+    // (a) an operator setting e.g. `SHUTDOWN_HTTP_DRAIN_SECS=120` against a
+    // 75s grace period and (b) the sibling divinevideo/divine-iac-coreconfig
+    // PR (tracked in issue #692) landing with `terminationGracePeriodSeconds`
+    // below the configured defaults. We log a loud warning rather than
+    // refusing to boot: the ceiling is cross-repo-coupled, and an operator
+    // may legitimately need to start before the iac repo catches up.
+    // TODO(#692): remove the warn-only fallback once the iac-side PR pins
+    // `terminationGracePeriodSeconds` to ≥75s in every environment.
+    {
+        let startup_timings = parse_shutdown_timings();
+        let grace_ceiling = parse_shutdown_grace_ceiling();
+        match validate_shutdown_timings(&startup_timings, grace_ceiling) {
+            Ok(()) => {
+                tracing::info!(
+                    pre_drain_secs = startup_timings.pre_drain.as_secs(),
+                    http_drain_secs = startup_timings.http_drain.as_secs(),
+                    signer_drain_secs = startup_timings.signer_drain.as_secs(),
+                    grace_ceiling_secs = grace_ceiling.as_secs(),
+                    "Shutdown phase budget fits inside configured grace ceiling"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    event = "shutdown_budget_exceeds_grace_ceiling",
+                    pre_drain_secs = startup_timings.pre_drain.as_secs(),
+                    http_drain_secs = startup_timings.http_drain.as_secs(),
+                    signer_drain_secs = startup_timings.signer_drain.as_secs(),
+                    grace_ceiling_secs = grace_ceiling.as_secs(),
+                    "{}",
+                    err
+                );
+            }
+        }
+    }
 
     // Setup database
     let database = Database::new().await?;
@@ -1798,5 +1907,126 @@ mod tests {
         pre_drain_pause(&unready, Duration::ZERO).await;
 
         assert!(unready.load(Ordering::Relaxed));
+    }
+
+    // --- Shutdown grace-period ceiling validation ---
+    //
+    // The iac repo pins `terminationGracePeriodSeconds` in the Deployment; the
+    // kubelet SIGKILLs any pod whose graceful shutdown exceeds that. The three
+    // shutdown env vars (`SHUTDOWN_PRE_DRAIN_SECS` / `HTTP_DRAIN` /
+    // `SIGNER_DRAIN`) are independent u64s with no upper bound, so a misconfig
+    // (e.g. `SHUTDOWN_HTTP_DRAIN_SECS=120` against a 75s grace) would silently
+    // lose in-flight requests on scale-down — exactly the failure this
+    // feature is supposed to prevent. We validate the total + teardown margin
+    // against a configurable ceiling on startup and log a loud warning if it
+    // exceeds. We deliberately warn rather than refuse to boot: the ceiling is
+    // cross-repo-coupled and an operator may legitimately need to boot with a
+    // larger grace period before the iac repo catches up.
+
+    fn clear_shutdown_ceiling_env() {
+        std::env::remove_var("SHUTDOWN_GRACE_PERIOD_CEILING_SECS");
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_shutdown_grace_ceiling_default() {
+        clear_shutdown_ceiling_env();
+
+        // Default matches DEFAULT_SHUTDOWN_GRACE_CEILING_SECS. Chosen to be
+        // an upper bound that covers the iac PR's 60–90s range with headroom.
+        assert_eq!(
+            parse_shutdown_grace_ceiling(),
+            Duration::from_secs(DEFAULT_SHUTDOWN_GRACE_CEILING_SECS)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_shutdown_grace_ceiling_override() {
+        clear_shutdown_ceiling_env();
+        std::env::set_var("SHUTDOWN_GRACE_PERIOD_CEILING_SECS", "60");
+
+        assert_eq!(parse_shutdown_grace_ceiling(), Duration::from_secs(60));
+
+        clear_shutdown_ceiling_env();
+    }
+
+    #[test]
+    fn test_shutdown_timings_total_budget() {
+        let t = ShutdownTimings {
+            pre_drain: Duration::from_secs(10),
+            http_drain: Duration::from_secs(45),
+            signer_drain: Duration::from_secs(10),
+        };
+        assert_eq!(t.total_budget(), Duration::from_secs(65));
+    }
+
+    #[test]
+    fn test_validate_shutdown_timings_ok_when_under_ceiling() {
+        // Default timings (65s) + teardown margin (10s) = 75s. A 75s or
+        // larger ceiling must validate cleanly; this is the iac PR's target.
+        let t = ShutdownTimings {
+            pre_drain: Duration::from_secs(10),
+            http_drain: Duration::from_secs(45),
+            signer_drain: Duration::from_secs(10),
+        };
+
+        assert!(validate_shutdown_timings(&t, Duration::from_secs(75)).is_ok());
+        assert!(validate_shutdown_timings(&t, Duration::from_secs(90)).is_ok());
+    }
+
+    #[test]
+    fn test_validate_shutdown_timings_error_when_over_ceiling() {
+        // The 65s default budget + 10s margin does NOT fit a 60s grace
+        // period. This is the concrete failure mode flagged in review:
+        // if the sibling iac PR lands with terminationGracePeriodSeconds=60,
+        // the kubelet will SIGKILL mid-signer-drain. Validation must catch
+        // this and return a descriptive error string.
+        let t = ShutdownTimings {
+            pre_drain: Duration::from_secs(10),
+            http_drain: Duration::from_secs(45),
+            signer_drain: Duration::from_secs(10),
+        };
+
+        let err = validate_shutdown_timings(&t, Duration::from_secs(60))
+            .expect_err("65s budget + 10s margin must not fit in 60s ceiling");
+        // Error message should be operator-actionable: include the total,
+        // the margin, and the ceiling so they can tune either side.
+        assert!(err.contains("65"), "error should name total budget: {err}");
+        assert!(err.contains("60"), "error should name ceiling: {err}");
+    }
+
+    #[test]
+    fn test_validate_shutdown_timings_error_when_single_field_exceeds_ceiling() {
+        // Operator misconfig: SHUTDOWN_HTTP_DRAIN_SECS=120 against default
+        // 75s ceiling. Single-field overshoot must still be caught.
+        let t = ShutdownTimings {
+            pre_drain: Duration::from_secs(10),
+            http_drain: Duration::from_secs(120),
+            signer_drain: Duration::from_secs(10),
+        };
+
+        assert!(validate_shutdown_timings(&t, Duration::from_secs(75)).is_err());
+    }
+
+    #[test]
+    fn test_validate_shutdown_timings_boundary_exactly_at_ceiling() {
+        // total_budget + SHUTDOWN_TEARDOWN_MARGIN = 65 + 10 = 75.
+        // A ceiling of 75 means the teardown margin exactly fits — that is
+        // precisely what the margin is reserved for, so accept. The iac
+        // PR's terminationGracePeriodSeconds=75s should validate cleanly
+        // against the defaults with no operator action.
+        let t = ShutdownTimings {
+            pre_drain: Duration::from_secs(10),
+            http_drain: Duration::from_secs(45),
+            signer_drain: Duration::from_secs(10),
+        };
+
+        // Exactly the ceiling: OK (margin fits).
+        assert!(validate_shutdown_timings(&t, Duration::from_secs(75)).is_ok());
+        // One second below: reject — margin no longer fits.
+        assert!(validate_shutdown_timings(&t, Duration::from_secs(74)).is_err());
+        // One second above: OK — extra headroom.
+        assert!(validate_shutdown_timings(&t, Duration::from_secs(76)).is_ok());
     }
 }
