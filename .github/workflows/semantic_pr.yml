@@ -9,5 +9,4 @@ permissions:
 
 jobs:
   semantic-pull-request:
-    uses: VeryGoodOpenSource/very_good_workflows/.github/workflows/semantic_pull_request.yml@v1
-
+    uses: VeryGoodOpenSource/very_good_workflows/.github/workflows/semantic_pull_request.yml@c2e27845f65775943bc310b3ab89e5c5432b8d4d # v1
