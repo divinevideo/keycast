@@ -1,6 +1,7 @@
 // ABOUTME: Repository module for data access operations
 // ABOUTME: Provides abstraction layer between handlers and database
 
+mod admin_audit_event;
 mod atproto_oauth_session;
 mod auth_event;
 mod authorization;
@@ -16,6 +17,9 @@ mod stored_key;
 mod team;
 mod user;
 
+pub use admin_audit_event::{
+    AdminAuditEventRecord, AdminAuditEventRepository, AdminAuditEventRow,
+};
 pub use atproto_oauth_session::{
     AtprotoOAuthSession, AtprotoOAuthSessionRepository, CreateAtprotoOAuthSessionParams,
     IssueAtprotoTokensParams,
