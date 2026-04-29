@@ -204,6 +204,57 @@ async fn pre_drain_pause(unready: &Arc<AtomicBool>, duration: Duration) {
     }
 }
 
+/// Result of awaiting the axum HTTP server's graceful-shutdown future with a
+/// bounded budget.
+#[derive(Debug)]
+enum HttpDrainOutcome {
+    /// The server finished its graceful-shutdown future before the budget ran
+    /// out. Join errors are logged by the caller but do not change the phase.
+    Completed,
+    /// The budget expired before the server finished. The task was aborted
+    /// and awaited to cancellation; the caller can safely proceed to phase 3
+    /// (relay teardown) and phase 4 (DB pool close) without racing a
+    /// still-live accept loop.
+    AbortedAfterTimeout,
+}
+
+/// Await the axum server's `JoinHandle` for up to `budget`. If it finishes
+/// in time, return `Completed`. Otherwise call `abort()` on the task,
+/// await its cancellation, and return `AbortedAfterTimeout`.
+///
+/// This exists because dropping a `tokio::task::JoinHandle` does NOT cancel
+/// the underlying task — the axum server would keep running concurrently
+/// with the relay-teardown and DB-pool-close phases, causing decode errors
+/// on late-arriving requests and forcing the kubelet SIGKILL to be the
+/// ultimate stop. The abort makes the HTTP drain budget a real bound on
+/// axum's lifetime.
+async fn drain_http_or_abort(
+    mut handle: tokio::task::JoinHandle<()>,
+    budget: Duration,
+) -> HttpDrainOutcome {
+    // `JoinHandle<T>` is `Unpin` and implements `Future<Output = Result<T,
+    // JoinError>>`, so `&mut handle` can be awaited by `timeout` without
+    // consuming it. This lets us still call `abort()` on the same handle on
+    // the timeout path.
+    match tokio::time::timeout(budget, &mut handle).await {
+        Ok(join_result) => {
+            if let Err(e) = join_result {
+                tracing::warn!("API server task error: {:?}", e);
+            }
+            HttpDrainOutcome::Completed
+        }
+        Err(_) => {
+            handle.abort();
+            // Await cancellation so we don't return while the accept loop is
+            // still being torn down. A cancelled task completes quickly; if
+            // it somehow doesn't, the outer kubelet grace period is still
+            // the final backstop, so no second timeout here.
+            let _ = (&mut handle).await;
+            HttpDrainOutcome::AbortedAfterTimeout
+        }
+    }
+}
+
 #[derive(Clone)]
 struct LivenessState {
     shutting_down: Arc<AtomicBool>,
@@ -1334,16 +1385,18 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         elapsed_secs = shutdown_started_at.elapsed().as_secs(),
         "Graceful shutdown: draining HTTP (axum with_graceful_shutdown)"
     );
-    match tokio::time::timeout(timings.http_drain, api_handle).await {
-        Ok(result) => {
-            if let Err(e) = result {
-                tracing::warn!("API server task error: {:?}", e);
-            }
-        }
-        Err(_) => {
+    match drain_http_or_abort(api_handle, timings.http_drain).await {
+        HttpDrainOutcome::Completed => {}
+        HttpDrainOutcome::AbortedAfterTimeout => {
+            // Axum did not finish its graceful-shutdown future in time, so
+            // we aborted the task. Log at warn — this means either (a) a
+            // handler hung for longer than the drain budget, or (b) there
+            // are stuck upstream connections. Either way, phase 3 (relay
+            // teardown) and phase 4 (DB pool close) can now proceed
+            // without racing a still-live accept loop.
             tracing::warn!(
                 http_drain_secs = timings.http_drain.as_secs(),
-                "API server shutdown timed out"
+                "API server shutdown timed out; axum task aborted to prevent DB pool close from racing late requests"
             );
         }
     }
@@ -2007,6 +2060,79 @@ mod tests {
         };
 
         assert!(validate_shutdown_timings(&t, Duration::from_secs(75)).is_err());
+    }
+
+    // --- HTTP drain abort-on-timeout ---
+    //
+    // On shutdown, the HTTP drain phase waits up to `SHUTDOWN_HTTP_DRAIN_SECS`
+    // for axum's `.with_graceful_shutdown()` future to complete. The axum
+    // task is a raw `tokio::spawn`, NOT on TaskTracker. Previously the
+    // timeout arm just logged "API server shutdown timed out" and fell
+    // through — but dropping a JoinHandle does NOT cancel the underlying
+    // task (std+tokio semantics). axum would keep running (potentially
+    // still accepting / serving new connections) during phase 3 (relay
+    // client teardown) and phase 4 (DB pool close), with pool-close
+    // generating decode errors on late-arriving requests until the kubelet
+    // SIGKILL finally stopped the process at terminationGracePeriodSeconds.
+    // The abort-on-timeout helper below makes the budget a real bound.
+
+    #[tokio::test(start_paused = true)]
+    async fn test_drain_http_or_abort_returns_completed_when_task_finishes_before_budget() {
+        // Fast path: if the spawned task completes inside the drain budget,
+        // we should report Completed and not touch abort().
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        let outcome = drain_http_or_abort(handle, Duration::from_secs(5)).await;
+
+        assert!(
+            matches!(outcome, HttpDrainOutcome::Completed),
+            "expected Completed, got {:?}",
+            outcome
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_drain_http_or_abort_aborts_task_when_budget_exceeded() {
+        // The behavioral promise: if the axum task is still running at the
+        // end of the HTTP drain budget, drain_http_or_abort must stop it
+        // before returning so phase 3 (relay teardown) and phase 4 (DB pool
+        // close) aren't racing a still-live accept loop.
+        //
+        // We spawn a task that would sleep for an hour; with a 5s drain
+        // budget the helper must abort it. After the helper returns, the
+        // spawned task must be finished (cancelled), NOT still pending.
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_flag_task = cancel_flag.clone();
+
+        let handle = tokio::spawn(async move {
+            // Use an async block with a drop guard so we can observe that
+            // the task was actually cancelled, not just left pending.
+            struct CancelSignal(Arc<AtomicBool>);
+            impl Drop for CancelSignal {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Relaxed);
+                }
+            }
+            let _guard = CancelSignal(cancel_flag_task);
+
+            // Would sleep for an hour if not aborted.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        });
+
+        let outcome = drain_http_or_abort(handle, Duration::from_secs(5)).await;
+
+        assert!(
+            matches!(outcome, HttpDrainOutcome::AbortedAfterTimeout),
+            "expected AbortedAfterTimeout, got {:?}",
+            outcome
+        );
+        assert!(
+            cancel_flag.load(Ordering::Relaxed),
+            "drain_http_or_abort must abort the spawned task — task drop guard did not fire, meaning the task is still running past the HTTP drain budget"
+        );
     }
 
     #[test]
