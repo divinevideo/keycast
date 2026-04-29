@@ -1761,10 +1761,12 @@ pub async fn delete_registered_client(
     )
     .await;
 
+    let admin_display = &auth.pubkey[..8];
     tracing::info!(
-        "Registered client deleted: id={} client_id={}",
+        "Registered client deleted: id={} client_id={} (by admin {})",
         deleted.id,
-        deleted.client_id
+        deleted.client_id,
+        admin_display
     );
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
