@@ -106,11 +106,7 @@ impl RegisteredClientRepository {
     }
 
     /// Get a single registered client by id, scoped to a tenant.
-    pub async fn get(
-        &self,
-        id: i32,
-        tenant_id: i64,
-    ) -> Result<RegisteredClient, RepositoryError> {
+    pub async fn get(&self, id: i32, tenant_id: i64) -> Result<RegisteredClient, RepositoryError> {
         let row = sqlx::query_as::<_, RegisteredClient>(
             "SELECT id, tenant_id::BIGINT AS tenant_id, client_id, name,
                     allowed_redirect_uris, created_at, updated_at
@@ -182,9 +178,8 @@ impl RegisteredClientRepository {
         }
 
         // Trim each redirect URI before persisting to ensure consistent matching.
-        let trimmed_uris: Option<Vec<String>> = allowed_redirect_uris.map(|uris| {
-            uris.iter().map(|s| s.trim().to_string()).collect()
-        });
+        let trimmed_uris: Option<Vec<String>> =
+            allowed_redirect_uris.map(|uris| uris.iter().map(|s| s.trim().to_string()).collect());
 
         // COALESCE pattern lets us patch either field without separate queries.
         let row = sqlx::query_as::<_, RegisteredClient>(
@@ -214,13 +209,11 @@ impl RegisteredClientRepository {
     /// Delete a registered client. Tenant-scoped.
     /// Returns NotFound if no row matches (id, tenant_id).
     pub async fn delete(&self, id: i32, tenant_id: i64) -> Result<(), RepositoryError> {
-        let result = sqlx::query(
-            "DELETE FROM registered_clients WHERE id = $1 AND tenant_id = $2",
-        )
-        .bind(id)
-        .bind(tenant_id)
-        .execute(&self.pool)
-        .await?;
+        let result = sqlx::query("DELETE FROM registered_clients WHERE id = $1 AND tenant_id = $2")
+            .bind(id)
+            .bind(tenant_id)
+            .execute(&self.pool)
+            .await?;
 
         if result.rows_affected() == 0 {
             return Err(RepositoryError::NotFound(format!(
@@ -267,12 +260,10 @@ fn validate_redirect_uri_list(uris: &[String]) -> Result<(), RepositoryError> {
         // Must have 0 or 1 asterisk (wildcard), not multiple.
         let asterisk_count = uri.matches('*').count();
         if asterisk_count > 1 {
-            return Err(RepositoryError::Integrity(
-                format!(
-                    "pattern '{}' has {} wildcards; expected 0 (exact) or 1 (wildcard)",
-                    uri, asterisk_count
-                ),
-            ));
+            return Err(RepositoryError::Integrity(format!(
+                "pattern '{}' has {} wildcards; expected 0 (exact) or 1 (wildcard)",
+                uri, asterisk_count
+            )));
         }
     }
     Ok(())

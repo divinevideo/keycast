@@ -16,7 +16,11 @@ use crate::secret_types::DecryptedPlaintext;
 /// This prevents producing events where event.pubkey disagrees with the keypair
 /// that signed it, breaking downstream Schnorr verification.
 /// The `event_name` is used in the log event field for telemetry distinction.
-pub fn canonicalize_event_author(unsigned: &mut UnsignedEvent, signer_pubkey: PublicKey, event_name: &str) {
+pub fn canonicalize_event_author(
+    unsigned: &mut UnsignedEvent,
+    signer_pubkey: PublicKey,
+    event_name: &str,
+) {
     if unsigned.pubkey != signer_pubkey {
         tracing::warn!(
             event = event_name,
@@ -90,7 +94,11 @@ impl SigningSession {
         let keys = self.keys.clone();
         let signer_pubkey = keys.public_key();
 
-        canonicalize_event_author(&mut unsigned, signer_pubkey, "signing_session.pubkey_canonicalized");
+        canonicalize_event_author(
+            &mut unsigned,
+            signer_pubkey,
+            "signing_session.pubkey_canonicalized",
+        );
 
         tokio::task::spawn_blocking(move || {
             // Run the async sign on the blocking thread pool

@@ -38,8 +38,10 @@ async fn create_then_list_returns_row_for_tenant() {
             TENANT_A,
             "test-client-1",
             "Test Client 1",
-            &["https://app.example.com/cb".to_string(),
-                "https://*.preview.example.com/cb".to_string()],
+            &[
+                "https://app.example.com/cb".to_string(),
+                "https://*.preview.example.com/cb".to_string(),
+            ],
         )
         .await
         .unwrap();
@@ -158,12 +160,7 @@ async fn create_rejects_empty_client_id() {
     let repo = fresh_repo(&["test-empty-id"]).await;
 
     let err = repo
-        .create(
-            TENANT_A,
-            "",
-            "X",
-            &["https://example.com/cb".to_string()],
-        )
+        .create(TENANT_A, "", "X", &["https://example.com/cb".to_string()])
         .await
         .unwrap_err();
     assert!(
@@ -232,8 +229,10 @@ async fn update_renames_and_replaces_uris() {
             created.id,
             TENANT_A,
             Some("Renamed"),
-            Some(&["https://example.com/cb".to_string(),
-                "https://*.preview.example.com/cb".to_string()]),
+            Some(&[
+                "https://example.com/cb".to_string(),
+                "https://*.preview.example.com/cb".to_string(),
+            ]),
         )
         .await
         .unwrap();
@@ -337,18 +336,18 @@ fn test_pattern_matches_exact_uri() {
 }
 
 #[test]
-    fn test_pattern_matches_wildcard_subdomain() {
-        use keycast_core::repositories::test_redirect_pattern;
-        assert!(test_redirect_pattern(
-            "https://*.example.com/cb",
-            "https://staging.example.com/cb"
-        ));
-        // Wildcard segment cannot contain '/'
-        assert!(!test_redirect_pattern(
-            "https://*.example.com/cb",
-            "https://evil.com/.example.com/cb"
-        ));
-    }
+fn test_pattern_matches_wildcard_subdomain() {
+    use keycast_core::repositories::test_redirect_pattern;
+    assert!(test_redirect_pattern(
+        "https://*.example.com/cb",
+        "https://staging.example.com/cb"
+    ));
+    // Wildcard segment cannot contain '/'
+    assert!(!test_redirect_pattern(
+        "https://*.example.com/cb",
+        "https://evil.com/.example.com/cb"
+    ));
+}
 
 #[tokio::test]
 async fn create_trims_redirect_uri_whitespace() {
