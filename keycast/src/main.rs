@@ -85,6 +85,15 @@ const DEFAULT_SHUTDOWN_GRACE_CEILING_SECS: u64 = 120;
 /// budgets fit.
 const SHUTDOWN_TEARDOWN_MARGIN: Duration = Duration::from_secs(10);
 
+/// Per-field sanity ceiling on each `SHUTDOWN_*_SECS` env var. Values above
+/// this fall back to the per-field default with a warning. 1 day is far
+/// above any plausible operational value (real drains are seconds, not
+/// hours) but prevents a typo like `SHUTDOWN_PRE_DRAIN_SECS=18446744073709551600`
+/// from making `ShutdownTimings::total_budget()` overflow — which would
+/// panic before the validate-and-warn path could surface an operator-actionable
+/// message. Three fields at the ceiling sum to 3 days, comfortably inside u64.
+const SHUTDOWN_PER_FIELD_CEILING_SECS: u64 = 24 * 3600;
+
 /// Parsed shutdown phase timings. See the `DEFAULT_SHUTDOWN_*` constants and
 /// the graceful-shutdown sequence in `async_main` for the phase breakdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,11 +116,27 @@ impl ShutdownTimings {
 }
 
 /// Read a non-negative integer duration (in seconds) from the given env var,
-/// falling back to `default_secs` if unset or unparseable. Zero is a valid
-/// value and is respected (not treated as "use default").
+/// falling back to `default_secs` if unset, unparseable, or above
+/// `SHUTDOWN_PER_FIELD_CEILING_SECS`. Zero is a valid value and is respected
+/// (not treated as "use default").
+///
+/// The per-field ceiling prevents an operator typo near `u64::MAX` from
+/// propagating into `ShutdownTimings::total_budget()` where the `+` sum
+/// would panic on overflow — which would abort the process before the
+/// validate-and-warn path could surface an operator-actionable message.
 fn parse_duration_secs_env(var: &str, default_secs: u64) -> Duration {
     match env::var(var) {
         Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) if secs > SHUTDOWN_PER_FIELD_CEILING_SECS => {
+                tracing::warn!(
+                    env_var = var,
+                    value = secs,
+                    ceiling_secs = SHUTDOWN_PER_FIELD_CEILING_SECS,
+                    default_secs,
+                    "Shutdown timing env var exceeds per-field sanity ceiling; using default"
+                );
+                Duration::from_secs(default_secs)
+            }
             Ok(secs) => Duration::from_secs(secs),
             Err(_) => {
                 tracing::warn!(
@@ -1968,6 +1993,98 @@ mod tests {
         assert_eq!(timings.pre_drain, Duration::from_secs(10));
 
         clear_shutdown_env();
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_shutdown_timings_rejects_u64_max_and_falls_back_to_default() {
+        // Regression: if a misconfig sets SHUTDOWN_PRE_DRAIN_SECS near
+        // u64::MAX, `Duration::from_secs` itself is fine but the later
+        // `total_budget()` sum with `+` panics on overflow. That aborts
+        // the process before the validate-and-warn path can run, turning
+        // an operator misconfig into a raw crashloop. Parsing must clamp
+        // or reject any value above SHUTDOWN_PER_FIELD_CEILING_SECS so
+        // the sum can never overflow.
+        clear_shutdown_env();
+        std::env::set_var(
+            "SHUTDOWN_PRE_DRAIN_SECS",
+            "18446744073709551600", // u64::MAX - 15, well above the ceiling
+        );
+
+        let timings = parse_shutdown_timings();
+
+        // Fell back to default (10s), NOT the u64::MAX-ish value.
+        assert_eq!(timings.pre_drain, Duration::from_secs(10));
+
+        // And the downstream total_budget() MUST NOT panic. This is the
+        // actual safety property — the validate-and-warn path must be
+        // reachable even under this misconfig.
+        let _ = timings.total_budget(); // must not panic
+
+        clear_shutdown_env();
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_shutdown_timings_rejects_value_above_per_field_ceiling() {
+        // Exactly one second above the ceiling. Reject and fall back to
+        // default so total_budget cannot overflow and the warn-with-context
+        // path in validate_shutdown_timings still runs.
+        clear_shutdown_env();
+        let too_big = SHUTDOWN_PER_FIELD_CEILING_SECS + 1;
+        std::env::set_var("SHUTDOWN_HTTP_DRAIN_SECS", too_big.to_string());
+
+        let timings = parse_shutdown_timings();
+
+        assert_eq!(
+            timings.http_drain,
+            Duration::from_secs(DEFAULT_SHUTDOWN_HTTP_DRAIN_SECS),
+            "value above per-field ceiling must fall back to default"
+        );
+
+        clear_shutdown_env();
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_shutdown_timings_accepts_value_at_per_field_ceiling() {
+        // The ceiling itself is a legitimate value (though far above any
+        // real operational setting). Reject only values strictly greater
+        // than the ceiling, so operators can explicitly opt into the max
+        // if they know what they are doing.
+        clear_shutdown_env();
+        std::env::set_var(
+            "SHUTDOWN_PRE_DRAIN_SECS",
+            SHUTDOWN_PER_FIELD_CEILING_SECS.to_string(),
+        );
+
+        let timings = parse_shutdown_timings();
+
+        assert_eq!(
+            timings.pre_drain,
+            Duration::from_secs(SHUTDOWN_PER_FIELD_CEILING_SECS)
+        );
+
+        clear_shutdown_env();
+    }
+
+    #[test]
+    fn test_total_budget_no_overflow_at_per_field_ceiling() {
+        // Safety property: with every field at the per-field ceiling,
+        // total_budget() must not panic and must stay comfortably inside
+        // u64 range. 3 * 86400 = 259200s = 3 days, far below u64::MAX.
+        let t = ShutdownTimings {
+            pre_drain: Duration::from_secs(SHUTDOWN_PER_FIELD_CEILING_SECS),
+            http_drain: Duration::from_secs(SHUTDOWN_PER_FIELD_CEILING_SECS),
+            signer_drain: Duration::from_secs(SHUTDOWN_PER_FIELD_CEILING_SECS),
+        };
+
+        // Must not panic.
+        let total = t.total_budget();
+        assert_eq!(
+            total,
+            Duration::from_secs(3 * SHUTDOWN_PER_FIELD_CEILING_SECS)
+        );
     }
 
     #[tokio::test(start_paused = true)]
