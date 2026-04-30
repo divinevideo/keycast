@@ -204,6 +204,44 @@ async fn pre_drain_pause(unready: &Arc<AtomicBool>, duration: Duration) {
     }
 }
 
+/// Result of awaiting the DB pool's close future with the documented
+/// teardown margin as an upper bound.
+#[derive(Debug)]
+enum PoolCloseOutcome {
+    /// The pool finished closing before the margin elapsed. The caller can
+    /// emit the clean "Graceful shutdown complete" log.
+    Completed,
+    /// The margin elapsed before the pool finished. The caller logs a
+    /// warning and proceeds — the kubelet SIGKILL at
+    /// `terminationGracePeriodSeconds` is the final backstop.
+    TimedOut,
+}
+
+/// Await `close_fut` for up to `margin`. If it finishes in time, return
+/// `Completed`; otherwise return `TimedOut`. The close future is dropped on
+/// timeout — sqlx's `Pool::close()` is cancellation-safe, and we would not
+/// gain anything by continuing to await past the documented margin when the
+/// kubelet is about to SIGKILL us anyway.
+///
+/// This enforces `SHUTDOWN_TEARDOWN_MARGIN` as a real bound on phase 4 so a
+/// stuck DB connection (e.g. a preload task mid-query when
+/// `task_tracker.wait()` timed out and `signer_handle.abort()` was called
+/// but not awaited) cannot block past `terminationGracePeriodSeconds` and
+/// swallow the final "Graceful shutdown complete" log.
+///
+/// Generic over `F: Future<Output = ()>` so we can exercise the timeout
+/// behaviour deterministically with `tokio::time::pause` in tests without
+/// standing up a real Postgres pool.
+async fn close_within_margin<F>(close_fut: F, margin: Duration) -> PoolCloseOutcome
+where
+    F: std::future::Future<Output = ()>,
+{
+    match tokio::time::timeout(margin, close_fut).await {
+        Ok(()) => PoolCloseOutcome::Completed,
+        Err(_) => PoolCloseOutcome::TimedOut,
+    }
+}
+
 /// Result of awaiting the axum HTTP server's graceful-shutdown future with a
 /// bounded budget.
 #[derive(Debug)]
@@ -1426,13 +1464,28 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         }
     }
 
-    // Phase 4: close database pool.
-    pool_for_shutdown.close().await;
-
-    tracing::info!(
-        total_shutdown_secs = shutdown_started_at.elapsed().as_secs(),
-        "Graceful shutdown complete"
-    );
+    // Phase 4: close database pool. Bounded by SHUTDOWN_TEARDOWN_MARGIN so
+    // a connection stuck in a long-running query (e.g. a tenant-cache
+    // preload task mid-query when task_tracker.wait() timed out and
+    // signer_handle.abort() was called but not awaited) cannot block past
+    // the kubelet SIGKILL and swallow the final "Graceful shutdown
+    // complete" log. sqlx's Pool::close is cancellation-safe, so dropping
+    // the future on timeout is safe.
+    match close_within_margin(pool_for_shutdown.close(), SHUTDOWN_TEARDOWN_MARGIN).await {
+        PoolCloseOutcome::Completed => {
+            tracing::info!(
+                total_shutdown_secs = shutdown_started_at.elapsed().as_secs(),
+                "Graceful shutdown complete"
+            );
+        }
+        PoolCloseOutcome::TimedOut => {
+            tracing::warn!(
+                total_shutdown_secs = shutdown_started_at.elapsed().as_secs(),
+                teardown_margin_secs = SHUTDOWN_TEARDOWN_MARGIN.as_secs(),
+                "Graceful shutdown complete with warning: DB pool close exceeded teardown margin; stuck checked-out connections were dropped"
+            );
+        }
+    }
 
     Ok(())
 }
@@ -2154,5 +2207,78 @@ mod tests {
         assert!(validate_shutdown_timings(&t, Duration::from_secs(74)).is_err());
         // One second above: OK — extra headroom.
         assert!(validate_shutdown_timings(&t, Duration::from_secs(76)).is_ok());
+    }
+
+    // --- Phase 4 bounded DB pool close ---
+    //
+    // sqlx's `Pool::close()` waits for every checked-out connection to be
+    // returned to the pool. If a long-running query is still outstanding
+    // when we enter phase 4 (e.g. a tenant-cache preload task was mid-query
+    // when task_tracker.wait() timed out and signer_handle.abort() was
+    // called but did not await), close can block indefinitely into the
+    // kubelet SIGKILL. That swallows the final "Graceful shutdown complete"
+    // log, so operators have no positive signal of clean shutdown.
+    // close_within_margin enforces the documented SHUTDOWN_TEARDOWN_MARGIN
+    // as a real bound.
+
+    #[tokio::test(start_paused = true)]
+    async fn test_close_within_margin_returns_completed_when_future_finishes_before_margin() {
+        // Fast path: close completes immediately. Should report Completed
+        // so the caller can emit the clean "Graceful shutdown complete"
+        // log with no warning.
+        let close_fut = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+
+        let outcome = close_within_margin(close_fut, Duration::from_secs(10)).await;
+
+        assert!(
+            matches!(outcome, PoolCloseOutcome::Completed),
+            "expected Completed, got {:?}",
+            outcome
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_close_within_margin_reports_timed_out_when_margin_exceeded() {
+        // Slow path: close blocks past the margin. Should report TimedOut
+        // so the caller logs a warning and proceeds — we cannot hang the
+        // process on pool teardown when the kubelet SIGKILL is about to
+        // hit us anyway.
+        let close_fut = async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        };
+
+        let outcome = close_within_margin(close_fut, Duration::from_secs(10)).await;
+
+        assert!(
+            matches!(outcome, PoolCloseOutcome::TimedOut),
+            "expected TimedOut, got {:?}",
+            outcome
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_close_within_margin_enforces_real_bound_past_margin() {
+        // A close future that blocks well past the margin must NOT extend
+        // the helper's runtime past `margin`. We measure virtual time
+        // elapsed under start_paused: it must be exactly the margin (not
+        // the 1h sleep). This is the safety property the reviewer asked
+        // for — phase 4 cannot eat into the kubelet's SIGKILL window.
+        let start = tokio::time::Instant::now();
+        let margin = Duration::from_secs(10);
+        let close_fut = async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        };
+
+        let _outcome = close_within_margin(close_fut, margin).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed <= margin + Duration::from_millis(100),
+            "close_within_margin must return within the margin, not block on the inner future; elapsed={:?}, margin={:?}",
+            elapsed,
+            margin
+        );
     }
 }
