@@ -281,6 +281,73 @@ enum HttpDrainOutcome {
     AbortedAfterTimeout,
 }
 
+/// Result of awaiting phase 3 (relay client teardown + tracked task drain)
+/// under the `signer_drain` budget.
+#[derive(Debug)]
+enum SignerDrainOutcome {
+    /// Both `client.shutdown()` and `task_tracker.wait()` finished before
+    /// the shared phase budget elapsed.
+    Completed,
+    /// The shared phase budget elapsed before both futures finished. The
+    /// abort callback was invoked to stop the signer task; the caller can
+    /// safely proceed to phase 4 (DB pool close).
+    AbortedAfterTimeout,
+}
+
+/// Run phase 3 under a single shared `budget`: await `client_shutdown`
+/// (which stops `signer.run()` and the relay worker loop so in-flight
+/// sign responses can still be published on the way out) followed by
+/// `tracker_wait` (which waits for tracked background tasks to finish).
+///
+/// On timeout the caller-supplied `abort_signer` callback is invoked —
+/// in production this calls `signer_handle.abort()` — and the helper
+/// returns `AbortedAfterTimeout`. The entire phase is bounded by
+/// `budget` via one outer `tokio::time::timeout`, so the helper returns
+/// in at most `budget` regardless of which sub-future (or both) hangs.
+///
+/// Why one shared budget, not two independent ones: the design contract
+/// enforced by `validate_shutdown_timings` is
+/// `pre_drain + http_drain + signer_drain + SHUTDOWN_TEARDOWN_MARGIN
+/// <= terminationGracePeriodSeconds`. If each inner await got its own
+/// `budget`-sized timeout, phase 3 could take up to `2 * signer_drain`
+/// in the worst case and silently bust the contract.
+///
+/// Previously `client_shutdown` (`nostr_sdk::Client::shutdown`) was
+/// awaited unbounded in `async_main` and only the trailing `tracker_wait`
+/// was wrapped in `timeout(signer_drain, ...)`. A hung WebSocket close
+/// handshake, a bug in `Client::shutdown`, or a dead relay socket would
+/// therefore block phase 3 past the kubelet SIGKILL at
+/// `terminationGracePeriodSeconds`, swallowing phase 4 entirely. This
+/// helper makes `signer_drain` a real phase-3 bound.
+///
+/// Generic over both inner futures and the abort callback so the timeout
+/// behaviour can be exercised deterministically with `tokio::time::pause`
+/// in tests without standing up a real `nostr_sdk::Client` or a real
+/// signer `JoinHandle`.
+async fn drain_signer_or_abort<C, W, A>(
+    client_shutdown: C,
+    tracker_wait: W,
+    abort_signer: A,
+    budget: Duration,
+) -> SignerDrainOutcome
+where
+    C: std::future::Future<Output = ()>,
+    W: std::future::Future<Output = ()>,
+    A: FnOnce(),
+{
+    let combined = async move {
+        client_shutdown.await;
+        tracker_wait.await;
+    };
+    match tokio::time::timeout(budget, combined).await {
+        Ok(()) => SignerDrainOutcome::Completed,
+        Err(_) => {
+            abort_signer();
+            SignerDrainOutcome::AbortedAfterTimeout
+        }
+    }
+}
+
 /// Await the axum server's `JoinHandle` for up to `budget`. If it finishes
 /// in time, return `Completed`. Otherwise call `abort()` on the task,
 /// await its cancellation, and return `AbortedAfterTimeout`.
@@ -1470,22 +1537,36 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     // complete and publish responses back to the requesting client before we
     // disconnect from the relays. `ClusterCoordinator` will be dropped
     // automatically on return, triggering deregister.
+    //
+    // `drain_signer_or_abort` applies ONE outer `tokio::time::timeout`
+    // at `timings.signer_drain` across both awaits so `signer_drain`
+    // is a real bound on the whole of phase 3 — previously only the
+    // trailing `task_tracker.wait()` was bounded, leaving
+    // `client_for_shutdown.shutdown()` (a nostr_sdk WebSocket close
+    // handshake) unbounded in practice. A hung close could therefore
+    // blow past `terminationGracePeriodSeconds` and swallow phase 4.
     tracing::info!(
         elapsed_secs = shutdown_started_at.elapsed().as_secs(),
-        "Graceful shutdown: tearing down NIP-46 relay client"
+        "Graceful shutdown: tearing down NIP-46 relay client and draining signer tasks"
     );
-    client_for_shutdown.shutdown().await;
-
-    match tokio::time::timeout(timings.signer_drain, task_tracker.wait()).await {
-        Ok(()) => {
+    let signer_drain_budget = timings.signer_drain;
+    let signer_handle_for_abort = signer_handle;
+    match drain_signer_or_abort(
+        client_for_shutdown.shutdown(),
+        task_tracker.wait(),
+        || signer_handle_for_abort.abort(),
+        signer_drain_budget,
+    )
+    .await
+    {
+        SignerDrainOutcome::Completed => {
             tracing::info!("All tracked tasks completed");
         }
-        Err(_) => {
+        SignerDrainOutcome::AbortedAfterTimeout => {
             tracing::warn!(
-                signer_drain_secs = timings.signer_drain.as_secs(),
-                "Task tracker wait timed out, aborting signer"
+                signer_drain_secs = signer_drain_budget.as_secs(),
+                "Signer drain timed out (client.shutdown() and/or task_tracker.wait() exceeded signer_drain budget); aborted signer"
             );
-            signer_handle.abort();
         }
     }
 
@@ -2396,6 +2477,221 @@ mod tests {
             "close_within_margin must return within the margin, not block on the inner future; elapsed={:?}, margin={:?}",
             elapsed,
             margin
+        );
+    }
+
+    // --- Phase 3 bounded signer drain ---
+    //
+    // Phase 3 runs `client_for_shutdown.shutdown().await` followed by
+    // `task_tracker.wait().await`. Previously `client.shutdown()` was
+    // unbounded: a stuck WebSocket close handshake, a bug in
+    // `nostr_sdk::Client::shutdown`, or a dead relay socket could hang
+    // the phase past `terminationGracePeriodSeconds` and swallow phase 4
+    // entirely. The `signer_drain` timeout only wrapped the trailing
+    // `task_tracker.wait()`, silently busting the design contract
+    // (enforced by `validate_shutdown_timings`) that `pre_drain +
+    // http_drain + signer_drain + SHUTDOWN_TEARDOWN_MARGIN <= ceiling`.
+    //
+    // `drain_signer_or_abort` applies ONE outer `timeout(signer_drain,
+    // ...)` over the whole phase so `signer_drain` is a real bound on
+    // phase 3 regardless of how many awaits are inside. On timeout it
+    // invokes the caller-supplied abort callback (which aborts the
+    // signer JoinHandle in production).
+
+    #[tokio::test(start_paused = true)]
+    async fn test_drain_signer_or_abort_returns_completed_when_both_finish_before_budget() {
+        // Fast path: both client.shutdown() and task_tracker.wait()
+        // complete inside the signer_drain budget. Should report
+        // Completed and NOT invoke the abort callback.
+        let abort_called = Arc::new(AtomicBool::new(false));
+        let abort_called_cb = abort_called.clone();
+        let abort_signer = move || {
+            abort_called_cb.store(true, Ordering::Relaxed);
+        };
+
+        let client_shutdown = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        };
+        let tracker_wait = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        };
+
+        let outcome = drain_signer_or_abort(
+            client_shutdown,
+            tracker_wait,
+            abort_signer,
+            Duration::from_secs(10),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, SignerDrainOutcome::Completed),
+            "expected Completed, got {:?}",
+            outcome
+        );
+        assert!(
+            !abort_called.load(Ordering::Relaxed),
+            "abort_signer must NOT be called on the happy path"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_drain_signer_or_abort_aborts_when_client_shutdown_hangs() {
+        // Regression target: the reviewer-flagged failure mode. The
+        // client.shutdown() future hangs (stuck WebSocket close
+        // handshake). The helper must bound the whole phase at
+        // `signer_drain` and invoke the abort callback — previously
+        // the unbounded client.shutdown().await would have blocked
+        // phase 3 indefinitely.
+        let abort_called = Arc::new(AtomicBool::new(false));
+        let abort_called_cb = abort_called.clone();
+        let abort_signer = move || {
+            abort_called_cb.store(true, Ordering::Relaxed);
+        };
+
+        let client_shutdown = async {
+            // Would hang for an hour if not bounded.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        };
+        let tracker_wait = async {
+            // Never reached because client_shutdown is awaited first
+            // and never completes inside the budget.
+            tokio::time::sleep(Duration::from_secs(0)).await;
+        };
+
+        let outcome = drain_signer_or_abort(
+            client_shutdown,
+            tracker_wait,
+            abort_signer,
+            Duration::from_secs(10),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, SignerDrainOutcome::AbortedAfterTimeout),
+            "expected AbortedAfterTimeout, got {:?}",
+            outcome
+        );
+        assert!(
+            abort_called.load(Ordering::Relaxed),
+            "abort_signer must be called when the signer_drain budget is exceeded by a hung client.shutdown()"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_drain_signer_or_abort_aborts_when_tracker_wait_hangs() {
+        // The other half of the failure space: client.shutdown()
+        // completes cleanly but task_tracker.wait() hangs (a tracked
+        // task stuck in a long-running operation). The whole phase
+        // must still be bounded by `signer_drain` and the signer
+        // handle aborted. This matches the pre-patch behavior for
+        // this specific case but must be preserved under the new
+        // outer-timeout structure.
+        let abort_called = Arc::new(AtomicBool::new(false));
+        let abort_called_cb = abort_called.clone();
+        let abort_signer = move || {
+            abort_called_cb.store(true, Ordering::Relaxed);
+        };
+
+        let client_shutdown = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let tracker_wait = async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        };
+
+        let outcome = drain_signer_or_abort(
+            client_shutdown,
+            tracker_wait,
+            abort_signer,
+            Duration::from_secs(10),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, SignerDrainOutcome::AbortedAfterTimeout),
+            "expected AbortedAfterTimeout, got {:?}",
+            outcome
+        );
+        assert!(
+            abort_called.load(Ordering::Relaxed),
+            "abort_signer must be called when the signer_drain budget is exceeded by a hung tracker_wait"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_drain_signer_or_abort_enforces_real_bound_past_budget() {
+        // The safety property: the helper returns within `budget`
+        // regardless of how long the inner futures would take.
+        // This is what makes `validate_shutdown_timings`'s contract
+        // honest — phase 3 cannot eat into phase 4 or the kubelet
+        // SIGKILL window.
+        let start = tokio::time::Instant::now();
+        let budget = Duration::from_secs(10);
+
+        let client_shutdown = async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        };
+        let tracker_wait = async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        };
+        let abort_signer = || {};
+
+        let _outcome =
+            drain_signer_or_abort(client_shutdown, tracker_wait, abort_signer, budget).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed <= budget + Duration::from_millis(100),
+            "drain_signer_or_abort must return within the signer_drain budget, not block on the inner futures; elapsed={:?}, budget={:?}",
+            elapsed,
+            budget
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_drain_signer_or_abort_shares_budget_across_client_and_tracker() {
+        // Subtle but critical: the phase budget is shared across the
+        // two awaits, NOT applied independently to each. If each got
+        // its own `budget`-sized timeout, phase 3 worst-case would be
+        // `2 * signer_drain`, quietly busting the design contract in
+        // validate_shutdown_timings. This test pins the shared-budget
+        // semantic: client.shutdown() takes 80% of the budget, and
+        // task_tracker.wait() would take another 80% — total 160% of
+        // budget. The helper must time out at exactly `budget`.
+        let start = tokio::time::Instant::now();
+        let budget = Duration::from_secs(10);
+        let abort_called = Arc::new(AtomicBool::new(false));
+        let abort_called_cb = abort_called.clone();
+        let abort_signer = move || {
+            abort_called_cb.store(true, Ordering::Relaxed);
+        };
+
+        let client_shutdown = async {
+            tokio::time::sleep(Duration::from_secs(8)).await;
+        };
+        let tracker_wait = async {
+            tokio::time::sleep(Duration::from_secs(8)).await;
+        };
+
+        let outcome =
+            drain_signer_or_abort(client_shutdown, tracker_wait, abort_signer, budget).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(outcome, SignerDrainOutcome::AbortedAfterTimeout),
+            "8s + 8s > 10s budget; expected AbortedAfterTimeout, got {:?}",
+            outcome
+        );
+        assert!(
+            elapsed <= budget + Duration::from_millis(100),
+            "helper must return at the shared budget, not extend to 2x it; elapsed={:?}, budget={:?}",
+            elapsed,
+            budget
+        );
+        assert!(
+            abort_called.load(Ordering::Relaxed),
+            "abort_signer must be called when the shared phase budget is exceeded by the sum of the two awaits"
         );
     }
 }
