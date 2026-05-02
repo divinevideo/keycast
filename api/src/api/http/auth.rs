@@ -3794,7 +3794,7 @@ mod tests {
         extract::State,
         http::{
             header::{AUTHORIZATION, ORIGIN},
-            HeaderMap, HeaderValue, StatusCode,
+            HeaderMap, HeaderValue,
         },
         Json,
     };
