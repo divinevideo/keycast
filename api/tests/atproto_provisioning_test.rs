@@ -126,6 +126,57 @@ async fn request_enable_posts_crosspost_enabled_flag() {
 
 #[tokio::test]
 #[serial]
+async fn request_enable_fails_closed_when_control_plane_url_is_missing() {
+    std::env::remove_var("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL");
+    let _domain = EnvGuard::set("DIVINE_HANDLE_DOMAIN", "bsky.example");
+
+    let error = keycast_api::atproto_provisioning::request_enable(
+        "npub1missingcontrolplane",
+        "Alice",
+        true,
+    )
+    .await
+    .expect_err("missing control plane should be treated as unavailable");
+
+    assert!(error.is_dependency_unavailable());
+    assert_eq!(
+        error.public_message(),
+        "ATProto enablement is temporarily unavailable. Please try again later."
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn request_enable_classifies_transport_failure_as_dependency_unavailable() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind temporary listener");
+    let address = listener.local_addr().expect("listener address");
+    drop(listener);
+
+    let _base = EnvGuard::set(
+        "DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL",
+        &format!("http://{}", address),
+    );
+    let _domain = EnvGuard::set("DIVINE_HANDLE_DOMAIN", "bsky.example");
+
+    let error = keycast_api::atproto_provisioning::request_enable(
+        "npub1offlinecontrolplane",
+        "Alice",
+        true,
+    )
+    .await
+    .expect_err("offline control plane should fail");
+
+    assert!(error.is_dependency_unavailable());
+    assert_eq!(
+        error.public_message(),
+        "ATProto enablement is temporarily unavailable. Please try again later."
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn request_reenable_posts_enable_endpoint() {
     let (base_url, state) = start_capture_server().await;
     let _base = EnvGuard::set("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL", &base_url);

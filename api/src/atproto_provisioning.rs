@@ -1,11 +1,14 @@
-use reqwest::Client;
+use reqwest::{Client, Url};
 use serde::Serialize;
 
-const DEFAULT_ATPROTO_CONTROL_PLANE_URL: &str = "http://127.0.0.1:3201";
 const DEFAULT_HANDLE_DOMAIN: &str = "divine.video";
+const ATPROTO_UNAVAILABLE_MESSAGE: &str =
+    "ATProto enablement is temporarily unavailable. Please try again later.";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AtprotoProvisioningError {
+    #[error("ATProto control-plane dependency is not configured")]
+    DependencyNotConfigured,
     #[error("request failed: {0}")]
     Request(#[from] reqwest::Error),
     #[error("provisioning service returned {status}: {body}")]
@@ -15,6 +18,24 @@ pub enum AtprotoProvisioningError {
     },
 }
 
+impl AtprotoProvisioningError {
+    pub fn is_dependency_unavailable(&self) -> bool {
+        matches!(
+            self,
+            AtprotoProvisioningError::DependencyNotConfigured
+                | AtprotoProvisioningError::Request(_)
+        )
+    }
+
+    pub fn public_message(&self) -> &'static str {
+        if self.is_dependency_unavailable() {
+            ATPROTO_UNAVAILABLE_MESSAGE
+        } else {
+            "ATProto provisioning failed. Please try again later."
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct EnableProvisioningRequest {
     nostr_pubkey: String,
@@ -22,9 +43,16 @@ struct EnableProvisioningRequest {
     crosspost_enabled: bool,
 }
 
-fn control_plane_base_url() -> String {
-    std::env::var("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL")
-        .unwrap_or_else(|_| DEFAULT_ATPROTO_CONTROL_PLANE_URL.to_string())
+fn control_plane_base_url() -> Result<String, AtprotoProvisioningError> {
+    let base = std::env::var("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or(AtprotoProvisioningError::DependencyNotConfigured)?;
+
+    Url::parse(&base).map_err(|_| AtprotoProvisioningError::DependencyNotConfigured)?;
+
+    Ok(base)
 }
 
 fn handle_domain() -> String {
@@ -46,7 +74,7 @@ pub async fn request_enable(
     username: &str,
     crosspost_enabled: bool,
 ) -> Result<(), AtprotoProvisioningError> {
-    let base = control_plane_base_url();
+    let base = control_plane_base_url()?;
     let domain = handle_domain();
     let url = format!("{}/api/account-links/opt-in", base.trim_end_matches('/'));
     let handle = format!("{}.{}", username.trim().to_ascii_lowercase(), domain);
@@ -72,7 +100,7 @@ pub async fn request_enable(
 }
 
 pub async fn request_reenable(nostr_pubkey: &str) -> Result<(), AtprotoProvisioningError> {
-    let base = control_plane_base_url();
+    let base = control_plane_base_url()?;
     let encoded_pubkey = urlencoding::encode(nostr_pubkey);
     let url = format!(
         "{}/api/account-links/{}/enable",
@@ -93,7 +121,7 @@ pub async fn request_reenable(nostr_pubkey: &str) -> Result<(), AtprotoProvision
 }
 
 pub async fn request_disable(nostr_pubkey: &str) -> Result<(), AtprotoProvisioningError> {
-    let base = control_plane_base_url();
+    let base = control_plane_base_url()?;
     let encoded_pubkey = urlencoding::encode(nostr_pubkey);
     let url = format!(
         "{}/api/account-links/{}/disable",
