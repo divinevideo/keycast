@@ -75,26 +75,28 @@ fn normalize_nip05_username(raw_username: &str) -> Result<String, AuthError> {
     let username = raw_username.trim().to_lowercase();
 
     if username.is_empty() {
-        return Err(AuthError::Internal("Username cannot be empty".to_string()));
+        return Err(AuthError::BadRequest(
+            "Username cannot be empty".to_string(),
+        ));
     }
 
     if !username
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' || c == '.')
     {
-        return Err(AuthError::Internal(
+        return Err(AuthError::BadRequest(
             "Username can only contain a-z, 0-9, hyphens, underscores, and dots".to_string(),
         ));
     }
 
     if username.starts_with('-') || username.ends_with('-') {
-        return Err(AuthError::Internal(
+        return Err(AuthError::BadRequest(
             "Username cannot start or end with a hyphen".to_string(),
         ));
     }
 
     if username.len() > MAX_NIP05_USERNAME_LENGTH {
-        return Err(AuthError::Internal(format!(
+        return Err(AuthError::BadRequest(format!(
             "Username must be at most {} characters",
             MAX_NIP05_USERNAME_LENGTH
         )));
@@ -328,6 +330,7 @@ pub enum AuthError {
         message: String,
         retry_after: Option<u32>,
     },
+    Conflict(String),
 }
 
 impl IntoResponse for AuthError {
@@ -407,6 +410,10 @@ impl IntoResponse for AuthError {
             ),
             AuthError::BadRequest(msg) => (
                 StatusCode::BAD_REQUEST,
+                msg,
+            ),
+            AuthError::Conflict(msg) => (
+                StatusCode::CONFLICT,
                 msg,
             ),
             AuthError::Forbidden(msg) => (
@@ -2232,7 +2239,7 @@ pub async fn update_profile(
                             username,
                             error_msg
                         );
-                        return Err(AuthError::Internal(error_msg));
+                        return Err(AuthError::Conflict(error_msg));
                     }
                 }
                 Err(e) => {
@@ -2253,7 +2260,7 @@ pub async fn update_profile(
             .check_username_available(&username, &user_pubkey, tenant_id)
             .await?
         {
-            return Err(AuthError::Internal("Username already taken".to_string()));
+            return Err(AuthError::Conflict("Username is already taken".to_string()));
         }
 
         // Sync to divine-name-server (if enabled)
