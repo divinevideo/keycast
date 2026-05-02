@@ -34,6 +34,7 @@ pub const EMAIL_VERIFICATION_EXPIRY_HOURS: i64 = 24;
 const PASSWORD_RESET_EXPIRY_HOURS: i64 = 1;
 const DEFAULT_NIP05_DOMAIN: &str = "divine.video";
 const MAX_NIP05_USERNAME_LENGTH: usize = 64;
+pub(crate) const INVALID_EMAIL_CODE: &str = "INVALID_EMAIL";
 
 /// Get token expiry in seconds. Uses `TOKEN_EXPIRY_SECONDS` env var if set,
 /// otherwise defaults to 24 hours (86400 seconds).
@@ -101,6 +102,39 @@ fn normalize_nip05_username(raw_username: &str) -> Result<String, AuthError> {
     }
 
     Ok(username)
+}
+
+pub(crate) fn normalize_registration_email(email: &str) -> Result<String, &'static str> {
+    let normalized = email.trim().to_lowercase();
+
+    if normalized.is_empty()
+        || normalized.len() > 254
+        || normalized.bytes().any(|byte| byte <= b' ' || byte == 0x7f)
+    {
+        return Err(INVALID_EMAIL_CODE);
+    }
+
+    let Some((local, domain)) = normalized.split_once('@') else {
+        return Err(INVALID_EMAIL_CODE);
+    };
+
+    if local.is_empty()
+        || domain.is_empty()
+        || local.contains('@')
+        || domain.contains('@')
+        || local.starts_with('.')
+        || local.ends_with('.')
+        || domain.starts_with('.')
+        || domain.ends_with('.')
+        || local.contains("..")
+        || domain.contains("..")
+        || !domain.contains('.')
+        || domain.split('.').any(str::is_empty)
+    {
+        return Err(INVALID_EMAIL_CODE);
+    }
+
+    Ok(normalized)
 }
 
 /// Generate UCAN token signed by user's key (self-signed)
@@ -4169,5 +4203,39 @@ mod tests {
             result.is_err(),
             "username longer than max boundary should be rejected"
         );
+    }
+
+    #[test]
+    fn test_normalize_registration_email_accepts_common_addresses() {
+        for email in [
+            "person@example.com",
+            "Person+tag@Example.COM",
+            "first.last@sub.example.co.uk",
+        ] {
+            assert!(
+                super::normalize_registration_email(email).is_ok(),
+                "{email} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_registration_email_rejects_malformed_addresses() {
+        for email in [
+            "person@gmail..com",
+            "person@.example.com",
+            "person@example.com.",
+            ".person@example.com",
+            "person.@example.com",
+            "personexample.com",
+            "person@localhost",
+            "person @example.com",
+            "",
+        ] {
+            assert!(
+                super::normalize_registration_email(email).is_err(),
+                "{email} should be rejected"
+            );
+        }
     }
 }
