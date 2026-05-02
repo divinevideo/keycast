@@ -16,6 +16,7 @@ use crate::api::extractors::UcanAuth;
 use crate::bcrypt_queue::{BcryptJob, BcryptQueueError};
 use crate::brand::BRAND_NAME;
 use crate::nip98;
+use crate::password_policy::{validate_new_password, PasswordPolicyError};
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
     CreateOAuthAuthorizationParams, OAuthAuthorizationRepository, OAuthCodeRepository,
@@ -396,6 +397,7 @@ pub enum AuthError {
     EmailSendFailed(String),
     DuplicateKey, // Nostr pubkey already registered (BYOK case)
     InvalidEmail,
+    WeakPassword,
     BadRequest(String),
     Forbidden(String),   // User has no authorization for this origin
     RegistrationExpired, // Async bcrypt timed out (instance died)
@@ -416,6 +418,17 @@ fn has_database_constraint(error: &sqlx::Error, expected_constraint: &str) -> bo
 
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
+        if matches!(self, AuthError::WeakPassword) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": crate::password_policy::WEAK_PASSWORD_MESSAGE,
+                    "code": crate::password_policy::WEAK_PASSWORD_CODE,
+                })),
+            )
+                .into_response();
+        }
+
         let (status, message) = match self {
             AuthError::Database(e)
                 if has_database_constraint(&e, USERS_EMAIL_TENANT_CONSTRAINT) =>
@@ -507,6 +520,7 @@ impl IntoResponse for AuthError {
                 )
                     .into_response();
             },
+            AuthError::WeakPassword => unreachable!("handled before generic error mapping"),
             AuthError::TokenExpired => (
                 StatusCode::UNAUTHORIZED,
                 "Verification code or token has expired. Please request a new one.".to_string(),
@@ -582,6 +596,12 @@ impl From<keycast_core::repositories::RepositoryError> for AuthError {
 impl From<bcrypt::BcryptError> for AuthError {
     fn from(e: bcrypt::BcryptError) -> Self {
         AuthError::PasswordHash(e)
+    }
+}
+
+impl From<PasswordPolicyError> for AuthError {
+    fn from(_: PasswordPolicyError) -> Self {
+        AuthError::WeakPassword
     }
 }
 
@@ -803,6 +823,8 @@ pub async fn register(
     let tenant_id = tenant.0.id;
 
     req.email = normalize_registration_email(&req.email).map_err(|_| AuthError::InvalidEmail)?;
+
+    validate_new_password(&req.password)?;
 
     let instance_id = keycast_core::instance::instance_id();
 
@@ -2199,6 +2221,8 @@ pub async fn reset_password(
         }
     }
 
+    validate_new_password(&req.new_password)?;
+
     // Hash new password (spawn_blocking to avoid blocking async runtime)
     let new_password = req.new_password.clone();
     let password_hash = tokio::task::spawn_blocking(move || hash(&new_password, DEFAULT_COST))
@@ -3291,12 +3315,7 @@ pub async fn change_password(
     let tenant_id = tenant.0.id;
     let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
 
-    // Validate new password length
-    if req.new_password.len() < 8 {
-        return Err(AuthError::BadRequest(
-            "New password must be at least 8 characters".to_string(),
-        ));
-    }
+    validate_new_password(&req.new_password)?;
 
     // Get user's current password hash
     let user_repo = UserRepository::new(pool.clone());
@@ -3662,8 +3681,8 @@ pub async fn delete_account(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_origin;
-    use axum::response::IntoResponse;
+    use super::{validate_origin, AuthError};
+    use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
 
     #[test]
     fn test_validate_origin_https() {
@@ -3742,6 +3761,18 @@ mod tests {
         let body = response_json(response).await;
         assert_eq!(body["code"], super::INVALID_EMAIL_CODE);
         assert_eq!(body["error"], "Please enter a valid email address.");
+    }
+
+    #[tokio::test]
+    async fn weak_password_error_has_stable_code_and_message() {
+        let response = AuthError::WeakPassword.into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(body["code"], crate::password_policy::WEAK_PASSWORD_CODE);
+        assert_eq!(body["error"], crate::password_policy::WEAK_PASSWORD_MESSAGE);
     }
 
     #[cfg(feature = "integration-tests")]

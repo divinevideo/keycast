@@ -22,6 +22,7 @@ use super::auth::{
     INVALID_EMAIL_CODE, INVALID_EMAIL_MESSAGE,
 };
 use super::oauth::{extract_origin, parse_policy_scope};
+use crate::password_policy::{validate_new_password, PasswordPolicyError};
 
 // ============================================================================
 // Headless Registration
@@ -82,6 +83,8 @@ pub async fn headless_register(
 
     req.email =
         normalize_registration_email(&req.email).map_err(|_| HeadlessError::InvalidEmail)?;
+
+    validate_new_password(&req.password)?;
 
     tracing::info!(
         event = "headless_registration_attempt",
@@ -625,6 +628,7 @@ pub enum HeadlessError {
     InvalidEmail,
     InvalidRequest(String),
     Conflict(String),
+    WeakPassword,
     Internal(String),
     ServiceUnavailable {
         message: String,
@@ -652,6 +656,11 @@ impl IntoResponse for HeadlessError {
             ),
             HeadlessError::InvalidRequest(msg) => (StatusCode::BAD_REQUEST, msg, "INVALID_REQUEST"),
             HeadlessError::Conflict(msg) => (StatusCode::CONFLICT, msg, "CONFLICT"),
+            HeadlessError::WeakPassword => (
+                StatusCode::BAD_REQUEST,
+                crate::password_policy::WEAK_PASSWORD_MESSAGE.to_string(),
+                crate::password_policy::WEAK_PASSWORD_CODE,
+            ),
             HeadlessError::Internal(msg) => {
                 tracing::error!("Headless internal error: {}", msg);
                 (
@@ -712,8 +721,16 @@ impl From<keycast_core::repositories::RepositoryError> for HeadlessError {
     }
 }
 
+impl From<PasswordPolicyError> for HeadlessError {
+    fn from(_: PasswordPolicyError) -> Self {
+        HeadlessError::WeakPassword
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::HeadlessError;
+    use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
     use nostr_sdk::Keys;
 
     struct LazyTestKeyManager;
@@ -807,5 +824,17 @@ mod tests {
         let body = response_json(response).await;
         assert_eq!(body["code"], crate::api::http::auth::INVALID_EMAIL_CODE);
         assert_eq!(body["error"], "Please enter a valid email address.");
+    }
+
+    #[tokio::test]
+    async fn weak_password_error_has_stable_code_and_message() {
+        let response = HeadlessError::WeakPassword.into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(body["code"], crate::password_policy::WEAK_PASSWORD_CODE);
+        assert_eq!(body["error"], crate::password_policy::WEAK_PASSWORD_MESSAGE);
     }
 }
