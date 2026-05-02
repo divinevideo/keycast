@@ -35,6 +35,7 @@ const PASSWORD_RESET_EXPIRY_HOURS: i64 = 1;
 const DEFAULT_NIP05_DOMAIN: &str = "divine.video";
 const MAX_NIP05_USERNAME_LENGTH: usize = 64;
 pub(crate) const INVALID_EMAIL_CODE: &str = "INVALID_EMAIL";
+pub(crate) const INVALID_EMAIL_MESSAGE: &str = "Please enter a valid email address.";
 
 /// Get token expiry in seconds. Uses `TOKEN_EXPIRY_SECONDS` env var if set,
 /// otherwise defaults to 24 hours (86400 seconds).
@@ -354,6 +355,7 @@ pub enum AuthError {
     TokenExpired,
     EmailSendFailed(String),
     DuplicateKey, // Nostr pubkey already registered (BYOK case)
+    InvalidEmail,
     BadRequest(String),
     Forbidden(String),   // User has no authorization for this origin
     RegistrationExpired, // Async bcrypt timed out (instance died)
@@ -435,6 +437,16 @@ impl IntoResponse for AuthError {
                 StatusCode::CONFLICT,
                 "This Nostr key is already registered. Please log in instead or use a different key.".to_string(),
             ),
+            AuthError::InvalidEmail => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": INVALID_EMAIL_MESSAGE,
+                        "code": INVALID_EMAIL_CODE,
+                    })),
+                )
+                    .into_response();
+            },
             AuthError::TokenExpired => (
                 StatusCode::UNAUTHORIZED,
                 "Verification code or token has expired. Please request a new one.".to_string(),
@@ -712,7 +724,7 @@ pub async fn register(
     let key_manager = auth_state.state.key_manager.as_ref();
     let tenant_id = tenant.0.id;
 
-    req.email = req.email.to_lowercase();
+    req.email = normalize_registration_email(&req.email).map_err(|_| AuthError::InvalidEmail)?;
 
     let instance_id = keycast_core::instance::instance_id();
 
@@ -3593,6 +3605,31 @@ mod tests {
         assert!(validate_origin("http://localhost.evil.com").is_err());
     }
 
+    #[tokio::test]
+    async fn test_register_rejects_malformed_email_with_stable_error() {
+        let response = match super::register(
+            create_unit_test_tenant(),
+            axum::extract::State(create_lazy_auth_state()),
+            axum::http::HeaderMap::new(),
+            axum::Json(super::RegisterRequest {
+                email: "person@gmail..com".to_string(),
+                password: "testpassword123".to_string(),
+                nsec: None,
+                relays: None,
+            }),
+        )
+        .await
+        {
+            Ok(response) => axum::response::IntoResponse::into_response(response),
+            Err(error) => axum::response::IntoResponse::into_response(error),
+        };
+
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["code"], super::INVALID_EMAIL_CODE);
+        assert_eq!(body["error"], "Please enter a valid email address.");
+    }
+
     #[cfg(feature = "integration-tests")]
     use super::{verify_email, VerifyEmailRequest};
     #[cfg(feature = "integration-tests")]
@@ -3633,6 +3670,70 @@ mod tests {
     use uuid::Uuid;
     #[cfg(feature = "integration-tests")]
     use zeroize::Zeroizing;
+
+    struct LazyTestKeyManager;
+
+    #[async_trait::async_trait]
+    impl keycast_core::encryption::KeyManager for LazyTestKeyManager {
+        async fn encrypt(
+            &self,
+            plaintext_bytes: &[u8],
+        ) -> Result<Vec<u8>, keycast_core::encryption::KeyManagerError> {
+            Ok(plaintext_bytes.to_vec())
+        }
+
+        async fn decrypt(
+            &self,
+            ciphertext_bytes: &[u8],
+        ) -> Result<zeroize::Zeroizing<Vec<u8>>, keycast_core::encryption::KeyManagerError>
+        {
+            Ok(zeroize::Zeroizing::new(ciphertext_bytes.to_vec()))
+        }
+    }
+
+    fn create_lazy_auth_state() -> crate::api::http::routes::AuthState {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:password@localhost/keycast_test")
+            .expect("lazy pool should be created");
+        let bcrypt_queue = crate::bcrypt_queue::BcryptQueue::new();
+        let secret_pool = keycast_core::secret_pool::SecretPool::new(1);
+        let tenant_cache = moka::future::Cache::builder().max_capacity(10).build();
+        let key_manager: std::sync::Arc<Box<dyn keycast_core::encryption::KeyManager>> =
+            std::sync::Arc::new(Box::new(LazyTestKeyManager));
+
+        crate::api::http::routes::AuthState {
+            state: std::sync::Arc::new(crate::state::KeycastState {
+                db: pool,
+                key_manager,
+                signer_handlers: None,
+                http_handler_cache: crate::handlers::http_rpc_handler::new_http_handler_cache(),
+                server_keys: Keys::generate(),
+                tenant_cache,
+                bcrypt_sender: bcrypt_queue.sender(),
+                redis: None,
+                secret_pool: secret_pool.receiver(),
+            }),
+            auth_tx: None,
+        }
+    }
+
+    fn create_unit_test_tenant() -> crate::api::tenant::TenantExtractor {
+        crate::api::tenant::TenantExtractor(std::sync::Arc::new(crate::api::tenant::Tenant {
+            id: 1,
+            domain: "example.test".to_string(),
+            name: "Test Tenant".to_string(),
+            settings: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }))
+    }
+
+    async fn response_json(response: axum::response::Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        serde_json::from_slice(&body).expect("response body should be JSON")
+    }
 
     /// Helper to create test database connection
     /// Uses DATABASE_URL env var or defaults to localhost
