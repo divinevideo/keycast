@@ -1896,11 +1896,11 @@ pub async fn authorize_get(
                     </div>
                     <div class="form_group">
                         <label for="register_password">Password</label>
-                        <input type="password" id="register_password" placeholder="Create a password" autocomplete="new-password" required minlength="8">
+                        <input type="password" id="register_password" placeholder="Create a password" autocomplete="new-password" required minlength="12">
                     </div>
                     <div class="form_group">
                         <label for="register_password-confirm">Confirm Password</label>
-                        <input type="password" id="register_password-confirm" placeholder="Confirm your password" autocomplete="new-password" required minlength="8">
+                        <input type="password" id="register_password-confirm" placeholder="Confirm your password" autocomplete="new-password" required minlength="12">
                     </div>
                     <div class="advanced_section" id="advanced_section">
                         <a class="advanced_toggle" onclick="toggleAdvanced()">

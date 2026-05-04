@@ -21,7 +21,7 @@ use keycast_api::{
             },
             claim::{claim_get, claim_post, ClaimForm, ClaimQuery},
             headless::{headless_register, HeadlessRegisterRequest},
-            oauth::{oauth_register, OAuthRegisterRequest},
+            oauth::{authorize_get, oauth_register, AuthorizeRequest, OAuthRegisterRequest},
         },
         tenant::{Tenant, TenantExtractor},
     },
@@ -319,6 +319,54 @@ async fn oauth_register_rejects_weak_password_before_database_access() {
         .unwrap();
 
     assert_weak_password_response(response).await;
+}
+
+#[tokio::test]
+async fn oauth_authorize_form_advertises_shared_password_minimum() {
+    let pool = setup_pool().await;
+    let auth_state = create_test_auth_state(pool);
+
+    let app = Router::new().route(
+        "/oauth/authorize",
+        get(
+            move |headers: HeaderMap, Query(params): Query<AuthorizeRequest>| {
+                let auth_state = auth_state.clone();
+                async move {
+                    authorize_get(
+                        create_test_tenant(),
+                        State(auth_state),
+                        headers,
+                        Query(params),
+                    )
+                    .await
+                }
+            },
+        ),
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/oauth/authorize?client_id=TestApp&redirect_uri=https%3A%2F%2Fexample.com%2Fcallback&default_register=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+
+    assert!(
+        body.contains("id=\"register_password\" placeholder=\"Create a password\" autocomplete=\"new-password\" required minlength=\"12\""),
+        "oauth authorize page body: {body}"
+    );
+    assert!(
+        body.contains("id=\"register_password-confirm\" placeholder=\"Confirm your password\" autocomplete=\"new-password\" required minlength=\"12\""),
+        "oauth authorize page body: {body}"
+    );
 }
 
 #[tokio::test]
