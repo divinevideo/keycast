@@ -19,7 +19,12 @@ impl PasswordPolicyError {
 }
 
 pub fn validate_new_password(password: &str) -> Result<(), PasswordPolicyError> {
-    let normalized = password.trim().to_ascii_lowercase();
+    let normalized = password
+        .trim()
+        .chars()
+        .filter(|ch| !is_invisible_format_character(*ch))
+        .collect::<String>()
+        .to_ascii_lowercase();
 
     if normalized.chars().count() < 12 {
         return Err(PasswordPolicyError);
@@ -30,6 +35,13 @@ pub fn validate_new_password(password: &str) -> Result<(), PasswordPolicyError> 
     }
 
     Ok(())
+}
+
+fn is_invisible_format_character(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}'
+    )
 }
 
 #[cfg(test)]
@@ -54,6 +66,12 @@ mod tests {
     #[test]
     fn rejects_whitespace_only_passwords() {
         validate_new_password("            ").expect_err("whitespace-only password should fail");
+    }
+
+    #[test]
+    fn rejects_obvious_weak_passwords_with_invisible_suffixes() {
+        validate_new_password("password123\u{200b}")
+            .expect_err("weak password with invisible suffix should fail");
     }
 
     #[test]
