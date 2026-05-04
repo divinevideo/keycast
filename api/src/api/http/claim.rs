@@ -13,6 +13,7 @@ use serde::Deserialize;
 use super::html_safety::escape_html;
 use super::routes::AuthState;
 use crate::brand::BRAND_NAME;
+use crate::password_policy::{validate_new_password, PasswordPolicyError};
 use keycast_core::repositories::{ClaimTokenRepository, UserRepository};
 
 /// Get server keys from SERVER_NSEC environment variable
@@ -265,6 +266,13 @@ pub async fn claim_post(
 
     form.email = form.email.to_lowercase();
 
+    // Validate passwords match
+    if form.password != form.password_confirmation {
+        return Err(ClaimError::PasswordMismatch);
+    }
+
+    validate_new_password(&form.password)?;
+
     // Classify token into one of the five terminal states; on anything but
     // Valid, bail with the state-specific error page.
     use keycast_core::types::claim_token::ClaimTokenState;
@@ -281,16 +289,6 @@ pub async fn claim_post(
         ClaimTokenState::Replaced { .. } => return Err(ClaimError::TokenReplaced),
         ClaimTokenState::Expired(_) => return Err(ClaimError::TokenExpired),
     };
-
-    // Validate passwords match
-    if form.password != form.password_confirmation {
-        return Err(ClaimError::PasswordMismatch);
-    }
-
-    // Validate password length
-    if form.password.len() < 8 {
-        return Err(ClaimError::WeakPassword);
-    }
 
     // Validate email format (basic check)
     if !form.email.contains('@') || !form.email.contains('.') {
@@ -618,8 +616,8 @@ impl IntoResponse for ClaimError {
                 "The passwords you entered don't match. Please go back and try again.",
             ),
             ClaimError::WeakPassword => (
-                "Password Too Short",
-                "Your password must be at least 8 characters. Please go back and try again.",
+                "Weak Password",
+                crate::password_policy::WEAK_PASSWORD_MESSAGE,
             ),
             ClaimError::InvalidEmail => (
                 "Invalid Email",
@@ -711,5 +709,11 @@ impl IntoResponse for ClaimError {
         );
 
         (axum::http::StatusCode::BAD_REQUEST, Html(html)).into_response()
+    }
+}
+
+impl From<PasswordPolicyError> for ClaimError {
+    fn from(_: PasswordPolicyError) -> Self {
+        ClaimError::WeakPassword
     }
 }

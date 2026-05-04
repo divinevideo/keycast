@@ -29,6 +29,7 @@ use super::auth::{
 };
 use super::html_safety::{escape_attr, escape_html, js_string_literal};
 use crate::brand::BRAND_NAME;
+use crate::password_policy::{validate_new_password, PasswordPolicyError};
 
 /// Generate a 256-bit random authorization handle (64 hex characters)
 /// Used for silent re-authentication in OAuth flows
@@ -314,6 +315,7 @@ pub struct TokenResponse {
 pub enum OAuthError {
     Unauthorized,
     InvalidEmail,
+    WeakPassword,
     InvalidRequest(String),
     InvalidGrant(String), // RFC 6749 - for invalid/expired refresh tokens or auth codes
     Database(sqlx::Error),
@@ -335,6 +337,16 @@ impl IntoResponse for OAuthError {
                     Json(serde_json::json!({
                         "error": INVALID_EMAIL_MESSAGE,
                         "code": INVALID_EMAIL_CODE,
+                    })),
+                )
+                    .into_response();
+            }
+            OAuthError::WeakPassword => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": crate::password_policy::WEAK_PASSWORD_MESSAGE,
+                        "code": crate::password_policy::WEAK_PASSWORD_CODE,
                     })),
                 )
                     .into_response();
@@ -390,6 +402,12 @@ impl From<sqlx::Error> for OAuthError {
 impl From<keycast_core::repositories::RepositoryError> for OAuthError {
     fn from(e: keycast_core::repositories::RepositoryError) -> Self {
         OAuthError::InvalidRequest(e.to_string())
+    }
+}
+
+impl From<PasswordPolicyError> for OAuthError {
+    fn from(_: PasswordPolicyError) -> Self {
+        OAuthError::WeakPassword
     }
 }
 
@@ -3197,6 +3215,8 @@ pub async fn oauth_register(
     let tenant_id = tenant.0.id;
 
     req.email = normalize_registration_email(&req.email).map_err(|_| OAuthError::InvalidEmail)?;
+
+    validate_new_password(&req.password)?;
 
     tracing::info!(
         "OAuth popup registration for email: {} in tenant: {}, nsec: {}, pubkey: {}, client_id: {}",

@@ -8,7 +8,7 @@ use axum::{
     extract::State,
     http::{HeaderMap, Request, StatusCode},
     routing::post,
-    Json, Router,
+    Form, Json, Router,
 };
 use bcrypt::{hash, verify};
 use chrono::{Duration, Utc};
@@ -19,7 +19,9 @@ use keycast_api::{
                 change_password, login, register, reset_password, ChangePasswordRequest,
                 RegisterRequest, ResetPasswordRequest,
             },
+            claim::{claim_post, ClaimForm},
             headless::{headless_register, HeadlessRegisterRequest},
+            oauth::{oauth_register, OAuthRegisterRequest},
         },
         tenant::{Tenant, TenantExtractor},
     },
@@ -34,7 +36,7 @@ use keycast_core::{
 };
 use moka::future::Cache;
 use nostr_sdk::Keys;
-use sqlx::PgPool;
+use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::sync::Arc;
 use tower::ServiceExt;
 use ucan::builder::UcanBuilder;
@@ -97,6 +99,14 @@ fn create_test_auth_state(pool: PgPool) -> keycast_api::api::http::routes::AuthS
     }
 }
 
+fn create_lazy_test_auth_state() -> keycast_api::api::http::routes::AuthState {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://postgres:password@127.0.0.1:1/keycast_test")
+        .unwrap();
+
+    create_test_auth_state(pool)
+}
+
 fn create_test_tenant() -> TenantExtractor {
     TenantExtractor(Arc::new(Tenant {
         id: 1,
@@ -143,6 +153,14 @@ async fn assert_weak_password_response(response: axum::response::Response) {
         body["error"],
         keycast_api::password_policy::WEAK_PASSWORD_MESSAGE
     );
+}
+
+async fn assert_weak_password_page(response: axum::response::Response) {
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+
+    assert!(body.contains(keycast_api::password_policy::WEAK_PASSWORD_MESSAGE));
 }
 
 async fn bearer_token_for(keys: &Keys, tenant_id: i64, email: &str) -> String {
@@ -265,6 +283,74 @@ async fn headless_register_rejects_weak_password_before_pending_registration() {
             .await
             .unwrap();
     assert!(!pending_exists);
+}
+
+#[tokio::test]
+async fn oauth_register_rejects_weak_password_before_database_access() {
+    let auth_state = create_lazy_test_auth_state();
+    let email = format!("weak-oauth-{}@example.com", Uuid::new_v4());
+
+    let app = Router::new().route(
+        "/oauth/register",
+        post(move |Json(req): Json<OAuthRegisterRequest>| {
+            let auth_state = auth_state.clone();
+            async move { oauth_register(create_test_tenant(), State(auth_state), Json(req)).await }
+        }),
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "email": email,
+                        "password": "password123",
+                        "client_id": "TestApp",
+                        "redirect_uri": "https://example.com/callback"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_weak_password_response(response).await;
+}
+
+#[tokio::test]
+async fn claim_post_rejects_weak_password_before_database_access() {
+    let auth_state = create_lazy_test_auth_state();
+    let email = format!("weak-claim-{}%40example.com", Uuid::new_v4());
+
+    let app = Router::new().route(
+        "/claim",
+        post(move |Form(form): Form<ClaimForm>| {
+            let auth_state = auth_state.clone();
+            async move { claim_post(create_test_tenant(), State(auth_state), Form(form)).await }
+        }),
+    );
+
+    let body = format!(
+        "token=claim-token&email={email}&password=password123&password_confirmation=password123"
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/claim")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_weak_password_page(response).await;
 }
 
 #[tokio::test]
