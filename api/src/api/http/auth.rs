@@ -130,7 +130,14 @@ pub(crate) fn normalize_registration_email(email: &str) -> Result<String, &'stat
         || local.contains("..")
         || domain.contains("..")
         || !domain.contains('.')
-        || domain.split('.').any(str::is_empty)
+        || domain.split('.').any(|label| {
+            label.is_empty()
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
     {
         return Err(INVALID_EMAIL_CODE);
     }
@@ -4324,6 +4331,10 @@ mod tests {
     fn test_normalize_registration_email_rejects_malformed_addresses() {
         for email in [
             "person@gmail..com",
+            "person@exa_mple.com",
+            "person@gm!ail.com",
+            "person@-example.com",
+            "person@example-.com",
             "person@.example.com",
             "person@example.com.",
             ".person@example.com",
