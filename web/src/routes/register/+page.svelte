@@ -28,7 +28,11 @@
 			return;
 		}
 
-		if (Array.from(password.trim()).length < 12) {
+		const normalizedPassword = password
+			.trim()
+			.replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g, '');
+
+		if (Array.from(normalizedPassword).length < 12) {
 			toast.error('Password must be at least 12 characters');
 			return;
 		}

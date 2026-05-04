@@ -101,7 +101,11 @@
 			toast.error('Please fill in both password fields');
 			return;
 		}
-		if (Array.from(newPassword.trim()).length < 12) {
+		const normalizedNewPassword = newPassword
+			.trim()
+			.replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g, '');
+
+		if (Array.from(normalizedNewPassword).length < 12) {
 			toast.error('New password must be at least 12 characters');
 			return;
 		}
