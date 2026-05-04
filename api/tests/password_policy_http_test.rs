@@ -5,9 +5,9 @@
 
 use axum::{
     body::{to_bytes, Body},
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, Request, StatusCode},
-    routing::post,
+    routing::{get, post},
     Form, Json, Router,
 };
 use bcrypt::{hash, verify};
@@ -19,7 +19,7 @@ use keycast_api::{
                 change_password, login, register, reset_password, ChangePasswordRequest,
                 RegisterRequest, ResetPasswordRequest,
             },
-            claim::{claim_post, ClaimForm},
+            claim::{claim_get, claim_post, ClaimForm, ClaimQuery},
             headless::{headless_register, HeadlessRegisterRequest},
             oauth::{oauth_register, OAuthRegisterRequest},
         },
@@ -352,6 +352,80 @@ async fn claim_post_preserves_invalid_token_error_for_weak_password() {
         .unwrap();
 
     assert_claim_error_page_contains(response, "Link not recognized").await;
+}
+
+#[tokio::test]
+async fn claim_get_advertises_shared_password_minimum() {
+    let pool = setup_pool().await;
+    let auth_state = create_test_auth_state(pool.clone());
+    let keys = Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    let token = format!("claim-policy-{}", Uuid::new_v4());
+    cleanup_user(&pool, &pubkey, "claim-policy@example.com").await;
+    let _ = sqlx::query("DELETE FROM account_claim_tokens WHERE token = $1 OR user_pubkey = $2")
+        .bind(&token)
+        .bind(&pubkey)
+        .execute(&pool)
+        .await;
+
+    sqlx::query("INSERT INTO users (pubkey, tenant_id, username, display_name, created_at, updated_at) VALUES ($1, 1, $2, $3, NOW(), NOW())")
+        .bind(&pubkey)
+        .bind(format!("claim-policy-{}", Uuid::new_v4()))
+        .bind("Claim Policy")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO account_claim_tokens (token, user_pubkey, expires_at, created_at, tenant_id) VALUES ($1, $2, $3, NOW(), 1)")
+        .bind(&token)
+        .bind(&pubkey)
+        .bind(Utc::now() + Duration::days(7))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let app = Router::new().route(
+        "/claim",
+        get(move |Query(params): Query<ClaimQuery>| {
+            let auth_state = auth_state.clone();
+            async move { claim_get(create_test_tenant(), State(auth_state), Query(params)).await }
+        }),
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/claim?token={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+
+    assert!(body.contains("minlength=\"12\""), "claim page body: {body}");
+    assert!(
+        body.contains("At least 12 characters"),
+        "claim page body: {body}"
+    );
+    assert!(
+        body.contains("password.length < 12"),
+        "claim page body: {body}"
+    );
+    assert!(
+        body.contains("Password must be at least 12 characters"),
+        "claim page body: {body}"
+    );
+
+    let _ = sqlx::query("DELETE FROM account_claim_tokens WHERE token = $1 OR user_pubkey = $2")
+        .bind(&token)
+        .bind(&pubkey)
+        .execute(&pool)
+        .await;
+    cleanup_user(&pool, &pubkey, "claim-policy@example.com").await;
 }
 
 #[tokio::test]

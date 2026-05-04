@@ -213,8 +213,8 @@ pub async fn claim_get(
             <input type="email" id="email" name="email" required placeholder="your@email.com">
 
             <label for="password">Password</label>
-            <input type="password" id="password" name="password" required placeholder="••••••••" minlength="8">
-            <p class="requirements">At least 8 characters</p>
+            <input type="password" id="password" name="password" required placeholder="••••••••" minlength="12">
+            <p class="requirements">At least 12 characters</p>
 
             <label for="password_confirmation">Confirm Password</label>
             <input type="password" id="password_confirmation" name="password_confirmation" required placeholder="••••••••">
@@ -229,8 +229,8 @@ pub async fn claim_get(
             const confirmation = document.getElementById('password_confirmation').value;
             const error = document.getElementById('error');
 
-            if (password.length < 8) {{
-                error.textContent = 'Password must be at least 8 characters';
+            if (password.length < 12) {{
+                error.textContent = 'Password must be at least 12 characters';
                 error.style.display = 'block';
                 return false;
             }}
