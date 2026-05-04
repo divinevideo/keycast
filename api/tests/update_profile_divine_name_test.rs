@@ -1,10 +1,12 @@
 mod common;
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
+    routing::get,
     Json,
+    Router,
 };
 use http_body_util::BodyExt;
 use keycast_api::api::http::{auth, routes::AuthState};
@@ -19,8 +21,11 @@ use keycast_core::secret_pool::SecretPool;
 use moka::future::Cache;
 use nostr_sdk::Keys;
 use serde_json::json;
+use serial_test::serial;
 use sqlx::PgPool;
 use std::sync::Arc;
+use tokio::task::JoinHandle;
+use tokio::net::TcpListener;
 use ucan::builder::UcanBuilder;
 use zeroize::Zeroizing;
 
@@ -93,6 +98,54 @@ async fn build_test_ucan(keys: &Keys, tenant_id: i64) -> String {
         .expect("failed to sign test UCAN")
         .encode()
         .expect("failed to encode test UCAN")
+}
+
+struct EnvGuard {
+    key: &'static str,
+    previous: Option<String>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        if let Some(ref value) = self.previous {
+            std::env::set_var(self.key, value);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
+
+async fn mock_name_check(Path(username): Path<String>) -> Json<serde_json::Value> {
+    Json(json!({
+        "ok": true,
+        "available": false,
+        "reason": format!("{username} is reserved"),
+    }))
+}
+
+async fn start_name_check_server() -> (String, JoinHandle<()>) {
+    let app = Router::new().route("/api/username/check/:username", get(mock_name_check));
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test listener");
+    let address = listener.local_addr().expect("listener address");
+
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve divine name check app");
+    });
+
+    (format!("http://{}", address), handle)
 }
 
 #[tokio::test]
@@ -240,6 +293,66 @@ async fn update_profile_username_conflict_returns_conflict_status() {
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body["error"], "Username is already taken");
+}
+
+#[tokio::test]
+#[serial]
+async fn update_profile_divine_name_conflict_returns_conflict_status() {
+    let pool = common::setup_test_db().await;
+
+    let user_keys = Keys::generate();
+    let user_pubkey = user_keys.public_key().to_hex();
+    let tenant_id = 1_i64;
+    let username = "reserved-handle".to_string();
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
+         VALUES ($1, $2, NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    let token = build_test_ucan(&user_keys, tenant_id).await;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {token}")
+            .parse()
+            .expect("authorization header should parse"),
+    );
+
+    let (base_url, server_handle) = start_name_check_server().await;
+    let _divine_name_server = EnvGuard::set("DIVINE_NAME_SERVER_URL", &base_url);
+    let _enable_divine_names = EnvGuard::set("ENABLE_DIVINE_NAMES", "1");
+
+    let response = auth::update_profile(
+        create_test_tenant(tenant_id),
+        State(create_test_auth_state(pool)),
+        headers,
+        Json(auth::ProfileData {
+            username: Some(username.clone()),
+            name: None,
+            about: None,
+            picture: None,
+            banner: None,
+            nip05: None,
+            website: None,
+            lud16: None,
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"], format!("{username} is reserved"));
+
+    server_handle.abort();
 }
 
 #[tokio::test]
