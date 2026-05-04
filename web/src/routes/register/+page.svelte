@@ -28,8 +28,8 @@
 			return;
 		}
 
-		if (password.length < 8) {
-			toast.error('Password must be at least 8 characters');
+		if (Array.from(password.trim()).length < 12) {
+			toast.error('Password must be at least 12 characters');
 			return;
 		}
 
@@ -122,9 +122,9 @@
 					id="password"
 					type="password"
 					bind:value={password}
-					placeholder="At least 8 characters"
+					placeholder="At least 12 characters"
 					required
-					minlength="8"
+					minlength="12"
 					disabled={isLoading}
 				/>
 			</div>
@@ -137,7 +137,7 @@
 					bind:value={confirmPassword}
 					placeholder="Re-enter password"
 					required
-					minlength="8"
+					minlength="12"
 					disabled={isLoading}
 				/>
 			</div>

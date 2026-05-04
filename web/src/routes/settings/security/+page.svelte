@@ -101,8 +101,8 @@
 			toast.error('Please fill in both password fields');
 			return;
 		}
-		if (newPassword.length < 8) {
-			toast.error('New password must be at least 8 characters');
+		if (Array.from(newPassword.trim()).length < 12) {
+			toast.error('New password must be at least 12 characters');
 			return;
 		}
 		if (newPassword !== confirmNewPassword) {
@@ -316,7 +316,8 @@
 						id="new-password"
 						type="password"
 						bind:value={newPassword}
-						placeholder="Enter new password (min 8 characters)"
+						placeholder="Enter new password (min 12 characters)"
+						minlength="12"
 						disabled={isChangingPassword}
 					/>
 				</div>
@@ -328,6 +329,7 @@
 						type="password"
 						bind:value={confirmNewPassword}
 						placeholder="Confirm new password"
+						minlength="12"
 						disabled={isChangingPassword}
 						onkeydown={(e) => e.key === 'Enter' && handleChangePassword()}
 					/>
