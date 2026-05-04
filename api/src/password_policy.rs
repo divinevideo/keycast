@@ -47,6 +47,7 @@ fn is_ignored_password_character(ch: char) -> bool {
         ch,
         '\u{0300}'..='\u{036f}'
             | '\u{00ad}'
+            | '\u{115f}'..='\u{1160}'
             | '\u{1ab0}'..='\u{1aff}'
             | '\u{1dc0}'..='\u{1dff}'
             | '\u{0600}'..='\u{0605}'
@@ -55,23 +56,28 @@ fn is_ignored_password_character(ch: char) -> bool {
             | '\u{070f}'
             | '\u{0890}'..='\u{0891}'
             | '\u{08e2}'
-            | '\u{180e}'
+            | '\u{17b4}'..='\u{17b5}'
+            | '\u{180b}'..='\u{180f}'
             | '\u{200b}'..='\u{200f}'
             | '\u{20d0}'..='\u{20ff}'
             | '\u{202a}'..='\u{202e}'
             | '\u{2060}'..='\u{206f}'
+            | '\u{3164}'
             | '\u{fe00}'..='\u{fe0f}'
             | '\u{fe20}'..='\u{fe2f}'
             | '\u{feff}'
-            | '\u{fff9}'..='\u{fffb}'
+            | '\u{ffa0}'
+            | '\u{fff0}'..='\u{fffb}'
             | '\u{110bd}'
             | '\u{110cd}'
             | '\u{13430}'..='\u{1343f}'
             | '\u{1bca0}'..='\u{1bca3}'
             | '\u{1d173}'..='\u{1d17a}'
-            | '\u{e0001}'
-            | '\u{e0100}'..='\u{e01ef}'
+            | '\u{e0000}'..='\u{e001f}'
             | '\u{e0020}'..='\u{e007f}'
+            | '\u{e0080}'..='\u{e00ff}'
+            | '\u{e0100}'..='\u{e01ef}'
+            | '\u{e01f0}'..='\u{e0fff}'
     )
 }
 
@@ -105,6 +111,8 @@ mod tests {
             "password123\u{200b}",
             "password123\u{00ad}",
             "password123\u{fe0f}",
+            "password123\u{180b}",
+            "password123\u{115f}",
         ] {
             validate_new_password(password)
                 .expect_err("weak password with invisible suffix should fail");
