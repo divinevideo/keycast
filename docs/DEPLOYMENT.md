@@ -261,7 +261,7 @@ GKE/ArgoCD deploys roll back by reverting the pinned image tag in `divine-iac-co
 | **Redis unreachable** | Hard failure, app exits | Exponential backoff retry (heartbeat), 1s reconnect loop (Pub/Sub). Hashring uses stale data until reconnected. App continues but may misroute NIP-46 requests. |
 | **KMS unavailable** | Hard failure if `KMS_PROVIDER` is `gcp` or `aws` | Cached keys still work. New decryptions retry 3x with exponential backoff (100ms, 200ms, 400ms), then fail. |
 | **PostgreSQL down** | 5 retries with exponential backoff (1s, 2s, 4s, 8s), then exits | Immediate 500 error per request. No circuit breaker. Pool auto-reconnects when DB returns. |
-| **ATProto control plane unreachable** | Production startup requires `DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL` to be explicitly configured. | ATProto enable/reenable/disable requests fail closed with HTTP 503 and an ATProto-specific temporary-unavailable message. Other Keycast routes remain available. |
+| **ATProto control plane unreachable** | Missing or invalid `DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL` logs a warning; Keycast still starts. | ATProto enable/reenable/disable requests fail closed with HTTP 503 and an ATProto-specific temporary-unavailable message. Other Keycast routes remain available. |
 
 **Key insight:** The app degrades gracefully for Redis/KMS partial failures but has no circuit breaker for database issues.
 
@@ -269,7 +269,7 @@ GKE/ArgoCD deploys roll back by reverting the pinned image tag in `divine-iac-co
 
 ATProto provisioning uses a separate control-plane service when users enable Bluesky publishing.
 
-Required in production:
+Optional scoped dependency:
 
 - `DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL=https://...`
 
@@ -278,7 +278,7 @@ Optional:
 - `DIVINE_HANDLE_DOMAIN=divine.video`
 - `KEYCAST_ATPROTO_TOKEN=...` when the control plane requires bearer service auth
 
-If the control plane is not configured or cannot be reached at runtime, the ATProto enablement endpoints fail closed with HTTP 503 and a user-safe temporary-unavailable message.
+If the control plane is not configured, malformed, or cannot be reached at runtime, Keycast logs the configuration/runtime problem and the ATProto enablement endpoints fail closed with HTTP 503 and a user-safe temporary-unavailable message. The rest of Keycast remains available.
 
 The ATProto entryway surface is intentionally gated off by default.
 

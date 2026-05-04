@@ -461,7 +461,7 @@ fn validate_environment() -> Result<(), String> {
         errors.push(Box::leak(e.into_boxed_str()));
     }
 
-    validate_atproto_control_plane_config(&mut errors);
+    warn_atproto_control_plane_config();
 
     if !errors.is_empty() {
         return Err(format!(
@@ -473,39 +473,41 @@ fn validate_environment() -> Result<(), String> {
     Ok(())
 }
 
-fn validate_atproto_control_plane_config(errors: &mut Vec<&'static str>) {
-    let is_production = matches!(env::var("NODE_ENV").as_deref(), Ok("production"))
-        || matches!(env::var("RUST_ENV").as_deref(), Ok("production"));
-
+fn warn_atproto_control_plane_config() {
     let configured = env::var("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
-    if is_production && configured.is_none() {
-        errors.push(
-            "DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL must be set in production (ATProto control-plane base URL)",
+    let Some(url) = configured else {
+        warn_atproto_control_plane_config_issue(
+            "DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL is not set; ATProto provisioning endpoints will return a scoped unavailable response",
         );
         return;
-    }
+    };
 
-    if let Some(url) = configured {
-        match url::Url::parse(&url) {
-            Ok(parsed)
-                if matches!(parsed.scheme(), "http" | "https")
-                    && parsed.query().is_none()
-                    && parsed.fragment().is_none() => {}
-            Ok(parsed)
-                if matches!(parsed.scheme(), "http" | "https")
-                    && (parsed.query().is_some() || parsed.fragment().is_some()) =>
-            {
-                errors.push(
-                    "DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL must not include query strings or fragments",
-                );
-            }
-            _ => errors.push("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL must be a valid http(s) URL"),
+    match url::Url::parse(&url) {
+        Ok(parsed)
+            if matches!(parsed.scheme(), "http" | "https")
+                && parsed.query().is_none()
+                && parsed.fragment().is_none() => {}
+        Ok(parsed)
+            if matches!(parsed.scheme(), "http" | "https")
+                && (parsed.query().is_some() || parsed.fragment().is_some()) =>
+        {
+            warn_atproto_control_plane_config_issue(
+                "DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL must not include query strings or fragments; ATProto provisioning endpoints will return a scoped unavailable response",
+            );
         }
+        _ => warn_atproto_control_plane_config_issue(
+            "DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL must be a valid http(s) URL; ATProto provisioning endpoints will return a scoped unavailable response",
+        ),
     }
+}
+
+fn warn_atproto_control_plane_config_issue(message: &'static str) {
+    tracing::warn!(message);
+    eprintln!("Configuration warning: {message}");
 }
 
 async fn wait_for_shutdown_signal() {
@@ -1250,41 +1252,35 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_validate_environment_requires_atproto_control_plane_in_production() {
+    fn test_validate_environment_allows_missing_atproto_control_plane_in_production() {
         set_minimal_valid_environment();
         std::env::set_var("NODE_ENV", "production");
         std::env::remove_var("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL");
 
         let result = validate_environment();
 
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL must be set in production"));
+        assert!(result.is_ok());
 
         clear_minimal_valid_environment();
     }
 
     #[test]
     #[serial]
-    fn test_validate_environment_rejects_invalid_atproto_control_plane_url() {
+    fn test_validate_environment_allows_invalid_atproto_control_plane_url() {
         set_minimal_valid_environment();
         std::env::set_var("NODE_ENV", "production");
         std::env::set_var("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL", "not a url");
 
         let result = validate_environment();
 
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL must be a valid http(s) URL"));
+        assert!(result.is_ok());
 
         clear_minimal_valid_environment();
     }
 
     #[test]
     #[serial]
-    fn test_validate_environment_rejects_atproto_control_plane_url_with_query_or_fragment() {
+    fn test_validate_environment_allows_atproto_control_plane_url_with_query_or_fragment() {
         for url in [
             "https://control-plane.example?tenant=prod",
             "https://control-plane.example#provisioning",
@@ -1295,10 +1291,7 @@ mod tests {
 
             let result = validate_environment();
 
-            assert!(result.is_err(), "{url} should be rejected");
-            assert!(result.unwrap_err().contains(
-                "DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL must not include query strings or fragments"
-            ));
+            assert!(result.is_ok(), "{url} should not block startup");
 
             clear_minimal_valid_environment();
         }

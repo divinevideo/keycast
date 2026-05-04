@@ -52,7 +52,10 @@ fn control_plane_base_url() -> Result<String, AtprotoProvisioningError> {
 
     let parsed =
         Url::parse(&base).map_err(|_| AtprotoProvisioningError::DependencyNotConfigured)?;
-    if parsed.query().is_some() || parsed.fragment().is_some() {
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
         return Err(AtprotoProvisioningError::DependencyNotConfigured);
     }
 
