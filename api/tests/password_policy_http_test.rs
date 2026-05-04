@@ -368,7 +368,11 @@ async fn oauth_authorize_form_advertises_shared_password_minimum() {
         "oauth authorize page body: {body}"
     );
     assert!(
-        body.contains("const normalizedPassword = password.trim().replace(/"),
+        body.contains("trimPasswordLikeRust(password).replace(/"),
+        "oauth authorize page body: {body}"
+    );
+    assert!(
+        body.contains("\\u0085"),
         "oauth authorize page body: {body}"
     );
     assert!(
@@ -484,6 +488,11 @@ async fn claim_get_advertises_shared_password_minimum() {
         "claim page body: {body}"
     );
     assert!(body.contains("replace(/"), "claim page body: {body}");
+    assert!(
+        body.contains("trimPasswordLikeRust(password).replace(/"),
+        "claim page body: {body}"
+    );
+    assert!(body.contains("\\u0085"), "claim page body: {body}");
     assert!(body.contains("\\u00AD"), "claim page body: {body}");
     assert!(body.contains("\\uFE00-\\uFE0F"), "claim page body: {body}");
     assert!(
@@ -528,6 +537,16 @@ fn svelte_password_forms_reject_bcrypt_overlong_inputs() {
         assert!(
             contents.contains("\\uFE00-\\uFE0F"),
             "{} should strip variation selectors before submit",
+            path.display()
+        );
+        assert!(
+            contents.contains("\\u0085"),
+            "{} should trim Rust-only whitespace before submit",
+            path.display()
+        );
+        assert!(
+            contents.contains("trimPasswordLikeRust("),
+            "{} should use the Rust-compatible password trim helper before submit",
             path.display()
         );
         assert!(

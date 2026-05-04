@@ -8,6 +8,8 @@
 	const api = new KeycastApi();
 	// biome-ignore lint/suspicious/noMisleadingCharacterClass: password policy intentionally strips combining mark ranges.
 	const ignoredPasswordCharacters = /[\u0300-\u036F\u00AD\u1AB0-\u1AFF\u1DC0-\u1DFF\u0600-\u0605\u061C\u06DD\u070F\u0890-\u0891\u08E2\u180E\u200B-\u200F\u20D0-\u20FF\u202A-\u202E\u2060-\u206F\uFE00-\uFE0F\uFE20-\uFE2F\uFEFF\uFFF9-\uFFFB]|\u{110BD}|\u{110CD}|[\u{13430}-\u{1343F}]|[\u{1BCA0}-\u{1BCA3}]|[\u{1D173}-\u{1D17A}]|\u{E0001}|[\u{E0100}-\u{E01EF}]|[\u{E0020}-\u{E007F}]/gu;
+	const rustPasswordTrim = /^[\s\u0085]+|[\s\u0085]+$/gu;
+	const trimPasswordLikeRust = (value: string) => value.replace(rustPasswordTrim, '');
 
 	let password = $state('');
 	let confirmPassword = $state('');
@@ -21,9 +23,10 @@
 			return;
 		}
 
-		const normalizedPassword = password
-			.trim()
-			.replace(ignoredPasswordCharacters, '');
+		const normalizedPassword = trimPasswordLikeRust(password).replace(
+			ignoredPasswordCharacters,
+			''
+		);
 
 		if (Array.from(normalizedPassword).length < 12) {
 			toast.error('Password must be at least 12 characters');
