@@ -1,6 +1,7 @@
 import { sveltekit } from "@sveltejs/kit/vite";
 import { defineConfig } from "vite";
-import path from "path";
+
+const keycastLoginEntry = new URL("../keycast-login/dist/index.mjs", import.meta.url).pathname;
 
 export default defineConfig({
     plugins: [sveltekit()],
@@ -8,7 +9,7 @@ export default defineConfig({
         alias: {
             // Explicit alias for Docker builds where symlinks don't work
             // Use .mjs (ESM) version for compatibility with Vite/Rollup
-            "keycast-login": path.resolve(__dirname, "../keycast-login/dist/index.mjs"),
+            "keycast-login": keycastLoginEntry,
         },
     },
     optimizeDeps: {
