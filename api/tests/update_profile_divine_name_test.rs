@@ -5,8 +5,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::get,
-    Json,
-    Router,
+    Json, Router,
 };
 use http_body_util::BodyExt;
 use keycast_api::api::http::{auth, routes::AuthState};
@@ -24,8 +23,8 @@ use serde_json::json;
 use serial_test::serial;
 use sqlx::PgPool;
 use std::sync::Arc;
-use tokio::task::JoinHandle;
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use ucan::builder::UcanBuilder;
 use zeroize::Zeroizing;
 
