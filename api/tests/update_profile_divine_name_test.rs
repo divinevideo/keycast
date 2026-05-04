@@ -292,7 +292,10 @@ async fn update_profile_username_conflict_returns_conflict_status() {
 
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(body["error"], "Username is already taken");
+    assert_eq!(
+        body["error"],
+        "Username is not available. Please choose another username."
+    );
 }
 
 #[tokio::test]
@@ -350,7 +353,10 @@ async fn update_profile_divine_name_conflict_returns_conflict_status() {
 
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(body["error"], format!("{username} is reserved"));
+    assert_eq!(
+        body["error"],
+        "Username is not available. Please choose another username."
+    );
 
     server_handle.abort();
 }
