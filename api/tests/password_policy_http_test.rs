@@ -368,7 +368,7 @@ async fn oauth_authorize_form_advertises_shared_password_minimum() {
         "oauth authorize page body: {body}"
     );
     assert!(
-        body.contains("trimPasswordLikeRust(password).replace(/"),
+        body.contains("trimPasswordLikeRust(password.replace(/"),
         "oauth authorize page body: {body}"
     );
     assert!(
@@ -377,6 +377,10 @@ async fn oauth_authorize_form_advertises_shared_password_minimum() {
     );
     assert!(
         body.contains("\\u00AD"),
+        "oauth authorize page body: {body}"
+    );
+    assert!(
+        body.contains("\\u115F-\\u1160"),
         "oauth authorize page body: {body}"
     );
     assert!(
@@ -489,11 +493,12 @@ async fn claim_get_advertises_shared_password_minimum() {
     );
     assert!(body.contains("replace(/"), "claim page body: {body}");
     assert!(
-        body.contains("trimPasswordLikeRust(password).replace(/"),
+        body.contains("trimPasswordLikeRust(password.replace(/"),
         "claim page body: {body}"
     );
     assert!(body.contains("\\u0085"), "claim page body: {body}");
     assert!(body.contains("\\u00AD"), "claim page body: {body}");
+    assert!(body.contains("\\u115F-\\u1160"), "claim page body: {body}");
     assert!(body.contains("\\uFE00-\\uFE0F"), "claim page body: {body}");
     assert!(
         body.contains("new TextEncoder().encode(password).length > 72"),
@@ -533,10 +538,19 @@ fn svelte_password_forms_reject_bcrypt_overlong_inputs() {
     for (path, expected_check) in forms {
         let contents = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let compact_contents = contents
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>();
 
         assert!(
             contents.contains("\\uFE00-\\uFE0F"),
             "{} should strip variation selectors before submit",
+            path.display()
+        );
+        assert!(
+            contents.contains("\\u115F-\\u1160"),
+            "{} should strip Hangul fillers before submit",
             path.display()
         );
         assert!(
@@ -545,8 +559,9 @@ fn svelte_password_forms_reject_bcrypt_overlong_inputs() {
             path.display()
         );
         assert!(
-            contents.contains("trimPasswordLikeRust("),
-            "{} should use the Rust-compatible password trim helper before submit",
+            compact_contents.contains("trimPasswordLikeRust(password.replace(")
+                || compact_contents.contains("trimPasswordLikeRust(newPassword.replace("),
+            "{} should strip ignored characters before trimming like the server",
             path.display()
         );
         assert!(
