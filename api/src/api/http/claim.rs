@@ -228,8 +228,9 @@ pub async fn claim_get(
             const password = document.getElementById('password').value;
             const confirmation = document.getElementById('password_confirmation').value;
             const error = document.getElementById('error');
+            const normalizedPassword = password.trim().replace(/[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g, '');
 
-            if (Array.from(password.trim()).length < 12) {{
+            if (Array.from(normalizedPassword).length < 12) {{
                 error.textContent = 'Password must be at least 12 characters';
                 error.style.display = 'block';
                 return false;
