@@ -106,14 +106,17 @@ fn normalize_nip05_username(raw_username: &str) -> Result<String, AuthError> {
 }
 
 pub(crate) fn normalize_registration_email(email: &str) -> Result<String, &'static str> {
-    let normalized = email.trim().to_lowercase();
+    let trimmed = email.trim();
 
-    if normalized.is_empty()
-        || normalized.len() > 254
-        || normalized.bytes().any(|byte| byte <= b' ' || byte == 0x7f)
+    if trimmed.is_empty()
+        || trimmed.len() > 254
+        || !trimmed.is_ascii()
+        || trimmed.bytes().any(|byte| byte <= b' ' || byte == 0x7f)
     {
         return Err(INVALID_EMAIL_CODE);
     }
+
+    let normalized = trimmed.to_ascii_lowercase();
 
     let Some((local, domain)) = normalized.split_once('@') else {
         return Err(INVALID_EMAIL_CODE);
@@ -4364,6 +4367,8 @@ mod tests {
             "person@example-.com",
             "person(foo)@example.com",
             "person<evil>@example.com",
+            "\u{212a}@example.com",
+            "person@\u{212a}.example.com",
             "person@.example.com",
             "person@example.com.",
             ".person@example.com",
