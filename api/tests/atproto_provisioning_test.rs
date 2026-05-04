@@ -218,6 +218,32 @@ async fn request_enable_classifies_control_plane_5xx_as_dependency_unavailable()
 
 #[tokio::test]
 #[serial]
+async fn request_enable_rejects_control_plane_url_with_query_or_fragment() {
+    for suffix in ["?tenant=prod", "#tenant-prod"] {
+        let (base_url, _state) = start_capture_server().await;
+        let _base = EnvGuard::set(
+            "DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL",
+            &format!("{base_url}{suffix}"),
+        );
+        let _domain = EnvGuard::set("DIVINE_HANDLE_DOMAIN", "bsky.example");
+
+        let error = keycast_api::atproto_provisioning::request_enable(
+            "npub1ambiguouscontrolplane",
+            "Alice",
+            true,
+        )
+        .await
+        .expect_err("ambiguous control-plane URL should fail closed");
+
+        assert!(matches!(
+            error,
+            keycast_api::atproto_provisioning::AtprotoProvisioningError::DependencyNotConfigured
+        ));
+    }
+}
+
+#[tokio::test]
+#[serial]
 async fn request_reenable_posts_enable_endpoint() {
     let (base_url, state) = start_capture_server().await;
     let _base = EnvGuard::set("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL", &base_url);

@@ -50,7 +50,11 @@ fn control_plane_base_url() -> Result<String, AtprotoProvisioningError> {
         .filter(|value| !value.is_empty())
         .ok_or(AtprotoProvisioningError::DependencyNotConfigured)?;
 
-    Url::parse(&base).map_err(|_| AtprotoProvisioningError::DependencyNotConfigured)?;
+    let parsed =
+        Url::parse(&base).map_err(|_| AtprotoProvisioningError::DependencyNotConfigured)?;
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(AtprotoProvisioningError::DependencyNotConfigured);
+    }
 
     Ok(base)
 }
