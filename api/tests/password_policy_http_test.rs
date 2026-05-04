@@ -155,12 +155,12 @@ async fn assert_weak_password_response(response: axum::response::Response) {
     );
 }
 
-async fn assert_weak_password_page(response: axum::response::Response) {
+async fn assert_claim_error_page_contains(response: axum::response::Response, expected: &str) {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body = String::from_utf8(body.to_vec()).unwrap();
 
-    assert!(body.contains(keycast_api::password_policy::WEAK_PASSWORD_MESSAGE));
+    assert!(body.contains(expected), "claim page body: {body}");
 }
 
 async fn bearer_token_for(keys: &Keys, tenant_id: i64, email: &str) -> String {
@@ -322,8 +322,9 @@ async fn oauth_register_rejects_weak_password_before_database_access() {
 }
 
 #[tokio::test]
-async fn claim_post_rejects_weak_password_before_database_access() {
-    let auth_state = create_lazy_test_auth_state();
+async fn claim_post_preserves_invalid_token_error_for_weak_password() {
+    let pool = setup_pool().await;
+    let auth_state = create_test_auth_state(pool);
     let email = format!("weak-claim-{}%40example.com", Uuid::new_v4());
 
     let app = Router::new().route(
@@ -350,7 +351,7 @@ async fn claim_post_rejects_weak_password_before_database_access() {
         .await
         .unwrap();
 
-    assert_weak_password_page(response).await;
+    assert_claim_error_page_contains(response, "Link not recognized").await;
 }
 
 #[tokio::test]

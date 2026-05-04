@@ -266,13 +266,6 @@ pub async fn claim_post(
 
     form.email = form.email.to_lowercase();
 
-    // Validate passwords match
-    if form.password != form.password_confirmation {
-        return Err(ClaimError::PasswordMismatch);
-    }
-
-    validate_new_password(&form.password)?;
-
     // Classify token into one of the five terminal states; on anything but
     // Valid, bail with the state-specific error page.
     use keycast_core::types::claim_token::ClaimTokenState;
@@ -289,6 +282,14 @@ pub async fn claim_post(
         ClaimTokenState::Replaced { .. } => return Err(ClaimError::TokenReplaced),
         ClaimTokenState::Expired(_) => return Err(ClaimError::TokenExpired),
     };
+
+    // Only validate form fields after confirming the claim token is usable;
+    // stale or invalid links should keep their state-specific error pages.
+    if form.password != form.password_confirmation {
+        return Err(ClaimError::PasswordMismatch);
+    }
+
+    validate_new_password(&form.password)?;
 
     // Validate email format (basic check)
     if !form.email.contains('@') || !form.email.contains('.') {
