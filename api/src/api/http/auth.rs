@@ -34,6 +34,7 @@ pub const EMAIL_VERIFICATION_EXPIRY_HOURS: i64 = 24;
 const PASSWORD_RESET_EXPIRY_HOURS: i64 = 1;
 const DEFAULT_NIP05_DOMAIN: &str = "divine.video";
 const MAX_NIP05_USERNAME_LENGTH: usize = 64;
+const USERS_EMAIL_TENANT_CONSTRAINT: &str = "idx_users_email_tenant";
 pub(crate) const INVALID_EMAIL_CODE: &str = "INVALID_EMAIL";
 pub(crate) const INVALID_EMAIL_MESSAGE: &str = "Please enter a valid email address.";
 
@@ -406,9 +407,28 @@ pub enum AuthError {
     Conflict(String),
 }
 
+fn has_database_constraint(error: &sqlx::Error, expected_constraint: &str) -> bool {
+    match error {
+        sqlx::Error::Database(db_error) => db_error.constraint() == Some(expected_constraint),
+        _ => false,
+    }
+}
+
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
+            AuthError::Database(e)
+                if has_database_constraint(&e, USERS_EMAIL_TENANT_CONSTRAINT) =>
+            {
+                tracing::info!(
+                    "Email conflict while verifying registration: constraint {}",
+                    USERS_EMAIL_TENANT_CONSTRAINT
+                );
+                (
+                    StatusCode::CONFLICT,
+                    "This email is already registered. Please log in instead.".to_string(),
+                )
+            }
             AuthError::Database(e) => {
                 // Log the real error but return generic message to user
                 tracing::error!("Database error: {}", e);
@@ -525,6 +545,20 @@ impl IntoResponse for AuthError {
         };
 
         (status, Json(serde_json::json!({ "error": message }))).into_response()
+    }
+}
+
+fn account_incomplete(message: impl Into<String>) -> AuthError {
+    AuthError::Conflict(message.into())
+}
+
+fn retryable_service_unavailable(
+    message: impl Into<String>,
+    retry_after: Option<u32>,
+) -> AuthError {
+    AuthError::ServiceUnavailable {
+        message: message.into(),
+        retry_after,
     }
 }
 
@@ -1093,7 +1127,7 @@ pub async fn login(
     let encrypted_secret: Vec<u8> = personal_keys_repo
         .find_encrypted_key_for_tenant(&public_key, tenant_id)
         .await?
-        .ok_or_else(|| AuthError::Internal("Personal keys not found".to_string()))?;
+        .ok_or_else(|| account_incomplete("Account setup is incomplete. Please register again."))?;
 
     let key_manager = auth_state.state.key_manager.as_ref();
     let decrypted_secret = key_manager
@@ -1254,15 +1288,15 @@ pub async fn create_bunker(
     let encrypted_secret: Vec<u8> = personal_keys_repo
         .find_encrypted_key_for_tenant(&user_pubkey, tenant_id)
         .await?
-        .ok_or(AuthError::Internal("Personal keys not found".to_string()))?;
+        .ok_or_else(|| account_incomplete("Account setup is incomplete. Please register again."))?;
 
     // Get pre-computed (secret, hash) from pool - instant, no waiting for bcrypt
-    let secret_pair = auth_state
-        .state
-        .secret_pool
-        .get()
-        .await
-        .ok_or_else(|| AuthError::Internal("Secret pool exhausted".to_string()))?;
+    let secret_pair = auth_state.state.secret_pool.get().await.ok_or_else(|| {
+        retryable_service_unavailable(
+            "Service temporarily unavailable. Please try again in a few minutes.",
+            Some(5),
+        )
+    })?;
     let connection_secret = secret_pair.secret;
     let secret_hash = secret_pair.hash;
 
@@ -1450,14 +1484,12 @@ pub async fn verify_email(
             oauth_data.pending_email
         );
 
-        let email = oauth_data
-            .pending_email
-            .as_ref()
-            .ok_or_else(|| AuthError::Internal("Missing pending email".to_string()))?;
-        let password_hash = oauth_data
-            .pending_password_hash
-            .as_ref()
-            .ok_or_else(|| AuthError::Internal("Missing pending password hash".to_string()))?;
+        let email = oauth_data.pending_email.as_ref().ok_or_else(|| {
+            account_incomplete("Registration is incomplete. Please register again.")
+        })?;
+        let password_hash = oauth_data.pending_password_hash.as_ref().ok_or_else(|| {
+            account_incomplete("Registration is incomplete. Please register again.")
+        })?;
 
         // Create user with email_verified=true (they just verified!)
         let user_repo = UserRepository::new(pool.clone());
@@ -1774,7 +1806,7 @@ pub async fn verify_email(
     let encrypted_secret = personal_keys_repo
         .find_encrypted_key_for_tenant(&public_key, tenant_id)
         .await?
-        .ok_or_else(|| AuthError::Internal("Personal keys not found".to_string()))?;
+        .ok_or_else(|| account_incomplete("Account setup is incomplete. Please register again."))?;
 
     let decrypted_secret = key_manager
         .decrypt(&encrypted_secret)
@@ -2314,15 +2346,17 @@ pub async fn update_profile(
             match crate::divine_names::check_availability(&username).await {
                 Ok((available, reason)) => {
                     if !available {
-                        let error_msg = reason.unwrap_or_else(|| {
-                            "Username is not available on divine.video".to_string()
-                        });
+                        let error_msg =
+                            reason.unwrap_or_else(|| "Username is not available".to_string());
                         tracing::info!(
                             "Username '{}' not available on divine-name-server: {}",
                             username,
                             error_msg
                         );
-                        return Err(AuthError::Conflict(error_msg));
+                        return Err(AuthError::Conflict(
+                            "Username is not available. Please choose another username."
+                                .to_string(),
+                        ));
                     }
                 }
                 Err(e) => {
@@ -2343,7 +2377,9 @@ pub async fn update_profile(
             .check_username_available(&username, &user_pubkey, tenant_id)
             .await?
         {
-            return Err(AuthError::Conflict("Username is already taken".to_string()));
+            return Err(AuthError::Conflict(
+                "Username is not available. Please choose another username.".to_string(),
+            ));
         }
 
         // Sync to divine-name-server (if enabled)
@@ -2384,9 +2420,20 @@ pub async fn update_profile(
         }
 
         // Update username in users table (always do local update)
-        user_repo
+        if let Err(error) = user_repo
             .update_username(&user_pubkey, &username, tenant_id)
-            .await?;
+            .await
+        {
+            if matches!(
+                error,
+                keycast_core::repositories::RepositoryError::Duplicate
+            ) {
+                return Err(AuthError::Conflict(
+                    "Username is not available. Please choose another username.".to_string(),
+                ));
+            }
+            return Err(error.into());
+        }
 
         tracing::info!(
             "Username updated to '{}' for user: {}",
@@ -3616,6 +3663,7 @@ pub async fn delete_account(
 #[cfg(test)]
 mod tests {
     use super::validate_origin;
+    use axum::response::IntoResponse;
 
     #[test]
     fn test_validate_origin_https() {
@@ -3650,6 +3698,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_username_conflict_response_uses_canonical_message() {
+        let response = super::AuthError::Conflict(
+            "Username is not available. Please choose another username.".to_string(),
+        )
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body_text = std::str::from_utf8(&body).unwrap();
+        assert!(!body_text.contains("dependency diagnostics"));
+        assert!(body_text.len() < 200);
+
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload["error"],
+            "Username is not available. Please choose another username."
+        );
+    }
+
+    #[tokio::test]
     async fn test_register_rejects_malformed_email_with_stable_error() {
         let response = match super::register(
             create_unit_test_tenant(),
@@ -3675,7 +3745,9 @@ mod tests {
     }
 
     #[cfg(feature = "integration-tests")]
-    use super::{verify_email, VerifyEmailRequest};
+    use super::{
+        generate_ucan_token, login, update_profile, verify_email, ProfileData, VerifyEmailRequest,
+    };
     #[cfg(feature = "integration-tests")]
     use crate::api::http::routes::AuthState;
     #[cfg(feature = "integration-tests")]
@@ -3689,8 +3761,10 @@ mod tests {
     #[cfg(feature = "integration-tests")]
     use axum::{
         extract::State,
-        http::{HeaderMap, StatusCode},
-        response::IntoResponse,
+        http::{
+            header::{AUTHORIZATION, ORIGIN},
+            HeaderMap, HeaderValue, StatusCode,
+        },
         Json,
     };
     #[cfg(feature = "integration-tests")]
@@ -3973,6 +4047,198 @@ mod tests {
         );
 
         cleanup_verify_email_test_data(&pool, &pubkey, &verification_token).await;
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_email_duplicate_email_returns_conflict() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+        let existing_pubkey = Keys::generate().public_key().to_hex();
+        let pending_keys = Keys::generate();
+        let pending_pubkey = pending_keys.public_key().to_hex();
+        let duplicate_email = format!("verify-duplicate-{}@example.com", Uuid::new_v4());
+        let verification_token = format!("verify_{}", Uuid::new_v4());
+        let placeholder_code = format!("placeholder_{}", Uuid::new_v4());
+        let password_hash = bcrypt::hash("testpassword123", bcrypt::DEFAULT_COST).unwrap();
+        let expires_at = Utc::now() + Duration::hours(24);
+        let encrypted_secret = pending_keys.secret_key().to_secret_bytes().to_vec();
+
+        cleanup_verify_email_test_data(&pool, &existing_pubkey, &verification_token).await;
+        cleanup_verify_email_test_data(&pool, &pending_pubkey, &verification_token).await;
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, true, NOW(), NOW())",
+        )
+        .bind(&existing_pubkey)
+        .bind(1_i64)
+        .bind(&duplicate_email)
+        .bind(&password_hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO oauth_codes (
+                tenant_id, code, user_pubkey, client_id, redirect_uri, scope,
+                expires_at, created_at, pending_email, pending_password_hash,
+                pending_email_verification_token, pending_encrypted_secret
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8, $9, $10, $11)",
+        )
+        .bind(1_i64)
+        .bind(&placeholder_code)
+        .bind(&pending_pubkey)
+        .bind("TestApp")
+        .bind("https://test.example.com/callback")
+        .bind("policy:social")
+        .bind(expires_at)
+        .bind(&duplicate_email)
+        .bind(&password_hash)
+        .bind(&verification_token)
+        .bind(&encrypted_secret)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = match verify_email(
+            create_test_tenant(),
+            State(auth_state),
+            HeaderMap::new(),
+            Json(VerifyEmailRequest {
+                token: verification_token.clone(),
+            }),
+        )
+        .await
+        {
+            Ok(response) => response.into_response(),
+            Err(err) => err.into_response(),
+        };
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        cleanup_verify_email_test_data(&pool, &existing_pubkey, &verification_token).await;
+        cleanup_verify_email_test_data(&pool, &pending_pubkey, &verification_token).await;
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_update_profile_username_taken_returns_conflict() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+        let first_pubkey = Keys::generate().public_key().to_hex();
+        let second_keys = Keys::generate();
+        let second_pubkey = second_keys.public_key().to_hex();
+        let username = format!("profile-conflict-{}", &first_pubkey[..8]);
+
+        cleanup_verify_email_test_data(&pool, &first_pubkey, "unused").await;
+        cleanup_verify_email_test_data(&pool, &second_pubkey, "unused").await;
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, username, created_at, updated_at)
+             VALUES ($1, $2, $3, NOW(), NOW())",
+        )
+        .bind(&first_pubkey)
+        .bind(1_i64)
+        .bind(&username)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
+             VALUES ($1, $2, NOW(), NOW())",
+        )
+        .bind(&second_pubkey)
+        .bind(1_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let token = generate_ucan_token(
+            &second_keys,
+            1_i64,
+            "second@example.com",
+            "http://localhost:3000",
+            None,
+        )
+        .await
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+
+        let response = match update_profile(
+            create_test_tenant(),
+            State(auth_state),
+            headers,
+            Json(ProfileData {
+                username: Some(username.clone()),
+                name: None,
+                picture: None,
+                about: None,
+                banner: None,
+                nip05: None,
+                website: None,
+                lud16: None,
+            }),
+        )
+        .await
+        {
+            Ok(response) => response.into_response(),
+            Err(err) => err.into_response(),
+        };
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        cleanup_verify_email_test_data(&pool, &first_pubkey, "unused").await;
+        cleanup_verify_email_test_data(&pool, &second_pubkey, "unused").await;
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_login_missing_personal_keys_returns_conflict() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+        let pubkey = Keys::generate().public_key().to_hex();
+        let email = format!("missing-keys-{}@example.com", Uuid::new_v4());
+        let password = "testpassword123";
+        let password_hash = bcrypt::hash(password, bcrypt::DEFAULT_COST).unwrap();
+
+        cleanup_verify_email_test_data(&pool, &pubkey, "unused").await;
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, true, NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .bind(1_i64)
+        .bind(&email)
+        .bind(&password_hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(ORIGIN, HeaderValue::from_static("http://localhost:3000"));
+
+        let response = match login(
+            create_test_tenant(),
+            State(auth_state),
+            headers,
+            format!(r#"{{"email":"{email}","password":"{password}"}}"#),
+        )
+        .await
+        {
+            Ok(response) => response.into_response(),
+            Err(err) => err.into_response(),
+        };
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        cleanup_verify_email_test_data(&pool, &pubkey, "unused").await;
     }
 
     #[cfg(feature = "integration-tests")]

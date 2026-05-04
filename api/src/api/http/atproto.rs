@@ -411,8 +411,30 @@ fn map_control_error(error: AtprotoControlError) -> AuthError {
         AtprotoControlError::UsernameMismatch => AuthError::BadRequest(
             "Requested username does not match the claimed username".to_string(),
         ),
-        AtprotoControlError::ProvisioningTrigger(err) => AuthError::Internal(err),
-        AtprotoControlError::Repository(err) => AuthError::Internal(err.to_string()),
+        AtprotoControlError::ProvisioningTrigger(err) => {
+            tracing::warn!("ATProto provisioning trigger failed: {}", err);
+            AuthError::ServiceUnavailable {
+                message: "ATProto setup is temporarily unavailable. Please try again shortly."
+                    .to_string(),
+                retry_after: Some(30),
+            }
+        }
+        AtprotoControlError::Repository(RepositoryError::NotFound(_)) => AuthError::UserNotFound,
+        AtprotoControlError::Repository(RepositoryError::Duplicate) => {
+            AuthError::Conflict("ATProto state conflicts with an existing record".to_string())
+        }
+        AtprotoControlError::Repository(RepositoryError::Integrity(err)) => {
+            tracing::warn!("ATProto repository integrity error: {}", err);
+            AuthError::BadRequest("ATProto state update is invalid".to_string())
+        }
+        AtprotoControlError::Repository(RepositoryError::Database(err)) => {
+            tracing::error!("ATProto repository error: {}", err);
+            AuthError::ServiceUnavailable {
+                message: "ATProto state is temporarily unavailable. Please try again shortly."
+                    .to_string(),
+                retry_after: Some(30),
+            }
+        }
     }
 }
 
@@ -541,4 +563,33 @@ pub async fn account_crosspost(
     .await?;
 
     Ok(Json(response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{map_control_error, AtprotoControlError};
+    use crate::api::http::auth::AuthError;
+    use keycast_core::repositories::RepositoryError;
+
+    #[test]
+    fn provisioning_trigger_maps_to_targeted_service_unavailable() {
+        let error = map_control_error(AtprotoControlError::ProvisioningTrigger(
+            "request failed: connection refused".to_string(),
+        ));
+
+        assert!(
+            matches!(error, AuthError::ServiceUnavailable { .. }),
+            "provisioning dependency failures should not be classified as internal errors"
+        );
+    }
+
+    #[test]
+    fn repository_duplicate_maps_to_conflict() {
+        let error = map_control_error(AtprotoControlError::Repository(RepositoryError::Duplicate));
+
+        assert!(
+            matches!(error, AuthError::Conflict(_)),
+            "ATProto duplicate state should be classified as conflict"
+        );
+    }
 }
