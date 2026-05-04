@@ -368,7 +368,15 @@ async fn oauth_authorize_form_advertises_shared_password_minimum() {
         "oauth authorize page body: {body}"
     );
     assert!(
-        body.contains("Array.from(password.trim()).length < 12"),
+        body.contains("const normalizedPassword = password.trim().replace(/"),
+        "oauth authorize page body: {body}"
+    );
+    assert!(
+        body.contains("\\u00AD"),
+        "oauth authorize page body: {body}"
+    );
+    assert!(
+        body.contains("Array.from(normalizedPassword).length < 12"),
         "oauth authorize page body: {body}"
     );
 }
