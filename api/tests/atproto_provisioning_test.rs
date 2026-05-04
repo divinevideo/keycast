@@ -77,6 +77,10 @@ async fn capture_enable(
     StatusCode::OK
 }
 
+async fn unavailable_opt_in() -> StatusCode {
+    StatusCode::BAD_GATEWAY
+}
+
 async fn start_capture_server() -> (String, CaptureState) {
     let state = CaptureState::default();
     let app = Router::new()
@@ -94,6 +98,21 @@ async fn start_capture_server() -> (String, CaptureState) {
     });
 
     (format!("http://{}", address), state)
+}
+
+async fn start_unavailable_server() -> String {
+    let app = Router::new().route("/api/account-links/opt-in", post(unavailable_opt_in));
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test listener");
+    let address = listener.local_addr().expect("listener address");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve test app");
+    });
+
+    format!("http://{}", address)
 }
 
 #[tokio::test]
@@ -167,6 +186,28 @@ async fn request_enable_classifies_transport_failure_as_dependency_unavailable()
     )
     .await
     .expect_err("offline control plane should fail");
+
+    assert!(error.is_dependency_unavailable());
+    assert_eq!(
+        error.public_message(),
+        "ATProto enablement is temporarily unavailable. Please try again later."
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn request_enable_classifies_control_plane_5xx_as_dependency_unavailable() {
+    let base_url = start_unavailable_server().await;
+    let _base = EnvGuard::set("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL", &base_url);
+    let _domain = EnvGuard::set("DIVINE_HANDLE_DOMAIN", "bsky.example");
+
+    let error = keycast_api::atproto_provisioning::request_enable(
+        "npub1badgatewaycontrolplane",
+        "Alice",
+        true,
+    )
+    .await
+    .expect_err("control-plane 5xx should fail");
 
     assert!(error.is_dependency_unavailable());
     assert_eq!(

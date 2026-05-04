@@ -20,11 +20,11 @@ pub enum AtprotoProvisioningError {
 
 impl AtprotoProvisioningError {
     pub fn is_dependency_unavailable(&self) -> bool {
-        matches!(
-            self,
+        match self {
             AtprotoProvisioningError::DependencyNotConfigured
-                | AtprotoProvisioningError::Request(_)
-        )
+            | AtprotoProvisioningError::Request(_) => true,
+            AtprotoProvisioningError::UnexpectedStatus { status, .. } => status.is_server_error(),
+        }
     }
 
     pub fn public_message(&self) -> &'static str {

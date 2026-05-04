@@ -209,7 +209,7 @@ async fn disable_trigger_failure_preserves_existing_state() {
 
     assert_eq!(
         error.to_string(),
-        "ATProto provisioning failed. Please try again later."
+        "ATProto enablement is temporarily unavailable. Please try again later."
     );
 
     let response = get_user_atproto_status(&repo, tenant_id, &user_pubkey)
