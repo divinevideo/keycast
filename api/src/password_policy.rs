@@ -4,6 +4,7 @@
 pub const WEAK_PASSWORD_CODE: &str = "WEAK_PASSWORD";
 pub const WEAK_PASSWORD_MESSAGE: &str =
     "Password must be at least 12 characters and not be a common weak password.";
+const BCRYPT_MAX_PASSWORD_BYTES: usize = 72;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PasswordPolicyError;
@@ -19,6 +20,10 @@ impl PasswordPolicyError {
 }
 
 pub fn validate_new_password(password: &str) -> Result<(), PasswordPolicyError> {
+    if password.len() > BCRYPT_MAX_PASSWORD_BYTES {
+        return Err(PasswordPolicyError);
+    }
+
     let normalized = password
         .trim()
         .chars()
@@ -72,6 +77,13 @@ mod tests {
     fn rejects_obvious_weak_passwords_with_invisible_suffixes() {
         validate_new_password("password123\u{200b}")
             .expect_err("weak password with invisible suffix should fail");
+    }
+
+    #[test]
+    fn rejects_passwords_over_bcrypt_byte_limit() {
+        let password = "a".repeat(73);
+
+        validate_new_password(&password).expect_err("overlong bcrypt input should fail");
     }
 
     #[test]
