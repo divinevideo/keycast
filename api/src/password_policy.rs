@@ -25,10 +25,10 @@ pub fn validate_new_password(password: &str) -> Result<(), PasswordPolicyError> 
     }
 
     let normalized = password
-        .trim()
         .chars()
         .filter(|ch| !is_ignored_password_character(*ch))
         .collect::<String>()
+        .trim()
         .to_ascii_lowercase();
 
     if normalized.chars().count() < 12 {
@@ -103,6 +103,12 @@ mod tests {
     #[test]
     fn rejects_whitespace_only_passwords() {
         validate_new_password("            ").expect_err("whitespace-only password should fail");
+    }
+
+    #[test]
+    fn rejects_whitespace_only_passwords_wrapped_in_ignored_characters() {
+        validate_new_password("\u{200b}            \u{200b}")
+            .expect_err("ignored characters should not shield whitespace-only passwords");
     }
 
     #[test]
