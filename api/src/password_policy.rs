@@ -27,7 +27,7 @@ pub fn validate_new_password(password: &str) -> Result<(), PasswordPolicyError> 
     let normalized = password
         .trim()
         .chars()
-        .filter(|ch| !is_invisible_format_character(*ch))
+        .filter(|ch| !is_ignored_password_character(*ch))
         .collect::<String>()
         .to_ascii_lowercase();
 
@@ -42,10 +42,13 @@ pub fn validate_new_password(password: &str) -> Result<(), PasswordPolicyError> 
     Ok(())
 }
 
-fn is_invisible_format_character(ch: char) -> bool {
+fn is_ignored_password_character(ch: char) -> bool {
     matches!(
         ch,
-        '\u{00ad}'
+        '\u{0300}'..='\u{036f}'
+            | '\u{00ad}'
+            | '\u{1ab0}'..='\u{1aff}'
+            | '\u{1dc0}'..='\u{1dff}'
             | '\u{0600}'..='\u{0605}'
             | '\u{061c}'
             | '\u{06dd}'
@@ -54,8 +57,11 @@ fn is_invisible_format_character(ch: char) -> bool {
             | '\u{08e2}'
             | '\u{180e}'
             | '\u{200b}'..='\u{200f}'
+            | '\u{20d0}'..='\u{20ff}'
             | '\u{202a}'..='\u{202e}'
             | '\u{2060}'..='\u{206f}'
+            | '\u{fe00}'..='\u{fe0f}'
+            | '\u{fe20}'..='\u{fe2f}'
             | '\u{feff}'
             | '\u{fff9}'..='\u{fffb}'
             | '\u{110bd}'
@@ -64,6 +70,7 @@ fn is_invisible_format_character(ch: char) -> bool {
             | '\u{1bca0}'..='\u{1bca3}'
             | '\u{1d173}'..='\u{1d17a}'
             | '\u{e0001}'
+            | '\u{e0100}'..='\u{e01ef}'
             | '\u{e0020}'..='\u{e007f}'
     )
 }
@@ -94,7 +101,11 @@ mod tests {
 
     #[test]
     fn rejects_obvious_weak_passwords_with_invisible_suffixes() {
-        for password in ["password123\u{200b}", "password123\u{00ad}"] {
+        for password in [
+            "password123\u{200b}",
+            "password123\u{00ad}",
+            "password123\u{fe0f}",
+        ] {
             validate_new_password(password)
                 .expect_err("weak password with invisible suffix should fail");
         }
