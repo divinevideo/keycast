@@ -21,7 +21,7 @@ impl PasswordPolicyError {
 pub fn validate_new_password(password: &str) -> Result<(), PasswordPolicyError> {
     let normalized = password.trim().to_ascii_lowercase();
 
-    if password.chars().count() < 12 {
+    if normalized.chars().count() < 12 {
         return Err(PasswordPolicyError);
     }
 
@@ -49,6 +49,11 @@ mod tests {
     #[test]
     fn rejects_passwords_shorter_than_twelve_characters() {
         validate_new_password("🔑🔑🔑").expect_err("short password should fail");
+    }
+
+    #[test]
+    fn rejects_whitespace_only_passwords() {
+        validate_new_password("            ").expect_err("whitespace-only password should fail");
     }
 
     #[test]
