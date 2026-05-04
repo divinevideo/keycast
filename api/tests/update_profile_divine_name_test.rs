@@ -226,6 +226,7 @@ async fn username_conflict_is_detected_in_local_repository_check() {
 }
 
 #[tokio::test]
+#[serial]
 async fn update_profile_username_conflict_returns_conflict_status() {
     let pool = common::setup_test_db().await;
     let repo = UserRepository::new(pool.clone());
