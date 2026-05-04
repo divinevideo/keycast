@@ -121,6 +121,7 @@ pub(crate) fn normalize_registration_email(email: &str) -> Result<String, &'stat
 
     if local.is_empty()
         || domain.is_empty()
+        || local.len() > 64
         || local.contains('@')
         || domain.contains('@')
         || local.starts_with('.')
@@ -130,8 +131,34 @@ pub(crate) fn normalize_registration_email(email: &str) -> Result<String, &'stat
         || local.contains("..")
         || domain.contains("..")
         || !domain.contains('.')
+        || !local.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'/'
+                        | b'='
+                        | b'?'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'{'
+                        | b'|'
+                        | b'}'
+                        | b'~'
+                        | b'.'
+                )
+        })
         || domain.split('.').any(|label| {
             label.is_empty()
+                || label.len() > 63
                 || label.starts_with('-')
                 || label.ends_with('-')
                 || !label
@@ -4335,6 +4362,8 @@ mod tests {
             "person@gm!ail.com",
             "person@-example.com",
             "person@example-.com",
+            "person(foo)@example.com",
+            "person<evil>@example.com",
             "person@.example.com",
             "person@example.com.",
             ".person@example.com",
@@ -4349,5 +4378,17 @@ mod tests {
                 "{email} should be rejected"
             );
         }
+
+        let local_too_long = format!("{}@example.com", "a".repeat(65));
+        assert!(
+            super::normalize_registration_email(&local_too_long).is_err(),
+            "local part longer than 64 bytes should be rejected"
+        );
+
+        let domain_label_too_long = format!("person@{}.com", "a".repeat(64));
+        assert!(
+            super::normalize_registration_email(&domain_label_too_long).is_err(),
+            "domain labels longer than 63 bytes should be rejected"
+        );
     }
 }
