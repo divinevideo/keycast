@@ -491,7 +491,18 @@ fn validate_atproto_control_plane_config(errors: &mut Vec<&'static str>) {
 
     if let Some(url) = configured {
         match url::Url::parse(&url) {
-            Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => {}
+            Ok(parsed)
+                if matches!(parsed.scheme(), "http" | "https")
+                    && parsed.query().is_none()
+                    && parsed.fragment().is_none() => {}
+            Ok(parsed)
+                if matches!(parsed.scheme(), "http" | "https")
+                    && (parsed.query().is_some() || parsed.fragment().is_some()) =>
+            {
+                errors.push(
+                    "DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL must not include query strings or fragments",
+                );
+            }
             _ => errors.push("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL must be a valid http(s) URL"),
         }
     }
@@ -1269,6 +1280,28 @@ mod tests {
             .contains("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL must be a valid http(s) URL"));
 
         clear_minimal_valid_environment();
+    }
+
+    #[test]
+    #[serial]
+    fn test_validate_environment_rejects_atproto_control_plane_url_with_query_or_fragment() {
+        for url in [
+            "https://control-plane.example?tenant=prod",
+            "https://control-plane.example#provisioning",
+        ] {
+            set_minimal_valid_environment();
+            std::env::set_var("NODE_ENV", "production");
+            std::env::set_var("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL", url);
+
+            let result = validate_environment();
+
+            assert!(result.is_err(), "{url} should be rejected");
+            assert!(result.unwrap_err().contains(
+                "DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL must not include query strings or fragments"
+            ));
+
+            clear_minimal_valid_environment();
+        }
     }
 
     #[test]
