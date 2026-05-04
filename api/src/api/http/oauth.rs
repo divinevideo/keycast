@@ -2137,6 +2137,11 @@ pub async fn authorize_get(
                 return;
             }}
 
+            if (Array.from(password.trim()).length < 12) {{
+                showError('Password must be at least 12 characters');
+                return;
+            }}
+
             let finalNsec = nsecInput || null;
             let finalPubkey = byokPubkey || null;
 

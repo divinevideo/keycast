@@ -367,6 +367,10 @@ async fn oauth_authorize_form_advertises_shared_password_minimum() {
         body.contains("id=\"register_password-confirm\" placeholder=\"Confirm your password\" autocomplete=\"new-password\" required minlength=\"12\""),
         "oauth authorize page body: {body}"
     );
+    assert!(
+        body.contains("Array.from(password.trim()).length < 12"),
+        "oauth authorize page body: {body}"
+    );
 }
 
 #[tokio::test]
