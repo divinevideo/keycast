@@ -21,7 +21,7 @@ impl PasswordPolicyError {
 pub fn validate_new_password(password: &str) -> Result<(), PasswordPolicyError> {
     let normalized = password.trim().to_ascii_lowercase();
 
-    if password.len() < 12 {
+    if password.chars().count() < 12 {
         return Err(PasswordPolicyError);
     }
 
@@ -44,6 +44,11 @@ mod tests {
             assert_eq!(error.code(), WEAK_PASSWORD_CODE);
             assert_eq!(error.message(), WEAK_PASSWORD_MESSAGE);
         }
+    }
+
+    #[test]
+    fn rejects_passwords_shorter_than_twelve_characters() {
+        validate_new_password("🔑🔑🔑").expect_err("short password should fail");
     }
 
     #[test]
