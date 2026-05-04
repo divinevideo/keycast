@@ -45,7 +45,26 @@ pub fn validate_new_password(password: &str) -> Result<(), PasswordPolicyError> 
 fn is_invisible_format_character(ch: char) -> bool {
     matches!(
         ch,
-        '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}'
+        '\u{00ad}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061c}'
+            | '\u{06dd}'
+            | '\u{070f}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08e2}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}'
     )
 }
 
@@ -75,8 +94,10 @@ mod tests {
 
     #[test]
     fn rejects_obvious_weak_passwords_with_invisible_suffixes() {
-        validate_new_password("password123\u{200b}")
-            .expect_err("weak password with invisible suffix should fail");
+        for password in ["password123\u{200b}", "password123\u{00ad}"] {
+            validate_new_password(password)
+                .expect_err("weak password with invisible suffix should fail");
+        }
     }
 
     #[test]
