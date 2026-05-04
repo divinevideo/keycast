@@ -376,7 +376,15 @@ async fn oauth_authorize_form_advertises_shared_password_minimum() {
         "oauth authorize page body: {body}"
     );
     assert!(
+        body.contains("\\uFE00-\\uFE0F"),
+        "oauth authorize page body: {body}"
+    );
+    assert!(
         body.contains("Array.from(normalizedPassword).length < 12"),
+        "oauth authorize page body: {body}"
+    );
+    assert!(
+        body.contains("new TextEncoder().encode(password).length > 72"),
         "oauth authorize page body: {body}"
     );
 }
@@ -477,6 +485,11 @@ async fn claim_get_advertises_shared_password_minimum() {
     );
     assert!(body.contains("replace(/"), "claim page body: {body}");
     assert!(body.contains("\\u00AD"), "claim page body: {body}");
+    assert!(body.contains("\\uFE00-\\uFE0F"), "claim page body: {body}");
+    assert!(
+        body.contains("new TextEncoder().encode(password).length > 72"),
+        "claim page body: {body}"
+    );
     assert!(
         body.contains("Password must be at least 12 characters"),
         "claim page body: {body}"
@@ -488,6 +501,41 @@ async fn claim_get_advertises_shared_password_minimum() {
         .execute(&pool)
         .await;
     cleanup_user(&pool, &pubkey, "claim-policy@example.com").await;
+}
+
+#[test]
+fn svelte_password_forms_reject_bcrypt_overlong_inputs() {
+    let web_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../web/src/routes");
+    let forms = [
+        (
+            web_root.join("register/+page.svelte"),
+            "new TextEncoder().encode(password).length > 72",
+        ),
+        (
+            web_root.join("reset-password/+page.svelte"),
+            "new TextEncoder().encode(password).length > 72",
+        ),
+        (
+            web_root.join("settings/security/+page.svelte"),
+            "new TextEncoder().encode(newPassword).length > 72",
+        ),
+    ];
+
+    for (path, expected_check) in forms {
+        let contents = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+
+        assert!(
+            contents.contains("\\uFE00-\\uFE0F"),
+            "{} should strip variation selectors before submit",
+            path.display()
+        );
+        assert!(
+            contents.contains(expected_check),
+            "{} should reject bcrypt-overlong passwords before submit",
+            path.display()
+        );
+    }
 }
 
 #[tokio::test]
