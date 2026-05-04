@@ -229,7 +229,7 @@ pub async fn claim_get(
             const confirmation = document.getElementById('password_confirmation').value;
             const error = document.getElementById('error');
 
-            if (password.length < 12) {{
+            if (Array.from(password).length < 12) {{
                 error.textContent = 'Password must be at least 12 characters';
                 error.style.display = 'block';
                 return false;

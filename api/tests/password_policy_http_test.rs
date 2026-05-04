@@ -412,7 +412,7 @@ async fn claim_get_advertises_shared_password_minimum() {
         "claim page body: {body}"
     );
     assert!(
-        body.contains("password.length < 12"),
+        body.contains("Array.from(password).length < 12"),
         "claim page body: {body}"
     );
     assert!(
