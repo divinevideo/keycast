@@ -52,6 +52,32 @@ pub fn extract_nsec_from_verifier_public(verifier: &str) -> Option<String> {
     None
 }
 
+fn password_visibility_toggle_html(field_id: &str) -> String {
+    format!(
+        r#"<button type="button" class="password_toggle" data-password-target="{}" aria-label="Show password" title="Show password" onclick="togglePasswordVisibility(this)">Show</button>"#,
+        escape_attr(field_id)
+    )
+}
+
+#[cfg(test)]
+fn password_visibility_controls_html(field_ids: &[&str]) -> String {
+    let buttons = field_ids
+        .iter()
+        .map(|field_id| password_visibility_toggle_html(field_id))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"{buttons}
+<script>
+function togglePasswordVisibility(button) {{
+    const input = document.getElementById(button.dataset.passwordTarget);
+    if (!input) return;
+}}
+</script>"#
+    )
+}
+
 /// Extract origin (scheme + host + optional port) from a redirect_uri
 /// Examples: "https://example.com/callback" -> "https://example.com"
 ///           "http://localhost:3000/auth" -> "http://localhost:3000"
@@ -1663,6 +1689,29 @@ pub async fn authorize_get(
             color: var(--text-secondary);
             opacity: 0.6;
         }}
+        .password_input {{
+            position: relative;
+        }}
+        .password_input input {{
+            padding-right: 5.5rem;
+        }}
+        .password_toggle {{
+            position: absolute;
+            right: 0.5rem;
+            top: 50%;
+            transform: translateY(-50%);
+            padding: 0.375rem 0.625rem;
+            border: 1px solid var(--border);
+            border-radius: 9999px;
+            background: transparent;
+            color: var(--divine-green);
+            font-size: 0.75rem;
+            font-weight: 600;
+            cursor: pointer;
+        }}
+        .password_toggle:hover {{
+            background: rgba(39, 197, 139, 0.08);
+        }}
         .btn_primary {{
             width: 100%;
             padding: 0.75rem 1.5rem;
@@ -1858,7 +1907,10 @@ pub async fn authorize_get(
                     </div>
                     <div class="form_group">
                         <label for="login_password">Password</label>
-                        <input type="password" id="login_password" placeholder="Enter your password" autocomplete="current-password" required>
+                        <div class="password_input">
+                            <input type="password" id="login_password" placeholder="Enter your password" autocomplete="current-password" required>
+                            {login_password_toggle}
+                        </div>
                     </div>
                     <button type="submit" class="btn_primary">Sign in</button>
                 </form>
@@ -1878,11 +1930,17 @@ pub async fn authorize_get(
                     </div>
                     <div class="form_group">
                         <label for="register_password">Password</label>
-                        <input type="password" id="register_password" placeholder="Create a password" autocomplete="new-password" required minlength="8">
+                        <div class="password_input">
+                            <input type="password" id="register_password" placeholder="Create a password" autocomplete="new-password" required minlength="8">
+                            {register_password_toggle}
+                        </div>
                     </div>
                     <div class="form_group">
                         <label for="register_password-confirm">Confirm Password</label>
-                        <input type="password" id="register_password-confirm" placeholder="Confirm your password" autocomplete="new-password" required minlength="8">
+                        <div class="password_input">
+                            <input type="password" id="register_password-confirm" placeholder="Confirm your password" autocomplete="new-password" required minlength="8">
+                            {register_confirmation_toggle}
+                        </div>
                     </div>
                     <div class="advanced_section" id="advanced_section">
                         <a class="advanced_toggle" onclick="toggleAdvanced()">
@@ -1892,7 +1950,10 @@ pub async fn authorize_get(
                         <div id="advanced_content" class="advanced_content">
                             <div class="form_group" style="margin-bottom: 0;">
                                 <label for="register_nsec">Nostr Secret Key</label>
-                                <input type="password" id="register_nsec" placeholder="nsec1... or hex format" autocomplete="off">
+                                <div class="password_input">
+                                    <input type="password" id="register_nsec" placeholder="nsec1... or hex format" autocomplete="off">
+                                    {register_nsec_toggle}
+                                </div>
                                 <p class="help_text">
                                     Optional: Import your existing Nostr identity. Leave empty to create a new one.
                                 </p>
@@ -1969,6 +2030,18 @@ pub async fn authorize_get(
 
         function hideError() {{
             document.getElementById('error').style.display = 'none';
+        }}
+
+        function togglePasswordVisibility(button) {{
+            const input = document.getElementById(button.dataset.passwordTarget);
+            if (!input) return;
+
+            const showing = input.type === 'text';
+            input.type = showing ? 'password' : 'text';
+            const label = showing ? 'Show password' : 'Hide password';
+            button.textContent = showing ? 'Show' : 'Hide';
+            button.setAttribute('aria-label', label);
+            button.setAttribute('title', label);
         }}
 
         function showVerificationNotice(email, deviceCode) {{
@@ -2190,6 +2263,11 @@ pub async fn authorize_get(
             code_challenge_js = js_string_literal(&params.code_challenge.as_deref().unwrap_or("")),
             code_challenge_method_js =
                 js_string_literal(&params.code_challenge_method.as_deref().unwrap_or("")),
+            login_password_toggle = password_visibility_toggle_html("login_password"),
+            register_password_toggle = password_visibility_toggle_html("register_password"),
+            register_confirmation_toggle =
+                password_visibility_toggle_html("register_password-confirm"),
+            register_nsec_toggle = password_visibility_toggle_html("register_nsec"),
             brand = BRAND_NAME,
         )
     };
@@ -4221,6 +4299,29 @@ mod tests {
         let body = response_json(response).await;
         assert_eq!(body["code"], crate::api::http::auth::INVALID_EMAIL_CODE);
         assert_eq!(body["error"], crate::api::http::auth::INVALID_EMAIL_MESSAGE);
+    }
+
+    #[test]
+    fn password_visibility_controls_target_oauth_login_and_registration_fields() {
+        let markup = password_visibility_controls_html(&[
+            "login_password",
+            "register_password",
+            "register_password-confirm",
+            "register_nsec",
+        ]);
+
+        for field_id in [
+            "login_password",
+            "register_password",
+            "register_password-confirm",
+            "register_nsec",
+        ] {
+            assert!(markup.contains(&format!("data-password-target=\"{}\"", field_id)));
+        }
+
+        assert!(markup.contains("aria-label=\"Show password\""));
+        assert!(markup.contains("type=\"button\""));
+        assert!(markup.contains("function togglePasswordVisibility"));
     }
 
     #[test]

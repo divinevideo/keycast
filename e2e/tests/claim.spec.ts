@@ -37,7 +37,12 @@ test.describe("Account claim flow", () => {
     expect(claimBody.expires_at).toBeTruthy();
 
     // 4. Navigate browser to the claim URL
-    await page.goto(claimBody.claim_url);
+    const claimUrl = new URL(claimBody.claim_url);
+    const apiUrl = new URL(process.env.API_URL || "http://localhost:3000");
+    claimUrl.protocol = apiUrl.protocol;
+    claimUrl.host = apiUrl.host;
+
+    await page.goto(claimUrl.toString());
 
     // 5. Verify the HTML form renders with display name and username
     await expect(page.locator("h1")).toContainText("Claim Your Account", {
@@ -78,6 +83,57 @@ test.describe("Account claim flow", () => {
       "Invalid or Expired Link",
       { timeout: 10000 },
     );
+  });
+
+  test("claim password visibility toggles preserve typed values", async ({
+    page,
+    request,
+  }) => {
+    test.setTimeout(60000);
+
+    const { cookie } = await registerAdmin(request);
+    const sessionCookie = `keycast_session=${parseCookieValue(cookie)}`;
+
+    const vineId = `e2e-vine-toggle-${Date.now()}`;
+    const preloadRes = await request.post("/api/admin/preload-user", {
+      headers: { Cookie: sessionCookie },
+      data: {
+        vine_id: vineId,
+        username: `toggle${Date.now()}`,
+        display_name: "Toggle Test",
+      },
+    });
+    expect(preloadRes.status()).toBe(200);
+
+    const claimRes = await request.post("/api/admin/claim-tokens", {
+      headers: { Cookie: sessionCookie },
+      data: { vine_id: vineId },
+    });
+    expect(claimRes.status()).toBe(200);
+    const claimBody = await claimRes.json();
+
+    const claimUrl = new URL(claimBody.claim_url);
+    const apiUrl = new URL(process.env.API_URL || "http://localhost:3000");
+    claimUrl.protocol = apiUrl.protocol;
+    claimUrl.host = apiUrl.host;
+
+    await page.goto(claimUrl.toString());
+    await expect(page.locator("h1")).toContainText("Claim Your Account", {
+      timeout: 10000,
+    });
+
+    const password = page.locator("#password");
+    const confirmation = page.locator("#password_confirmation");
+    await password.fill("ClaimPass123!");
+    await confirmation.fill("ClaimPass123!");
+
+    await page.locator('[data-password-target="password"]').click();
+    await expect(password).toHaveAttribute("type", "text");
+    await expect(password).toHaveValue("ClaimPass123!");
+
+    await page.locator('[data-password-target="password_confirmation"]').click();
+    await expect(confirmation).toHaveAttribute("type", "text");
+    await expect(confirmation).toHaveValue("ClaimPass123!");
   });
 
   test("claim form rejects mismatched passwords", async ({

@@ -10,10 +10,17 @@ use axum::{
 use nostr_sdk::Keys;
 use serde::Deserialize;
 
-use super::html_safety::escape_html;
+use super::html_safety::{escape_attr, escape_html};
 use super::routes::AuthState;
 use crate::brand::BRAND_NAME;
 use keycast_core::repositories::{ClaimTokenRepository, UserRepository};
+
+fn password_visibility_toggle_html(field_id: &str) -> String {
+    format!(
+        r#"<button type="button" class="password-toggle" data-password-target="{}" aria-label="Show password" title="Show password" onclick="togglePasswordVisibility(this)">Show</button>"#,
+        escape_attr(field_id)
+    )
+}
 
 /// Get server keys from SERVER_NSEC environment variable
 fn get_server_keys() -> Result<Keys, ClaimError> {
@@ -159,6 +166,31 @@ pub async fn claim_get(
             border-color: #27C58B;
             box-shadow: 0 0 0 3px rgba(39, 197, 139, 0.1);
         }}
+        .password-input {{
+            position: relative;
+            margin-bottom: 18px;
+        }}
+        .password-input input {{
+            padding-right: 92px;
+            margin-bottom: 0;
+        }}
+        .password-toggle {{
+            position: absolute;
+            right: 8px;
+            top: 50%;
+            transform: translateY(-50%);
+            width: auto;
+            padding: 6px 10px;
+            background: transparent;
+            color: #27C58B;
+            border: 1px solid #1C4033;
+            border-radius: 6px;
+            font-size: 12px;
+            margin: 0;
+        }}
+        .password-toggle:hover {{
+            background: rgba(39, 197, 139, 0.1);
+        }}
         button {{
             width: 100%;
             padding: 12px;
@@ -212,17 +244,35 @@ pub async fn claim_get(
             <input type="email" id="email" name="email" required placeholder="your@email.com">
 
             <label for="password">Password</label>
-            <input type="password" id="password" name="password" required placeholder="••••••••" minlength="8">
+            <div class="password-input">
+                <input type="password" id="password" name="password" required placeholder="••••••••" minlength="8">
+                {password_toggle}
+            </div>
             <p class="requirements">At least 8 characters</p>
 
             <label for="password_confirmation">Confirm Password</label>
-            <input type="password" id="password_confirmation" name="password_confirmation" required placeholder="••••••••">
+            <div class="password-input">
+                <input type="password" id="password_confirmation" name="password_confirmation" required placeholder="••••••••">
+                {password_confirmation_toggle}
+            </div>
 
             <button type="submit">Claim Account</button>
         </form>
     </div>
 
     <script>
+        function togglePasswordVisibility(button) {{
+            const input = document.getElementById(button.dataset.passwordTarget);
+            if (!input) return;
+
+            const showing = input.type === 'text';
+            input.type = showing ? 'password' : 'text';
+            const label = showing ? 'Show password' : 'Hide password';
+            button.textContent = showing ? 'Show' : 'Hide';
+            button.setAttribute('aria-label', label);
+            button.setAttribute('title', label);
+        }}
+
         function validateForm() {{
             const password = document.getElementById('password').value;
             const confirmation = document.getElementById('password_confirmation').value;
@@ -248,6 +298,8 @@ pub async fn claim_get(
         display_name = escape_html(&display_name_str),
         username = escape_html(&username_str),
         token = escape_html(&params.token),
+        password_toggle = password_visibility_toggle_html("password"),
+        password_confirmation_toggle = password_visibility_toggle_html("password_confirmation"),
     );
 
     Ok(Html(html).into_response())
@@ -711,5 +763,25 @@ impl IntoResponse for ClaimError {
         );
 
         (axum::http::StatusCode::BAD_REQUEST, Html(html)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn password_visibility_controls_target_claim_fields() {
+        let password_toggle = password_visibility_toggle_html("password");
+        let confirmation_toggle = password_visibility_toggle_html("password_confirmation");
+
+        for markup in [&password_toggle, &confirmation_toggle] {
+            assert!(markup.contains("type=\"button\""));
+            assert!(markup.contains("aria-label=\"Show password\""));
+            assert!(markup.contains("onclick=\"togglePasswordVisibility(this)\""));
+        }
+
+        assert!(password_toggle.contains("data-password-target=\"password\""));
+        assert!(confirmation_toggle.contains("data-password-target=\"password_confirmation\""));
     }
 }
