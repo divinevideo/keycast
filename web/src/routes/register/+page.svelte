@@ -3,6 +3,7 @@
 	import { toast } from 'svelte-hot-french-toast';
 	import { KeycastApi } from '$lib/keycast_api.svelte';
 	import { setCurrentUser } from '$lib/current_user.svelte';
+	import PasswordInput from '$lib/components/PasswordInput.svelte';
 	import { BRAND } from '$lib/brand';
 	import { onMount } from 'svelte';
 
@@ -118,26 +119,24 @@
 
 			<div class="form-group">
 				<label for="password">Password</label>
-				<input
+				<PasswordInput
 					id="password"
-					type="password"
 					bind:value={password}
 					placeholder="At least 8 characters"
 					required
-					minlength="8"
+					minlength={8}
 					disabled={isLoading}
 				/>
 			</div>
 
 			<div class="form-group">
 				<label for="confirm-password">Confirm Password</label>
-				<input
+				<PasswordInput
 					id="confirm-password"
-					type="password"
 					bind:value={confirmPassword}
 					placeholder="Re-enter password"
 					required
-					minlength="8"
+					minlength={8}
 					disabled={isLoading}
 				/>
 			</div>
@@ -155,9 +154,8 @@
 			<div class="advanced-section">
 				<div class="form-group">
 					<label for="nsec">Your Nostr private key</label>
-					<input
+					<PasswordInput
 						id="nsec"
-						type="password"
 						bind:value={nsec}
 						placeholder="nsec1... or hex format"
 						autocomplete="off"

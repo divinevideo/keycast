@@ -4,6 +4,7 @@
 	import { toast } from 'svelte-hot-french-toast';
 	import { KeycastApi } from '$lib/keycast_api.svelte';
 	import { setCurrentUser } from '$lib/current_user.svelte';
+	import PasswordInput from '$lib/components/PasswordInput.svelte';
 	import { BRAND } from '$lib/brand';
 	import { signin, SigninMethod, signout } from '$lib/utils/auth';
 	import { PlugsConnected } from 'phosphor-svelte';
@@ -223,9 +224,8 @@
 
 				<div class="form-group">
 					<label for="password">Password</label>
-					<input
+					<PasswordInput
 						id="password"
-						type="password"
 						bind:value={password}
 						placeholder="••••••••"
 						required

@@ -3,6 +3,7 @@
 	import { page } from '$app/stores';
 	import { toast } from 'svelte-hot-french-toast';
 	import { KeycastApi } from '$lib/keycast_api.svelte';
+	import PasswordInput from '$lib/components/PasswordInput.svelte';
 	import { BRAND } from '$lib/brand';
 
 	const api = new KeycastApi();
@@ -72,26 +73,24 @@
 			<form onsubmit={(e) => { e.preventDefault(); handleSubmit(); }}>
 				<div class="form-group">
 					<label for="password">New Password</label>
-					<input
+					<PasswordInput
 						id="password"
-						type="password"
 						bind:value={password}
 						placeholder="At least 8 characters"
 						required
-						minlength="8"
+						minlength={8}
 						disabled={isLoading}
 					/>
 				</div>
 
 				<div class="form-group">
 					<label for="confirmPassword">Confirm Password</label>
-					<input
+					<PasswordInput
 						id="confirmPassword"
-						type="password"
 						bind:value={confirmPassword}
 						placeholder="Confirm your password"
 						required
-						minlength="8"
+						minlength={8}
 						disabled={isLoading}
 					/>
 				</div>
@@ -183,34 +182,6 @@
 		color: var(--color-divine-text-secondary);
 		font-size: 0.875rem;
 		font-weight: 500;
-	}
-
-	input {
-		width: 100%;
-		padding: 0.75rem 1rem;
-		background: var(--color-divine-muted);
-		border: 1px solid var(--color-divine-border);
-		border-radius: 0.5rem;
-		color: var(--color-divine-text);
-		font-size: 1rem;
-		box-sizing: border-box;
-		transition: border-color 0.2s, box-shadow 0.2s;
-	}
-
-	input:focus {
-		outline: none;
-		border-color: var(--color-divine-green);
-		box-shadow: 0 0 0 2px rgba(39, 197, 139, 0.2);
-	}
-
-	input::placeholder {
-		color: var(--color-divine-text-secondary);
-		opacity: 0.6;
-	}
-
-	input:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
 	}
 
 	.btn-primary {

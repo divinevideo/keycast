@@ -1,6 +1,7 @@
 <script lang="ts">
 import { goto } from "$app/navigation";
 import { page } from "$app/stores";
+import PasswordInput from "$lib/components/PasswordInput.svelte";
 import { getCurrentUser } from "$lib/current_user.svelte";
 import { KeycastApi } from "$lib/keycast_api.svelte";
 import type { StoredKey } from "$lib/types";
@@ -50,7 +51,7 @@ async function createKey() {
     </div>
     <div class="form-group">
         <label for="secretKey">Private key (nsec or hex)</label>
-        <input type="password" placeholder="nsec1..." bind:value={secretKey} />
+        <PasswordInput id="secretKey" placeholder="nsec1..." bind:value={secretKey} />
     </div>
 
     <button type="submit" class="button button-primary">Securely Add Key</button>

@@ -3,6 +3,7 @@
 	import { getAccountStatus, isEmailVerified, fetchAccountStatus } from '$lib/account_status.svelte';
 	import { KeycastApi } from '$lib/keycast_api.svelte';
 	import AtprotoSettingsCard from '$lib/components/AtprotoSettingsCard.svelte';
+	import PasswordInput from '$lib/components/PasswordInput.svelte';
 	import { BRAND } from '$lib/brand';
 	import { toast } from 'svelte-hot-french-toast';
 	import { goto } from '$app/navigation';
@@ -238,9 +239,8 @@
 			{#if !isPasswordVerified}
 				<div class="form-group">
 					<label for="main-password">Password</label>
-					<input
+					<PasswordInput
 						id="main-password"
-						type="password"
 						bind:value={mainPassword}
 						placeholder="Enter your password"
 						disabled={isVerifying}
@@ -312,9 +312,8 @@
 			<div class="form-container">
 				<div class="form-group">
 					<label for="new-password">New Password</label>
-					<input
+					<PasswordInput
 						id="new-password"
-						type="password"
 						bind:value={newPassword}
 						placeholder="Enter new password (min 8 characters)"
 						disabled={isChangingPassword}
@@ -323,9 +322,8 @@
 
 				<div class="form-group">
 					<label for="confirm-new-password">Confirm New Password</label>
-					<input
+					<PasswordInput
 						id="confirm-new-password"
-						type="password"
 						bind:value={confirmNewPassword}
 						placeholder="Confirm new password"
 						disabled={isChangingPassword}

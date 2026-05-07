@@ -198,6 +198,24 @@ test.describe("Authentication flows", () => {
     await expect(page.locator("text=Continue as")).toHaveCount(0);
   });
 
+  test("login password visibility toggle preserves the typed value", async ({
+    page,
+  }) => {
+    await page.goto("/login");
+
+    const passwordInput = page.locator("input#password");
+    await passwordInput.fill("VisiblePass123!");
+
+    await expect(passwordInput).toHaveAttribute("type", "password");
+    await page.getByRole("button", { name: "Show password" }).click();
+    await expect(passwordInput).toHaveAttribute("type", "text");
+    await expect(passwordInput).toHaveValue("VisiblePass123!");
+
+    await page.getByRole("button", { name: "Hide password" }).click();
+    await expect(passwordInput).toHaveAttribute("type", "password");
+    await expect(passwordInput).toHaveValue("VisiblePass123!");
+  });
+
   test("change password", async ({ request }) => {
     const email = `e2e-chpw-${Date.now()}@test.local`;
     const oldPassword = "OldPass123!";
