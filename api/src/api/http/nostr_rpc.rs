@@ -8,6 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use chrono::{DateTime, Utc};
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
     OAuthAuthorizationRepository, PersonalKeysRepository, PolicyRepository, UserRepository,
@@ -394,13 +395,32 @@ fn is_server_signed(ucan: &ucan::Ucan) -> bool {
 /// Originally for unclaimed Vine imports; gate dropped to allow admin-issued
 /// preload UCANs to keep signing for accounts after claim — needed to publish
 /// additional legacy Vine archives discovered after handover.
+///
+/// Caller must pass the UCAN's `redirect_origin` and `exp` so we can (1) reject
+/// non-preload server-signed UCANs (admin sessions, claim UCANs, etc.) and (2)
+/// propagate the UCAN expiry into the cached handler so warm cache hits stop
+/// signing once the UCAN lifetime ends.
 async fn load_preloaded_user_handler(
     auth_state: &AuthState,
     pool: &sqlx::PgPool,
     user_pubkey_hex: &str,
     tenant_id: i64,
+    redirect_origin: &str,
+    ucan_expires_at: Option<DateTime<Utc>>,
     dpop_cnf_jkt: Option<String>,
 ) -> Result<Arc<HttpRpcHandler>, RpcError> {
+    // Only accept UCANs minted by generate_preload_ucan (admin.rs).
+    // Other server-signed UCANs (admin sessions, claim flow) must not be usable
+    // to sign as preload users via this path.
+    if redirect_origin != "preload" {
+        tracing::warn!(
+            "Preloaded user RPC denied: redirect_origin={} for user {}",
+            redirect_origin,
+            &user_pubkey_hex[..8]
+        );
+        return Err(RpcError::Auth(AuthError::InvalidToken));
+    }
+
     let key_manager = auth_state.state.key_manager.as_ref();
 
     // Verify user exists (encrypted key lookup below will also catch missing rows).
@@ -445,15 +465,17 @@ async fn load_preloaded_user_handler(
     // Create signing session
     let session = Arc::new(SigningSession::new(user_keys));
 
-    // Create handler with NO policy restrictions (empty permissions = full access)
-    // Preloaded users get full access until they claim their account
+    // Create handler with NO policy restrictions (empty permissions = full access).
+    // The cached handler's expiry is the UCAN's exp: cache hits short-circuit UCAN
+    // validation entirely, so without this, a warm cache entry would keep signing
+    // past the UCAN's lifetime until the entry was idle-evicted.
     let handler = Arc::new(HttpRpcHandler::new(
         session,
-        0,      // No authorization_id - this is direct access
-        None,   // No expiry (handled by token expiry)
-        None,   // Not revoked
-        vec![], // No permissions = full access
-        false,  // Not OAuth (preloaded user mode)
+        0,                // No authorization_id - this is direct access
+        ucan_expires_at,  // Stop signing when the UCAN expires (Daniel feedback)
+        None,             // Not revoked
+        vec![],           // No permissions = full access
+        false,            // Not OAuth (preloaded user mode)
         cache_key,
         cache_key, // Use same key for auth_handle
         dpop_cnf_jkt,
@@ -517,10 +539,15 @@ async fn get_handler(
     METRICS.inc_http_rpc_cache_miss();
 
     // Verify UCAN and extract bunker_pubkey (Schnorr signature verification ~1-2ms)
-    let (user_pubkey, _redirect_origin, bunker_pubkey, ucan) =
+    let (user_pubkey, redirect_origin, bunker_pubkey, ucan) =
         crate::ucan_auth::validate_ucan_token(auth_header, tenant_id)
             .await
             .map_err(|_| RpcError::Auth(AuthError::InvalidToken))?;
+
+    // Extract UCAN expiry (unix seconds → DateTime<Utc>) so cached preload
+    // handlers can be invalidated once the UCAN lifetime ends.
+    let ucan_expires_at: Option<DateTime<Utc>> =
+        DateTime::<Utc>::from_timestamp(*ucan.expires_at() as i64, 0);
 
     let dpop_cnf_jkt = crate::ucan_auth::extract_cnf_jkt_from_ucan(&ucan);
 
@@ -565,11 +592,15 @@ async fn get_handler(
         // MODE 2: Preloaded user - server-signed UCAN without bunker_pubkey
         // Used for Vine import; works for both unclaimed and claimed accounts so
         // admins can publish additional legacy archives after handover.
+        // The callee rejects server-signed UCANs whose redirect_origin != "preload"
+        // so admin-session / claim UCANs cannot fall through this path.
         let h = load_preloaded_user_handler(
             auth_state,
             pool,
             &user_pubkey,
             tenant_id,
+            &redirect_origin,
+            ucan_expires_at,
             dpop_cnf_jkt.clone(),
         )
         .await?;

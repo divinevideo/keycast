@@ -907,3 +907,261 @@ async fn test_cache_hit_dpop_bound_ucan_enforced_end_to_end() {
     .expect("Valid DPoP proof on cache hit should succeed");
     assert_eq!(response_4.result, Some(Value::String(pubkey)));
 }
+
+// ============================================================================
+// Preload UCAN regression tests (PR #232 / Daniel review feedback)
+// ============================================================================
+
+/// Build a preload UCAN (server-signed, redirect_origin: "preload", no bunker_pubkey).
+/// Mirrors `generate_preload_ucan` in admin.rs.
+async fn build_preload_ucan_with_lifetime(
+    user_pubkey: &nostr_sdk::PublicKey,
+    tenant_id: i64,
+    server_keys: &Keys,
+    lifetime_secs: u64,
+) -> String {
+    let server_key_material = NostrKeyMaterial::from_keys(server_keys.clone());
+    let user_did = nostr_pubkey_to_did(user_pubkey);
+
+    let facts = json!({
+        "tenant_id": tenant_id,
+        "redirect_origin": "preload",
+        "issued_by_admin": "deadbeef".to_string(),
+    });
+
+    let ucan = UcanBuilder::default()
+        .issued_by(&server_key_material)
+        .for_audience(&user_did)
+        .with_lifetime(lifetime_secs)
+        .with_fact(facts)
+        .build()
+        .expect("Failed to build preload UCAN")
+        .sign()
+        .await
+        .expect("Failed to sign preload UCAN");
+
+    ucan.encode().expect("Failed to encode preload UCAN")
+}
+
+/// Build a server-signed UCAN with a non-"preload" redirect_origin.
+/// Should be rejected by the signing path even though it's server-signed.
+async fn build_server_signed_non_preload_ucan(
+    user_pubkey: &nostr_sdk::PublicKey,
+    tenant_id: i64,
+    server_keys: &Keys,
+) -> String {
+    let server_key_material = NostrKeyMaterial::from_keys(server_keys.clone());
+    let user_did = nostr_pubkey_to_did(user_pubkey);
+
+    let facts = json!({
+        "tenant_id": tenant_id,
+        "redirect_origin": "admin",
+        "admin": true,
+        "admin_role": "full",
+    });
+
+    let ucan = UcanBuilder::default()
+        .issued_by(&server_key_material)
+        .for_audience(&user_did)
+        .with_lifetime(3600)
+        .with_fact(facts)
+        .build()
+        .expect("Failed to build admin UCAN")
+        .sign()
+        .await
+        .expect("Failed to sign admin UCAN");
+
+    ucan.encode().expect("Failed to encode admin UCAN")
+}
+
+/// Daniel review: cached preload handlers must stop at UCAN expiry.
+///
+/// Before the fix, `load_preloaded_user_handler` passed `expires_at: None` to
+/// the cached handler. On cache hit, `get_handler` short-circuits UCAN
+/// validation and only checks `handler.is_valid()`, so a warm cache entry kept
+/// signing past the UCAN's lifetime until idle eviction.
+///
+/// This test mints a preload UCAN with a 2-second lifetime, exercises a
+/// successful sign to populate the cache, sleeps past expiry, and asserts the
+/// second call (cache hit) is rejected and the entry evicted.
+#[tokio::test]
+#[serial]
+async fn test_warm_cache_preload_handler_rejected_after_ucan_expiry() {
+    // Server keys must match SERVER_NSEC env (read by validate_ucan_token /
+    // is_server_signed); set both to the same value.
+    let server_keys = Keys::generate();
+    std::env::set_var(
+        "SERVER_NSEC",
+        server_keys
+            .secret_key()
+            .to_bech32()
+            .expect("server nsec bech32"),
+    );
+
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (user_keys, pubkey_hex) = create_test_user();
+    let pubkey = user_keys.public_key();
+    let key_manager: Arc<Box<dyn KeyManager>> =
+        Arc::new(Box::new(FileKeyManager::new().expect("key manager")));
+
+    insert_user(&pool, tenant_id, &pubkey_hex).await;
+    create_personal_key(&pool, tenant_id, &pubkey_hex, &user_keys, &**key_manager).await;
+
+    // Build AuthState whose state.server_keys matches SERVER_NSEC so behavior is
+    // consistent across the request lifecycle.
+    let auth_state = {
+        let bcrypt_queue = BcryptQueue::new();
+        let secret_pool = SecretPool::new(1);
+        let tenant_cache = Cache::builder().max_capacity(10).build();
+        AuthState {
+            state: Arc::new(KeycastState {
+                db: pool.clone(),
+                key_manager: key_manager.clone(),
+                signer_handlers: None,
+                http_handler_cache: new_http_handler_cache(),
+                server_keys: server_keys.clone(),
+                tenant_cache,
+                bcrypt_sender: bcrypt_queue.sender(),
+                redis: None,
+                secret_pool: secret_pool.receiver(),
+            }),
+            auth_tx: None,
+        }
+    };
+
+    // Preload UCAN with 2s lifetime — long enough to validate on first request,
+    // short enough for the test to wait it out.
+    let token = build_preload_ucan_with_lifetime(&pubkey, tenant_id, &server_keys, 2).await;
+    let auth_header = format!("Bearer {}", token);
+    let cache_key = *blake3::hash(token.as_bytes()).as_bytes();
+
+    // First call: cache miss → UCAN validates → handler cached.
+    let response_1 = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state.clone(),
+        &auth_header,
+        None,
+        get_public_key_request(),
+    )
+    .await
+    .expect("First preload request should succeed");
+    assert_eq!(response_1.result, Some(Value::String(pubkey_hex.clone())));
+
+    // Cache should now contain the handler with expires_at carried from UCAN.
+    let cached = auth_state
+        .state
+        .http_handler_cache
+        .get(&cache_key)
+        .await
+        .expect("Handler should be in cache after first request");
+    assert!(
+        cached.is_valid(),
+        "Cached handler should still be valid before UCAN expiry"
+    );
+
+    // Wait past the UCAN's 2-second lifetime.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    // Cached handler should now report invalid (expires_at < now).
+    assert!(
+        !cached.is_valid(),
+        "Cached handler should be invalid once UCAN exp has passed"
+    );
+
+    // Second call: cache hit → handler.is_valid() returns false → InvalidToken.
+    let err = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state.clone(),
+        &auth_header,
+        None,
+        get_public_key_request(),
+    )
+    .await
+    .expect_err("Cached request after UCAN expiry must be rejected");
+    match err {
+        RpcError::Auth(AuthError::InvalidToken) => {}
+        other => panic!("expected InvalidToken, got: {:?}", other),
+    }
+
+    // Cache entry must be evicted so subsequent requests don't keep hitting it.
+    assert!(
+        auth_state
+            .state
+            .http_handler_cache
+            .get(&cache_key)
+            .await
+            .is_none(),
+        "Invalid cached handler must be evicted"
+    );
+}
+
+/// Daniel review: signing path must accept *real* preload UCANs only.
+///
+/// Before the fix, MODE 2 routed any server-signed UCAN without a bunker_pubkey
+/// to `load_preloaded_user_handler`, which would happily decrypt the user's
+/// nsec and sign. That meant an admin-session UCAN (`redirect_origin: "admin"`)
+/// could be used to sign as any user.
+///
+/// This test mints a server-signed UCAN with `redirect_origin: "admin"` and
+/// verifies the signing path rejects it before touching the user's key.
+#[tokio::test]
+#[serial]
+async fn test_server_signed_non_preload_redirect_origin_rejected() {
+    let server_keys = Keys::generate();
+    std::env::set_var(
+        "SERVER_NSEC",
+        server_keys
+            .secret_key()
+            .to_bech32()
+            .expect("server nsec bech32"),
+    );
+
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (user_keys, pubkey_hex) = create_test_user();
+    let pubkey = user_keys.public_key();
+    let key_manager: Arc<Box<dyn KeyManager>> =
+        Arc::new(Box::new(FileKeyManager::new().expect("key manager")));
+
+    insert_user(&pool, tenant_id, &pubkey_hex).await;
+    create_personal_key(&pool, tenant_id, &pubkey_hex, &user_keys, &**key_manager).await;
+
+    let auth_state = {
+        let bcrypt_queue = BcryptQueue::new();
+        let secret_pool = SecretPool::new(1);
+        let tenant_cache = Cache::builder().max_capacity(10).build();
+        AuthState {
+            state: Arc::new(KeycastState {
+                db: pool.clone(),
+                key_manager: key_manager.clone(),
+                signer_handlers: None,
+                http_handler_cache: new_http_handler_cache(),
+                server_keys: server_keys.clone(),
+                tenant_cache,
+                bcrypt_sender: bcrypt_queue.sender(),
+                redis: None,
+                secret_pool: secret_pool.receiver(),
+            }),
+            auth_tx: None,
+        }
+    };
+
+    // UCAN is server-signed but redirect_origin = "admin" (not "preload").
+    let token = build_server_signed_non_preload_ucan(&pubkey, tenant_id, &server_keys).await;
+    let auth_header = format!("Bearer {}", token);
+
+    let err = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state,
+        &auth_header,
+        None,
+        get_public_key_request(),
+    )
+    .await
+    .expect_err("Server-signed non-preload UCAN must not sign for users");
+    match err {
+        RpcError::Auth(AuthError::InvalidToken) => {}
+        other => panic!("expected InvalidToken, got: {:?}", other),
+    }
+}
