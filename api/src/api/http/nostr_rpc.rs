@@ -391,8 +391,9 @@ fn is_server_signed(ucan: &ucan::Ucan) -> bool {
 }
 
 /// Load handler for preloaded user (server-signed UCAN, no bunker_pubkey)
-/// These are users imported from Vine that haven't claimed their accounts yet.
-/// They have no policy restrictions - full access until account is claimed.
+/// Originally for unclaimed Vine imports; gate dropped to allow admin-issued
+/// preload UCANs to keep signing for accounts after claim — needed to publish
+/// additional legacy Vine archives discovered after handover.
 async fn load_preloaded_user_handler(
     auth_state: &AuthState,
     pool: &sqlx::PgPool,
@@ -402,17 +403,16 @@ async fn load_preloaded_user_handler(
 ) -> Result<Arc<HttpRpcHandler>, RpcError> {
     let key_manager = auth_state.state.key_manager.as_ref();
 
-    // Verify user exists and is unclaimed (email IS NULL)
+    // Verify user exists (encrypted key lookup below will also catch missing rows).
     let user_repo = UserRepository::new(pool.clone());
-    let is_unclaimed = user_repo
+    if user_repo
         .is_unclaimed(user_pubkey_hex, tenant_id)
         .await
-        .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?;
-
-    if is_unclaimed != Some(true) {
-        // User either doesn't exist or has already claimed their account
+        .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?
+        .is_none()
+    {
         tracing::warn!(
-            "Preloaded user RPC denied: user {} not unclaimed",
+            "Preloaded user RPC denied: user {} not found",
             &user_pubkey_hex[..8]
         );
         return Err(RpcError::Auth(AuthError::InvalidToken));
@@ -563,7 +563,8 @@ async fn get_handler(
         h
     } else if is_server_signed(&ucan) {
         // MODE 2: Preloaded user - server-signed UCAN without bunker_pubkey
-        // These are Vine-imported users who haven't claimed their accounts yet
+        // Used for Vine import; works for both unclaimed and claimed accounts so
+        // admins can publish additional legacy archives after handover.
         let h = load_preloaded_user_handler(
             auth_state,
             pool,
