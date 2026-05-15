@@ -471,11 +471,11 @@ async fn load_preloaded_user_handler(
     // past the UCAN's lifetime until the entry was idle-evicted.
     let handler = Arc::new(HttpRpcHandler::new(
         session,
-        0,                // No authorization_id - this is direct access
-        ucan_expires_at,  // Stop signing when the UCAN expires (Daniel feedback)
-        None,             // Not revoked
-        vec![],           // No permissions = full access
-        false,            // Not OAuth (preloaded user mode)
+        0,               // No authorization_id - this is direct access
+        ucan_expires_at, // Stop signing when the UCAN expires (Daniel feedback)
+        None,            // Not revoked
+        vec![],          // No permissions = full access
+        false,           // Not OAuth (preloaded user mode)
         cache_key,
         cache_key, // Use same key for auth_handle
         dpop_cnf_jkt,
