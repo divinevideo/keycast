@@ -1,271 +1,97 @@
 # Repository Guidelines
 
-This file is the canonical agent guide for this repo. It is tool-agnostic; Claude
-Code reads it via an `@AGENTS.md` import in `CLAUDE.md`. Keep Claude-only notes in
-`CLAUDE.md`; everything else belongs here.
+## Repo Shape And Source Of Truth
 
-## Project Overview
+- This is a Rust workspace plus a SvelteKit frontend. The unified server binary is `keycast/src/main.rs`; HTTP routes live in `api/`, shared business logic in `core/`, the NIP-46 signer in `signer/`, and Redis-backed cluster coordination in `cluster-hashring/`.
+- The web app lives in `web/` and uses SvelteKit with Bun for package management.
+- Database migrations live in `database/migrations/`. End-to-end and integration coverage lives in `e2e/` and `tests/`.
+- Operational and design notes live in `docs/` (start with `ARCHITECTURE.md`, `DEVELOPMENT.md`, `DEPLOYMENT.md`, `SECURITY.md`, and the OAuth/signer-specific guides). `CLAUDE.md` is also kept current and is the fastest orientation read.
+- Older docs can drift. If documentation conflicts, trust the current implementation, targeted tests, and the newest focused doc over historical notes.
 
-Keycast is a secure remote signing and permissions system for teams using Nostr. It
-provides NIP-46 remote signing, team-based key management, and flexible permissions
-policies.
+## Worktree-First Task Workflow
 
-**Rust workspace crates:**
-- **keycast**: Unified binary (`keycast/src/main.rs`) — runs API + Signer in a single process.
-- **api**: HTTP API library — team management, authentication, OAuth 2.0 (library only, no binary).
-- **core**: Shared business logic, database models, encryption, permissions system.
-- **signer**: NIP-46 signer library — handles multiple bunker connections.
-- **cluster-hashring**: Redis-backed cluster coordination with consistent hashing (Pub/Sub).
+- Start every new task in a **new worktree branched from `origin/main`** — never from local `main` (often stale), never from another branch or worktree.
+- Fetch first, then create the worktree:
+  - `git fetch origin`
+  - `git worktree add .worktrees/<task-name> -b <branch-name> origin/main`
+- Keep one task per worktree. Do not mix unrelated fixes, reviews, or experiments in the same tree.
+- If the current checkout is dirty, do not start new work there. Commit it, stash it intentionally, or discard it intentionally first.
+- **Rebase onto fresh `origin/main` before every push**, even on a branch you've already pushed:
+  - `git fetch origin && git rebase origin/main`
+  - `git push --force-with-lease` (never `--force` without `--lease`)
+- Never merge `main` into a feature branch — always rebase.
 
-**Client libraries:**
-- **keycast-login**: TypeScript/JavaScript OAuth client with storage abstraction.
-- **keycast_flutter**: Dart/Flutter OAuth client (separate repo: keycast_flutter_demo).
+## PR Guardrails
 
-**Frontend:**
-- **web**: SvelteKit frontend application (uses Bun for package management).
+- Every PR title must use Conventional Commit format: `type(scope): summary` or `docs: summary` for docs-only PRs. The semantic PR check (`.github/workflows/semantic_pr.yml`) enforces this.
+- Set the semantic title when creating the PR. Do not rely on editing it afterward; if you must, verify the semantic check reruns successfully.
+- **Every PR targets `main`. Never stack PRs.** When features are interdependent, ship them as **one combined PR** with clearly delineated commits and a description that calls out each feature separately. Never `gh pr create --base <other-branch>`.
+- A task is not complete if the intended changes are still uncommitted.
+- Stage only the files that belong to the task. Avoid broad staging when the worktree contains unrelated changes.
+- End each task with a clean `git status` except for changes that are explicitly still in progress and clearly called out.
+- Open a pull request once the change is ready for review. Do not leave finished work sitting only in a local branch or worktree.
+- Use `.github/pull_request_template.md` and fill out summary, motivation, related issue, testing, and visuals sections.
+- For `web/` or other UI-facing changes, attach screenshots/video or explicitly state that there is no visual change.
+- Do not name corporate partners, customers, brands, or campaign names in public issue titles, PR titles, branch names, screenshots, or descriptions unless a maintainer explicitly approves it. Use generic descriptors such as "partner account", "creator page", or "external partner".
 
-## Project Structure & Module Organization
-- Rust workspace with core crates under `api/`, `core/`, `signer/`, `cluster-hashring/`, and the unified binary under `keycast/`.
-- Web assets live under `web/` and use SvelteKit with Bun-based workflows.
-- Database migrations live under `database/migrations/`.
-- End-to-end and integration coverage lives in `e2e/` and `tests/`.
-- Operational and design notes live in `docs/`.
+## No Technical Debt, No Failing Tests
 
-## Build, Test, and Development Commands
-
-### Prerequisites
-1. **PostgreSQL** — install locally or use Docker:
-   ```bash
-   docker run -d --name postgres -p 5432:5432 \
-     -e POSTGRES_PASSWORD=password \
-     -e POSTGRES_DB=keycast \
-     postgres:16
-   ```
-2. **Redis** — required for cluster coordination:
-   ```bash
-   docker run -d --name redis -p 6379:6379 redis:7
-   ```
-3. **Master encryption key**: `bun run key:generate`
-4. **Database setup**: `bun run db:reset` (creates tables and runs migrations)
-
-### Common commands
-- `bun run dev`: run the unified binary (API + Signer) locally with hot reload (http://localhost:3000).
-- `bun run dev:web`: run the web frontend locally (https://localhost:5173).
-- `bun run build`: build the unified binary (produces `target/release/keycast`).
-- `bun run build:web`: build the web frontend (produces `web/build/`).
-- `cargo test --workspace --verbose`: run workspace Rust tests.
-- `cargo clippy --workspace --all-targets --all-features -- -D warnings -A deprecated`: match CI lint expectations.
-- `cargo fmt --all -- --check`: verify formatting before review.
-- Use targeted test commands when a change is scoped to one crate or one e2e path, but record that scope clearly in the PR.
-
-## Coding Style & Naming Conventions
-- Keep Rust changes idiomatic and formatted with `rustfmt`.
-- Keep frontend changes aligned with the current SvelteKit/Bun setup rather than introducing new tooling casually.
-- Prefer small, task-scoped changes over wide refactors.
-
-## Commit & Pull Request Guidelines
-- PR titles must use Conventional Commit format: `type(scope): summary` or `type: summary`.
-- Set the correct PR title when opening the PR instead of relying on title edits afterward.
-- If a PR title must be fixed after opening, verify that the semantic PR title check reruns successfully.
-- Keep PRs tightly scoped to the task. Do not include unrelated formatting churn, lockfile noise, drive-by refactors, or incidental cleanup.
-- Temporary or transitional code must include `TODO(#issue):` with a tracking issue for later removal.
-- PR descriptions should include a concise summary, motivation, linked issue, and manual test plan.
-- For `web/` or other UI-facing changes, include screenshots/video in the PR or explicitly state that there is no visual change.
-- Do not mention corporate partners, customers, brands, campaign names, or other sensitive external identities in public issue titles, PR titles, branch names, screenshots, or descriptions unless a maintainer explicitly approves it. Use generic descriptors instead, such as "partner account", "creator page", or "external partner".
+- Do not accumulate technical debt. Fix issues in the PR that touches them; do not defer with TODOs, follow-up issues, skipped tests, or commented-out code. The only acceptable TODO is a transitional-code TODO with a tracking-issue link: `TODO(#issue): ...`.
+- **`origin/main` always passes.** Any failing test on a feature branch is caused by that branch's diff. Never claim flakiness, never `#[ignore]` to silence a failure, never push red "to see what CI says." Run the affected targeted tests plus `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --all-features -- -D warnings -A deprecated` before every push.
 - Do not continue speculative feature work after exploratory implementation if maintainer alignment on scope or UX is still missing.
 
-## Testing Expectations
-- Run `cargo test --workspace --verbose`, `cargo clippy --workspace --all-targets --all-features -- -D warnings -A deprecated`, and `cargo fmt --all -- --check` before requesting review.
-- When touching OAuth, auth/session behavior, NIP-05 behavior, or signer flows, run the most relevant targeted tests and document which ones were used.
-- When changing `web/` behavior, manually verify the affected path and document the manual checks in the PR.
-- OAuth integration tests live in `api/`: `cd api && cargo test`, or target a file, e.g. `cargo test --test oauth_integration_test` / `cargo test --test oauth_unit_test`.
+## Architecture And Layering
 
-## Security & Deployment Notes
-- Do not commit secrets or real credentials.
-- Treat OAuth client configuration, session handling, relay configuration, and production identity settings as sensitive operational context.
-- Be careful with changes that affect signing, token issuance, encryption, or multi-tenant identity semantics; call those out explicitly in the PR body.
-- All sensitive keys are encrypted at rest with AES-256-GCM.
-- The master encryption key must be generated before first run (`bun run key:generate`).
+- HTTP handlers in `api/` should stay thin. Push business logic into `core/` so it stays testable and reusable from the signer, the HTTP RPC path, and tests.
+- Treat `core/` as the source of truth for database models, encryption, UCAN/session handling, OAuth state, and the custom permissions trait.
+- Encrypted secrets (stored keys, OAuth keypairs, master key material) only ever leave `core/`'s key-manager abstractions when actively in use. Do not log, serialize, or persist plaintext key material.
+- New custom permissions implement `CustomPermission` (`core/src/traits.rs`) and must be registered in both `core/src/custom_permissions/mod.rs` (`AVAILABLE_PERMISSIONS`), `core/src/types/permission.rs` (`to_custom_permission()`), and `web/src/lib/types.ts` (`AVAILABLE_PERMISSIONS`).
+- The signer routes incoming NIP-46 requests by recipient pubkey; preserve that contract when adding handlers and avoid global state that conflates authorizations.
+- Keep frontend changes aligned with the existing SvelteKit/Bun setup. Reuse existing components and stores rather than adding parallel patterns.
 
-## Architecture
+## OAuth, Signing, And Identity Rules
 
-### Authentication System
+- Treat OAuth client configuration, session handling, UCAN issuance, relay configuration, and production identity settings as sensitive operational context. Call out changes that affect them explicitly in the PR body.
+- Authentication uses UCAN tokens (Bearer or `keycast_session` cookie). Do not introduce parallel auth schemes; extend the UCAN path instead.
+- OAuth authorizations support multi-device — each approval creates a new authorization and revocation is soft-delete via `revoked_at`. Preserve that semantic when touching authorization lifecycle code.
+- Server-side keys are encrypted at rest with the configured `KMS_PROVIDER` (`file`, `gcp`, or `aws`). Do not bypass `core/`'s key-manager abstractions.
+- Never truncate Nostr pubkeys, event IDs, or signatures in logs, error messages, analytics, or test fixtures. Use full values and let UI handle overflow.
 
-All API authentication uses **UCAN tokens** (Bearer token or `keycast_session` cookie).
+## Verification
 
-**Authentication Methods**:
-1. **Email/Password**: Login/register sets UCAN session cookie.
-2. **OAuth Flow**: Third-party apps receive UCAN token via `/api/oauth/token`.
+Run the smallest relevant verification first, then broaden if the change is cross-cutting.
 
-**Authentication Architecture**:
-- Email login/register creates user in `users` table and stores encrypted keys in `personal_keys`.
-- Returns UCAN session token (set as `keycast_session` HttpOnly cookie).
-- UCAN contains: tenant_id, email, redirect_origin, bunker_pubkey.
-- OAuth authorizations (`oauth_authorizations`) are created via:
-  - Third-party OAuth flow: `/api/oauth/token` creates authorization when app exchanges code.
-  - Manual bunker creation: User explicitly creates bunker via `/user/bunker/create`.
-- Each authorization has its own bunker keypair (derived via HKDF) and connection secret.
-- All authenticated API requests use UCAN Bearer token or session cookie.
-- Backend validates UCAN signature and extracts user pubkey.
+- Format and lint:
+  - `cargo fmt --all -- --check`
+  - `cargo clippy --workspace --all-targets --all-features -- -D warnings -A deprecated`
+- Rust tests:
+  - `cargo test --workspace --verbose` for a quick pass.
+  - `bun run test` to spin up Postgres + Redis via `docker-compose.deps.yml`, set up the test database, and run the full workspace + integration-feature test suite (matches what CI runs via `bun run test:ci`).
+  - Targeted test commands (e.g. `cd api && cargo test --test oauth_integration_test`) when a change is scoped to a single crate or path. Record that scope in the PR.
+- Combined gate: `bun run check` runs fmt, clippy, and `cargo test --workspace` together.
+- Optional pre-push parity with CI: `bun run setup:hooks` installs `scripts/hooks/pre-push`.
+- For `web/` changes, manually verify the affected path in the browser and document the manual checks in the PR.
 
-**Permission Model**:
-- **Whitelist** (VITE_ALLOWED_PUBKEYS): Can create teams, full admin access.
-- **Team Membership**: Can view teams they belong to, role-based permissions (admin/member).
-- **Personal Keys**: Can manage their own OAuth authorizations.
+When touching OAuth, auth/session behavior, NIP-05/profile behavior, signer flows, encryption, or cluster coordination, run the most relevant targeted tests and document which ones were used.
 
-**Key Types**:
-- Regular `Authorization`: Team-managed keys with separate bunker keypair and user signing key.
-- `OAuthAuthorization`: Personal user keys where the user's own keypair acts as both bunker and signer.
+## Database And Migrations
 
-### Database & Encryption
+- New schema changes live in `database/migrations/` as a new timestamped migration. Do not edit shipped migrations.
+- Use SQLx for queries so compile-time verification stays meaningful. If you change a query, regenerate `sqlx-data.json` (where applicable) and commit it with the source change.
+- Locally, `bun run db:reset` recreates the dev database; `bun run db:migrate` applies new migrations. Production migrations are run via `tools/run-migrations.sh` from the deploy pipeline.
 
-- PostgreSQL database with SQLx for compile-time query verification.
-- AES-256-GCM row-level encryption for all private keys (encrypted at rest, decrypted only when used).
-- Supports `KMS_PROVIDER=file|gcp|aws`:
-  - `file` (default): local master key file.
-  - `gcp`: Google Cloud KMS.
-  - `aws`: AWS KMS (requires build with `--features aws`).
-- Backward compatibility: if `KMS_PROVIDER` is unset, `USE_GCP_KMS=true` selects `gcp`, otherwise `file`; if both are set and disagree, `KMS_PROVIDER` is source of truth.
-- Database migrations in `database/migrations/`.
+## Secrets, Local Stack, And Deployment
 
-Key tables:
-- `users`: Nostr public keys
-- `teams`: Team containers
-- `team_users`: Team membership with roles (admin/member)
-- `stored_keys`: Encrypted Nostr keypairs managed by teams
-- `policies`: Named permission sets
-- `permissions`: Custom permission configurations (JSON)
-- `policy_permissions`: Links policies to permissions
-- `authorizations`: NIP-46 remote signing credentials for team keys
-- `oauth_authorizations`: OAuth-based personal auth with NIP-46 support (supports multi-device: each approval creates new authorization, uses `revoked_at` for soft-delete)
+- Do not commit secrets, real credentials, master keys, or production `.env` files. The dev master key is generated locally via `bun run key:generate`.
+- Local development uses `docker-compose.deps.yml` for Postgres and Redis. The dev `SERVER_NSEC` and `ALLOWED_PUBKEYS` values in `package.json` scripts are intentionally non-secret development values; do not reuse them for any deployed environment.
+- Production runs on Google Cloud Run as service `keycast` (us-central1) with `min-instances=3` so the NIP-46 signer stays connected. Be careful with changes that affect startup, signer connection lifecycle, or Redis/cluster coordination — those have outsized blast radius.
+- Deploys are gated behind `bun run deploy` (Cloud Build). Do not deploy on someone else's behalf without explicit confirmation.
 
-### Custom Permissions System
+## Clean Workspace Expectations
 
-Custom permissions implement the `CustomPermission` trait (`core/src/traits.rs`) with three methods:
-- `can_sign(&self, event: &UnsignedEvent) -> bool`
-- `can_encrypt(&self, plaintext: &str, pubkey: &str) -> bool`
-- `can_decrypt(&self, ciphertext: &str, pubkey: &str) -> bool`
-
-When adding a new custom permission:
-1. Create implementation in `core/src/custom_permissions/`.
-2. Add to `AVAILABLE_PERMISSIONS` in `core/src/custom_permissions/mod.rs`.
-3. Add to `AVAILABLE_PERMISSIONS` in `web/src/lib/types.ts`.
-4. Add case to `to_custom_permission()` in `core/src/types/permission.rs`.
-
-Existing permissions:
-- `allowed_kinds`: Restrict signing/encryption by Nostr event kind.
-- `content_filter`: Filter events by content regex patterns.
-- `encrypt_to_self`: Restrict encryption/decryption to user's own pubkey.
-
-### Signer Daemon Architecture
-
-The unified binary (`keycast/src/main.rs`) runs both the HTTP API and NIP-46 signer daemon:
-- Single process handles all active authorizations (both team and OAuth).
-- Loads all authorizations on startup into in-memory HashMap (bunker_pubkey -> handler).
-- Connects to all configured relays for all authorizations.
-- Routes incoming NIP-46 requests to appropriate authorization based on recipient pubkey.
-- Validates requests against policy permissions before signing/encrypting/decrypting.
-- Supports both regular team authorizations and OAuth personal authorizations.
-- Monitors the database for new/removed authorizations and adjusts connections accordingly.
-
-### API Routes Structure
-
-Key endpoints (see `api/src/api/http/routes.rs`):
-
-**Authentication (First-Party)**:
-- `/api/auth/register`: Register with email/password, optional nsec import, sets UCAN session cookie.
-- `/api/auth/login`: Login with email/password, sets UCAN session cookie.
-- `/api/auth/logout`: Clears session cookie.
-- CORS: Restrictive (ALLOWED_ORIGINS env var).
-
-**OAuth (Third-Party)**:
-- `/api/oauth/authorize`: OAuth authorization flow (GET shows approval page, POST processes approval).
-- `/api/oauth/token`: Exchange authorization code for bunker URL with PKCE.
-- `/api/oauth/poll?state={state}`: Poll for authorization code (iOS PWA pattern). Returns HTTP 200 with code when ready, HTTP 202 if pending, HTTP 404 if expired.
-- CORS: Permissive (any origin).
-
-**User Management (UCAN Auth Required)**:
-- `/api/user/oauth-authorizations`: List personal OAuth authorizations.
-- `/api/user/oauth-authorizations/:id`: Revoke authorization.
-- `/api/user/bunker`: Get personal NIP-46 bunker URL (legacy).
-
-**Team Management (UCAN Auth Required)**:
-- `/api/teams/*`: Team CRUD, member management, key management, policies.
-- Requires whitelist or team membership.
-
-### Environment Variables
-
-Required (set in `.env` or docker-compose):
-- `DATABASE_URL`: PostgreSQL connection string (e.g., `postgres://postgres:password@localhost/keycast`).
-- `POSTGRES_PASSWORD`: PostgreSQL password (for docker-compose).
-- `ALLOWED_ORIGINS`: Comma-separated CORS origins (e.g., `https://app.keycast.com,http://localhost:5173`).
-- `SERVER_NSEC`: Server Nostr secret key for signing UCANs (hex 64 chars or nsec bech32). Generate with `openssl rand -hex 32`. Used for server-signed session tokens for users without personal keys yet.
-- `DOMAIN`: Domain name for production deployment (docker-compose only).
-
-Optional:
-- `REDIS_URL`: Redis connection string for cluster coordination (required in production).
-- `REDIS_KEY_PREFIX`: Optional prefix for all Redis keys (e.g., `keycast` → `keycast:oauth_poll:...`). Useful for multi-app GCP Memorystore deployments.
-- `KMS_PROVIDER`: Key manager backend (`file`, `gcp`, or `aws`; default: `file`).
-- `MASTER_KEY_PATH`: Path to master encryption key file (required when `KMS_PROVIDER=file`, default: `./master.key`).
-- `USE_GCP_KMS`: Legacy compatibility flag. If `KMS_PROVIDER` is unset, `true` selects `gcp`; otherwise ignored when `KMS_PROVIDER` is set.
-- `GCP_PROJECT_ID`: Required when `KMS_PROVIDER=gcp`.
-- `AWS_KMS_KEY_ID`: Required when `KMS_PROVIDER=aws` (key ID/ARN/alias).
-- `AWS_REGION`: AWS KMS region for `KMS_PROVIDER=aws` (default: `us-east-1`).
-- `USE_VALKEY_IAM`: Enable GCP IAM authentication for Memorystore Valkey (default: `false`). When enabled, uses Workload Identity to obtain access tokens for Redis authentication. Tokens are cached and refreshed automatically before expiry.
-- `BUNKER_RELAYS`: Comma-separated relay URLs for NIP-46 communication (required, no default).
-- `NIP05_DOMAIN`: When the tenant host is `localhost` or `127.0.0.1` only, overrides the domain used in profile `nip05` (with `DOMAIN` as second choice); does **not** override the tenant domain for real hosts—profile and `/.well-known/nostr.json` must stay on the same host.
-- `RUST_LOG`: Log level configuration (default: `info`).
-- `SQLX_POOL_SIZE`: Database connection pool size (should match Cloud Run concurrency, default: `50`).
-- `VITE_ALLOWED_PUBKEYS`: Comma-separated pubkeys for whitelist access (web frontend).
-- `ENABLE_EXAMPLES`: Enable `/examples` directory serving (default: `false`, set to `true` for development).
-- `KEYCAST_SERVICE_TOKEN`: Bearer token for service-to-service admin API calls (relay-manager, COOP). Required for `/api/admin/users/:pubkey/status` endpoints.
-- `APP_URL`: Base URL for claim links and email verification links (e.g., `https://login.divine.video`). Falls back to `http://localhost:3000` in development.
-
-Development (`.env` in `/web`):
-- `VITE_ALLOWED_PUBKEYS`: Comma-separated pubkeys for dev access.
-
-## Nostr Protocol Integration
-
-- Uses `nostr-sdk` crate (from git, specific revision) with NIP-04, NIP-44, NIP-46, NIP-49, NIP-59 support.
-- NIP-46 remote signing: Clients connect via bunker URLs (`bunker://<pubkey>?relay=<relay>&secret=<secret>`).
-- HTTP RPC (`/api/nostr`): REST endpoint that mirrors NIP-46 methods for low-latency signing (uses UCAN auth).
-
-## Deployment
-
-Production runs on Google Cloud Run as service `keycast` with `min-instances=3` to ensure the NIP-46 signer runs continuously.
-
-### Deploy to Production
-```bash
-bun run deploy  # or: pnpm run deploy:gcp
-```
-This runs Cloud Build which:
-1. Builds Docker image.
-2. Pushes to Artifact Registry.
-3. Deploys to Cloud Run.
-4. Runs smoke tests.
-
-### Architecture
-- **Service:** `keycast` (Cloud Run, us-central1).
-- **URL:** https://login.divine.video
-- **Database:** Cloud SQL PostgreSQL (`keycast-db-plus`) with PgBouncer connection pooling.
-- **Cache/Coordination:** Redis (Memorystore) for cluster hashring coordination.
-- **Secrets:** GCP Secret Manager.
-
-### View Logs
-```bash
-# View recent logs
-pnpm run logs
-
-# Stream logs continuously
-pnpm run logs:watch
-
-# Or via gcloud directly
-gcloud logging read 'resource.type=cloud_run_revision AND resource.labels.service_name=keycast' \
-  --limit=50 --project=openvine-co --format='value(jsonPayload.fields.message)'
-```
-
-### Notes
-- Database migrations run automatically during Cloud Build deployment (except 0001 initial schema).
-- For local development or manual runs, use `tools/run-migrations.sh`.
-- Build issues on low-memory VMs: need 2GB+ RAM for the Vite build; may require swap space or retries.
-- Cloud Run uses `concurrency=50` (registration uses async bcrypt queue, enabling higher concurrency).
+- Do not leave untracked or modified files around after a task unless they are part of the intentional diff.
+- Delete temporary debugging artifacts (scratch scripts, throwaway logs, ad-hoc fixtures) before commit.
+- If a generated file must be committed, make sure it is reproducible and relevant to the change.
+- Before opening the PR, review the diff and remove stray edits, generated junk, logs, scratch files, and half-finished experiments.
+- After opening or updating a PR, inspect GitHub checks and rerun stale semantic jobs if needed.
+- After a branch is merged or abandoned, prune the worktree and branch so stale task state does not accumulate.
