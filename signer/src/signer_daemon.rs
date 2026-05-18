@@ -120,6 +120,28 @@ impl Nip46Handler {
         }
     }
 
+    /// Check that the user's account is active (not suspended or banned).
+    /// Only applies to OAuth authorizations (personal keys tied to a user account).
+    /// Team authorizations don't have user rows — they're managed through team admin.
+    async fn check_user_active(&self) -> SignerResult<()> {
+        if !self.is_oauth {
+            return Ok(());
+        }
+        let user_pubkey = self.user_keys.public_key().to_hex();
+        let status: Option<(String,)> =
+            sqlx::query_as("SELECT status FROM users WHERE pubkey = $1 AND tenant_id = $2")
+                .bind(&user_pubkey)
+                .bind(self.tenant_id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        match status {
+            Some((s,)) if s == "active" => Ok(()),
+            Some(_) => Err(SignerError::permission_denied("Account restricted")),
+            None => Err(SignerError::permission_denied("User not found")),
+        }
+    }
+
     /// Validate permissions before signing an event.
     ///
     /// Loads the policy permissions for this authorization and checks each one.
@@ -165,12 +187,14 @@ impl Nip46Handler {
     }
 
     /// Validate permissions before encrypting plaintext for a recipient.
+    /// Includes a user status check (DB query) — callers should NOT add a separate check.
     #[doc(hidden)]
     pub async fn validate_permissions_for_encrypt(
         &self,
         plaintext: &str,
         recipient_pubkey: &PublicKey,
     ) -> SignerResult<()> {
+        self.check_user_active().await?;
         // Load permissions based on authorization type
         let permissions = if self.is_oauth {
             let oauth_auth =
@@ -210,12 +234,14 @@ impl Nip46Handler {
     }
 
     /// Validate permissions before decrypting ciphertext from a sender.
+    /// Includes a user status check (DB query) — callers should NOT add a separate check.
     #[doc(hidden)]
     pub async fn validate_permissions_for_decrypt(
         &self,
         ciphertext: &str,
         sender_pubkey: &PublicKey,
     ) -> SignerResult<()> {
+        self.check_user_active().await?;
         // Load permissions based on authorization type
         let permissions = if self.is_oauth {
             let oauth_auth =
@@ -1672,7 +1698,8 @@ impl SigningHandler for Nip46Handler {
             self.authorization_id
         );
 
-        // VALIDATE PERMISSIONS BEFORE SIGNING
+        // Check account status and policy permissions before signing
+        self.check_user_active().await?;
         self.validate_permissions_for_sign(&unsigned_event).await?;
 
         // Canonicalize the pubkey to match the signer keys, matching SigningSession::sign_event behavior.
@@ -1771,7 +1798,8 @@ impl Nip46Handler {
             content,
         );
 
-        // VALIDATE PERMISSIONS BEFORE SIGNING
+        // Check account status and policy permissions before signing
+        self.check_user_active().await?;
         self.validate_permissions_for_sign(&unsigned_event).await?;
 
         // Sign the event with user keys (CPU-bound, use spawn_blocking)

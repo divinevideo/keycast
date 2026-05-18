@@ -61,6 +61,7 @@ impl NostrRpcResponse {
 #[derive(Debug)]
 pub enum RpcError {
     Auth(AuthError),
+    AccountSuspended(String),
     InvalidParams(String),
     UnsupportedMethod(String),
     SigningFailed(String),
@@ -73,6 +74,7 @@ impl IntoResponse for RpcError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             RpcError::Auth(e) => return e.into_response(),
+            RpcError::AccountSuspended(msg) => (StatusCode::FORBIDDEN, msg),
             RpcError::InvalidParams(msg) => (StatusCode::BAD_REQUEST, msg),
             RpcError::UnsupportedMethod(method) => (
                 StatusCode::BAD_REQUEST,
@@ -149,6 +151,13 @@ pub async fn nostr_rpc(
             return Err(e);
         }
     };
+
+    // For mutating operations (sign/encrypt/decrypt), check user account status.
+    // get_public_key is NOT gated -- suspended users need to retrieve their pubkey.
+    let needs_status_check = !matches!(req.method.as_str(), "get_public_key");
+    if needs_status_check {
+        check_user_status_active(pool, &handler.user_pubkey_hex(), tenant_id).await?;
+    }
 
     // Dispatch based on method - all permission checks use cached data (no DB hits)
     let result = match req.method.as_str() {
@@ -236,6 +245,30 @@ pub async fn nostr_rpc(
     METRICS.inc_http_rpc_success();
 
     Ok(Json(NostrRpcResponse::success(result)))
+}
+
+/// Check that the user's account is active before allowing mutating operations.
+/// This runs a DB query per request (not cached) so status changes take effect immediately.
+async fn check_user_status_active(
+    pool: &sqlx::PgPool,
+    user_pubkey_hex: &str,
+    tenant_id: i64,
+) -> Result<(), RpcError> {
+    let status: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM users WHERE pubkey = $1 AND tenant_id = $2")
+            .bind(user_pubkey_hex)
+            .bind(tenant_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| {
+                RpcError::Internal(format!("Database error checking user status: {}", e))
+            })?;
+
+    match status {
+        Some((s,)) if s == "active" => Ok(()),
+        Some(_) => Err(RpcError::AccountSuspended("Account restricted".to_string())),
+        None => Err(RpcError::Auth(AuthError::InvalidToken)),
+    }
 }
 
 /// Load an HttpRpcHandler on-demand from DB and cache it

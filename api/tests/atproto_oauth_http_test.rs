@@ -362,6 +362,7 @@ async fn par_authorize_and_token_exchange_with_existing_login_session() {
         &server_keys,
         true,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -513,6 +514,7 @@ async fn authorize_rejects_when_atproto_link_is_not_ready() {
         &server_keys,
         true,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -615,6 +617,7 @@ async fn par_uses_request_host_tenant_for_authorize_flow() {
         &server_keys,
         true,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -704,6 +707,7 @@ async fn authorize_rejects_revoked_request_uri_before_redirecting() {
         None,
         &server_keys,
         true,
+        None,
         None,
     )
     .await
@@ -828,6 +832,7 @@ async fn refresh_token_rotation_requires_the_bound_dpop_key() {
         None,
         &server_keys,
         true,
+        None,
         None,
     )
     .await
@@ -1143,6 +1148,7 @@ async fn confidential_client_requires_private_key_jwt_at_par_and_keeps_key_bindi
         None,
         &server_keys,
         true,
+        None,
         None,
     )
     .await

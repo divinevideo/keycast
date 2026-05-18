@@ -345,7 +345,7 @@ pub async fn headless_login(
     let user_repo = UserRepository::new(pool.clone());
     let user = user_repo.find_with_password(&req.email, tenant_id).await?;
 
-    let (public_key, password_hash, email_verified) = match user {
+    let (public_key, password_hash, email_verified, _user_status) = match user {
         Some(u) => u,
         None => {
             super::auth_observability::record_auth_event_and_log(

@@ -2,10 +2,17 @@
 // ABOUTME: Provides methods for finding, creating, and querying user data
 
 use crate::repositories::RepositoryError;
-use crate::types::user::{User, UserAtprotoState};
+use crate::types::user::{User, UserAtprotoState, UserStatus};
 use chrono::{DateTime, Utc};
 use nostr_sdk::PublicKey;
 use sqlx::{FromRow, PgPool};
+
+pub type StatusTransition = (
+    UserStatus,
+    UserStatus,
+    Option<String>,
+    Option<DateTime<Utc>>,
+);
 
 /// Data returned when looking up a user by verification token.
 /// Includes fields needed to check async bcrypt completion state.
@@ -28,6 +35,8 @@ pub struct AdminUserDetails {
     pub display_name: Option<String>,
     pub vine_id: Option<String>,
     pub has_personal_key: bool,
+    pub status: UserStatus,
+    pub suspended_reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -51,7 +60,7 @@ impl UserRepository {
         pubkey: &PublicKey,
     ) -> Result<User, RepositoryError> {
         sqlx::query_as::<_, User>(
-            "SELECT pubkey, created_at, updated_at FROM users WHERE tenant_id = $1 AND pubkey = $2",
+            "SELECT pubkey, created_at, updated_at, status, suspended_reason, suspended_at FROM users WHERE tenant_id = $1 AND pubkey = $2",
         )
         .bind(tenant_id)
         .bind(pubkey.to_hex())
@@ -75,7 +84,7 @@ impl UserRepository {
             "INSERT INTO users (tenant_id, pubkey, created_at, updated_at)
              VALUES ($1, $2, NOW(), NOW())
              ON CONFLICT (pubkey) DO UPDATE SET updated_at = users.updated_at
-             RETURNING pubkey, created_at, updated_at",
+             RETURNING pubkey, created_at, updated_at, status, suspended_reason, suspended_at",
         )
         .bind(tenant_id)
         .bind(&pubkey_hex)
@@ -195,15 +204,15 @@ impl UserRepository {
         Ok(result.map(|r| r.0))
     }
 
-    /// Find user with password hash and email verification status for login verification.
-    /// Returns (pubkey, password_hash, email_verified).
+    /// Find user with password hash, email verification status, and account status for login verification.
+    /// Returns (pubkey, password_hash, email_verified, status).
     pub async fn find_with_password(
         &self,
         email: &str,
         tenant_id: i64,
-    ) -> Result<Option<(String, String, bool)>, RepositoryError> {
+    ) -> Result<Option<(String, String, bool, UserStatus)>, RepositoryError> {
         sqlx::query_as(
-            "SELECT pubkey, password_hash, email_verified FROM users WHERE email = $1 AND tenant_id = $2 AND password_hash IS NOT NULL",
+            "SELECT pubkey, password_hash, email_verified, status FROM users WHERE email = $1 AND tenant_id = $2 AND password_hash IS NOT NULL",
         )
         .bind(email)
         .bind(tenant_id)
@@ -615,21 +624,75 @@ impl UserRepository {
             .map_err(Into::into)
     }
 
-    /// Get user's email and verified status.
-    /// Returns None if user doesn't exist, Some with nullable email/verified if user exists.
+    /// Get user's email, verified status, and account status.
+    /// Returns None if user doesn't exist.
     pub async fn get_account_status(
         &self,
         pubkey: &str,
         tenant_id: i64,
-    ) -> Result<Option<(Option<String>, Option<bool>)>, RepositoryError> {
+    ) -> Result<Option<(Option<String>, Option<bool>, UserStatus, Option<String>)>, RepositoryError>
+    {
         sqlx::query_as(
-            "SELECT email, email_verified FROM users WHERE pubkey = $1 AND tenant_id = $2",
+            "SELECT email, email_verified, status, suspended_reason FROM users WHERE pubkey = $1 AND tenant_id = $2",
         )
         .bind(pubkey)
         .bind(tenant_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(Into::into)
+    }
+
+    /// Get user's account status fields for admin queries.
+    /// Returns (status, suspended_reason, suspended_at) or None if user not found.
+    pub async fn get_user_status(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<Option<(UserStatus, Option<String>, Option<DateTime<Utc>>)>, RepositoryError> {
+        sqlx::query_as(
+            "SELECT status, suspended_reason, suspended_at FROM users WHERE pubkey = $1 AND tenant_id = $2",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Set user's account status. Clears suspended_reason/suspended_at when setting to active.
+    /// Preserves suspended_at when escalating between non-active states (e.g. suspended → banned).
+    /// Returns (old_status, new_status, suspended_reason, suspended_at) atomically via CTE.
+    pub async fn set_user_status(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+        status: &UserStatus,
+        reason: Option<&str>,
+    ) -> Result<StatusTransition, RepositoryError> {
+        let now = Utc::now();
+        let suspended_reason: Option<&str> = if status.is_active() { None } else { reason };
+        // When setting to active, clear suspended_at. When restricting, preserve existing
+        // suspended_at if already set (escalation), otherwise set it now.
+        let row: Option<StatusTransition> = sqlx::query_as(
+            "WITH old AS (SELECT status, suspended_at FROM users WHERE pubkey = $5 AND tenant_id = $6) \
+             UPDATE users SET status = $1, suspended_reason = $2, \
+               suspended_at = CASE WHEN $1 = 'active' THEN NULL \
+                                   WHEN (SELECT suspended_at FROM old) IS NOT NULL THEN (SELECT suspended_at FROM old) \
+                                   ELSE $3 END, \
+               updated_at = $4 \
+             WHERE pubkey = $5 AND tenant_id = $6 \
+             RETURNING (SELECT status FROM old), users.status, users.suspended_reason, users.suspended_at",
+        )
+        .bind(status.as_str())
+        .bind(suspended_reason)
+        .bind(now)
+        .bind(now)
+        .bind(pubkey)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.ok_or_else(|| RepositoryError::NotFound("user not found".to_string()))
     }
 
     /// Check if username is available (excluding a specific pubkey).
@@ -1254,6 +1317,8 @@ impl UserRepository {
                 u.display_name,
                 u.vine_id,
                 (pk.user_pubkey IS NOT NULL) as \"has_personal_key\",
+                u.status,
+                u.suspended_reason,
                 u.created_at,
                 u.updated_at
              FROM users u

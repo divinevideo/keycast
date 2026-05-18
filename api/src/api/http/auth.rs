@@ -186,6 +186,7 @@ pub(crate) async fn generate_ucan_token(
     email: &str,
     redirect_origin: &str,
     relays: Option<&[String]>,
+    status: Option<&keycast_core::types::user::UserStatus>,
 ) -> Result<String, AuthError> {
     use crate::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
     use serde_json::json;
@@ -203,6 +204,11 @@ pub(crate) async fn generate_ucan_token(
 
     if let Some(relays) = relays {
         facts_obj["relays"] = json!(relays);
+    }
+    if let Some(s) = status {
+        if !s.is_active() {
+            facts_obj["account_status"] = json!(s.as_str());
+        }
     }
 
     let facts = facts_obj;
@@ -238,6 +244,7 @@ pub async fn generate_server_signed_ucan(
     server_keys: &Keys,
     is_first_party: bool,
     admin_role: Option<&str>,
+    status: Option<&keycast_core::types::user::UserStatus>,
 ) -> Result<String, AuthError> {
     use crate::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
     use serde_json::json;
@@ -259,6 +266,11 @@ pub async fn generate_server_signed_ucan(
     }
     if let Some(role) = admin_role {
         facts["admin_role"] = json!(role);
+    }
+    if let Some(s) = status {
+        if !s.is_active() {
+            facts["account_status"] = json!(s.as_str());
+        }
     }
 
     let ucan = UcanBuilder::default()
@@ -358,6 +370,10 @@ pub struct AccountStatusResponse {
     pub email: String,
     pub email_verified: bool,
     pub public_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suspended_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -758,6 +774,7 @@ async fn nostr_auth_login(
         &server_keys,
         false, // NIP-98 admin login is not first-party OAuth
         Some(admin_role),
+        None, // Admin login does not carry user account status
     )
     .await?;
 
@@ -1021,7 +1038,7 @@ pub async fn login(
     let user_repo = UserRepository::new(pool.clone());
     let user = user_repo.find_with_password(&req.email, tenant_id).await?;
 
-    let (public_key, password_hash, email_verified) = match user {
+    let (public_key, password_hash, email_verified, user_status) = match user {
         Some(u) => u,
         None => {
             super::auth_observability::record_auth_event_and_log(
@@ -1140,8 +1157,20 @@ pub async fn login(
     let keys = Keys::new(secret_key.into());
 
     // Generate UCAN token for session cookie with redirect_origin
-    let ucan_token =
-        generate_ucan_token(&keys, tenant_id, &req.email, &redirect_origin, None).await?;
+    let status_ref = if user_status.is_active() {
+        None
+    } else {
+        Some(&user_status)
+    };
+    let ucan_token = generate_ucan_token(
+        &keys,
+        tenant_id,
+        &req.email,
+        &redirect_origin,
+        None,
+        status_ref,
+    )
+    .await?;
 
     // Track successful login
     METRICS.inc_login();
@@ -1823,7 +1852,8 @@ pub async fn verify_email(
         .unwrap_or_else(|_| "http://localhost:3000".to_string());
 
     // Generate UCAN token for session cookie
-    let ucan_token = generate_ucan_token(&keys, tenant_id, &email, &redirect_origin, None).await?;
+    let ucan_token =
+        generate_ucan_token(&keys, tenant_id, &email, &redirect_origin, None, None).await?;
 
     tracing::info!(
         event = "email_verification",
@@ -2305,11 +2335,25 @@ pub async fn get_account_status(
         .await?;
 
     match user {
-        Some((email, email_verified)) => Ok(Json(AccountStatusResponse {
-            email: email.unwrap_or_default(),
-            email_verified: email_verified.unwrap_or(false),
-            public_key: user_pubkey,
-        })),
+        Some((email, email_verified, status, suspended_reason)) => {
+            let account_status = if status.is_active() {
+                None
+            } else {
+                Some(status.as_str().to_string())
+            };
+            let reason = if status.is_active() {
+                None
+            } else {
+                suspended_reason
+            };
+            Ok(Json(AccountStatusResponse {
+                email: email.unwrap_or_default(),
+                email_verified: email_verified.unwrap_or(false),
+                public_key: user_pubkey,
+                account_status,
+                suspended_reason: reason,
+            }))
+        }
         None => Err(AuthError::UserNotFound),
     }
 }
@@ -3510,7 +3554,7 @@ pub async fn change_key(
     // Issue new UCAN session cookie signed by the new key
     let redirect_origin = extract_origin_from_headers(&headers)?;
     let ucan_token =
-        generate_ucan_token(&new_keys, tenant_id, &email, &redirect_origin, None).await?;
+        generate_ucan_token(&new_keys, tenant_id, &email, &redirect_origin, None, None).await?;
 
     let cookie = format!(
         "keycast_session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400",
@@ -4160,6 +4204,7 @@ mod tests {
             1_i64,
             "second@example.com",
             "http://localhost:3000",
+            None,
             None,
         )
         .await

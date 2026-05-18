@@ -210,6 +210,7 @@ Optional:
 - `SQLX_POOL_SIZE`: Database connection pool size (should match Cloud Run concurrency, default: `50`)
 - `VITE_ALLOWED_PUBKEYS`: Comma-separated pubkeys for whitelist access (web frontend)
 - `ENABLE_EXAMPLES`: Enable `/examples` directory serving (default: `false`, set to `true` for development)
+- `KEYCAST_SERVICE_TOKEN`: Bearer token for service-to-service admin API calls (relay-manager, COOP). Required for `/api/admin/users/:pubkey/status` endpoints.
 
 Development (`.env` in `/web`):
 - `VITE_ALLOWED_PUBKEYS`: Comma-separated pubkeys for dev access

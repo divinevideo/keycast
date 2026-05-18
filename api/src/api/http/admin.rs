@@ -2,6 +2,7 @@
 // ABOUTME: Used for Vine import and support workflows
 
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use axum::Json;
 use chrono::{Duration, Utc};
 use nostr_sdk::{FromBech32, Keys};
@@ -17,6 +18,7 @@ use keycast_core::repositories::{
     RegisteredClientRepository, RepositoryError, UserRepository,
 };
 use keycast_core::types::claim_token::generate_claim_token;
+use keycast_core::types::user::UserStatus;
 
 /// Admin token expiry in days (30 days for long-lived admin tokens)
 const ADMIN_TOKEN_EXPIRY_DAYS: i64 = 30;
@@ -898,6 +900,9 @@ pub struct UserLookupDetails {
     pub display_name: Option<String>,
     pub vine_id: Option<String>,
     pub has_personal_key: bool,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suspended_reason: Option<String>,
     pub active_sessions: i64,
     pub created_at: String,
     pub last_active: Option<String>,
@@ -964,6 +969,8 @@ pub async fn get_user_lookup(
             display_name: details.display_name,
             vine_id: details.vine_id,
             has_personal_key: details.has_personal_key,
+            status: details.status.as_str().to_string(),
+            suspended_reason: details.suspended_reason,
             active_sessions: sessions.len() as i64,
             created_at: details.created_at.to_rfc3339(),
             last_active,
@@ -1796,5 +1803,128 @@ pub async fn test_registered_client_pattern(
 
     Ok(Json(TestRedirectPatternResponse {
         matches: test_redirect_pattern(&req.pattern, &req.uri),
+    }))
+}
+
+// --- Service-token-authenticated admin endpoints (for relay-manager, COOP) ---
+
+fn authorize_service_token(headers: &HeaderMap) -> Result<(), ApiError> {
+    use subtle::ConstantTimeEq;
+
+    let expected = std::env::var("KEYCAST_SERVICE_TOKEN")
+        .ok()
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| ApiError::internal("KEYCAST_SERVICE_TOKEN not configured"))?;
+
+    let actual = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ApiError::auth("Missing Authorization header"))?;
+
+    // Hash both to fixed length to avoid leaking expected token length via timing
+    let expected_hash = blake3::hash(format!("Bearer {expected}").as_bytes());
+    let actual_hash = blake3::hash(actual.as_bytes());
+    if expected_hash
+        .as_bytes()
+        .ct_eq(actual_hash.as_bytes())
+        .into()
+    {
+        Ok(())
+    } else {
+        Err(ApiError::auth("Invalid service token"))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UserStatusResponse {
+    pub pubkey: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suspended_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suspended_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+pub async fn get_user_status_admin(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    headers: HeaderMap,
+    Path(pubkey): Path<String>,
+) -> ApiResult<Json<UserStatusResponse>> {
+    authorize_service_token(&headers)?;
+    let tenant_id = tenant.0.id;
+    let user_repo = UserRepository::new(auth_state.state.db.clone());
+
+    let (status, suspended_reason, suspended_at) = user_repo
+        .get_user_status(&pubkey, tenant_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("User not found"))?;
+
+    Ok(Json(UserStatusResponse {
+        pubkey,
+        status: status.as_str().to_string(),
+        suspended_reason,
+        suspended_at,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetUserStatusRequest {
+    pub status: String,
+    pub reason: Option<String>,
+}
+
+pub async fn set_user_status_admin(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    headers: HeaderMap,
+    Path(pubkey): Path<String>,
+    Json(req): Json<SetUserStatusRequest>,
+) -> ApiResult<Json<UserStatusResponse>> {
+    authorize_service_token(&headers)?;
+    let tenant_id = tenant.0.id;
+    let user_repo = UserRepository::new(auth_state.state.db.clone());
+
+    let status = match req.status.as_str() {
+        "active" => UserStatus::Active,
+        "suspended" => UserStatus::Suspended,
+        "banned" => UserStatus::Banned,
+        _ => {
+            return Err(ApiError::bad_request(
+                "Invalid status. Must be: active, suspended, banned",
+            ))
+        }
+    };
+
+    if !status.is_active() && req.reason.as_ref().is_none_or(|r| r.trim().is_empty()) {
+        return Err(ApiError::bad_request(
+            "reason is required when status is suspended or banned",
+        ));
+    }
+
+    let reason = if status.is_active() {
+        None
+    } else {
+        req.reason.as_deref().map(str::trim)
+    };
+    let (old_status, updated_status, suspended_reason, suspended_at) = user_repo
+        .set_user_status(&pubkey, tenant_id, &status, reason)
+        .await?;
+
+    tracing::info!(
+        event = "user_status_changed",
+        pubkey = %pubkey,
+        old_status = %old_status.as_str(),
+        new_status = %updated_status.as_str(),
+        reason = ?req.reason,
+        "Admin changed user status"
+    );
+
+    Ok(Json(UserStatusResponse {
+        pubkey,
+        status: updated_status.as_str().to_string(),
+        suspended_reason,
+        suspended_at,
     }))
 }

@@ -17,6 +17,29 @@ pub enum UserError {
     NotFound,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
+pub enum UserStatus {
+    #[default]
+    Active,
+    Suspended,
+    Banned,
+}
+
+impl UserStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UserStatus::Active => "active",
+            UserStatus::Suspended => "suspended",
+            UserStatus::Banned => "banned",
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        matches!(self, UserStatus::Active)
+    }
+}
+
 /// A user is a representation of a Nostr user (based solely on a pubkey value)
 #[derive(Debug, FromRow, Serialize, Deserialize)]
 pub struct User {
@@ -26,6 +49,9 @@ pub struct User {
     pub created_at: DateTime<chrono::Utc>,
     /// The date and time the user was last updated
     pub updated_at: DateTime<chrono::Utc>,
+    pub status: UserStatus,
+    pub suspended_reason: Option<String>,
+    pub suspended_at: Option<DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,7 +103,7 @@ impl User {
         pubkey: &PublicKey,
     ) -> Result<Self, UserError> {
         match sqlx::query_as::<_, User>(
-            "SELECT pubkey, created_at, updated_at FROM users WHERE tenant_id = $1 AND pubkey = $2",
+            "SELECT pubkey, created_at, updated_at, status, suspended_reason, suspended_at FROM users WHERE tenant_id = $1 AND pubkey = $2",
         )
         .bind(tenant_id)
         .bind(pubkey.to_hex())

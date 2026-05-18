@@ -37,6 +37,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
 sha256 = "1.5"
+subtle = "2.6"
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

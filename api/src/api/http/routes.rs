@@ -227,6 +227,15 @@ pub fn api_routes(
         .layer(auth_cors.clone())
         .with_state(auth_state.clone());
 
+    // Service-authenticated admin routes (for relay-manager, COOP)
+    // Uses KEYCAST_SERVICE_TOKEN Bearer auth, not UCAN
+    let service_admin_routes = Router::new()
+        .route(
+            "/admin/users/:pubkey/status",
+            get(admin::get_user_status_admin).put(admin::set_user_status_admin),
+        )
+        .with_state(auth_state.clone());
+
     // Claim routes (public, accessed via email link)
     // Users claim preloaded accounts by setting email/password
     let claim_routes = Router::new()
@@ -292,6 +301,7 @@ pub fn api_routes(
         .merge(policy_routes.layer(public_cors.clone())) // Public - available to third-party OAuth apps
         .merge(headless_routes.layer(public_cors.clone())) // Public CORS - embedded flow for web + mobile (PKCE protects token exchange)
         .merge(admin_routes) // Admin routes for preloaded accounts (has auth_cors)
+        .merge(service_admin_routes) // Service-token admin routes (no CORS, server-to-server)
         .merge(claim_routes.layer(public_cors.clone())) // Public - claim preloaded accounts
         .merge(metrics_route.layer(public_cors.clone())) // Public - Prometheus metrics
         .merge(docs_route.layer(public_cors))

@@ -531,7 +531,7 @@ pub async fn auth_status(
 
         // Return authenticated with pubkey, optionally with email info if user exists in DB
         // NIP-07 admins may not have a user record, but their UCAN session is still valid
-        if let Some((email, email_verified)) = user_info {
+        if let Some((email, email_verified, _status, _reason)) = user_info {
             Ok(Json(AuthStatusResponse {
                 authenticated: true,
                 pubkey: Some(user_pubkey),
@@ -625,7 +625,7 @@ pub async fn authorize_get(
                     tracing::warn!("UCAN cookie has pubkey {} but user doesn't exist in tenant {}, clearing stale cookie", pubkey, tenant_id);
                     (None, true, None) // User was deleted, clear the cookie
                 }
-                Some((email, _verified)) => (user_pubkey, false, email),
+                Some((email, _verified, _status, _reason)) => (user_pubkey, false, email),
             }
         }
     } else {
@@ -2453,6 +2453,7 @@ async fn handle_refresh_token_grant(
         &auth_state.state.server_keys,
         false, // Refresh tokens are not first-party
         None,
+        None,
     )
     .await
     .map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?;
@@ -2878,6 +2879,7 @@ async fn create_oauth_authorization_and_token(
         &auth_state.state.server_keys,
         is_headless, // first_party fact for headless flow tokens
         None,
+        None,
     )
     .await
     .map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?;
@@ -3070,7 +3072,7 @@ pub async fn oauth_login(
 
     // Validate credentials
     let user_repo = UserRepository::new(pool.clone());
-    let (public_key, password_hash, email_verified) =
+    let (public_key, password_hash, email_verified, _user_status) =
         match user_repo.find_with_password(&req.email, tenant_id).await? {
             Some(user) => user,
             None => {
@@ -3204,9 +3206,10 @@ pub async fn oauth_login(
     };
 
     // Generate UCAN token with redirect_origin
-    let ucan_token = generate_ucan_token(&keys, tenant_id, &req.email, &redirect_origin, None)
-        .await
-        .map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?;
+    let ucan_token =
+        generate_ucan_token(&keys, tenant_id, &req.email, &redirect_origin, None, None)
+            .await
+            .map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?;
 
     // OAuth popup login: bunker authorization will be created manually by user if needed
 
