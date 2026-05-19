@@ -134,23 +134,38 @@ impl RelaySender {
     /// Try to send an item to the queue
     /// Returns error if queue is full (backpressure)
     pub fn try_send(&self, item: Nip46RpcItem) -> Result<(), RelayQueueError> {
-        let closed = self
+        self.try_send_with_open_queue_probe(item, || {})
+    }
+
+    fn try_send_with_open_queue_probe<F>(
+        &self,
+        item: Nip46RpcItem,
+        after_open_check: F,
+    ) -> Result<(), RelayQueueError>
+    where
+        F: FnOnce(),
+    {
+        let close_guard = self
             .closed
             .lock()
             .expect("relay queue close state mutex poisoned");
-        if *closed {
+        if *close_guard {
             METRICS.inc_queue_dropped();
             return Err(RelayQueueError::Closed);
         }
 
-        match self.tx.try_send(item) {
+        after_open_check();
+
+        let result = match self.tx.try_send(item) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
                 METRICS.inc_queue_dropped();
                 Err(RelayQueueError::QueueFull)
             }
             Err(TrySendError::Disconnected(_)) => Err(RelayQueueError::Disconnected),
-        }
+        };
+        drop(close_guard);
+        result
     }
 
     /// Check whether the queue has been explicitly closed.
@@ -371,6 +386,27 @@ mod tests {
             result
         );
         assert!(sender.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_relay_sender_blocks_close_until_enqueue_attempt_completes() {
+        let queue = RelayQueue::new();
+        let sender = queue.sender();
+
+        let result = sender.try_send_with_open_queue_probe(test_item().await, || {
+            assert!(
+                matches!(
+                    sender.closed.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ),
+                "close state mutex must stay locked until the enqueue attempt finishes"
+            );
+        });
+
+        assert!(result.is_ok(), "send should complete before close wins");
+        queue.close();
+        assert!(queue.is_closed());
+        assert_eq!(sender.len(), 1);
     }
 
     #[test]
