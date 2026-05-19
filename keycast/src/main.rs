@@ -607,7 +607,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
 
     // Create Redis connection for API using coordinator's factory (shares IAM auth)
     let factory = coordinator.factory();
-    let redis_conn = factory.get_multiplexed_connection().await?;
+    let redis_conn = factory.get_connection_manager().await?;
     let prefixed_redis =
         keycast_api::PrefixedRedis::new_with_factory(redis_conn, factory, redis_prefix);
     tracing::info!(

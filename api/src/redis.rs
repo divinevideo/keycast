@@ -2,7 +2,7 @@
 // ABOUTME: Enables multi-app GCP Memorystore deployments with isolated namespaces
 
 use cluster_hashring::ValkeyConnectionFactory;
-use redis::aio::MultiplexedConnection;
+use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, RedisResult};
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use tokio::sync::RwLock;
 /// connection refresh for IAM token rotation.
 #[derive(Clone)]
 pub struct PrefixedRedis {
-    conn: Arc<RwLock<MultiplexedConnection>>,
+    conn: Arc<RwLock<ConnectionManager>>,
     factory: Option<Arc<ValkeyConnectionFactory>>,
     prefix: Option<String>,
 }
@@ -37,7 +37,7 @@ impl PrefixedRedis {
     /// * `conn` - The underlying Redis connection
     /// * `prefix` - Optional prefix to prepend to all keys (e.g., "keycast" → "keycast:key")
     #[must_use]
-    pub fn new(conn: MultiplexedConnection, prefix: Option<String>) -> Self {
+    pub fn new(conn: ConnectionManager, prefix: Option<String>) -> Self {
         Self {
             conn: Arc::new(RwLock::new(conn)),
             factory: None,
@@ -53,7 +53,7 @@ impl PrefixedRedis {
     /// * `prefix` - Optional prefix to prepend to all keys
     #[must_use]
     pub fn new_with_factory(
-        conn: MultiplexedConnection,
+        conn: ConnectionManager,
         factory: Arc<ValkeyConnectionFactory>,
         prefix: Option<String>,
     ) -> Self {
@@ -102,7 +102,7 @@ impl PrefixedRedis {
     /// Execute operation with automatic connection refresh on auth failure.
     async fn with_refresh<T, F, Fut>(&self, op: F) -> RedisResult<T>
     where
-        F: Fn(MultiplexedConnection) -> Fut,
+        F: Fn(ConnectionManager) -> Fut,
         Fut: std::future::Future<Output = RedisResult<T>>,
     {
         let conn = self.conn.read().await.clone();
@@ -112,7 +112,7 @@ impl PrefixedRedis {
                 // Token may have expired, try refresh
                 if let Some(ref factory) = self.factory {
                     tracing::debug!("Auth error detected, attempting connection refresh");
-                    match factory.get_multiplexed_connection().await {
+                    match factory.get_connection_manager().await {
                         Ok(new_conn) => {
                             *self.conn.write().await = new_conn.clone();
                             tracing::debug!(
@@ -150,7 +150,7 @@ impl PrefixedRedis {
             return;
         }
 
-        match factory.get_multiplexed_connection().await {
+        match factory.get_connection_manager().await {
             Ok(new_conn) => {
                 *self.conn.write().await = new_conn;
                 tracing::debug!("Refreshed PrefixedRedis connection for IAM token rotation");
@@ -383,7 +383,7 @@ mod tests {
     #[ignore]
     async fn test_prefixed_redis_integration() {
         let client = redis::Client::open("redis://localhost:6379").unwrap();
-        let conn = client.get_multiplexed_async_connection().await.unwrap();
+        let conn = ConnectionManager::new(client).await.unwrap();
         let redis = PrefixedRedis::new(conn, Some("test_prefix".to_string()));
 
         // Test setex and get
@@ -423,7 +423,7 @@ mod tests {
     #[ignore]
     async fn test_prefixed_redis_no_prefix_integration() {
         let client = redis::Client::open("redis://localhost:6379").unwrap();
-        let conn = client.get_multiplexed_async_connection().await.unwrap();
+        let conn = ConnectionManager::new(client).await.unwrap();
         let redis = PrefixedRedis::new(conn, None);
 
         // Test without prefix
@@ -443,7 +443,7 @@ mod tests {
     #[ignore]
     async fn test_prefixed_redis_set_nx_ex_integration() {
         let client = redis::Client::open("redis://localhost:6379").unwrap();
-        let conn = client.get_multiplexed_async_connection().await.unwrap();
+        let conn = ConnectionManager::new(client).await.unwrap();
         let redis = PrefixedRedis::new(conn, Some("test_prefix".to_string()));
 
         redis.del("setnx_key").await.unwrap_or(());
@@ -458,5 +458,48 @@ mod tests {
         assert_eq!(result.as_deref(), Some("v1"));
 
         redis.del("setnx_key").await.unwrap();
+    }
+
+    /// Integration test for recovery after Redis closes the active command socket.
+    #[tokio::test]
+    #[ignore]
+    async fn test_prefixed_redis_recovers_after_connection_killed() {
+        let redis_url =
+            std::env::var("TEST_REDIS_URL").unwrap_or_else(|_| "redis://localhost:16379".into());
+        let client = redis::Client::open(redis_url.as_str()).unwrap();
+        let conn = ConnectionManager::new(client.clone()).await.unwrap();
+        let redis = PrefixedRedis::new(conn, Some("test_prefix".to_string()));
+
+        redis
+            .setex("killed_connection", 60, "before")
+            .await
+            .unwrap();
+
+        let mut active_conn = redis.conn.read().await.clone();
+        let client_id: i64 = redis::cmd("CLIENT")
+            .arg("ID")
+            .query_async(&mut active_conn)
+            .await
+            .unwrap();
+
+        let mut admin_conn = client.get_multiplexed_async_connection().await.unwrap();
+        let _: () = redis::cmd("CLIENT")
+            .arg("KILL")
+            .arg("ID")
+            .arg(client_id)
+            .query_async(&mut admin_conn)
+            .await
+            .unwrap();
+
+        assert!(
+            redis.get("killed_connection").await.is_err(),
+            "first command after CLIENT KILL should observe the closed socket"
+        );
+
+        redis.setex("killed_connection", 60, "after").await.unwrap();
+        let result = redis.get("killed_connection").await.unwrap();
+        assert_eq!(result.as_deref(), Some("after"));
+
+        redis.del("killed_connection").await.unwrap();
     }
 }

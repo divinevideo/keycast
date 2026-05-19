@@ -58,7 +58,7 @@ crossbeam-channel = "0.5"
 num_cpus = "1.16"
 secrecy = { workspace = true }
 zeroize = { workspace = true }
-redis = { version = "0.27", features = ["tokio-comp", "aio"] }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "aio"] }
 cluster-hashring = { path = "../cluster-hashring" }
 
 [dev-dependencies]

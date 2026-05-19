@@ -16,13 +16,13 @@
 //! let factory = ValkeyConnectionFactory::new("redis://10.0.0.5:6379", true).await?;
 //!
 //! // Get connections
-//! let conn = factory.get_multiplexed_connection().await?;
+//! let conn = factory.get_connection_manager().await?;
 //! let pubsub = factory.get_pubsub_connection().await?;
 //! ```
 
 use crate::Error;
 use gcp_auth::TokenProvider;
-use redis::aio::{ConnectionManager, MultiplexedConnection, PubSub};
+use redis::aio::{ConnectionManager, PubSub};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -288,19 +288,6 @@ impl ValkeyConnectionFactory {
 
         // Don't log the URL - it may contain the token
         redis::Client::open(url).map_err(Error::Redis)
-    }
-
-    /// Get a multiplexed connection for general Redis operations.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if connection fails or token refresh fails.
-    pub async fn get_multiplexed_connection(&self) -> Result<MultiplexedConnection, Error> {
-        let client = self.create_client().await?;
-        client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(Error::Redis)
     }
 
     /// Get a connection manager for general Redis operations.
