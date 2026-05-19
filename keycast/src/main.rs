@@ -65,9 +65,9 @@ const DEFAULT_SHUTDOWN_PRE_DRAIN_SECS: u64 = 10;
 /// Override with `SHUTDOWN_HTTP_DRAIN_SECS`.
 const DEFAULT_SHUTDOWN_HTTP_DRAIN_SECS: u64 = 45;
 
-/// Maximum time we wait for the NIP-46 signer + tracked background tasks to
-/// finish after we tear down the relay client. Override with
-/// `SHUTDOWN_SIGNER_DRAIN_SECS`.
+/// Maximum time we wait for the relay queue, NIP-46 signer, and tracked
+/// background tasks to finish before/while tearing down the relay client.
+/// Override with `SHUTDOWN_SIGNER_DRAIN_SECS`.
 const DEFAULT_SHUTDOWN_SIGNER_DRAIN_SECS: u64 = 10;
 
 /// Conservative upper bound on the Deployment's `terminationGracePeriodSeconds`
@@ -314,10 +314,11 @@ fn abort_join_handles(handles: &[tokio::task::AbortHandle]) {
     }
 }
 
-/// Run phase 3 under a single shared `budget`: await `client_shutdown`
-/// (which stops `signer.run()`), close the relay queue so workers drain and
-/// exit, await `relay_worker_handles`, then await `tracker_wait` (which waits
-/// for tracked background tasks to finish).
+/// Run phase 3 under a single shared `budget`: close the relay queue so workers
+/// drain and exit while the relay client is still connected, await
+/// `relay_worker_handles`, await `client_shutdown` (which stops `signer.run()`),
+/// then await `tracker_wait` (which waits for tracked background tasks to
+/// finish).
 ///
 /// On timeout the caller-supplied `abort_signer` callback is invoked — in
 /// production this calls `signer_handle.abort()` — and any unfinished relay
@@ -364,9 +365,9 @@ where
         .map(tokio::task::JoinHandle::abort_handle)
         .collect();
     let combined = async move {
-        client_shutdown.await;
         close_relay_queue();
         wait_for_join_handles(relay_worker_handles).await;
+        client_shutdown.await;
         tracker_wait.await;
     };
     match tokio::time::timeout(budget, combined).await {
@@ -1562,13 +1563,14 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         }
     }
 
-    // Phase 3: tear down the relay client (stops signer.run() subscription),
-    // close the relay queue so relay workers drain and exit, and wait for
-    // signer + other tracked tasks. We do this **after** HTTP drain so NIP-46
-    // requests that arrived before SIGTERM have a chance to complete and
-    // publish responses back to the requesting client before we disconnect
-    // from the relays. `ClusterCoordinator` will be dropped automatically on
-    // return, triggering deregister.
+    // Phase 3: close the relay queue so relay workers stop accepting new
+    // events, drain queued relay work while the relay client remains connected,
+    // then tear down the relay client (stopping signer.run() subscription) and
+    // wait for signer + other tracked tasks. We do this **after** HTTP drain so
+    // NIP-46 requests that arrived before SIGTERM have a chance to complete and
+    // publish responses back to the requesting client before we disconnect from
+    // the relays. `ClusterCoordinator` will be dropped automatically on return,
+    // triggering deregister.
     //
     // `drain_signer_or_abort` applies ONE outer `tokio::time::timeout`
     // at `timings.signer_drain` across both awaits so `signer_drain`
@@ -1579,7 +1581,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     // blow past `terminationGracePeriodSeconds` and swallow phase 4.
     tracing::info!(
         elapsed_secs = shutdown_started_at.elapsed().as_secs(),
-        "Graceful shutdown: tearing down NIP-46 relay client and draining signer tasks"
+        "Graceful shutdown: draining relay workers, then tearing down NIP-46 relay client and signer tasks"
     );
     let signer_drain_budget = timings.signer_drain;
     let signer_handle_for_abort = signer_handle;
@@ -2274,10 +2276,7 @@ mod tests {
         // Default must match the intended Deployment grace period. A default
         // higher than the real pod grace would let unsafe phase budgets pass
         // validation locally and only fail later under kubelet SIGKILL.
-        assert_eq!(
-            parse_shutdown_grace_ceiling(),
-            Duration::from_secs(75)
-        );
+        assert_eq!(parse_shutdown_grace_ceiling(), Duration::from_secs(75));
     }
 
     #[test]
@@ -2518,8 +2517,8 @@ mod tests {
 
     // --- Phase 3 bounded signer drain ---
     //
-    // Phase 3 runs `client_for_shutdown.shutdown().await` followed by
-    // `task_tracker.wait().await`. Previously `client.shutdown()` was
+    // Phase 3 drains relay workers, runs `client_for_shutdown.shutdown().await`,
+    // then `task_tracker.wait().await`. Previously `client.shutdown()` was
     // unbounded: a stuck WebSocket close handshake, a bug in
     // `nostr_sdk::Client::shutdown`, or a dead relay socket could hang
     // the phase past `terminationGracePeriodSeconds` and swallow phase 4
@@ -2575,7 +2574,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_drain_signer_or_abort_closes_queue_and_waits_for_relay_workers() {
+    async fn test_drain_signer_or_abort_drains_relay_workers_before_client_shutdown() {
         // Regression target: relay workers spawned by RelayQueue are not in
         // TaskTracker. Phase 3 must explicitly close the relay queue and await
         // those worker handles before reporting Completed, otherwise phase 4
@@ -2603,9 +2602,21 @@ mod tests {
         let abort_signer = move || {
             abort_called_cb.store(true, Ordering::Relaxed);
         };
+        let queue_closed_for_client = queue_closed.clone();
+        let worker_finished_for_client = worker_finished.clone();
+        let client_shutdown = async move {
+            assert!(
+                queue_closed_for_client.load(Ordering::Relaxed),
+                "phase 3 must close relay intake before shutting down the relay client"
+            );
+            assert!(
+                worker_finished_for_client.load(Ordering::Relaxed),
+                "phase 3 must drain relay workers before shutting down the relay client"
+            );
+        };
 
         let outcome = drain_signer_or_abort(
-            async {},
+            client_shutdown,
             close_relay_queue,
             relay_worker_handles,
             async {},
