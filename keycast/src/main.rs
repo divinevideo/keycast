@@ -71,13 +71,12 @@ const DEFAULT_SHUTDOWN_HTTP_DRAIN_SECS: u64 = 45;
 const DEFAULT_SHUTDOWN_SIGNER_DRAIN_SECS: u64 = 10;
 
 /// Conservative upper bound on the Deployment's `terminationGracePeriodSeconds`
-/// used at startup to sanity-check the shutdown phase budgets. The iac repo
-/// (TODO(#692): track in divinevideo/divine-iac-coreconfig sibling PR) targets
-/// 75s but the issue spec accepts 60–90s; 120s covers the full range with
-/// headroom. If an operator bumps grace higher they can raise this via
-/// `SHUTDOWN_GRACE_PERIOD_CEILING_SECS`. This constant does NOT change the
-/// kubelet behavior — it is purely a misconfig guardrail.
-const DEFAULT_SHUTDOWN_GRACE_CEILING_SECS: u64 = 120;
+/// used at startup to sanity-check the shutdown phase budgets. The default must
+/// match the intended Deployment grace period so validation cannot pass against
+/// a ceiling higher than the kubelet actually enforces. If an operator bumps
+/// grace higher they can raise this via `SHUTDOWN_GRACE_PERIOD_CEILING_SECS`.
+/// This constant does NOT change kubelet behavior — it is purely a guardrail.
+const DEFAULT_SHUTDOWN_GRACE_CEILING_SECS: u64 = 75;
 
 /// Headroom reserved between the end of the phased drain and the kubelet
 /// SIGKILL for DB pool close, tracing flush, and other post-drain cleanup.
@@ -2272,11 +2271,12 @@ mod tests {
     fn test_parse_shutdown_grace_ceiling_default() {
         clear_shutdown_ceiling_env();
 
-        // Default matches DEFAULT_SHUTDOWN_GRACE_CEILING_SECS. Chosen to be
-        // an upper bound that covers the iac PR's 60–90s range with headroom.
+        // Default must match the intended Deployment grace period. A default
+        // higher than the real pod grace would let unsafe phase budgets pass
+        // validation locally and only fail later under kubelet SIGKILL.
         assert_eq!(
             parse_shutdown_grace_ceiling(),
-            Duration::from_secs(DEFAULT_SHUTDOWN_GRACE_CEILING_SECS)
+            Duration::from_secs(75)
         );
     }
 
