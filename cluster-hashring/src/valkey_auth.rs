@@ -22,7 +22,7 @@
 
 use crate::Error;
 use gcp_auth::TokenProvider;
-use redis::aio::{MultiplexedConnection, PubSub};
+use redis::aio::{ConnectionManager, MultiplexedConnection, PubSub};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -301,6 +301,16 @@ impl ValkeyConnectionFactory {
             .get_multiplexed_async_connection()
             .await
             .map_err(Error::Redis)
+    }
+
+    /// Get a connection manager for general Redis operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if connection fails or token refresh fails.
+    pub async fn get_connection_manager(&self) -> Result<ConnectionManager, Error> {
+        let client = self.create_client().await?;
+        ConnectionManager::new(client).await.map_err(Error::Redis)
     }
 
     /// Get a Pub/Sub connection.

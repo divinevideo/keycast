@@ -1,6 +1,6 @@
 use crate::valkey_auth::ValkeyConnectionFactory;
 use crate::Error;
-use redis::aio::MultiplexedConnection;
+use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,7 +11,7 @@ const DEFAULT_CHANNEL: &str = "cluster:membership";
 const STALE_THRESHOLD_SECS: u64 = 30;
 
 pub struct RedisRegistry {
-    conn: MultiplexedConnection,
+    conn: ConnectionManager,
     factory: Arc<ValkeyConnectionFactory>,
     instance_id: String,
     instances_key: String,
@@ -47,7 +47,7 @@ impl RedisRegistry {
         factory: Arc<ValkeyConnectionFactory>,
         prefix: Option<&str>,
     ) -> Result<Self, Error> {
-        let mut conn = factory.get_multiplexed_connection().await?;
+        let mut conn = factory.get_connection_manager().await?;
 
         let instance_id = Uuid::new_v4().to_string();
         let timestamp = current_timestamp_ms();
@@ -140,7 +140,7 @@ impl RedisRegistry {
     }
 
     /// Get the Redis connection for Pub/Sub operations
-    pub fn connection(&self) -> MultiplexedConnection {
+    pub fn connection(&self) -> ConnectionManager {
         self.conn.clone()
     }
 
@@ -152,7 +152,7 @@ impl RedisRegistry {
     /// Refresh the Redis connection (for IAM token rotation).
     /// This creates a new connection with fresh credentials.
     pub async fn refresh_connection(&mut self) -> Result<(), Error> {
-        self.conn = self.factory.get_multiplexed_connection().await?;
+        self.conn = self.factory.get_connection_manager().await?;
         tracing::debug!(instance_id = %self.instance_id, "Refreshed Redis connection");
         Ok(())
     }
@@ -177,6 +177,26 @@ mod tests {
     /// Generate unique test prefix to isolate test data
     fn test_prefix() -> String {
         format!("test:{}", Uuid::new_v4())
+    }
+
+    async fn registry_client_id(registry: &mut RedisRegistry) -> u64 {
+        redis::cmd("CLIENT")
+            .arg("ID")
+            .query_async(&mut registry.conn)
+            .await
+            .unwrap()
+    }
+
+    async fn kill_client(redis_url: &str, client_id: u64) {
+        let client = redis::Client::open(redis_url).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        redis::cmd("CLIENT")
+            .arg("KILL")
+            .arg("ID")
+            .arg(client_id)
+            .query_async::<()>(&mut conn)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -231,6 +251,32 @@ mod tests {
         registry.heartbeat().await.unwrap();
 
         // Instance should still be active
+        let instances = registry.get_active_instances().await.unwrap();
+        assert!(instances.contains(&registry.instance_id().to_string()));
+
+        registry.deregister().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Redis via TEST_REDIS_URL or local Redis on localhost:16379"]
+    async fn test_registry_recovers_after_connection_killed() {
+        let redis_url = get_redis_url();
+        let prefix = test_prefix();
+
+        let mut registry = RedisRegistry::register_with_prefix(&redis_url, Some(&prefix))
+            .await
+            .unwrap();
+
+        let client_id = registry_client_id(&mut registry).await;
+        kill_client(&redis_url, client_id).await;
+
+        let first_result = registry.heartbeat().await;
+        assert!(
+            first_result.is_err(),
+            "the command that discovers the killed socket should fail"
+        );
+
+        registry.heartbeat().await.unwrap();
         let instances = registry.get_active_instances().await.unwrap();
         assert!(instances.contains(&registry.instance_id().to_string()));
 
