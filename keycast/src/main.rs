@@ -1585,7 +1585,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     );
     let signer_drain_budget = timings.signer_drain;
     let signer_handle_for_abort = signer_handle;
-    let close_relay_queue = move || drop(relay_queue);
+    let close_relay_queue = move || relay_queue.close();
     match drain_signer_or_abort(
         client_for_shutdown.shutdown(),
         close_relay_queue,
@@ -2641,6 +2641,56 @@ mod tests {
         assert!(
             !abort_called.load(Ordering::Relaxed),
             "abort_signer must NOT be called on the happy path"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_drain_signer_or_abort_completes_with_retained_relay_sender_clone() {
+        let relay_queue = RelayQueue::new();
+        let retained_sender = relay_queue.sender();
+        let worker_sender_view = retained_sender.clone();
+        let abort_called = Arc::new(AtomicBool::new(false));
+        let worker_finished = Arc::new(AtomicBool::new(false));
+
+        let worker_finished_for_task = worker_finished.clone();
+        let relay_worker_handles = vec![tokio::spawn(async move {
+            while !worker_sender_view.is_closed() {
+                tokio::task::yield_now().await;
+            }
+            worker_finished_for_task.store(true, Ordering::Relaxed);
+        })];
+
+        let abort_called_cb = abort_called.clone();
+        let abort_signer = move || {
+            abort_called_cb.store(true, Ordering::Relaxed);
+        };
+
+        let outcome = drain_signer_or_abort(
+            async {},
+            move || relay_queue.close(),
+            relay_worker_handles,
+            async {},
+            abort_signer,
+            Duration::from_secs(10),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, SignerDrainOutcome::Completed),
+            "expected Completed with retained RelaySender clone, got {:?}",
+            outcome
+        );
+        assert!(
+            retained_sender.is_closed(),
+            "explicit close must be visible through retained RelaySender clones"
+        );
+        assert!(
+            worker_finished.load(Ordering::Relaxed),
+            "phase 3 must drain relay workers after explicit close"
+        );
+        assert!(
+            !abort_called.load(Ordering::Relaxed),
+            "retained RelaySender clones must not force the timeout path"
         );
     }
 

@@ -4,15 +4,17 @@
 use crate::error::{SignerError, SignerResult};
 use crate::signer_daemon::Nip46Handler;
 use cluster_hashring::ClusterCoordinator;
-use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 use keycast_core::encryption::KeyManager;
 use keycast_core::metrics::METRICS;
 use moka::future::Cache;
 use nostr_sdk::prelude::*;
 use sqlx::PgPool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 const QUEUE_CAPACITY: usize = 4096;
+const WORKER_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// NIP-46 request item for the relay queue
 /// Contains all data needed to process a single NIP-46 request
@@ -30,19 +32,41 @@ pub struct Nip46RpcItem {
 pub struct RelayQueue {
     tx: Sender<Nip46RpcItem>,
     rx: Receiver<Nip46RpcItem>,
+    closed: Arc<Mutex<bool>>,
 }
 
 impl RelayQueue {
     /// Create a new relay queue with bounded capacity
     pub fn new() -> Self {
         let (tx, rx) = bounded(QUEUE_CAPACITY);
-        Self { tx, rx }
+        Self {
+            tx,
+            rx,
+            closed: Arc::new(Mutex::new(false)),
+        }
+    }
+
+    /// Close the queue to new work while allowing workers to drain queued items.
+    pub fn close(&self) {
+        *self
+            .closed
+            .lock()
+            .expect("relay queue close state mutex poisoned") = true;
+    }
+
+    /// Check whether the queue has been explicitly closed.
+    pub fn is_closed(&self) -> bool {
+        *self
+            .closed
+            .lock()
+            .expect("relay queue close state mutex poisoned")
     }
 
     /// Get a sender handle for enqueueing items
     pub fn sender(&self) -> RelaySender {
         RelaySender {
             tx: self.tx.clone(),
+            closed: self.closed.clone(),
         }
     }
 
@@ -68,6 +92,7 @@ impl RelayQueue {
         (0..num_workers)
             .map(|worker_id| {
                 let rx = self.rx.clone();
+                let closed = self.closed.clone();
                 let handlers = handlers.clone();
                 let client = client.clone();
                 let pool = pool.clone();
@@ -75,9 +100,10 @@ impl RelayQueue {
                 let coordinator = coordinator.clone();
 
                 tokio::spawn(async move {
+                    let worker_queue = RelayWorkerQueue { rx, closed };
                     relay_worker_loop(
                         worker_id,
-                        rx,
+                        worker_queue,
                         handlers,
                         client,
                         pool,
@@ -101,12 +127,22 @@ impl Default for RelayQueue {
 #[derive(Clone)]
 pub struct RelaySender {
     tx: Sender<Nip46RpcItem>,
+    closed: Arc<Mutex<bool>>,
 }
 
 impl RelaySender {
     /// Try to send an item to the queue
     /// Returns error if queue is full (backpressure)
     pub fn try_send(&self, item: Nip46RpcItem) -> Result<(), RelayQueueError> {
+        let closed = self
+            .closed
+            .lock()
+            .expect("relay queue close state mutex poisoned");
+        if *closed {
+            METRICS.inc_queue_dropped();
+            return Err(RelayQueueError::Closed);
+        }
+
         match self.tx.try_send(item) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
@@ -115,6 +151,14 @@ impl RelaySender {
             }
             Err(TrySendError::Disconnected(_)) => Err(RelayQueueError::Disconnected),
         }
+    }
+
+    /// Check whether the queue has been explicitly closed.
+    pub fn is_closed(&self) -> bool {
+        *self
+            .closed
+            .lock()
+            .expect("relay queue close state mutex poisoned")
     }
 
     /// Get current queue length (approximate, for metrics)
@@ -133,14 +177,21 @@ impl RelaySender {
 pub enum RelayQueueError {
     #[error("Relay queue is full - system overloaded")]
     QueueFull,
+    #[error("Relay queue is closed")]
+    Closed,
     #[error("Relay queue disconnected")]
     Disconnected,
+}
+
+struct RelayWorkerQueue {
+    rx: Receiver<Nip46RpcItem>,
+    closed: Arc<Mutex<bool>>,
 }
 
 /// Worker loop that processes NIP-46 items from the relay queue
 async fn relay_worker_loop(
     worker_id: usize,
-    rx: Receiver<Nip46RpcItem>,
+    queue: RelayWorkerQueue,
     handlers: Cache<String, Nip46Handler>,
     client: Client,
     pool: PgPool,
@@ -150,16 +201,30 @@ async fn relay_worker_loop(
     tracing::debug!("Relay worker {} started", worker_id);
 
     loop {
+        if *queue
+            .closed
+            .lock()
+            .expect("relay queue close state mutex poisoned")
+            && queue.rx.is_empty()
+        {
+            tracing::info!(
+                "Relay worker {} shutting down (queue closed and empty)",
+                worker_id
+            );
+            break;
+        }
+
         // Block on receiving next item (in spawn_blocking to not block async runtime)
         let item = {
-            let rx = rx.clone();
-            match tokio::task::spawn_blocking(move || rx.recv()).await {
+            let rx = queue.rx.clone();
+            match tokio::task::spawn_blocking(move || rx.recv_timeout(WORKER_RECV_TIMEOUT)).await {
                 Ok(Ok(item)) => item,
-                Ok(Err(_)) => {
+                Ok(Err(RecvTimeoutError::Disconnected)) => {
                     // Channel disconnected - shutdown
                     tracing::info!("Relay worker {} shutting down (channel closed)", worker_id);
                     break;
                 }
+                Ok(Err(RecvTimeoutError::Timeout)) => continue,
                 Err(e) => {
                     tracing::error!("Relay worker {} spawn_blocking panicked: {}", worker_id, e);
                     continue;
@@ -248,6 +313,19 @@ impl Default for VerifyQueue {
 mod tests {
     use super::*;
 
+    async fn test_item() -> Nip46RpcItem {
+        let keys = Keys::generate();
+        let unsigned = EventBuilder::text_note("test").build(keys.public_key());
+        let event = keys
+            .sign_event(unsigned)
+            .await
+            .expect("test event should sign");
+        Nip46RpcItem {
+            event: Box::new(event),
+            bunker_pubkey: keys.public_key().to_hex(),
+        }
+    }
+
     #[test]
     fn test_relay_queue_creation() {
         let queue = RelayQueue::new();
@@ -264,6 +342,35 @@ mod tests {
         // Both senders should work with the same queue
         assert!(sender1.is_empty());
         assert!(sender2.is_empty());
+    }
+
+    #[test]
+    fn test_relay_queue_close_is_visible_to_sender_clones() {
+        let queue = RelayQueue::new();
+        let sender1 = queue.sender();
+        let sender2 = sender1.clone();
+
+        queue.close();
+
+        assert!(queue.is_closed());
+        assert!(sender1.is_closed());
+        assert!(sender2.is_closed());
+    }
+
+    #[tokio::test]
+    async fn test_relay_sender_rejects_new_work_after_close() {
+        let queue = RelayQueue::new();
+        let sender = queue.sender();
+
+        queue.close();
+
+        let result = sender.try_send(test_item().await);
+        assert!(
+            matches!(result, Err(RelayQueueError::Closed)),
+            "expected closed queue error, got {:?}",
+            result
+        );
+        assert!(sender.is_empty());
     }
 
     #[test]
