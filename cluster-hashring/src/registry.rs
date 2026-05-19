@@ -139,7 +139,7 @@ impl RedisRegistry {
         &self.instances_key
     }
 
-    /// Get the Redis connection for Pub/Sub operations
+    /// Get the Redis command connection for operations like `PUBLISH`.
     pub fn connection(&self) -> ConnectionManager {
         self.conn.clone()
     }

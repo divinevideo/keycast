@@ -292,6 +292,11 @@ impl ValkeyConnectionFactory {
 
     /// Get a connection manager for general Redis operations.
     ///
+    /// The manager will reconnect dropped sockets automatically, but those
+    /// reconnects reuse the credentials baked into the client created here.
+    /// IAM token rotation still requires rebuilding the manager via this
+    /// factory so reconnect attempts use a fresh token.
+    ///
     /// # Errors
     ///
     /// Returns an error if connection fails or token refresh fails.
