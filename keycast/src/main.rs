@@ -281,12 +281,12 @@ enum HttpDrainOutcome {
     AbortedAfterTimeout,
 }
 
-/// Result of awaiting phase 3 (relay client teardown + tracked task drain)
-/// under the `signer_drain` budget.
+/// Result of awaiting phase 3 (relay client teardown + relay worker drain +
+/// tracked task drain) under the `signer_drain` budget.
 #[derive(Debug)]
 enum SignerDrainOutcome {
-    /// Both `client.shutdown()` and `task_tracker.wait()` finished before
-    /// the shared phase budget elapsed.
+    /// `client.shutdown()`, relay worker joins, and `task_tracker.wait()`
+    /// finished before the shared phase budget elapsed.
     Completed,
     /// The shared phase budget elapsed before both futures finished. The
     /// abort callback was invoked to stop the signer task; the caller can
@@ -294,16 +294,38 @@ enum SignerDrainOutcome {
     AbortedAfterTimeout,
 }
 
+/// Await relay worker handles until they finish after the queue is closed.
+async fn wait_for_join_handles(handles: Vec<tokio::task::JoinHandle<()>>) {
+    for handle in handles {
+        match handle.await {
+            Ok(()) => {}
+            Err(error) if error.is_cancelled() => {
+                tracing::debug!("Relay worker task cancelled during shutdown");
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "Relay worker task failed during shutdown");
+            }
+        }
+    }
+}
+
+fn abort_join_handles(handles: &[tokio::task::AbortHandle]) {
+    for handle in handles {
+        handle.abort();
+    }
+}
+
 /// Run phase 3 under a single shared `budget`: await `client_shutdown`
-/// (which stops `signer.run()` and the relay worker loop so in-flight
-/// sign responses can still be published on the way out) followed by
-/// `tracker_wait` (which waits for tracked background tasks to finish).
+/// (which stops `signer.run()`), close the relay queue so workers drain and
+/// exit, await `relay_worker_handles`, then await `tracker_wait` (which waits
+/// for tracked background tasks to finish).
 ///
-/// On timeout the caller-supplied `abort_signer` callback is invoked —
-/// in production this calls `signer_handle.abort()` — and the helper
-/// returns `AbortedAfterTimeout`. The entire phase is bounded by
-/// `budget` via one outer `tokio::time::timeout`, so the helper returns
-/// in at most `budget` regardless of which sub-future (or both) hangs.
+/// On timeout the caller-supplied `abort_signer` callback is invoked — in
+/// production this calls `signer_handle.abort()` — and any unfinished relay
+/// worker handles are aborted before returning `AbortedAfterTimeout`. The
+/// entire phase is bounded by `budget` via one outer `tokio::time::timeout`, so
+/// the helper returns in at most `budget` regardless of which sub-future (or
+/// relay worker) hangs.
 ///
 /// Why one shared budget, not two independent ones: the design contract
 /// enforced by `validate_shutdown_timings` is
@@ -324,25 +346,35 @@ enum SignerDrainOutcome {
 /// behaviour can be exercised deterministically with `tokio::time::pause`
 /// in tests without standing up a real `nostr_sdk::Client` or a real
 /// signer `JoinHandle`.
-async fn drain_signer_or_abort<C, W, A>(
+async fn drain_signer_or_abort<C, Q, W, A>(
     client_shutdown: C,
+    close_relay_queue: Q,
+    relay_worker_handles: Vec<tokio::task::JoinHandle<()>>,
     tracker_wait: W,
     abort_signer: A,
     budget: Duration,
 ) -> SignerDrainOutcome
 where
     C: std::future::Future<Output = ()>,
+    Q: FnOnce(),
     W: std::future::Future<Output = ()>,
     A: FnOnce(),
 {
+    let relay_worker_abort_handles: Vec<_> = relay_worker_handles
+        .iter()
+        .map(tokio::task::JoinHandle::abort_handle)
+        .collect();
     let combined = async move {
         client_shutdown.await;
+        close_relay_queue();
+        wait_for_join_handles(relay_worker_handles).await;
         tracker_wait.await;
     };
     match tokio::time::timeout(budget, combined).await {
         Ok(()) => SignerDrainOutcome::Completed,
         Err(_) => {
             abort_signer();
+            abort_join_handles(&relay_worker_abort_handles);
             SignerDrainOutcome::AbortedAfterTimeout
         }
     }
@@ -1077,7 +1109,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| num_cpus::get().max(4) * 2);
-    let _relay_worker_handles = relay_queue.spawn_workers(
+    let relay_worker_handles = relay_queue.spawn_workers(
         num_workers,
         signer.handlers(),
         signer.client(),
@@ -1531,12 +1563,13 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         }
     }
 
-    // Phase 3: tear down the relay client (stops signer.run() subscription)
-    // and wait for signer + other tracked tasks. We do this **after** HTTP
-    // drain so NIP-46 requests that arrived before SIGTERM have a chance to
-    // complete and publish responses back to the requesting client before we
-    // disconnect from the relays. `ClusterCoordinator` will be dropped
-    // automatically on return, triggering deregister.
+    // Phase 3: tear down the relay client (stops signer.run() subscription),
+    // close the relay queue so relay workers drain and exit, and wait for
+    // signer + other tracked tasks. We do this **after** HTTP drain so NIP-46
+    // requests that arrived before SIGTERM have a chance to complete and
+    // publish responses back to the requesting client before we disconnect
+    // from the relays. `ClusterCoordinator` will be dropped automatically on
+    // return, triggering deregister.
     //
     // `drain_signer_or_abort` applies ONE outer `tokio::time::timeout`
     // at `timings.signer_drain` across both awaits so `signer_drain`
@@ -1551,8 +1584,11 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     );
     let signer_drain_budget = timings.signer_drain;
     let signer_handle_for_abort = signer_handle;
+    let close_relay_queue = move || drop(relay_queue);
     match drain_signer_or_abort(
         client_for_shutdown.shutdown(),
+        close_relay_queue,
+        relay_worker_handles,
         task_tracker.wait(),
         || signer_handle_for_abort.abort(),
         signer_drain_budget,
@@ -1565,7 +1601,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         SignerDrainOutcome::AbortedAfterTimeout => {
             tracing::warn!(
                 signer_drain_secs = signer_drain_budget.as_secs(),
-                "Signer drain timed out (client.shutdown() and/or task_tracker.wait() exceeded signer_drain budget); aborted signer"
+                "Signer drain timed out (client.shutdown(), relay workers, and/or task_tracker.wait() exceeded signer_drain budget); aborted signer and relay workers"
             );
         }
     }
@@ -2515,9 +2551,12 @@ mod tests {
         let tracker_wait = async {
             tokio::time::sleep(Duration::from_secs(1)).await;
         };
+        let relay_worker_handles = Vec::new();
 
         let outcome = drain_signer_or_abort(
             client_shutdown,
+            || {},
+            relay_worker_handles,
             tracker_wait,
             abort_signer,
             Duration::from_secs(10),
@@ -2532,6 +2571,133 @@ mod tests {
         assert!(
             !abort_called.load(Ordering::Relaxed),
             "abort_signer must NOT be called on the happy path"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_drain_signer_or_abort_closes_queue_and_waits_for_relay_workers() {
+        // Regression target: relay workers spawned by RelayQueue are not in
+        // TaskTracker. Phase 3 must explicitly close the relay queue and await
+        // those worker handles before reporting Completed, otherwise phase 4
+        // can close the DB pool while relay workers are still processing queued
+        // NIP-46 requests.
+        let queue_closed = Arc::new(AtomicBool::new(false));
+        let worker_finished = Arc::new(AtomicBool::new(false));
+        let abort_called = Arc::new(AtomicBool::new(false));
+
+        let queue_closed_for_worker = queue_closed.clone();
+        let worker_finished_for_worker = worker_finished.clone();
+        let relay_worker_handles = vec![tokio::spawn(async move {
+            while !queue_closed_for_worker.load(Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            worker_finished_for_worker.store(true, Ordering::Relaxed);
+        })];
+
+        let queue_closed_for_cb = queue_closed.clone();
+        let close_relay_queue = move || {
+            queue_closed_for_cb.store(true, Ordering::Relaxed);
+        };
+        let abort_called_cb = abort_called.clone();
+        let abort_signer = move || {
+            abort_called_cb.store(true, Ordering::Relaxed);
+        };
+
+        let outcome = drain_signer_or_abort(
+            async {},
+            close_relay_queue,
+            relay_worker_handles,
+            async {},
+            abort_signer,
+            Duration::from_secs(10),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, SignerDrainOutcome::Completed),
+            "expected Completed, got {:?}",
+            outcome
+        );
+        assert!(
+            queue_closed.load(Ordering::Relaxed),
+            "phase 3 must close the relay queue before waiting for relay workers"
+        );
+        assert!(
+            worker_finished.load(Ordering::Relaxed),
+            "phase 3 must wait for relay worker handles before reporting Completed"
+        );
+        assert!(
+            !abort_called.load(Ordering::Relaxed),
+            "abort_signer must NOT be called on the happy path"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_drain_signer_or_abort_aborts_relay_workers_on_timeout() {
+        // If a relay worker is stuck past signer_drain, dropping its JoinHandle
+        // is insufficient: tokio keeps the task running. Phase 3 must abort
+        // the relay worker handles on the timeout path before phase 4 closes
+        // the DB pool.
+        let queue_closed = Arc::new(AtomicBool::new(false));
+        let abort_called = Arc::new(AtomicBool::new(false));
+        let relay_worker_aborted = Arc::new(AtomicBool::new(false));
+
+        struct MarkOnDrop {
+            dropped: Arc<AtomicBool>,
+        }
+
+        impl Drop for MarkOnDrop {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let relay_worker_aborted_for_task = relay_worker_aborted.clone();
+        let relay_worker_handles = vec![tokio::spawn(async move {
+            let mark_on_drop = MarkOnDrop {
+                dropped: relay_worker_aborted_for_task,
+            };
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            std::mem::forget(mark_on_drop);
+        })];
+
+        let queue_closed_for_cb = queue_closed.clone();
+        let close_relay_queue = move || {
+            queue_closed_for_cb.store(true, Ordering::Relaxed);
+        };
+        let abort_called_cb = abort_called.clone();
+        let abort_signer = move || {
+            abort_called_cb.store(true, Ordering::Relaxed);
+        };
+
+        let outcome = drain_signer_or_abort(
+            async {},
+            close_relay_queue,
+            relay_worker_handles,
+            async {},
+            abort_signer,
+            Duration::from_secs(10),
+        )
+        .await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            matches!(outcome, SignerDrainOutcome::AbortedAfterTimeout),
+            "expected AbortedAfterTimeout, got {:?}",
+            outcome
+        );
+        assert!(
+            queue_closed.load(Ordering::Relaxed),
+            "phase 3 must close the relay queue even when a worker exceeds signer_drain"
+        );
+        assert!(
+            abort_called.load(Ordering::Relaxed),
+            "abort_signer must be called when the shared phase budget is exceeded"
+        );
+        assert!(
+            relay_worker_aborted.load(Ordering::Relaxed),
+            "relay worker handle must be aborted on timeout, not just dropped"
         );
     }
 
@@ -2558,9 +2724,12 @@ mod tests {
             // and never completes inside the budget.
             tokio::time::sleep(Duration::from_secs(0)).await;
         };
+        let relay_worker_handles = Vec::new();
 
         let outcome = drain_signer_or_abort(
             client_shutdown,
+            || {},
+            relay_worker_handles,
             tracker_wait,
             abort_signer,
             Duration::from_secs(10),
@@ -2599,9 +2768,12 @@ mod tests {
         let tracker_wait = async {
             tokio::time::sleep(Duration::from_secs(3600)).await;
         };
+        let relay_worker_handles = Vec::new();
 
         let outcome = drain_signer_or_abort(
             client_shutdown,
+            || {},
+            relay_worker_handles,
             tracker_wait,
             abort_signer,
             Duration::from_secs(10),
@@ -2636,9 +2808,17 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(3600)).await;
         };
         let abort_signer = || {};
+        let relay_worker_handles = Vec::new();
 
-        let _outcome =
-            drain_signer_or_abort(client_shutdown, tracker_wait, abort_signer, budget).await;
+        let _outcome = drain_signer_or_abort(
+            client_shutdown,
+            || {},
+            relay_worker_handles,
+            tracker_wait,
+            abort_signer,
+            budget,
+        )
+        .await;
         let elapsed = start.elapsed();
 
         assert!(
@@ -2673,9 +2853,17 @@ mod tests {
         let tracker_wait = async {
             tokio::time::sleep(Duration::from_secs(8)).await;
         };
+        let relay_worker_handles = Vec::new();
 
-        let outcome =
-            drain_signer_or_abort(client_shutdown, tracker_wait, abort_signer, budget).await;
+        let outcome = drain_signer_or_abort(
+            client_shutdown,
+            || {},
+            relay_worker_handles,
+            tracker_wait,
+            abort_signer,
+            budget,
+        )
+        .await;
         let elapsed = start.elapsed();
 
         assert!(
