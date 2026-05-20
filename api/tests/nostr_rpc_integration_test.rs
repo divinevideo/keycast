@@ -10,7 +10,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{Duration, Utc};
 use keycast_api::api::{
     http::{
-        auth::AuthError,
+        auth::{sign_event, AuthError, SignEventRequest},
         nostr_rpc::{nostr_rpc, NostrRpcRequest, NostrRpcResponse, RpcError},
         routes::AuthState,
     },
@@ -1164,4 +1164,237 @@ async fn test_server_signed_non_preload_redirect_origin_rejected() {
         RpcError::Auth(AuthError::InvalidToken) => {}
         other => panic!("expected InvalidToken, got: {:?}", other),
     }
+}
+
+// ============================================================================
+// Account suspension tests
+// ============================================================================
+
+async fn build_self_signed_ucan(
+    user_keys: &Keys,
+    tenant_id: i64,
+    redirect_origin: &str,
+    bunker_pubkey: Option<&str>,
+) -> String {
+    let user_did = nostr_pubkey_to_did(&user_keys.public_key());
+    let key_material = NostrKeyMaterial::from_keys(user_keys.clone());
+    let mut facts = json!({
+        "tenant_id": tenant_id,
+        "email": "test@example.com",
+        "redirect_origin": redirect_origin,
+    });
+    if let Some(bpk) = bunker_pubkey {
+        facts["bunker_pubkey"] = json!(bpk);
+    }
+
+    let ucan = UcanBuilder::default()
+        .issued_by(&key_material)
+        .for_audience(&user_did)
+        .with_lifetime(3600)
+        .with_fact(facts)
+        .build()
+        .expect("Failed to build UCAN")
+        .sign()
+        .await
+        .expect("Failed to sign UCAN");
+
+    ucan.encode().expect("Failed to encode UCAN")
+}
+
+async fn suspend_user(pool: &PgPool, pubkey: &str, tenant_id: i64) {
+    use keycast_core::repositories::UserRepository;
+    use keycast_core::types::user::UserStatus;
+    let user_repo = UserRepository::new(pool.clone());
+    user_repo
+        .set_user_status(
+            pubkey,
+            tenant_id,
+            &UserStatus::Suspended,
+            Some("age_review"),
+        )
+        .await
+        .expect("Failed to suspend user");
+}
+
+/// Test: suspended user denied from sign_event HTTP endpoint (covers slow path)
+#[tokio::test]
+#[serial]
+async fn test_suspended_user_denied_sign_event() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (user_keys, pubkey) = create_test_user();
+    let key_manager = FileKeyManager::new().expect("Failed to create key manager");
+
+    insert_user(&pool, tenant_id, &pubkey).await;
+    create_personal_key(&pool, tenant_id, &pubkey, &user_keys, &key_manager).await;
+
+    let redirect_origin = format!("https://suspend-sign-{}.example.com", Uuid::new_v4());
+    create_test_oauth_authorization(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &redirect_origin,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    // Suspend the user
+    suspend_user(&pool, &pubkey, tenant_id).await;
+
+    // Build UCAN and call sign_event (no cached handler → slow path)
+    // sign_event extracts user from UCAN audience, doesn't need bunker_pubkey
+    let token = build_self_signed_ucan(&user_keys, tenant_id, &redirect_origin, None).await;
+    let auth_state = create_test_auth_state(
+        pool.clone(),
+        Arc::new(Box::new(key_manager) as Box<dyn KeyManager>),
+    );
+
+    let unsigned = EventBuilder::text_note("should be denied").build(user_keys.public_key());
+    let event_json = serde_json::to_value(&unsigned).expect("Failed to serialize unsigned event");
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "Authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    headers.insert("host", "login.divine.video".parse().unwrap());
+    headers.insert("x-forwarded-proto", "https".parse().unwrap());
+
+    let result = sign_event(
+        create_test_tenant_extractor(tenant_id),
+        State(auth_state),
+        headers,
+        Json(SignEventRequest { event: event_json }),
+    )
+    .await;
+
+    match result {
+        Err(AuthError::Forbidden(msg)) => {
+            assert_eq!(msg, "Account restricted");
+        }
+        other => panic!("expected Forbidden(Account restricted), got: {:?}", other),
+    }
+}
+
+/// Test: suspended user denied from nostr_rpc sign_event method
+#[tokio::test]
+#[serial]
+async fn test_suspended_user_denied_nostr_rpc_sign() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (user_keys, pubkey) = create_test_user();
+    let key_manager = FileKeyManager::new().expect("Failed to create key manager");
+
+    insert_user(&pool, tenant_id, &pubkey).await;
+    create_personal_key(&pool, tenant_id, &pubkey, &user_keys, &key_manager).await;
+
+    let redirect_origin = format!("https://suspend-rpc-{}.example.com", Uuid::new_v4());
+    let (_auth_id, bunker_pubkey) = create_test_oauth_authorization(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &redirect_origin,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    // Suspend the user
+    suspend_user(&pool, &pubkey, tenant_id).await;
+
+    // Include bunker_pubkey so nostr_rpc routes through Mode 1 (OAuth handler path)
+    let token = build_self_signed_ucan(
+        &user_keys,
+        tenant_id,
+        &redirect_origin,
+        Some(&bunker_pubkey),
+    )
+    .await;
+    let auth_state = create_test_auth_state(
+        pool.clone(),
+        Arc::new(Box::new(key_manager) as Box<dyn KeyManager>),
+    );
+
+    let unsigned = EventBuilder::text_note("should be denied").build(user_keys.public_key());
+    let event_json = serde_json::to_value(&unsigned).expect("Failed to serialize unsigned event");
+
+    let err = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state,
+        &format!("Bearer {}", token),
+        None,
+        NostrRpcRequest {
+            method: "sign_event".to_string(),
+            params: vec![event_json],
+        },
+    )
+    .await
+    .expect_err("Suspended user should be denied signing via RPC");
+
+    match err {
+        RpcError::AccountSuspended(msg) => {
+            assert_eq!(msg, "Account restricted");
+        }
+        other => panic!("expected AccountSuspended, got: {:?}", other),
+    }
+}
+
+/// Test: suspended user can still call get_public_key via nostr_rpc
+#[tokio::test]
+#[serial]
+async fn test_suspended_user_allowed_get_public_key() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (user_keys, pubkey) = create_test_user();
+    let key_manager = FileKeyManager::new().expect("Failed to create key manager");
+
+    insert_user(&pool, tenant_id, &pubkey).await;
+    create_personal_key(&pool, tenant_id, &pubkey, &user_keys, &key_manager).await;
+
+    let redirect_origin = format!("https://suspend-gpk-{}.example.com", Uuid::new_v4());
+    let (_auth_id, bunker_pubkey) = create_test_oauth_authorization(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &redirect_origin,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    // Suspend the user
+    suspend_user(&pool, &pubkey, tenant_id).await;
+
+    let token = build_self_signed_ucan(
+        &user_keys,
+        tenant_id,
+        &redirect_origin,
+        Some(&bunker_pubkey),
+    )
+    .await;
+    let auth_state = create_test_auth_state(
+        pool.clone(),
+        Arc::new(Box::new(key_manager) as Box<dyn KeyManager>),
+    );
+
+    let response = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state,
+        &format!("Bearer {}", token),
+        None,
+        get_public_key_request(),
+    )
+    .await
+    .expect("Suspended user should still be able to get_public_key");
+
+    let result_pubkey = response
+        .result
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .expect("result should be a string");
+    assert_eq!(result_pubkey, pubkey);
 }

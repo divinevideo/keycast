@@ -390,6 +390,14 @@ pub async fn claim_post(
     let user_pubkey = nostr_sdk::PublicKey::from_hex(&claim_token.user_pubkey)
         .map_err(|e| ClaimError::Internal(format!("Invalid pubkey: {}", e)))?;
 
+    // Fetch account status for UCAN fact (normally active at claim time)
+    let claim_user_status = user_repo
+        .get_user_status(&claim_token.user_pubkey, tenant_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|(s, _, _)| s);
+
     // Load server keys for UCAN signing
     let server_keys = get_server_keys()?;
 
@@ -402,7 +410,7 @@ pub async fn claim_post(
         &server_keys,
         false, // Account claim is not first-party OAuth
         None,
-        None,
+        claim_user_status.as_ref(),
     )
     .await
     .map_err(|e| ClaimError::Internal(format!("Failed to generate session: {:?}", e)))?;

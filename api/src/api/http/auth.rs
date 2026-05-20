@@ -1827,8 +1827,15 @@ pub async fn verify_email(
     // Mark email as verified (token kept for idempotent re-verification)
     user_repo.verify_email(&public_key, tenant_id).await?;
 
-    // Get user's email for UCAN
+    // Get user's email and account status for UCAN
     let email = user_repo.get_email(&public_key, tenant_id).await?;
+    // Best-effort: DB errors → None (no status fact). Hard enforcement is at signing time.
+    let user_status = user_repo
+        .get_user_status(&public_key, tenant_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|(s, _, _)| s);
 
     // Get user's keys to generate UCAN (tenant-scoped)
     let personal_keys_repo = PersonalKeysRepository::new(pool.clone());
@@ -1852,8 +1859,15 @@ pub async fn verify_email(
         .unwrap_or_else(|_| "http://localhost:3000".to_string());
 
     // Generate UCAN token for session cookie
-    let ucan_token =
-        generate_ucan_token(&keys, tenant_id, &email, &redirect_origin, None, None).await?;
+    let ucan_token = generate_ucan_token(
+        &keys,
+        tenant_id,
+        &email,
+        &redirect_origin,
+        None,
+        user_status.as_ref(),
+    )
+    .await?;
 
     tracing::info!(
         event = "email_verification",
@@ -3134,6 +3148,14 @@ pub async fn sign_event(
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
 
+    // Check account status before either signing path (fast or slow)
+    let user_repo = UserRepository::new(pool.clone());
+    if let Some((status, _, _)) = user_repo.get_user_status(&user_pubkey, tenant_id).await? {
+        if !status.is_active() {
+            return Err(AuthError::Forbidden("Account restricted".to_string()));
+        }
+    }
+
     // Parse unsigned event first for validation
     let unsigned_event: UnsignedEvent = serde_json::from_value(req.event.clone())
         .map_err(|e| AuthError::Internal(format!("Invalid event format: {}", e)))?;
@@ -3553,8 +3575,21 @@ pub async fn change_key(
 
     // Issue new UCAN session cookie signed by the new key
     let redirect_origin = extract_origin_from_headers(&headers)?;
-    let ucan_token =
-        generate_ucan_token(&new_keys, tenant_id, &email, &redirect_origin, None, None).await?;
+    let change_key_status = user_repo
+        .get_user_status(&new_pubkey, tenant_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|(s, _, _)| s);
+    let ucan_token = generate_ucan_token(
+        &new_keys,
+        tenant_id,
+        &email,
+        &redirect_origin,
+        None,
+        change_key_status.as_ref(),
+    )
+    .await?;
 
     let cookie = format!(
         "keycast_session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400",
