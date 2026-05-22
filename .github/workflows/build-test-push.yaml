@@ -73,7 +73,7 @@ jobs:
           ./scripts/generate_key.sh
 
           # Run migrations
-          cargo install sqlx-cli --no-default-features --features postgres
+          cargo install sqlx-cli --version 0.8.6 --no-default-features --features postgres
           sqlx migrate run --database-url $DATABASE_URL --source database/migrations
 
       - name: Run tests
