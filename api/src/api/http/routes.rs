@@ -235,6 +235,10 @@ pub fn api_routes(
             get(admin::get_user_status_admin).put(admin::set_user_status_admin),
         )
         .route("/admin/users/batch-lookup", post(admin::batch_lookup_users))
+        .route(
+            "/admin/create-minor-account",
+            post(admin::create_minor_account),
+        )
         .with_state(auth_state.clone());
 
     // Claim routes (public, accessed via email link)

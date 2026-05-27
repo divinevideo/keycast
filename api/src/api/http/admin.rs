@@ -1844,6 +1844,9 @@ pub struct UserStatusResponse {
     pub suspended_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suspended_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub verified_minor: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified_minor_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 pub async fn get_user_status_admin(
@@ -1856,8 +1859,8 @@ pub async fn get_user_status_admin(
     let tenant_id = tenant.0.id;
     let user_repo = UserRepository::new(auth_state.state.db.clone());
 
-    let (status, suspended_reason, suspended_at) = user_repo
-        .get_user_status(&pubkey, tenant_id)
+    let (status, suspended_reason, suspended_at, verified_minor, verified_minor_at) = user_repo
+        .get_full_admin_status(&pubkey, tenant_id)
         .await?
         .ok_or_else(|| ApiError::not_found("User not found"))?;
 
@@ -1866,6 +1869,8 @@ pub async fn get_user_status_admin(
         status: status.as_str().to_string(),
         suspended_reason,
         suspended_at,
+        verified_minor,
+        verified_minor_at,
     }))
 }
 
@@ -1921,11 +1926,136 @@ pub async fn set_user_status_admin(
         "Admin changed user status"
     );
 
+    // set_user_status doesn't return verified_minor, so fetch it separately.
+    // This is the write path (infrequent), so the extra query is acceptable.
+    let (verified_minor, verified_minor_at) = user_repo
+        .get_verified_minor(&pubkey, tenant_id)
+        .await?
+        .unwrap_or((false, None));
+
     Ok(Json(UserStatusResponse {
         pubkey,
         status: updated_status.as_str().to_string(),
         suspended_reason,
         suspended_at,
+        verified_minor,
+        verified_minor_at,
+    }))
+}
+
+// --- Create approved minor account (service-token auth) ---
+
+#[derive(Debug, Deserialize)]
+pub struct CreateMinorAccountRequest {
+    pub username: String,
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateMinorAccountResponse {
+    pub pubkey: String,
+    pub claim_url: String,
+    pub expires_at: String,
+}
+
+pub async fn create_minor_account(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateMinorAccountRequest>,
+) -> ApiResult<Json<CreateMinorAccountResponse>> {
+    authorize_service_token(&headers)?;
+    let tenant_id = tenant.0.id;
+    let pool = &auth_state.state.db;
+    let key_manager = auth_state.state.key_manager.as_ref();
+
+    let username = req.username.trim().to_lowercase();
+    if username.is_empty() {
+        return Err(ApiError::bad_request("username is required"));
+    }
+    if username.len() > 64
+        || !username
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+        || !username.starts_with(|c: char| c.is_ascii_alphanumeric())
+        || !username.ends_with(|c: char| c.is_ascii_alphanumeric())
+    {
+        return Err(ApiError::bad_request(
+            "username must be 1-64 characters, start and end with alphanumeric, containing only lowercase letters, digits, hyphens, or underscores",
+        ));
+    }
+
+    let user_repo = UserRepository::new(pool.clone());
+
+    if user_repo
+        .find_pubkey_by_username(&username, tenant_id)
+        .await?
+        .is_some()
+    {
+        return Err(ApiError::conflict(format!(
+            "User with username {} already exists",
+            username
+        )));
+    }
+
+    let keys = Keys::generate();
+    let pubkey_hex = keys.public_key().to_hex();
+
+    let secret_bytes = keys.secret_key().to_secret_bytes();
+    let encrypted_secret = key_manager
+        .encrypt(&secret_bytes)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to encrypt secret: {}", e)))?;
+
+    user_repo
+        .create_minor_account(
+            &pubkey_hex,
+            tenant_id,
+            &username,
+            req.display_name.as_deref(),
+            &encrypted_secret,
+        )
+        .await?;
+
+    if crate::divine_names::is_enabled() {
+        match crate::divine_names::claim_username(&keys, &username, None).await {
+            Ok(response) if response.ok => {
+                tracing::info!("Username '{}' claimed on divine-name-server", username);
+            }
+            Ok(response) => {
+                tracing::warn!(
+                    "divine-name-server rejected username '{}': {}",
+                    username,
+                    response.error.unwrap_or_default()
+                );
+            }
+            Err(e) => {
+                tracing::warn!("divine-name-server unreachable for '{}': {}", username, e);
+            }
+        }
+    }
+
+    let token = generate_claim_token();
+    let claim_token_repo = ClaimTokenRepository::new(pool.clone());
+    let claim_token = claim_token_repo
+        .create(&token, &pubkey_hex, None, tenant_id)
+        .await?;
+
+    let app_url =
+        std::env::var("APP_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
+    let claim_url = format!("{}/api/claim?token={}", app_url, token);
+
+    tracing::info!(
+        event = "minor_account_created",
+        pubkey = %pubkey_hex,
+        username = %username,
+        "Approved minor account created with claim link"
+    );
+
+    Ok(Json(CreateMinorAccountResponse {
+        pubkey: pubkey_hex,
+        claim_url,
+        expires_at: claim_token.expires_at.to_rfc3339(),
     }))
 }
 

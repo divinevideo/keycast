@@ -1067,6 +1067,80 @@ impl UserRepository {
         Ok(oauth_count)
     }
 
+    /// Get verified_minor flag and timestamp for a user.
+    pub async fn get_verified_minor(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<Option<(bool, Option<DateTime<Utc>>)>, RepositoryError> {
+        sqlx::query_as(
+            "SELECT verified_minor, verified_minor_at FROM users WHERE pubkey = $1 AND tenant_id = $2",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Combined status + verified_minor query for admin status endpoints.
+    pub async fn get_full_admin_status(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<Option<(UserStatus, Option<String>, Option<DateTime<Utc>>, bool, Option<DateTime<Utc>>)>, RepositoryError> {
+        sqlx::query_as(
+            "SELECT status, suspended_reason, suspended_at, verified_minor, verified_minor_at \
+             FROM users WHERE pubkey = $1 AND tenant_id = $2",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Create an approved minor account with personal key atomically.
+    /// Like create_preloaded_user but without vine_id and with verified_minor=true.
+    pub async fn create_minor_account(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+        username: &str,
+        display_name: Option<&str>,
+        encrypted_secret: &[u8],
+    ) -> Result<(), RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let now = Utc::now();
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, username, display_name, verified_minor, verified_minor_at, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, TRUE, $5, $5, $5)",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .bind(username)
+        .bind(display_name)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(pubkey)
+        .bind(encrypted_secret)
+        .bind(tenant_id)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     // =========================================================================
     // Preloaded account methods (for Vine import)
     // =========================================================================
