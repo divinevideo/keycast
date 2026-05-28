@@ -290,7 +290,45 @@ async fn test_create_minor_account_conflict_claimed_minor() {
         .await;
 }
 
-// --- Test 5: Invalid username rejected ---
+// --- Test 5: Conflict — username taken by Vine preloaded user (unclaimed, non-minor) ---
+
+#[tokio::test]
+async fn test_create_minor_account_conflict_vine_preloaded_user() {
+    common::assert_test_database_url();
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+    let pool = common::setup_test_db().await;
+    let username = format!("vine-{}", uuid::Uuid::new_v4().simple());
+
+    let pubkey = Keys::generate().public_key().to_hex();
+    let vine_id = format!("vine-{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, vine_id, username, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, NOW(), NOW())",
+    )
+    .bind(&pubkey)
+    .bind(TENANT_ID)
+    .bind(&vine_id)
+    .bind(&username)
+    .execute(&pool)
+    .await
+    .expect("Failed to create Vine preloaded user");
+
+    let app = build_app(create_test_auth_state(pool.clone()));
+    let resp = app
+        .oneshot(post_create_minor(&username, None, SERVICE_TOKEN))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // Cleanup
+    let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
+        .bind(&pubkey)
+        .execute(&pool)
+        .await;
+}
+
+// --- Test 6: Invalid username rejected ---
 
 #[tokio::test]
 async fn test_create_minor_account_invalid_username() {
@@ -323,7 +361,7 @@ async fn test_create_minor_account_invalid_username() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-// --- Test 6: Missing auth token rejected ---
+// --- Test 7: Missing auth token rejected ---
 
 #[tokio::test]
 async fn test_create_minor_account_missing_token() {
@@ -347,7 +385,7 @@ async fn test_create_minor_account_missing_token() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
-// --- Test 7: Wrong auth token rejected ---
+// --- Test 8: Wrong auth token rejected ---
 
 #[tokio::test]
 async fn test_create_minor_account_wrong_token() {
@@ -364,7 +402,7 @@ async fn test_create_minor_account_wrong_token() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
-// --- Test 8: Retry with expired token creates new token ---
+// --- Test 9: Retry with expired token creates new token ---
 
 #[tokio::test]
 async fn test_create_minor_account_retry_expired_token_creates_new() {

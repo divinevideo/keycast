@@ -2046,7 +2046,7 @@ pub async fn create_minor_account(
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to encrypt secret: {}", e)))?;
 
-    user_repo
+    match user_repo
         .create_minor_account(
             &pubkey_hex,
             tenant_id,
@@ -2054,7 +2054,49 @@ pub async fn create_minor_account(
             req.display_name.as_deref(),
             &encrypted_secret,
         )
-        .await?;
+        .await
+    {
+        Ok(()) => {}
+        Err(RepositoryError::Duplicate) => {
+            // Concurrent request created this user first. Re-query and return idempotently.
+            if let Some((dup_pubkey, _, true)) = user_repo
+                .find_user_minor_status_by_username(&username, tenant_id)
+                .await?
+            {
+                let claim_token = if let Some(existing_token) = claim_token_repo
+                    .find_valid_by_user_pubkey(&dup_pubkey, tenant_id)
+                    .await?
+                {
+                    existing_token
+                } else {
+                    let token = generate_claim_token();
+                    let (new_token, _) = claim_token_repo
+                        .create_with_prior_invalidation(&token, &dup_pubkey, None, tenant_id)
+                        .await?;
+                    new_token
+                };
+
+                let app_url = std::env::var("APP_URL")
+                    .unwrap_or_else(|_| "http://localhost:3000".to_string());
+                let claim_url = format!("{}/api/claim?token={}", app_url, claim_token.token);
+
+                return Ok((
+                    StatusCode::OK,
+                    Json(CreateMinorAccountResponse {
+                        pubkey: dup_pubkey,
+                        claim_url,
+                        expires_at: claim_token.expires_at.to_rfc3339(),
+                    }),
+                )
+                    .into_response());
+            }
+            return Err(ApiError::conflict(format!(
+                "User with username {} already exists",
+                username
+            )));
+        }
+        Err(e) => return Err(e.into()),
+    }
 
     if crate::divine_names::is_enabled() {
         match crate::divine_names::claim_username(&keys, &username, None).await {
