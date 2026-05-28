@@ -1333,6 +1333,44 @@ impl UserRepository {
         Ok(rows)
     }
 
+    /// Look up multiple users by email for enrichment (batch).
+    /// Returns AdminUserDetails for each email that matches a user in the tenant.
+    pub async fn find_users_by_emails(
+        &self,
+        emails: &[String],
+        tenant_id: i64,
+    ) -> Result<Vec<AdminUserDetails>, RepositoryError> {
+        if emails.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let lowered: Vec<String> = emails.iter().map(|e| e.to_lowercase()).collect();
+
+        let rows: Vec<AdminUserDetails> = sqlx::query_as(
+            "SELECT
+                u.pubkey,
+                u.email,
+                u.email_verified,
+                u.username,
+                u.display_name,
+                u.vine_id,
+                (pk.user_pubkey IS NOT NULL) as \"has_personal_key\",
+                u.status,
+                u.suspended_reason,
+                u.created_at,
+                u.updated_at
+             FROM users u
+             LEFT JOIN personal_keys pk ON pk.user_pubkey = u.pubkey AND pk.tenant_id = u.tenant_id
+             WHERE u.email = ANY($1::text[]) AND u.tenant_id = $2",
+        )
+        .bind(&lowered)
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
     /// Look up a single user for admin. Thin wrapper over `find_users_for_admin`.
     pub async fn find_user_for_admin(
         &self,
