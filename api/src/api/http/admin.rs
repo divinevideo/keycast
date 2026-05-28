@@ -2,7 +2,8 @@
 // ABOUTME: Used for Vine import and support workflows
 
 use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
 use axum::Json;
 use chrono::{Duration, Utc};
 use nostr_sdk::{FromBech32, Keys};
@@ -1951,7 +1952,7 @@ pub struct CreateMinorAccountRequest {
     pub display_name: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CreateMinorAccountResponse {
     pub pubkey: String,
     pub claim_url: String,
@@ -1963,7 +1964,7 @@ pub async fn create_minor_account(
     State(auth_state): State<AuthState>,
     headers: HeaderMap,
     Json(req): Json<CreateMinorAccountRequest>,
-) -> ApiResult<Json<CreateMinorAccountResponse>> {
+) -> ApiResult<axum::response::Response> {
     authorize_service_token(&headers)?;
     let tenant_id = tenant.0.id;
     let pool = &auth_state.state.db;
@@ -1988,18 +1989,12 @@ pub async fn create_minor_account(
     let user_repo = UserRepository::new(pool.clone());
     let claim_token_repo = ClaimTokenRepository::new(pool.clone());
 
-    // Idempotent: if an unclaimed approved-minor already exists for this username,
-    // return or create a valid claim token instead of conflicting.
-    if let Some(existing_pubkey) = user_repo
-        .find_pubkey_by_username(&username, tenant_id)
+    // Single query checks username existence + minor/unclaimed status atomically.
+    if let Some((existing_pubkey, _verified_minor, is_unclaimed)) = user_repo
+        .find_user_minor_status_by_username(&username, tenant_id)
         .await?
     {
-        let is_unclaimed_minor = user_repo
-            .find_unclaimed_minor_by_username(&username, tenant_id)
-            .await?
-            .is_some();
-
-        if !is_unclaimed_minor {
+        if !is_unclaimed {
             return Err(ApiError::conflict(format!(
                 "User with username {} already exists",
                 username
@@ -2014,9 +2009,10 @@ pub async fn create_minor_account(
             existing_token
         } else {
             let token = generate_claim_token();
-            claim_token_repo
-                .create(&token, &existing_pubkey, None, tenant_id)
-                .await?
+            let (new_token, _invalidated) = claim_token_repo
+                .create_with_prior_invalidation(&token, &existing_pubkey, None, tenant_id)
+                .await?;
+            new_token
         };
 
         let app_url =
@@ -2030,11 +2026,15 @@ pub async fn create_minor_account(
             "Returning claim link for existing unclaimed minor account"
         );
 
-        return Ok(Json(CreateMinorAccountResponse {
-            pubkey: existing_pubkey,
-            claim_url,
-            expires_at: claim_token.expires_at.to_rfc3339(),
-        }));
+        return Ok((
+            StatusCode::OK,
+            Json(CreateMinorAccountResponse {
+                pubkey: existing_pubkey,
+                claim_url,
+                expires_at: claim_token.expires_at.to_rfc3339(),
+            }),
+        )
+            .into_response());
     }
 
     let keys = Keys::generate();
@@ -2089,11 +2089,15 @@ pub async fn create_minor_account(
         "Approved minor account created with claim link"
     );
 
-    Ok(Json(CreateMinorAccountResponse {
-        pubkey: pubkey_hex,
-        claim_url,
-        expires_at: claim_token.expires_at.to_rfc3339(),
-    }))
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateMinorAccountResponse {
+            pubkey: pubkey_hex,
+            claim_url,
+            expires_at: claim_token.expires_at.to_rfc3339(),
+        }),
+    )
+        .into_response())
 }
 
 // --- Batch user lookup by email (for divine-invite-sync HubSpot enrichment) ---
