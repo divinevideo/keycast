@@ -2122,7 +2122,7 @@ pub async fn create_minor_account(
         .await?;
 
     let app_url = std::env::var("APP_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
-    let claim_url = format!("{}/api/claim?token={}", app_url, token);
+    let claim_url = format!("{}/api/claim?token={}", app_url, claim_token.token);
 
     tracing::info!(
         event = "minor_account_created",

@@ -1112,6 +1112,8 @@ impl UserRepository {
     /// Look up a user by username, returning enough state to distinguish
     /// unclaimed approved-minors (retryable) from other accounts (conflict).
     /// Returns (pubkey, verified_minor, is_unclaimed) in a single query.
+    /// NOTE: `is_unclaimed` relies on email+password_hash being NULL — must stay
+    /// in sync with the claim flow that sets both columns on completion.
     pub async fn find_user_minor_status_by_username(
         &self,
         username: &str,
