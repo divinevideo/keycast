@@ -1088,7 +1088,16 @@ impl UserRepository {
         &self,
         pubkey: &str,
         tenant_id: i64,
-    ) -> Result<Option<(UserStatus, Option<String>, Option<DateTime<Utc>>, bool, Option<DateTime<Utc>>)>, RepositoryError> {
+    ) -> Result<
+        Option<(
+            UserStatus,
+            Option<String>,
+            Option<DateTime<Utc>>,
+            bool,
+            Option<DateTime<Utc>>,
+        )>,
+        RepositoryError,
+    > {
         sqlx::query_as(
             "SELECT status, suspended_reason, suspended_at, verified_minor, verified_minor_at \
              FROM users WHERE pubkey = $1 AND tenant_id = $2",
@@ -1098,6 +1107,26 @@ impl UserRepository {
         .fetch_optional(&self.pool)
         .await
         .map_err(Into::into)
+    }
+
+    /// Find an unclaimed approved-minor account by username.
+    /// "Unclaimed" means verified_minor=true with no email or password set.
+    pub async fn find_unclaimed_minor_by_username(
+        &self,
+        username: &str,
+        tenant_id: i64,
+    ) -> Result<Option<String>, RepositoryError> {
+        let result: Option<(String,)> = sqlx::query_as(
+            "SELECT pubkey FROM users
+             WHERE LOWER(username) = LOWER($1) AND tenant_id = $2
+               AND verified_minor = TRUE
+               AND email IS NULL AND password_hash IS NULL",
+        )
+        .bind(username)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(result.map(|r| r.0))
     }
 
     /// Create an approved minor account with personal key atomically.

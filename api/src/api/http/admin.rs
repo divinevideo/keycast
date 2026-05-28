@@ -1986,16 +1986,55 @@ pub async fn create_minor_account(
     }
 
     let user_repo = UserRepository::new(pool.clone());
+    let claim_token_repo = ClaimTokenRepository::new(pool.clone());
 
-    if user_repo
+    // Idempotent: if an unclaimed approved-minor already exists for this username,
+    // return or create a valid claim token instead of conflicting.
+    if let Some(existing_pubkey) = user_repo
         .find_pubkey_by_username(&username, tenant_id)
         .await?
-        .is_some()
     {
-        return Err(ApiError::conflict(format!(
-            "User with username {} already exists",
-            username
-        )));
+        let is_unclaimed_minor = user_repo
+            .find_unclaimed_minor_by_username(&username, tenant_id)
+            .await?
+            .is_some();
+
+        if !is_unclaimed_minor {
+            return Err(ApiError::conflict(format!(
+                "User with username {} already exists",
+                username
+            )));
+        }
+
+        // Existing unclaimed minor — return existing valid token or create a new one
+        let claim_token = if let Some(existing_token) = claim_token_repo
+            .find_valid_by_user_pubkey(&existing_pubkey, tenant_id)
+            .await?
+        {
+            existing_token
+        } else {
+            let token = generate_claim_token();
+            claim_token_repo
+                .create(&token, &existing_pubkey, None, tenant_id)
+                .await?
+        };
+
+        let app_url =
+            std::env::var("APP_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
+        let claim_url = format!("{}/api/claim?token={}", app_url, claim_token.token);
+
+        tracing::info!(
+            event = "minor_account_retry",
+            pubkey = %existing_pubkey,
+            username = %username,
+            "Returning claim link for existing unclaimed minor account"
+        );
+
+        return Ok(Json(CreateMinorAccountResponse {
+            pubkey: existing_pubkey,
+            claim_url,
+            expires_at: claim_token.expires_at.to_rfc3339(),
+        }));
     }
 
     let keys = Keys::generate();
@@ -2036,13 +2075,11 @@ pub async fn create_minor_account(
     }
 
     let token = generate_claim_token();
-    let claim_token_repo = ClaimTokenRepository::new(pool.clone());
     let claim_token = claim_token_repo
         .create(&token, &pubkey_hex, None, tenant_id)
         .await?;
 
-    let app_url =
-        std::env::var("APP_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
+    let app_url = std::env::var("APP_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
     let claim_url = format!("{}/api/claim?token={}", app_url, token);
 
     tracing::info!(
