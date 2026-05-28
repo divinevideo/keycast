@@ -1928,3 +1928,81 @@ pub async fn set_user_status_admin(
         suspended_at,
     }))
 }
+
+// --- Batch user lookup by email (for divine-invite-sync HubSpot enrichment) ---
+
+#[derive(Debug, Deserialize)]
+pub struct BatchLookupRequest {
+    pub emails: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BatchLookupUser {
+    pub email: String,
+    pub pubkey: String,
+    pub status: String,
+    pub email_verified: bool,
+    pub has_personal_key: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BatchLookupResponse {
+    pub results: std::collections::HashMap<String, BatchLookupUser>,
+    pub not_found: Vec<String>,
+}
+
+pub async fn batch_lookup_users(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    headers: HeaderMap,
+    Json(req): Json<BatchLookupRequest>,
+) -> ApiResult<Json<BatchLookupResponse>> {
+    authorize_service_token(&headers)?;
+
+    if req.emails.len() > 1000 {
+        return Err(ApiError::bad_request("Maximum 1000 emails per request"));
+    }
+
+    let deduped: Vec<String> = {
+        let mut seen = std::collections::HashSet::new();
+        req.emails
+            .iter()
+            .map(|e| e.to_lowercase())
+            .filter(|e| seen.insert(e.clone()))
+            .collect()
+    };
+
+    let tenant_id = tenant.0.id;
+    let user_repo = UserRepository::new(auth_state.state.db.clone());
+
+    let users = user_repo.find_users_by_emails(&deduped, tenant_id).await?;
+
+    let mut results = std::collections::HashMap::new();
+    let mut found_emails: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for user in users {
+        if let Some(email) = &user.email {
+            let lower = email.to_lowercase();
+            found_emails.insert(lower.clone());
+            results.insert(
+                lower,
+                BatchLookupUser {
+                    email: email.clone(),
+                    pubkey: user.pubkey,
+                    status: user.status.as_str().to_string(),
+                    email_verified: user.email_verified.unwrap_or(false),
+                    has_personal_key: user.has_personal_key,
+                    created_at: user.created_at.to_rfc3339(),
+                },
+            );
+        }
+    }
+
+    let not_found: Vec<String> = deduped
+        .into_iter()
+        .filter(|e| !found_emails.contains(e))
+        .collect();
+
+    Ok(Json(BatchLookupResponse { results, not_found }))
+}
