@@ -248,6 +248,72 @@ sidechannel and **does not apply to signing**, which is all we do. If the repo h
 `cargo-audit`/`cargo-deny` gate, add an allowlist entry citing that rationale; if no such
 gate exists, no action needed. This must not silently block CI.
 
+## Integration with `divine-activity-pub` (the consuming service)
+
+Cross-checked against the AP gateway's own design docs
+(`divine-activity-pub/PLAN.md`, `wire-format.md`, dated 2026-05-30). The gateway's
+plan explicitly lists this Keycast workstream as its dependency
+(`PLAN.md` §Workstream handoffs: *"create/store RSA key per actor, return public PEM,
+RSA-SHA256 sign endpoint"*) — the three endpoints here match that handoff exactly.
+The following are the concrete contract points that make the two services line up:
+
+1. **Key identity is the stable Nostr pubkey, not the username.** The gateway's `actors`
+   table maps `nostr_pubkey` (hex) → `username` → `ap_actor_url` → `rsa_key_id` (a "keycast
+   ref"). Usernames are mutable and the AP actor URL embeds the username, but a federated
+   `publicKeyPem` is cached by every remote server that has seen it — so the key **must** be
+   bound to the immutable identity. Keying by `(tenant_id, user_pubkey)` does exactly that.
+   The gateway's `rsa_key_id` ref **is** the `user_pubkey` (hex) — no separate opaque key id
+   is needed; the create/get responses echo `pubkey` for that purpose. (If the gateway
+   prefers an opaque handle we can also return the row id, but pubkey is the natural join
+   key and the default.)
+
+2. **Idempotent create is load-bearing — never silently rotate.** Because remote servers
+   cache the actor's public key, regenerating it would break signature verification for
+   every existing follower until they refetch. `POST /api/ap/keys` therefore returns the
+   existing key (`"created": false`) and **never** regenerates. (Key rotation, if ever
+   needed, is a deliberate separate operation, out of scope here.)
+
+3. **Keycast signs only; it does NOT verify.** The gateway's Phase 3 also needs to *verify*
+   inbound HTTP Signatures from remote actors (`Follow`, etc.) — but that uses the **remote**
+   actor's public key, which Keycast never holds. The gateway does inbound verification
+   itself (its docs note WebCrypto if it ships as a CF Worker). **No verify endpoint is added
+   to Keycast**, by design — stating this so nobody expects one.
+
+4. **The gateway owns all HTTP-Signature/AS2 structure; Keycast supplies two opaque values.**
+   - `publicKey.id` (`<actorUrl>#main-key`), `publicKey.owner` (the actor URL), and the
+     `keyId` in the `Signature:` header are all constructed by the gateway. Keycast supplies
+     only `publicKeyPem`.
+   - For each outbound request the gateway builds the draft-cavage signing string —
+     `(request-target) host date digest` for POST (`digest` = `SHA-256=base64(sha256(body))`),
+     `(request-target) host date` for GET — and passes that exact multi-line string as
+     `signing_string`. Keycast signs its UTF-8 bytes and returns base64. The gateway pastes
+     the result into `signature="…"`. This is why the "sign the blob" shape (not
+     "build the header") is correct: the gateway already knows the method/target/host/date
+     from the request it is about to make.
+
+5. **Auth: the gateway will use the service token.** The gateway is trusted backend infra
+   signing on behalf of every Divine actor (its runtime is leaning toward a CF Worker, which
+   holds `KEYCAST_SERVICE_TOKEN` as a secret and acts for all actors) — so in practice it
+   uses the service-token path with an explicit `pubkey` in each request body. The UCAN path
+   we also build is for any future user-facing caller; the gateway itself will not use it.
+
+6. **Tenant is resolved from the `Host` header — the gateway must address the right host.**
+   `TenantExtractor` derives the tenant from `Host`/`x-forwarded-host` (`tenant.rs:87`),
+   and this applies even to service-token routes. The gateway must therefore call Keycast at
+   the tenant-appropriate host (e.g. `https://login.divine.video/api/ap/...`) so it lands on
+   the `divine.video` tenant; the service token authenticates *who* is calling, the host
+   selects *which tenant's* keyspace. (Calling a wrong/missing host would resolve the wrong
+   tenant and 404 on the actor's key — a likely first-integration footgun, called out here.)
+
+7. **Scope: Divine-origin (outbound) actors only.** The gateway's `RESEARCH.md` (§inbound)
+   notes a *second*, deferred custodial concern: minting **surrogate Nostr identities** for
+   remote AP actors (`@alice@mastodon.social`) so inbound Follow/Like/Comment can map into
+   Nostr. That is unrelated to this work — remote actors keep their own RSA keys on their
+   home servers; Keycast never signs for them. Keycast RSA custody here is exclusively for
+   **Divine-origin actors signing their own outbound requests**. If a future surrogate
+   identity is itself given a Divine Nostr pubkey, it would slot into the same
+   `(tenant_id, user_pubkey)` model for free, but no design accommodation is made for it now.
+
 ## Rollout
 
 - Pure additive: new table, new modules, new routes, one new dependency. No change to
