@@ -71,3 +71,4 @@ async-trait = "0.1"
 md5 = "0.7"
 bcrypt = "0.17.1"
 serial_test = "3.2"
+rsa = { version = "0.9", features = ["pem"] }

@@ -3473,6 +3473,7 @@ dependencies = [
  "rand 0.8.5",
  "redis",
  "reqwest",
+ "rsa",
  "secp256k1",
  "secrecy",
  "serde",
