@@ -142,4 +142,20 @@ mod tests {
         let sig = Signature::try_from(raw.as_slice()).expect("sig");
         vk.verify(msg, &sig).expect("verify");
     }
+
+    #[test]
+    #[ignore] // run explicitly: cargo test -p keycast_core ap_signing -- --ignored emit_interop_vector
+    fn emit_interop_vector() {
+        use std::io::Write;
+        let km = generate_rsa_2048().expect("keygen");
+        let msg = b"(request-target): post /inbox\nhost: divine.video\ndate: Mon, 01 Jan 2026 00:00:00 GMT";
+        let sig = sign_pkcs1v15_sha256(&km.pkcs8_der, msg).expect("sign");
+
+        let dir = std::path::Path::new("target/ap_interop");
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("pub.pem"), km.public_pem.as_bytes()).unwrap();
+        std::fs::write(dir.join("msg.bin"), msg).unwrap();
+        let mut f = std::fs::File::create(dir.join("sig.bin")).unwrap();
+        f.write_all(&sig).unwrap();
+    }
 }
