@@ -49,6 +49,10 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: UCAN token from /auth/register or /auth/login
+    ServiceToken:
+      type: http
+      scheme: bearer
+      description: KEYCAST_SERVICE_TOKEN for trusted service-to-service callers (e.g. the AP gateway)
 
   schemas:
     Error:
@@ -62,6 +66,75 @@ components:
           description: Stable application error code, when available
       required:
         - error
+
+    ApCreateKeyRequest:
+      type: object
+      properties:
+        pubkey:
+          type: string
+          description: Hex Nostr pubkey of the actor. Required for service-token callers; for UCAN callers it defaults to the token's pubkey and, if present, must match it.
+          example: "e1ff3bfdd4e40315959b08b4fcc8245eaa514637e1d4ec2ae166b743341be1af"
+    ApKeyResponse:
+      type: object
+      properties:
+        pubkey:
+          type: string
+        public_key_pem:
+          type: string
+          description: SPKI PEM public key for the actor's publicKey.publicKeyPem.
+          example: "-----BEGIN PUBLIC KEY-----\nMIIBIjAN...\n-----END PUBLIC KEY-----\n"
+        key_type:
+          type: string
+          example: "rsa-2048"
+        created:
+          type: boolean
+          description: true if a new key was minted; false if an existing key was returned (idempotent).
+      required:
+        - pubkey
+        - public_key_pem
+        - key_type
+        - created
+    ApPublicKeyResponse:
+      type: object
+      properties:
+        pubkey:
+          type: string
+        public_key_pem:
+          type: string
+        key_type:
+          type: string
+          example: "rsa-2048"
+      required:
+        - pubkey
+        - public_key_pem
+        - key_type
+    ApSignRequest:
+      type: object
+      properties:
+        pubkey:
+          type: string
+          description: Hex Nostr pubkey of the actor (required for service-token callers).
+        signing_string:
+          type: string
+          description: The exact draft-cavage HTTP-Signature signing string. Signed as UTF-8 bytes.
+          example: "(request-target): post /inbox\nhost: mastodon.social\ndate: Mon, 01 Jan 2026 00:00:00 GMT\ndigest: SHA-256=X..."
+      required:
+        - signing_string
+    ApSignResponse:
+      type: object
+      properties:
+        pubkey:
+          type: string
+        signature:
+          type: string
+          description: base64-encoded RSASSA-PKCS1-v1_5 SHA-256 signature for the Signature header.
+        algorithm:
+          type: string
+          example: "rsa-sha256"
+      required:
+        - pubkey
+        - signature
+        - algorithm
 
     RegisterRequest:
       type: object
@@ -456,6 +529,118 @@ paths:
                 $ref: '#/components/schemas/Error'
         '500':
           description: Signing failed (KMS error, invalid key, etc.)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /ap/keys:
+    post:
+      summary: Create or return an actor's ActivityPub RSA key
+      description: |
+        Mints (or returns, idempotently) an RSA-2048 keypair for an actor and returns its
+        SPKI public PEM for embedding in `publicKey.publicKeyPem`. The private key is stored
+        encrypted-at-rest and is never returned. Calling again returns the existing key
+        with `created: false` — the key is never regenerated (federated keys are cached by
+        remote servers). Auth: ServiceToken (with `pubkey`) or UCAN (BearerAuth).
+      tags:
+        - ActivityPub
+      security:
+        - ServiceToken: []
+        - BearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApCreateKeyRequest'
+      responses:
+        '200':
+          description: Key created or already existed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApKeyResponse'
+        '400':
+          description: Invalid or missing pubkey
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: UCAN pubkey mismatch
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /ap/keys/{pubkey}:
+    get:
+      summary: Get an actor's ActivityPub public key PEM
+      tags:
+        - ActivityPub
+      security:
+        - ServiceToken: []
+        - BearerAuth: []
+      parameters:
+        - in: path
+          name: pubkey
+          required: true
+          schema:
+            type: string
+          description: Hex Nostr pubkey of the actor
+      responses:
+        '200':
+          description: Public key PEM
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApPublicKeyResponse'
+        '404':
+          description: No AP key for this actor
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /ap/sign:
+    post:
+      summary: Sign an HTTP-Signature signing string (RSA-SHA256)
+      description: |
+        Signs the exact caller-supplied signing string with RSASSA-PKCS1-v1_5 + SHA-256 and
+        returns the base64 signature. The caller builds the draft-cavage signing string and
+        assembles the final `Signature:` header. The private key never leaves Keycast.
+        Suspended/banned accounts are rejected.
+      tags:
+        - ActivityPub
+      security:
+        - ServiceToken: []
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApSignRequest'
+      responses:
+        '200':
+          description: Signature
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApSignResponse'
+        '403':
+          description: Account restricted or pubkey mismatch
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: No AP key for this actor
           content:
             application/json:
               schema:
@@ -1061,3 +1246,5 @@ tags:
     description: User profile and session management
   - name: Discovery
     description: NIP-05 identifier discovery
+  - name: ActivityPub
+    description: RSA key custody and HTTP-Signature signing for the ActivityPub gateway
