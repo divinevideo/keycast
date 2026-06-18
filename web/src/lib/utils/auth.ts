@@ -1,6 +1,7 @@
 import { browser } from "$app/environment";
 import { goto } from "$app/navigation";
 import { getCurrentUser, setCurrentUser } from "$lib/current_user.svelte";
+import { ApiError } from "$lib/keycast_api.svelte";
 import toast from "svelte-hot-french-toast";
 import { getViteDomain, isTeamsEnabled } from "$lib/utils/env";
 
@@ -12,6 +13,34 @@ export enum SigninMethod {
 interface SignoutOptions {
     redirectTo?: string | null;
     showToast?: boolean;
+}
+
+/**
+ * If `err` is an authentication 401 (expired/missing session), clear stale client
+ * auth state, surface a session-expired message, and redirect to /login with a return
+ * path. Returns true when it handled the error so callers can early-return instead of
+ * rendering the raw internal auth message.
+ *
+ * Only fires on 401 — a 403 ("logged in but not authorized") and all other errors are
+ * left for the caller to handle, preserving the not-logged-in vs forbidden distinction.
+ */
+export function redirectToLoginOnAuthError(
+    err: unknown,
+    returnPath?: string,
+): boolean {
+    if (!(err instanceof ApiError) || err.status !== 401) {
+        return false;
+    }
+
+    // Drop the lingering client-side pubkey cookie/state so the UI no longer believes
+    // it is signed in.
+    setCurrentUser(null);
+
+    const path =
+        returnPath ?? (browser ? window.location.pathname + window.location.search : "/");
+    toast.error("Your session has expired. Please sign in again.");
+    goto(`/login?redirect=${encodeURIComponent(path)}`, { replaceState: true });
+    return true;
 }
 
 export async function signin(
