@@ -10,6 +10,7 @@ import type {
     Team,
     TeamWithRelations,
 } from "$lib/types";
+import { redirectToLoginOnAuthError } from "$lib/utils/auth";
 import { readablePermissionConfig } from "$lib/utils/permissions";
 import { toTitleCase } from "$lib/utils/strings";
 import { CaretRight, X, Copy, Check, Warning } from "phosphor-svelte";
@@ -101,6 +102,7 @@ async function createAuthorization() {
             showSuccessModal = true;
         })
         .catch((error) => {
+            if (redirectToLoginOnAuthError(error)) return;
             toast.error("Failed to create authorization");
             toast.error(`Failed to create authorization: ${error.message}`);
         });

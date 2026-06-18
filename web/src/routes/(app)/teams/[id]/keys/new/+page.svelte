@@ -5,6 +5,7 @@ import PasswordInput from "$lib/components/PasswordInput.svelte";
 import { getCurrentUser } from "$lib/current_user.svelte";
 import { KeycastApi } from "$lib/keycast_api.svelte";
 import type { StoredKey } from "$lib/types";
+import { redirectToLoginOnAuthError } from "$lib/utils/auth";
 import { toast } from "svelte-hot-french-toast";
 
 const { id } = $page.params;
@@ -36,6 +37,7 @@ async function createKey() {
             goto(`/teams/${id}`);
         })
         .catch((error) => {
+            if (redirectToLoginOnAuthError(error)) return;
             toast.error("Failed to create key");
             keyError = error.message;
         });

@@ -84,6 +84,7 @@ async function removeUser(userToRemove: User) {
             );
         })
         .catch((error) => {
+            if (redirectToLoginOnAuthError(error)) return;
             toast.error("Failed to remove user");
         });
 }

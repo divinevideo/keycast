@@ -4,6 +4,7 @@ import { page } from "$app/stores";
 import { getCurrentUser } from "$lib/current_user.svelte";
 import { KeycastApi } from "$lib/keycast_api.svelte";
 import type { User } from "$lib/types";
+import { redirectToLoginOnAuthError } from "$lib/utils/auth";
 import { pubkeyFromNpubOrHex } from "$lib/utils/nostr";
 import { toast } from "svelte-hot-french-toast";
 
@@ -43,6 +44,7 @@ async function addTeammate() {
             goto(`/teams/${id}`);
         })
         .catch((error) => {
+            if (redirectToLoginOnAuthError(error)) return;
             toast.error("Failed to add teammate");
             errorMessage = error.message;
         });

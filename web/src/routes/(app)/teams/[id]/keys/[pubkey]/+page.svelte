@@ -67,6 +67,7 @@ async function removeKey() {
             goto(`/teams/${id}`);
         })
         .catch((error) => {
+            if (redirectToLoginOnAuthError(error)) return;
             toast.error("Failed to remove key");
         });
 }
