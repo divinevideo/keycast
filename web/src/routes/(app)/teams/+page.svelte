@@ -79,6 +79,7 @@ async function createTeam(inline = false) {
             toast.success("Team created successfully");
         })
         .catch((error) => {
+            if (redirectToLoginOnAuthError(error, "/teams")) return;
             toast.error(`Failed to create team: ${error.message}`);
             if (inline) {
                 inlineTeamError = error.message;
