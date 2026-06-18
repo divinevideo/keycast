@@ -13,3 +13,17 @@ export function safeRedirectPath(redirect: string | null | undefined): string {
     if (redirect.startsWith("//") || redirect.startsWith("/\\")) return "/";
     return redirect;
 }
+
+/**
+ * Resolve a post-authentication destination. An explicit, same-origin `redirect`
+ * target (e.g. the page the user was bounced off when their session expired) takes
+ * precedence over the caller's computed `fallback`. Anything missing or unsafe yields
+ * the fallback.
+ */
+export function resolvePostAuthDest(
+    requested: string | null | undefined,
+    fallback: string,
+): string {
+    const safe = safeRedirectPath(requested);
+    return safe === "/" ? fallback : safe;
+}

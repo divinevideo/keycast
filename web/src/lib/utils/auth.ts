@@ -2,6 +2,7 @@ import { browser } from "$app/environment";
 import { goto } from "$app/navigation";
 import { getCurrentUser, setCurrentUser } from "$lib/current_user.svelte";
 import { ApiError } from "$lib/keycast_api.svelte";
+import { resolvePostAuthDest } from "$lib/utils/redirect";
 import toast from "svelte-hot-french-toast";
 import { getViteDomain, isTeamsEnabled } from "$lib/utils/env";
 
@@ -68,7 +69,12 @@ export async function signin(
                 dest = "/admin";
             }
         }
-        goto(dest);
+        // An explicit, same-origin `redirect` (e.g. the page the user was bounced off
+        // when their session expired) takes precedence over the computed default.
+        const requested = browser
+            ? new URLSearchParams(window.location.search).get("redirect")
+            : null;
+        goto(resolvePostAuthDest(requested, dest));
     }
     return pubkey;
 }

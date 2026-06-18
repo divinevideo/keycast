@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { safeRedirectPath } from "./redirect";
+import { resolvePostAuthDest, safeRedirectPath } from "./redirect";
 
 describe("safeRedirectPath", () => {
     test("allows same-origin absolute paths and preserves query/hash", () => {
@@ -25,5 +25,23 @@ describe("safeRedirectPath", () => {
         expect(safeRedirectPath("//evil.com")).toBe("/");
         expect(safeRedirectPath("/\\evil.com")).toBe("/");
         expect(safeRedirectPath("/\\/evil.com")).toBe("/");
+    });
+});
+
+describe("resolvePostAuthDest", () => {
+    test("prefers a valid same-origin redirect over the fallback", () => {
+        expect(resolvePostAuthDest("/support-admin", "/admin")).toBe("/support-admin");
+    });
+
+    test("uses the fallback when no redirect is provided", () => {
+        expect(resolvePostAuthDest(null, "/admin")).toBe("/admin");
+        expect(resolvePostAuthDest(undefined, "/teams")).toBe("/teams");
+        expect(resolvePostAuthDest("/", "/admin")).toBe("/admin");
+    });
+
+    test("uses the fallback when the redirect is unsafe", () => {
+        expect(resolvePostAuthDest("//evil.com", "/admin")).toBe("/admin");
+        expect(resolvePostAuthDest("https://evil.com", "/admin")).toBe("/admin");
+        expect(resolvePostAuthDest("relative", "/admin")).toBe("/admin");
     });
 });
