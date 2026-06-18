@@ -154,8 +154,9 @@
 			if (result.has_token && result.claim_url && result.expires_at) {
 				claimToken = { claim_url: result.claim_url, expires_at: result.expires_at };
 			}
-		} catch {
-			// Silently ignore - user may not have claim token access
+		} catch (err) {
+			if (redirectToLoginOnAuthError(err, '/support-admin')) return;
+			// Silently ignore genuine no-access cases (403/404) - user may not have claim token access
 		} finally {
 			isLoadingClaimToken = false;
 		}
