@@ -16,6 +16,11 @@ interface SignoutOptions {
     showToast?: boolean;
 }
 
+// Guards against a burst of simultaneous 401s (e.g. several parallel requests failing
+// at once) firing multiple toasts and navigations. Cleared once the login navigation
+// settles, so a later session expiry is handled again.
+let redirecting = false;
+
 /**
  * If `err` is an authentication 401 (expired/missing session), clear stale client
  * auth state, surface a session-expired message, and redirect to /login with a return
@@ -33,6 +38,13 @@ export function redirectToLoginOnAuthError(
         return false;
     }
 
+    // Report the 401 as handled to every caller so they all early-return, but only run
+    // the redirect side effects for the first 401 in a burst.
+    if (redirecting) {
+        return true;
+    }
+    redirecting = true;
+
     // Drop the lingering client-side pubkey cookie/state so the UI no longer believes
     // it is signed in.
     setCurrentUser(null);
@@ -40,7 +52,9 @@ export function redirectToLoginOnAuthError(
     const path =
         returnPath ?? (browser ? window.location.pathname + window.location.search : "/");
     toast.error("Your session has expired. Please sign in again.");
-    goto(`/login?redirect=${encodeURIComponent(path)}`, { replaceState: true });
+    goto(`/login?redirect=${encodeURIComponent(path)}`, { replaceState: true }).finally(() => {
+        redirecting = false;
+    });
     return true;
 }
 
