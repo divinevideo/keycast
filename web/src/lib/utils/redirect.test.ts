@@ -26,6 +26,14 @@ describe("safeRedirectPath", () => {
         expect(safeRedirectPath("/\\evil.com")).toBe("/");
         expect(safeRedirectPath("/\\/evil.com")).toBe("/");
     });
+
+    test("rejects control-character vectors browsers strip to off-origin", () => {
+        // Browsers remove tab/newline/CR, turning these into `//evil.com`.
+        expect(safeRedirectPath("/\t/evil.com")).toBe("/");
+        expect(safeRedirectPath("/\n/evil.com")).toBe("/");
+        expect(safeRedirectPath("/\r/evil.com")).toBe("/");
+        expect(safeRedirectPath("/\t\\evil.com")).toBe("/");
+    });
 });
 
 describe("resolvePostAuthDest", () => {

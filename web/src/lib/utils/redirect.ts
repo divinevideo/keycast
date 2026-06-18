@@ -1,17 +1,25 @@
+// Sentinel origin used to resolve redirect targets. Only a genuine same-origin
+// relative path keeps this origin after URL parsing.
+const SENTINEL_ORIGIN = "http://localhost";
+
 /**
  * Validate a post-login redirect target.
  *
- * Only same-origin absolute paths are allowed: the value must start with a single `/`.
- * Protocol-relative (`//host`) and backslash-trick (`/\host`) values are rejected
- * because browsers resolve them to a different origin, which would be an open redirect.
- * The query string and hash are preserved for valid paths. Anything invalid falls back
- * to `/`.
+ * Only same-origin relative paths are allowed: the value must start with a single `/`,
+ * and resolving it against a sentinel origin must not change that origin. This rejects
+ * protocol-relative (`//host`), backslash (`/\host`), and control-character tricks
+ * (`/\t/host`, which browsers strip to `//host`) — all open-redirect vectors. The path,
+ * query, and hash are preserved for valid values. Anything invalid falls back to `/`.
  */
 export function safeRedirectPath(redirect: string | null | undefined): string {
     if (!redirect || !redirect.startsWith("/")) return "/";
-    // Reject `//host` and `/\host` — both resolve off-origin in browsers.
-    if (redirect.startsWith("//") || redirect.startsWith("/\\")) return "/";
-    return redirect;
+    try {
+        const url = new URL(redirect, SENTINEL_ORIGIN);
+        if (url.origin !== SENTINEL_ORIGIN) return "/";
+        return url.pathname + url.search + url.hash;
+    } catch {
+        return "/";
+    }
 }
 
 /**
