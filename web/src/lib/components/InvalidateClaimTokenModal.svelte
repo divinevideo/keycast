@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { toast } from 'svelte-hot-french-toast';
 	import { KeycastApi } from '$lib/keycast_api.svelte';
+	import { redirectToLoginOnAuthError } from '$lib/utils/auth';
 
 	const api = new KeycastApi();
 
@@ -43,6 +44,7 @@
 			onSuccess();
 			onClose();
 		} catch (err: any) {
+			if (redirectToLoginOnAuthError(err, '/support-admin')) return;
 			toast.error(err?.message || 'Failed to invalidate claim link');
 		} finally {
 			isInvalidating = false;

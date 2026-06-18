@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { KeycastApi } from '$lib/keycast_api.svelte';
+	import { redirectToLoginOnAuthError } from '$lib/utils/auth';
 	import { BRAND } from '$lib/brand';
 	import { toast } from 'svelte-hot-french-toast';
 	import { goto } from '$app/navigation';
@@ -76,6 +77,7 @@
 			showToken = false;
 			toast.success('Admin API token generated');
 		} catch (err: any) {
+			if (redirectToLoginOnAuthError(err, '/admin')) return;
 			console.error('Failed to generate token:', err);
 			toast.error(err.message || 'Failed to generate token');
 		} finally {
@@ -144,6 +146,7 @@
 			const response = await api.get<{ admins: SupportAdmin[] }>('/admin/support-admins');
 			supportAdmins = response.admins;
 		} catch (err: any) {
+			if (redirectToLoginOnAuthError(err, '/admin')) return;
 			supportAdminError = err.message || 'Failed to load support admins';
 		} finally {
 			isLoadingSupportAdmins = false;
@@ -166,6 +169,7 @@
 			newSupportAdminId = '';
 			await loadSupportAdmins();
 		} catch (err: any) {
+			if (redirectToLoginOnAuthError(err, '/admin')) return;
 			supportAdminError = err.message || 'Failed to add support admin';
 		} finally {
 			isAddingSupportAdmin = false;
@@ -178,6 +182,7 @@
 			toast.success('Support admin removed');
 			supportAdmins = supportAdmins.filter(a => a.pubkey !== pubkey);
 		} catch (err: any) {
+			if (redirectToLoginOnAuthError(err, '/admin')) return;
 			toast.error(err.message || 'Failed to remove support admin');
 		}
 	}

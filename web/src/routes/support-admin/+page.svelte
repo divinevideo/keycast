@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { BRAND } from '$lib/brand';
 	import { KeycastApi } from '$lib/keycast_api.svelte';
+	import { redirectToLoginOnAuthError } from '$lib/utils/auth';
 	import { goto } from '$app/navigation';
 	import Loader from '$lib/components/Loader.svelte';
 	import InvalidateClaimTokenModal from '$lib/components/InvalidateClaimTokenModal.svelte';
@@ -98,6 +99,7 @@
 				expandedPubkey = result.results[0].pubkey;
 			}
 		} catch (err: any) {
+			if (redirectToLoginOnAuthError(err, '/support-admin')) return;
 			searchError = err.message || 'Search failed';
 		} finally {
 			isSearching = false;
@@ -169,6 +171,7 @@
 			claimToken = result;
 			toast.success('Claim link generated');
 		} catch (err: any) {
+			if (redirectToLoginOnAuthError(err, '/support-admin')) return;
 			toast.error(err.message || 'Failed to generate claim link');
 		} finally {
 			isGeneratingClaimToken = false;
@@ -185,6 +188,7 @@
 			claimToken = result;
 			toast.success('Claim link regenerated. Prior link is now invalidated.');
 		} catch (err: any) {
+			if (redirectToLoginOnAuthError(err, '/support-admin')) return;
 			toast.error(err.message || 'Failed to regenerate claim link');
 		} finally {
 			isGeneratingClaimToken = false;
