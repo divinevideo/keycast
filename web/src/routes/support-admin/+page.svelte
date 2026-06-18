@@ -99,7 +99,7 @@
 				expandedPubkey = result.results[0].pubkey;
 			}
 		} catch (err: any) {
-			if (redirectToLoginOnAuthError(err, '/support-admin')) return;
+			if (redirectToLoginOnAuthError(err)) return;
 			searchError = err.message || 'Search failed';
 		} finally {
 			isSearching = false;
@@ -155,7 +155,7 @@
 				claimToken = { claim_url: result.claim_url, expires_at: result.expires_at };
 			}
 		} catch (err) {
-			if (redirectToLoginOnAuthError(err, '/support-admin')) return;
+			if (redirectToLoginOnAuthError(err)) return;
 			// Silently ignore genuine no-access cases (403/404) - user may not have claim token access
 		} finally {
 			isLoadingClaimToken = false;
@@ -172,7 +172,7 @@
 			claimToken = result;
 			toast.success('Claim link generated');
 		} catch (err: any) {
-			if (redirectToLoginOnAuthError(err, '/support-admin')) return;
+			if (redirectToLoginOnAuthError(err)) return;
 			toast.error(err.message || 'Failed to generate claim link');
 		} finally {
 			isGeneratingClaimToken = false;
@@ -189,7 +189,7 @@
 			claimToken = result;
 			toast.success('Claim link regenerated. Prior link is now invalidated.');
 		} catch (err: any) {
-			if (redirectToLoginOnAuthError(err, '/support-admin')) return;
+			if (redirectToLoginOnAuthError(err)) return;
 			toast.error(err.message || 'Failed to regenerate claim link');
 		} finally {
 			isGeneratingClaimToken = false;

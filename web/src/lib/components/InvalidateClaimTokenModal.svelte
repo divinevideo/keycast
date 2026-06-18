@@ -44,7 +44,7 @@
 			onSuccess();
 			onClose();
 		} catch (err: any) {
-			if (redirectToLoginOnAuthError(err, '/support-admin')) return;
+			if (redirectToLoginOnAuthError(err)) return;
 			toast.error(err?.message || 'Failed to invalidate claim link');
 		} finally {
 			isInvalidating = false;
