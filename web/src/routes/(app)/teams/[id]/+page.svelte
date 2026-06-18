@@ -15,6 +15,7 @@ import type {
     TeamWithRelations,
     User,
 } from "$lib/types";
+import { redirectToLoginOnAuthError } from "$lib/utils/auth";
 import { truncatedNpubForPubkey } from "$lib/utils/nostr";
 import { DotsThreeVertical } from "phosphor-svelte";
 import { toast } from "svelte-hot-french-toast";
@@ -39,6 +40,10 @@ $effect(() => {
                 users = team.team_users;
                 storedKeys = team.stored_keys;
                 policies = team.policies;
+            })
+            .catch((error) => {
+                if (redirectToLoginOnAuthError(error)) return;
+                console.error(error);
             })
             .finally(() => {
                 isLoading = false;

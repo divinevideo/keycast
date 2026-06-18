@@ -15,6 +15,7 @@ import type {
     StoredKey,
     Team,
 } from "$lib/types";
+import { redirectToLoginOnAuthError } from "$lib/utils/auth";
 import { formattedDate } from "$lib/utils/dates";
 import { npubFromPubkey } from "$lib/utils/nostr";
 import { CaretRight } from "phosphor-svelte";
@@ -40,6 +41,10 @@ $effect(() => {
                 team = (teamKeyResponse as KeyWithRelations).team;
                 authorizations = (teamKeyResponse as KeyWithRelations)
                     .authorizations;
+            })
+            .catch((error) => {
+                if (redirectToLoginOnAuthError(error)) return;
+                console.error(error);
             })
             .finally(() => {
                 isLoading = false;
