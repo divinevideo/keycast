@@ -1398,3 +1398,215 @@ async fn test_suspended_user_allowed_get_public_key() {
         .expect("result should be a string");
     assert_eq!(result_pubkey, pubkey);
 }
+
+// ============================================================================
+// nip17_unwrap_batch (NIP-59 gift-wrap unwrap)
+// ============================================================================
+
+/// Build a kind:1059 gift wrap (from `sender` to `receiver`) carrying a kind:14
+/// DM rumor, serialized to its JSON event value for an RPC param.
+async fn gift_wrap_param(sender: &Keys, receiver: &PublicKey, text: &str) -> Value {
+    let rumor = EventBuilder::private_msg_rumor(*receiver, text).build(sender.public_key());
+    let wrap = EventBuilder::gift_wrap(sender, receiver, rumor, Vec::<Tag>::new())
+        .await
+        .expect("gift wrap should build");
+    serde_json::to_value(&wrap).expect("serialize gift wrap")
+}
+
+/// Happy path + partial failure: a batch with one decryptable wrap, one
+/// non-gift-wrap event, one wrap for a different recipient, and one unparseable
+/// item returns four ordered, index-aligned slots (success / per-item errors).
+#[tokio::test]
+#[serial]
+async fn test_nip17_unwrap_batch_happy_path_and_partial_failure() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (user_keys, pubkey) = create_test_user();
+    let key_manager = FileKeyManager::new().expect("Failed to create key manager");
+
+    insert_user(&pool, tenant_id, &pubkey).await;
+    create_personal_key(&pool, tenant_id, &pubkey, &user_keys, &key_manager).await;
+
+    let redirect_origin = format!("https://unwrap-{}.example.com", Uuid::new_v4());
+    let (_auth_id, bunker_pubkey) = create_test_oauth_authorization(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &redirect_origin,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    let receiver = user_keys.public_key();
+    let sender_a = Keys::generate();
+    let sender_b = Keys::generate();
+    let other_receiver = Keys::generate();
+
+    // 0: valid wrap to the user; 1: non-gift-wrap (kind 1); 2: wrap addressed to
+    // someone else (undecryptable); 3: not an event at all.
+    let valid = gift_wrap_param(&sender_a, &receiver, "hello from A").await;
+    let non_wrap = serde_json::to_value(
+        EventBuilder::text_note("plain note")
+            .sign_with_keys(&sender_b)
+            .expect("sign"),
+    )
+    .expect("serialize note");
+    let wrong_recipient =
+        gift_wrap_param(&sender_b, &other_receiver.public_key(), "not for you").await;
+    let garbage = json!({ "not": "an event" });
+
+    let token =
+        build_self_signed_ucan(&user_keys, tenant_id, &redirect_origin, Some(&bunker_pubkey)).await;
+    let auth_state = create_test_auth_state(
+        pool.clone(),
+        Arc::new(Box::new(key_manager) as Box<dyn KeyManager>),
+    );
+
+    let response = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state,
+        &format!("Bearer {}", token),
+        None,
+        NostrRpcRequest {
+            method: "nip17_unwrap_batch".to_string(),
+            params: vec![valid, non_wrap, wrong_recipient, garbage],
+        },
+    )
+    .await
+    .expect("batch unwrap should return success");
+
+    let results = response
+        .result
+        .as_ref()
+        .and_then(|v| v.as_array())
+        .expect("result should be an array");
+    assert_eq!(results.len(), 4, "one ordered slot per input");
+
+    // 0: success — rumor content + authenticated sender (the seal signer).
+    assert!(results[0].get("error").is_none());
+    assert_eq!(
+        results[0]["sender"].as_str().unwrap(),
+        sender_a.public_key().to_hex()
+    );
+    assert_eq!(
+        results[0]["rumor"]["content"].as_str().unwrap(),
+        "hello from A"
+    );
+
+    // 1-3: per-item errors, in order.
+    assert_eq!(results[1]["error"].as_str().unwrap(), "not_gift_wrap");
+    assert_eq!(results[2]["error"].as_str().unwrap(), "decrypt_failed");
+    assert_eq!(results[3]["error"].as_str().unwrap(), "invalid_event");
+}
+
+/// A batch over the `MAX_UNWRAP_BATCH` cap is rejected before any per-item work.
+#[tokio::test]
+#[serial]
+async fn test_nip17_unwrap_batch_size_cap_rejected() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (user_keys, pubkey) = create_test_user();
+    let key_manager = FileKeyManager::new().expect("Failed to create key manager");
+
+    insert_user(&pool, tenant_id, &pubkey).await;
+    create_personal_key(&pool, tenant_id, &pubkey, &user_keys, &key_manager).await;
+
+    let redirect_origin = format!("https://unwrap-cap-{}.example.com", Uuid::new_v4());
+    let (_auth_id, bunker_pubkey) = create_test_oauth_authorization(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &redirect_origin,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    let token =
+        build_self_signed_ucan(&user_keys, tenant_id, &redirect_origin, Some(&bunker_pubkey)).await;
+    let auth_state = create_test_auth_state(
+        pool.clone(),
+        Arc::new(Box::new(key_manager) as Box<dyn KeyManager>),
+    );
+
+    // 101 trivial params: the cap check fires before any unwrap work.
+    let params: Vec<Value> = (0..101).map(|_| json!({})).collect();
+
+    let err = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state,
+        &format!("Bearer {}", token),
+        None,
+        NostrRpcRequest {
+            method: "nip17_unwrap_batch".to_string(),
+            params,
+        },
+    )
+    .await
+    .expect_err("over-cap batch should be rejected");
+
+    match err {
+        RpcError::InvalidParams(msg) => assert!(msg.contains("Maximum")),
+        other => panic!("expected InvalidParams, got: {:?}", other),
+    }
+}
+
+/// A suspended user is gated out of the unwrap batch by the per-request status
+/// check (same gate as the single mutating methods).
+#[tokio::test]
+#[serial]
+async fn test_suspended_user_denied_nip17_unwrap_batch() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (user_keys, pubkey) = create_test_user();
+    let key_manager = FileKeyManager::new().expect("Failed to create key manager");
+
+    insert_user(&pool, tenant_id, &pubkey).await;
+    create_personal_key(&pool, tenant_id, &pubkey, &user_keys, &key_manager).await;
+
+    let redirect_origin = format!("https://unwrap-suspend-{}.example.com", Uuid::new_v4());
+    let (_auth_id, bunker_pubkey) = create_test_oauth_authorization(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &redirect_origin,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    suspend_user(&pool, &pubkey, tenant_id).await;
+
+    let receiver = user_keys.public_key();
+    let sender = Keys::generate();
+    let wrap = gift_wrap_param(&sender, &receiver, "should be gated").await;
+
+    let token =
+        build_self_signed_ucan(&user_keys, tenant_id, &redirect_origin, Some(&bunker_pubkey)).await;
+    let auth_state = create_test_auth_state(
+        pool.clone(),
+        Arc::new(Box::new(key_manager) as Box<dyn KeyManager>),
+    );
+
+    let err = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state,
+        &format!("Bearer {}", token),
+        None,
+        NostrRpcRequest {
+            method: "nip17_unwrap_batch".to_string(),
+            params: vec![wrap],
+        },
+    )
+    .await
+    .expect_err("suspended user should be denied unwrap batch");
+
+    match err {
+        RpcError::AccountSuspended(msg) => assert_eq!(msg, "Account restricted"),
+        other => panic!("expected AccountSuspended, got: {:?}", other),
+    }
+}

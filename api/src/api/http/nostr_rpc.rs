@@ -15,7 +15,7 @@ use keycast_core::repositories::{
 };
 use keycast_core::signing_session::{parse_cache_key, CacheKey, SigningSession};
 use keycast_core::traits::CustomPermission;
-use nostr_sdk::{Keys, PublicKey, UnsignedEvent};
+use nostr_sdk::{Event, Keys, PublicKey, UnsignedEvent};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -24,6 +24,15 @@ use std::sync::Arc;
 
 use super::auth::AuthError;
 use super::routes::AuthState;
+
+/// Maximum gift wraps accepted in a single `nip17_unwrap_batch` request.
+/// Bounds per-request work and keeps the body well under axum's 2 MB default
+/// limit (gift wraps are ~1-2 KB each). Mirrors the `batch_lookup_users` cap.
+const MAX_UNWRAP_BATCH: usize = 100;
+
+/// Bounded fan-out width for unwrapping a batch. Caps in-flight blocking-pool
+/// tasks so one large batch can't starve the runtime.
+const UNWRAP_BATCH_CONCURRENCY: usize = 16;
 
 /// RPC request format (mirrors NIP-46)
 #[derive(Debug, Deserialize)]
@@ -118,6 +127,9 @@ impl From<HandlerError> for RpcError {
 /// - nip04_decrypt: Decrypts ciphertext using NIP-04
 /// - nip44_encrypt: Encrypts plaintext using NIP-44
 /// - nip44_decrypt: Decrypts ciphertext using NIP-44
+/// - nip17_unwrap_batch: Unwraps a batch of NIP-59 gift wraps (1059→seal→rumor),
+///   returning ordered per-item `{rumor, sender}` / `{error}` slots. Amortizes the
+///   per-request auth/status overhead and collapses the client's 2 RPCs-per-DM.
 ///
 /// Uses BLAKE3 token cache - on cache hit, skips UCAN verification entirely.
 /// All operations use cached handler with in-memory permission validation (no DB hits).
@@ -207,6 +219,36 @@ pub async fn nostr_rpc(
 
             // Expose secret only at serialization boundary
             JsonValue::String(plaintext.expose_secret().to_string())
+        }
+
+        "nip17_unwrap_batch" => {
+            // Size cap keeps the request under axum's 2 MB default body limit and
+            // bounds per-request work (mirrors the batch_lookup_users cap precedent).
+            if req.params.is_empty() {
+                return Err(RpcError::InvalidParams("Empty gift wrap batch".into()));
+            }
+            if req.params.len() > MAX_UNWRAP_BATCH {
+                return Err(RpcError::InvalidParams(format!(
+                    "Maximum {} gift wraps per batch",
+                    MAX_UNWRAP_BATCH
+                )));
+            }
+
+            // Whole-batch validity gate: an expired/revoked authorization can
+            // decrypt nothing, so fail the batch rather than emitting N error
+            // slots (matches the single-method behavior).
+            if !handler.is_valid() {
+                return Err(RpcError::Auth(AuthError::InvalidToken));
+            }
+
+            // Server does BOTH gift-wrap decrypt layers internally, so the client
+            // makes one call per page instead of 2 sequential RPCs per message.
+            let results = unwrap_gift_wrap_batch(&handler, &req.params).await;
+
+            // One coalesced activity log for the whole batch (per-request semantics).
+            spawn_log_activity(pool.clone(), handler.is_oauth(), handler.authorization_id());
+
+            JsonValue::Array(results)
         }
 
         "nip04_encrypt" => {
@@ -721,6 +763,52 @@ fn parse_decrypt_params(params: &[JsonValue]) -> Result<(PublicKey, String), Rpc
         .map_err(|e| RpcError::InvalidParams(format!("Invalid pubkey: {}", e)))?;
 
     Ok((pubkey, ciphertext.to_string()))
+}
+
+/// Build the per-item error slot for the unwrap batch response.
+fn unwrap_error_slot(code: &str) -> JsonValue {
+    serde_json::json!({ "error": code })
+}
+
+/// Unwrap a batch of NIP-59 gift wraps into ordered, index-aligned result slots.
+///
+/// Each slot is `{"rumor": <kind14 unsigned event>, "sender": "<hex>"}` on
+/// success or `{"error": "<code>"}` on a per-item failure — one bad gift wrap
+/// never fails the batch. Items run with bounded concurrency
+/// (`UNWRAP_BATCH_CONCURRENCY`); `chunks` + ordered await preserves request
+/// order (NIP-17 history is positional).
+async fn unwrap_gift_wrap_batch(handler: &Arc<HttpRpcHandler>, items: &[JsonValue]) -> Vec<JsonValue> {
+    let mut results: Vec<JsonValue> = Vec::with_capacity(items.len());
+
+    for chunk in items.chunks(UNWRAP_BATCH_CONCURRENCY) {
+        let mut handles = Vec::with_capacity(chunk.len());
+        for item in chunk {
+            let handler = handler.clone();
+            let item = item.clone();
+            handles.push(tokio::spawn(async move {
+                let event: Event = match serde_json::from_value(item) {
+                    Ok(e) => e,
+                    Err(_) => return unwrap_error_slot("invalid_event"),
+                };
+                match handler.nip17_unwrap(event).await {
+                    Ok(unwrapped) => match serde_json::to_value(&unwrapped.rumor) {
+                        Ok(rumor) => serde_json::json!({
+                            "rumor": rumor,
+                            "sender": unwrapped.sender.to_hex(),
+                        }),
+                        Err(_) => unwrap_error_slot("internal"),
+                    },
+                    Err(e) => unwrap_error_slot(e.code()),
+                }
+            }));
+        }
+        // Await in spawn order to keep the response index-aligned with the request.
+        for handle in handles {
+            results.push(handle.await.unwrap_or_else(|_| unwrap_error_slot("internal")));
+        }
+    }
+
+    results
 }
 
 /// Spawn activity logging in background (non-blocking)

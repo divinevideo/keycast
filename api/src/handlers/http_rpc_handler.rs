@@ -7,7 +7,8 @@ use keycast_core::signing_session::{CacheKey, SigningSession};
 use keycast_core::traits::CustomPermission;
 use moka::future::Cache;
 use nostr_sdk::nips::nip04;
-use nostr_sdk::{Event, Keys, PublicKey, UnsignedEvent};
+use nostr_sdk::nips::nip59::{self, UnwrappedGift};
+use nostr_sdk::{Event, Keys, Kind, PublicKey, UnsignedEvent};
 use secrecy::SecretString;
 use std::sync::Arc;
 use thiserror::Error;
@@ -22,6 +23,45 @@ pub enum HandlerError {
     Signing(String),
     #[error("encryption error: {0}")]
     Encryption(String),
+}
+
+/// Per-item failure reason for the NIP-17 gift-wrap unwrap batch.
+///
+/// Each variant maps to a stable, machine-readable `code()` returned in the
+/// per-item `{"error": "<code>"}` response slot so one malformed gift wrap
+/// never fails the whole batch.
+#[derive(Debug, Error)]
+pub enum UnwrapError {
+    #[error("authorization expired or revoked")]
+    AuthorizationInvalid,
+    #[error("not a gift wrap event")]
+    NotGiftWrap,
+    #[error("invalid gift wrap signature")]
+    InvalidWrapSignature,
+    #[error("gift wrap decryption failed")]
+    DecryptFailed,
+    #[error("rumor author does not match seal signer")]
+    SenderMismatch,
+    #[error("permission denied")]
+    PermissionDenied,
+    #[error("internal error")]
+    Internal,
+}
+
+impl UnwrapError {
+    /// Stable wire code for the per-item error slot. Keep these strings stable —
+    /// clients branch on them (e.g. to route a slot into a retry queue).
+    pub fn code(&self) -> &'static str {
+        match self {
+            UnwrapError::AuthorizationInvalid => "authorization_invalid",
+            UnwrapError::NotGiftWrap => "not_gift_wrap",
+            UnwrapError::InvalidWrapSignature => "invalid_wrap_signature",
+            UnwrapError::DecryptFailed => "decrypt_failed",
+            UnwrapError::SenderMismatch => "sender_mismatch",
+            UnwrapError::PermissionDenied => "permission_denied",
+            UnwrapError::Internal => "internal",
+        }
+    }
 }
 
 /// HTTP RPC handler - caches authorization state AND permissions for spam protection
@@ -295,6 +335,69 @@ impl HttpRpcHandler {
             .map_err(|e| HandlerError::Encryption(e.to_string()))
     }
 
+    /// Unwrap a single NIP-59 gift wrap (kind 1059) → seal (kind 13) → rumor.
+    ///
+    /// This is the per-item primitive behind the `nip17_unwrap_batch` RPC. It
+    /// reproduces the security guarantees the divine-mobile client enforces in
+    /// `GiftWrapUtil.getRumorEvent`, delegating the protocol unwrap to the
+    /// vetted `nostr_sdk` implementation rather than hand-rolling NIP-59:
+    ///
+    /// 1. validity (expiration/revocation) is checked first (cached, no DB hit);
+    /// 2. the OUTER gift wrap's id+Schnorr signature is verified — defense in
+    ///    depth, since `UnwrappedGift::from_gift_wrap` verifies the *seal* but
+    ///    NOT the outer wrap;
+    /// 3. `UnwrappedGift::from_gift_wrap` decrypts the outer layer, **verifies
+    ///    the seal's signature** (the sole cryptographic anchor of the sender's
+    ///    identity), decrypts the inner layer, and rejects a rumor whose
+    ///    `pubkey` disagrees with the authenticated seal signer (`SenderMismatch`);
+    /// 4. the cached decrypt policy is enforced against the **authenticated**
+    ///    inner sender — `from_gift_wrap` decrypts internally, so without this an
+    ///    `encrypt_to_self`-restricted authorization could read others' DMs.
+    ///
+    /// CPU-bound work (two Schnorr verifies + two NIP-44 decrypts) runs on
+    /// `spawn_blocking`, mirroring `SigningSession::sign_event`.
+    pub async fn nip17_unwrap(&self, gift_wrap: Event) -> Result<UnwrappedGift, UnwrapError> {
+        if !self.is_valid() {
+            return Err(UnwrapError::AuthorizationInvalid);
+        }
+
+        // Cheap kind gate before doing any crypto (from_gift_wrap also checks this).
+        if gift_wrap.kind != Kind::GiftWrap {
+            return Err(UnwrapError::NotGiftWrap);
+        }
+
+        let keys = self.signing.keys().clone();
+        let unwrapped = tokio::task::spawn_blocking(move || -> Result<UnwrappedGift, UnwrapError> {
+            // Defense-in-depth: verify the outer wrap's own id+signature (parity
+            // with the client's getRumorEvent). from_gift_wrap does not do this.
+            gift_wrap
+                .verify()
+                .map_err(|_| UnwrapError::InvalidWrapSignature)?;
+
+            // from_gift_wrap is async but its crypto is synchronous; drive it to
+            // completion on this blocking thread (same pattern as sign_event).
+            tokio::runtime::Handle::current()
+                .block_on(UnwrappedGift::from_gift_wrap(&keys, &gift_wrap))
+                .map_err(|e| match e {
+                    nip59::Error::NotGiftWrap => UnwrapError::NotGiftWrap,
+                    nip59::Error::SenderMismatch => UnwrapError::SenderMismatch,
+                    // Signer (wrong recipient / decrypt failure) and Event (malformed
+                    // seal/rumor json) both surface as a decrypt failure to the client.
+                    _ => UnwrapError::DecryptFailed,
+                })
+        })
+        .await
+        .map_err(|_| UnwrapError::Internal)??;
+
+        // Enforce decrypt policy on the authenticated inner sender. Only
+        // `encrypt_to_self` actually denies decrypt today; DM authorizations
+        // have no policy (full access) and pass through.
+        self.validate_decrypt_permission(&unwrapped.rumor.content, &unwrapped.sender)
+            .map_err(|_| UnwrapError::PermissionDenied)?;
+
+        Ok(unwrapped)
+    }
+
     /// Encrypt plaintext using NIP-04 after checking validity and permissions
     /// (CPU-bound crypto runs on spawn_blocking)
     pub async fn nip04_encrypt(
@@ -520,5 +623,111 @@ mod tests {
         );
 
         assert_eq!(handler.expected_dpop_jkt(), Some("thumbprint-123"));
+    }
+
+    // -- nip17_unwrap (NIP-59 gift-wrap unwrap) ------------------------------
+
+    /// Build a kind:1059 gift wrap from `sender` to `receiver` carrying a
+    /// kind:14 private DM rumor with the given text.
+    async fn build_gift_wrap(
+        sender: &Keys,
+        receiver: &PublicKey,
+        text: &str,
+    ) -> nostr_sdk::Event {
+        let rumor = nostr_sdk::EventBuilder::private_msg_rumor(*receiver, text)
+            .build(sender.public_key());
+        nostr_sdk::EventBuilder::gift_wrap(sender, receiver, rumor, Vec::<nostr_sdk::Tag>::new())
+            .await
+            .expect("gift wrap should build")
+    }
+
+    #[tokio::test]
+    async fn nip17_unwrap_round_trips_gift_wrap() {
+        let handler = create_test_handler(None, None);
+        let receiver = handler.public_key();
+        let sender = Keys::generate();
+
+        let gift_wrap = build_gift_wrap(&sender, &receiver, "hello dm").await;
+
+        let unwrapped = handler
+            .nip17_unwrap(gift_wrap)
+            .await
+            .expect("unwrap should succeed");
+
+        assert_eq!(
+            unwrapped.sender,
+            sender.public_key(),
+            "sender must be the authenticated seal signer"
+        );
+        assert_eq!(unwrapped.rumor.content, "hello dm");
+        assert_eq!(unwrapped.rumor.kind, Kind::PrivateDirectMessage);
+    }
+
+    #[tokio::test]
+    async fn nip17_unwrap_rejects_non_gift_wrap() {
+        let handler = create_test_handler(None, None);
+        let sender = Keys::generate();
+        let event = nostr_sdk::EventBuilder::text_note("not a wrap")
+            .sign_with_keys(&sender)
+            .expect("sign");
+
+        let err = handler
+            .nip17_unwrap(event)
+            .await
+            .expect_err("non-gift-wrap should be rejected");
+        assert_eq!(err.code(), "not_gift_wrap");
+    }
+
+    #[tokio::test]
+    async fn nip17_unwrap_rejects_wrong_recipient() {
+        let handler = create_test_handler(None, None);
+        let other_receiver = Keys::generate();
+        let sender = Keys::generate();
+
+        // Wrap addressed to someone else: this handler's key cannot decrypt it.
+        let gift_wrap = build_gift_wrap(&sender, &other_receiver.public_key(), "secret").await;
+
+        let err = handler
+            .nip17_unwrap(gift_wrap)
+            .await
+            .expect_err("wrong recipient should fail to decrypt");
+        assert_eq!(err.code(), "decrypt_failed");
+    }
+
+    #[tokio::test]
+    async fn nip17_unwrap_denied_when_expired() {
+        let expires = Utc::now() - chrono::Duration::hours(1);
+        let handler = create_test_handler(Some(expires), None);
+        let receiver = handler.public_key();
+        let sender = Keys::generate();
+
+        let gift_wrap = build_gift_wrap(&sender, &receiver, "hi").await;
+
+        let err = handler
+            .nip17_unwrap(gift_wrap)
+            .await
+            .expect_err("expired authorization should be denied");
+        assert_eq!(err.code(), "authorization_invalid");
+    }
+
+    #[tokio::test]
+    async fn nip17_unwrap_denied_by_encrypt_to_self_policy() {
+        // I4: the unwrap path decrypts inside the SDK, so it must still enforce
+        // the decrypt policy on the authenticated inner sender. encrypt_to_self
+        // only permits decrypting messages from oneself, so a DM from another
+        // sender must be denied rather than silently bypassing the policy.
+        use keycast_core::custom_permissions::encrypt_to_self::EncryptToSelf;
+        let handler =
+            create_test_handler_with_permissions(None, None, vec![Box::new(EncryptToSelf {})]);
+        let receiver = handler.public_key();
+        let sender = Keys::generate(); // not the user -> encrypt_to_self denies
+
+        let gift_wrap = build_gift_wrap(&sender, &receiver, "from someone else").await;
+
+        let err = handler
+            .nip17_unwrap(gift_wrap)
+            .await
+            .expect_err("encrypt_to_self should deny a DM from another sender");
+        assert_eq!(err.code(), "permission_denied");
     }
 }
