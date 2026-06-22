@@ -58,10 +58,15 @@ async function deleteTeam() {
             "Are you sure you want to delete this team? This action is irreversible.",
         )
     ) {
-        api.delete(`/teams/${id}`).then(() => {
-            toast.success("Team deleted successfully");
-            goto("/teams");
-        });
+        api.delete(`/teams/${id}`)
+            .then(() => {
+                toast.success("Team deleted successfully");
+                goto("/teams");
+            })
+            .catch((error) => {
+                if (redirectToLoginOnAuthError(error)) return;
+                toast.error("Failed to delete team");
+            });
     }
 }
 

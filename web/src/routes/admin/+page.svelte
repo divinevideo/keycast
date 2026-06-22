@@ -37,6 +37,7 @@
 				goto('/support-admin', { replaceState: true });
 			}
 		} catch (err) {
+			if (redirectToLoginOnAuthError(err)) return;
 			console.error('Failed to check admin status:', err);
 			isAdmin = false;
 			goto('/login?redirect=/admin', { replaceState: true });

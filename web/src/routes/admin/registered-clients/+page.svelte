@@ -65,7 +65,8 @@
 				status = 'not-admin';
 				return;
 			}
-		} catch {
+		} catch (err) {
+			if (redirectToLoginOnAuthError(err)) return;
 			goto('/login?redirect=/admin/registered-clients', { replaceState: true });
 			return;
 		}

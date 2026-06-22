@@ -72,7 +72,8 @@
 				return;
 			}
 			adminRole = response.role;
-		} catch {
+		} catch (err) {
+			if (redirectToLoginOnAuthError(err)) return;
 			goto('/login?redirect=/support-admin', { replaceState: true });
 			return;
 		}
