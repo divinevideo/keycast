@@ -1457,8 +1457,13 @@ async fn test_nip17_unwrap_batch_happy_path_and_partial_failure() {
         gift_wrap_param(&sender_b, &other_receiver.public_key(), "not for you").await;
     let garbage = json!({ "not": "an event" });
 
-    let token =
-        build_self_signed_ucan(&user_keys, tenant_id, &redirect_origin, Some(&bunker_pubkey)).await;
+    let token = build_self_signed_ucan(
+        &user_keys,
+        tenant_id,
+        &redirect_origin,
+        Some(&bunker_pubkey),
+    )
+    .await;
     let auth_state = create_test_auth_state(
         pool.clone(),
         Arc::new(Box::new(key_manager) as Box<dyn KeyManager>),
@@ -1525,8 +1530,13 @@ async fn test_nip17_unwrap_batch_size_cap_rejected() {
     )
     .await;
 
-    let token =
-        build_self_signed_ucan(&user_keys, tenant_id, &redirect_origin, Some(&bunker_pubkey)).await;
+    let token = build_self_signed_ucan(
+        &user_keys,
+        tenant_id,
+        &redirect_origin,
+        Some(&bunker_pubkey),
+    )
+    .await;
     let auth_state = create_test_auth_state(
         pool.clone(),
         Arc::new(Box::new(key_manager) as Box<dyn KeyManager>),
@@ -1585,8 +1595,13 @@ async fn test_suspended_user_denied_nip17_unwrap_batch() {
     let sender = Keys::generate();
     let wrap = gift_wrap_param(&sender, &receiver, "should be gated").await;
 
-    let token =
-        build_self_signed_ucan(&user_keys, tenant_id, &redirect_origin, Some(&bunker_pubkey)).await;
+    let token = build_self_signed_ucan(
+        &user_keys,
+        tenant_id,
+        &redirect_origin,
+        Some(&bunker_pubkey),
+    )
+    .await;
     let auth_state = create_test_auth_state(
         pool.clone(),
         Arc::new(Box::new(key_manager) as Box<dyn KeyManager>),

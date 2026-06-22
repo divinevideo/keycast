@@ -777,7 +777,10 @@ fn unwrap_error_slot(code: &str) -> JsonValue {
 /// never fails the batch. Items run with bounded concurrency
 /// (`UNWRAP_BATCH_CONCURRENCY`); `chunks` + ordered await preserves request
 /// order (NIP-17 history is positional).
-async fn unwrap_gift_wrap_batch(handler: &Arc<HttpRpcHandler>, items: &[JsonValue]) -> Vec<JsonValue> {
+async fn unwrap_gift_wrap_batch(
+    handler: &Arc<HttpRpcHandler>,
+    items: &[JsonValue],
+) -> Vec<JsonValue> {
     let mut results: Vec<JsonValue> = Vec::with_capacity(items.len());
 
     for chunk in items.chunks(UNWRAP_BATCH_CONCURRENCY) {
@@ -804,7 +807,11 @@ async fn unwrap_gift_wrap_batch(handler: &Arc<HttpRpcHandler>, items: &[JsonValu
         }
         // Await in spawn order to keep the response index-aligned with the request.
         for handle in handles {
-            results.push(handle.await.unwrap_or_else(|_| unwrap_error_slot("internal")));
+            results.push(
+                handle
+                    .await
+                    .unwrap_or_else(|_| unwrap_error_slot("internal")),
+            );
         }
     }
 

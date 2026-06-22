@@ -367,27 +367,28 @@ impl HttpRpcHandler {
         }
 
         let keys = self.signing.keys().clone();
-        let unwrapped = tokio::task::spawn_blocking(move || -> Result<UnwrappedGift, UnwrapError> {
-            // Defense-in-depth: verify the outer wrap's own id+signature (parity
-            // with the client's getRumorEvent). from_gift_wrap does not do this.
-            gift_wrap
-                .verify()
-                .map_err(|_| UnwrapError::InvalidWrapSignature)?;
+        let unwrapped =
+            tokio::task::spawn_blocking(move || -> Result<UnwrappedGift, UnwrapError> {
+                // Defense-in-depth: verify the outer wrap's own id+signature (parity
+                // with the client's getRumorEvent). from_gift_wrap does not do this.
+                gift_wrap
+                    .verify()
+                    .map_err(|_| UnwrapError::InvalidWrapSignature)?;
 
-            // from_gift_wrap is async but its crypto is synchronous; drive it to
-            // completion on this blocking thread (same pattern as sign_event).
-            tokio::runtime::Handle::current()
-                .block_on(UnwrappedGift::from_gift_wrap(&keys, &gift_wrap))
-                .map_err(|e| match e {
-                    nip59::Error::NotGiftWrap => UnwrapError::NotGiftWrap,
-                    nip59::Error::SenderMismatch => UnwrapError::SenderMismatch,
-                    // Signer (wrong recipient / decrypt failure) and Event (malformed
-                    // seal/rumor json) both surface as a decrypt failure to the client.
-                    _ => UnwrapError::DecryptFailed,
-                })
-        })
-        .await
-        .map_err(|_| UnwrapError::Internal)??;
+                // from_gift_wrap is async but its crypto is synchronous; drive it to
+                // completion on this blocking thread (same pattern as sign_event).
+                tokio::runtime::Handle::current()
+                    .block_on(UnwrappedGift::from_gift_wrap(&keys, &gift_wrap))
+                    .map_err(|e| match e {
+                        nip59::Error::NotGiftWrap => UnwrapError::NotGiftWrap,
+                        nip59::Error::SenderMismatch => UnwrapError::SenderMismatch,
+                        // Signer (wrong recipient / decrypt failure) and Event (malformed
+                        // seal/rumor json) both surface as a decrypt failure to the client.
+                        _ => UnwrapError::DecryptFailed,
+                    })
+            })
+            .await
+            .map_err(|_| UnwrapError::Internal)??;
 
         // Enforce decrypt policy on the authenticated inner sender. Only
         // `encrypt_to_self` actually denies decrypt today; DM authorizations
@@ -629,13 +630,9 @@ mod tests {
 
     /// Build a kind:1059 gift wrap from `sender` to `receiver` carrying a
     /// kind:14 private DM rumor with the given text.
-    async fn build_gift_wrap(
-        sender: &Keys,
-        receiver: &PublicKey,
-        text: &str,
-    ) -> nostr_sdk::Event {
-        let rumor = nostr_sdk::EventBuilder::private_msg_rumor(*receiver, text)
-            .build(sender.public_key());
+    async fn build_gift_wrap(sender: &Keys, receiver: &PublicKey, text: &str) -> nostr_sdk::Event {
+        let rumor =
+            nostr_sdk::EventBuilder::private_msg_rumor(*receiver, text).build(sender.public_key());
         nostr_sdk::EventBuilder::gift_wrap(sender, receiver, rumor, Vec::<nostr_sdk::Tag>::new())
             .await
             .expect("gift wrap should build")
