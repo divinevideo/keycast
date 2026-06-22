@@ -34,6 +34,12 @@ describe("safeRedirectPath", () => {
         expect(safeRedirectPath("/\r/evil.com")).toBe("/");
         expect(safeRedirectPath("/\t\\evil.com")).toBe("/");
     });
+
+    test("rejects normalization vectors that collapse to a // pathname", () => {
+        // These keep the sentinel origin but normalize to a protocol-relative pathname.
+        expect(safeRedirectPath("/%2e%2e//evil.com")).toBe("/");
+        expect(safeRedirectPath("/..//evil.com")).toBe("/");
+    });
 });
 
 describe("resolvePostAuthDest", () => {

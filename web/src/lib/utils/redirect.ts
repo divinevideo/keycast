@@ -16,6 +16,10 @@ export function safeRedirectPath(redirect: string | null | undefined): string {
     try {
         const url = new URL(redirect, SENTINEL_ORIGIN);
         if (url.origin !== SENTINEL_ORIGIN) return "/";
+        // Path normalization (e.g. `/%2e%2e//evil.com` or `/..//evil.com`) can collapse
+        // to a `//host` pathname while keeping the sentinel origin. That pathname is
+        // itself protocol-relative when navigated, so reject it.
+        if (url.pathname.startsWith("//")) return "/";
         return url.pathname + url.search + url.hash;
     } catch {
         return "/";
