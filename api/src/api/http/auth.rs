@@ -3546,8 +3546,9 @@ pub async fn change_email(
     // new request that supersedes the prior one, so it bypasses the cooldown (otherwise correcting
     // a typo'd address within the window would silently fail). The endpoint is password-gated on
     // every call, so the residual "send to alternating targets" rate is bounded by request auth.
-    if let Ok(Some((Some(existing_target), Some(last_sent)))) =
-        user_repo.pending_email_send_state(&user_pubkey, tenant_id).await
+    if let Ok(Some((Some(existing_target), Some(last_sent)))) = user_repo
+        .pending_email_send_state(&user_pubkey, tenant_id)
+        .await
     {
         if existing_target == new_email
             && Utc::now() - last_sent < Duration::minutes(EMAIL_CHANGE_RESEND_COOLDOWN_MINUTES)
@@ -3555,8 +3556,9 @@ pub async fn change_email(
             // Honest message: nothing fresh was sent, the earlier links are still valid.
             return Ok(Json(ChangeEmailResponse {
                 success: true,
-                message: "We recently sent confirmation links for this change. Please check your inbox."
-                    .to_string(),
+                message:
+                    "We recently sent confirmation links for this change. Please check your inbox."
+                        .to_string(),
             }));
         }
     }
@@ -3590,13 +3592,23 @@ pub async fn change_email(
     let new_token = generate_secure_token();
     let expires = Utc::now() + Duration::hours(EMAIL_CHANGE_EXPIRY_HOURS);
     user_repo
-        .set_pending_email_change(&user_pubkey, tenant_id, &new_email, &old_token, &new_token, expires)
+        .set_pending_email_change(
+            &user_pubkey,
+            tenant_id,
+            &new_email,
+            &old_token,
+            &new_token,
+            expires,
+        )
         .await?;
 
     // Best-effort sends; don't fail the flow if email delivery is unavailable.
     match crate::email_service::EmailService::new() {
         Ok(svc) => {
-            if let Err(e) = svc.send_email_change_confirmation(&new_email, &new_token).await {
+            if let Err(e) = svc
+                .send_email_change_confirmation(&new_email, &new_token)
+                .await
+            {
                 tracing::error!("Failed to send email-change confirmation: {}", e);
             }
             // The old-address token serves both confirm and cancel; the action is distinguished

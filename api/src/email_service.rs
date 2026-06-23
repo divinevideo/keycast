@@ -236,7 +236,10 @@ impl EmailSender for DevEmailSender {
         to_new_email: &str,
         confirm_token: &str,
     ) -> Result<(), String> {
-        let confirm_url = format!("{}/confirm-email-change?token={}", self.base_url, confirm_token);
+        let confirm_url = format!(
+            "{}/confirm-email-change?token={}",
+            self.base_url, confirm_token
+        );
         eprintln!(
             "\n\x1b[34m[DEV EMAIL]\x1b[0m Email-change confirm (new address) for {}: \x1b[4m{}\x1b[0m\n",
             to_new_email, confirm_url
@@ -261,8 +264,14 @@ impl EmailSender for DevEmailSender {
         confirm_token: &str,
         cancel_token: &str,
     ) -> Result<(), String> {
-        let confirm_url = format!("{}/confirm-email-change?token={}", self.base_url, confirm_token);
-        let cancel_url = format!("{}/cancel-email-change?token={}", self.base_url, cancel_token);
+        let confirm_url = format!(
+            "{}/confirm-email-change?token={}",
+            self.base_url, confirm_token
+        );
+        let cancel_url = format!(
+            "{}/cancel-email-change?token={}",
+            self.base_url, cancel_token
+        );
         eprintln!(
             "\n\x1b[34m[DEV EMAIL]\x1b[0m Email-change notice (old address) for {} -> {}: confirm \x1b[4m{}\x1b[0m cancel \x1b[4m{}\x1b[0m\n",
             to_old_email, new_email, confirm_url, cancel_url
@@ -576,7 +585,10 @@ impl EmailSender for SendGridEmailSender {
         to_new_email: &str,
         confirm_token: &str,
     ) -> Result<(), String> {
-        let confirm_url = format!("{}/confirm-email-change?token={}", self.base_url, confirm_token);
+        let confirm_url = format!(
+            "{}/confirm-email-change?token={}",
+            self.base_url, confirm_token
+        );
         let subject = format!("Confirm your new {} email address", BRAND_NAME);
         let html_content = format!(
             r#"
@@ -620,8 +632,14 @@ impl EmailSender for SendGridEmailSender {
         confirm_token: &str,
         cancel_token: &str,
     ) -> Result<(), String> {
-        let confirm_url = format!("{}/confirm-email-change?token={}", self.base_url, confirm_token);
-        let cancel_url = format!("{}/cancel-email-change?token={}", self.base_url, cancel_token);
+        let confirm_url = format!(
+            "{}/confirm-email-change?token={}",
+            self.base_url, confirm_token
+        );
+        let cancel_url = format!(
+            "{}/cancel-email-change?token={}",
+            self.base_url, cancel_token
+        );
         // Escape the new address for the HTML context (defense-in-depth; callers normalize it).
         let new_email_html = html_escape(new_email);
         let subject = format!("Confirm the email change on your {} account", BRAND_NAME);

@@ -656,13 +656,13 @@ impl UserRepository {
     ) -> Result<Option<(PendingEmailChange, PendingEmailSide)>, RepositoryError> {
         // Select both token columns so we can decide the side without trusting the caller.
         type Row = (
-            String,                  // pubkey
-            Option<String>,          // pending_email
-            Option<DateTime<Utc>>,   // pending_email_expires_at
-            Option<DateTime<Utc>>,   // pending_email_old_confirmed_at
-            Option<DateTime<Utc>>,   // pending_email_new_confirmed_at
-            Option<String>,          // pending_email_old_token
-            Option<String>,          // pending_email_new_token
+            String,                // pubkey
+            Option<String>,        // pending_email
+            Option<DateTime<Utc>>, // pending_email_expires_at
+            Option<DateTime<Utc>>, // pending_email_old_confirmed_at
+            Option<DateTime<Utc>>, // pending_email_new_confirmed_at
+            Option<String>,        // pending_email_old_token
+            Option<String>,        // pending_email_new_token
         );
         let row: Option<Row> = sqlx::query_as(
             "SELECT pubkey, pending_email, pending_email_expires_at,
@@ -677,23 +677,25 @@ impl UserRepository {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|(pubkey, email, expires, old_conf, new_conf, old_tok, _new_tok)| {
-            let side = if old_tok.as_deref() == Some(token) {
-                PendingEmailSide::Old
-            } else {
-                PendingEmailSide::New
-            };
-            (
-                PendingEmailChange {
-                    pubkey,
-                    pending_email: email,
-                    pending_email_expires_at: expires,
-                    pending_email_old_confirmed_at: old_conf,
-                    pending_email_new_confirmed_at: new_conf,
-                },
-                side,
-            )
-        }))
+        Ok(row.map(
+            |(pubkey, email, expires, old_conf, new_conf, old_tok, _new_tok)| {
+                let side = if old_tok.as_deref() == Some(token) {
+                    PendingEmailSide::Old
+                } else {
+                    PendingEmailSide::New
+                };
+                (
+                    PendingEmailChange {
+                        pubkey,
+                        pending_email: email,
+                        pending_email_expires_at: expires,
+                        pending_email_old_confirmed_at: old_conf,
+                        pending_email_new_confirmed_at: new_conf,
+                    },
+                    side,
+                )
+            },
+        ))
     }
 
     /// Record confirmation from one side of a pending email change.

@@ -123,10 +123,14 @@ fn build_app(pool: PgPool) -> Router {
     Router::new()
         .route(
             "/user/change-email",
-            post(move |headers: HeaderMap, Json(req): Json<ChangeEmailRequest>| {
-                let pool = p1.clone();
-                async move { change_email(create_test_tenant(), State(pool), headers, Json(req)).await }
-            }),
+            post(
+                move |headers: HeaderMap, Json(req): Json<ChangeEmailRequest>| {
+                    let pool = p1.clone();
+                    async move {
+                        change_email(create_test_tenant(), State(pool), headers, Json(req)).await
+                    }
+                },
+            ),
         )
         .route(
             "/auth/confirm-email-change",
@@ -134,7 +138,8 @@ fn build_app(pool: PgPool) -> Router {
                 move |headers: HeaderMap, Json(req): Json<ConfirmEmailChangeRequest>| {
                     let pool = p2.clone();
                     async move {
-                        confirm_email_change(create_test_tenant(), State(pool), headers, Json(req)).await
+                        confirm_email_change(create_test_tenant(), State(pool), headers, Json(req))
+                            .await
                     }
                 },
             ),
@@ -145,7 +150,8 @@ fn build_app(pool: PgPool) -> Router {
                 move |headers: HeaderMap, Json(req): Json<ConfirmEmailChangeRequest>| {
                     let pool = p3.clone();
                     async move {
-                        cancel_email_change(create_test_tenant(), State(pool), headers, Json(req)).await
+                        cancel_email_change(create_test_tenant(), State(pool), headers, Json(req))
+                            .await
                     }
                 },
             ),
@@ -153,7 +159,12 @@ fn build_app(pool: PgPool) -> Router {
         .layer(middleware::from_fn(request_id_middleware))
 }
 
-async fn post_json(app: &Router, uri: &str, auth: Option<&str>, body: serde_json::Value) -> axum::http::Response<Body> {
+async fn post_json(
+    app: &Router,
+    uri: &str,
+    auth: Option<&str>,
+    body: serde_json::Value,
+) -> axum::http::Response<Body> {
     let mut builder = Request::builder()
         .method("POST")
         .uri(uri)
@@ -171,7 +182,13 @@ async fn post_json(app: &Router, uri: &str, auth: Option<&str>, body: serde_json
 async fn pending_state(
     pool: &PgPool,
     pubkey: &str,
-) -> (Option<String>, Option<String>, Option<String>, Option<chrono::DateTime<Utc>>, Option<chrono::DateTime<Utc>>) {
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<chrono::DateTime<Utc>>,
+    Option<chrono::DateTime<Utc>>,
+) {
     sqlx::query_as(
         "SELECT pending_email, pending_email_old_token, pending_email_new_token,
                 pending_email_old_confirmed_at, pending_email_new_confirmed_at
@@ -222,12 +239,24 @@ async fn test_happy_path_dual_confirm_finalizes() {
     assert_eq!(current_email(&pool, &pubkey).await, old_email);
 
     // Confirm new address only — must not finalize.
-    let resp = post_json(&app, "/auth/confirm-email-change", None, serde_json::json!({ "token": new_tok })).await;
+    let resp = post_json(
+        &app,
+        "/auth/confirm-email-change",
+        None,
+        serde_json::json!({ "token": new_tok }),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(current_email(&pool, &pubkey).await, old_email);
 
     // Confirm old address — now both confirmed, finalize.
-    let resp = post_json(&app, "/auth/confirm-email-change", None, serde_json::json!({ "token": old_tok })).await;
+    let resp = post_json(
+        &app,
+        "/auth/confirm-email-change",
+        None,
+        serde_json::json!({ "token": old_tok }),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(current_email(&pool, &pubkey).await, new_email);
 
@@ -252,19 +281,34 @@ async fn test_finalizes_regardless_of_confirmation_order() {
 
     let app = build_app(pool.clone());
     let auth = mint_session_token(&keys).await;
-    post_json(&app, "/user/change-email", Some(&auth),
-        serde_json::json!({ "new_email": new_email, "password": "pw-order-test" })).await;
+    post_json(
+        &app,
+        "/user/change-email",
+        Some(&auth),
+        serde_json::json!({ "new_email": new_email, "password": "pw-order-test" }),
+    )
+    .await;
 
     let (_, old_tok, new_tok, _, _) = pending_state(&pool, &pubkey).await;
 
     // Confirm OLD first.
-    post_json(&app, "/auth/confirm-email-change", None,
-        serde_json::json!({ "token": old_tok.unwrap() })).await;
+    post_json(
+        &app,
+        "/auth/confirm-email-change",
+        None,
+        serde_json::json!({ "token": old_tok.unwrap() }),
+    )
+    .await;
     assert_eq!(current_email(&pool, &pubkey).await, old_email);
 
     // Then NEW — finalizes.
-    post_json(&app, "/auth/confirm-email-change", None,
-        serde_json::json!({ "token": new_tok.unwrap() })).await;
+    post_json(
+        &app,
+        "/auth/confirm-email-change",
+        None,
+        serde_json::json!({ "token": new_tok.unwrap() }),
+    )
+    .await;
     assert_eq!(current_email(&pool, &pubkey).await, new_email);
 
     cleanup_by_email(&pool, &old_email).await;
@@ -282,12 +326,22 @@ async fn test_partial_confirmation_does_not_finalize() {
 
     let app = build_app(pool.clone());
     let auth = mint_session_token(&keys).await;
-    post_json(&app, "/user/change-email", Some(&auth),
-        serde_json::json!({ "new_email": new_email, "password": "pw-pw-pw-pw" })).await;
+    post_json(
+        &app,
+        "/user/change-email",
+        Some(&auth),
+        serde_json::json!({ "new_email": new_email, "password": "pw-pw-pw-pw" }),
+    )
+    .await;
 
     let (_, old_tok, _, _, _) = pending_state(&pool, &pubkey).await;
-    post_json(&app, "/auth/confirm-email-change", None,
-        serde_json::json!({ "token": old_tok.unwrap() })).await;
+    post_json(
+        &app,
+        "/auth/confirm-email-change",
+        None,
+        serde_json::json!({ "token": old_tok.unwrap() }),
+    )
+    .await;
 
     assert_eq!(current_email(&pool, &pubkey).await, old_email);
     let (_, _, _, old_conf, new_conf) = pending_state(&pool, &pubkey).await;
@@ -309,8 +363,13 @@ async fn test_wrong_password_rejected_no_pending() {
 
     let app = build_app(pool.clone());
     let auth = mint_session_token(&keys).await;
-    let resp = post_json(&app, "/user/change-email", Some(&auth),
-        serde_json::json!({ "new_email": new_email, "password": "WRONG-password" })).await;
+    let resp = post_json(
+        &app,
+        "/user/change-email",
+        Some(&auth),
+        serde_json::json!({ "new_email": new_email, "password": "WRONG-password" }),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     let (pending, _, _, _, _) = pending_state(&pool, &pubkey).await;
@@ -351,8 +410,13 @@ async fn test_duplicate_email_anti_enumeration() {
     let app = build_app(pool.clone());
     let auth = mint_session_token(&keys).await;
     // Returns success even though the target is taken...
-    let resp = post_json(&app, "/user/change-email", Some(&auth),
-        serde_json::json!({ "new_email": taken_email, "password": "pw-initiator-1" })).await;
+    let resp = post_json(
+        &app,
+        "/user/change-email",
+        Some(&auth),
+        serde_json::json!({ "new_email": taken_email, "password": "pw-initiator-1" }),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
 
     // ...but no pending change is written.
@@ -374,8 +438,13 @@ async fn test_expired_token_rejected() {
 
     let app = build_app(pool.clone());
     let auth = mint_session_token(&keys).await;
-    post_json(&app, "/user/change-email", Some(&auth),
-        serde_json::json!({ "new_email": new_email, "password": "pw-expire-test" })).await;
+    post_json(
+        &app,
+        "/user/change-email",
+        Some(&auth),
+        serde_json::json!({ "new_email": new_email, "password": "pw-expire-test" }),
+    )
+    .await;
 
     let (_, old_tok, _, _, _) = pending_state(&pool, &pubkey).await;
     // Force expiry.
@@ -386,8 +455,13 @@ async fn test_expired_token_rejected() {
         .await
         .unwrap();
 
-    let resp = post_json(&app, "/auth/confirm-email-change", None,
-        serde_json::json!({ "token": old_tok.unwrap() })).await;
+    let resp = post_json(
+        &app,
+        "/auth/confirm-email-change",
+        None,
+        serde_json::json!({ "token": old_tok.unwrap() }),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(current_email(&pool, &pubkey).await, old_email);
 
@@ -406,12 +480,22 @@ async fn test_cancel_clears_pending() {
 
     let app = build_app(pool.clone());
     let auth = mint_session_token(&keys).await;
-    post_json(&app, "/user/change-email", Some(&auth),
-        serde_json::json!({ "new_email": new_email, "password": "pw-cancel-test" })).await;
+    post_json(
+        &app,
+        "/user/change-email",
+        Some(&auth),
+        serde_json::json!({ "new_email": new_email, "password": "pw-cancel-test" }),
+    )
+    .await;
 
     let (_, old_tok, _, _, _) = pending_state(&pool, &pubkey).await;
-    let resp = post_json(&app, "/auth/cancel-email-change", None,
-        serde_json::json!({ "token": old_tok.unwrap() })).await;
+    let resp = post_json(
+        &app,
+        "/auth/cancel-email-change",
+        None,
+        serde_json::json!({ "token": old_tok.unwrap() }),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
 
     let (pending, _, _, _, _) = pending_state(&pool, &pubkey).await;
@@ -426,8 +510,13 @@ async fn test_cancel_clears_pending() {
 async fn test_invalid_confirm_token_rejected() {
     let pool = setup_pool().await;
     let app = build_app(pool.clone());
-    let resp = post_json(&app, "/auth/confirm-email-change", None,
-        serde_json::json!({ "token": "this-token-does-not-exist" })).await;
+    let resp = post_json(
+        &app,
+        "/auth/confirm-email-change",
+        None,
+        serde_json::json!({ "token": "this-token-does-not-exist" }),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -444,14 +533,24 @@ async fn test_new_change_cancels_prior() {
     let app = build_app(pool.clone());
     let auth = mint_session_token(&keys).await;
 
-    post_json(&app, "/user/change-email", Some(&auth),
-        serde_json::json!({ "new_email": email_a, "password": "pw-rotate-test" })).await;
+    post_json(
+        &app,
+        "/user/change-email",
+        Some(&auth),
+        serde_json::json!({ "new_email": email_a, "password": "pw-rotate-test" }),
+    )
+    .await;
     let (_, old_tok_a, _, _, _) = pending_state(&pool, &pubkey).await;
 
     // Second initiation to a DIFFERENT address supersedes the first immediately — the resend
     // cooldown is scoped to same-target resends, so a corrected address is not rate-limited.
-    post_json(&app, "/user/change-email", Some(&auth),
-        serde_json::json!({ "new_email": email_b, "password": "pw-rotate-test" })).await;
+    post_json(
+        &app,
+        "/user/change-email",
+        Some(&auth),
+        serde_json::json!({ "new_email": email_b, "password": "pw-rotate-test" }),
+    )
+    .await;
     let (pending, old_tok_b, _, _, _) = pending_state(&pool, &pubkey).await;
 
     assert_eq!(pending.as_deref(), Some(email_b.as_str()));
@@ -475,13 +574,23 @@ async fn test_same_target_resend_within_cooldown_does_not_resend() {
     let app = build_app(pool.clone());
     let auth = mint_session_token(&keys).await;
 
-    post_json(&app, "/user/change-email", Some(&auth),
-        serde_json::json!({ "new_email": new_email, "password": "pw-cooldown-test" })).await;
+    post_json(
+        &app,
+        "/user/change-email",
+        Some(&auth),
+        serde_json::json!({ "new_email": new_email, "password": "pw-cooldown-test" }),
+    )
+    .await;
     let (_, old_tok_1, new_tok_1, _, _) = pending_state(&pool, &pubkey).await;
 
     // Same target again, immediately — cooldown applies, tokens unchanged.
-    let resp = post_json(&app, "/user/change-email", Some(&auth),
-        serde_json::json!({ "new_email": new_email, "password": "pw-cooldown-test" })).await;
+    let resp = post_json(
+        &app,
+        "/user/change-email",
+        Some(&auth),
+        serde_json::json!({ "new_email": new_email, "password": "pw-cooldown-test" }),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let (_, old_tok_2, new_tok_2, _, _) = pending_state(&pool, &pubkey).await;
     assert_eq!(old_tok_1, old_tok_2);

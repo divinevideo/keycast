@@ -61,7 +61,10 @@ pub fn api_routes(
         .route("/auth/forgot-password", post(auth::forgot_password))
         .route("/auth/reset-password", post(auth::reset_password))
         .route("/auth/resend-verification", post(auth::resend_verification))
-        .route("/auth/confirm-email-change", post(auth::confirm_email_change))
+        .route(
+            "/auth/confirm-email-change",
+            post(auth::confirm_email_change),
+        )
         .route("/auth/cancel-email-change", post(auth::cancel_email_change))
         .with_state(pool.clone());
 
