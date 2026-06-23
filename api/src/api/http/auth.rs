@@ -3601,7 +3601,7 @@ pub async fn confirm_email_change(
     // Expiry check (treat a missing expiry as expired).
     if pending
         .pending_email_expires_at
-        .map_or(true, |e| e < Utc::now())
+        .is_none_or(|e| e < Utc::now())
     {
         return Err(AuthError::TokenExpired);
     }
