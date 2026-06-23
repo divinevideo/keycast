@@ -25,6 +25,25 @@ pub struct VerificationTokenData {
     pub email_verified: bool,
 }
 
+/// Which side of a pending email change a token belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingEmailSide {
+    /// Token sent to the user's current (old) address.
+    Old,
+    /// Token sent to the proposed new address.
+    New,
+}
+
+/// Snapshot of a pending email change, looked up by either confirmation token.
+#[derive(Debug, Clone)]
+pub struct PendingEmailChange {
+    pub pubkey: String,
+    pub pending_email: Option<String>,
+    pub pending_email_expires_at: Option<DateTime<Utc>>,
+    pub pending_email_old_confirmed_at: Option<DateTime<Utc>>,
+    pub pending_email_new_confirmed_at: Option<DateTime<Utc>>,
+}
+
 /// User details returned by admin lookup.
 #[derive(Debug, FromRow)]
 pub struct AdminUserDetails {
@@ -549,6 +568,201 @@ impl UserRepository {
              WHERE pubkey = $3 AND tenant_id = $4",
         )
         .bind(password_hash)
+        .bind(Utc::now())
+        .bind(pubkey)
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // =========================================================================
+    // Pending email change (self-serve, dual confirmation)
+    // =========================================================================
+
+    /// Store a pending email change (dual-token). Overwrites any existing pending change,
+    /// which naturally cancels a prior in-flight change.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn set_pending_email_change(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+        new_email: &str,
+        old_token: &str,
+        new_token: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), RepositoryError> {
+        let now = Utc::now();
+        sqlx::query(
+            "UPDATE users
+             SET pending_email = $1,
+                 pending_email_old_token = $2,
+                 pending_email_new_token = $3,
+                 pending_email_expires_at = $4,
+                 pending_email_sent_at = $5,
+                 pending_email_old_confirmed_at = NULL,
+                 pending_email_new_confirmed_at = NULL,
+                 updated_at = $5
+             WHERE pubkey = $6 AND tenant_id = $7",
+        )
+        .bind(new_email)
+        .bind(old_token)
+        .bind(new_token)
+        .bind(expires_at)
+        .bind(now)
+        .bind(pubkey)
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Timestamp of the most recent pending-email-change send (for the resend cooldown).
+    pub async fn pending_email_last_sent(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<Option<DateTime<Utc>>, RepositoryError> {
+        let row: Option<(Option<DateTime<Utc>>,)> = sqlx::query_as(
+            "SELECT pending_email_sent_at FROM users WHERE pubkey = $1 AND tenant_id = $2",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|r| r.0))
+    }
+
+    /// Find a pending change by either the old- or new-address token, and report which side
+    /// the token belongs to.
+    pub async fn find_by_pending_email_token(
+        &self,
+        token: &str,
+        tenant_id: i64,
+    ) -> Result<Option<(PendingEmailChange, PendingEmailSide)>, RepositoryError> {
+        // Select both token columns so we can decide the side without trusting the caller.
+        type Row = (
+            String,                  // pubkey
+            Option<String>,          // pending_email
+            Option<DateTime<Utc>>,   // pending_email_expires_at
+            Option<DateTime<Utc>>,   // pending_email_old_confirmed_at
+            Option<DateTime<Utc>>,   // pending_email_new_confirmed_at
+            Option<String>,          // pending_email_old_token
+            Option<String>,          // pending_email_new_token
+        );
+        let row: Option<Row> = sqlx::query_as(
+            "SELECT pubkey, pending_email, pending_email_expires_at,
+                    pending_email_old_confirmed_at, pending_email_new_confirmed_at,
+                    pending_email_old_token, pending_email_new_token
+             FROM users
+             WHERE (pending_email_old_token = $1 OR pending_email_new_token = $1)
+               AND tenant_id = $2",
+        )
+        .bind(token)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|(pubkey, email, expires, old_conf, new_conf, old_tok, _new_tok)| {
+            let side = if old_tok.as_deref() == Some(token) {
+                PendingEmailSide::Old
+            } else {
+                PendingEmailSide::New
+            };
+            (
+                PendingEmailChange {
+                    pubkey,
+                    pending_email: email,
+                    pending_email_expires_at: expires,
+                    pending_email_old_confirmed_at: old_conf,
+                    pending_email_new_confirmed_at: new_conf,
+                },
+                side,
+            )
+        }))
+    }
+
+    /// Record confirmation from one side of a pending email change.
+    pub async fn mark_pending_email_confirmed(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+        side: PendingEmailSide,
+    ) -> Result<(), RepositoryError> {
+        // Column name is a fixed internal mapping, never user input.
+        let col = match side {
+            PendingEmailSide::Old => "pending_email_old_confirmed_at",
+            PendingEmailSide::New => "pending_email_new_confirmed_at",
+        };
+        let sql = format!(
+            "UPDATE users SET {col} = $1, updated_at = $1 WHERE pubkey = $2 AND tenant_id = $3"
+        );
+        sqlx::query(&sql)
+            .bind(Utc::now())
+            .bind(pubkey)
+            .bind(tenant_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Apply the pending email atomically and clear pending state.
+    /// Returns `Ok(false)` if the target email was registered by someone else in the
+    /// meantime (unique violation); pending state is cleared so the user can restart.
+    pub async fn finalize_email_change(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<bool, RepositoryError> {
+        let now = Utc::now();
+        let result = sqlx::query(
+            "UPDATE users
+             SET email = pending_email,
+                 email_verified = true,
+                 pending_email = NULL,
+                 pending_email_old_token = NULL,
+                 pending_email_new_token = NULL,
+                 pending_email_expires_at = NULL,
+                 pending_email_sent_at = NULL,
+                 pending_email_old_confirmed_at = NULL,
+                 pending_email_new_confirmed_at = NULL,
+                 updated_at = $1
+             WHERE pubkey = $2 AND tenant_id = $3 AND pending_email IS NOT NULL",
+        )
+        .bind(now)
+        .bind(pubkey)
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await;
+
+        match result {
+            Ok(_) => Ok(true),
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+                self.clear_pending_email_change(pubkey, tenant_id).await?;
+                Ok(false)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Clear any pending email change (cancel path / cleanup).
+    pub async fn clear_pending_email_change(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "UPDATE users
+             SET pending_email = NULL,
+                 pending_email_old_token = NULL,
+                 pending_email_new_token = NULL,
+                 pending_email_expires_at = NULL,
+                 pending_email_sent_at = NULL,
+                 pending_email_old_confirmed_at = NULL,
+                 pending_email_new_confirmed_at = NULL,
+                 updated_at = $1
+             WHERE pubkey = $2 AND tenant_id = $3",
+        )
         .bind(Utc::now())
         .bind(pubkey)
         .bind(tenant_id)
