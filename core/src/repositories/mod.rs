@@ -39,6 +39,6 @@ pub use registered_client::{
 pub use stored_key::StoredKeyRepository;
 pub use team::TeamRepository;
 pub use user::{
-    AdminUserDetails, DeleteAccountResult, PendingEmailChange, PendingEmailSide, UserRepository,
-    VerificationTokenData,
+    AdminUserDetails, DeleteAccountResult, FinalizeEmailOutcome, PendingEmailChange,
+    PendingEmailSide, UserRepository, VerificationTokenData,
 };

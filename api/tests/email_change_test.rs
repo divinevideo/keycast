@@ -240,6 +240,38 @@ async fn test_happy_path_dual_confirm_finalizes() {
 }
 
 #[tokio::test]
+async fn test_finalizes_regardless_of_confirmation_order() {
+    // Old-then-new ordering (happy path covers new-then-old). The atomic finalize must apply
+    // the swap once both are confirmed, whichever order they arrive.
+    let pool = setup_pool().await;
+    let keys = Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    let old_email = format!("old-{}@example.com", Uuid::new_v4());
+    let new_email = format!("new-{}@example.com", Uuid::new_v4());
+    create_user(&pool, &pubkey, &old_email, "pw-order-test").await;
+
+    let app = build_app(pool.clone());
+    let auth = mint_session_token(&keys).await;
+    post_json(&app, "/user/change-email", Some(&auth),
+        serde_json::json!({ "new_email": new_email, "password": "pw-order-test" })).await;
+
+    let (_, old_tok, new_tok, _, _) = pending_state(&pool, &pubkey).await;
+
+    // Confirm OLD first.
+    post_json(&app, "/auth/confirm-email-change", None,
+        serde_json::json!({ "token": old_tok.unwrap() })).await;
+    assert_eq!(current_email(&pool, &pubkey).await, old_email);
+
+    // Then NEW — finalizes.
+    post_json(&app, "/auth/confirm-email-change", None,
+        serde_json::json!({ "token": new_tok.unwrap() })).await;
+    assert_eq!(current_email(&pool, &pubkey).await, new_email);
+
+    cleanup_by_email(&pool, &old_email).await;
+    cleanup_by_email(&pool, &new_email).await;
+}
+
+#[tokio::test]
 async fn test_partial_confirmation_does_not_finalize() {
     let pool = setup_pool().await;
     let keys = Keys::generate();

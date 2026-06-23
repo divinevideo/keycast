@@ -34,6 +34,17 @@ pub enum PendingEmailSide {
     New,
 }
 
+/// Result of attempting to finalize a pending email change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalizeEmailOutcome {
+    /// Both sides confirmed; the email was swapped and pending state cleared.
+    Finalized,
+    /// Not both sides have confirmed yet (or there is no pending change).
+    NotReady,
+    /// The target email was registered by someone else; pending state was cleared.
+    EmailTaken,
+}
+
 /// Snapshot of a pending email change, looked up by either confirmation token.
 #[derive(Debug, Clone)]
 pub struct PendingEmailChange {
@@ -706,14 +717,20 @@ impl UserRepository {
         Ok(())
     }
 
-    /// Apply the pending email atomically and clear pending state.
-    /// Returns `Ok(false)` if the target email was registered by someone else in the
-    /// meantime (unique violation); pending state is cleared so the user can restart.
-    pub async fn finalize_email_change(
+    /// Atomically finalize the pending email change **only if both addresses have confirmed**,
+    /// then clear pending state. Evaluating both confirmations and applying the swap in a single
+    /// UPDATE avoids a TOCTOU race when the two confirmation links are clicked concurrently.
+    ///
+    /// Returns:
+    /// - `Finalized` if the swap was applied.
+    /// - `NotReady` if both sides have not yet confirmed (or there is no pending change).
+    /// - `EmailTaken` if the target email was registered by someone else in the meantime
+    ///   (unique violation); pending state is cleared so the user can restart.
+    pub async fn finalize_email_change_if_ready(
         &self,
         pubkey: &str,
         tenant_id: i64,
-    ) -> Result<bool, RepositoryError> {
+    ) -> Result<FinalizeEmailOutcome, RepositoryError> {
         let now = Utc::now();
         let result = sqlx::query(
             "UPDATE users
@@ -727,7 +744,10 @@ impl UserRepository {
                  pending_email_old_confirmed_at = NULL,
                  pending_email_new_confirmed_at = NULL,
                  updated_at = $1
-             WHERE pubkey = $2 AND tenant_id = $3 AND pending_email IS NOT NULL",
+             WHERE pubkey = $2 AND tenant_id = $3
+               AND pending_email IS NOT NULL
+               AND pending_email_old_confirmed_at IS NOT NULL
+               AND pending_email_new_confirmed_at IS NOT NULL",
         )
         .bind(now)
         .bind(pubkey)
@@ -736,10 +756,11 @@ impl UserRepository {
         .await;
 
         match result {
-            Ok(_) => Ok(true),
+            Ok(r) if r.rows_affected() > 0 => Ok(FinalizeEmailOutcome::Finalized),
+            Ok(_) => Ok(FinalizeEmailOutcome::NotReady),
             Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
                 self.clear_pending_email_change(pubkey, tenant_id).await?;
-                Ok(false)
+                Ok(FinalizeEmailOutcome::EmailTaken)
             }
             Err(e) => Err(e.into()),
         }

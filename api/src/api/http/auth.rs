@@ -3588,7 +3588,7 @@ pub async fn confirm_email_change(
     headers: HeaderMap,
     Json(req): Json<ConfirmEmailChangeRequest>,
 ) -> Result<Json<ChangeEmailResponse>, AuthError> {
-    use keycast_core::repositories::PendingEmailSide;
+    use keycast_core::repositories::FinalizeEmailOutcome;
 
     let tenant_id = tenant.0.id;
     let user_repo = UserRepository::new(pool.clone());
@@ -3610,45 +3610,40 @@ pub async fn confirm_email_change(
         .mark_pending_email_confirmed(&pending.pubkey, tenant_id, side)
         .await?;
 
-    // Are both sides now confirmed? (snapshot was read before marking this side)
-    let old_done = matches!(side, PendingEmailSide::Old)
-        || pending.pending_email_old_confirmed_at.is_some();
-    let new_done = matches!(side, PendingEmailSide::New)
-        || pending.pending_email_new_confirmed_at.is_some();
-
-    if old_done && new_done {
-        let finalized = user_repo
-            .finalize_email_change(&pending.pubkey, tenant_id)
-            .await?;
-        if !finalized {
-            // Target email was registered by someone else between initiate and confirm.
-            return Err(AuthError::Conflict(
-                "That email address is no longer available.".to_string(),
-            ));
+    // Finalize atomically iff both sides have now confirmed. Doing the both-confirmed check and
+    // the swap in one UPDATE avoids a race when both links are clicked concurrently (each request
+    // marks its own side, and whichever finalize runs after both marks commit applies the swap).
+    match user_repo
+        .finalize_email_change_if_ready(&pending.pubkey, tenant_id)
+        .await?
+    {
+        FinalizeEmailOutcome::Finalized => {
+            record_email_change_event(
+                &pool,
+                &headers,
+                tenant_id,
+                "/api/auth/confirm-email-change",
+                "email_change",
+                "success",
+                Some("finalized"),
+                200,
+                pending.pending_email.as_deref(),
+                Some(&pending.pubkey),
+            )
+            .await;
+            Ok(Json(ChangeEmailResponse {
+                success: true,
+                message: "Your email address has been updated.".to_string(),
+            }))
         }
-        record_email_change_event(
-            &pool,
-            &headers,
-            tenant_id,
-            "/api/auth/confirm-email-change",
-            "email_change",
-            "success",
-            Some("finalized"),
-            200,
-            pending.pending_email.as_deref(),
-            Some(&pending.pubkey),
-        )
-        .await;
-        return Ok(Json(ChangeEmailResponse {
+        FinalizeEmailOutcome::EmailTaken => Err(AuthError::Conflict(
+            "That email address is no longer available.".to_string(),
+        )),
+        FinalizeEmailOutcome::NotReady => Ok(Json(ChangeEmailResponse {
             success: true,
-            message: "Your email address has been updated.".to_string(),
-        }));
+            message: "Confirmed. Waiting for the other address to confirm.".to_string(),
+        })),
     }
-
-    Ok(Json(ChangeEmailResponse {
-        success: true,
-        message: "Confirmed. Waiting for the other address to confirm.".to_string(),
-    }))
 }
 
 /// Cancel a pending email change. Token-bound (old- or new-address token); returns a generic
