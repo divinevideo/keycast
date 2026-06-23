@@ -9,9 +9,11 @@ use moka::future::Cache;
 use nostr_sdk::nips::nip04;
 use nostr_sdk::nips::nip59::{self, UnwrappedGift};
 use nostr_sdk::{Event, Keys, Kind, PublicKey, UnsignedEvent};
+use once_cell::sync::Lazy;
 use secrecy::SecretString;
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 
 #[derive(Debug, Error)]
 pub enum HandlerError {
@@ -63,6 +65,23 @@ impl UnwrapError {
         }
     }
 }
+
+/// Global cap on gift-wrap unwraps running crypto at once, shared across ALL
+/// requests. Each unwrap holds one permit for the full lifetime of its
+/// `spawn_blocking` crypto closure (see [`HttpRpcHandler::nip17_unwrap`]), so this
+/// is a hard ceiling on concurrent unwrap blocking-pool work even when requests
+/// cancel mid-batch — aborting a request cannot preempt a closure that has already
+/// started, and that closure keeps its permit until it returns. Sized well under
+/// tokio's default 512-thread blocking pool (shared with all signing) so a burst
+/// of large unwrap batches cannot crowd signing off the pool, while still letting
+/// a full 100-item page drain in a couple of waves.
+const UNWRAP_CRYPTO_CONCURRENCY: usize = 64;
+
+/// Process-wide permit pool enforcing [`UNWRAP_CRYPTO_CONCURRENCY`]. Held as an
+/// owned permit moved into each unwrap's `spawn_blocking` closure so the limit
+/// tracks crypto that is actually running, not async tasks that may be cancelled.
+static UNWRAP_CRYPTO_PERMITS: Lazy<Arc<Semaphore>> =
+    Lazy::new(|| Arc::new(Semaphore::new(UNWRAP_CRYPTO_CONCURRENCY)));
 
 /// HTTP RPC handler - caches authorization state AND permissions for spam protection
 ///
@@ -355,7 +374,10 @@ impl HttpRpcHandler {
     ///    `encrypt_to_self`-restricted authorization could read others' DMs.
     ///
     /// CPU-bound work (two Schnorr verifies + two NIP-44 decrypts) runs on
-    /// `spawn_blocking`, mirroring `SigningSession::sign_event`.
+    /// `spawn_blocking`, mirroring `SigningSession::sign_event`, under a permit
+    /// from the global [`UNWRAP_CRYPTO_PERMITS`] semaphore that bounds total
+    /// concurrent unwrap crypto so a burst of large batches cannot crowd signing
+    /// off the shared blocking pool.
     pub async fn nip17_unwrap(&self, gift_wrap: Event) -> Result<UnwrappedGift, UnwrapError> {
         if !self.is_valid() {
             return Err(UnwrapError::AuthorizationInvalid);
@@ -367,8 +389,28 @@ impl HttpRpcHandler {
         }
 
         let keys = self.signing.keys().clone();
+
+        // Bound total in-flight unwrap crypto across ALL requests with one shared
+        // semaphore. Acquire an OWNED permit and move it INTO the spawn_blocking
+        // closure so it is released only when the blocking crypto returns — not when
+        // the awaiting async task is dropped. This keeps the cap a TRUE bound under
+        // disconnect/cancel churn: aborting the per-request JoinSet drops the async
+        // task awaiting this handle, but cannot preempt an already-running
+        // spawn_blocking closure, which holds its permit (and its blocking-pool slot)
+        // until it finishes.
+        let permit = Arc::clone(&UNWRAP_CRYPTO_PERMITS)
+            .acquire_owned()
+            .await
+            // Defensive: acquire_owned only errors on a closed semaphore, and this
+            // process-wide static is never closed, so this branch is unreachable.
+            .map_err(|_| UnwrapError::Internal)?;
+
         let unwrapped =
             tokio::task::spawn_blocking(move || -> Result<UnwrappedGift, UnwrapError> {
+                // Hold the global crypto permit for the lifetime of this blocking
+                // closure; it releases on return, i.e. when the crypto truly completes.
+                let _permit = permit;
+
                 // Defense-in-depth: verify the outer wrap's own id+signature (parity
                 // with the client's getRumorEvent). from_gift_wrap does not do this.
                 gift_wrap

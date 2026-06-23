@@ -30,10 +30,6 @@ use super::routes::AuthState;
 /// limit (gift wraps are ~1-2 KB each). Mirrors the `batch_lookup_users` cap.
 const MAX_UNWRAP_BATCH: usize = 100;
 
-/// Bounded fan-out width for unwrapping a batch. Caps in-flight blocking-pool
-/// tasks so one large batch can't starve the runtime.
-const UNWRAP_BATCH_CONCURRENCY: usize = 16;
-
 /// RPC request format (mirrors NIP-46)
 #[derive(Debug, Deserialize)]
 pub struct NostrRpcRequest {
@@ -774,47 +770,55 @@ fn unwrap_error_slot(code: &str) -> JsonValue {
 ///
 /// Each slot is `{"rumor": <kind14 unsigned event>, "sender": "<hex>"}` on
 /// success or `{"error": "<code>"}` on a per-item failure — one bad gift wrap
-/// never fails the batch. Items run with bounded concurrency
-/// (`UNWRAP_BATCH_CONCURRENCY`); `chunks` + ordered await preserves request
-/// order (NIP-17 history is positional).
+/// never fails the batch.
+///
+/// Every item is fanned out into a [`tokio::task::JoinSet`] so the per-item tasks
+/// are tied to THIS request's future: if the client disconnects, dropping the set
+/// aborts the still-pending tasks instead of leaving them to decrypt in the
+/// background. Abort cannot preempt a per-item `spawn_blocking` closure that has
+/// already started — that work is instead bounded, and its blocking-pool slot
+/// accounted for, by the global `UNWRAP_CRYPTO_PERMITS` semaphore held inside
+/// `HttpRpcHandler::nip17_unwrap`. That same semaphore is the single shared cap on
+/// concurrent unwrap crypto, so spawning every item at once only parks cheap async
+/// tasks on it and never floods the blocking pool. Results are reassembled by
+/// index, so the response stays positionally aligned with the request (NIP-17
+/// history is ordered) regardless of completion order.
 async fn unwrap_gift_wrap_batch(
     handler: &Arc<HttpRpcHandler>,
     items: &[JsonValue],
 ) -> Vec<JsonValue> {
-    let mut results: Vec<JsonValue> = Vec::with_capacity(items.len());
-
-    for chunk in items.chunks(UNWRAP_BATCH_CONCURRENCY) {
-        let mut handles = Vec::with_capacity(chunk.len());
-        for item in chunk {
-            let handler = handler.clone();
-            let item = item.clone();
-            handles.push(tokio::spawn(async move {
-                let event: Event = match serde_json::from_value(item) {
-                    Ok(e) => e,
-                    Err(_) => return unwrap_error_slot("invalid_event"),
-                };
-                match handler.nip17_unwrap(event).await {
-                    Ok(unwrapped) => match serde_json::to_value(&unwrapped.rumor) {
-                        Ok(rumor) => serde_json::json!({
-                            "rumor": rumor,
-                            "sender": unwrapped.sender.to_hex(),
-                        }),
-                        Err(_) => unwrap_error_slot("internal"),
-                    },
-                    Err(e) => unwrap_error_slot(e.code()),
-                }
-            }));
-        }
-        // Await in spawn order to keep the response index-aligned with the request.
-        for handle in handles {
-            results.push(
-                handle
-                    .await
-                    .unwrap_or_else(|_| unwrap_error_slot("internal")),
-            );
-        }
+    let mut set: tokio::task::JoinSet<(usize, JsonValue)> = tokio::task::JoinSet::new();
+    for (idx, item) in items.iter().enumerate() {
+        let handler = handler.clone();
+        let item = item.clone();
+        set.spawn(async move {
+            let event: Event = match serde_json::from_value(item) {
+                Ok(e) => e,
+                Err(_) => return (idx, unwrap_error_slot("invalid_event")),
+            };
+            let slot = match handler.nip17_unwrap(event).await {
+                Ok(unwrapped) => match serde_json::to_value(&unwrapped.rumor) {
+                    Ok(rumor) => serde_json::json!({
+                        "rumor": rumor,
+                        "sender": unwrapped.sender.to_hex(),
+                    }),
+                    Err(_) => unwrap_error_slot("internal"),
+                },
+                Err(e) => unwrap_error_slot(e.code()),
+            };
+            (idx, slot)
+        });
     }
 
+    // Pre-fill with internal-error slots so a task that fails to report a result
+    // (e.g. a JoinError from a panicked task) still yields a valid, index-aligned
+    // slot rather than a hole in the ordered response.
+    let mut results = vec![unwrap_error_slot("internal"); items.len()];
+    while let Some(joined) = set.join_next().await {
+        if let Ok((idx, slot)) = joined {
+            results[idx] = slot;
+        }
+    }
     results
 }
 
@@ -1067,18 +1071,20 @@ mod tests {
         serde_json::to_value(&wrap).expect("serialize gift wrap")
     }
 
-    /// `unwrap_gift_wrap_batch` chunks at `UNWRAP_BATCH_CONCURRENCY` (16). The
-    /// integration ordering test uses 4 items, so the multi-chunk path never runs.
-    /// This drives 40 items (> 2 chunks) through the function directly and asserts
-    /// every slot's content + authenticated sender stays index-aligned with the
-    /// request across chunk boundaries.
+    /// `unwrap_gift_wrap_batch` fans every item out concurrently and reassembles
+    /// results by index. The integration ordering test uses only 4 items, so this
+    /// drives a full `MAX_UNWRAP_BATCH` page through the function directly and
+    /// asserts every slot's content + authenticated sender stays index-aligned
+    /// with the request regardless of completion order.
     #[tokio::test]
-    async fn unwrap_gift_wrap_batch_preserves_order_across_chunks() {
+    async fn unwrap_gift_wrap_batch_preserves_order() {
         let handler = Arc::new(create_test_handler_with_dpop(None));
         let receiver = handler.public_key();
 
-        // 40 = 2 * UNWRAP_BATCH_CONCURRENCY + 8 -> spans three chunks (16, 16, 8).
-        const N: usize = 40;
+        // A full page (100), larger than the global unwrap crypto-permit pool, so
+        // items queue on the semaphore and complete out of order — exercising both
+        // the permit-queueing path and the index-reassembly that re-orders them.
+        const N: usize = MAX_UNWRAP_BATCH;
         let mut senders = Vec::with_capacity(N);
         let mut items = Vec::with_capacity(N);
         for i in 0..N {
