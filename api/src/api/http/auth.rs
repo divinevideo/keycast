@@ -3476,7 +3476,25 @@ pub async fn change_email(
 
     // Validate + normalize the new email (reuse the registration normalizer to prevent
     // case/dot bypass and reject anything malformed).
-    let new_email = normalize_registration_email(&req.new_email).map_err(|_| AuthError::InvalidEmail)?;
+    let new_email = match normalize_registration_email(&req.new_email) {
+        Ok(email) => email,
+        Err(_) => {
+            record_email_change_event(
+                &pool,
+                &headers,
+                tenant_id,
+                "/api/user/change-email",
+                "email_change_request",
+                "failure",
+                Some("invalid_email"),
+                400,
+                None,
+                Some(&user_pubkey),
+            )
+            .await;
+            return Err(AuthError::InvalidEmail);
+        }
+    };
 
     let user_repo = UserRepository::new(pool.clone());
 
@@ -3492,6 +3510,21 @@ pub async fn change_email(
         .map_err(|e| AuthError::Internal(format!("Task join error: {}", e)))?
         .map_err(|_| AuthError::Internal("Password verification failed".to_string()))?;
     if !valid {
+        // Record the failed attempt — this endpoint re-verifies the password, so failures feed
+        // the same abuse/brute-force monitoring as login/forgot-password.
+        record_email_change_event(
+            &pool,
+            &headers,
+            tenant_id,
+            "/api/user/change-email",
+            "email_change_request",
+            "failure",
+            Some("wrong_password"),
+            401,
+            Some(&new_email),
+            Some(&user_pubkey),
+        )
+        .await;
         return Err(AuthError::InvalidCredentials);
     }
 
@@ -3519,7 +3552,12 @@ pub async fn change_email(
         if existing_target == new_email
             && Utc::now() - last_sent < Duration::minutes(EMAIL_CHANGE_RESEND_COOLDOWN_MINUTES)
         {
-            return Ok(ok_response);
+            // Honest message: nothing fresh was sent, the earlier links are still valid.
+            return Ok(Json(ChangeEmailResponse {
+                success: true,
+                message: "We recently sent confirmation links for this change. Please check your inbox."
+                    .to_string(),
+            }));
         }
     }
 

@@ -316,7 +316,25 @@ async fn test_wrong_password_rejected_no_pending() {
     let (pending, _, _, _, _) = pending_state(&pool, &pubkey).await;
     assert_eq!(pending, None);
 
+    // The failed attempt is audited (feeds brute-force monitoring on this password-gated path).
+    let event: Option<common::AuthEventRow> = sqlx::query_as(
+        "SELECT endpoint, event_type, outcome, reason_code, request_id, http_status
+         FROM auth_events WHERE tenant_id = 1 AND email = $1
+         ORDER BY occurred_at DESC, id DESC LIMIT 1",
+    )
+    .bind(&new_email)
+    .fetch_optional(&pool)
+    .await
+    .expect("auth event query");
+    let event = event.expect("a failure event should be recorded");
+    assert_eq!(event.0, "/api/user/change-email");
+    assert_eq!(event.1, "email_change_request");
+    assert_eq!(event.2, "failure");
+    assert_eq!(event.3, Some("wrong_password".to_string()));
+    assert_eq!(event.5, Some(401));
+
     cleanup_by_email(&pool, &old_email).await;
+    cleanup_by_email(&pool, &new_email).await;
 }
 
 #[tokio::test]
