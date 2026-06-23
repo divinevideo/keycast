@@ -734,6 +734,12 @@ impl UserRepository {
     /// then clear pending state. Evaluating both confirmations and applying the swap in a single
     /// UPDATE avoids a TOCTOU race when the two confirmation links are clicked concurrently.
     ///
+    /// Safe to key on pubkey+tenant without a token because [`Self::set_pending_email_change`]
+    /// resets **both** `confirmed_at` columns atomically on every (re-)initiation. "Both sides
+    /// confirmed" can therefore only ever be true for the *current* change, so this guard cannot
+    /// finalize a superseded or partially-approved one. That invariant is load-bearing: if
+    /// re-initiation ever stopped clearing confirmations, this path would need token-gating too.
+    ///
     /// Returns:
     /// - `Finalized` if the swap was applied.
     /// - `NotReady` if both sides have not yet confirmed (or there is no pending change).

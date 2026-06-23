@@ -265,3 +265,66 @@ async fn valid_cancel_token_clears_change() {
         .execute(&pool)
         .await;
 }
+
+/// Re-initiation must reset BOTH confirmed_at columns. This is the keystone invariant that lets
+/// finalize_email_change_if_ready key on pubkey+tenant without a token: "both sides confirmed"
+/// can only ever be true for the current change. If this ever regresses, a stale confirmation
+/// could carry over and finalize a change the new mailbox never approved.
+#[tokio::test]
+async fn reinitiation_resets_prior_confirmations() {
+    let pool = setup_pool().await;
+    let repo = UserRepository::new(pool.clone());
+    let pubkey = new_pubkey();
+    create_user(
+        &pool,
+        &pubkey,
+        &format!("old-{}@example.com", Uuid::new_v4()),
+    )
+    .await;
+
+    let expires = Utc::now() + Duration::hours(1);
+    let old_tok_a = format!("old-a-{}", Uuid::new_v4());
+    repo.set_pending_email_change(
+        &pubkey,
+        TENANT_ID,
+        "a@example.com",
+        &old_tok_a,
+        "new-a",
+        expires,
+    )
+    .await
+    .unwrap();
+
+    // Confirm one side of change A.
+    let updated = repo
+        .mark_pending_email_confirmed(&pubkey, TENANT_ID, PendingEmailSide::Old, &old_tok_a)
+        .await
+        .unwrap();
+    assert!(updated);
+    let (_, old_conf, _) = pending_state(&pool, &pubkey).await;
+    assert!(old_conf.is_some(), "change A old side confirmed");
+
+    // Re-initiate to a different address: both confirmations must reset.
+    repo.set_pending_email_change(
+        &pubkey,
+        TENANT_ID,
+        "b@example.com",
+        &format!("old-b-{}", Uuid::new_v4()),
+        "new-b",
+        expires,
+    )
+    .await
+    .unwrap();
+
+    let (pending, old_conf, new_conf) = pending_state(&pool, &pubkey).await;
+    assert_eq!(pending.as_deref(), Some("b@example.com"));
+    assert!(
+        old_conf.is_none() && new_conf.is_none(),
+        "re-initiation must clear both confirmations so finalize cannot apply a stale approval"
+    );
+
+    let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
+        .bind(&pubkey)
+        .execute(&pool)
+        .await;
+}
