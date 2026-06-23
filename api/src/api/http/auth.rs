@@ -3666,9 +3666,14 @@ pub async fn confirm_email_change(
         return Err(AuthError::TokenExpired);
     }
 
-    user_repo
-        .mark_pending_email_confirmed(&pending.pubkey, tenant_id, side)
+    // Token-gated: if a concurrent re-initiation rotated the tokens after we resolved the side,
+    // this marks no row and the token is no longer valid for the current pending change.
+    let confirmed = user_repo
+        .mark_pending_email_confirmed(&pending.pubkey, tenant_id, side, &req.token)
         .await?;
+    if !confirmed {
+        return Err(AuthError::InvalidToken);
+    }
 
     // Finalize atomically iff both sides have now confirmed. Doing the both-confirmed check and
     // the swap in one UPDATE avoids a race when both links are clicked concurrently (each request
@@ -3721,22 +3726,26 @@ pub async fn cancel_email_change(
         .find_by_pending_email_token(&req.token, tenant_id)
         .await?
     {
-        user_repo
-            .clear_pending_email_change(&pending.pubkey, tenant_id)
+        // Token-gated clear: a cancel link whose change was superseded by a concurrent
+        // re-initiation must not wipe the fresh change. Only audit an actual cancellation.
+        let cleared = user_repo
+            .clear_pending_email_change_by_token(&pending.pubkey, tenant_id, &req.token)
             .await?;
-        record_email_change_event(
-            &pool,
-            &headers,
-            tenant_id,
-            "/api/auth/cancel-email-change",
-            "email_change",
-            "success",
-            Some("cancelled"),
-            200,
-            pending.pending_email.as_deref(),
-            Some(&pending.pubkey),
-        )
-        .await;
+        if cleared {
+            record_email_change_event(
+                &pool,
+                &headers,
+                tenant_id,
+                "/api/auth/cancel-email-change",
+                "email_change",
+                "success",
+                Some("cancelled"),
+                200,
+                pending.pending_email.as_deref(),
+                Some(&pending.pubkey),
+            )
+            .await;
+        }
     }
 
     Ok(Json(ChangeEmailResponse {

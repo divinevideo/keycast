@@ -699,27 +699,35 @@ impl UserRepository {
     }
 
     /// Record confirmation from one side of a pending email change.
+    ///
+    /// Token-gated: the UPDATE only applies when the per-side token still matches the row, so a
+    /// token whose side was resolved before a concurrent re-initiation rotated the tokens cannot
+    /// mark a *different* pending change confirmed. Returns `true` iff a row was updated; `false`
+    /// means the change was superseded and the caller should treat the token as no longer valid.
     pub async fn mark_pending_email_confirmed(
         &self,
         pubkey: &str,
         tenant_id: i64,
         side: PendingEmailSide,
-    ) -> Result<(), RepositoryError> {
-        // Column name is a fixed internal mapping, never user input.
-        let col = match side {
-            PendingEmailSide::Old => "pending_email_old_confirmed_at",
-            PendingEmailSide::New => "pending_email_new_confirmed_at",
+        token: &str,
+    ) -> Result<bool, RepositoryError> {
+        // Column names are a fixed internal mapping, never user input.
+        let (confirmed_col, token_col) = match side {
+            PendingEmailSide::Old => ("pending_email_old_confirmed_at", "pending_email_old_token"),
+            PendingEmailSide::New => ("pending_email_new_confirmed_at", "pending_email_new_token"),
         };
         let sql = format!(
-            "UPDATE users SET {col} = $1, updated_at = $1 WHERE pubkey = $2 AND tenant_id = $3"
+            "UPDATE users SET {confirmed_col} = $1, updated_at = $1
+             WHERE pubkey = $2 AND tenant_id = $3 AND {token_col} = $4"
         );
-        sqlx::query(&sql)
+        let result = sqlx::query(&sql)
             .bind(Utc::now())
             .bind(pubkey)
             .bind(tenant_id)
+            .bind(token)
             .execute(&self.pool)
             .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     /// Atomically finalize the pending email change **only if both addresses have confirmed**,
@@ -771,7 +779,44 @@ impl UserRepository {
         }
     }
 
-    /// Clear any pending email change (cancel path / cleanup).
+    /// Clear a pending email change only if `token` still matches one of its two token columns.
+    ///
+    /// Used by the cancel path: gating on the token prevents a cancel link whose change was
+    /// superseded by a concurrent re-initiation from wiping the fresh, legitimate change. Returns
+    /// `true` iff a row was cleared. The unconditional [`Self::clear_pending_email_change`] remains
+    /// for the finalize cleanup path, which must clear regardless of token.
+    pub async fn clear_pending_email_change_by_token(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+        token: &str,
+    ) -> Result<bool, RepositoryError> {
+        let result = sqlx::query(
+            "UPDATE users
+             SET pending_email = NULL,
+                 pending_email_old_token = NULL,
+                 pending_email_new_token = NULL,
+                 pending_email_expires_at = NULL,
+                 pending_email_sent_at = NULL,
+                 pending_email_old_confirmed_at = NULL,
+                 pending_email_new_confirmed_at = NULL,
+                 updated_at = $1
+             WHERE pubkey = $2 AND tenant_id = $3
+               AND (pending_email_old_token = $4 OR pending_email_new_token = $4)",
+        )
+        .bind(Utc::now())
+        .bind(pubkey)
+        .bind(tenant_id)
+        .bind(token)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Clear any pending email change (cleanup path: finalize's EmailTaken branch).
+    ///
+    /// Unconditional by design — the cancel path uses the token-gated
+    /// [`Self::clear_pending_email_change_by_token`] instead.
     pub async fn clear_pending_email_change(
         &self,
         pubkey: &str,
