@@ -10,15 +10,8 @@
 	let status = $state<'idle' | 'loading' | 'done' | 'error'>('idle');
 	let message = $state('');
 
-	// Auto-submit once on mount when a token is present.
-	let submitted = $state(false);
-	$effect(() => {
-		if (token && !submitted) {
-			submitted = true;
-			confirm();
-		}
-	});
-
+	// Require an explicit human click before submitting. Firing on mount lets a mail scanner or
+	// link-preview service that runs page JS consume the confirmation with no human action.
 	async function confirm() {
 		if (!token) return;
 		try {
@@ -54,7 +47,10 @@
 				<p>Invalid or missing confirmation token.</p>
 				<p>Please use the link from your email.</p>
 			</div>
-		{:else if status === 'loading' || status === 'idle'}
+		{:else if status === 'idle'}
+			<p class="subtitle">Click below to confirm your email address change.</p>
+			<button class="btn-primary" onclick={confirm}>Confirm Email Change</button>
+		{:else if status === 'loading'}
 			<p class="subtitle">Confirming...</p>
 		{:else if status === 'done'}
 			<p class="subtitle">{message}</p>
@@ -133,6 +129,25 @@
 		margin: 0 0 1.5rem 0;
 		text-align: center;
 		font-size: 0.95rem;
+	}
+
+	.btn-primary {
+		display: block;
+		width: 100%;
+		padding: 0.75rem 1.5rem;
+		background: var(--color-divine-green);
+		color: #fff;
+		border: none;
+		border-radius: 9999px;
+		font-size: 1rem;
+		font-weight: 600;
+		cursor: pointer;
+		transition: all 0.2s;
+	}
+
+	.btn-primary:hover {
+		background: var(--color-divine-green-dark);
+		box-shadow: 0 2px 8px rgba(39, 197, 139, 0.16);
 	}
 
 	.auth-link {
