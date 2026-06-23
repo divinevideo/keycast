@@ -8,6 +8,18 @@ use std::sync::{Arc, Mutex};
 
 use crate::brand::BRAND_NAME;
 
+/// Minimal HTML-escaping for interpolating untrusted text into email HTML bodies.
+/// Defense-in-depth: callers already pass normalized emails (no `<`/`>`), but the
+/// senders must not assume that.
+fn html_escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
 /// Captured email for testing/inspection
 #[derive(Debug, Clone)]
 pub struct CapturedEmail {
@@ -33,6 +45,25 @@ pub trait EmailSender: Send + Sync {
 
     /// Send a claim link email for a preloaded Vine account.
     async fn send_claim_email(&self, to_email: &str, claim_url: &str) -> Result<(), String>;
+
+    /// Send a confirmation link to the proposed NEW address during an email change.
+    /// The implementation builds the URL from its configured base URL (mirrors
+    /// `send_password_reset_email`), so handlers pass only the token.
+    async fn send_email_change_confirmation(
+        &self,
+        to_new_email: &str,
+        confirm_token: &str,
+    ) -> Result<(), String>;
+
+    /// Send a security notification to the user's CURRENT (old) address during an email change.
+    /// Includes both a confirm link (approve the change) and a cancel link (reject it).
+    async fn send_email_change_notification(
+        &self,
+        to_old_email: &str,
+        new_email: &str,
+        confirm_token: &str,
+        cancel_token: &str,
+    ) -> Result<(), String>;
 
     /// Get captured emails (only available in dev/test mode)
     fn get_captured_emails(&self) -> Vec<CapturedEmail> {
@@ -194,6 +225,56 @@ impl EmailSender for DevEmailSender {
                 subject: format!("Your Vine account on {} is ready to claim", BRAND_NAME),
                 verification_url: Some(claim_url.to_string()),
                 reset_url: None,
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn send_email_change_confirmation(
+        &self,
+        to_new_email: &str,
+        confirm_token: &str,
+    ) -> Result<(), String> {
+        let confirm_url = format!("{}/confirm-email-change?token={}", self.base_url, confirm_token);
+        eprintln!(
+            "\n\x1b[34m[DEV EMAIL]\x1b[0m Email-change confirm (new address) for {}: \x1b[4m{}\x1b[0m\n",
+            to_new_email, confirm_url
+        );
+
+        if let Ok(mut captured) = self.captured.lock() {
+            captured.push(CapturedEmail {
+                to: to_new_email.to_string(),
+                subject: format!("Confirm your new {} email address", BRAND_NAME),
+                verification_url: Some(confirm_url),
+                reset_url: None,
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn send_email_change_notification(
+        &self,
+        to_old_email: &str,
+        new_email: &str,
+        confirm_token: &str,
+        cancel_token: &str,
+    ) -> Result<(), String> {
+        let confirm_url = format!("{}/confirm-email-change?token={}", self.base_url, confirm_token);
+        let cancel_url = format!("{}/cancel-email-change?token={}", self.base_url, cancel_token);
+        eprintln!(
+            "\n\x1b[34m[DEV EMAIL]\x1b[0m Email-change notice (old address) for {} -> {}: confirm \x1b[4m{}\x1b[0m cancel \x1b[4m{}\x1b[0m\n",
+            to_old_email, new_email, confirm_url, cancel_url
+        );
+
+        if let Ok(mut captured) = self.captured.lock() {
+            captured.push(CapturedEmail {
+                to: to_old_email.to_string(),
+                subject: format!("Confirm the email change on your {} account", BRAND_NAME),
+                // Store the confirm link for test inspection; cancel link goes in reset_url.
+                verification_url: Some(confirm_url),
+                reset_url: Some(cancel_url),
             });
         }
 
@@ -489,6 +570,102 @@ impl EmailSender for SendGridEmailSender {
         self.send_email(to_email, &subject, &html_content, &text_content)
             .await
     }
+
+    async fn send_email_change_confirmation(
+        &self,
+        to_new_email: &str,
+        confirm_token: &str,
+    ) -> Result<(), String> {
+        let confirm_url = format!("{}/confirm-email-change?token={}", self.base_url, confirm_token);
+        let subject = format!("Confirm your new {} email address", BRAND_NAME);
+        let html_content = format!(
+            r#"
+            <html>
+            <body style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+                <h1 style="color: #00B488;">Confirm your new email</h1>
+                <p>You requested to use this address for your {brand} account. Click the button below to confirm it. The change only takes effect after both your old and new addresses confirm.</p>
+                <div style="margin: 30px 0;">
+                    <a href="{url}"
+                       style="background: #00B488; color: #fff; padding: 12px 24px; text-decoration: none; border-radius: 4px; display: inline-block; font-weight: bold;">
+                        Confirm New Email
+                    </a>
+                </div>
+                <p style="color: #666; font-size: 14px;">
+                    Or copy and paste this link into your browser:<br>
+                    <a href="{url}" style="color: #00B488;">{url}</a>
+                </p>
+                <p style="color: #666; font-size: 14px; margin-top: 30px;">
+                    This link will expire in 24 hours. If you didn't request this, you can safely ignore this email.
+                </p>
+            </body>
+            </html>
+            "#,
+            url = confirm_url,
+            brand = BRAND_NAME
+        );
+
+        let text_content = format!(
+            "You requested to use this address for your {brand} account. Confirm it by clicking this link:\n\n{url}\n\nThe change only takes effect after both your old and new addresses confirm. This link will expire in 24 hours. If you didn't request this, you can safely ignore this email.",
+            url = confirm_url, brand = BRAND_NAME
+        );
+
+        self.send_email(to_new_email, &subject, &html_content, &text_content)
+            .await
+    }
+
+    async fn send_email_change_notification(
+        &self,
+        to_old_email: &str,
+        new_email: &str,
+        confirm_token: &str,
+        cancel_token: &str,
+    ) -> Result<(), String> {
+        let confirm_url = format!("{}/confirm-email-change?token={}", self.base_url, confirm_token);
+        let cancel_url = format!("{}/cancel-email-change?token={}", self.base_url, cancel_token);
+        // Escape the new address for the HTML context (defense-in-depth; callers normalize it).
+        let new_email_html = html_escape(new_email);
+        let subject = format!("Confirm the email change on your {} account", BRAND_NAME);
+        let html_content = format!(
+            r#"
+            <html>
+            <body style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+                <h1 style="color: #00B488;">Email change requested</h1>
+                <p>Someone requested to change the email address on your {brand} account to <strong>{new_email}</strong>. The change only takes effect after you confirm here <em>and</em> the new address is verified.</p>
+                <div style="margin: 30px 0;">
+                    <a href="{confirm_url}"
+                       style="background: #00B488; color: #fff; padding: 12px 24px; text-decoration: none; border-radius: 4px; display: inline-block; font-weight: bold;">
+                        Confirm Change
+                    </a>
+                </div>
+                <p style="margin: 20px 0;">
+                    <strong>Didn't request this?</strong> Cancel it immediately and consider changing your password:
+                </p>
+                <div style="margin: 20px 0;">
+                    <a href="{cancel_url}"
+                       style="background: #b00020; color: #fff; padding: 10px 20px; text-decoration: none; border-radius: 4px; display: inline-block; font-weight: bold;">
+                        Cancel Change
+                    </a>
+                </div>
+                <p style="color: #666; font-size: 14px; margin-top: 30px;">
+                    These links will expire in 24 hours.
+                </p>
+            </body>
+            </html>
+            "#,
+            new_email = new_email_html,
+            confirm_url = confirm_url,
+            cancel_url = cancel_url,
+            brand = BRAND_NAME
+        );
+
+        let text_content = format!(
+            "Someone requested to change the email address on your {brand} account to {new_email}.\n\nConfirm the change:\n{confirm_url}\n\nDidn't request this? Cancel it immediately and consider changing your password:\n{cancel_url}\n\nThese links will expire in 24 hours.",
+            new_email = new_email, confirm_url = confirm_url, cancel_url = cancel_url, brand = BRAND_NAME
+        );
+
+        self.send_email(to_old_email, &subject, &html_content, &text_content)
+            .await
+    }
 }
 
 /// Create the appropriate email sender based on environment
@@ -556,6 +733,28 @@ impl EmailService {
 
     pub async fn send_claim_email(&self, to_email: &str, claim_url: &str) -> Result<(), String> {
         self.inner.send_claim_email(to_email, claim_url).await
+    }
+
+    pub async fn send_email_change_confirmation(
+        &self,
+        to_new_email: &str,
+        confirm_token: &str,
+    ) -> Result<(), String> {
+        self.inner
+            .send_email_change_confirmation(to_new_email, confirm_token)
+            .await
+    }
+
+    pub async fn send_email_change_notification(
+        &self,
+        to_old_email: &str,
+        new_email: &str,
+        confirm_token: &str,
+        cancel_token: &str,
+    ) -> Result<(), String> {
+        self.inner
+            .send_email_change_notification(to_old_email, new_email, confirm_token, cancel_token)
+            .await
     }
 }
 
