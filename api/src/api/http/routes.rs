@@ -61,6 +61,11 @@ pub fn api_routes(
         .route("/auth/forgot-password", post(auth::forgot_password))
         .route("/auth/reset-password", post(auth::reset_password))
         .route("/auth/resend-verification", post(auth::resend_verification))
+        .route(
+            "/auth/confirm-email-change",
+            post(auth::confirm_email_change),
+        )
+        .route("/auth/cancel-email-change", post(auth::cancel_email_change))
         .with_state(pool.clone());
 
     // OAuth routes (no authentication required for initial authorize request)
@@ -119,6 +124,7 @@ pub fn api_routes(
             post(auth::verify_password_for_export),
         )
         .route("/user/change-password", post(auth::change_password))
+        .route("/user/change-email", post(auth::change_email))
         .layer(auth_cors.clone())
         .with_state(pool.clone());
 

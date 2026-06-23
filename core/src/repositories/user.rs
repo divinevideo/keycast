@@ -25,6 +25,36 @@ pub struct VerificationTokenData {
     pub email_verified: bool,
 }
 
+/// Which side of a pending email change a token belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingEmailSide {
+    /// Token sent to the user's current (old) address.
+    Old,
+    /// Token sent to the proposed new address.
+    New,
+}
+
+/// Result of attempting to finalize a pending email change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalizeEmailOutcome {
+    /// Both sides confirmed; the email was swapped and pending state cleared.
+    Finalized,
+    /// Not both sides have confirmed yet (or there is no pending change).
+    NotReady,
+    /// The target email was registered by someone else; pending state was cleared.
+    EmailTaken,
+}
+
+/// Snapshot of a pending email change, looked up by either confirmation token.
+#[derive(Debug, Clone)]
+pub struct PendingEmailChange {
+    pub pubkey: String,
+    pub pending_email: Option<String>,
+    pub pending_email_expires_at: Option<DateTime<Utc>>,
+    pub pending_email_old_confirmed_at: Option<DateTime<Utc>>,
+    pub pending_email_new_confirmed_at: Option<DateTime<Utc>>,
+}
+
 /// User details returned by admin lookup.
 #[derive(Debug, FromRow)]
 pub struct AdminUserDetails {
@@ -549,6 +579,267 @@ impl UserRepository {
              WHERE pubkey = $3 AND tenant_id = $4",
         )
         .bind(password_hash)
+        .bind(Utc::now())
+        .bind(pubkey)
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // =========================================================================
+    // Pending email change (self-serve, dual confirmation)
+    // =========================================================================
+
+    /// Store a pending email change (dual-token). Overwrites any existing pending change,
+    /// which naturally cancels a prior in-flight change.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn set_pending_email_change(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+        new_email: &str,
+        old_token: &str,
+        new_token: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<(), RepositoryError> {
+        let now = Utc::now();
+        sqlx::query(
+            "UPDATE users
+             SET pending_email = $1,
+                 pending_email_old_token = $2,
+                 pending_email_new_token = $3,
+                 pending_email_expires_at = $4,
+                 pending_email_sent_at = $5,
+                 pending_email_old_confirmed_at = NULL,
+                 pending_email_new_confirmed_at = NULL,
+                 updated_at = $5
+             WHERE pubkey = $6 AND tenant_id = $7",
+        )
+        .bind(new_email)
+        .bind(old_token)
+        .bind(new_token)
+        .bind(expires_at)
+        .bind(now)
+        .bind(pubkey)
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Current pending-change target and the timestamp of its last send.
+    /// Used to scope the resend cooldown to re-initiations of the *same* target; a change to a
+    /// different address is a new request and should not be rate-limited by a prior one.
+    /// Returns `(pending_email, pending_email_sent_at)` for the user, or `None` if no user row.
+    pub async fn pending_email_send_state(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<Option<(Option<String>, Option<DateTime<Utc>>)>, RepositoryError> {
+        let row: Option<(Option<String>, Option<DateTime<Utc>>)> = sqlx::query_as(
+            "SELECT pending_email, pending_email_sent_at FROM users WHERE pubkey = $1 AND tenant_id = $2",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Find a pending change by either the old- or new-address token, and report which side
+    /// the token belongs to.
+    pub async fn find_by_pending_email_token(
+        &self,
+        token: &str,
+        tenant_id: i64,
+    ) -> Result<Option<(PendingEmailChange, PendingEmailSide)>, RepositoryError> {
+        // Select both token columns so we can decide the side without trusting the caller.
+        type Row = (
+            String,                // pubkey
+            Option<String>,        // pending_email
+            Option<DateTime<Utc>>, // pending_email_expires_at
+            Option<DateTime<Utc>>, // pending_email_old_confirmed_at
+            Option<DateTime<Utc>>, // pending_email_new_confirmed_at
+            Option<String>,        // pending_email_old_token
+            Option<String>,        // pending_email_new_token
+        );
+        let row: Option<Row> = sqlx::query_as(
+            "SELECT pubkey, pending_email, pending_email_expires_at,
+                    pending_email_old_confirmed_at, pending_email_new_confirmed_at,
+                    pending_email_old_token, pending_email_new_token
+             FROM users
+             WHERE (pending_email_old_token = $1 OR pending_email_new_token = $1)
+               AND tenant_id = $2",
+        )
+        .bind(token)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(
+            |(pubkey, email, expires, old_conf, new_conf, old_tok, _new_tok)| {
+                let side = if old_tok.as_deref() == Some(token) {
+                    PendingEmailSide::Old
+                } else {
+                    PendingEmailSide::New
+                };
+                (
+                    PendingEmailChange {
+                        pubkey,
+                        pending_email: email,
+                        pending_email_expires_at: expires,
+                        pending_email_old_confirmed_at: old_conf,
+                        pending_email_new_confirmed_at: new_conf,
+                    },
+                    side,
+                )
+            },
+        ))
+    }
+
+    /// Record confirmation from one side of a pending email change.
+    ///
+    /// Token-gated: the UPDATE only applies when the per-side token still matches the row, so a
+    /// token whose side was resolved before a concurrent re-initiation rotated the tokens cannot
+    /// mark a *different* pending change confirmed. Returns `true` iff a row was updated; `false`
+    /// means the change was superseded and the caller should treat the token as no longer valid.
+    pub async fn mark_pending_email_confirmed(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+        side: PendingEmailSide,
+        token: &str,
+    ) -> Result<bool, RepositoryError> {
+        // Column names are a fixed internal mapping, never user input.
+        let (confirmed_col, token_col) = match side {
+            PendingEmailSide::Old => ("pending_email_old_confirmed_at", "pending_email_old_token"),
+            PendingEmailSide::New => ("pending_email_new_confirmed_at", "pending_email_new_token"),
+        };
+        let sql = format!(
+            "UPDATE users SET {confirmed_col} = $1, updated_at = $1
+             WHERE pubkey = $2 AND tenant_id = $3 AND {token_col} = $4"
+        );
+        let result = sqlx::query(&sql)
+            .bind(Utc::now())
+            .bind(pubkey)
+            .bind(tenant_id)
+            .bind(token)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Atomically finalize the pending email change **only if both addresses have confirmed**,
+    /// then clear pending state. Evaluating both confirmations and applying the swap in a single
+    /// UPDATE avoids a TOCTOU race when the two confirmation links are clicked concurrently.
+    ///
+    /// Safe to key on pubkey+tenant without a token because [`Self::set_pending_email_change`]
+    /// resets **both** `confirmed_at` columns atomically on every (re-)initiation. "Both sides
+    /// confirmed" can therefore only ever be true for the *current* change, so this guard cannot
+    /// finalize a superseded or partially-approved one. That invariant is load-bearing: if
+    /// re-initiation ever stopped clearing confirmations, this path would need token-gating too.
+    ///
+    /// Returns:
+    /// - `Finalized` if the swap was applied.
+    /// - `NotReady` if both sides have not yet confirmed (or there is no pending change).
+    /// - `EmailTaken` if the target email was registered by someone else in the meantime
+    ///   (unique violation); pending state is cleared so the user can restart.
+    pub async fn finalize_email_change_if_ready(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<FinalizeEmailOutcome, RepositoryError> {
+        let now = Utc::now();
+        let result = sqlx::query(
+            "UPDATE users
+             SET email = pending_email,
+                 email_verified = true,
+                 pending_email = NULL,
+                 pending_email_old_token = NULL,
+                 pending_email_new_token = NULL,
+                 pending_email_expires_at = NULL,
+                 pending_email_sent_at = NULL,
+                 pending_email_old_confirmed_at = NULL,
+                 pending_email_new_confirmed_at = NULL,
+                 updated_at = $1
+             WHERE pubkey = $2 AND tenant_id = $3
+               AND pending_email IS NOT NULL
+               AND pending_email_old_confirmed_at IS NOT NULL
+               AND pending_email_new_confirmed_at IS NOT NULL",
+        )
+        .bind(now)
+        .bind(pubkey)
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await;
+
+        match result {
+            Ok(r) if r.rows_affected() > 0 => Ok(FinalizeEmailOutcome::Finalized),
+            Ok(_) => Ok(FinalizeEmailOutcome::NotReady),
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+                self.clear_pending_email_change(pubkey, tenant_id).await?;
+                Ok(FinalizeEmailOutcome::EmailTaken)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Clear a pending email change only if `token` still matches one of its two token columns.
+    ///
+    /// Used by the cancel path: gating on the token prevents a cancel link whose change was
+    /// superseded by a concurrent re-initiation from wiping the fresh, legitimate change. Returns
+    /// `true` iff a row was cleared. The unconditional [`Self::clear_pending_email_change`] remains
+    /// for the finalize cleanup path, which must clear regardless of token.
+    pub async fn clear_pending_email_change_by_token(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+        token: &str,
+    ) -> Result<bool, RepositoryError> {
+        let result = sqlx::query(
+            "UPDATE users
+             SET pending_email = NULL,
+                 pending_email_old_token = NULL,
+                 pending_email_new_token = NULL,
+                 pending_email_expires_at = NULL,
+                 pending_email_sent_at = NULL,
+                 pending_email_old_confirmed_at = NULL,
+                 pending_email_new_confirmed_at = NULL,
+                 updated_at = $1
+             WHERE pubkey = $2 AND tenant_id = $3
+               AND (pending_email_old_token = $4 OR pending_email_new_token = $4)",
+        )
+        .bind(Utc::now())
+        .bind(pubkey)
+        .bind(tenant_id)
+        .bind(token)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Clear any pending email change (cleanup path: finalize's EmailTaken branch).
+    ///
+    /// Unconditional by design — the cancel path uses the token-gated
+    /// [`Self::clear_pending_email_change_by_token`] instead.
+    pub async fn clear_pending_email_change(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "UPDATE users
+             SET pending_email = NULL,
+                 pending_email_old_token = NULL,
+                 pending_email_new_token = NULL,
+                 pending_email_expires_at = NULL,
+                 pending_email_sent_at = NULL,
+                 pending_email_old_confirmed_at = NULL,
+                 pending_email_new_confirmed_at = NULL,
+                 updated_at = $1
+             WHERE pubkey = $2 AND tenant_id = $3",
+        )
         .bind(Utc::now())
         .bind(pubkey)
         .bind(tenant_id)

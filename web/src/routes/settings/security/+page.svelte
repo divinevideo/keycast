@@ -39,6 +39,10 @@
 	let confirmNewPassword = $state('');
 	let isChangingPassword = $state(false);
 
+	// Change Email Section
+	let newEmail = $state('');
+	let isChangingEmail = $state(false);
+
 	// Change Key Section
 	let newNsec = $state('');
 	let confirmText = $state('');
@@ -134,6 +138,30 @@
 			toast.error(err.message || 'Failed to change password');
 		} finally {
 			isChangingPassword = false;
+		}
+	}
+
+	async function handleChangeEmail() {
+		if (!newEmail) {
+			toast.error('Please enter a new email address');
+			return;
+		}
+
+		try {
+			isChangingEmail = true;
+
+			const res = await api.post<{ success: boolean; message: string }>('/user/change-email', {
+				new_email: newEmail,
+				password: mainPassword
+			});
+
+			toast.success(res.message || 'Check both your current and new email to confirm the change.');
+			newEmail = '';
+		} catch (err: any) {
+			console.error('Change email error:', err);
+			toast.error(err.message || 'Failed to start email change');
+		} finally {
+			isChangingEmail = false;
 		}
 	}
 
@@ -337,6 +365,36 @@
 					disabled={isChangingPassword || !newPassword || !confirmNewPassword}
 				>
 					{isChangingPassword ? 'Changing Password...' : 'Change Password'}
+				</button>
+			</div>
+		</div>
+
+		<!-- Change Email Section -->
+		<div class="section">
+			<div class="section-header">
+				<h2>Change Email</h2>
+				<p>Update your account email. You'll confirm from both your current and new address.</p>
+			</div>
+
+			<div class="form-container">
+				<div class="form-group">
+					<label for="new-email">New Email Address</label>
+					<input
+						id="new-email"
+						type="email"
+						bind:value={newEmail}
+						placeholder="Enter new email address"
+						disabled={isChangingEmail}
+						onkeydown={(e) => e.key === 'Enter' && handleChangeEmail()}
+					/>
+				</div>
+
+				<button
+					class="btn-primary"
+					onclick={handleChangeEmail}
+					disabled={isChangingEmail || !newEmail}
+				>
+					{isChangingEmail ? 'Sending Confirmation...' : 'Change Email'}
 				</button>
 			</div>
 		</div>

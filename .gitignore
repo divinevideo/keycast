@@ -63,3 +63,6 @@ e2e/playwright-report/
 
 # MCP cache
 .repo-cache/
+
+# Local wrangler/miniflare state
+.wrangler/
