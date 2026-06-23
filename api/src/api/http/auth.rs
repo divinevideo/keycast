@@ -3667,12 +3667,15 @@ pub async fn confirm_email_change(
     }
 
     // Token-gated: if a concurrent re-initiation rotated the tokens after we resolved the side,
-    // this marks no row and the token is no longer valid for the current pending change.
+    // this marks no row and the token belongs to a change that has since been superseded. Surface
+    // that distinctly from a bogus token: the link was real, just replaced by a newer request.
     let confirmed = user_repo
         .mark_pending_email_confirmed(&pending.pubkey, tenant_id, side, &req.token)
         .await?;
     if !confirmed {
-        return Err(AuthError::InvalidToken);
+        return Err(AuthError::Conflict(
+            "This email change request was superseded by a newer one. Please use the most recent confirmation link.".to_string(),
+        ));
     }
 
     // Finalize atomically iff both sides have now confirmed. Doing the both-confirmed check and
