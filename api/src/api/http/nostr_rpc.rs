@@ -1079,7 +1079,6 @@ mod tests {
 
         // 40 = 2 * UNWRAP_BATCH_CONCURRENCY + 8 -> spans three chunks (16, 16, 8).
         const N: usize = 40;
-        assert!(N > UNWRAP_BATCH_CONCURRENCY, "must exceed one chunk");
         let mut senders = Vec::with_capacity(N);
         let mut items = Vec::with_capacity(N);
         for i in 0..N {
