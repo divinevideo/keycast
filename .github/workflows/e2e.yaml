@@ -71,7 +71,7 @@ jobs:
       ATPROTO_OAUTH_PDS_DID: "did:web:pds.divine.test"
       ENABLE_TENANT_AUTO_PROVISIONING: "true"
       API_URL: http://localhost:3000
-      KEYCAST_BINARY: ./target/debug/keycast
+      KEYCAST_BINARY: ${{ github.workspace }}/target/debug/keycast
 
     steps:
       - uses: actions/checkout@v6
@@ -97,7 +97,7 @@ jobs:
           ./scripts/generate_key.sh
 
       - name: Run database migrations
-        run: ./target/debug/keycast --migrate
+        run: "$KEYCAST_BINARY" --migrate
 
       - name: Install e2e dependencies
         working-directory: e2e
@@ -113,7 +113,7 @@ jobs:
           RUST_LOG: "info,sqlx=warn,nostr_relay_pool=warn"
         run: |
           mkdir -p e2e/test-results
-          nohup ./target/debug/keycast \
+          nohup "$KEYCAST_BINARY" \
             > e2e/test-results/keycast.log 2>&1 < /dev/null &
           echo $! > .keycast.pid
           disown
