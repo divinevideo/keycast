@@ -430,14 +430,8 @@ async fn test_new_change_cancels_prior() {
         serde_json::json!({ "new_email": email_a, "password": "pw-rotate-test" })).await;
     let (_, old_tok_a, _, _, _) = pending_state(&pool, &pubkey).await;
 
-    // Second initiation supersedes the first. Bypass the 5-min cooldown by clearing sent_at.
-    sqlx::query("UPDATE users SET pending_email_sent_at = $1 WHERE pubkey = $2")
-        .bind(Utc::now() - Duration::minutes(10))
-        .bind(&pubkey)
-        .execute(&pool)
-        .await
-        .unwrap();
-
+    // Second initiation to a DIFFERENT address supersedes the first immediately — the resend
+    // cooldown is scoped to same-target resends, so a corrected address is not rate-limited.
     post_json(&app, "/user/change-email", Some(&auth),
         serde_json::json!({ "new_email": email_b, "password": "pw-rotate-test" })).await;
     let (pending, old_tok_b, _, _, _) = pending_state(&pool, &pubkey).await;
@@ -448,4 +442,33 @@ async fn test_new_change_cancels_prior() {
     cleanup_by_email(&pool, &old_email).await;
     cleanup_by_email(&pool, &email_a).await;
     cleanup_by_email(&pool, &email_b).await;
+}
+
+#[tokio::test]
+async fn test_same_target_resend_within_cooldown_does_not_resend() {
+    // Re-initiating the SAME target within the cooldown window must not rotate tokens or re-send.
+    let pool = setup_pool().await;
+    let keys = Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    let old_email = format!("old-{}@example.com", Uuid::new_v4());
+    let new_email = format!("new-{}@example.com", Uuid::new_v4());
+    create_user(&pool, &pubkey, &old_email, "pw-cooldown-test").await;
+
+    let app = build_app(pool.clone());
+    let auth = mint_session_token(&keys).await;
+
+    post_json(&app, "/user/change-email", Some(&auth),
+        serde_json::json!({ "new_email": new_email, "password": "pw-cooldown-test" })).await;
+    let (_, old_tok_1, new_tok_1, _, _) = pending_state(&pool, &pubkey).await;
+
+    // Same target again, immediately — cooldown applies, tokens unchanged.
+    let resp = post_json(&app, "/user/change-email", Some(&auth),
+        serde_json::json!({ "new_email": new_email, "password": "pw-cooldown-test" })).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let (_, old_tok_2, new_tok_2, _, _) = pending_state(&pool, &pubkey).await;
+    assert_eq!(old_tok_1, old_tok_2);
+    assert_eq!(new_tok_1, new_tok_2);
+
+    cleanup_by_email(&pool, &old_email).await;
+    cleanup_by_email(&pool, &new_email).await;
 }

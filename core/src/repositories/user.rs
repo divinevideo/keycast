@@ -628,20 +628,23 @@ impl UserRepository {
         Ok(())
     }
 
-    /// Timestamp of the most recent pending-email-change send (for the resend cooldown).
-    pub async fn pending_email_last_sent(
+    /// Current pending-change target and the timestamp of its last send.
+    /// Used to scope the resend cooldown to re-initiations of the *same* target; a change to a
+    /// different address is a new request and should not be rate-limited by a prior one.
+    /// Returns `(pending_email, pending_email_sent_at)` for the user, or `None` if no user row.
+    pub async fn pending_email_send_state(
         &self,
         pubkey: &str,
         tenant_id: i64,
-    ) -> Result<Option<DateTime<Utc>>, RepositoryError> {
-        let row: Option<(Option<DateTime<Utc>>,)> = sqlx::query_as(
-            "SELECT pending_email_sent_at FROM users WHERE pubkey = $1 AND tenant_id = $2",
+    ) -> Result<Option<(Option<String>, Option<DateTime<Utc>>)>, RepositoryError> {
+        let row: Option<(Option<String>, Option<DateTime<Utc>>)> = sqlx::query_as(
+            "SELECT pending_email, pending_email_sent_at FROM users WHERE pubkey = $1 AND tenant_id = $2",
         )
         .bind(pubkey)
         .bind(tenant_id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.and_then(|r| r.0))
+        Ok(row)
     }
 
     /// Find a pending change by either the old- or new-address token, and report which side

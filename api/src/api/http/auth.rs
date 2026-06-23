@@ -3508,9 +3508,17 @@ pub async fn change_email(
         message: "Check both your current and new email to confirm the change.".to_string(),
     });
 
-    // Resend cooldown: ignore rapid repeat initiations.
-    if let Ok(Some(last_sent)) = user_repo.pending_email_last_sent(&user_pubkey, tenant_id).await {
-        if Utc::now() - last_sent < Duration::minutes(EMAIL_CHANGE_RESEND_COOLDOWN_MINUTES) {
+    // Resend cooldown: rate-limit re-initiations of the *same* target. The prior emails are still
+    // valid, so we just tell the user to check their inbox. A change to a *different* address is a
+    // new request that supersedes the prior one, so it bypasses the cooldown (otherwise correcting
+    // a typo'd address within the window would silently fail). The endpoint is password-gated on
+    // every call, so the residual "send to alternating targets" rate is bounded by request auth.
+    if let Ok(Some((Some(existing_target), Some(last_sent)))) =
+        user_repo.pending_email_send_state(&user_pubkey, tenant_id).await
+    {
+        if existing_target == new_email
+            && Utc::now() - last_sent < Duration::minutes(EMAIL_CHANGE_RESEND_COOLDOWN_MINUTES)
+        {
             return Ok(ok_response);
         }
     }
@@ -3553,6 +3561,8 @@ pub async fn change_email(
             if let Err(e) = svc.send_email_change_confirmation(&new_email, &new_token).await {
                 tracing::error!("Failed to send email-change confirmation: {}", e);
             }
+            // The old-address token serves both confirm and cancel; the action is distinguished
+            // by endpoint (/confirm-email-change vs /cancel-email-change), not by a separate token.
             if let Err(e) = svc
                 .send_email_change_notification(&current_email, &new_email, &old_token, &old_token)
                 .await
