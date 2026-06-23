@@ -1050,4 +1050,62 @@ mod tests {
         let result = enforce_cached_dpop_binding(&handler, &headers, htu).await;
         assert!(result.is_ok());
     }
+
+    /// Build a kind:1059 gift wrap (from `sender` to `receiver`) carrying a kind:14
+    /// DM rumor with the given text, serialized to its JSON event value.
+    async fn gift_wrap_value(sender: &Keys, receiver: &PublicKey, text: &str) -> JsonValue {
+        let rumor =
+            nostr_sdk::EventBuilder::private_msg_rumor(*receiver, text).build(sender.public_key());
+        let wrap = nostr_sdk::EventBuilder::gift_wrap(
+            sender,
+            receiver,
+            rumor,
+            Vec::<nostr_sdk::Tag>::new(),
+        )
+        .await
+        .expect("gift wrap should build");
+        serde_json::to_value(&wrap).expect("serialize gift wrap")
+    }
+
+    /// `unwrap_gift_wrap_batch` chunks at `UNWRAP_BATCH_CONCURRENCY` (16). The
+    /// integration ordering test uses 4 items, so the multi-chunk path never runs.
+    /// This drives 40 items (> 2 chunks) through the function directly and asserts
+    /// every slot's content + authenticated sender stays index-aligned with the
+    /// request across chunk boundaries.
+    #[tokio::test]
+    async fn unwrap_gift_wrap_batch_preserves_order_across_chunks() {
+        let handler = Arc::new(create_test_handler_with_dpop(None));
+        let receiver = handler.public_key();
+
+        // 40 = 2 * UNWRAP_BATCH_CONCURRENCY + 8 -> spans three chunks (16, 16, 8).
+        const N: usize = 40;
+        assert!(N > UNWRAP_BATCH_CONCURRENCY, "must exceed one chunk");
+        let mut senders = Vec::with_capacity(N);
+        let mut items = Vec::with_capacity(N);
+        for i in 0..N {
+            let sender = Keys::generate();
+            items.push(gift_wrap_value(&sender, &receiver, &format!("ordered message {i}")).await);
+            senders.push(sender);
+        }
+
+        let results = unwrap_gift_wrap_batch(&handler, &items).await;
+        assert_eq!(results.len(), N, "one ordered slot per input");
+
+        for (i, slot) in results.iter().enumerate() {
+            assert!(
+                slot.get("error").is_none(),
+                "slot {i} should succeed, got {slot:?}"
+            );
+            assert_eq!(
+                slot["rumor"]["content"].as_str().unwrap(),
+                format!("ordered message {i}"),
+                "content out of order at slot {i}"
+            );
+            assert_eq!(
+                slot["sender"].as_str().unwrap(),
+                senders[i].public_key().to_hex(),
+                "authenticated sender out of order at slot {i}"
+            );
+        }
+    }
 }

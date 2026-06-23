@@ -380,6 +380,9 @@ impl HttpRpcHandler {
                 tokio::runtime::Handle::current()
                     .block_on(UnwrappedGift::from_gift_wrap(&keys, &gift_wrap))
                     .map_err(|e| match e {
+                        // Defensive/unreachable: the kind gate above already rejects
+                        // non-gift-wraps before we get here, so from_gift_wrap's own
+                        // kind check never fires. Mapped anyway for exhaustiveness.
                         nip59::Error::NotGiftWrap => UnwrapError::NotGiftWrap,
                         nip59::Error::SenderMismatch => UnwrapError::SenderMismatch,
                         // Signer (wrong recipient / decrypt failure) and Event (malformed
@@ -726,5 +729,68 @@ mod tests {
             .await
             .expect_err("encrypt_to_self should deny a DM from another sender");
         assert_eq!(err.code(), "permission_denied");
+    }
+
+    #[tokio::test]
+    async fn nip17_unwrap_rejects_sender_mismatch() {
+        // Pins the strict sender-mismatch behavior (NIP-59 requires rumor.pubkey ==
+        // seal signer). Built like nostr-sdk's own `test_sender_mismatch`: the rumor
+        // claims an impersonated author while the seal/wrap is signed by `sender`, so
+        // `from_gift_wrap` authenticates `sender` but the inner author disagrees.
+        let handler = create_test_handler(None, None);
+        let receiver = handler.public_key();
+        let sender = Keys::generate(); // signs the seal -> the authenticated sender
+        let impersonated = Keys::generate(); // rumor lies about its author
+
+        let rumor = nostr_sdk::EventBuilder::private_msg_rumor(receiver, "spoofed")
+            .build(impersonated.public_key());
+        let gift_wrap = nostr_sdk::EventBuilder::gift_wrap(
+            &sender,
+            &receiver,
+            rumor,
+            Vec::<nostr_sdk::Tag>::new(),
+        )
+        .await
+        .expect("gift wrap should build");
+
+        let err = handler
+            .nip17_unwrap(gift_wrap)
+            .await
+            .expect_err("rumor author disagreeing with the seal signer must be rejected");
+        assert_eq!(err.code(), "sender_mismatch");
+    }
+
+    #[tokio::test]
+    async fn nip17_unwrap_rejects_invalid_wrap_signature() {
+        // Exercises the OUTER-wrap defense-in-depth check, which `from_gift_wrap`
+        // does NOT perform (it verifies only the seal). We can't sign a broken wrap
+        // with EventBuilder, so we tamper a valid one: deserialization does not
+        // verify id/signature, so mutating `content` while leaving id+sig untouched
+        // yields a kind:1059 event whose recomputed id no longer matches -> verify()
+        // fails before any decrypt runs.
+        let handler = create_test_handler(None, None);
+        let receiver = handler.public_key();
+        let sender = Keys::generate();
+
+        let gift_wrap = build_gift_wrap(&sender, &receiver, "tamper me").await;
+        let mut json = serde_json::to_value(&gift_wrap).expect("serialize gift wrap");
+        let original = json["content"]
+            .as_str()
+            .expect("content string")
+            .to_string();
+        json["content"] = serde_json::Value::String(format!("{original}x"));
+        let tampered: Event =
+            serde_json::from_value(json).expect("deserialize does not verify, so this succeeds");
+        assert_eq!(
+            tampered.kind,
+            Kind::GiftWrap,
+            "tamper must keep kind:1059 so it passes the kind gate"
+        );
+
+        let err = handler
+            .nip17_unwrap(tampered)
+            .await
+            .expect_err("tampered outer wrap must fail the defense-in-depth verify");
+        assert_eq!(err.code(), "invalid_wrap_signature");
     }
 }
