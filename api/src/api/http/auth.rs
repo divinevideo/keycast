@@ -31,6 +31,9 @@ use sqlx::PgPool;
 
 const DEFAULT_TOKEN_EXPIRY_HOURS: i64 = 24;
 pub const EMAIL_VERIFICATION_EXPIRY_HOURS: i64 = 24;
+pub const EMAIL_CHANGE_EXPIRY_HOURS: i64 = 24;
+/// Minimum minutes between successive email-change initiations (resend cooldown).
+const EMAIL_CHANGE_RESEND_COOLDOWN_MINUTES: i64 = 5;
 const PASSWORD_RESET_EXPIRY_HOURS: i64 = 1;
 const DEFAULT_NIP05_DOMAIN: &str = "divine.video";
 const MAX_NIP05_USERNAME_LENGTH: usize = 64;
@@ -3401,6 +3404,290 @@ pub async fn change_password(
         "success": true,
         "message": "Password changed successfully"
     })))
+}
+
+// ===== SELF-SERVE EMAIL CHANGE ENDPOINTS =====
+
+#[derive(Debug, Deserialize)]
+pub struct ChangeEmailRequest {
+    pub new_email: String,
+    pub password: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChangeEmailResponse {
+    pub success: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConfirmEmailChangeRequest {
+    pub token: String,
+}
+
+/// Record an auth event for the email-change flow (best-effort).
+#[allow(clippy::too_many_arguments)]
+async fn record_email_change_event(
+    pool: &PgPool,
+    headers: &HeaderMap,
+    tenant_id: i64,
+    endpoint: &'static str,
+    event_type: &'static str,
+    outcome: &'static str,
+    reason_code: Option<&str>,
+    http_status: i32,
+    email: Option<&str>,
+    pubkey: Option<&str>,
+) {
+    super::auth_observability::record_auth_event_and_log(
+        pool,
+        headers,
+        None,
+        super::auth_observability::AuthEvent {
+            tenant_id,
+            endpoint,
+            event_type,
+            outcome,
+            reason_code,
+            http_status,
+            email,
+            pubkey,
+            client_id: None,
+            redirect_origin: None,
+            metadata_json: serde_json::json!({}),
+        },
+    )
+    .await;
+}
+
+/// Initiate a self-serve email change.
+///
+/// Authenticated (UCAN) with current-password re-verification. Generates per-address tokens,
+/// emails a confirmation link to the new address and a confirm/cancel notification to the old
+/// address. Always returns 200 for an authenticated user (anti-enumeration on the new address).
+pub async fn change_email(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Json(req): Json<ChangeEmailRequest>,
+) -> Result<Json<ChangeEmailResponse>, AuthError> {
+    let tenant_id = tenant.0.id;
+    let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
+
+    // Validate + normalize the new email (reuse the registration normalizer to prevent
+    // case/dot bypass and reject anything malformed).
+    let new_email = normalize_registration_email(&req.new_email).map_err(|_| AuthError::InvalidEmail)?;
+
+    let user_repo = UserRepository::new(pool.clone());
+
+    // Re-verify the current password before allowing any change.
+    let (current_email, password_hash) = user_repo
+        .get_credentials(&user_pubkey, tenant_id)
+        .await?
+        .ok_or(AuthError::UserNotFound)?;
+    let password = req.password.clone();
+    let hash = password_hash.clone();
+    let valid = tokio::task::spawn_blocking(move || verify(&password, &hash))
+        .await
+        .map_err(|e| AuthError::Internal(format!("Task join error: {}", e)))?
+        .map_err(|_| AuthError::Internal("Password verification failed".to_string()))?;
+    if !valid {
+        return Err(AuthError::InvalidCredentials);
+    }
+
+    // No-op if the address is unchanged.
+    if new_email == current_email {
+        return Ok(Json(ChangeEmailResponse {
+            success: true,
+            message: "That is already your email address.".to_string(),
+        }));
+    }
+
+    let ok_response = Json(ChangeEmailResponse {
+        success: true,
+        message: "Check both your current and new email to confirm the change.".to_string(),
+    });
+
+    // Resend cooldown: ignore rapid repeat initiations.
+    if let Ok(Some(last_sent)) = user_repo.pending_email_last_sent(&user_pubkey, tenant_id).await {
+        if Utc::now() - last_sent < Duration::minutes(EMAIL_CHANGE_RESEND_COOLDOWN_MINUTES) {
+            return Ok(ok_response);
+        }
+    }
+
+    // Anti-enumeration: if the new email is already registered, return success without sending
+    // or storing anything, so the endpoint can't be used to probe for registered addresses.
+    if user_repo
+        .find_pubkey_by_email(&new_email, tenant_id)
+        .await?
+        .is_some()
+    {
+        record_email_change_event(
+            &pool,
+            &headers,
+            tenant_id,
+            "/api/user/change-email",
+            "email_change_request",
+            "accepted",
+            Some("email_already_registered"),
+            200,
+            Some(&new_email),
+            Some(&user_pubkey),
+        )
+        .await;
+        return Ok(ok_response);
+    }
+
+    // Generate per-address tokens and store the pending change (overwrites any prior pending
+    // change, naturally cancelling it).
+    let old_token = generate_secure_token();
+    let new_token = generate_secure_token();
+    let expires = Utc::now() + Duration::hours(EMAIL_CHANGE_EXPIRY_HOURS);
+    user_repo
+        .set_pending_email_change(&user_pubkey, tenant_id, &new_email, &old_token, &new_token, expires)
+        .await?;
+
+    // Best-effort sends; don't fail the flow if email delivery is unavailable.
+    match crate::email_service::EmailService::new() {
+        Ok(svc) => {
+            if let Err(e) = svc.send_email_change_confirmation(&new_email, &new_token).await {
+                tracing::error!("Failed to send email-change confirmation: {}", e);
+            }
+            if let Err(e) = svc
+                .send_email_change_notification(&current_email, &new_email, &old_token, &old_token)
+                .await
+            {
+                tracing::error!("Failed to send email-change notification: {}", e);
+            }
+        }
+        Err(e) => tracing::warn!("Email service unavailable: {}", e),
+    }
+
+    record_email_change_event(
+        &pool,
+        &headers,
+        tenant_id,
+        "/api/user/change-email",
+        "email_change_request",
+        "accepted",
+        None,
+        200,
+        Some(&new_email),
+        Some(&user_pubkey),
+    )
+    .await;
+
+    Ok(ok_response)
+}
+
+/// Confirm one side of a pending email change. Finalizes atomically once both sides confirm.
+/// Token-based, unauthenticated (the token proves control of the address it was sent to).
+pub async fn confirm_email_change(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Json(req): Json<ConfirmEmailChangeRequest>,
+) -> Result<Json<ChangeEmailResponse>, AuthError> {
+    use keycast_core::repositories::PendingEmailSide;
+
+    let tenant_id = tenant.0.id;
+    let user_repo = UserRepository::new(pool.clone());
+
+    let (pending, side) = user_repo
+        .find_by_pending_email_token(&req.token, tenant_id)
+        .await?
+        .ok_or(AuthError::InvalidToken)?;
+
+    // Expiry check (treat a missing expiry as expired).
+    if pending
+        .pending_email_expires_at
+        .map_or(true, |e| e < Utc::now())
+    {
+        return Err(AuthError::TokenExpired);
+    }
+
+    user_repo
+        .mark_pending_email_confirmed(&pending.pubkey, tenant_id, side)
+        .await?;
+
+    // Are both sides now confirmed? (snapshot was read before marking this side)
+    let old_done = matches!(side, PendingEmailSide::Old)
+        || pending.pending_email_old_confirmed_at.is_some();
+    let new_done = matches!(side, PendingEmailSide::New)
+        || pending.pending_email_new_confirmed_at.is_some();
+
+    if old_done && new_done {
+        let finalized = user_repo
+            .finalize_email_change(&pending.pubkey, tenant_id)
+            .await?;
+        if !finalized {
+            // Target email was registered by someone else between initiate and confirm.
+            return Err(AuthError::Conflict(
+                "That email address is no longer available.".to_string(),
+            ));
+        }
+        record_email_change_event(
+            &pool,
+            &headers,
+            tenant_id,
+            "/api/auth/confirm-email-change",
+            "email_change",
+            "success",
+            Some("finalized"),
+            200,
+            pending.pending_email.as_deref(),
+            Some(&pending.pubkey),
+        )
+        .await;
+        return Ok(Json(ChangeEmailResponse {
+            success: true,
+            message: "Your email address has been updated.".to_string(),
+        }));
+    }
+
+    Ok(Json(ChangeEmailResponse {
+        success: true,
+        message: "Confirmed. Waiting for the other address to confirm.".to_string(),
+    }))
+}
+
+/// Cancel a pending email change. Token-bound (old- or new-address token); returns a generic
+/// response whether or not a pending change existed, so it leaks nothing.
+pub async fn cancel_email_change(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(pool): State<PgPool>,
+    headers: HeaderMap,
+    Json(req): Json<ConfirmEmailChangeRequest>,
+) -> Result<Json<ChangeEmailResponse>, AuthError> {
+    let tenant_id = tenant.0.id;
+    let user_repo = UserRepository::new(pool.clone());
+
+    if let Some((pending, _side)) = user_repo
+        .find_by_pending_email_token(&req.token, tenant_id)
+        .await?
+    {
+        user_repo
+            .clear_pending_email_change(&pending.pubkey, tenant_id)
+            .await?;
+        record_email_change_event(
+            &pool,
+            &headers,
+            tenant_id,
+            "/api/auth/cancel-email-change",
+            "email_change",
+            "success",
+            Some("cancelled"),
+            200,
+            pending.pending_email.as_deref(),
+            Some(&pending.pubkey),
+        )
+        .await;
+    }
+
+    Ok(Json(ChangeEmailResponse {
+        success: true,
+        message: "The email change has been cancelled.".to_string(),
+    }))
 }
 
 #[derive(Debug, Deserialize)]
