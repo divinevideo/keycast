@@ -55,6 +55,11 @@ export function redirectToLoginOnAuthError(
     goto(`/login?redirect=${encodeURIComponent(path)}`, { replaceState: true }).finally(() => {
         redirecting = false;
     });
+    // Safety net: a navigation promise that never settles must not latch `redirecting`
+    // forever and silently swallow every later 401.
+    setTimeout(() => {
+        redirecting = false;
+    }, 10_000);
     return true;
 }
 
