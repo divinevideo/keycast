@@ -75,6 +75,10 @@ export async function signin(
         if (!alreadySignedIn) {
             toast.success("Signed in successfully");
         }
+        // Sign-in's default destination is role-aware on purpose: nip07 sign-in lands
+        // admins on their console (below), while password login (login/+page.svelte)
+        // defaults to "/". An explicit ?redirect= overrides either. This divergence is
+        // intentional, not an oversight.
         let dest = isTeamsEnabled() ? "/teams" : "/";
         if (method === SigninMethod.Nip07) {
             // Check actual admin role to redirect to the right page
