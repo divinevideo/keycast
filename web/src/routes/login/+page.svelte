@@ -4,6 +4,7 @@
 	import { toast } from 'svelte-hot-french-toast';
 	import { KeycastApi } from '$lib/keycast_api.svelte';
 	import { setCurrentUser } from '$lib/current_user.svelte';
+	import { safeRedirectPath } from '$lib/utils/redirect';
 	import PasswordInput from '$lib/components/PasswordInput.svelte';
 	import { BRAND } from '$lib/brand';
 	import { signin, SigninMethod, signout } from '$lib/utils/auth';
@@ -58,8 +59,7 @@
 	let isResending = $state(false);
 
 	function resolveRedirectTarget() {
-		const redirect = $page.url.searchParams.get('redirect');
-		return redirect && redirect.startsWith('/') ? redirect : '/';
+		return safeRedirectPath($page.url.searchParams.get('redirect'));
 	}
 
 	async function handleContinueAsCurrentAccount() {
@@ -113,8 +113,7 @@
 			setCurrentUser(response.pubkey, 'cookie');
 
 			// Redirect to original page or dashboard
-			const redirect = $page.url.searchParams.get('redirect');
-			goto(redirect && redirect.startsWith('/') ? redirect : '/');
+			goto(resolveRedirectTarget());
 		} catch (err: any) {
 			console.error('Login error:', err);
 

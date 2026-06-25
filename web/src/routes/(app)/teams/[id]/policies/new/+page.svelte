@@ -11,6 +11,7 @@ import type {
     ContentFilterConfig,
     Permission,
 } from "$lib/types";
+import { redirectToLoginOnAuthError } from "$lib/utils/auth";
 import { toast } from "svelte-hot-french-toast";
 
 const { id } = $page.params;
@@ -50,7 +51,7 @@ async function createPolicy() {
             goto(`/teams/${id}`);
         })
         .catch((error) => {
-            toast.error("Failed to create policy");
+            if (redirectToLoginOnAuthError(error)) return;
             toast.error(`Failed to create policy: ${error.message}`);
         });
 }

@@ -15,6 +15,7 @@ import type {
     StoredKey,
     Team,
 } from "$lib/types";
+import { redirectToLoginOnAuthError } from "$lib/utils/auth";
 import { formattedDate } from "$lib/utils/dates";
 import { npubFromPubkey } from "$lib/utils/nostr";
 import { CaretRight } from "phosphor-svelte";
@@ -41,6 +42,10 @@ $effect(() => {
                 authorizations = (teamKeyResponse as KeyWithRelations)
                     .authorizations;
             })
+            .catch((error) => {
+                if (redirectToLoginOnAuthError(error)) return;
+                console.error(error);
+            })
             .finally(() => {
                 isLoading = false;
             });
@@ -62,6 +67,7 @@ async function removeKey() {
             goto(`/teams/${id}`);
         })
         .catch((error) => {
+            if (redirectToLoginOnAuthError(error)) return;
             toast.error("Failed to remove key");
         });
 }

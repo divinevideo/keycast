@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { BRAND } from '$lib/brand';
 	import { KeycastApi } from '$lib/keycast_api.svelte';
+	import { redirectToLoginOnAuthError } from '$lib/utils/auth';
 	import { goto } from '$app/navigation';
 	import Loader from '$lib/components/Loader.svelte';
 	import InvalidateClaimTokenModal from '$lib/components/InvalidateClaimTokenModal.svelte';
@@ -71,7 +72,8 @@
 				return;
 			}
 			adminRole = response.role;
-		} catch {
+		} catch (err) {
+			if (redirectToLoginOnAuthError(err)) return;
 			goto('/login?redirect=/support-admin', { replaceState: true });
 			return;
 		}
@@ -98,6 +100,7 @@
 				expandedPubkey = result.results[0].pubkey;
 			}
 		} catch (err: any) {
+			if (redirectToLoginOnAuthError(err)) return;
 			searchError = err.message || 'Search failed';
 		} finally {
 			isSearching = false;
@@ -152,8 +155,10 @@
 			if (result.has_token && result.claim_url && result.expires_at) {
 				claimToken = { claim_url: result.claim_url, expires_at: result.expires_at };
 			}
-		} catch {
-			// Silently ignore - user may not have claim token access
+		} catch (err) {
+			if (redirectToLoginOnAuthError(err)) return;
+			// 401 already redirected above. Any other error (403/404/500/network) is
+			// non-fatal here; the user may simply lack claim-token access, so leave the UI as-is.
 		} finally {
 			isLoadingClaimToken = false;
 		}
@@ -169,6 +174,7 @@
 			claimToken = result;
 			toast.success('Claim link generated');
 		} catch (err: any) {
+			if (redirectToLoginOnAuthError(err)) return;
 			toast.error(err.message || 'Failed to generate claim link');
 		} finally {
 			isGeneratingClaimToken = false;
@@ -185,6 +191,7 @@
 			claimToken = result;
 			toast.success('Claim link regenerated. Prior link is now invalidated.');
 		} catch (err: any) {
+			if (redirectToLoginOnAuthError(err)) return;
 			toast.error(err.message || 'Failed to regenerate claim link');
 		} finally {
 			isGeneratingClaimToken = false;

@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { BRAND } from '$lib/brand';
 	import { KeycastApi } from '$lib/keycast_api.svelte';
+	import { redirectToLoginOnAuthError } from '$lib/utils/auth';
 	import { goto } from '$app/navigation';
 	import { toast } from 'svelte-hot-french-toast';
 	import {
@@ -64,7 +65,8 @@
 				status = 'not-admin';
 				return;
 			}
-		} catch {
+		} catch (err) {
+			if (redirectToLoginOnAuthError(err)) return;
 			goto('/login?redirect=/admin/registered-clients', { replaceState: true });
 			return;
 		}
@@ -80,6 +82,7 @@
 			const result = await api.get<{ clients: RegisteredClient[] }>('/admin/registered-clients');
 			clients = result.clients;
 		} catch (err: any) {
+			if (redirectToLoginOnAuthError(err)) return;
 			listError = err?.message || 'Failed to load registered clients';
 		} finally {
 			isLoadingClients = false;
@@ -130,6 +133,7 @@
 			resetNewForm();
 			await loadClients();
 		} catch (err: any) {
+			if (redirectToLoginOnAuthError(err)) return;
 			toast.error(err?.message || 'Failed to create client');
 		} finally {
 			isCreating = false;
@@ -180,6 +184,7 @@
 			cancelEdit();
 			await loadClients();
 		} catch (err: any) {
+			if (redirectToLoginOnAuthError(err)) return;
 			toast.error(err?.message || 'Failed to update client');
 		} finally {
 			isSaving = false;
@@ -205,6 +210,7 @@
 			deleteCandidate = null;
 			await loadClients();
 		} catch (err: any) {
+			if (redirectToLoginOnAuthError(err)) return;
 			toast.error(err?.message || 'Failed to delete client');
 		} finally {
 			isDeleting = false;
@@ -226,6 +232,7 @@
 			);
 			testResult = { matches: result.matches, pattern, uri };
 		} catch (err: any) {
+			if (redirectToLoginOnAuthError(err)) return;
 			toast.error(err?.message || 'Test failed');
 		} finally {
 			isTesting = false;

@@ -5,6 +5,7 @@ import TeamCard from "$lib/components/TeamCard.svelte";
 import { getCurrentUser } from "$lib/current_user.svelte";
 import { KeycastApi } from "$lib/keycast_api.svelte";
 import type { TeamWithRelations } from "$lib/types";
+import { redirectToLoginOnAuthError } from "$lib/utils/auth";
 import { isTeamsEnabled } from "$lib/utils/env";
 import { PlusCircle } from "phosphor-svelte";
 import { toast } from "svelte-hot-french-toast";
@@ -34,6 +35,7 @@ $effect(() => {
                 teams = teamsResponse as TeamWithRelations[];
             })
             .catch((error) => {
+                if (redirectToLoginOnAuthError(error, "/teams")) return;
                 console.error(error);
             })
             .finally(() => {
@@ -77,6 +79,7 @@ async function createTeam(inline = false) {
             toast.success("Team created successfully");
         })
         .catch((error) => {
+            if (redirectToLoginOnAuthError(error, "/teams")) return;
             toast.error(`Failed to create team: ${error.message}`);
             if (inline) {
                 inlineTeamError = error.message;

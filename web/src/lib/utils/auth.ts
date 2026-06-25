@@ -1,6 +1,8 @@
 import { browser } from "$app/environment";
 import { goto } from "$app/navigation";
 import { getCurrentUser, setCurrentUser } from "$lib/current_user.svelte";
+import { ApiError } from "$lib/keycast_api.svelte";
+import { resolvePostAuthDest } from "$lib/utils/redirect";
 import toast from "svelte-hot-french-toast";
 import { getViteDomain, isTeamsEnabled } from "$lib/utils/env";
 
@@ -12,6 +14,53 @@ export enum SigninMethod {
 interface SignoutOptions {
     redirectTo?: string | null;
     showToast?: boolean;
+}
+
+// Guards against a burst of simultaneous 401s (e.g. several parallel requests failing
+// at once) firing multiple toasts and navigations. Cleared once the login navigation
+// settles, so a later session expiry is handled again.
+let redirecting = false;
+
+/**
+ * If `err` is an authentication 401 (expired/missing session), clear stale client
+ * auth state, surface a session-expired message, and redirect to /login with a return
+ * path. Returns true when it handled the error so callers can early-return instead of
+ * rendering the raw internal auth message.
+ *
+ * Only fires on 401 — a 403 ("logged in but not authorized") and all other errors are
+ * left for the caller to handle, preserving the not-logged-in vs forbidden distinction.
+ */
+export function redirectToLoginOnAuthError(
+    err: unknown,
+    returnPath?: string,
+): boolean {
+    if (!(err instanceof ApiError) || err.status !== 401) {
+        return false;
+    }
+
+    // Report the 401 as handled to every caller so they all early-return, but only run
+    // the redirect side effects for the first 401 in a burst.
+    if (redirecting) {
+        return true;
+    }
+    redirecting = true;
+
+    // Drop the lingering client-side pubkey cookie/state so the UI no longer believes
+    // it is signed in.
+    setCurrentUser(null);
+
+    const path =
+        returnPath ?? (browser ? window.location.pathname + window.location.search : "/");
+    toast.error("Your session has expired. Please sign in again.");
+    goto(`/login?redirect=${encodeURIComponent(path)}`, { replaceState: true }).finally(() => {
+        redirecting = false;
+    });
+    // Safety net: a navigation promise that never settles must not latch `redirecting`
+    // forever and silently swallow every later 401.
+    setTimeout(() => {
+        redirecting = false;
+    }, 10_000);
+    return true;
 }
 
 export async function signin(
@@ -26,6 +75,10 @@ export async function signin(
         if (!alreadySignedIn) {
             toast.success("Signed in successfully");
         }
+        // Sign-in's default destination is role-aware on purpose: nip07 sign-in lands
+        // admins on their console (below), while password login (login/+page.svelte)
+        // defaults to "/". An explicit ?redirect= overrides either. This divergence is
+        // intentional, not an oversight.
         let dest = isTeamsEnabled() ? "/teams" : "/";
         if (method === SigninMethod.Nip07) {
             // Check actual admin role to redirect to the right page
@@ -39,7 +92,12 @@ export async function signin(
                 dest = "/admin";
             }
         }
-        goto(dest);
+        // An explicit, same-origin `redirect` (e.g. the page the user was bounced off
+        // when their session expired) takes precedence over the computed default.
+        const requested = browser
+            ? new URLSearchParams(window.location.search).get("redirect")
+            : null;
+        goto(resolvePostAuthDest(requested, dest));
     }
     return pubkey;
 }
