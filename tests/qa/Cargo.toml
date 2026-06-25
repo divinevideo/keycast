@@ -13,6 +13,10 @@ name = "api_rpc_test"
 path = "tests/api_rpc_test.rs"
 
 [[test]]
+name = "decrypt_bench_test"
+path = "tests/decrypt_bench_test.rs"
+
+[[test]]
 name = "nip46_relay_test"
 path = "tests/nip46_relay_test.rs"
 
