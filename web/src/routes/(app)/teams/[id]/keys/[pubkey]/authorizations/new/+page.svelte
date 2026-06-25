@@ -103,7 +103,6 @@ async function createAuthorization() {
         })
         .catch((error) => {
             if (redirectToLoginOnAuthError(error)) return;
-            toast.error("Failed to create authorization");
             toast.error(`Failed to create authorization: ${error.message}`);
         });
 }

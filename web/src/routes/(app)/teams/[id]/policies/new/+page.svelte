@@ -52,7 +52,6 @@ async function createPolicy() {
         })
         .catch((error) => {
             if (redirectToLoginOnAuthError(error)) return;
-            toast.error("Failed to create policy");
             toast.error(`Failed to create policy: ${error.message}`);
         });
 }
