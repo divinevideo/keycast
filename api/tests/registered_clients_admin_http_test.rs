@@ -1,5 +1,5 @@
-// ABOUTME: HTTP-layer negative tests for the registered_clients admin endpoints
-// ABOUTME: Locks down the is_full_admin gate so support-admin and non-admin callers are rejected
+// ABOUTME: HTTP-layer tests for registered_clients admin endpoints (auth gate + mutations)
+// ABOUTME: Negative coverage for support-admin and non-admin; positive full-admin list/pattern/create/update/delete
 
 #![cfg(feature = "integration-tests")]
 
@@ -281,6 +281,24 @@ fn test_pattern_body() -> serde_json::Value {
     })
 }
 
+fn allowed_create_body() -> serde_json::Value {
+    let id = format!("http-allow-{}", Uuid::new_v4());
+    serde_json::json!({
+        "client_id": id,
+        "name": "Allowed Create",
+        "allowed_redirect_uris": ["https://example.com/cb"]
+    })
+}
+
+async fn cleanup_registered_client(pool: &PgPool, client_id: &str) {
+    sqlx::query("DELETE FROM registered_clients WHERE tenant_id = $1 AND client_id = $2")
+        .bind(TENANT_ID)
+        .bind(client_id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
 // -----------------------------------------------------------------------------
 // Negative tests: support-admin is rejected on every endpoint
 // -----------------------------------------------------------------------------
@@ -506,4 +524,135 @@ async fn pattern_test_allows_full_admin() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn create_allows_full_admin() {
+    let pool = common::setup_test_db().await;
+    let body = allowed_create_body();
+    let client_id = body["client_id"].as_str().unwrap().to_string();
+    cleanup_registered_client(&pool, &client_id).await;
+
+    let app = build_app(
+        create_test_auth_state(pool.clone()),
+        AuthConfig::full_admin(),
+    );
+
+    let response = app
+        .oneshot(request("POST", "/admin/registered-clients", Some(body)))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = read_body_string(response).await;
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["client_id"].as_str().unwrap(), client_id.as_str());
+    assert_eq!(v["name"].as_str().unwrap(), "Allowed Create");
+    assert!(v["id"].as_i64().is_some());
+    let uris = v["allowed_redirect_uris"].as_array().unwrap();
+    assert_eq!(uris.len(), 1);
+    assert_eq!(uris[0].as_str().unwrap(), "https://example.com/cb");
+
+    let repo = RegisteredClientRepository::new(pool.clone());
+    assert!(
+        repo.get_allowed_redirect_uris(&client_id, TENANT_ID)
+            .await
+            .unwrap()
+            .is_some(),
+        "full-admin create should persist a row"
+    );
+
+    cleanup_registered_client(&pool, &client_id).await;
+}
+
+#[tokio::test]
+async fn update_allows_full_admin() {
+    let pool = common::setup_test_db().await;
+    let body = allowed_create_body();
+    let client_id = body["client_id"].as_str().unwrap().to_string();
+    cleanup_registered_client(&pool, &client_id).await;
+
+    let app = build_app(
+        create_test_auth_state(pool.clone()),
+        AuthConfig::full_admin(),
+    );
+
+    let response = app
+        .clone()
+        .oneshot(request("POST", "/admin/registered-clients", Some(body)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = read_body_string(response).await;
+    let created: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let id = created["id"]
+        .as_i64()
+        .expect("create response should include id") as i32;
+
+    let patch = serde_json::json!({ "name": "Updated Via HTTP" });
+    let response = app
+        .oneshot(request(
+            "PATCH",
+            &format!("/admin/registered-clients/{id}"),
+            Some(patch),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = read_body_string(response).await;
+    let updated: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(updated["id"].as_i64().unwrap() as i32, id);
+    assert_eq!(updated["client_id"].as_str().unwrap(), client_id.as_str());
+    assert_eq!(updated["name"].as_str().unwrap(), "Updated Via HTTP");
+
+    cleanup_registered_client(&pool, &client_id).await;
+}
+
+#[tokio::test]
+async fn delete_allows_full_admin() {
+    let pool = common::setup_test_db().await;
+    let body = allowed_create_body();
+    let client_id = body["client_id"].as_str().unwrap().to_string();
+    cleanup_registered_client(&pool, &client_id).await;
+
+    let app = build_app(
+        create_test_auth_state(pool.clone()),
+        AuthConfig::full_admin(),
+    );
+
+    let response = app
+        .clone()
+        .oneshot(request("POST", "/admin/registered-clients", Some(body)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = read_body_string(response).await;
+    let created: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let id = created["id"]
+        .as_i64()
+        .expect("create response should include id") as i32;
+
+    let response = app
+        .oneshot(request(
+            "DELETE",
+            &format!("/admin/registered-clients/{id}"),
+            None,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let text = read_body_string(response).await;
+    let deleted: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(deleted["deleted"].as_bool(), Some(true));
+
+    let repo = RegisteredClientRepository::new(pool);
+    assert!(
+        repo.get_allowed_redirect_uris(&client_id, TENANT_ID)
+            .await
+            .unwrap()
+            .is_none(),
+        "full-admin delete should remove the row"
+    );
 }
