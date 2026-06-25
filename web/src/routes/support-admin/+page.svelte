@@ -157,7 +157,8 @@
 			}
 		} catch (err) {
 			if (redirectToLoginOnAuthError(err)) return;
-			// Silently ignore genuine no-access cases (403/404) - user may not have claim token access
+			// 401 already redirected above. Any other error (403/404/500/network) is
+			// non-fatal here; the user may simply lack claim-token access, so leave the UI as-is.
 		} finally {
 			isLoadingClaimToken = false;
 		}
