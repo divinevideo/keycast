@@ -15,7 +15,7 @@ use keycast_core::repositories::{
 };
 use keycast_core::signing_session::{parse_cache_key, CacheKey, SigningSession};
 use keycast_core::traits::CustomPermission;
-use nostr_sdk::{Keys, PublicKey, UnsignedEvent};
+use nostr_sdk::{Event, Keys, PublicKey, UnsignedEvent};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -24,6 +24,11 @@ use std::sync::Arc;
 
 use super::auth::AuthError;
 use super::routes::AuthState;
+
+/// Maximum gift wraps accepted in a single `nip17_unwrap_batch` request.
+/// Bounds per-request work and keeps the body well under axum's 2 MB default
+/// limit (gift wraps are ~1-2 KB each). Mirrors the `batch_lookup_users` cap.
+const MAX_UNWRAP_BATCH: usize = 100;
 
 /// RPC request format (mirrors NIP-46)
 #[derive(Debug, Deserialize)]
@@ -118,6 +123,9 @@ impl From<HandlerError> for RpcError {
 /// - nip04_decrypt: Decrypts ciphertext using NIP-04
 /// - nip44_encrypt: Encrypts plaintext using NIP-44
 /// - nip44_decrypt: Decrypts ciphertext using NIP-44
+/// - nip17_unwrap_batch: Unwraps a batch of NIP-59 gift wraps (1059→seal→rumor),
+///   returning ordered per-item `{rumor, sender}` / `{error}` slots. Amortizes the
+///   per-request auth/status overhead and collapses the client's 2 RPCs-per-DM.
 ///
 /// Uses BLAKE3 token cache - on cache hit, skips UCAN verification entirely.
 /// All operations use cached handler with in-memory permission validation (no DB hits).
@@ -207,6 +215,36 @@ pub async fn nostr_rpc(
 
             // Expose secret only at serialization boundary
             JsonValue::String(plaintext.expose_secret().to_string())
+        }
+
+        "nip17_unwrap_batch" => {
+            // Size cap keeps the request under axum's 2 MB default body limit and
+            // bounds per-request work (mirrors the batch_lookup_users cap precedent).
+            if req.params.is_empty() {
+                return Err(RpcError::InvalidParams("Empty gift wrap batch".into()));
+            }
+            if req.params.len() > MAX_UNWRAP_BATCH {
+                return Err(RpcError::InvalidParams(format!(
+                    "Maximum {} gift wraps per batch",
+                    MAX_UNWRAP_BATCH
+                )));
+            }
+
+            // Whole-batch validity gate: an expired/revoked authorization can
+            // decrypt nothing, so fail the batch rather than emitting N error
+            // slots (matches the single-method behavior).
+            if !handler.is_valid() {
+                return Err(RpcError::Auth(AuthError::InvalidToken));
+            }
+
+            // Server does BOTH gift-wrap decrypt layers internally, so the client
+            // makes one call per page instead of 2 sequential RPCs per message.
+            let results = unwrap_gift_wrap_batch(&handler, &req.params).await;
+
+            // One coalesced activity log for the whole batch (per-request semantics).
+            spawn_log_activity(pool.clone(), handler.is_oauth(), handler.authorization_id());
+
+            JsonValue::Array(results)
         }
 
         "nip04_encrypt" => {
@@ -723,6 +761,67 @@ fn parse_decrypt_params(params: &[JsonValue]) -> Result<(PublicKey, String), Rpc
     Ok((pubkey, ciphertext.to_string()))
 }
 
+/// Build the per-item error slot for the unwrap batch response.
+fn unwrap_error_slot(code: &str) -> JsonValue {
+    serde_json::json!({ "error": code })
+}
+
+/// Unwrap a batch of NIP-59 gift wraps into ordered, index-aligned result slots.
+///
+/// Each slot is `{"rumor": <kind14 unsigned event>, "sender": "<hex>"}` on
+/// success or `{"error": "<code>"}` on a per-item failure — one bad gift wrap
+/// never fails the batch.
+///
+/// Every item is fanned out into a [`tokio::task::JoinSet`] so the per-item tasks
+/// are tied to THIS request's future: if the client disconnects, dropping the set
+/// aborts the still-pending tasks instead of leaving them to decrypt in the
+/// background. Abort cannot preempt a per-item `spawn_blocking` closure that has
+/// already started — that work is instead bounded, and its blocking-pool slot
+/// accounted for, by the global `UNWRAP_CRYPTO_PERMITS` semaphore held inside
+/// `HttpRpcHandler::nip17_unwrap`. That same semaphore is the single shared cap on
+/// concurrent unwrap crypto, so spawning every item at once only parks cheap async
+/// tasks on it and never floods the blocking pool. Results are reassembled by
+/// index, so the response stays positionally aligned with the request (NIP-17
+/// history is ordered) regardless of completion order.
+async fn unwrap_gift_wrap_batch(
+    handler: &Arc<HttpRpcHandler>,
+    items: &[JsonValue],
+) -> Vec<JsonValue> {
+    let mut set: tokio::task::JoinSet<(usize, JsonValue)> = tokio::task::JoinSet::new();
+    for (idx, item) in items.iter().enumerate() {
+        let handler = handler.clone();
+        let item = item.clone();
+        set.spawn(async move {
+            let event: Event = match serde_json::from_value(item) {
+                Ok(e) => e,
+                Err(_) => return (idx, unwrap_error_slot("invalid_event")),
+            };
+            let slot = match handler.nip17_unwrap(event).await {
+                Ok(unwrapped) => match serde_json::to_value(&unwrapped.rumor) {
+                    Ok(rumor) => serde_json::json!({
+                        "rumor": rumor,
+                        "sender": unwrapped.sender.to_hex(),
+                    }),
+                    Err(_) => unwrap_error_slot("internal"),
+                },
+                Err(e) => unwrap_error_slot(e.code()),
+            };
+            (idx, slot)
+        });
+    }
+
+    // Pre-fill with internal-error slots so a task that fails to report a result
+    // (e.g. a JoinError from a panicked task) still yields a valid, index-aligned
+    // slot rather than a hole in the ordered response.
+    let mut results = vec![unwrap_error_slot("internal"); items.len()];
+    while let Some(joined) = set.join_next().await {
+        if let Ok((idx, slot)) = joined {
+            results[idx] = slot;
+        }
+    }
+    results
+}
+
 /// Spawn activity logging in background (non-blocking)
 /// Updates oauth_authorizations stats without blocking the response
 fn spawn_log_activity(pool: PgPool, is_oauth: bool, authorization_id: i64) {
@@ -954,5 +1053,64 @@ mod tests {
 
         let result = enforce_cached_dpop_binding(&handler, &headers, htu).await;
         assert!(result.is_ok());
+    }
+
+    /// Build a kind:1059 gift wrap (from `sender` to `receiver`) carrying a kind:14
+    /// DM rumor with the given text, serialized to its JSON event value.
+    async fn gift_wrap_value(sender: &Keys, receiver: &PublicKey, text: &str) -> JsonValue {
+        let rumor =
+            nostr_sdk::EventBuilder::private_msg_rumor(*receiver, text).build(sender.public_key());
+        let wrap = nostr_sdk::EventBuilder::gift_wrap(
+            sender,
+            receiver,
+            rumor,
+            Vec::<nostr_sdk::Tag>::new(),
+        )
+        .await
+        .expect("gift wrap should build");
+        serde_json::to_value(&wrap).expect("serialize gift wrap")
+    }
+
+    /// `unwrap_gift_wrap_batch` fans every item out concurrently and reassembles
+    /// results by index. The integration ordering test uses only 4 items, so this
+    /// drives a full `MAX_UNWRAP_BATCH` page through the function directly and
+    /// asserts every slot's content + authenticated sender stays index-aligned
+    /// with the request regardless of completion order.
+    #[tokio::test]
+    async fn unwrap_gift_wrap_batch_preserves_order() {
+        let handler = Arc::new(create_test_handler_with_dpop(None));
+        let receiver = handler.public_key();
+
+        // A full page (100), larger than the global unwrap crypto-permit pool, so
+        // items queue on the semaphore and complete out of order — exercising both
+        // the permit-queueing path and the index-reassembly that re-orders them.
+        const N: usize = MAX_UNWRAP_BATCH;
+        let mut senders = Vec::with_capacity(N);
+        let mut items = Vec::with_capacity(N);
+        for i in 0..N {
+            let sender = Keys::generate();
+            items.push(gift_wrap_value(&sender, &receiver, &format!("ordered message {i}")).await);
+            senders.push(sender);
+        }
+
+        let results = unwrap_gift_wrap_batch(&handler, &items).await;
+        assert_eq!(results.len(), N, "one ordered slot per input");
+
+        for (i, slot) in results.iter().enumerate() {
+            assert!(
+                slot.get("error").is_none(),
+                "slot {i} should succeed, got {slot:?}"
+            );
+            assert_eq!(
+                slot["rumor"]["content"].as_str().unwrap(),
+                format!("ordered message {i}"),
+                "content out of order at slot {i}"
+            );
+            assert_eq!(
+                slot["sender"].as_str().unwrap(),
+                senders[i].public_key().to_hex(),
+                "authenticated sender out of order at slot {i}"
+            );
+        }
     }
 }
