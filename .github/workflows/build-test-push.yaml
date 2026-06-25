@@ -140,17 +140,10 @@ jobs:
           repository: containers-poc
           region: ${{ env.GCP_REGION }}
 
-      - name: Push to Test
-        uses: divinevideo/divine-github-actions/docker-push-gcp@v1
-        with:
-          image-name: keycast:local
-          registry-image: keycast
-          tags: ${{ steps.tags.outputs.tags }}
-          wif-provider: ${{ vars.WORKLOAD_IDENTITY_PROVIDER_TEST }}
-          service-account: ${{ vars.SERVICE_ACCOUNT_TEST }}
-          project-id: ${{ vars.GCP_PROJECT_ID_TEST }}
-          repository: containers-test
-          region: ${{ env.GCP_REGION }}
+      # Test environment decommissioned (divine-iac-coreconfig #1006, 2026-06-17):
+      # dv-platform-test project is DELETE_REQUESTED and its github-actions-test
+      # WIF provider was removed, so a Push to Test step here is a guaranteed
+      # failure. Re-add only if a test environment is ever reprovisioned.
 
       - name: Push to Staging
         uses: divinevideo/divine-github-actions/docker-push-gcp@v1
@@ -186,7 +179,6 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Environments:**" >> $GITHUB_STEP_SUMMARY
           echo "- POC: \`${{ env.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_POC }}/containers-poc/keycast\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Test: \`${{ env.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_TEST }}/containers-test/keycast\`" >> $GITHUB_STEP_SUMMARY
           echo "- Staging: \`${{ env.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_STAGING }}/containers-staging/keycast\`" >> $GITHUB_STEP_SUMMARY
           if [[ "${{ github.ref }}" == refs/tags/v* ]] || [[ "${{ inputs.include_production }}" == "true" ]]; then
             echo "- Production: \`${{ env.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID_PRODUCTION }}/containers-production/keycast\`" >> $GITHUB_STEP_SUMMARY

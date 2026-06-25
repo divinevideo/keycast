@@ -97,7 +97,8 @@ jobs:
           ./scripts/generate_key.sh
 
       - name: Run database migrations
-        run: "$KEYCAST_BINARY" --migrate
+        run: |
+          "$KEYCAST_BINARY" --migrate
 
       - name: Install e2e dependencies
         working-directory: e2e
@@ -113,7 +114,8 @@ jobs:
             ${{ runner.os }}-playwright-
 
       - name: Report Playwright cache status
-        run: echo "Playwright cache hit: ${{ steps.playwright-cache.outputs.cache-hit }}"
+        run: |
+          echo "Playwright cache hit: ${{ steps.playwright-cache.outputs.cache-hit }}"
 
       - name: Install Playwright browsers
         working-directory: e2e
