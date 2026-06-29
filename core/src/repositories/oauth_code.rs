@@ -6,7 +6,10 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 /// Data returned when finding an OAuth code
-#[derive(Debug, Clone)]
+///
+/// Field names match `oauth_codes` columns so `sqlx::FromRow` maps by name; queries may
+/// list the columns in any order as long as every field has a matching selected column.
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct OAuthCodeData {
     pub user_pubkey: String,
     pub client_id: String,
@@ -24,6 +27,12 @@ pub struct OAuthCodeData {
     pub device_code: Option<String>,
     /// Whether this code was issued via headless flow (for first_party UCAN fact)
     pub is_headless: bool,
+    /// bcrypt hash of the 6-digit in-app PIN fallback (keycast#262), if one was issued
+    pub pin_hash: Option<String>,
+    /// Failed verify-pin attempts; brute-force cap is enforced against this counter
+    pub pin_attempts: i32,
+    /// Timestamp of the last PIN issuance; backs the PIN-resend cooldown
+    pub pin_sent_at: Option<DateTime<Utc>>,
 }
 
 /// Parameters for storing a basic OAuth code
@@ -65,6 +74,8 @@ pub struct StoreOAuthCodeWithRegistrationParams<'a> {
     pub device_code: Option<&'a str>,
     /// Whether this code is from headless flow (for first_party UCAN fact)
     pub is_headless: bool,
+    /// bcrypt hash of the 6-digit in-app PIN fallback (keycast#262); None for browser OAuth
+    pub pin_hash: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,8 +120,8 @@ impl OAuthCodeRepository {
     ) -> Result<(), RepositoryError> {
         sqlx::query(
             "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at,
-             pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret, state, device_code, is_headless)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+             pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret, state, device_code, is_headless, pin_hash, pin_sent_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
         )
         .bind(params.tenant_id)
         .bind(params.code)
@@ -129,116 +140,138 @@ impl OAuthCodeRepository {
         .bind(params.state)
         .bind(params.device_code)
         .bind(params.is_headless)
+        .bind(params.pin_hash)
+        // pin_sent_at tracks the last PIN issuance for the resend cooldown; set when a PIN is issued.
+        .bind(params.pin_hash.map(|_| Utc::now()))
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
+    /// Columns selected for every `OAuthCodeData` lookup (matches the struct's `FromRow` fields).
+    const SELECT_COLUMNS: &'static str =
+        "user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method, \
+         pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret, \
+         previous_auth_id, state, device_code, is_headless, pin_hash, pin_attempts, pin_sent_at";
+
     /// Find a valid (non-expired) OAuth code.
-    #[allow(clippy::type_complexity)]
     pub async fn find_valid(
         &self,
         tenant_id: i64,
         code: &str,
     ) -> Result<Option<OAuthCodeData>, RepositoryError> {
-        let result: Option<(
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<Vec<u8>>,
-            Option<i32>,
-            Option<String>,
-            Option<String>,
-            bool,
-        )> = sqlx::query_as(
-            "SELECT user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method,
-                    pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret,
-                    previous_auth_id, state, device_code, is_headless
-             FROM oauth_codes
-             WHERE tenant_id = $1 AND code = $2 AND expires_at > $3",
-        )
-        .bind(tenant_id)
-        .bind(code)
-        .bind(Utc::now())
-        .fetch_optional(&self.pool)
-        .await?;
+        let query = format!(
+            "SELECT {} FROM oauth_codes WHERE tenant_id = $1 AND code = $2 AND expires_at > $3",
+            Self::SELECT_COLUMNS
+        );
+        let result = sqlx::query_as::<_, OAuthCodeData>(&query)
+            .bind(tenant_id)
+            .bind(code)
+            .bind(Utc::now())
+            .fetch_optional(&self.pool)
+            .await?;
 
-        Ok(result.map(|row| OAuthCodeData {
-            user_pubkey: row.0,
-            client_id: row.1,
-            redirect_uri: row.2,
-            scope: row.3,
-            code_challenge: row.4,
-            code_challenge_method: row.5,
-            pending_email: row.6,
-            pending_password_hash: row.7,
-            pending_email_verification_token: row.8,
-            pending_encrypted_secret: row.9,
-            previous_auth_id: row.10,
-            state: row.11,
-            device_code: row.12,
-            is_headless: row.13,
-        }))
+        Ok(result)
     }
 
     /// Find a pending OAuth registration by email verification token.
     /// Used when user clicks the email verification link to complete OAuth flow.
-    #[allow(clippy::type_complexity)]
     pub async fn find_by_verification_token(
         &self,
         token: &str,
         tenant_id: i64,
     ) -> Result<Option<OAuthCodeData>, RepositoryError> {
-        let result: Option<(
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<Vec<u8>>,
-            Option<i32>,
-            Option<String>,
-            Option<String>,
-            bool,
-        )> = sqlx::query_as(
-            "SELECT user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method,
-                    pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret,
-                    previous_auth_id, state, device_code, is_headless
-             FROM oauth_codes
-             WHERE pending_email_verification_token = $1 AND tenant_id = $2 AND expires_at > $3",
+        let query = format!(
+            "SELECT {} FROM oauth_codes WHERE pending_email_verification_token = $1 AND tenant_id = $2 AND expires_at > $3",
+            Self::SELECT_COLUMNS
+        );
+        let result = sqlx::query_as::<_, OAuthCodeData>(&query)
+            .bind(token)
+            .bind(tenant_id)
+            .bind(Utc::now())
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(result)
+    }
+
+    /// Find a pending registration by its RFC 8628 `device_code` (the 64-char app-held secret).
+    ///
+    /// This is the lookup gate for in-app PIN verification (keycast#262): the `device_code` is the
+    /// real authenticator and the 6-digit PIN is defense-in-depth, so PIN verification MUST resolve
+    /// the pending row by `device_code` rather than by a global PIN scan (which would be brute-forceable
+    /// across all pending registrations). Only pending rows carry a non-null `device_code`, and the PIN
+    /// stays valid for the full 24h verify window, so this filters on `expires_at > now`.
+    pub async fn find_by_device_code(
+        &self,
+        device_code: &str,
+        tenant_id: i64,
+    ) -> Result<Option<OAuthCodeData>, RepositoryError> {
+        let query = format!(
+            "SELECT {} FROM oauth_codes WHERE device_code = $1 AND tenant_id = $2 AND expires_at > $3",
+            Self::SELECT_COLUMNS
+        );
+        let result = sqlx::query_as::<_, OAuthCodeData>(&query)
+            .bind(device_code)
+            .bind(tenant_id)
+            .bind(Utc::now())
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(result)
+    }
+
+    /// Atomically increment the PIN-attempt counter for a pending registration and return the new
+    /// count. Returns `None` when no pending row matches (unknown/expired `device_code`).
+    ///
+    /// The increment is done in a single `UPDATE ... RETURNING` so concurrent verify-pin requests
+    /// across Cloud Run instances cannot race the cap (an in-memory counter would not be shared state).
+    pub async fn increment_pin_attempts(
+        &self,
+        device_code: &str,
+        tenant_id: i64,
+    ) -> Result<Option<i32>, RepositoryError> {
+        let row: Option<(i32,)> = sqlx::query_as(
+            "UPDATE oauth_codes SET pin_attempts = pin_attempts + 1 \
+             WHERE device_code = $1 AND tenant_id = $2 \
+             RETURNING pin_attempts",
         )
-        .bind(token)
+        .bind(device_code)
         .bind(tenant_id)
-        .bind(Utc::now())
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(result.map(|row| OAuthCodeData {
-            user_pubkey: row.0,
-            client_id: row.1,
-            redirect_uri: row.2,
-            scope: row.3,
-            code_challenge: row.4,
-            code_challenge_method: row.5,
-            pending_email: row.6,
-            pending_password_hash: row.7,
-            pending_email_verification_token: row.8,
-            pending_encrypted_secret: row.9,
-            previous_auth_id: row.10,
-            state: row.11,
-            device_code: row.12,
-            is_headless: row.13,
-        }))
+        Ok(row.map(|r| r.0))
+    }
+
+    /// Re-arm a pending registration for PIN resend: install a fresh verification token + PIN hash,
+    /// reset the attempt counter to zero, refresh `pin_sent_at`, and extend the verify window.
+    ///
+    /// Used by the lockout-recovery path: after the attempt cap is hit, the user must request a resend
+    /// (subject to the cooldown) which mints a new PIN and clears the lockout.
+    pub async fn reset_pin_for_resend(
+        &self,
+        device_code: &str,
+        tenant_id: i64,
+        new_verification_token: &str,
+        new_pin_hash: &str,
+        new_expires_at: DateTime<Utc>,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "UPDATE oauth_codes \
+             SET pending_email_verification_token = $1, pin_hash = $2, pin_attempts = 0, \
+                 pin_sent_at = $3, expires_at = $4 \
+             WHERE device_code = $5 AND tenant_id = $6",
+        )
+        .bind(new_verification_token)
+        .bind(new_pin_hash)
+        .bind(Utc::now())
+        .bind(new_expires_at)
+        .bind(device_code)
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Delete pending OAuth registration by verification token.
@@ -342,5 +375,156 @@ mod tests {
         // Should no longer be found
         let found = repo.find_valid(1, &code).await.unwrap();
         assert!(found.is_none());
+    }
+
+    /// Helper: insert a pending headless registration with a device_code and optional PIN hash.
+    async fn insert_pending_registration(
+        repo: &OAuthCodeRepository,
+        device_code: &str,
+        pin_hash: Option<&str>,
+        expires_at: DateTime<Utc>,
+    ) -> (String, String) {
+        use nostr_sdk::Keys;
+        let user_pubkey = Keys::generate().public_key().to_hex();
+        let code = format!("pending_{}", uuid::Uuid::new_v4());
+        let token = format!("verif_{}", uuid::Uuid::new_v4());
+        let email = format!("pin-test-{}@example.com", uuid::Uuid::new_v4());
+
+        repo.store_with_pending_registration(StoreOAuthCodeWithRegistrationParams {
+            tenant_id: 1,
+            code: &code,
+            user_pubkey: &user_pubkey,
+            client_id: "test_client",
+            redirect_uri: "http://localhost:3000/callback",
+            scope: "policy:social",
+            code_challenge: None,
+            code_challenge_method: None,
+            expires_at,
+            pending_email: &email,
+            pending_password_hash: "hashed",
+            pending_email_verification_token: &token,
+            pending_encrypted_secret: Some(b"secret"),
+            state: None,
+            device_code: Some(device_code),
+            is_headless: true,
+            pin_hash,
+        })
+        .await
+        .unwrap();
+
+        (token, email)
+    }
+
+    #[tokio::test]
+    async fn test_find_by_device_code_returns_pending_with_pin() {
+        let pool = setup_pool().await;
+        let repo = OAuthCodeRepository::new(pool.clone());
+
+        let device_code = format!("dc_{}", uuid::Uuid::new_v4());
+        let expires_at = Utc::now() + chrono::Duration::hours(24);
+        let (_token, email) =
+            insert_pending_registration(&repo, &device_code, Some("pinhash123"), expires_at).await;
+
+        let found = repo.find_by_device_code(&device_code, 1).await.unwrap();
+        assert!(
+            found.is_some(),
+            "pending row should be found by device_code"
+        );
+        let data = found.unwrap();
+        assert_eq!(data.pin_hash.as_deref(), Some("pinhash123"));
+        assert_eq!(data.pin_attempts, 0);
+        assert_eq!(data.pending_email.as_deref(), Some(email.as_str()));
+        assert!(data.is_headless);
+
+        sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_find_by_device_code_excludes_expired() {
+        let pool = setup_pool().await;
+        let repo = OAuthCodeRepository::new(pool.clone());
+
+        let device_code = format!("dc_{}", uuid::Uuid::new_v4());
+        let expires_at = Utc::now() - chrono::Duration::hours(1); // already expired
+        insert_pending_registration(&repo, &device_code, Some("pinhash123"), expires_at).await;
+
+        let found = repo.find_by_device_code(&device_code, 1).await.unwrap();
+        assert!(found.is_none(), "expired pending row must not be returned");
+
+        sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_increment_pin_attempts_accumulates_and_returns() {
+        let pool = setup_pool().await;
+        let repo = OAuthCodeRepository::new(pool.clone());
+
+        let device_code = format!("dc_{}", uuid::Uuid::new_v4());
+        let expires_at = Utc::now() + chrono::Duration::hours(24);
+        insert_pending_registration(&repo, &device_code, Some("pinhash123"), expires_at).await;
+
+        let first = repo.increment_pin_attempts(&device_code, 1).await.unwrap();
+        assert_eq!(first, Some(1));
+        let second = repo.increment_pin_attempts(&device_code, 1).await.unwrap();
+        assert_eq!(second, Some(2));
+
+        // Unknown device_code returns None (no row updated).
+        let none = repo.increment_pin_attempts("nonexistent", 1).await.unwrap();
+        assert_eq!(none, None);
+
+        sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_reset_pin_for_resend_rearms_token_pin_and_attempts() {
+        let pool = setup_pool().await;
+        let repo = OAuthCodeRepository::new(pool.clone());
+
+        let device_code = format!("dc_{}", uuid::Uuid::new_v4());
+        let expires_at = Utc::now() + chrono::Duration::hours(24);
+        insert_pending_registration(&repo, &device_code, Some("oldpin"), expires_at).await;
+
+        // Burn two attempts.
+        repo.increment_pin_attempts(&device_code, 1).await.unwrap();
+        repo.increment_pin_attempts(&device_code, 1).await.unwrap();
+
+        let new_token = format!("verif_{}", uuid::Uuid::new_v4());
+        let new_expires = Utc::now() + chrono::Duration::hours(24);
+        repo.reset_pin_for_resend(&device_code, 1, &new_token, "newpin", new_expires)
+            .await
+            .unwrap();
+
+        let data = repo
+            .find_by_device_code(&device_code, 1)
+            .await
+            .unwrap()
+            .expect("row should still exist after resend");
+        assert_eq!(data.pin_hash.as_deref(), Some("newpin"));
+        assert_eq!(data.pin_attempts, 0, "attempts reset on resend");
+
+        // New token is now the live verification token.
+        let by_token = repo
+            .find_by_verification_token(&new_token, 1)
+            .await
+            .unwrap();
+        assert!(by_token.is_some(), "new token should resolve to the row");
+
+        sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }

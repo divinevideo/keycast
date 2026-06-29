@@ -205,6 +205,8 @@ pub async fn headless_register(
             state: req.state.as_deref(),
             device_code: Some(&device_code),
             is_headless: true,
+            // PIN fallback is added in a later step; no PIN issued yet.
+            pin_hash: None,
         })
         .await?;
 

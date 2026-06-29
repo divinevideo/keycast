@@ -228,6 +228,8 @@ async fn store_oauth_code_with_pending_registration(
         state,
         device_code,
         is_headless: false,
+        // Browser OAuth registration verifies via the email link in a real browser; no PIN fallback.
+        pin_hash: None,
     })
     .await?;
     Ok(())
