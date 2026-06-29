@@ -184,6 +184,22 @@ impl ClusterCoordinator {
                     _ = heartbeat_interval.tick() => {
                         let mut reg = registry.lock().await;
 
+                        // Shutdown race guard: if the cancel token fired while
+                        // we were waiting on the registry lock, a concurrent
+                        // `deregister_and_stop_heartbeat` may have already
+                        // removed this instance under this same lock. Sending a
+                        // heartbeat now would re-register us (ZADD) and the
+                        // instance would linger in the ring for a full heartbeat
+                        // interval after we meant to leave. The select! arm for
+                        // `cancel_token.cancelled()` does not protect us here:
+                        // when both arms are ready select! may pick this one.
+                        // We MUST check while holding the lock so the check is
+                        // serialized against the deregister's DEL.
+                        if cancel_token.is_cancelled() {
+                            tracing::debug!("Heartbeat task observed cancellation under lock; not re-registering");
+                            break;
+                        }
+
                         // Check if IAM token needs refresh (before it expires)
                         if factory.uses_iam_auth() {
                             let ttl = factory.token_ttl_secs().await;
@@ -462,16 +478,38 @@ impl ClusterCoordinator {
         Ok(())
     }
 
-    /// Deregister from the cluster without consuming self.
+    /// Gracefully deregister from the cluster without consuming `self`.
     ///
-    /// Use when you can't take ownership (e.g., Arc::try_unwrap fails).
-    pub async fn force_deregister(&self) -> Result<(), Error> {
+    /// Use during process shutdown when the coordinator is shared behind an
+    /// `Arc` (with the signer and relay workers) and ownership cannot be
+    /// reclaimed for [`shutdown`](Self::shutdown).
+    ///
+    /// Mirrors [`shutdown`](Self::shutdown)'s ordering: the background tasks are
+    /// stopped FIRST (by cancelling the shared token) so the heartbeat cannot
+    /// re-register, then the `leave` event is published and the instance is
+    /// deregistered. Because this takes `&self` it cannot `await` the heartbeat
+    /// `JoinHandle` (which lives behind `&mut self`); instead it relies on the
+    /// heartbeat loop re-checking the cancel token *while holding the registry
+    /// lock* before each re-register. This method holds that same registry lock
+    /// for the deregister, so the heartbeat's ZADD and this method's DEL are
+    /// serialized and the instance cannot be resurrected after removal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deregistration fails. Failure to publish the `leave`
+    /// event is logged and swallowed (peers still converge via heartbeat
+    /// staleness), matching [`shutdown`](Self::shutdown).
+    pub async fn deregister_and_stop_heartbeat(&self) -> Result<(), Error> {
+        // 1. Stop background tasks first so the heartbeat cannot re-register.
+        self.cancel_token.cancel();
+
+        // 2. Publish leave + deregister under the registry lock (serialized
+        //    against any in-flight heartbeat ZADD — see the method docs).
         let mut reg = self.registry.lock().await;
-
-        // Publish leave event
         let instance_id = reg.instance_id().to_string();
-        Self::publish_event(&mut reg, "leave", &instance_id).await?;
-
+        if let Err(e) = Self::publish_event(&mut reg, "leave", &instance_id).await {
+            tracing::warn!("Failed to publish leave event: {}", e);
+        }
         reg.deregister().await
     }
 
@@ -550,6 +588,51 @@ mod tests {
         assert_eq!(coordinator.instance_count(), 1);
 
         coordinator.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Redis via TEST_REDIS_URL or local Redis on localhost:16379"]
+    async fn test_deregister_and_stop_heartbeat_does_not_reappear() {
+        // Regression for the SIGTERM-time graceful deregister: after
+        // `deregister_and_stop_heartbeat` the instance must NOT be resurrected
+        // by a surviving heartbeat tick. We wait past one full heartbeat
+        // interval — long enough for the race (cancel vs. heartbeat ZADD) to
+        // manifest if the token check were not serialized under the registry
+        // lock — and assert the instance stays gone in Redis.
+        let redis_url = get_redis_url();
+        let prefix = test_prefix();
+
+        let coordinator = ClusterCoordinator::start_with_prefix(&redis_url, Some(&prefix))
+            .await
+            .unwrap();
+        let instance_id = coordinator.instance_id();
+
+        // Independent registry on the same prefix to read the ground truth in
+        // Redis (its own presence is irrelevant; we only check `instance_id`).
+        let mut observer = RedisRegistry::register_with_prefix(&redis_url, Some(&prefix))
+            .await
+            .unwrap();
+
+        let before = observer.get_active_instances().await.unwrap();
+        assert!(
+            before.contains(&instance_id),
+            "coordinator must be registered before deregister, got {before:?}"
+        );
+
+        // Graceful deregister via the `&self` (Arc-shared) path.
+        coordinator.deregister_and_stop_heartbeat().await.unwrap();
+
+        // Wait well past one heartbeat interval so a surviving heartbeat task
+        // would have re-registered (ZADD) if the race were open.
+        tokio::time::sleep(Duration::from_secs(DEFAULT_HEARTBEAT_INTERVAL_SECS + 2)).await;
+
+        let after = observer.get_active_instances().await.unwrap();
+        assert!(
+            !after.contains(&instance_id),
+            "deregistered instance must not reappear after more than one heartbeat interval, got {after:?}"
+        );
+
+        observer.deregister().await.unwrap();
     }
 
     #[tokio::test]

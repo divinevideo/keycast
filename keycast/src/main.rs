@@ -114,6 +114,14 @@ const DEFAULT_SHUTDOWN_TEARDOWN_MARGIN_SECS: u64 = 10;
 /// always has time to flush.
 const POOL_CLOSE_LOG_HEADROOM: Duration = Duration::from_secs(2);
 
+/// Upper bound on the SIGTERM-time cluster deregister (publish `leave` +
+/// remove from the registry). This runs concurrently with the pre-drain pause,
+/// so on GKE (pre_drain ≥ this) it adds no wall-clock; on Cloud Run
+/// (pre_drain = 0) it is the only phase-1 cost, kept small so a dead Redis
+/// cannot stall shutdown past the grace period. The Cloud Run drain budgets in
+/// `cloudbuild.yaml` are sized to absorb this worst case.
+const CLUSTER_DEREGISTER_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Per-field sanity ceiling on each `SHUTDOWN_*_SECS` env var. Values above
 /// this fall back to the per-field default with a warning. 1 day is far
 /// above any plausible operational value (real drains are seconds, not
@@ -1719,9 +1727,38 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         "Graceful shutdown: starting pre-drain phase (readiness now 503)"
     );
 
-    // Phase 1: flip readiness and sleep so endpoint/NEG detach (GKE) propagates
-    // before we stop accepting.
-    pre_drain_pause(&shutting_down, timings.pre_drain).await;
+    // Phase 1: flip readiness and sleep so endpoint/NEG detach (GKE)
+    // propagates, AND concurrently publish the cluster `leave` event so peers
+    // rebalance off this instance immediately. The deregister is the *only*
+    // rebalance trigger on Cloud Run (no readiness-driven endpoint removal);
+    // on GKE it runs alongside endpoint detach. We join the two so peers learn
+    // we are leaving before we tear down relays, but bound the deregister so a
+    // dead Redis cannot stall shutdown. The heartbeat task is stopped as part
+    // of the deregister (it cancels the shared token), so it cannot re-register
+    // us after this point.
+    let deregister = async {
+        match tokio::time::timeout(
+            CLUSTER_DEREGISTER_TIMEOUT,
+            coordinator.deregister_and_stop_heartbeat(),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                tracing::info!("Graceful shutdown: cluster leave published, instance deregistered")
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "Graceful shutdown: cluster deregister failed; peers will converge via heartbeat staleness")
+            }
+            Err(_) => tracing::warn!(
+                timeout_secs = CLUSTER_DEREGISTER_TIMEOUT.as_secs(),
+                "Graceful shutdown: cluster deregister timed out (Redis slow/down); continuing"
+            ),
+        }
+    };
+    tokio::join!(
+        pre_drain_pause(&shutting_down, timings.pre_drain),
+        deregister
+    );
 
     // Phase 2: tell axum to stop accepting new HTTP connections and wait for
     // in-flight requests to finish.
@@ -1759,8 +1796,10 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     // wait for signer + other tracked tasks. We do this **after** HTTP drain so
     // NIP-46 requests that arrived before SIGTERM have a chance to complete and
     // publish responses back to the requesting client before we disconnect from
-    // the relays. `ClusterCoordinator` will be dropped automatically on return,
-    // triggering deregister.
+    // the relays. The cluster `leave` was already published in phase 1 (the
+    // coordinator is an `Arc` shared with the signer/workers and has no Drop
+    // hook, so it is NOT deregistered implicitly on return — see the explicit
+    // `deregister_and_stop_heartbeat` above).
     //
     // `drain_signer_or_abort` applies ONE outer `tokio::time::timeout`
     // at `timings.signer_drain` across both awaits so `signer_drain`
