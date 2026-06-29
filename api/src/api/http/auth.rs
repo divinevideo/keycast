@@ -1075,7 +1075,7 @@ pub async fn register(
     match crate::email_service::EmailService::new() {
         Ok(email_service) => {
             if let Err(e) = email_service
-                .send_verification_email(&req.email, &verification_token)
+                .send_verification_email(&req.email, &verification_token, None)
                 .await
             {
                 tracing::error!("Failed to send verification email to {}: {}", req.email, e);
@@ -2465,7 +2465,7 @@ pub async fn resend_verification(
         match crate::email_service::EmailService::new() {
             Ok(email_service) => {
                 if let Err(e) = email_service
-                    .send_verification_email(&email_clone, &token_clone)
+                    .send_verification_email(&email_clone, &token_clone, None)
                     .await
                 {
                     tracing::error!(

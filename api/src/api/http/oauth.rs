@@ -3074,7 +3074,7 @@ async fn handle_authorization_code_grant(
         match crate::email_service::EmailService::new() {
             Ok(email_service) => {
                 if let Err(e) = email_service
-                    .send_verification_email(pending_email_val, &verification_token)
+                    .send_verification_email(pending_email_val, &verification_token, None)
                     .await
                 {
                     tracing::error!(
@@ -3857,7 +3857,7 @@ pub async fn oauth_register(
     match crate::email_service::EmailService::new() {
         Ok(email_service) => {
             if let Err(e) = email_service
-                .send_verification_email(&req.email, &verification_token)
+                .send_verification_email(&req.email, &verification_token, None)
                 .await
             {
                 tracing::error!("Failed to send verification email to {}: {}", req.email, e);

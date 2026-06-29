@@ -177,6 +177,16 @@ pub async fn headless_register(
             .map_err(|e| HeadlessError::Internal(format!("Task join error: {}", e)))?
             .map_err(|e| HeadlessError::Internal(format!("Password hash error: {}", e)))?;
 
+    // Generate a 6-digit in-app verification PIN (keycast#262), emailed alongside the link as a
+    // second transport for the same proof. Stored hashed; the device_code is the real gate.
+    let pin: String = format!("{:06}", rand::thread_rng().gen_range(0..1_000_000));
+    let pin_for_hash = pin.clone();
+    let pin_hash =
+        tokio::task::spawn_blocking(move || bcrypt::hash(&pin_for_hash, bcrypt::DEFAULT_COST))
+            .await
+            .map_err(|e| HeadlessError::Internal(format!("Task join error: {}", e)))?
+            .map_err(|e| HeadlessError::Internal(format!("PIN hash error: {}", e)))?;
+
     // Generate placeholder authorization code (will be replaced after email verification)
     let placeholder_code: String = rand::thread_rng()
         .sample_iter(&rand::distributions::Alphanumeric)
@@ -205,8 +215,7 @@ pub async fn headless_register(
             state: req.state.as_deref(),
             device_code: Some(&device_code),
             is_headless: true,
-            // PIN fallback is added in a later step; no PIN issued yet.
-            pin_hash: None,
+            pin_hash: Some(&pin_hash),
         })
         .await?;
 
@@ -214,7 +223,7 @@ pub async fn headless_register(
     match crate::email_service::EmailService::new() {
         Ok(email_service) => {
             if let Err(e) = email_service
-                .send_verification_email(&req.email, &verification_token)
+                .send_verification_email(&req.email, &verification_token, Some(&pin))
                 .await
             {
                 tracing::error!("Failed to send verification email to {}: {}", req.email, e);
@@ -851,5 +860,63 @@ mod tests {
         let body = response_json(response).await;
         assert_eq!(body["code"], crate::api::http::auth::INVALID_EMAIL_CODE);
         assert_eq!(body["error"], "Please enter a valid email address.");
+    }
+
+    /// headless_register stores a hashed 6-digit PIN on the pending row (keycast#262).
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_headless_register_stores_hashed_pin() {
+        let auth_state = create_lazy_auth_state();
+        let pool = auth_state.state.db.clone();
+        let email = format!("headless-pin-{}@example.com", uuid::Uuid::new_v4());
+
+        let response = super::headless_register(
+            create_unit_test_tenant(),
+            axum::extract::State(auth_state),
+            axum::Json(super::HeadlessRegisterRequest {
+                email: email.clone(),
+                password: "testpassword123".to_string(),
+                client_id: "TestClient".to_string(),
+                redirect_uri: "https://client.example/callback".to_string(),
+                nsec: None,
+                scope: None,
+                code_challenge: None,
+                code_challenge_method: None,
+                state: None,
+            }),
+        )
+        .await
+        .map(axum::response::IntoResponse::into_response)
+        .expect("headless_register should succeed");
+
+        let body = response_json(response).await;
+        let device_code = body["device_code"]
+            .as_str()
+            .expect("response carries device_code")
+            .to_string();
+
+        let (pin_hash, pin_attempts): (Option<String>, i32) = sqlx::query_as(
+            "SELECT pin_hash, pin_attempts FROM oauth_codes WHERE device_code = $1 AND tenant_id = 1",
+        )
+        .bind(&device_code)
+        .fetch_one(&pool)
+        .await
+        .expect("pending row should exist");
+
+        let pin_hash = pin_hash.expect("a PIN must be hashed and stored at registration");
+        assert!(
+            pin_hash.starts_with("$2"),
+            "pin_hash must be a bcrypt hash, got {pin_hash}"
+        );
+        assert_eq!(pin_attempts, 0, "attempt counter starts at zero");
+
+        let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE email = $1")
+            .bind(&email)
+            .execute(&pool)
+            .await;
     }
 }
