@@ -667,6 +667,186 @@ async fn extract_first_party_or_user_signed_user(
 }
 
 // ============================================================================
+// Headless Verify PIN (in-app fallback for the email verification link)
+// ============================================================================
+
+/// Failed PIN attempts allowed before the PIN is locked until resend (keycast#262).
+const MAX_PIN_ATTEMPTS: i32 = 5;
+
+#[derive(Debug, Deserialize)]
+pub struct HeadlessVerifyPinRequest {
+    /// RFC 8628 device_code from registration — the 64-char app-held secret and real gate.
+    pub device_code: String,
+    /// 6-digit PIN emailed to the user (defense-in-depth on top of device_code).
+    pub pin: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HeadlessVerifyPinResponse {
+    pub success: bool,
+    /// Authorization code to exchange for bunker_url — returned synchronously (Redis-independent).
+    pub code: String,
+    /// Nostr public key (hex)
+    pub pubkey: String,
+    /// OAuth state (echoed back)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+}
+
+/// Record a verify-pin failure to the shared brute-force feed (#258). The `reason` is internal
+/// only — the client always sees the same uniform error (anti-enumeration).
+async fn record_pin_verify_failure(
+    pool: &sqlx::PgPool,
+    headers: &HeaderMap,
+    tenant_id: i64,
+    pubkey: Option<&str>,
+    email: Option<&str>,
+    reason: &str,
+) {
+    super::auth_observability::record_auth_event_and_log(
+        pool,
+        headers,
+        None,
+        super::auth_observability::AuthEvent {
+            tenant_id,
+            endpoint: "/api/headless/verify-pin",
+            event_type: "email_pin_verify",
+            outcome: "failure",
+            reason_code: Some(reason),
+            http_status: 401,
+            email,
+            pubkey,
+            client_id: None,
+            redirect_origin: None,
+            metadata_json: serde_json::json!({}),
+        },
+    )
+    .await;
+}
+
+/// POST /api/headless/verify-pin
+///
+/// In-app fallback for the email verification link (keycast#262): for webviews that never run the
+/// link page, a different device, or a mangled link, the user types the 6-digit PIN. The pending
+/// row is located by `device_code` (the real authenticator); the PIN is defense-in-depth, bounded
+/// by [`MAX_PIN_ATTEMPTS`]. On success the same finalize path as the link runs and the OAuth
+/// authorization code is returned synchronously in the body (no Redis dependency).
+pub async fn headless_verify_pin(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<super::routes::AuthState>,
+    headers: HeaderMap,
+    Json(req): Json<HeadlessVerifyPinRequest>,
+) -> Result<impl IntoResponse, HeadlessError> {
+    let pool = &auth_state.state.db;
+    let tenant_id = tenant.0.id;
+
+    let oauth_code_repo = OAuthCodeRepository::new(pool.clone());
+    let pending = oauth_code_repo
+        .find_by_device_code(&req.device_code, tenant_id)
+        .await?;
+
+    let Some(pending) = pending else {
+        // Burn comparable time so an unknown/expired device_code isn't distinguishable by latency.
+        let _ = tokio::task::spawn_blocking(|| {
+            let _ = bcrypt::hash("dummy", bcrypt::DEFAULT_COST);
+        })
+        .await;
+        record_pin_verify_failure(
+            pool,
+            &headers,
+            tenant_id,
+            None,
+            None,
+            "device_code_not_found",
+        )
+        .await;
+        return Err(HeadlessError::PinVerificationFailed);
+    };
+
+    let Some(pin_hash) = pending.pin_hash.clone() else {
+        record_pin_verify_failure(
+            pool,
+            &headers,
+            tenant_id,
+            Some(&pending.user_pubkey),
+            pending.pending_email.as_deref(),
+            "no_pin_issued",
+        )
+        .await;
+        return Err(HeadlessError::PinVerificationFailed);
+    };
+
+    // Already locked: reject without checking the PIN (uniform error, no lockout signal).
+    if pending.pin_attempts >= MAX_PIN_ATTEMPTS {
+        record_pin_verify_failure(
+            pool,
+            &headers,
+            tenant_id,
+            Some(&pending.user_pubkey),
+            pending.pending_email.as_deref(),
+            "pin_locked",
+        )
+        .await;
+        return Err(HeadlessError::PinVerificationFailed);
+    }
+
+    // Constant-time PIN comparison (bcrypt's own compare; work factor dominates).
+    let candidate = req.pin.clone();
+    let stored = pin_hash;
+    let valid = tokio::task::spawn_blocking(move || verify(&candidate, &stored))
+        .await
+        .map_err(|e| HeadlessError::Internal(format!("Task join error: {}", e)))?
+        .unwrap_or(false);
+
+    if !valid {
+        let new_count = oauth_code_repo
+            .increment_pin_attempts(&req.device_code, tenant_id)
+            .await?
+            .unwrap_or(0);
+        let reason = if new_count >= MAX_PIN_ATTEMPTS {
+            "pin_locked"
+        } else {
+            "wrong_pin"
+        };
+        record_pin_verify_failure(
+            pool,
+            &headers,
+            tenant_id,
+            Some(&pending.user_pubkey),
+            pending.pending_email.as_deref(),
+            reason,
+        )
+        .await;
+        return Err(HeadlessError::PinVerificationFailed);
+    }
+
+    // Correct PIN: run the SAME finalize path as the link (idempotent; does not delete the row).
+    // RedisBestEffort because the code is returned synchronously below, so a Redis outage is fine.
+    let finalized = super::auth::finalize_pending_registration(
+        pool,
+        auth_state.state.redis.as_ref(),
+        tenant_id,
+        &pending,
+        super::auth::HeadlessDelivery::RedisBestEffort,
+    )
+    .await?;
+
+    tracing::info!(
+        event = "email_pin_verify",
+        tenant_id = tenant_id,
+        outcome = "success",
+        "PIN verified, registration finalized"
+    );
+
+    Ok(Json(HeadlessVerifyPinResponse {
+        success: true,
+        code: finalized.new_code,
+        pubkey: pending.user_pubkey,
+        state: finalized.state,
+    }))
+}
+
+// ============================================================================
 // Error Type
 // ============================================================================
 
@@ -678,6 +858,9 @@ pub enum HeadlessError {
     InvalidRequest(String),
     Conflict(String),
     Internal(String),
+    /// Uniform rejection for every verify-pin failure mode (unknown device_code, wrong/locked/
+    /// expired PIN) — never reveals which, nor lockout state (anti-enumeration).
+    PinVerificationFailed,
     ServiceUnavailable {
         message: String,
         retry_after: Option<u32>,
@@ -704,6 +887,12 @@ impl IntoResponse for HeadlessError {
             ),
             HeadlessError::InvalidRequest(msg) => (StatusCode::BAD_REQUEST, msg, "INVALID_REQUEST"),
             HeadlessError::Conflict(msg) => (StatusCode::CONFLICT, msg, "CONFLICT"),
+            HeadlessError::PinVerificationFailed => (
+                StatusCode::UNAUTHORIZED,
+                "Invalid or expired verification code. Please try again or request a new one."
+                    .to_string(),
+                "PIN_VERIFICATION_FAILED",
+            ),
             HeadlessError::Internal(msg) => {
                 tracing::error!("Headless internal error: {}", msg);
                 (
@@ -916,6 +1105,226 @@ mod tests {
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE email = $1")
             .bind(&email)
+            .execute(&pool)
+            .await;
+    }
+
+    /// Insert a pending headless registration with a known PIN. Returns (pubkey, device_code).
+    #[cfg(feature = "integration-tests")]
+    async fn insert_pending_with_pin(
+        pool: &sqlx::PgPool,
+        email: &str,
+        pin_plain: &str,
+    ) -> (String, String) {
+        let keys = Keys::generate();
+        let pubkey = keys.public_key().to_hex();
+        let device_code = format!("dc_{}", uuid::Uuid::new_v4());
+        let token = format!("verify_{}", uuid::Uuid::new_v4());
+        let placeholder = format!("placeholder_{}", uuid::Uuid::new_v4());
+        let password_hash = bcrypt::hash("testpassword123", bcrypt::DEFAULT_COST).unwrap();
+        let pin_hash = bcrypt::hash(pin_plain, bcrypt::DEFAULT_COST).unwrap();
+        let encrypted_secret = keys.secret_key().to_secret_bytes().to_vec();
+        let expires_at = chrono::Utc::now() + chrono::Duration::hours(24);
+
+        sqlx::query(
+            "INSERT INTO oauth_codes (
+                tenant_id, code, user_pubkey, client_id, redirect_uri, scope,
+                expires_at, created_at, pending_email, pending_password_hash,
+                pending_email_verification_token, pending_encrypted_secret,
+                device_code, is_headless, pin_hash, pin_attempts
+            ) VALUES (1, $1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, $10, $11, true, $12, 0)",
+        )
+        .bind(&placeholder)
+        .bind(&pubkey)
+        .bind("TestApp")
+        .bind("https://test.example.com/callback")
+        .bind("policy:social")
+        .bind(expires_at)
+        .bind(email)
+        .bind(&password_hash)
+        .bind(&token)
+        .bind(&encrypted_secret)
+        .bind(&device_code)
+        .bind(&pin_hash)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        (pubkey, device_code)
+    }
+
+    #[cfg(feature = "integration-tests")]
+    async fn call_verify_pin(
+        auth_state: crate::api::http::routes::AuthState,
+        device_code: &str,
+        pin: &str,
+    ) -> axum::response::Response {
+        match super::headless_verify_pin(
+            create_unit_test_tenant(),
+            axum::extract::State(auth_state),
+            axum::http::HeaderMap::new(),
+            axum::Json(super::HeadlessVerifyPinRequest {
+                device_code: device_code.to_string(),
+                pin: pin.to_string(),
+            }),
+        )
+        .await
+        {
+            Ok(r) => axum::response::IntoResponse::into_response(r),
+            Err(e) => axum::response::IntoResponse::into_response(e),
+        }
+    }
+
+    /// Happy path: correct PIN finalizes and returns the OAuth code synchronously in the body.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_pin_happy_path_returns_code_synchronously() {
+        let auth_state = create_lazy_auth_state();
+        let pool = auth_state.state.db.clone();
+        let email = format!("verify-pin-ok-{}@example.com", uuid::Uuid::new_v4());
+        let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
+
+        let response = call_verify_pin(auth_state, &device_code, "123456").await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["success"], true);
+        assert!(
+            body["code"].as_str().is_some_and(|c| !c.is_empty()),
+            "verify-pin must return an exchange code synchronously"
+        );
+        assert_eq!(body["pubkey"], pubkey);
+
+        // User materialized as verified.
+        let verified: (bool,) =
+            sqlx::query_as("SELECT email_verified FROM users WHERE pubkey = $1 AND tenant_id = 1")
+                .bind(&pubkey)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(verified.0);
+
+        let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM personal_keys WHERE user_pubkey = $1")
+            .bind(&pubkey)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(&pubkey)
+            .execute(&pool)
+            .await;
+    }
+
+    /// After 5 failed attempts the PIN is locked; even the correct PIN then fails uniformly.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_pin_attempt_cap_locks_at_5() {
+        let auth_state = create_lazy_auth_state();
+        let pool = auth_state.state.db.clone();
+        let email = format!("verify-pin-lock-{}@example.com", uuid::Uuid::new_v4());
+        let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
+
+        let mut statuses = Vec::new();
+        for _ in 0..5 {
+            let r = call_verify_pin(auth_state.clone(), &device_code, "000000").await;
+            statuses.push(r.status());
+        }
+        assert!(
+            statuses.iter().all(|s| !s.is_success()),
+            "wrong PIN attempts must all fail"
+        );
+
+        // Correct PIN after the cap must still fail (locked), not succeed.
+        let locked = call_verify_pin(auth_state, &device_code, "123456").await;
+        assert!(
+            !locked.status().is_success(),
+            "correct PIN after lockout must not finalize"
+        );
+
+        let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(&pubkey)
+            .execute(&pool)
+            .await;
+    }
+
+    /// Anti-enumeration: an unknown device_code and a wrong PIN are indistinguishable to the client.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_pin_anti_enumeration_uniform_errors() {
+        let auth_state = create_lazy_auth_state();
+        let pool = auth_state.state.db.clone();
+        let email = format!("verify-pin-enum-{}@example.com", uuid::Uuid::new_v4());
+        let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
+
+        let wrong_pin = call_verify_pin(auth_state.clone(), &device_code, "000000").await;
+        let wrong_device = call_verify_pin(
+            auth_state,
+            &format!("dc_{}", uuid::Uuid::new_v4()),
+            "000000",
+        )
+        .await;
+
+        assert_eq!(
+            wrong_pin.status(),
+            wrong_device.status(),
+            "wrong PIN and wrong device_code must return the same status"
+        );
+        let wrong_pin_body = response_json(wrong_pin).await;
+        let wrong_device_body = response_json(wrong_device).await;
+        assert_eq!(
+            wrong_pin_body, wrong_device_body,
+            "failure bodies must be identical (no enumeration / lockout signal)"
+        );
+
+        let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(&pubkey)
+            .execute(&pool)
+            .await;
+    }
+
+    /// Duplicate email: the PIN path funnels through the shared finalize, so it inherits the
+    /// 409 conflict behavior of the link path.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_pin_duplicate_email_conflict() {
+        let auth_state = create_lazy_auth_state();
+        let pool = auth_state.state.db.clone();
+        let email = format!("verify-pin-dup-{}@example.com", uuid::Uuid::new_v4());
+
+        // Pre-existing user owns the email.
+        let existing_pubkey = Keys::generate().public_key().to_hex();
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
+             VALUES ($1, 1, $2, $3, true, NOW(), NOW())",
+        )
+        .bind(&existing_pubkey)
+        .bind(&email)
+        .bind(bcrypt::hash("testpassword123", bcrypt::DEFAULT_COST).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (pending_pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
+
+        let response = call_verify_pin(auth_state, &device_code, "123456").await;
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+
+        let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE pubkey = ANY($1)")
+            .bind(vec![existing_pubkey, pending_pubkey])
             .execute(&pool)
             .await;
     }

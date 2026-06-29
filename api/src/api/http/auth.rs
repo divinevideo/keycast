@@ -751,6 +751,38 @@ impl From<bcrypt::BcryptError> for AuthError {
     }
 }
 
+/// Map a verification finalize error into the headless API's error type so the in-app PIN path
+/// (keycast#262) inherits the link path's behavior — in particular the duplicate-email 409.
+impl From<AuthError> for super::headless::HeadlessError {
+    fn from(e: AuthError) -> Self {
+        use super::headless::HeadlessError;
+        match e {
+            AuthError::EmailAlreadyExists => HeadlessError::Conflict(
+                "This email is already registered. Please log in instead.".to_string(),
+            ),
+            AuthError::Database(ref db_err)
+                if has_database_constraint(db_err, USERS_EMAIL_TENANT_CONSTRAINT) =>
+            {
+                HeadlessError::Conflict(
+                    "This email is already registered. Please log in instead.".to_string(),
+                )
+            }
+            AuthError::Conflict(msg) => HeadlessError::Conflict(msg),
+            AuthError::ServiceUnavailable {
+                message,
+                retry_after,
+            } => HeadlessError::ServiceUnavailable {
+                message,
+                retry_after,
+            },
+            other => {
+                tracing::error!("PIN verification finalize failed: {:?}", other);
+                HeadlessError::Internal("Email verification could not be completed".to_string())
+            }
+        }
+    }
+}
+
 /// Extract user public key from UCAN token in Authorization header or cookie
 /// tenant_id is required to validate the token was issued for this tenant
 pub(crate) async fn extract_user_from_token(
