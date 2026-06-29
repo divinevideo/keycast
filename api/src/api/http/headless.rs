@@ -847,6 +847,118 @@ pub async fn headless_verify_pin(
 }
 
 // ============================================================================
+// Headless Resend PIN (lockout recovery + new code)
+// ============================================================================
+
+/// Minutes between PIN resends (mirrors the users-table `email_verification_sent_at` cooldown).
+const PIN_RESEND_COOLDOWN_MINUTES: i64 = 5;
+
+#[derive(Debug, Deserialize)]
+pub struct HeadlessResendPinRequest {
+    /// RFC 8628 device_code from registration (the app-held secret).
+    pub device_code: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HeadlessResendPinResponse {
+    pub success: bool,
+    pub message: String,
+}
+
+/// POST /api/headless/resend-pin
+///
+/// Lockout recovery + PIN resend (keycast#262). Keyed by device_code, it re-mints a fresh
+/// verification token + 6-digit PIN, resets the attempt counter, refreshes the verify window, and
+/// re-sends the email — subject to a 5-minute cooldown. Always returns a uniform success response
+/// so it leaks neither registration existence nor lockout state.
+///
+/// Pending headless registrations have no `users` row yet, so the users-table resend path does not
+/// apply; this is the device_code-keyed equivalent on the `oauth_codes` row.
+pub async fn headless_resend_pin(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<super::routes::AuthState>,
+    Json(req): Json<HeadlessResendPinRequest>,
+) -> Result<impl IntoResponse, HeadlessError> {
+    let pool = &auth_state.state.db;
+    let tenant_id = tenant.0.id;
+
+    // Uniform response regardless of outcome (anti-enumeration / no lockout signal).
+    let success = || {
+        Json(HeadlessResendPinResponse {
+            success: true,
+            message: "If your registration is pending, a new code has been sent.".to_string(),
+        })
+    };
+
+    let oauth_code_repo = OAuthCodeRepository::new(pool.clone());
+    let Some(pending) = oauth_code_repo
+        .find_by_device_code(&req.device_code, tenant_id)
+        .await?
+    else {
+        return Ok(success());
+    };
+
+    // Cooldown: silently skip if a PIN was sent within the window.
+    if let Some(sent_at) = pending.pin_sent_at {
+        if (Utc::now() - sent_at).num_minutes() < PIN_RESEND_COOLDOWN_MINUTES {
+            tracing::debug!("resend-pin: within cooldown, skipping (not revealed to client)");
+            return Ok(success());
+        }
+    }
+
+    let Some(email) = pending.pending_email.clone() else {
+        return Ok(success());
+    };
+
+    // Mint a fresh token + PIN, reset the attempt counter, refresh the 24h verify window.
+    let new_token = generate_secure_token();
+    let new_pin: String = format!("{:06}", rand::thread_rng().gen_range(0..1_000_000));
+    let pin_for_hash = new_pin.clone();
+    let new_pin_hash =
+        tokio::task::spawn_blocking(move || bcrypt::hash(&pin_for_hash, bcrypt::DEFAULT_COST))
+            .await
+            .map_err(|e| HeadlessError::Internal(format!("Task join error: {}", e)))?
+            .map_err(|e| HeadlessError::Internal(format!("PIN hash error: {}", e)))?;
+
+    let new_expires_at = Utc::now() + Duration::hours(EMAIL_VERIFICATION_EXPIRY_HOURS);
+    oauth_code_repo
+        .reset_pin_for_resend(
+            &req.device_code,
+            tenant_id,
+            &new_token,
+            &new_pin_hash,
+            new_expires_at,
+        )
+        .await?;
+
+    // Re-send the link + PIN (best-effort; the user can request another resend after the cooldown).
+    match crate::email_service::EmailService::new() {
+        Ok(email_service) => {
+            if let Err(e) = email_service
+                .send_verification_email(&email, &new_token, Some(&new_pin))
+                .await
+            {
+                tracing::error!("Failed to resend verification email to {}: {}", email, e);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Email service unavailable, skipping PIN resend email: {}",
+                e
+            );
+        }
+    }
+
+    tracing::info!(
+        event = "email_pin_resend",
+        tenant_id = tenant_id,
+        "Re-armed PIN and resent verification email"
+    );
+
+    Ok(success())
+}
+
+// ============================================================================
 // Error Type
 // ============================================================================
 
@@ -1325,6 +1437,129 @@ mod tests {
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE pubkey = ANY($1)")
             .bind(vec![existing_pubkey, pending_pubkey])
+            .execute(&pool)
+            .await;
+    }
+
+    #[cfg(feature = "integration-tests")]
+    async fn call_resend_pin(
+        auth_state: crate::api::http::routes::AuthState,
+        device_code: &str,
+    ) -> axum::response::Response {
+        match super::headless_resend_pin(
+            create_unit_test_tenant(),
+            axum::extract::State(auth_state),
+            axum::Json(super::HeadlessResendPinRequest {
+                device_code: device_code.to_string(),
+            }),
+        )
+        .await
+        {
+            Ok(r) => axum::response::IntoResponse::into_response(r),
+            Err(e) => axum::response::IntoResponse::into_response(e),
+        }
+    }
+
+    /// After the attempt cap locks the PIN, a resend (past the cooldown) re-arms a fresh PIN/token
+    /// and resets the attempt counter to zero.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_resend_pin_rearms_after_lockout() {
+        let auth_state = create_lazy_auth_state();
+        let pool = auth_state.state.db.clone();
+        let email = format!("resend-pin-ok-{}@example.com", uuid::Uuid::new_v4());
+        let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
+
+        // Simulate a locked PIN whose last send is past the cooldown.
+        sqlx::query(
+            "UPDATE oauth_codes SET pin_attempts = 5, pin_sent_at = NOW() - INTERVAL '10 minutes' WHERE device_code = $1",
+        )
+        .bind(&device_code)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (old_hash, old_token): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT pin_hash, pending_email_verification_token FROM oauth_codes WHERE device_code = $1",
+        )
+        .bind(&device_code)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let response = call_resend_pin(auth_state, &device_code).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let (attempts, new_hash, new_token): (i32, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT pin_attempts, pin_hash, pending_email_verification_token FROM oauth_codes WHERE device_code = $1",
+        )
+        .bind(&device_code)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(attempts, 0, "resend resets the attempt counter");
+        assert_ne!(new_hash, old_hash, "resend mints a fresh PIN");
+        assert_ne!(
+            new_token, old_token,
+            "resend mints a fresh verification token"
+        );
+
+        let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(&pubkey)
+            .execute(&pool)
+            .await;
+    }
+
+    /// Within the 5-minute cooldown, resend is a silent no-op (PIN/token unchanged).
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_resend_pin_respects_cooldown() {
+        let auth_state = create_lazy_auth_state();
+        let pool = auth_state.state.db.clone();
+        let email = format!("resend-pin-cooldown-{}@example.com", uuid::Uuid::new_v4());
+        let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
+
+        // Last send just now → inside the cooldown window.
+        sqlx::query("UPDATE oauth_codes SET pin_sent_at = NOW() WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let (old_hash, old_token): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT pin_hash, pending_email_verification_token FROM oauth_codes WHERE device_code = $1",
+        )
+        .bind(&device_code)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let response = call_resend_pin(auth_state, &device_code).await;
+        // Uniform success response (no lockout/cooldown signal leaked to the client).
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let (new_hash, new_token): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT pin_hash, pending_email_verification_token FROM oauth_codes WHERE device_code = $1",
+        )
+        .bind(&device_code)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(new_hash, old_hash, "cooldown must not re-mint the PIN");
+        assert_eq!(new_token, old_token, "cooldown must not re-mint the token");
+
+        let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(&pubkey)
             .execute(&pool)
             .await;
     }

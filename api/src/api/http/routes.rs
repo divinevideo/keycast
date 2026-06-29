@@ -224,6 +224,7 @@ pub fn api_routes(
         .route("/headless/login", post(headless::headless_login))
         .route("/headless/authorize", post(headless::headless_authorize))
         .route("/headless/verify-pin", post(headless::headless_verify_pin))
+        .route("/headless/resend-pin", post(headless::headless_resend_pin))
         .with_state(auth_state.clone());
 
     // Admin routes (for preloaded accounts and claim tokens)
