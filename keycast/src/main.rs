@@ -48,41 +48,71 @@ use zeroize::Zeroizing;
 const READYZ_DB_TIMEOUT: Duration = Duration::from_millis(800);
 
 /// Duration the process pauses between flipping the readiness probe to 503
-/// and starting to drain accepted connections. This is the window during which
-/// Kubernetes observes the failing probe and removes the pod from the Service
-/// EndpointSlice so the load balancer stops routing new traffic to us. Keeping
-/// this out of the drain budget is critical — otherwise new NIP-46 sign
-/// requests arriving during these seconds would be rejected mid-request and
-/// trigger client-side reconnect storms on scale-down. Override with
-/// `SHUTDOWN_PRE_DRAIN_SECS` (e.g. `0` in local dev / tests).
-const DEFAULT_SHUTDOWN_PRE_DRAIN_SECS: u64 = 10;
+/// and starting to drain accepted connections. On GKE this is the window during
+/// which the pod's deletion triggers endpoint/NEG detach (the Pod is removed
+/// from the Service EndpointSlice and the GCLB NEG) so the load balancer stops
+/// routing new traffic to us; the readiness probe flipping to 503 only
+/// *reinforces* this — it is the Pod's `deletionTimestamp`, not a failing
+/// readiness probe, that drives endpoint removal on a normal scale-down. NEG
+/// detach propagation can take >10s, so the default covers a conservative upper
+/// bound. Keeping this out of the drain budget is critical — otherwise new
+/// NIP-46 sign requests arriving during these seconds would be rejected
+/// mid-request and trigger client-side reconnect storms on scale-down.
+///
+/// Cloud Run has **no** readiness-probe-driven endpoint removal: a terminating
+/// instance is removed from routing by the platform, and peer rebalancing comes
+/// from the cluster coordinator's `leave` event (see the SIGTERM-time
+/// deregister in `async_main`), not from this pause. Set
+/// `SHUTDOWN_PRE_DRAIN_SECS=0` there. Override with `SHUTDOWN_PRE_DRAIN_SECS`
+/// (e.g. `0` in local dev / tests).
+const DEFAULT_SHUTDOWN_PRE_DRAIN_SECS: u64 = 15;
 
 /// Maximum time we wait for axum to drain in-flight HTTP requests after we
 /// stop accepting new connections. The sum of `pre_drain + http_drain +
-/// signer_drain` plus ~5–10s of teardown headroom must fit inside the
-/// Deployment's `terminationGracePeriodSeconds` — otherwise the kubelet
-/// SIGKILLs us mid-drain. Default sized for `terminationGracePeriodSeconds: 75`.
-/// Override with `SHUTDOWN_HTTP_DRAIN_SECS`.
-const DEFAULT_SHUTDOWN_HTTP_DRAIN_SECS: u64 = 45;
+/// signer_drain` plus the teardown margin must fit inside the Deployment's
+/// `terminationGracePeriodSeconds` — otherwise the kubelet SIGKILLs us
+/// mid-drain. Defaults are sized so `pre_drain(15) + http_drain(40) +
+/// signer_drain(10) + margin(10) = 75` fits `terminationGracePeriodSeconds: 75`
+/// exactly. When the configured budget does not fit the ceiling it is clamped
+/// down proportionally at runtime (see `clamp_shutdown_timings`). Override with
+/// `SHUTDOWN_HTTP_DRAIN_SECS`.
+const DEFAULT_SHUTDOWN_HTTP_DRAIN_SECS: u64 = 40;
 
 /// Maximum time we wait for the relay queue, NIP-46 signer, and tracked
 /// background tasks to finish before/while tearing down the relay client.
 /// Override with `SHUTDOWN_SIGNER_DRAIN_SECS`.
 const DEFAULT_SHUTDOWN_SIGNER_DRAIN_SECS: u64 = 10;
 
-/// Conservative upper bound on the Deployment's `terminationGracePeriodSeconds`
-/// used at startup to sanity-check the shutdown phase budgets. The default must
-/// match the intended Deployment grace period so validation cannot pass against
-/// a ceiling higher than the kubelet actually enforces. If an operator bumps
-/// grace higher they can raise this via `SHUTDOWN_GRACE_PERIOD_CEILING_SECS`.
-/// This constant does NOT change kubelet behavior — it is purely a guardrail.
+/// Upper bound on the platform's post-SIGTERM grace (the kubelet's
+/// `terminationGracePeriodSeconds` on GKE, or the ~10s SIGTERM→SIGKILL window
+/// on Cloud Run) used to size and clamp the shutdown phase budgets.
+///
+/// **This default must be set per deployment** — it does NOT change platform
+/// behavior, it only tells keycast how much grace it actually has so the phased
+/// drain provably fits. The default of 75 matches the intended GKE grace
+/// (`terminationGracePeriodSeconds: 75`) ONLY; Cloud Run, which enforces ~10s,
+/// MUST set `SHUTDOWN_GRACE_PERIOD_CEILING_SECS=10` (see `cloudbuild.yaml`).
+/// Leaving the default on a platform with a smaller real grace would let the
+/// full budget run and be SIGKILLed mid-drain. When the configured budget
+/// exceeds the ceiling it is clamped down proportionally at runtime rather than
+/// run as-is (see `clamp_shutdown_timings`). Override with
+/// `SHUTDOWN_GRACE_PERIOD_CEILING_SECS`.
 const DEFAULT_SHUTDOWN_GRACE_CEILING_SECS: u64 = 75;
 
-/// Headroom reserved between the end of the phased drain and the kubelet
+/// Headroom reserved between the end of the phased drain and the platform
 /// SIGKILL for DB pool close, tracing flush, and other post-drain cleanup.
-/// Subtracted from the ceiling when validating that the configured phase
-/// budgets fit.
-const SHUTDOWN_TEARDOWN_MARGIN: Duration = Duration::from_secs(10);
+/// Subtracted from the ceiling when sizing/clamping the phase budgets and used
+/// as the phase-4 pool-close bound. Configurable because on a tight grace
+/// (Cloud Run's ~10s) the GKE-sized 10s margin alone would consume the whole
+/// ceiling; there it must be set small (1–2s) via `SHUTDOWN_TEARDOWN_MARGIN_SECS`.
+const DEFAULT_SHUTDOWN_TEARDOWN_MARGIN_SECS: u64 = 10;
+
+/// Headroom carved out of the teardown margin for the final "Graceful shutdown
+/// complete" log line (and tracing flush) to be emitted *after* the DB pool
+/// close future resolves but *before* the platform SIGKILL. The phase-4 pool
+/// close is bounded by `teardown_margin - this` so the success/timeout log
+/// always has time to flush.
+const POOL_CLOSE_LOG_HEADROOM: Duration = Duration::from_secs(2);
 
 /// Per-field sanity ceiling on each `SHUTDOWN_*_SECS` env var. Values above
 /// this fall back to the per-field default with a warning. 1 day is far
@@ -106,9 +136,9 @@ struct ShutdownTimings {
 }
 
 impl ShutdownTimings {
-    /// Sum of all three phase durations. Does NOT include
-    /// `SHUTDOWN_TEARDOWN_MARGIN` — add that separately when comparing
-    /// against a grace-period ceiling.
+    /// Sum of all three phase durations. Does NOT include the teardown
+    /// margin — add that separately when comparing against a grace-period
+    /// ceiling.
     fn total_budget(&self) -> Duration {
         self.pre_drain + self.http_drain + self.signer_drain
     }
@@ -180,32 +210,58 @@ fn parse_shutdown_grace_ceiling() -> Duration {
     )
 }
 
-/// Check that `timings.total_budget() + SHUTDOWN_TEARDOWN_MARGIN <= ceiling`.
+/// Parse the teardown margin (post-drain headroom for DB pool close, tracing
+/// flush, and process teardown). Override with `SHUTDOWN_TEARDOWN_MARGIN_SECS`.
+fn parse_shutdown_teardown_margin() -> Duration {
+    parse_duration_secs_env(
+        "SHUTDOWN_TEARDOWN_MARGIN_SECS",
+        DEFAULT_SHUTDOWN_TEARDOWN_MARGIN_SECS,
+    )
+}
+
+/// Whether `SHUTDOWN_PRE_DRAIN_SECS` was explicitly set to a valid value.
+///
+/// Used by `clamp_shutdown_timings` to decide whether the pre-drain pause is
+/// load-bearing (operator chose it deliberately — e.g. to cover GKE NEG-detach
+/// propagation, or `0` on Cloud Run) and must be preserved when clamping, or
+/// is merely the built-in default and may be scaled down with the drains to
+/// fit a tight ceiling.
+fn pre_drain_was_explicitly_set() -> bool {
+    matches!(
+        env::var("SHUTDOWN_PRE_DRAIN_SECS"),
+        Ok(raw) if raw
+            .trim()
+            .parse::<u64>()
+            .map(|secs| secs <= SHUTDOWN_PER_FIELD_CEILING_SECS)
+            .unwrap_or(false)
+    )
+}
+
+/// Check that `timings.total_budget() + margin <= ceiling`.
 /// The margin is the reserved headroom for DB pool close, tracing flush, and
-/// process teardown between the end of the phased drain and the kubelet
-/// SIGKILL at `terminationGracePeriodSeconds`. Exact equality is accepted
-/// (the margin fully fits); anything larger is rejected.
+/// process teardown between the end of the phased drain and the platform
+/// SIGKILL. Exact equality is accepted (the margin fully fits); anything
+/// larger is rejected.
 ///
 /// Returned `Err(String)` is operator-actionable and includes the current
-/// budget, margin, and ceiling so it can be dropped straight into a log
-/// line. We deliberately warn (not abort) on violation at the call site:
-/// the ceiling is cross-repo-coupled to the iac repo, and an operator may
-/// legitimately need to boot ahead of an iac-side grace bump.
-///
-/// TODO(#692): remove the soft-warning fallback in `async_main` once the
-/// sibling divinevideo/divine-iac-coreconfig PR lands and `terminationGracePeriodSeconds`
-/// is pinned at ≥75s in all environments.
-fn validate_shutdown_timings(timings: &ShutdownTimings, ceiling: Duration) -> Result<(), String> {
+/// budget, margin, and ceiling so it can be dropped straight into a log line.
+/// This is the predicate `clamp_shutdown_timings` uses to decide whether the
+/// configured budget must be scaled down to fit the platform grace.
+fn validate_shutdown_timings(
+    timings: &ShutdownTimings,
+    ceiling: Duration,
+    margin: Duration,
+) -> Result<(), String> {
     let total = timings.total_budget();
-    let required = total + SHUTDOWN_TEARDOWN_MARGIN;
+    let required = total + margin;
     if required > ceiling {
         Err(format!(
             "shutdown phase budget ({total_secs}s) + teardown margin ({margin_secs}s) \
              = {required_secs}s does not fit inside SHUTDOWN_GRACE_PERIOD_CEILING_SECS \
              = {ceiling_secs}s (pre_drain={pre}s, http_drain={http}s, signer_drain={sig}s); \
-             the kubelet will SIGKILL mid-drain on terminationGracePeriodSeconds",
+             the platform will SIGKILL mid-drain at its grace period",
             total_secs = total.as_secs(),
-            margin_secs = SHUTDOWN_TEARDOWN_MARGIN.as_secs(),
+            margin_secs = margin.as_secs(),
             required_secs = required.as_secs(),
             ceiling_secs = ceiling.as_secs(),
             pre = timings.pre_drain.as_secs(),
@@ -214,6 +270,104 @@ fn validate_shutdown_timings(timings: &ShutdownTimings, ceiling: Duration) -> Re
         ))
     } else {
         Ok(())
+    }
+}
+
+/// Outcome of clamping the configured phase budget against the platform grace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClampedTimings {
+    timings: ShutdownTimings,
+    /// True when the configured budget did not fit and was scaled down.
+    clamped: bool,
+}
+
+/// Scale the phase budget down so it provably fits the platform grace:
+/// `pre_drain + http_drain + signer_drain + margin <= ceiling`.
+///
+/// If the configured budget already fits, the timings are returned unchanged
+/// with `clamped == false`. Otherwise the phases are reduced into the
+/// `available = ceiling - margin` window:
+///
+/// - When `pre_drain_explicit` is true the pre-drain pause is load-bearing
+///   (the operator chose it — e.g. to cover GKE NEG-detach propagation, or `0`
+///   on Cloud Run), so it is preserved (capped at `available`) and only
+///   `http_drain`/`signer_drain` are scaled proportionally into the remainder.
+/// - Otherwise pre_drain is just the built-in default and is scaled
+///   proportionally alongside the drains, so a tight ceiling does not get its
+///   whole budget eaten by an unconfigured pre-drain.
+///
+/// Proportional scaling uses millisecond integer math and floors each result,
+/// so the clamped sum is always `<= available` (never overshoots the ceiling).
+fn clamp_shutdown_timings(
+    timings: ShutdownTimings,
+    ceiling: Duration,
+    margin: Duration,
+    pre_drain_explicit: bool,
+) -> ClampedTimings {
+    let available = ceiling.saturating_sub(margin);
+    if timings.total_budget() <= available {
+        return ClampedTimings {
+            timings,
+            clamped: false,
+        };
+    }
+
+    // pre_drain kept fixed (capped) when explicit; otherwise it joins the
+    // proportional pool with the two drains.
+    let (kept_pre, scalable_pre) = if pre_drain_explicit {
+        (timings.pre_drain.min(available), Duration::ZERO)
+    } else {
+        (Duration::ZERO, timings.pre_drain)
+    };
+
+    let remaining = available.saturating_sub(kept_pre);
+    let scalable_total = scalable_pre + timings.http_drain + timings.signer_drain;
+
+    // Scale `d` into `remaining` by the share it holds of `scalable_total`.
+    let scale = |d: Duration| -> Duration {
+        if scalable_total.is_zero() {
+            Duration::ZERO
+        } else {
+            let scaled_ms = d.as_millis() * remaining.as_millis() / scalable_total.as_millis();
+            Duration::from_millis(scaled_ms as u64)
+        }
+    };
+
+    ClampedTimings {
+        timings: ShutdownTimings {
+            pre_drain: kept_pre + scale(scalable_pre),
+            http_drain: scale(timings.http_drain),
+            signer_drain: scale(timings.signer_drain),
+        },
+        clamped: true,
+    }
+}
+
+/// The effective shutdown plan resolved from the environment: the
+/// operator-configured timings, the clamped (effective) timings, the grace
+/// ceiling, and the teardown margin. Resolved once at startup (for the
+/// fits/clamped log) and once at shutdown (for the real phase budgets) so both
+/// paths apply identical clamping.
+struct ShutdownPlan {
+    configured: ShutdownTimings,
+    clamped: ClampedTimings,
+    ceiling: Duration,
+    margin: Duration,
+}
+
+/// Parse phase timings, ceiling, and teardown margin from the environment and
+/// clamp the phases so they provably fit the grace ceiling.
+fn resolve_shutdown_plan() -> ShutdownPlan {
+    let configured = parse_shutdown_timings();
+    let ceiling = parse_shutdown_grace_ceiling();
+    let margin = parse_shutdown_teardown_margin();
+    let clamped =
+        clamp_shutdown_timings(configured, ceiling, margin, pre_drain_was_explicitly_set());
+    ShutdownPlan {
+        configured,
+        clamped,
+        ceiling,
+        margin,
     }
 }
 
@@ -236,22 +390,22 @@ enum PoolCloseOutcome {
     /// emit the clean "Graceful shutdown complete" log.
     Completed,
     /// The margin elapsed before the pool finished. The caller logs a
-    /// warning and proceeds — the kubelet SIGKILL at
-    /// `terminationGracePeriodSeconds` is the final backstop.
+    /// warning and proceeds — the platform SIGKILL at the grace period is the
+    /// final backstop.
     TimedOut,
 }
 
 /// Await `close_fut` for up to `margin`. If it finishes in time, return
 /// `Completed`; otherwise return `TimedOut`. The close future is dropped on
 /// timeout — sqlx's `Pool::close()` is cancellation-safe, and we would not
-/// gain anything by continuing to await past the documented margin when the
-/// kubelet is about to SIGKILL us anyway.
+/// gain anything by continuing to await past the margin when the platform is
+/// about to SIGKILL us anyway.
 ///
-/// This enforces `SHUTDOWN_TEARDOWN_MARGIN` as a real bound on phase 4 so a
-/// stuck DB connection (e.g. a preload task mid-query when
+/// This enforces the teardown margin (less `POOL_CLOSE_LOG_HEADROOM`) as a real
+/// bound on phase 4 so a stuck DB connection (e.g. a preload task mid-query when
 /// `task_tracker.wait()` timed out and `signer_handle.abort()` was called
-/// but not awaited) cannot block past `terminationGracePeriodSeconds` and
-/// swallow the final "Graceful shutdown complete" log.
+/// but not awaited) cannot block past the platform SIGKILL and swallow the
+/// final "Graceful shutdown complete" log.
 ///
 /// Generic over `F: Future<Output = ()>` so we can exercise the timeout
 /// behaviour deterministically with `tokio::time::pause` in tests without
@@ -273,10 +427,14 @@ enum HttpDrainOutcome {
     /// The server finished its graceful-shutdown future before the budget ran
     /// out. Join errors are logged by the caller but do not change the phase.
     Completed,
-    /// The budget expired before the server finished. The task was aborted
-    /// and awaited to cancellation; the caller can safely proceed to phase 3
-    /// (relay teardown) and phase 4 (DB pool close) without racing a
-    /// still-live accept loop.
+    /// The budget expired before the server finished. The server task was
+    /// aborted and awaited to cancellation, which stops the **accept loop** so
+    /// the caller can proceed to phase 3 (relay teardown) and phase 4 (DB pool
+    /// close) without racing a still-live accept loop. Note this does NOT
+    /// guarantee every in-flight per-connection task is finished — hyper's
+    /// per-connection tasks are not children of the aborted handle and may
+    /// still be running; phase 4's bounded pool close covers any that linger
+    /// holding a DB connection.
     AbortedAfterTimeout,
 }
 
@@ -328,9 +486,9 @@ fn abort_join_handles(handles: &[tokio::task::AbortHandle]) {
 /// relay worker) hangs.
 ///
 /// Why one shared budget, not two independent ones: the design contract
-/// enforced by `validate_shutdown_timings` is
-/// `pre_drain + http_drain + signer_drain + SHUTDOWN_TEARDOWN_MARGIN
-/// <= terminationGracePeriodSeconds`. If each inner await got its own
+/// enforced by `validate_shutdown_timings`/`clamp_shutdown_timings` is
+/// `pre_drain + http_drain + signer_drain + teardown_margin
+/// <= grace ceiling`. If each inner await got its own
 /// `budget`-sized timeout, phase 3 could take up to `2 * signer_drain`
 /// in the worst case and silently bust the contract.
 ///
@@ -970,40 +1128,49 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         instance_id, cpu_count, worker_threads, pool_size
     );
 
-    // Validate the shutdown phase budget against the configured grace-period
-    // ceiling as a startup-time sanity check. This is defense in depth against
-    // (a) an operator setting e.g. `SHUTDOWN_HTTP_DRAIN_SECS=120` against a
-    // 75s grace period and (b) the sibling divinevideo/divine-iac-coreconfig
-    // PR (tracked in issue #692) landing with `terminationGracePeriodSeconds`
-    // below the configured defaults. We log a loud warning rather than
-    // refusing to boot: the ceiling is cross-repo-coupled, and an operator
-    // may legitimately need to start before the iac repo catches up.
-    // TODO(#692): remove the warn-only fallback once the iac-side PR pins
-    // `terminationGracePeriodSeconds` to ≥75s in every environment.
+    // Resolve and log the effective shutdown phase budget at startup. The
+    // configured budget is clamped to provably fit the configured grace
+    // ceiling (`SHUTDOWN_GRACE_PERIOD_CEILING_SECS`, which must be set to the
+    // platform's real post-SIGTERM grace — ~10s on Cloud Run, 75s on GKE). If
+    // the operator-configured budget does not fit (e.g. `SHUTDOWN_HTTP_DRAIN_SECS=120`
+    // against a 75s ceiling, or the GKE-sized defaults against a 10s Cloud Run
+    // ceiling), the phases are scaled down proportionally at runtime rather
+    // than run as-is and SIGKILLed mid-drain. We log the clamp loudly so the
+    // operator can retune; we do not refuse to boot.
     {
-        let startup_timings = parse_shutdown_timings();
-        let grace_ceiling = parse_shutdown_grace_ceiling();
-        match validate_shutdown_timings(&startup_timings, grace_ceiling) {
-            Ok(()) => {
-                tracing::info!(
-                    pre_drain_secs = startup_timings.pre_drain.as_secs(),
-                    http_drain_secs = startup_timings.http_drain.as_secs(),
-                    signer_drain_secs = startup_timings.signer_drain.as_secs(),
-                    grace_ceiling_secs = grace_ceiling.as_secs(),
-                    "Shutdown phase budget fits inside configured grace ceiling"
-                );
-            }
-            Err(err) => {
-                tracing::warn!(
-                    event = "shutdown_budget_exceeds_grace_ceiling",
-                    pre_drain_secs = startup_timings.pre_drain.as_secs(),
-                    http_drain_secs = startup_timings.http_drain.as_secs(),
-                    signer_drain_secs = startup_timings.signer_drain.as_secs(),
-                    grace_ceiling_secs = grace_ceiling.as_secs(),
+        let plan = resolve_shutdown_plan();
+        if plan.clamped.clamped {
+            let eff = plan.clamped.timings;
+            tracing::warn!(
+                event = "shutdown_budget_clamped_to_grace_ceiling",
+                configured_pre_drain_secs = plan.configured.pre_drain.as_secs(),
+                configured_http_drain_secs = plan.configured.http_drain.as_secs(),
+                configured_signer_drain_secs = plan.configured.signer_drain.as_secs(),
+                effective_pre_drain_secs = eff.pre_drain.as_secs(),
+                effective_http_drain_secs = eff.http_drain.as_secs(),
+                effective_signer_drain_secs = eff.signer_drain.as_secs(),
+                teardown_margin_secs = plan.margin.as_secs(),
+                grace_ceiling_secs = plan.ceiling.as_secs(),
+                "Configured shutdown phase budget exceeds the grace ceiling; phases clamped down proportionally to fit"
+            );
+            if let Err(err) = validate_shutdown_timings(&eff, plan.ceiling, plan.margin) {
+                // Should be unreachable: clamp guarantees a fit. Surface loudly
+                // if the invariant is ever broken.
+                tracing::error!(
+                    event = "shutdown_budget_clamp_invariant_violated",
                     "{}",
                     err
                 );
             }
+        } else {
+            tracing::info!(
+                pre_drain_secs = plan.clamped.timings.pre_drain.as_secs(),
+                http_drain_secs = plan.clamped.timings.http_drain.as_secs(),
+                signer_drain_secs = plan.clamped.timings.signer_drain.as_secs(),
+                teardown_margin_secs = plan.margin.as_secs(),
+                grace_ceiling_secs = plan.ceiling.as_secs(),
+                "Shutdown phase budget fits inside configured grace ceiling"
+            );
         }
     }
 
@@ -1503,17 +1670,22 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
 
     // --- Graceful shutdown ---
     //
-    // Phase ordering matters. On scale-down events Kubernetes sends SIGTERM
-    // and *also* starts removing the pod from the Service EndpointSlice based
-    // on the readiness probe, but endpoint-slice propagation is asynchronous.
-    // If we stop accepting connections the instant we see SIGTERM, the LB may
-    // still be routing new NIP-46 / HTTP requests to us for several seconds
-    // and those requests fail mid-flight — the exact client-reconnect storm
-    // that issue #692 targets.
+    // Phase ordering matters. On scale-down the platform sends SIGTERM and
+    // *also* starts removing the instance from load-balancer routing, but that
+    // removal is asynchronous. On GKE the Pod's `deletionTimestamp` (not a
+    // failing readiness probe) drives endpoint/NEG detach from the Service
+    // EndpointSlice and the GCLB NEG; the readiness probe flipping to 503 only
+    // reinforces it. On Cloud Run the platform stops routing to a terminating
+    // instance directly. Either way propagation lags SIGTERM by seconds. If we
+    // stop accepting connections the instant we see SIGTERM, the LB may still
+    // be routing new NIP-46 / HTTP requests to us and those fail mid-flight —
+    // the exact client-reconnect storm that issue #692 targets.
     //
     // So the sequence is:
-    //   1. Flip `/healthz/ready` to 503 and sleep `pre_drain`. Kubelet observes
-    //      the failing probe; the Service controller removes us from endpoints.
+    //   1. Flip `/healthz/ready` to 503 and sleep `pre_drain` so endpoint/NEG
+    //      detach (GKE) propagates before we stop accepting. On Cloud Run there
+    //      is no readiness-driven endpoint removal, so `pre_drain` is set to 0
+    //      and peer rebalancing comes from the cluster coordinator `leave`.
     //   2. Stop accepting new HTTP connections (axum `.with_graceful_shutdown`
     //      future resolves) and wait up to `http_drain` for in-flight requests.
     //   3. Tear down the NIP-46 relay client (which stops `signer.run()` and
@@ -1521,11 +1693,25 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     //      tracked background tasks.
     //   4. Close the DB pool.
     //
-    // Sum of `pre_drain + http_drain + signer_drain` + DB-pool-close headroom
-    // must fit inside the Deployment's `terminationGracePeriodSeconds` or the
-    // kubelet SIGKILLs us mid-drain.
-    let timings = parse_shutdown_timings();
+    // The effective budget `pre_drain + http_drain + signer_drain +
+    // teardown_margin` is clamped at resolve time to fit the configured grace
+    // ceiling (`SHUTDOWN_GRACE_PERIOD_CEILING_SECS`) so the platform does not
+    // SIGKILL us mid-drain.
+    let plan = resolve_shutdown_plan();
+    let timings = plan.clamped.timings;
+    let teardown_margin = plan.margin;
     let shutdown_started_at = std::time::Instant::now();
+    if plan.clamped.clamped {
+        tracing::warn!(
+            event = "shutdown_budget_clamped_to_grace_ceiling",
+            effective_pre_drain_secs = timings.pre_drain.as_secs(),
+            effective_http_drain_secs = timings.http_drain.as_secs(),
+            effective_signer_drain_secs = timings.signer_drain.as_secs(),
+            teardown_margin_secs = teardown_margin.as_secs(),
+            grace_ceiling_secs = plan.ceiling.as_secs(),
+            "Graceful shutdown: configured budget exceeds grace ceiling; using clamped phase budget"
+        );
+    }
     tracing::info!(
         pre_drain_secs = timings.pre_drain.as_secs(),
         http_drain_secs = timings.http_drain.as_secs(),
@@ -1533,8 +1719,8 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         "Graceful shutdown: starting pre-drain phase (readiness now 503)"
     );
 
-    // Phase 1: flip readiness and sleep so K8s can remove us from the Service
-    // endpoints before we stop accepting.
+    // Phase 1: flip readiness and sleep so endpoint/NEG detach (GKE) propagates
+    // before we stop accepting.
     pre_drain_pause(&shutting_down, timings.pre_drain).await;
 
     // Phase 2: tell axum to stop accepting new HTTP connections and wait for
@@ -1550,15 +1736,19 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     match drain_http_or_abort(api_handle, timings.http_drain).await {
         HttpDrainOutcome::Completed => {}
         HttpDrainOutcome::AbortedAfterTimeout => {
-            // Axum did not finish its graceful-shutdown future in time, so
-            // we aborted the task. Log at warn — this means either (a) a
-            // handler hung for longer than the drain budget, or (b) there
-            // are stuck upstream connections. Either way, phase 3 (relay
-            // teardown) and phase 4 (DB pool close) can now proceed
-            // without racing a still-live accept loop.
+            // Axum did not finish its graceful-shutdown future in time, so we
+            // aborted the server task. Log at warn — this means either (a) a
+            // handler hung for longer than the drain budget, or (b) there are
+            // stuck upstream connections. Aborting the server task stops the
+            // accept loop, but per-connection tasks spawned by hyper are NOT
+            // children of this handle and may still be running; phase 4's
+            // bounded pool close is what ultimately covers any of those still
+            // holding a DB connection. The point of the abort is to stop
+            // accepting *new* connections so phase 3 (relay teardown) and
+            // phase 4 (DB pool close) don't race a still-live accept loop.
             tracing::warn!(
                 http_drain_secs = timings.http_drain.as_secs(),
-                "API server shutdown timed out; axum task aborted to prevent DB pool close from racing late requests"
+                "API server shutdown timed out; axum accept loop aborted (in-flight connection tasks may still run; bounded DB pool close covers any lingering ones)"
             );
         }
     }
@@ -1607,14 +1797,16 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         }
     }
 
-    // Phase 4: close database pool. Bounded by SHUTDOWN_TEARDOWN_MARGIN so
-    // a connection stuck in a long-running query (e.g. a tenant-cache
-    // preload task mid-query when task_tracker.wait() timed out and
-    // signer_handle.abort() was called but not awaited) cannot block past
-    // the kubelet SIGKILL and swallow the final "Graceful shutdown
-    // complete" log. sqlx's Pool::close is cancellation-safe, so dropping
-    // the future on timeout is safe.
-    match close_within_margin(pool_for_shutdown.close(), SHUTDOWN_TEARDOWN_MARGIN).await {
+    // Phase 4: close database pool. Bounded by the teardown margin less
+    // POOL_CLOSE_LOG_HEADROOM so a connection stuck in a long-running query
+    // (e.g. a tenant-cache preload task mid-query when task_tracker.wait()
+    // timed out and signer_handle.abort() was called but not awaited) cannot
+    // block past the platform SIGKILL. The reserved headroom guarantees the
+    // final "Graceful shutdown complete" log (and tracing flush) lands before
+    // the SIGKILL even on the timeout path. sqlx's Pool::close is
+    // cancellation-safe, so dropping the future on timeout is safe.
+    let pool_close_budget = teardown_margin.saturating_sub(POOL_CLOSE_LOG_HEADROOM);
+    match close_within_margin(pool_for_shutdown.close(), pool_close_budget).await {
         PoolCloseOutcome::Completed => {
             tracing::info!(
                 total_shutdown_secs = shutdown_started_at.elapsed().as_secs(),
@@ -1624,8 +1816,9 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         PoolCloseOutcome::TimedOut => {
             tracing::warn!(
                 total_shutdown_secs = shutdown_started_at.elapsed().as_secs(),
-                teardown_margin_secs = SHUTDOWN_TEARDOWN_MARGIN.as_secs(),
-                "Graceful shutdown complete with warning: DB pool close exceeded teardown margin; stuck checked-out connections were dropped"
+                pool_close_budget_secs = pool_close_budget.as_secs(),
+                teardown_margin_secs = teardown_margin.as_secs(),
+                "Graceful shutdown complete with warning: DB pool close exceeded its budget; stuck checked-out connections were dropped"
             );
         }
     }
@@ -2056,8 +2249,10 @@ mod tests {
         let timings = parse_shutdown_timings();
 
         // Documented defaults — see main.rs docs on graceful shutdown.
-        assert_eq!(timings.pre_drain, Duration::from_secs(10));
-        assert_eq!(timings.http_drain, Duration::from_secs(45));
+        // Sized so pre(15) + http(40) + signer(10) + margin(10) = 75 fits the
+        // intended GKE terminationGracePeriodSeconds exactly.
+        assert_eq!(timings.pre_drain, Duration::from_secs(15));
+        assert_eq!(timings.http_drain, Duration::from_secs(40));
         assert_eq!(timings.signer_drain, Duration::from_secs(10));
     }
 
@@ -2108,7 +2303,10 @@ mod tests {
 
         let timings = parse_shutdown_timings();
 
-        assert_eq!(timings.pre_drain, Duration::from_secs(10));
+        assert_eq!(
+            timings.pre_drain,
+            Duration::from_secs(DEFAULT_SHUTDOWN_PRE_DRAIN_SECS)
+        );
 
         clear_shutdown_env();
     }
@@ -2131,8 +2329,11 @@ mod tests {
 
         let timings = parse_shutdown_timings();
 
-        // Fell back to default (10s), NOT the u64::MAX-ish value.
-        assert_eq!(timings.pre_drain, Duration::from_secs(10));
+        // Fell back to the default, NOT the u64::MAX-ish value.
+        assert_eq!(
+            timings.pre_drain,
+            Duration::from_secs(DEFAULT_SHUTDOWN_PRE_DRAIN_SECS)
+        );
 
         // And the downstream total_budget() MUST NOT panic. This is the
         // actual safety property — the validate-and-warn path must be
@@ -2310,8 +2511,9 @@ mod tests {
             signer_drain: Duration::from_secs(10),
         };
 
-        assert!(validate_shutdown_timings(&t, Duration::from_secs(75)).is_ok());
-        assert!(validate_shutdown_timings(&t, Duration::from_secs(90)).is_ok());
+        let margin = Duration::from_secs(10);
+        assert!(validate_shutdown_timings(&t, Duration::from_secs(75), margin).is_ok());
+        assert!(validate_shutdown_timings(&t, Duration::from_secs(90), margin).is_ok());
     }
 
     #[test]
@@ -2327,7 +2529,7 @@ mod tests {
             signer_drain: Duration::from_secs(10),
         };
 
-        let err = validate_shutdown_timings(&t, Duration::from_secs(60))
+        let err = validate_shutdown_timings(&t, Duration::from_secs(60), Duration::from_secs(10))
             .expect_err("65s budget + 10s margin must not fit in 60s ceiling");
         // Error message should be operator-actionable: include the total,
         // the margin, and the ceiling so they can tune either side.
@@ -2345,7 +2547,10 @@ mod tests {
             signer_drain: Duration::from_secs(10),
         };
 
-        assert!(validate_shutdown_timings(&t, Duration::from_secs(75)).is_err());
+        assert!(
+            validate_shutdown_timings(&t, Duration::from_secs(75), Duration::from_secs(10))
+                .is_err()
+        );
     }
 
     // --- HTTP drain abort-on-timeout ---
@@ -2423,23 +2628,201 @@ mod tests {
 
     #[test]
     fn test_validate_shutdown_timings_boundary_exactly_at_ceiling() {
-        // total_budget + SHUTDOWN_TEARDOWN_MARGIN = 65 + 10 = 75.
+        // total_budget + teardown margin = 65 + 10 = 75.
         // A ceiling of 75 means the teardown margin exactly fits — that is
         // precisely what the margin is reserved for, so accept. The iac
         // PR's terminationGracePeriodSeconds=75s should validate cleanly
-        // against the defaults with no operator action.
+        // against these timings with no operator action.
         let t = ShutdownTimings {
             pre_drain: Duration::from_secs(10),
             http_drain: Duration::from_secs(45),
             signer_drain: Duration::from_secs(10),
         };
 
+        let margin = Duration::from_secs(10);
         // Exactly the ceiling: OK (margin fits).
-        assert!(validate_shutdown_timings(&t, Duration::from_secs(75)).is_ok());
+        assert!(validate_shutdown_timings(&t, Duration::from_secs(75), margin).is_ok());
         // One second below: reject — margin no longer fits.
-        assert!(validate_shutdown_timings(&t, Duration::from_secs(74)).is_err());
+        assert!(validate_shutdown_timings(&t, Duration::from_secs(74), margin).is_err());
         // One second above: OK — extra headroom.
-        assert!(validate_shutdown_timings(&t, Duration::from_secs(76)).is_ok());
+        assert!(validate_shutdown_timings(&t, Duration::from_secs(76), margin).is_ok());
+    }
+
+    #[test]
+    fn test_default_timings_fit_default_ceiling_without_clamping() {
+        // The shipped defaults (pre=15, http=40, signer=10) plus the default
+        // margin (10) must fit the default GKE ceiling (75) exactly so the
+        // normal GKE path never clamps.
+        let defaults = ShutdownTimings {
+            pre_drain: Duration::from_secs(DEFAULT_SHUTDOWN_PRE_DRAIN_SECS),
+            http_drain: Duration::from_secs(DEFAULT_SHUTDOWN_HTTP_DRAIN_SECS),
+            signer_drain: Duration::from_secs(DEFAULT_SHUTDOWN_SIGNER_DRAIN_SECS),
+        };
+        let ceiling = Duration::from_secs(DEFAULT_SHUTDOWN_GRACE_CEILING_SECS);
+        let margin = Duration::from_secs(DEFAULT_SHUTDOWN_TEARDOWN_MARGIN_SECS);
+
+        assert!(validate_shutdown_timings(&defaults, ceiling, margin).is_ok());
+        // pre_drain explicitly set or not, an already-fitting budget is never
+        // clamped.
+        for explicit in [true, false] {
+            let result = clamp_shutdown_timings(defaults, ceiling, margin, explicit);
+            assert!(
+                !result.clamped,
+                "defaults must not be clamped (explicit={explicit})"
+            );
+            assert_eq!(result.timings, defaults);
+        }
+    }
+
+    // --- Teardown margin parsing ---
+
+    fn clear_shutdown_margin_env() {
+        std::env::remove_var("SHUTDOWN_TEARDOWN_MARGIN_SECS");
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_shutdown_teardown_margin_default() {
+        clear_shutdown_margin_env();
+        assert_eq!(parse_shutdown_teardown_margin(), Duration::from_secs(10));
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_shutdown_teardown_margin_override() {
+        clear_shutdown_margin_env();
+        std::env::set_var("SHUTDOWN_TEARDOWN_MARGIN_SECS", "2");
+        assert_eq!(parse_shutdown_teardown_margin(), Duration::from_secs(2));
+        clear_shutdown_margin_env();
+    }
+
+    #[test]
+    #[serial]
+    fn test_pre_drain_explicit_detection() {
+        clear_shutdown_env();
+        assert!(
+            !pre_drain_was_explicitly_set(),
+            "unset must not count as explicit"
+        );
+
+        std::env::set_var("SHUTDOWN_PRE_DRAIN_SECS", "0");
+        assert!(
+            pre_drain_was_explicitly_set(),
+            "an explicit 0 must count as set"
+        );
+
+        std::env::set_var("SHUTDOWN_PRE_DRAIN_SECS", "not-a-number");
+        assert!(
+            !pre_drain_was_explicitly_set(),
+            "an unparseable value falls back to default and must not count as explicit"
+        );
+        clear_shutdown_env();
+    }
+
+    // --- Clamp shutdown timings ---
+    //
+    // The clamp makes the phased drain provably fit whatever post-SIGTERM grace
+    // the platform actually enforces. The GKE-sized defaults validate cleanly
+    // against a 75s ceiling but bust a Cloud Run ~10s ceiling; rather than run
+    // the full budget and get SIGKILLed mid-drain, the phases are scaled down.
+
+    #[test]
+    fn test_clamp_scales_drains_into_cloud_run_ceiling_keeping_explicit_pre_drain() {
+        // Cloud Run: pre_drain explicitly 0, tiny ceiling, small margin. The
+        // two drains must be scaled to fit `ceiling - margin = 8`.
+        let configured = ShutdownTimings {
+            pre_drain: Duration::ZERO,
+            http_drain: Duration::from_secs(40),
+            signer_drain: Duration::from_secs(10),
+        };
+        let ceiling = Duration::from_secs(10);
+        let margin = Duration::from_secs(2);
+
+        let result = clamp_shutdown_timings(configured, ceiling, margin, /* explicit */ true);
+
+        assert!(
+            result.clamped,
+            "GKE-sized drains must be clamped to a 10s ceiling"
+        );
+        assert_eq!(
+            result.timings.pre_drain,
+            Duration::ZERO,
+            "explicit pre_drain preserved"
+        );
+        // Must provably fit, with the margin reserved.
+        assert!(
+            result.timings.total_budget() + margin <= ceiling,
+            "clamped budget {:?} + margin {:?} must fit ceiling {:?}",
+            result.timings.total_budget(),
+            margin,
+            ceiling
+        );
+        // Proportions roughly preserved (http was 4x signer): http stays larger.
+        assert!(result.timings.http_drain > result.timings.signer_drain);
+    }
+
+    #[test]
+    fn test_clamp_scales_pre_drain_too_when_not_explicit() {
+        // Default (non-explicit) pre_drain against a tight ceiling: pre_drain
+        // is eligible for scaling so it does not eat the whole budget.
+        let configured = ShutdownTimings {
+            pre_drain: Duration::from_secs(15),
+            http_drain: Duration::from_secs(40),
+            signer_drain: Duration::from_secs(10),
+        };
+        let ceiling = Duration::from_secs(10);
+        let margin = Duration::from_secs(2);
+
+        let result = clamp_shutdown_timings(configured, ceiling, margin, /* explicit */ false);
+
+        assert!(result.clamped);
+        assert!(
+            result.timings.pre_drain > Duration::ZERO
+                && result.timings.pre_drain < Duration::from_secs(15),
+            "non-explicit pre_drain should be scaled down, not preserved or zeroed: {:?}",
+            result.timings.pre_drain
+        );
+        assert!(result.timings.total_budget() + margin <= ceiling);
+    }
+
+    #[test]
+    fn test_clamp_preserves_explicit_pre_drain_even_when_it_consumes_budget() {
+        // Operator explicitly demanded a large pre_drain on a tight ceiling:
+        // honor it (capped at available) and starve the drains rather than
+        // silently shrinking the endpoint-propagation wait they asked for.
+        let configured = ShutdownTimings {
+            pre_drain: Duration::from_secs(30),
+            http_drain: Duration::from_secs(40),
+            signer_drain: Duration::from_secs(10),
+        };
+        let ceiling = Duration::from_secs(10);
+        let margin = Duration::from_secs(2);
+
+        let result = clamp_shutdown_timings(configured, ceiling, margin, /* explicit */ true);
+
+        assert!(result.clamped);
+        // pre_drain capped at available (ceiling - margin = 8); drains squeezed to 0.
+        assert_eq!(result.timings.pre_drain, Duration::from_secs(8));
+        assert_eq!(result.timings.http_drain, Duration::ZERO);
+        assert_eq!(result.timings.signer_drain, Duration::ZERO);
+        assert!(result.timings.total_budget() + margin <= ceiling);
+    }
+
+    #[test]
+    fn test_clamp_noop_when_budget_fits() {
+        let configured = ShutdownTimings {
+            pre_drain: Duration::from_secs(1),
+            http_drain: Duration::from_secs(2),
+            signer_drain: Duration::from_secs(1),
+        };
+        let result = clamp_shutdown_timings(
+            configured,
+            Duration::from_secs(60),
+            Duration::from_secs(10),
+            true,
+        );
+        assert!(!result.clamped);
+        assert_eq!(result.timings, configured);
     }
 
     // --- Phase 4 bounded DB pool close ---
