@@ -122,6 +122,14 @@ const POOL_CLOSE_LOG_HEADROOM: Duration = Duration::from_secs(2);
 /// `cloudbuild.yaml` are sized to absorb this worst case.
 const CLUSTER_DEREGISTER_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Slice of the phase-3 `signer_drain` budget reserved for a best-effort relay
+/// client close (`Client::shutdown`) — graceful WebSocket close plus a flush of
+/// any already-published NIP-46 responses. It is reserved so the relay close is
+/// never starved by a slow worker/tracker drain, and it bounds the *additional*
+/// close attempt made on the drain-timeout path. Capped at half the budget so
+/// the worker/tracker drain always keeps the larger share.
+const RELAY_CLOSE_BUDGET: Duration = Duration::from_secs(2);
+
 /// Per-field sanity ceiling on each `SHUTDOWN_*_SECS` env var. Values above
 /// this fall back to the per-field default with a warning. 1 day is far
 /// above any plausible operational value (real drains are seconds, not
@@ -450,12 +458,14 @@ enum HttpDrainOutcome {
 /// tracked task drain) under the `signer_drain` budget.
 #[derive(Debug)]
 enum SignerDrainOutcome {
-    /// `client.shutdown()`, relay worker joins, and `task_tracker.wait()`
-    /// finished before the shared phase budget elapsed.
+    /// Relay worker joins, `client.shutdown()`, and `task_tracker.wait()`
+    /// finished before the drain sub-budget elapsed.
     Completed,
-    /// The shared phase budget elapsed before both futures finished. The
-    /// abort callback was invoked to stop the signer task; the caller can
-    /// safely proceed to phase 4 (DB pool close).
+    /// The drain sub-budget elapsed before the drain finished. The abort
+    /// callback was invoked to stop the signer task and the relay workers were
+    /// aborted; a best-effort bounded relay close was then attempted so the
+    /// relay client still closes gracefully. The caller can safely proceed to
+    /// phase 4 (DB pool close).
     AbortedAfterTimeout,
 }
 
@@ -480,40 +490,40 @@ fn abort_join_handles(handles: &[tokio::task::AbortHandle]) {
     }
 }
 
-/// Run phase 3 under a single shared `budget`: close the relay queue so workers
-/// drain and exit while the relay client is still connected, await
-/// `relay_worker_handles`, await `client_shutdown` (which stops `signer.run()`),
-/// then await `tracker_wait` (which waits for tracked background tasks to
-/// finish).
+/// Run phase 3 under the shared `budget`, split into a drain sub-budget and a
+/// reserved relay-close slice (`RELAY_CLOSE_BUDGET`, capped at half the budget):
 ///
-/// On timeout the caller-supplied `abort_signer` callback is invoked — in
-/// production this calls `signer_handle.abort()` — and any unfinished relay
-/// worker handles are aborted before returning `AbortedAfterTimeout`. The
-/// entire phase is bounded by `budget` via one outer `tokio::time::timeout`, so
-/// the helper returns in at most `budget` regardless of which sub-future (or
-/// relay worker) hangs.
+/// 1. **Drain** (`budget - slice`): close the relay queue so workers drain and
+///    exit while the relay client is still connected, await
+///    `relay_worker_handles`, call `client_shutdown` (which stops `signer.run()`
+///    so `tracker_wait` can complete), then await `tracker_wait`. `client_shutdown`
+///    must run before `tracker_wait` because `signer.run()` is tracked by the
+///    task tracker and only ends once the relay client disconnects.
+/// 2. **Relay close** (`slice`): on the drain-timeout path, after aborting the
+///    signer and relay workers, attempt a fresh bounded `client_shutdown` so
+///    the relay client still closes its WebSockets gracefully and flushes any
+///    already-published responses even though the drain timed out. (On the
+///    happy path the relay client was already shut down in step 1, so this slice
+///    goes unused.) `Client::shutdown` is idempotent, so the second call is
+///    safe.
 ///
-/// Why one shared budget, not two independent ones: the design contract
-/// enforced by `validate_shutdown_timings`/`clamp_shutdown_timings` is
-/// `pre_drain + http_drain + signer_drain + teardown_margin
-/// <= grace ceiling`. If each inner await got its own
-/// `budget`-sized timeout, phase 3 could take up to `2 * signer_drain`
-/// in the worst case and silently bust the contract.
+/// Returns `Completed` only when the drain finished within its sub-budget;
+/// otherwise `abort_signer` (in production `signer_handle.abort()`) and the
+/// relay worker handles are aborted and it returns `AbortedAfterTimeout`.
 ///
-/// Previously `client_shutdown` (`nostr_sdk::Client::shutdown`) was
-/// awaited unbounded in `async_main` and only the trailing `tracker_wait`
-/// was wrapped in `timeout(signer_drain, ...)`. A hung WebSocket close
-/// handshake, a bug in `Client::shutdown`, or a dead relay socket would
-/// therefore block phase 3 past the kubelet SIGKILL at
-/// `terminationGracePeriodSeconds`, swallowing phase 4 entirely. This
-/// helper makes `signer_drain` a real phase-3 bound.
+/// Budget contract: drain sub-budget + relay-close slice == `budget`, and only
+/// one of them runs the relay close, so total wall-clock never exceeds `budget`.
+/// This preserves the design contract enforced by `validate_shutdown_timings`/
+/// `clamp_shutdown_timings`: `pre_drain + http_drain + signer_drain +
+/// teardown_margin <= grace ceiling`.
 ///
-/// Generic over both inner futures and the abort callback so the timeout
-/// behaviour can be exercised deterministically with `tokio::time::pause`
-/// in tests without standing up a real `nostr_sdk::Client` or a real
-/// signer `JoinHandle`.
-async fn drain_signer_or_abort<C, Q, W, A>(
-    client_shutdown: C,
+/// `client_shutdown` is a factory (`Fn() -> Future`) rather than a single
+/// future so it can be invoked again on the timeout path. It is generic, along
+/// with the inner futures and the abort callback, so the timeout behaviour can
+/// be exercised deterministically with `tokio::time::pause` in tests without
+/// standing up a real `nostr_sdk::Client` or a real signer `JoinHandle`.
+async fn drain_signer_or_abort<CF, CFut, Q, W, A>(
+    client_shutdown: CF,
     close_relay_queue: Q,
     relay_worker_handles: Vec<tokio::task::JoinHandle<()>>,
     tracker_wait: W,
@@ -521,7 +531,8 @@ async fn drain_signer_or_abort<C, Q, W, A>(
     budget: Duration,
 ) -> SignerDrainOutcome
 where
-    C: std::future::Future<Output = ()>,
+    CF: Fn() -> CFut,
+    CFut: std::future::Future<Output = ()>,
     Q: FnOnce(),
     W: std::future::Future<Output = ()>,
     A: FnOnce(),
@@ -530,17 +541,32 @@ where
         .iter()
         .map(tokio::task::JoinHandle::abort_handle)
         .collect();
-    let combined = async move {
+
+    // Reserve a slice for the relay close so it cannot be starved by a slow
+    // drain; cap at half the budget so the drain keeps the larger share.
+    let relay_close_slice = RELAY_CLOSE_BUDGET.min(budget / 2);
+    let drain_budget = budget.saturating_sub(relay_close_slice);
+
+    // Borrow (not move) the factory into the drain future so it can be called
+    // again on the timeout path after the drain future is dropped.
+    let client_shutdown_ref = &client_shutdown;
+    let drain = async move {
         close_relay_queue();
         wait_for_join_handles(relay_worker_handles).await;
-        client_shutdown.await;
+        client_shutdown_ref().await;
         tracker_wait.await;
     };
-    match tokio::time::timeout(budget, combined).await {
+
+    match tokio::time::timeout(drain_budget, drain).await {
         Ok(()) => SignerDrainOutcome::Completed,
         Err(_) => {
             abort_signer();
             abort_join_handles(&relay_worker_abort_handles);
+            // Best-effort graceful relay close even though the drain timed out:
+            // workers may have been stuck before reaching the in-drain
+            // client_shutdown, leaving the relay client connected with
+            // unflushed responses. Bounded by the reserved slice.
+            let _ = tokio::time::timeout(relay_close_slice, client_shutdown()).await;
             SignerDrainOutcome::AbortedAfterTimeout
         }
     }
@@ -1801,13 +1827,14 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     // hook, so it is NOT deregistered implicitly on return — see the explicit
     // `deregister_and_stop_heartbeat` above).
     //
-    // `drain_signer_or_abort` applies ONE outer `tokio::time::timeout`
-    // at `timings.signer_drain` across both awaits so `signer_drain`
-    // is a real bound on the whole of phase 3 — previously only the
-    // trailing `task_tracker.wait()` was bounded, leaving
-    // `client_for_shutdown.shutdown()` (a nostr_sdk WebSocket close
-    // handshake) unbounded in practice. A hung close could therefore
-    // blow past `terminationGracePeriodSeconds` and swallow phase 4.
+    // `drain_signer_or_abort` bounds the whole of phase 3 by
+    // `timings.signer_drain` (split into a drain sub-budget plus a reserved
+    // relay-close slice) so `signer_drain` is a real bound — previously only
+    // the trailing `task_tracker.wait()` was bounded, leaving
+    // `client_for_shutdown.shutdown()` (a nostr_sdk WebSocket close handshake)
+    // unbounded in practice. A hung close could therefore blow past the grace
+    // period and swallow phase 4. The reserved slice also guarantees a graceful
+    // relay close is attempted even when the drain itself times out.
     tracing::info!(
         elapsed_secs = shutdown_started_at.elapsed().as_secs(),
         "Graceful shutdown: draining relay workers, then tearing down NIP-46 relay client and signer tasks"
@@ -1815,8 +1842,15 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     let signer_drain_budget = timings.signer_drain;
     let signer_handle_for_abort = signer_handle;
     let close_relay_queue = move || relay_queue.close();
+    // Factory (not a single future) so the relay close can be re-attempted on
+    // the drain-timeout path. Each call clones the cheap Arc-backed Client and
+    // returns an owning ('static) future. `Client::shutdown` is idempotent.
+    let client_shutdown = move || {
+        let client = client_for_shutdown.clone();
+        async move { client.shutdown().await }
+    };
     match drain_signer_or_abort(
-        client_for_shutdown.shutdown(),
+        client_shutdown,
         close_relay_queue,
         relay_worker_handles,
         task_tracker.wait(),
@@ -2943,16 +2977,17 @@ mod tests {
     // then `task_tracker.wait().await`. Previously `client.shutdown()` was
     // unbounded: a stuck WebSocket close handshake, a bug in
     // `nostr_sdk::Client::shutdown`, or a dead relay socket could hang
-    // the phase past `terminationGracePeriodSeconds` and swallow phase 4
-    // entirely. The `signer_drain` timeout only wrapped the trailing
-    // `task_tracker.wait()`, silently busting the design contract
-    // (enforced by `validate_shutdown_timings`) that `pre_drain +
-    // http_drain + signer_drain + SHUTDOWN_TEARDOWN_MARGIN <= ceiling`.
+    // the phase past the grace period and swallow phase 4 entirely. The
+    // `signer_drain` timeout only wrapped the trailing `task_tracker.wait()`,
+    // silently busting the design contract (enforced by
+    // `validate_shutdown_timings`) that `pre_drain + http_drain + signer_drain
+    // + teardown_margin <= ceiling`.
     //
-    // `drain_signer_or_abort` applies ONE outer `timeout(signer_drain,
-    // ...)` over the whole phase so `signer_drain` is a real bound on
-    // phase 3 regardless of how many awaits are inside. On timeout it
-    // invokes the caller-supplied abort callback (which aborts the
+    // `drain_signer_or_abort` bounds the whole phase by `signer_drain`, split
+    // into a drain sub-budget plus a reserved relay-close slice, so
+    // `signer_drain` is a real bound on phase 3 regardless of how many awaits
+    // are inside. On timeout it invokes the caller-supplied abort callback
+    // (which aborts the
     // signer JoinHandle in production).
 
     #[tokio::test(start_paused = true)]
@@ -2966,7 +3001,7 @@ mod tests {
             abort_called_cb.store(true, Ordering::Relaxed);
         };
 
-        let client_shutdown = async {
+        let client_shutdown = || async {
             tokio::time::sleep(Duration::from_secs(1)).await;
         };
         let tracker_wait = async {
@@ -3026,15 +3061,20 @@ mod tests {
         };
         let queue_closed_for_client = queue_closed.clone();
         let worker_finished_for_client = worker_finished.clone();
-        let client_shutdown = async move {
-            assert!(
-                queue_closed_for_client.load(Ordering::Relaxed),
-                "phase 3 must close relay intake before shutting down the relay client"
-            );
-            assert!(
-                worker_finished_for_client.load(Ordering::Relaxed),
-                "phase 3 must drain relay workers before shutting down the relay client"
-            );
+        // Factory: clone the Arcs per call so the closure stays `Fn`.
+        let client_shutdown = move || {
+            let queue_closed_for_client = queue_closed_for_client.clone();
+            let worker_finished_for_client = worker_finished_for_client.clone();
+            async move {
+                assert!(
+                    queue_closed_for_client.load(Ordering::Relaxed),
+                    "phase 3 must close relay intake before shutting down the relay client"
+                );
+                assert!(
+                    worker_finished_for_client.load(Ordering::Relaxed),
+                    "phase 3 must drain relay workers before shutting down the relay client"
+                );
+            }
         };
 
         let outcome = drain_signer_or_abort(
@@ -3088,7 +3128,7 @@ mod tests {
         };
 
         let outcome = drain_signer_or_abort(
-            async {},
+            || async {},
             move || relay_queue.close(),
             relay_worker_handles,
             async {},
@@ -3155,7 +3195,7 @@ mod tests {
         };
 
         let outcome = drain_signer_or_abort(
-            async {},
+            || async {},
             close_relay_queue,
             relay_worker_handles,
             async {},
@@ -3185,6 +3225,58 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn test_drain_signer_or_abort_attempts_relay_close_on_timeout() {
+        // flow-f2: when the drain times out because relay workers are stuck
+        // BEFORE the in-drain client.shutdown() is reached, the relay client
+        // must still receive a bounded close so it disconnects gracefully and
+        // flushes any already-published responses.
+        let shutdown_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shutdown_calls_factory = shutdown_calls.clone();
+        let client_shutdown = move || {
+            let shutdown_calls_factory = shutdown_calls_factory.clone();
+            async move {
+                shutdown_calls_factory.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+
+        // Worker never finishes inside the budget, so the drain times out in
+        // wait_for_join_handles before the in-drain client.shutdown() is reached.
+        let relay_worker_handles = vec![tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        })];
+
+        let abort_called = Arc::new(AtomicBool::new(false));
+        let abort_called_cb = abort_called.clone();
+
+        let outcome = drain_signer_or_abort(
+            client_shutdown,
+            || {},
+            relay_worker_handles,
+            async {},
+            move || {
+                abort_called_cb.store(true, Ordering::Relaxed);
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, SignerDrainOutcome::AbortedAfterTimeout),
+            "expected AbortedAfterTimeout, got {:?}",
+            outcome
+        );
+        assert!(
+            abort_called.load(Ordering::Relaxed),
+            "abort_signer must be called on the drain-timeout path"
+        );
+        assert!(
+            shutdown_calls.load(Ordering::Relaxed) >= 1,
+            "relay client.shutdown() must be attempted on the drain-timeout path (flow-f2), calls={}",
+            shutdown_calls.load(Ordering::Relaxed)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn test_drain_signer_or_abort_aborts_when_client_shutdown_hangs() {
         // Regression target: the reviewer-flagged failure mode. The
         // client.shutdown() future hangs (stuck WebSocket close
@@ -3198,7 +3290,7 @@ mod tests {
             abort_called_cb.store(true, Ordering::Relaxed);
         };
 
-        let client_shutdown = async {
+        let client_shutdown = || async {
             // Would hang for an hour if not bounded.
             tokio::time::sleep(Duration::from_secs(3600)).await;
         };
@@ -3245,7 +3337,7 @@ mod tests {
             abort_called_cb.store(true, Ordering::Relaxed);
         };
 
-        let client_shutdown = async {
+        let client_shutdown = || async {
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
         let tracker_wait = async {
@@ -3284,7 +3376,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         let budget = Duration::from_secs(10);
 
-        let client_shutdown = async {
+        let client_shutdown = || async {
             tokio::time::sleep(Duration::from_secs(3600)).await;
         };
         let tracker_wait = async {
@@ -3330,7 +3422,7 @@ mod tests {
             abort_called_cb.store(true, Ordering::Relaxed);
         };
 
-        let client_shutdown = async {
+        let client_shutdown = || async {
             tokio::time::sleep(Duration::from_secs(8)).await;
         };
         let tracker_wait = async {

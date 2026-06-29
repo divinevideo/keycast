@@ -150,7 +150,10 @@ impl RelaySender {
             .lock()
             .expect("relay queue close state mutex poisoned");
         if *close_guard {
-            METRICS.inc_queue_dropped();
+            // Distinct from the queue-full counter below: a closed queue means
+            // we are draining for graceful shutdown, not overloaded. Conflating
+            // the two would make shutdown look like a capacity incident.
+            METRICS.inc_queue_closed();
             return Err(RelayQueueError::Closed);
         }
 
@@ -386,6 +389,26 @@ mod tests {
             result
         );
         assert!(sender.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_closed_queue_rejection_counts_as_closed_not_overload() {
+        use std::sync::atomic::Ordering;
+
+        let queue = RelayQueue::new();
+        let sender = queue.sender();
+        queue.close();
+
+        // Global process metrics: other tests may run concurrently, so assert a
+        // strict increase (monotonic counter) rather than an exact value.
+        let before = METRICS.nip46_requests_queue_closed.load(Ordering::Relaxed);
+        let result = sender.try_send(test_item().await);
+        assert!(matches!(result, Err(RelayQueueError::Closed)));
+        let after = METRICS.nip46_requests_queue_closed.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "a closed-queue rejection must increment the queue_closed (shutdown) counter, not the overload drop counter"
+        );
     }
 
     #[tokio::test]
