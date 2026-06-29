@@ -2,9 +2,9 @@
 // ABOUTME: Implements UCAN-based authentication and NIP-46 bunker URL generation
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     Json,
 };
 use bcrypt::{hash, verify, DEFAULT_COST};
@@ -1984,36 +1984,51 @@ pub async fn finalize_pending_registration(
     })
 }
 
-/// Verify email address with token
-/// Handles two flows:
-/// 1. OAuth registration: token in oauth_codes → complete OAuth flow → redirect to client
-/// 2. Normal registration: token in users → mark verified → issue UCAN → set cookie
-pub async fn verify_email(
-    tenant: crate::api::tenant::TenantExtractor,
-    State(auth_state): State<super::routes::AuthState>,
-    headers: HeaderMap,
-    Json(req): Json<VerifyEmailRequest>,
-) -> Result<impl IntoResponse, AuthError> {
+/// Result of running the shared email-verification logic, rendered as JSON by the POST handler
+/// and as HTML/redirect by the GET handler so both transports stay behaviorally identical.
+enum VerifyOutcome {
+    /// Non-headless OAuth: send the browser to the client callback carrying a fresh code.
+    OAuthRedirect { redirect_url: String },
+    /// Headless (mobile app): the app polls for the code; the page just shows success.
+    Headless,
+    /// First-party normal registration: user is logged in; carries the session cookie.
+    LoggedIn { cookie: String },
+    /// Idempotent re-click on an already-verified first-party account.
+    AlreadyVerified,
+    /// Async bcrypt hash still running; the caller should retry shortly.
+    Processing,
+    /// The verification link has expired.
+    Expired,
+}
+
+/// Core email-verification logic shared by the POST (JSON) and GET (browser) handlers.
+///
+/// Verification runs entirely server-side here, so it does not depend on any client JavaScript —
+/// the key fix for sandboxed in-app browsers that never run the SPA's `onMount` fetch (keycast#262).
+async fn perform_email_verification(
+    auth_state: &super::routes::AuthState,
+    headers: &HeaderMap,
+    tenant_id: i64,
+    token: &str,
+) -> Result<VerifyOutcome, AuthError> {
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
-    let tenant_id = tenant.0.id;
 
     // First: Check oauth_codes for pending OAuth registration
     let oauth_code_repo = OAuthCodeRepository::new(pool.clone());
     if let Some(oauth_data) = oauth_code_repo
-        .find_by_verification_token(&req.token, tenant_id)
+        .find_by_verification_token(token, tenant_id)
         .await?
     {
-        // Found in oauth_codes - this is an OAuth registration flow
         tracing::info!(
             "Email verification for OAuth registration: pubkey {}, email {:?}",
             oauth_data.user_pubkey,
             oauth_data.pending_email
         );
 
-        // Complete the registration via the shared finalize path. This intentionally does NOT
-        // delete the pending row: re-clicking the link within the 24h window re-arms a fresh
-        // 10-minute code, which makes link prefetch/preview harmless (keycast#262 Part A).
+        // Complete via the shared finalize path. This intentionally does NOT delete the pending
+        // row: re-verifying within the 24h window re-arms a fresh 10-minute code, which makes
+        // link prefetch/preview harmless (keycast#262 Part A).
         let finalized = finalize_pending_registration(
             pool,
             auth_state.state.redis.as_ref(),
@@ -2022,12 +2037,8 @@ pub async fn verify_email(
             HeadlessDelivery::RedisRequired,
         )
         .await?;
-        let new_code = finalized.new_code;
 
-        // For headless flows (mobile app), don't redirect — the app is polling
-        // via device_code/Redis and will pick up the code automatically.
-        // The browser just shows a success page.
-        if oauth_data.is_headless {
+        if finalized.is_headless {
             tracing::info!(
                 event = "email_verification",
                 tenant_id = tenant_id,
@@ -2035,27 +2046,13 @@ pub async fn verify_email(
                 success = true,
                 "Email verified (headless), app will pick up code via polling"
             );
-
-            return Ok((
-                axum::http::StatusCode::OK,
-                axum::Json(VerifyEmailResponse {
-                    success: true,
-                    message: "Email verified! Open the app to continue.".to_string(),
-                    redirect_to: None,
-                    authenticated: None,
-                    status: Some("headless".to_string()),
-                    retry_after: None,
-                }),
-            )
-                .into_response());
+            return Ok(VerifyOutcome::Headless);
         }
 
-        // Non-headless: redirect to OAuth client's callback URL
-        let mut redirect_url = format!("{}?code={}", oauth_data.redirect_uri, new_code);
-        if let Some(ref state) = oauth_data.state {
+        let mut redirect_url = format!("{}?code={}", finalized.redirect_uri, finalized.new_code);
+        if let Some(ref state) = finalized.state {
             redirect_url = format!("{}&state={}", redirect_url, state);
         }
-
         tracing::info!(
             event = "email_verification",
             tenant_id = tenant_id,
@@ -2063,25 +2060,13 @@ pub async fn verify_email(
             success = true,
             "Email verified, redirecting to OAuth client"
         );
-
-        return Ok((
-            axum::http::StatusCode::OK,
-            axum::Json(VerifyEmailResponse {
-                success: true,
-                message: "Email verified! Redirecting to app...".to_string(),
-                redirect_to: Some(redirect_url),
-                authenticated: None,
-                status: None,
-                retry_after: None,
-            }),
-        )
-            .into_response());
+        return Ok(VerifyOutcome::OAuthRedirect { redirect_url });
     }
 
     // Second: Check users table for normal registration
     let user_repo = UserRepository::new(pool.clone());
     let token_data = user_repo
-        .find_by_verification_token(&req.token, tenant_id)
+        .find_by_verification_token(token, tenant_id)
         .await?
         .ok_or(AuthError::InvalidToken)?;
 
@@ -2089,35 +2074,13 @@ pub async fn verify_email(
 
     // Already verified (e.g. user clicked the link again) - show success
     if token_data.email_verified {
-        return Ok((
-            axum::http::StatusCode::OK,
-            axum::Json(VerifyEmailResponse {
-                success: true,
-                message: "Your email is already verified. You can log in.".to_string(),
-                redirect_to: None,
-                authenticated: None,
-                status: None,
-                retry_after: None,
-            }),
-        )
-            .into_response());
+        return Ok(VerifyOutcome::AlreadyVerified);
     }
 
     // Check if token is expired
     if let Some(expires) = token_data.email_verification_expires_at {
         if expires < Utc::now() {
-            return Ok((
-                axum::http::StatusCode::OK,
-                axum::Json(VerifyEmailResponse {
-                    success: false,
-                    message: "Verification link has expired. Please request a new one.".to_string(),
-                    redirect_to: None,
-                    authenticated: None,
-                    status: None,
-                    retry_after: None,
-                }),
-            )
-                .into_response());
+            return Ok(VerifyOutcome::Expired);
         }
     }
 
@@ -2130,28 +2093,17 @@ pub async fn verify_email(
             tracing::warn!(
                 "Password hash not completed after {}s for token {}..., likely instance died",
                 age.num_seconds(),
-                &req.token[..std::cmp::min(8, req.token.len())]
+                &token[..std::cmp::min(8, token.len())]
             );
             return Err(AuthError::RegistrationExpired);
         }
-        // Still processing - tell frontend to poll
+        // Still processing - tell caller to retry
         tracing::debug!(
             "Password hash still processing (age: {}s) for token {}...",
             age.num_seconds(),
-            &req.token[..std::cmp::min(8, req.token.len())]
+            &token[..std::cmp::min(8, token.len())]
         );
-        return Ok((
-            axum::http::StatusCode::OK,
-            axum::Json(VerifyEmailResponse {
-                success: false,
-                message: "Processing your registration, please wait...".to_string(),
-                redirect_to: None,
-                authenticated: None,
-                status: Some("processing".to_string()),
-                retry_after: Some(1),
-            }),
-        )
-            .into_response());
+        return Ok(VerifyOutcome::Processing);
     }
 
     // Mark email as verified (token kept for idempotent re-verification)
@@ -2184,7 +2136,7 @@ pub async fn verify_email(
     let keys = Keys::new(secret_key.into());
 
     // Extract redirect_origin from Origin header for UCAN
-    let redirect_origin = extract_origin_from_headers(&headers)
+    let redirect_origin = extract_origin_from_headers(headers)
         .or_else(|_| std::env::var("APP_URL"))
         .unwrap_or_else(|_| "http://localhost:3000".to_string());
 
@@ -2207,25 +2159,192 @@ pub async fn verify_email(
         "Email verified successfully, issuing UCAN"
     );
 
-    // Set UCAN session cookie
     let cookie = format!(
         "keycast_session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400",
         ucan_token
     );
+    Ok(VerifyOutcome::LoggedIn { cookie })
+}
 
-    Ok((
-        axum::http::StatusCode::OK,
-        [(axum::http::header::SET_COOKIE, cookie)],
-        axum::Json(VerifyEmailResponse {
-            success: true,
-            message: "Email verified successfully! You are now logged in.".to_string(),
-            redirect_to: None,
-            authenticated: Some(true),
-            status: None,
-            retry_after: None,
-        }),
-    )
-        .into_response())
+/// Verify email address with token (POST, JSON — used by the SPA verify page / clients).
+/// Handles two flows:
+/// 1. OAuth registration: token in oauth_codes → complete OAuth flow → redirect to client
+/// 2. Normal registration: token in users → mark verified → issue UCAN → set cookie
+pub async fn verify_email(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<super::routes::AuthState>,
+    headers: HeaderMap,
+    Json(req): Json<VerifyEmailRequest>,
+) -> Result<impl IntoResponse, AuthError> {
+    let tenant_id = tenant.0.id;
+    let outcome = perform_email_verification(&auth_state, &headers, tenant_id, &req.token).await?;
+
+    let response = match outcome {
+        VerifyOutcome::Headless => (
+            StatusCode::OK,
+            Json(VerifyEmailResponse {
+                success: true,
+                message: "Email verified! Open the app to continue.".to_string(),
+                redirect_to: None,
+                authenticated: None,
+                status: Some("headless".to_string()),
+                retry_after: None,
+            }),
+        )
+            .into_response(),
+        VerifyOutcome::OAuthRedirect { redirect_url } => (
+            StatusCode::OK,
+            Json(VerifyEmailResponse {
+                success: true,
+                message: "Email verified! Redirecting to app...".to_string(),
+                redirect_to: Some(redirect_url),
+                authenticated: None,
+                status: None,
+                retry_after: None,
+            }),
+        )
+            .into_response(),
+        VerifyOutcome::AlreadyVerified => (
+            StatusCode::OK,
+            Json(VerifyEmailResponse {
+                success: true,
+                message: "Your email is already verified. You can log in.".to_string(),
+                redirect_to: None,
+                authenticated: None,
+                status: None,
+                retry_after: None,
+            }),
+        )
+            .into_response(),
+        VerifyOutcome::Expired => (
+            StatusCode::OK,
+            Json(VerifyEmailResponse {
+                success: false,
+                message: "Verification link has expired. Please request a new one.".to_string(),
+                redirect_to: None,
+                authenticated: None,
+                status: None,
+                retry_after: None,
+            }),
+        )
+            .into_response(),
+        VerifyOutcome::Processing => (
+            StatusCode::OK,
+            Json(VerifyEmailResponse {
+                success: false,
+                message: "Processing your registration, please wait...".to_string(),
+                redirect_to: None,
+                authenticated: None,
+                status: Some("processing".to_string()),
+                retry_after: Some(1),
+            }),
+        )
+            .into_response(),
+        VerifyOutcome::LoggedIn { cookie } => (
+            StatusCode::OK,
+            [(axum::http::header::SET_COOKIE, cookie)],
+            Json(VerifyEmailResponse {
+                success: true,
+                message: "Email verified successfully! You are now logged in.".to_string(),
+                redirect_to: None,
+                authenticated: Some(true),
+                status: None,
+                retry_after: None,
+            }),
+        )
+            .into_response(),
+    };
+
+    Ok(response)
+}
+
+/// Query parameters for the GET verify-email link.
+#[derive(Debug, Deserialize)]
+pub struct VerifyEmailQuery {
+    pub token: Option<String>,
+}
+
+/// Verify email address by GET (the link target in verification emails).
+///
+/// Verification happens on this server-side GET, so it works even in sandboxed in-app browsers
+/// that never run the SPA's client JavaScript (keycast#262 Part A). Renders a minimal HTML page
+/// for headless / error states and 3xx-redirects for OAuth / first-party flows.
+pub async fn verify_email_get(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<super::routes::AuthState>,
+    headers: HeaderMap,
+    Query(query): Query<VerifyEmailQuery>,
+) -> Response {
+    let tenant_id = tenant.0.id;
+
+    let Some(token) = query.token.filter(|t| !t.is_empty()) else {
+        return verify_html_page(
+            StatusCode::BAD_REQUEST,
+            "Invalid link",
+            "This verification link is missing its token. Please use the link from your email.",
+        );
+    };
+
+    match perform_email_verification(&auth_state, &headers, tenant_id, &token).await {
+        Ok(VerifyOutcome::OAuthRedirect { redirect_url }) => {
+            Redirect::to(&redirect_url).into_response()
+        }
+        Ok(VerifyOutcome::LoggedIn { cookie }) => {
+            // Set the session cookie, then send the browser to the app home.
+            ([(axum::http::header::SET_COOKIE, cookie)], Redirect::to("/")).into_response()
+        }
+        Ok(VerifyOutcome::Headless) => verify_html_page(
+            StatusCode::OK,
+            "Email verified!",
+            "Your email is verified. You can return to the app to continue.",
+        ),
+        Ok(VerifyOutcome::AlreadyVerified) => verify_html_page(
+            StatusCode::OK,
+            "Already verified",
+            "Your email is already verified. You can return to the app or log in.",
+        ),
+        Ok(VerifyOutcome::Processing) => verify_html_page(
+            StatusCode::OK,
+            "Almost there…",
+            "We're finishing your registration. Please refresh this page in a few seconds.",
+        ),
+        Ok(VerifyOutcome::Expired) => verify_html_page(
+            StatusCode::OK,
+            "Link expired",
+            "This verification link has expired. Please request a new one from the app.",
+        ),
+        Err(_) => verify_html_page(
+            StatusCode::OK,
+            "Verification failed",
+            "This verification link is invalid or has expired. If you already verified, you can log in.",
+        ),
+    }
+}
+
+/// Render a minimal, self-contained HTML status page for the GET verify flow.
+fn verify_html_page(status: StatusCode, heading: &str, message: &str) -> Response {
+    let body = format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>{heading}</title>\
+         <style>body{{font-family:system-ui,-apple-system,sans-serif;background:#0d1117;color:#e6edf3;\
+         display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:1rem}}\
+         .card{{max-width:420px;text-align:center;background:#161b22;border:1px solid #30363d;\
+         border-radius:1rem;padding:2rem}}h1{{font-size:1.4rem;margin:0 0 .5rem}}\
+         p{{color:#9da7b3;margin:0;font-size:.95rem}}</style></head>\
+         <body><div class=\"card\"><h1>{heading}</h1><p>{message}</p></div></body></html>",
+        heading = html_escape(heading),
+        message = html_escape(message),
+    );
+    (status, Html(body)).into_response()
+}
+
+/// Minimal HTML-escaping for the small set of static status strings rendered above.
+fn html_escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 #[derive(Debug, Deserialize)]
@@ -5298,7 +5417,8 @@ mod tests {
 
     #[cfg(feature = "integration-tests")]
     use super::{
-        generate_ucan_token, login, update_profile, verify_email, ProfileData, VerifyEmailRequest,
+        generate_ucan_token, login, update_profile, verify_email, verify_email_get, ProfileData,
+        VerifyEmailQuery, VerifyEmailRequest,
     };
     #[cfg(feature = "integration-tests")]
     use crate::api::http::routes::AuthState;
@@ -5867,6 +5987,183 @@ mod tests {
         );
 
         cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
+    }
+
+    /// Build a Redis-backed AuthState for headless GET tests (the link path requires Redis).
+    #[cfg(feature = "integration-tests")]
+    async fn create_test_auth_state_with_redis(pool: PgPool) -> AuthState {
+        let mut state = create_test_auth_state(pool);
+        let redis_url =
+            std::env::var("TEST_REDIS_URL").unwrap_or_else(|_| "redis://localhost:16379".into());
+        let client = redis::Client::open(redis_url.as_str()).unwrap();
+        let conn = redis::aio::ConnectionManager::new(client).await.unwrap();
+        let redis = crate::redis::PrefixedRedis::new(conn, Some("test_verify".to_string()));
+        let inner = Arc::get_mut(&mut state.state).expect("unique Arc");
+        inner.redis = Some(redis);
+        state
+    }
+
+    /// Insert a headless pending registration (device_code set) and return (pubkey, token, device_code).
+    #[cfg(feature = "integration-tests")]
+    async fn insert_headless_pending_registration(
+        pool: &PgPool,
+        email: &str,
+    ) -> (String, String, String) {
+        let pending_keys = Keys::generate();
+        let pending_pubkey = pending_keys.public_key().to_hex();
+        let verification_token = format!("verify_{}", Uuid::new_v4());
+        let placeholder_code = format!("placeholder_{}", Uuid::new_v4());
+        let device_code = format!("dc_{}", Uuid::new_v4());
+        let password_hash = bcrypt::hash("testpassword123", bcrypt::DEFAULT_COST).unwrap();
+        let expires_at = Utc::now() + Duration::hours(24);
+        let encrypted_secret = pending_keys.secret_key().to_secret_bytes().to_vec();
+
+        cleanup_verify_email_test_data(pool, &pending_pubkey, &verification_token).await;
+
+        sqlx::query(
+            "INSERT INTO oauth_codes (
+                tenant_id, code, user_pubkey, client_id, redirect_uri, scope,
+                expires_at, created_at, pending_email, pending_password_hash,
+                pending_email_verification_token, pending_encrypted_secret, device_code, is_headless
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8, $9, $10, $11, $12, true)",
+        )
+        .bind(1_i64)
+        .bind(&placeholder_code)
+        .bind(&pending_pubkey)
+        .bind("TestApp")
+        .bind("https://test.example.com/callback")
+        .bind("policy:social")
+        .bind(expires_at)
+        .bind(email)
+        .bind(&password_hash)
+        .bind(&verification_token)
+        .bind(&encrypted_secret)
+        .bind(&device_code)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        (pending_pubkey, verification_token, device_code)
+    }
+
+    /// GET /api/auth/verify-email for a non-headless OAuth registration must verify server-side
+    /// (no client JS) and 3xx-redirect the browser to the client callback carrying a fresh code.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_email_get_oauth_redirects_with_code() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+        let email = format!("verify-get-oauth-{}@example.com", Uuid::new_v4());
+        let (pubkey, token) = insert_oauth_pending_registration(&pool, &email).await;
+
+        let response = verify_email_get(
+            create_test_tenant(),
+            State(auth_state),
+            HeaderMap::new(),
+            axum::extract::Query(VerifyEmailQuery {
+                token: Some(token.clone()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert!(
+            response.status().is_redirection(),
+            "GET verify for OAuth should redirect, got {}",
+            response.status()
+        );
+        let location = response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("redirect must set Location")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            location.contains("code="),
+            "redirect Location must carry an exchange code: {location}"
+        );
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
+    }
+
+    /// GET verify for a headless registration shows an HTML success page (the app polls for the
+    /// code) and re-arms a fresh code without deleting the pending row.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_email_get_headless_returns_success_page() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state_with_redis(pool.clone()).await;
+        let email = format!("verify-get-headless-{}@example.com", Uuid::new_v4());
+        let (pubkey, token, _device_code) =
+            insert_headless_pending_registration(&pool, &email).await;
+
+        let response = verify_email_get(
+            create_test_tenant(),
+            State(auth_state),
+            HeaderMap::new(),
+            axum::extract::Query(VerifyEmailQuery {
+                token: Some(token.clone()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        assert!(
+            content_type.contains("text/html"),
+            "headless GET verify should render an HTML page, got {content_type}"
+        );
+
+        // Pending row survives (idempotent re-arm).
+        let repo = keycast_core::repositories::OAuthCodeRepository::new(pool.clone());
+        assert!(repo
+            .find_by_verification_token(&token, 1)
+            .await
+            .unwrap()
+            .is_some());
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
+    }
+
+    /// GET verify with a bogus token must render an HTML error page for the browser, not a 500
+    /// or a raw JSON body.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_email_get_invalid_token_renders_html_not_500() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+
+        let response = verify_email_get(
+            create_test_tenant(),
+            State(auth_state),
+            HeaderMap::new(),
+            axum::extract::Query(VerifyEmailQuery {
+                token: Some(format!("nonexistent_{}", Uuid::new_v4())),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_ne!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid token must not 500"
+        );
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        assert!(
+            content_type.contains("text/html"),
+            "invalid-token GET verify should render HTML, got {content_type}"
+        );
     }
 
     #[cfg(feature = "integration-tests")]

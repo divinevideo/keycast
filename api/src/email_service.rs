@@ -119,8 +119,10 @@ impl EmailSender for DevEmailSender {
         to_email: &str,
         verification_token: &str,
     ) -> Result<(), String> {
+        // Point at the server-side GET endpoint so verification works without client JS
+        // (sandboxed in-app browsers never run the SPA page's fetch — keycast#262).
         let verification_url = format!(
-            "{}/verify-email?token={}",
+            "{}/api/auth/verify-email?token={}",
             self.base_url, verification_token
         );
 
@@ -454,8 +456,10 @@ impl EmailSender for SendGridEmailSender {
         to_email: &str,
         verification_token: &str,
     ) -> Result<(), String> {
+        // Point at the server-side GET endpoint so verification works without client JS
+        // (sandboxed in-app browsers never run the SPA page's fetch — keycast#262).
         let verification_url = format!(
-            "{}/verify-email?token={}",
+            "{}/api/auth/verify-email?token={}",
             self.base_url, verification_token
         );
 
