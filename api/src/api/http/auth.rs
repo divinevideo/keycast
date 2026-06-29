@@ -6198,6 +6198,106 @@ mod tests {
         );
     }
 
+    /// Acceptance: the link path and the PIN path produce identical materialization, because both
+    /// funnel through finalize_pending_registration (keycast#262). The only difference is the
+    /// headless Redis-delivery strictness, which does not change the user/keys/code outcome.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_link_and_pin_paths_finalize_identically() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state_with_redis(pool.clone()).await;
+        let redis = auth_state.state.redis.clone();
+        let repo = keycast_core::repositories::OAuthCodeRepository::new(pool.clone());
+
+        let email_a = format!("identical-link-{}@example.com", Uuid::new_v4());
+        let email_b = format!("identical-pin-{}@example.com", Uuid::new_v4());
+        let (pubkey_a, token_a, _dc_a) =
+            insert_headless_pending_registration(&pool, &email_a).await;
+        let (pubkey_b, token_b, _dc_b) =
+            insert_headless_pending_registration(&pool, &email_b).await;
+
+        let data_a = repo
+            .find_by_verification_token(&token_a, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        let data_b = repo
+            .find_by_verification_token(&token_b, 1)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A finalizes via the link path's delivery mode; B via the PIN path's.
+        let ra = super::finalize_pending_registration(
+            &pool,
+            redis.as_ref(),
+            1,
+            &data_a,
+            super::HeadlessDelivery::RedisRequired,
+        )
+        .await
+        .expect("link-path finalize succeeds");
+        let rb = super::finalize_pending_registration(
+            &pool,
+            redis.as_ref(),
+            1,
+            &data_b,
+            super::HeadlessDelivery::RedisBestEffort,
+        )
+        .await
+        .expect("pin-path finalize succeeds");
+
+        assert_eq!(ra.is_headless, rb.is_headless);
+        assert!(!ra.new_code.is_empty() && !rb.new_code.is_empty());
+
+        // Both paths materialize an identically-shaped result: verified user + 1 personal key +
+        // a fresh headless 10-minute exchange code, with the pending row preserved.
+        for (pubkey, code) in [(&pubkey_a, &ra.new_code), (&pubkey_b, &rb.new_code)] {
+            let (verified,): (bool,) = sqlx::query_as(
+                "SELECT email_verified FROM users WHERE pubkey = $1 AND tenant_id = 1",
+            )
+            .bind(pubkey)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(verified, "user must be materialized as verified");
+
+            let (key_count,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM personal_keys WHERE user_pubkey = $1 AND tenant_id = 1",
+            )
+            .bind(pubkey)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(key_count, 1, "personal_keys must be created exactly once");
+
+            let minted = repo
+                .find_valid(1, code)
+                .await
+                .unwrap()
+                .expect("a fresh exchange code must be minted");
+            assert!(minted.is_headless);
+        }
+
+        assert!(
+            repo.find_by_verification_token(&token_a, 1)
+                .await
+                .unwrap()
+                .is_some(),
+            "link-path pending row must be preserved"
+        );
+        assert!(
+            repo.find_by_verification_token(&token_b, 1)
+                .await
+                .unwrap()
+                .is_some(),
+            "pin-path pending row must be preserved"
+        );
+
+        cleanup_verify_email_test_data(&pool, &pubkey_a, &token_a).await;
+        cleanup_verify_email_test_data(&pool, &pubkey_b, &token_b).await;
+    }
+
     #[cfg(feature = "integration-tests")]
     async fn insert_pending_oauth_registration(
         pool: &PgPool,
