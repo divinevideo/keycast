@@ -26,8 +26,8 @@ use crate::password_verifier::{
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
     AccountStatusWithMinorRow, AuthEventRepository, CreateOAuthAuthorizationParams,
-    OAuthAuthorizationRepository, OAuthCodeRepository, PersonalKeysRepository, PolicyRepository,
-    UserRepository, VerifiedMinorRow,
+    OAuthAuthorizationRepository, OAuthCodeData, OAuthCodeRepository, PersonalKeysRepository,
+    PolicyRepository, UserRepository, VerifiedMinorRow,
 };
 use keycast_core::traits::CustomPermission;
 use nostr_sdk::{Keys, PublicKey, ToBech32, UnsignedEvent};
@@ -1637,6 +1637,353 @@ pub async fn get_bunker_url(
     }
 }
 
+/// Outcome of completing a pending registration: the freshly minted 10-minute exchange code
+/// plus the routing context the caller needs to build its response.
+pub struct FinalizedRegistration {
+    /// Fresh 10-minute OAuth authorization code the app/browser exchanges for tokens.
+    pub new_code: String,
+    pub redirect_uri: String,
+    pub state: Option<String>,
+    pub is_headless: bool,
+}
+
+/// How a freshly minted headless exchange code reaches the waiting app.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HeadlessDelivery {
+    /// Email-link path: the app only learns the code via Redis polling, so Redis must be available
+    /// and the push must succeed — otherwise the app would be stranded with no code to pick up.
+    RedisRequired,
+    /// In-app PIN path: the code is returned synchronously in the response body, so the Redis push
+    /// is best-effort and a Redis outage must not fail the flow.
+    RedisBestEffort,
+}
+
+/// Delete a pending registration row that can never complete (terminal conflict).
+///
+/// Pending rows are otherwise kept so re-verification re-arms a fresh exchange code; deletion is
+/// reserved for conflicts where no exchange code could ever be minted from the row.
+async fn delete_pending_registration(
+    oauth_code_repo: &OAuthCodeRepository,
+    kept_token: Option<&str>,
+    tenant_id: i64,
+) -> Result<(), AuthError> {
+    if let Some(token) = kept_token {
+        oauth_code_repo
+            .delete_by_verification_token(token, tenant_id)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Shared completion path for a pending email-verification registration (keycast#262).
+///
+/// Invoked by both the email-link verification path and the in-app PIN path so they produce
+/// identical results: deferred user creation (including duplicate-email handling), a fresh
+/// 10-minute exchange code, and the headless Redis polling push.
+///
+/// The pending `oauth_codes` row is intentionally NOT deleted here. Re-verifying within the 24h
+/// window re-arms a fresh exchange code, which is what makes link prefetch/preview harmless: a
+/// mail-scanner GET can no longer materialize the user, mint a short-lived code, delete the row,
+/// and strand the user's real visit. The row expires on its own at the end of the verify window.
+pub async fn finalize_pending_registration(
+    pool: &PgPool,
+    redis: Option<&crate::redis::PrefixedRedis>,
+    tenant_id: i64,
+    oauth_data: &OAuthCodeData,
+    delivery: HeadlessDelivery,
+) -> Result<FinalizedRegistration, AuthError> {
+    let email = oauth_data
+        .pending_email
+        .as_ref()
+        .ok_or_else(|| account_incomplete("Registration is incomplete. Please register again."))?;
+    let password_hash = oauth_data
+        .pending_password_hash
+        .as_ref()
+        .ok_or_else(|| account_incomplete("Registration is incomplete. Please register again."))?;
+    // The token kept on the materialized user row is the one already stored on the pending row,
+    // so the link path can be re-clicked idempotently (it resolves the same user).
+    let kept_token = oauth_data.pending_email_verification_token.as_deref();
+
+    let oauth_code_repo = OAuthCodeRepository::new(pool.clone());
+    let user_repo = UserRepository::new(pool.clone());
+    let existing_user = user_repo
+        .oauth_registration_state(&oauth_data.user_pubkey, tenant_id)
+        .await?;
+
+    if let Some(existing) = existing_user {
+        match existing.email.as_deref() {
+            Some(existing_email) if existing_email == email => {
+                if existing.email_verified && existing.has_password_hash {
+                    // Genuine retry: a prior attempt already applied the pending
+                    // credentials. Backfill the personal key if that attempt (or
+                    // another creation path) left it missing.
+                    tracing::info!(
+                        "Retrying email verification for existing user: {}",
+                        oauth_data.user_pubkey
+                    );
+                    if let (Some(encrypted_secret), false) = (
+                        oauth_data.pending_encrypted_secret.as_deref(),
+                        existing.has_personal_key,
+                    ) {
+                        user_repo
+                            .backfill_personal_key(
+                                &oauth_data.user_pubkey,
+                                tenant_id,
+                                encrypted_secret,
+                            )
+                            .await?;
+                        tracing::info!(
+                            "Backfilled missing personal key during verification retry: {}",
+                            oauth_data.user_pubkey
+                        );
+                    }
+                } else {
+                    // A same-email row can come from standard registration before
+                    // verification or before bcrypt finishes. Complete it before
+                    // minting an OAuth code.
+                    if let Err(err) = user_repo
+                        .complete_pending_oauth_registration(
+                            &oauth_data.user_pubkey,
+                            tenant_id,
+                            email,
+                            password_hash,
+                            kept_token,
+                            oauth_data.pending_encrypted_secret.as_deref(),
+                        )
+                        .await
+                    {
+                        if matches!(err, keycast_core::repositories::RepositoryError::Duplicate) {
+                            delete_pending_registration(&oauth_code_repo, kept_token, tenant_id)
+                                .await?;
+                            return Err(AuthError::EmailAlreadyExists);
+                        }
+                        return Err(err.into());
+                    }
+                    tracing::info!(
+                        "Completed incomplete same-email registration row: {}",
+                        oauth_data.user_pubkey
+                    );
+                }
+            }
+            Some(_) => {
+                // The pubkey is already bound to a different email. Never
+                // overwrite an existing account's credentials from an
+                // unauthenticated verification.
+                tracing::warn!(
+                    "Email verification for pubkey {} conflicts with an existing account email",
+                    oauth_data.user_pubkey
+                );
+                delete_pending_registration(&oauth_code_repo, kept_token, tenant_id).await?;
+                return Err(AuthError::DuplicateKey);
+            }
+            None => {
+                // Bare row pre-created by another path (team membership,
+                // authorization pre-creation): apply the pending registration
+                // instead of silently dropping it.
+                if let Err(err) = user_repo
+                    .complete_pending_oauth_registration(
+                        &oauth_data.user_pubkey,
+                        tenant_id,
+                        email,
+                        password_hash,
+                        kept_token,
+                        oauth_data.pending_encrypted_secret.as_deref(),
+                    )
+                    .await
+                {
+                    if matches!(err, keycast_core::repositories::RepositoryError::Duplicate) {
+                        delete_pending_registration(&oauth_code_repo, kept_token, tenant_id).await?;
+                        return Err(AuthError::EmailAlreadyExists);
+                    }
+                    return Err(err.into());
+                }
+                tracing::info!(
+                    "Applied pending registration to pre-existing user row: {}",
+                    oauth_data.user_pubkey
+                );
+            }
+        }
+    } else if let Some(ref encrypted_secret) = oauth_data.pending_encrypted_secret {
+        // Auto-generated or direct nsec: create user + personal_keys atomically.
+        let now = Utc::now();
+        let mut tx = pool.begin().await?;
+
+        if let Err(err) = sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, email_verification_token, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(&oauth_data.user_pubkey)
+        .bind(tenant_id)
+        .bind(email)
+        .bind(password_hash)
+        .bind(true) // email_verified = true
+        .bind(kept_token)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        {
+            if has_database_constraint(&err, USERS_EMAIL_TENANT_CONSTRAINT) {
+                // Duplicate email: this registration can never complete, so the pending row is
+                // terminal — delete it rather than leaving a row that only ever 409s.
+                tx.rollback().await?;
+                delete_pending_registration(&oauth_code_repo, kept_token, tenant_id).await?;
+                return Err(AuthError::EmailAlreadyExists);
+            }
+            return Err(err.into());
+        }
+
+        sqlx::query(
+            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(&oauth_data.user_pubkey)
+        .bind(encrypted_secret)
+        .bind(tenant_id)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        tracing::info!(
+            "Created user and personal_keys for OAuth registration: {}",
+            oauth_data.user_pubkey
+        );
+    } else {
+        // BYOK flow: just create user, keys will come at token exchange.
+        if let Err(err) = user_repo
+            .create_with_password_verified(
+                &oauth_data.user_pubkey,
+                tenant_id,
+                email,
+                password_hash,
+                true, // email_verified = true
+                kept_token,
+            )
+            .await
+        {
+            if matches!(err, keycast_core::repositories::RepositoryError::Duplicate) {
+                delete_pending_registration(&oauth_code_repo, kept_token, tenant_id).await?;
+                return Err(AuthError::EmailAlreadyExists);
+            }
+            return Err(err.into());
+        }
+
+        tracing::info!(
+            "Created user for BYOK OAuth registration: {}",
+            oauth_data.user_pubkey
+        );
+    }
+
+    let headless_retry_error = || AuthError::ServiceUnavailable {
+        message: "Email verified, but app sign-in is still finishing. Please retry shortly."
+            .to_string(),
+        retry_after: Some(5),
+    };
+
+    // For the link path (RedisRequired), validate device_code + Redis BEFORE minting so we never
+    // mint a code the polling app could never receive.
+    let strict_delivery = if oauth_data.is_headless && delivery == HeadlessDelivery::RedisRequired {
+        let device_code = oauth_data.device_code.as_ref().ok_or_else(|| {
+            tracing::error!(
+                event = "headless_poll_delivery_failed",
+                tenant_id = tenant_id,
+                user_pubkey = %oauth_data.user_pubkey,
+                "Headless verification is missing device_code"
+            );
+            headless_retry_error()
+        })?;
+        let redis = redis.ok_or_else(|| {
+            tracing::error!(
+                event = "headless_poll_delivery_failed",
+                tenant_id = tenant_id,
+                user_pubkey = %oauth_data.user_pubkey,
+                "Headless verification requires Redis, but Redis is unavailable"
+            );
+            headless_retry_error()
+        })?;
+        Some((device_code, redis))
+    } else {
+        None
+    };
+
+    // Generate a fresh authorization code (10 minute exchange window — do not lengthen).
+    let new_code: String = rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect();
+
+    let code_expires_at = Utc::now() + Duration::minutes(10);
+    let store_params = keycast_core::repositories::StoreOAuthCodeParams {
+        tenant_id,
+        code: &new_code,
+        user_pubkey: &oauth_data.user_pubkey,
+        client_id: &oauth_data.client_id,
+        redirect_uri: &oauth_data.redirect_uri,
+        scope: &oauth_data.scope,
+        code_challenge: oauth_data.code_challenge.as_deref(),
+        code_challenge_method: oauth_data.code_challenge_method.as_deref(),
+        expires_at: code_expires_at,
+        previous_auth_id: oauth_data.previous_auth_id,
+        state: oauth_data.state.as_deref(),
+        is_headless: oauth_data.is_headless, // Inherit from original registration
+    };
+    oauth_code_repo.store(store_params).await?;
+
+    if let Some((device_code, redis)) = strict_delivery {
+        let key = format!("oauth_poll:{}", device_code);
+        if let Err(e) = redis.setex(&key, 600, &new_code).await {
+            tracing::error!(
+                event = "headless_poll_delivery_failed",
+                tenant_id = tenant_id,
+                user_pubkey = %oauth_data.user_pubkey,
+                device_code = %device_code,
+                error = %e,
+                "Failed to store headless OAuth code in Redis for polling"
+            );
+            if let Err(cleanup_err) = oauth_code_repo.delete(tenant_id, &new_code).await {
+                tracing::error!(
+                    tenant_id = tenant_id,
+                    user_pubkey = %oauth_data.user_pubkey,
+                    code = %new_code,
+                    error = %cleanup_err,
+                    "Failed to clean up OAuth code after Redis polling write failed"
+                );
+            }
+            return Err(headless_retry_error());
+        }
+        tracing::debug!(
+            "Stored OAuth code in Redis for headless polling: device_code={}",
+            device_code
+        );
+    } else if let Some(ref device_code) = oauth_data.device_code {
+        // Best-effort push: non-headless same-device verification, or the PIN path where the code
+        // is also returned synchronously in the response body (so a Redis miss is not fatal).
+        if let Some(redis) = redis {
+            let key = format!("oauth_poll:{}", device_code);
+            if let Err(e) = redis.setex(&key, 600, &new_code).await {
+                tracing::warn!("Failed to store OAuth code in Redis for polling: {}", e);
+                // Continue - redirect flow / synchronous return still works.
+            } else {
+                tracing::debug!(
+                    "Stored OAuth code in Redis for polling: device_code={}",
+                    device_code
+                );
+            }
+        }
+    }
+
+    Ok(FinalizedRegistration {
+        new_code,
+        redirect_uri: oauth_data.redirect_uri.clone(),
+        state: oauth_data.state.clone(),
+        is_headless: oauth_data.is_headless,
+    })
+}
+
 /// Verify email address with token
 /// Handles two flows:
 /// 1. OAuth registration: token in oauth_codes → complete OAuth flow → redirect to client
@@ -1664,301 +2011,18 @@ pub async fn verify_email(
             oauth_data.pending_email
         );
 
-        let email = oauth_data.pending_email.as_ref().ok_or_else(|| {
-            account_incomplete("Registration is incomplete. Please register again.")
-        })?;
-        let password_hash = oauth_data.pending_password_hash.as_ref().ok_or_else(|| {
-            account_incomplete("Registration is incomplete. Please register again.")
-        })?;
-
-        // Create user with email_verified=true (they just verified!)
-        let user_repo = UserRepository::new(pool.clone());
-        let existing_user = user_repo
-            .oauth_registration_state(&oauth_data.user_pubkey, tenant_id)
-            .await?;
-
-        if let Some(existing) = existing_user {
-            match existing.email.as_deref() {
-                Some(existing_email) if existing_email == email => {
-                    if existing.email_verified && existing.has_password_hash {
-                        // Genuine retry: a prior attempt already applied the pending
-                        // credentials. Backfill the personal key if that attempt (or
-                        // another creation path) left it missing.
-                        tracing::info!(
-                            "Retrying OAuth email verification for existing user: {}",
-                            oauth_data.user_pubkey
-                        );
-                        if let (Some(encrypted_secret), false) = (
-                            oauth_data.pending_encrypted_secret.as_deref(),
-                            existing.has_personal_key,
-                        ) {
-                            user_repo
-                                .backfill_personal_key(
-                                    &oauth_data.user_pubkey,
-                                    tenant_id,
-                                    encrypted_secret,
-                                )
-                                .await?;
-                            tracing::info!(
-                                "Backfilled missing personal key during OAuth verification retry: {}",
-                                oauth_data.user_pubkey
-                            );
-                        }
-                    } else {
-                        // A same-email row can come from standard registration before
-                        // verification or before bcrypt finishes. Complete it before
-                        // minting an OAuth code.
-                        if let Err(err) = user_repo
-                            .complete_pending_oauth_registration(
-                                &oauth_data.user_pubkey,
-                                tenant_id,
-                                email,
-                                password_hash,
-                                &req.token,
-                                oauth_data.pending_encrypted_secret.as_deref(),
-                            )
-                            .await
-                        {
-                            if matches!(err, keycast_core::repositories::RepositoryError::Duplicate)
-                            {
-                                oauth_code_repo
-                                    .delete_by_verification_token(&req.token, tenant_id)
-                                    .await?;
-                                return Err(AuthError::EmailAlreadyExists);
-                            }
-                            return Err(err.into());
-                        }
-                        tracing::info!(
-                            "Completed incomplete same-email OAuth registration row: {}",
-                            oauth_data.user_pubkey
-                        );
-                    }
-                }
-                Some(_) => {
-                    // The pubkey is already bound to a different email. Never
-                    // overwrite an existing account's credentials from an
-                    // unauthenticated verification link.
-                    tracing::warn!(
-                        "OAuth email verification for pubkey {} conflicts with an existing account email",
-                        oauth_data.user_pubkey
-                    );
-                    oauth_code_repo
-                        .delete_by_verification_token(&req.token, tenant_id)
-                        .await?;
-                    return Err(AuthError::DuplicateKey);
-                }
-                None => {
-                    // Bare row pre-created by another path (team membership,
-                    // authorization pre-creation): apply the pending registration
-                    // instead of silently dropping it.
-                    if let Err(err) = user_repo
-                        .complete_pending_oauth_registration(
-                            &oauth_data.user_pubkey,
-                            tenant_id,
-                            email,
-                            password_hash,
-                            &req.token,
-                            oauth_data.pending_encrypted_secret.as_deref(),
-                        )
-                        .await
-                    {
-                        if matches!(err, keycast_core::repositories::RepositoryError::Duplicate) {
-                            oauth_code_repo
-                                .delete_by_verification_token(&req.token, tenant_id)
-                                .await?;
-                            return Err(AuthError::EmailAlreadyExists);
-                        }
-                        return Err(err.into());
-                    }
-                    tracing::info!(
-                        "Applied pending OAuth registration to pre-existing user row: {}",
-                        oauth_data.user_pubkey
-                    );
-                }
-            }
-        } else if let Some(ref encrypted_secret) = oauth_data.pending_encrypted_secret {
-            // Auto-generated or direct nsec: create user + personal_keys
-            // Use a transaction to ensure atomicity
-            let now = Utc::now();
-            let mut tx = pool.begin().await?;
-
-            if let Err(err) = sqlx::query(
-                "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, email_verification_token, created_at, updated_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-            )
-            .bind(&oauth_data.user_pubkey)
-            .bind(tenant_id)
-            .bind(email)
-            .bind(password_hash)
-            .bind(true) // email_verified = true
-            .bind(&req.token) // Keep token for idempotent re-verification
-            .bind(now)
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            {
-                if has_database_constraint(&err, USERS_EMAIL_TENANT_CONSTRAINT) {
-                    tx.rollback().await?;
-                    oauth_code_repo
-                        .delete_by_verification_token(&req.token, tenant_id)
-                        .await?;
-                    return Err(AuthError::EmailAlreadyExists);
-                }
-                return Err(err.into());
-            }
-
-            sqlx::query(
-                "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
-                 VALUES ($1, $2, $3, $4, $5)",
-            )
-            .bind(&oauth_data.user_pubkey)
-            .bind(encrypted_secret)
-            .bind(tenant_id)
-            .bind(now)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-
-            tx.commit().await?;
-
-            tracing::info!(
-                "Created user and personal_keys for OAuth registration: {}",
-                oauth_data.user_pubkey
-            );
-        } else {
-            // BYOK flow: just create user, keys will come at token exchange
-            if let Err(err) = user_repo
-                .create_with_password_verified(
-                    &oauth_data.user_pubkey,
-                    tenant_id,
-                    email,
-                    password_hash,
-                    true,             // email_verified = true
-                    Some(&req.token), // Keep token for idempotent re-verification
-                )
-                .await
-            {
-                if matches!(err, keycast_core::repositories::RepositoryError::Duplicate) {
-                    oauth_code_repo
-                        .delete_by_verification_token(&req.token, tenant_id)
-                        .await?;
-                    return Err(AuthError::EmailAlreadyExists);
-                }
-                return Err(err.into());
-            }
-
-            tracing::info!(
-                "Created user for BYOK OAuth registration: {}",
-                oauth_data.user_pubkey
-            );
-        }
-
-        let headless_retry_error = || AuthError::ServiceUnavailable {
-            message: "Email verified, but app sign-in is still finishing. Please retry shortly."
-                .to_string(),
-            retry_after: Some(5),
-        };
-
-        let required_device_code = if oauth_data.is_headless {
-            Some(oauth_data.device_code.as_ref().ok_or_else(|| {
-                tracing::error!(
-                    event = "headless_poll_delivery_failed",
-                    tenant_id = tenant_id,
-                    user_pubkey = %oauth_data.user_pubkey,
-                    "Headless verification is missing device_code"
-                );
-                headless_retry_error()
-            })?)
-        } else {
-            None
-        };
-
-        let required_redis = if oauth_data.is_headless {
-            Some(auth_state.state.redis.as_ref().ok_or_else(|| {
-                tracing::error!(
-                    event = "headless_poll_delivery_failed",
-                    tenant_id = tenant_id,
-                    user_pubkey = %oauth_data.user_pubkey,
-                    "Headless verification requires Redis, but Redis is unavailable"
-                );
-                headless_retry_error()
-            })?)
-        } else {
-            None
-        };
-
-        // Generate new authorization code for the redirect
-        let new_code: String = rand::thread_rng()
-            .sample_iter(&rand::distributions::Alphanumeric)
-            .take(32)
-            .map(char::from)
-            .collect();
-
-        // Store the new code (10 minute expiry for exchange)
-        let code_expires_at = Utc::now() + Duration::minutes(10);
-        let store_params = keycast_core::repositories::StoreOAuthCodeParams {
+        // Complete the registration via the shared finalize path. This intentionally does NOT
+        // delete the pending row: re-clicking the link within the 24h window re-arms a fresh
+        // 10-minute code, which makes link prefetch/preview harmless (keycast#262 Part A).
+        let finalized = finalize_pending_registration(
+            pool,
+            auth_state.state.redis.as_ref(),
             tenant_id,
-            code: &new_code,
-            user_pubkey: &oauth_data.user_pubkey,
-            client_id: &oauth_data.client_id,
-            redirect_uri: &oauth_data.redirect_uri,
-            scope: &oauth_data.scope,
-            code_challenge: oauth_data.code_challenge.as_deref(),
-            code_challenge_method: oauth_data.code_challenge_method.as_deref(),
-            expires_at: code_expires_at,
-            previous_auth_id: oauth_data.previous_auth_id,
-            state: oauth_data.state.as_deref(),
-            is_headless: oauth_data.is_headless, // Inherit from original registration
-        };
-        oauth_code_repo.store(store_params).await?;
-
-        if let Some(device_code) = required_device_code {
-            let redis =
-                required_redis.expect("headless flow must validate Redis before storing code");
-            let key = format!("oauth_poll:{}", device_code);
-            if let Err(e) = redis.setex(&key, 600, &new_code).await {
-                tracing::error!(
-                    event = "headless_poll_delivery_failed",
-                    tenant_id = tenant_id,
-                    user_pubkey = %oauth_data.user_pubkey,
-                    device_code = %device_code,
-                    error = %e,
-                    "Failed to store headless OAuth code in Redis for polling"
-                );
-                if let Err(cleanup_err) = oauth_code_repo.delete(tenant_id, &new_code).await {
-                    tracing::error!(
-                        tenant_id = tenant_id,
-                        user_pubkey = %oauth_data.user_pubkey,
-                        code = %new_code,
-                        error = %cleanup_err,
-                        "Failed to clean up OAuth code after Redis polling write failed"
-                    );
-                }
-                return Err(headless_retry_error());
-            }
-            tracing::debug!(
-                "Stored OAuth code in Redis for headless polling: device_code={}",
-                device_code
-            );
-        } else if let Some(ref device_code) = oauth_data.device_code {
-            if let Some(redis) = &auth_state.state.redis {
-                let key = format!("oauth_poll:{}", device_code);
-                if let Err(e) = redis.setex(&key, 600, &new_code).await {
-                    tracing::warn!("Failed to store OAuth code in Redis for polling: {}", e);
-                    // Continue - redirect flow still works for same-device verification
-                } else {
-                    tracing::debug!(
-                        "Stored OAuth code in Redis for polling: device_code={}",
-                        device_code
-                    );
-                }
-            }
-        }
-
-        // Delete the pending registration entry
-        oauth_code_repo
-            .delete_by_verification_token(&req.token, tenant_id)
-            .await?;
+            &oauth_data,
+            HeadlessDelivery::RedisRequired,
+        )
+        .await?;
+        let new_code = finalized.new_code;
 
         // For headless flows (mobile app), don't redirect — the app is polling
         // via device_code/Redis and will pick up the code automatically.
@@ -5643,6 +5707,166 @@ mod tests {
 
         cleanup_verify_email_test_data(&pool, &existing_pubkey, &verification_token).await;
         cleanup_verify_email_test_data(&pool, &pending_pubkey, &verification_token).await;
+    }
+
+    /// Extract the `code` query parameter from a verify redirect URL like `{uri}?code=XXX&state=YYY`.
+    #[cfg(feature = "integration-tests")]
+    fn extract_code_from_redirect(redirect_to: &str) -> String {
+        let after = redirect_to
+            .split("code=")
+            .nth(1)
+            .expect("redirect should carry a code");
+        after.split('&').next().unwrap().to_string()
+    }
+
+    /// Insert a non-headless OAuth pending registration (browser flow) and return (pubkey, token).
+    #[cfg(feature = "integration-tests")]
+    async fn insert_oauth_pending_registration(pool: &PgPool, email: &str) -> (String, String) {
+        let pending_keys = Keys::generate();
+        let pending_pubkey = pending_keys.public_key().to_hex();
+        let verification_token = format!("verify_{}", Uuid::new_v4());
+        let placeholder_code = format!("placeholder_{}", Uuid::new_v4());
+        let password_hash = bcrypt::hash("testpassword123", bcrypt::DEFAULT_COST).unwrap();
+        let expires_at = Utc::now() + Duration::hours(24);
+        let encrypted_secret = pending_keys.secret_key().to_secret_bytes().to_vec();
+
+        cleanup_verify_email_test_data(pool, &pending_pubkey, &verification_token).await;
+
+        sqlx::query(
+            "INSERT INTO oauth_codes (
+                tenant_id, code, user_pubkey, client_id, redirect_uri, scope,
+                expires_at, created_at, pending_email, pending_password_hash,
+                pending_email_verification_token, pending_encrypted_secret
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8, $9, $10, $11)",
+        )
+        .bind(1_i64)
+        .bind(&placeholder_code)
+        .bind(&pending_pubkey)
+        .bind("TestApp")
+        .bind("https://test.example.com/callback")
+        .bind("policy:social")
+        .bind(expires_at)
+        .bind(email)
+        .bind(&password_hash)
+        .bind(&verification_token)
+        .bind(&encrypted_secret)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        (pending_pubkey, verification_token)
+    }
+
+    /// Re-verifying an OAuth registration within the window must re-arm a fresh 10-min code
+    /// WITHOUT deleting the pending row (keycast#262 Part A idempotency).
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_email_oauth_idempotent_rearms_without_deleting_pending() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+        let email = format!("verify-idem-{}@example.com", Uuid::new_v4());
+        let (pubkey, token) = insert_oauth_pending_registration(&pool, &email).await;
+
+        let first = verify_email(
+            create_test_tenant(),
+            State(auth_state.clone()),
+            HeaderMap::new(),
+            Json(VerifyEmailRequest {
+                token: token.clone(),
+            }),
+        )
+        .await
+        .map(|r| r.into_response())
+        .unwrap_or_else(|e| e.into_response());
+        assert_eq!(first.status(), StatusCode::OK);
+        let body1 = response_json(first).await;
+        let code1 = extract_code_from_redirect(body1["redirect_to"].as_str().unwrap());
+
+        // Pending row must survive the first verify (so prefetch can't strand a later real visit).
+        let repo = keycast_core::repositories::OAuthCodeRepository::new(pool.clone());
+        assert!(
+            repo.find_by_verification_token(&token, 1)
+                .await
+                .unwrap()
+                .is_some(),
+            "pending row must survive verify (idempotent re-arm)"
+        );
+
+        let second = verify_email(
+            create_test_tenant(),
+            State(auth_state.clone()),
+            HeaderMap::new(),
+            Json(VerifyEmailRequest {
+                token: token.clone(),
+            }),
+        )
+        .await
+        .map(|r| r.into_response())
+        .unwrap_or_else(|e| e.into_response());
+        assert_eq!(
+            second.status(),
+            StatusCode::OK,
+            "re-verify must still succeed, not fail with InvalidToken"
+        );
+        let body2 = response_json(second).await;
+        let code2 = extract_code_from_redirect(body2["redirect_to"].as_str().unwrap());
+
+        assert_ne!(code1, code2, "each verify must mint a fresh exchange code");
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
+    }
+
+    /// A prefetch (mail scanner / link preview) of the verify link must not strand the user:
+    /// the pending row survives, so the user's later real click still completes.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_email_prefetch_does_not_strand_user() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+        let email = format!("verify-prefetch-{}@example.com", Uuid::new_v4());
+        let (pubkey, token) = insert_oauth_pending_registration(&pool, &email).await;
+
+        // Simulated prefetch hit.
+        let prefetch = verify_email(
+            create_test_tenant(),
+            State(auth_state.clone()),
+            HeaderMap::new(),
+            Json(VerifyEmailRequest {
+                token: token.clone(),
+            }),
+        )
+        .await
+        .map(|r| r.into_response())
+        .unwrap_or_else(|e| e.into_response());
+        assert_eq!(prefetch.status(), StatusCode::OK);
+
+        // The user's real click afterwards must still complete (not InvalidToken / stranded).
+        let real = verify_email(
+            create_test_tenant(),
+            State(auth_state.clone()),
+            HeaderMap::new(),
+            Json(VerifyEmailRequest {
+                token: token.clone(),
+            }),
+        )
+        .await
+        .map(|r| r.into_response())
+        .unwrap_or_else(|e| e.into_response());
+        assert_eq!(
+            real.status(),
+            StatusCode::OK,
+            "user's real click after a prefetch must still verify"
+        );
+        let body = response_json(real).await;
+        assert_eq!(body["success"], true);
+        // Must re-arm via the pending-registration path (fresh redirect + code), NOT fall through
+        // to the degenerate users-table "already verified" branch that mints no exchange code.
+        assert!(
+            body["redirect_to"].is_string(),
+            "real click after prefetch must re-arm a fresh exchange code, not silently strand"
+        );
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
     }
 
     #[cfg(feature = "integration-tests")]

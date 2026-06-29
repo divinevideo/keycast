@@ -1948,13 +1948,17 @@ impl UserRepository {
     /// Returns [`RepositoryError::NotFound`] if no row exists for this pubkey.
     /// Returns [`RepositoryError::Duplicate`] if the email is owned by another
     /// user or the row is already bound to a different email.
+    ///
+    /// `verification_token` is the token kept on the materialized row so the
+    /// email link stays idempotently re-resolvable; pass `None` when the
+    /// pending registration carries no token.
     pub async fn complete_pending_oauth_registration(
         &self,
         pubkey: &str,
         tenant_id: i64,
         email: &str,
         password_hash: &str,
-        verification_token: &str,
+        verification_token: Option<&str>,
         encrypted_secret: Option<&[u8]>,
     ) -> Result<(), RepositoryError> {
         let mut tx = self.pool.begin().await?;
@@ -4087,7 +4091,14 @@ mod tests {
 
         create_bare_user(&pool, &pubkey).await;
 
-        repo.complete_pending_oauth_registration(&pubkey, 1, &email, "hash", &token, Some(&secret))
+        repo.complete_pending_oauth_registration(
+            &pubkey,
+            1,
+            &email,
+            "hash",
+            Some(&token),
+            Some(&secret),
+        )
             .await
             .unwrap();
 
@@ -4140,7 +4151,7 @@ mod tests {
             1,
             &email,
             "hash",
-            "token",
+            Some("token"),
             Some(&[1_u8; 32]),
         )
         .await
@@ -4207,7 +4218,7 @@ mod tests {
         create_bare_user(&pool, &pubkey).await;
 
         let result = repo
-            .complete_pending_oauth_registration(&pubkey, 1, &email, "hash", "token", None)
+            .complete_pending_oauth_registration(&pubkey, 1, &email, "hash", Some("token"), None)
             .await;
         assert!(
             matches!(result, Err(RepositoryError::Duplicate)),
@@ -4253,7 +4264,7 @@ mod tests {
                 1,
                 &pending_email,
                 "pending-hash",
-                "token",
+                Some("token"),
                 Some(&[1_u8; 32]),
             )
             .await;
@@ -4309,7 +4320,7 @@ mod tests {
             1,
             &email,
             "pending-hash",
-            "token",
+            Some("token"),
             Some(&secret),
         )
         .await
@@ -4366,7 +4377,7 @@ mod tests {
             1,
             &email,
             "pending-hash",
-            "token",
+            Some("token"),
             Some(&secret),
         )
         .await
@@ -4409,7 +4420,7 @@ mod tests {
                 1,
                 "oauth-missing@example.com",
                 "hash",
-                "token",
+                Some("token"),
                 None,
             )
             .await;
