@@ -285,6 +285,29 @@ impl OAuthCodeRepository {
         Ok(())
     }
 
+    /// Clear the failed-attempt counter for a pending registration after a correct PIN (keycast#262).
+    ///
+    /// `reserve_pin_attempt` increments `pin_attempts` before every bcrypt compare, including the
+    /// successful one, so a verified registration would otherwise carry that success toward the
+    /// lockout cap and a duplicate/retried verify of the same correct PIN could spuriously lock out.
+    /// Resetting to zero on success keeps the invariant that only *failed* attempts lock, without
+    /// weakening the brute-force cap: this is reachable only with a correct PIN.
+    pub async fn reset_pin_attempts(
+        &self,
+        device_code: &str,
+        tenant_id: i64,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "UPDATE oauth_codes SET pin_attempts = 0 \
+             WHERE device_code = $1 AND tenant_id = $2",
+        )
+        .bind(device_code)
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Find a still-live, un-redeemed exchange code already minted for a finalized registration, if
     /// one exists (keycast#262).
     ///
@@ -588,6 +611,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(none, None);
+
+        sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_reset_pin_attempts_clears_counter() {
+        let pool = setup_pool().await;
+        let repo = OAuthCodeRepository::new(pool.clone());
+
+        let device_code = format!("dc_{}", uuid::Uuid::new_v4());
+        let expires_at = Utc::now() + chrono::Duration::hours(24);
+        insert_pending_registration(&repo, &device_code, Some("pinhash123"), expires_at).await;
+
+        // Burn a couple of attempt slots (as a near-success run would), then reset on success.
+        repo.reserve_pin_attempt(&device_code, 1, 5).await.unwrap();
+        repo.reserve_pin_attempt(&device_code, 1, 5).await.unwrap();
+        let before = repo
+            .find_by_device_code(&device_code, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.pin_attempts, 2, "attempts accumulated before reset");
+
+        repo.reset_pin_attempts(&device_code, 1).await.unwrap();
+
+        let after = repo
+            .find_by_device_code(&device_code, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.pin_attempts, 0,
+            "successful verify must clear the failed-attempt counter"
+        );
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
             .bind(&device_code)

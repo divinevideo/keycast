@@ -847,6 +847,21 @@ pub async fn headless_verify_pin(
     )
     .await?;
 
+    // Correct PIN: clear the failed-attempt counter that `reserve_pin_attempt` incremented before
+    // the bcrypt compare. Only failed attempts should count toward the lockout cap (keycast#262), so
+    // a successful verify (and any idempotent re-verify of the same correct PIN) must not lock out.
+    // Best-effort: the registration already finalized, so a stray counter is not worth failing on.
+    if let Err(e) = oauth_code_repo
+        .reset_pin_attempts(&req.device_code, tenant_id)
+        .await
+    {
+        tracing::warn!(
+            "Failed to reset pin_attempts after successful PIN verify for {}: {}",
+            pending.user_pubkey,
+            e
+        );
+    }
+
     tracing::info!(
         event = "email_pin_verify",
         tenant_id = tenant_id,
