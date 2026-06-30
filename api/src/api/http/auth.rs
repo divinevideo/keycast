@@ -1837,12 +1837,22 @@ pub async fn finalize_pending_registration(
         }
     } else if let Some(ref encrypted_secret) = oauth_data.pending_encrypted_secret {
         // Auto-generated or direct nsec: create user + personal_keys atomically.
+        //
+        // Idempotent under concurrency (link GET + PIN, mail prefetch, multiple instances): the
+        // users INSERT uses ON CONFLICT (pubkey) DO NOTHING RETURNING, and the personal_keys INSERT
+        // only runs when we actually created the user. `personal_keys` has no unique key on
+        // user_pubkey, so a blind insert on the losing race would duplicate key material; gating on
+        // the RETURNING row prevents that. No returned row => a concurrent finalize already
+        // materialized this user, so we fall through as "already exists" and re-mint a fresh code
+        // (keycast#262 finalize-race).
         let now = Utc::now();
         let mut tx = pool.begin().await?;
 
-        if let Err(err) = sqlx::query(
+        let inserted: Option<(String,)> = match sqlx::query_as(
             "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, email_verification_token, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (pubkey) DO NOTHING
+             RETURNING pubkey",
         )
         .bind(&oauth_data.user_pubkey)
         .bind(tenant_id)
@@ -1852,37 +1862,48 @@ pub async fn finalize_pending_registration(
         .bind(kept_token)
         .bind(now)
         .bind(now)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         {
-            if has_database_constraint(&err, USERS_EMAIL_TENANT_CONSTRAINT) {
+            Ok(row) => row,
+            Err(err) if has_database_constraint(&err, USERS_EMAIL_TENANT_CONSTRAINT) => {
                 // Duplicate email: this registration can never complete, so the pending row is
                 // terminal — delete it rather than leaving a row that only ever 409s.
                 tx.rollback().await?;
                 delete_pending_registration(&oauth_code_repo, kept_token, tenant_id).await?;
                 return Err(AuthError::EmailAlreadyExists);
             }
-            return Err(err.into());
+            Err(err) => return Err(err.into()),
+        };
+
+        if inserted.is_some() {
+            sqlx::query(
+                "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(&oauth_data.user_pubkey)
+            .bind(encrypted_secret)
+            .bind(tenant_id)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+
+            tracing::info!(
+                "Created user and personal_keys for OAuth registration: {}",
+                oauth_data.user_pubkey
+            );
+        } else {
+            // Lost the race: another finalize already created this user (and its keys). Nothing to
+            // insert; commit the empty tx and proceed to re-mint a fresh exchange code.
+            tx.commit().await?;
+            tracing::info!(
+                "User already materialized by concurrent finalize, skipping creation: {}",
+                oauth_data.user_pubkey
+            );
         }
-
-        sqlx::query(
-            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5)",
-        )
-        .bind(&oauth_data.user_pubkey)
-        .bind(encrypted_secret)
-        .bind(tenant_id)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-
-        tracing::info!(
-            "Created user and personal_keys for OAuth registration: {}",
-            oauth_data.user_pubkey
-        );
     } else {
         // BYOK flow: just create user, keys will come at token exchange.
         if let Err(err) = user_repo

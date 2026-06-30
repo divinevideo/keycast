@@ -691,6 +691,12 @@ impl UserRepository {
     }
 
     /// Create a new user with email/password and pre-verified status.
+    ///
+    /// Idempotent on `pubkey`: concurrent finalize of the same pending registration may call this
+    /// twice for the same pubkey, so a pubkey conflict is a no-op (`ON CONFLICT (pubkey) DO
+    /// NOTHING`) rather than an error — the caller then proceeds as "user already exists". A
+    /// genuine duplicate *email* on a different pubkey still surfaces via the email unique
+    /// constraint, which the caller maps to a 409 (keycast#262 finalize-race).
     pub async fn create_with_password_verified(
         &self,
         pubkey: &str,
@@ -702,7 +708,8 @@ impl UserRepository {
     ) -> Result<(), RepositoryError> {
         sqlx::query(
             "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, email_verification_token, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (pubkey) DO NOTHING",
         )
         .bind(pubkey)
         .bind(tenant_id)
@@ -2975,6 +2982,34 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_create_with_password_verified_is_idempotent_on_pubkey() {
+        // Concurrent finalize of the same pending registration can call this twice for the same
+        // pubkey; the second call must be a no-op rather than a unique-violation error so finalize
+        // can proceed to re-mint a fresh exchange code (keycast#262 finalize-race).
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let pubkey = Keys::generate().public_key().to_hex();
+        let email = format!("idem-{}@example.com", test_suffix());
+
+        repo.create_with_password_verified(&pubkey, 1, &email, "hash", true, None)
+            .await
+            .expect("first create should succeed");
+
+        // Second identical create must NOT error (ON CONFLICT (pubkey) DO NOTHING).
+        repo.create_with_password_verified(&pubkey, 1, &email, "hash", true, None)
+            .await
+            .expect("second create on same pubkey must be a no-op, not an error");
+
+        assert!(repo.exists(&pubkey, 1).await.unwrap());
+
+        sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(&pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
