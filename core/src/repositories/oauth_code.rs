@@ -33,6 +33,9 @@ pub struct OAuthCodeData {
     pub pin_attempts: i32,
     /// Timestamp of the last PIN issuance; backs the PIN-resend cooldown
     pub pin_sent_at: Option<DateTime<Utc>>,
+    /// Terminal marker (keycast#262): set when the registration's exchange code is redeemed. Once
+    /// non-NULL, finalize refuses to re-mint and the row is eligible for cleanup.
+    pub consumed_at: Option<DateTime<Utc>>,
 }
 
 /// Parameters for storing a basic OAuth code
@@ -152,7 +155,7 @@ impl OAuthCodeRepository {
     const SELECT_COLUMNS: &'static str =
         "user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method, \
          pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret, \
-         previous_auth_id, state, device_code, is_headless, pin_hash, pin_attempts, pin_sent_at";
+         previous_auth_id, state, device_code, is_headless, pin_hash, pin_attempts, pin_sent_at, consumed_at";
 
     /// Find a valid (non-expired) OAuth code.
     pub async fn find_valid(
@@ -251,33 +254,98 @@ impl OAuthCodeRepository {
     }
 
     /// Re-arm a pending registration for PIN resend: install a fresh verification token + PIN hash,
-    /// reset the attempt counter to zero, refresh `pin_sent_at`, and extend the verify window.
+    /// reset the attempt counter to zero, and refresh `pin_sent_at`.
     ///
     /// Used by the lockout-recovery path: after the attempt cap is hit, the user must request a resend
     /// (subject to the cooldown) which mints a new PIN and clears the lockout.
+    ///
+    /// Deliberately does NOT touch `expires_at`: the pending row keeps its original 24h registration
+    /// window. Otherwise repeated resends could extend a pending row indefinitely, defeating the
+    /// row's finite lifecycle (keycast#262).
     pub async fn reset_pin_for_resend(
         &self,
         device_code: &str,
         tenant_id: i64,
         new_verification_token: &str,
         new_pin_hash: &str,
-        new_expires_at: DateTime<Utc>,
     ) -> Result<(), RepositoryError> {
         sqlx::query(
             "UPDATE oauth_codes \
              SET pending_email_verification_token = $1, pin_hash = $2, pin_attempts = 0, \
-                 pin_sent_at = $3, expires_at = $4 \
-             WHERE device_code = $5 AND tenant_id = $6",
+                 pin_sent_at = $3 \
+             WHERE device_code = $4 AND tenant_id = $5",
         )
         .bind(new_verification_token)
         .bind(new_pin_hash)
         .bind(Utc::now())
-        .bind(new_expires_at)
         .bind(device_code)
         .bind(tenant_id)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Delete previously minted, un-redeemed exchange codes for a finalized registration so at most
+    /// one exchange code is ever live for it (keycast#262).
+    ///
+    /// Re-verifying within the window (link re-click, link + PIN) mints a fresh exchange code; this
+    /// removes the prior one. Exchange codes are produced by [`Self::store`] and carry neither a
+    /// `device_code` nor a `pending_email`, which is what distinguishes them from the pending
+    /// registration row — so this never deletes the pending row itself.
+    pub async fn delete_unredeemed_exchange_codes(
+        &self,
+        tenant_id: i64,
+        user_pubkey: &str,
+        client_id: &str,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "DELETE FROM oauth_codes \
+             WHERE tenant_id = $1 AND user_pubkey = $2 AND client_id = $3 \
+               AND device_code IS NULL AND pending_email IS NULL",
+        )
+        .bind(tenant_id)
+        .bind(user_pubkey)
+        .bind(client_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Mark a pending registration row terminal once its exchange code has been redeemed.
+    ///
+    /// Targets only the pending row (`device_code IS NOT NULL`) for this user + client, and only if
+    /// not already consumed. After this, finalize refuses to re-mint (keycast#262). A no-op for
+    /// normal token exchanges that have no pending row.
+    pub async fn mark_pending_consumed(
+        &self,
+        tenant_id: i64,
+        user_pubkey: &str,
+        client_id: &str,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "UPDATE oauth_codes SET consumed_at = $1 \
+             WHERE tenant_id = $2 AND user_pubkey = $3 AND client_id = $4 \
+               AND device_code IS NOT NULL AND consumed_at IS NULL",
+        )
+        .bind(Utc::now())
+        .bind(tenant_id)
+        .bind(user_pubkey)
+        .bind(client_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Delete dead rows: anything past its expiry, plus consumed pending registrations (terminal
+    /// once their exchange code was redeemed). Bounds table growth and enforces the pending row's
+    /// finite lifecycle (keycast#262). Returns the number of rows removed.
+    pub async fn delete_expired_and_consumed(&self) -> Result<u64, RepositoryError> {
+        let result =
+            sqlx::query("DELETE FROM oauth_codes WHERE expires_at < $1 OR consumed_at IS NOT NULL")
+                .bind(Utc::now())
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected())
     }
 
     /// Delete pending OAuth registration by verification token.
@@ -528,16 +596,22 @@ mod tests {
         let repo = OAuthCodeRepository::new(pool.clone());
 
         let device_code = format!("dc_{}", uuid::Uuid::new_v4());
-        let expires_at = Utc::now() + chrono::Duration::hours(24);
+        // Original registration window: an exact, known expiry we can assert stays put.
+        let expires_at = Utc::now() + chrono::Duration::hours(12);
         insert_pending_registration(&repo, &device_code, Some("oldpin"), expires_at).await;
+        let original_expiry: DateTime<Utc> =
+            sqlx::query_scalar("SELECT expires_at FROM oauth_codes WHERE device_code = $1")
+                .bind(&device_code)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
 
         // Burn two attempts.
         repo.reserve_pin_attempt(&device_code, 1, 5).await.unwrap();
         repo.reserve_pin_attempt(&device_code, 1, 5).await.unwrap();
 
         let new_token = format!("verif_{}", uuid::Uuid::new_v4());
-        let new_expires = Utc::now() + chrono::Duration::hours(24);
-        repo.reset_pin_for_resend(&device_code, 1, &new_token, "newpin", new_expires)
+        repo.reset_pin_for_resend(&device_code, 1, &new_token, "newpin")
             .await
             .unwrap();
 
@@ -549,6 +623,18 @@ mod tests {
         assert_eq!(data.pin_hash.as_deref(), Some("newpin"));
         assert_eq!(data.pin_attempts, 0, "attempts reset on resend");
 
+        // Resend must NOT extend the original 24h window (keycast#262 bounded lifecycle).
+        let after_expiry: DateTime<Utc> =
+            sqlx::query_scalar("SELECT expires_at FROM oauth_codes WHERE device_code = $1")
+                .bind(&device_code)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            after_expiry, original_expiry,
+            "resend must not extend expires_at past the original registration window"
+        );
+
         // New token is now the live verification token.
         let by_token = repo
             .find_by_verification_token(&new_token, 1)
@@ -558,6 +644,178 @@ mod tests {
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
             .bind(&device_code)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_delete_unredeemed_exchange_codes_spares_pending_row() {
+        let pool = setup_pool().await;
+        let repo = OAuthCodeRepository::new(pool.clone());
+
+        // A pending registration row (device_code + pending_email set).
+        let device_code = format!("dc_{}", uuid::Uuid::new_v4());
+        let expires_at = Utc::now() + chrono::Duration::hours(24);
+        insert_pending_registration(&repo, &device_code, Some("pinhash"), expires_at).await;
+        let pending = repo
+            .find_by_device_code(&device_code, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        let user_pubkey = pending.user_pubkey.clone();
+        let client_id = pending.client_id.clone();
+
+        // A previously minted exchange code for the same user+client (no device_code/pending_email).
+        let exchange_code = format!("exch_{}", uuid::Uuid::new_v4());
+        repo.store(StoreOAuthCodeParams {
+            tenant_id: 1,
+            code: &exchange_code,
+            user_pubkey: &user_pubkey,
+            client_id: &client_id,
+            redirect_uri: "http://localhost:3000/callback",
+            scope: "policy:social",
+            code_challenge: None,
+            code_challenge_method: None,
+            expires_at: Utc::now() + chrono::Duration::minutes(10),
+            previous_auth_id: None,
+            state: None,
+            is_headless: true,
+        })
+        .await
+        .unwrap();
+
+        repo.delete_unredeemed_exchange_codes(1, &user_pubkey, &client_id)
+            .await
+            .unwrap();
+
+        // Exchange code is gone; pending registration row survives.
+        assert!(
+            repo.find_valid(1, &exchange_code).await.unwrap().is_none(),
+            "prior exchange code must be deleted"
+        );
+        assert!(
+            repo.find_by_device_code(&device_code, 1)
+                .await
+                .unwrap()
+                .is_some(),
+            "pending registration row must NOT be deleted"
+        );
+
+        sqlx::query("DELETE FROM oauth_codes WHERE user_pubkey = $1")
+            .bind(&user_pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_mark_pending_consumed_sets_marker_on_pending_row_only() {
+        let pool = setup_pool().await;
+        let repo = OAuthCodeRepository::new(pool.clone());
+
+        let device_code = format!("dc_{}", uuid::Uuid::new_v4());
+        let expires_at = Utc::now() + chrono::Duration::hours(24);
+        insert_pending_registration(&repo, &device_code, Some("pinhash"), expires_at).await;
+        let pending = repo
+            .find_by_device_code(&device_code, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(pending.consumed_at.is_none(), "starts un-consumed");
+
+        repo.mark_pending_consumed(1, &pending.user_pubkey, &pending.client_id)
+            .await
+            .unwrap();
+
+        let after = repo
+            .find_by_device_code(&device_code, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            after.consumed_at.is_some(),
+            "pending row should be marked consumed"
+        );
+
+        sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_delete_expired_and_consumed_removes_dead_rows() {
+        let pool = setup_pool().await;
+        let repo = OAuthCodeRepository::new(pool.clone());
+
+        // Live row (kept).
+        let live_dc = format!("dc_live_{}", uuid::Uuid::new_v4());
+        insert_pending_registration(
+            &repo,
+            &live_dc,
+            Some("pin"),
+            Utc::now() + chrono::Duration::hours(24),
+        )
+        .await;
+
+        // Expired row (removed).
+        let expired_dc = format!("dc_exp_{}", uuid::Uuid::new_v4());
+        insert_pending_registration(
+            &repo,
+            &expired_dc,
+            Some("pin"),
+            Utc::now() - chrono::Duration::hours(1),
+        )
+        .await;
+
+        // Live-but-consumed row (removed).
+        let consumed_dc = format!("dc_con_{}", uuid::Uuid::new_v4());
+        insert_pending_registration(
+            &repo,
+            &consumed_dc,
+            Some("pin"),
+            Utc::now() + chrono::Duration::hours(24),
+        )
+        .await;
+        let consumed = repo
+            .find_by_device_code(&consumed_dc, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        repo.mark_pending_consumed(1, &consumed.user_pubkey, &consumed.client_id)
+            .await
+            .unwrap();
+
+        let removed = repo.delete_expired_and_consumed().await.unwrap();
+        assert!(removed >= 2, "expired and consumed rows should be deleted");
+
+        // find_by_device_code filters expired, so query the raw row for the expired case.
+        let expired_still_present: Option<(String,)> =
+            sqlx::query_as("SELECT device_code FROM oauth_codes WHERE device_code = $1")
+                .bind(&expired_dc)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert!(expired_still_present.is_none(), "expired row removed");
+        let consumed_still_present: Option<(String,)> =
+            sqlx::query_as("SELECT device_code FROM oauth_codes WHERE device_code = $1")
+                .bind(&consumed_dc)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert!(consumed_still_present.is_none(), "consumed row removed");
+        assert!(
+            repo.find_by_device_code(&live_dc, 1)
+                .await
+                .unwrap()
+                .is_some(),
+            "live un-consumed row retained"
+        );
+
+        sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&live_dc)
             .execute(&pool)
             .await
             .unwrap();

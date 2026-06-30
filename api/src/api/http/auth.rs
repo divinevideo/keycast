@@ -514,6 +514,9 @@ pub enum AuthError {
     Forbidden(String),   // User has no authorization for this origin
     KeyEgressDenied,     // Policy refuses raw-key egress for this account
     RegistrationExpired, // Async bcrypt timed out (instance died)
+    /// The pending registration's exchange code was already redeemed; re-mint is refused
+    /// (keycast#262 bounded lifecycle).
+    RegistrationAlreadyCompleted,
     ServiceUnavailable {
         // Server at capacity or shutting down
         message: String,
@@ -683,6 +686,10 @@ impl IntoResponse for AuthError {
                 StatusCode::GONE,
                 "Registration expired. Please register again.".to_string(),
             ),
+            AuthError::RegistrationAlreadyCompleted => (
+                StatusCode::CONFLICT,
+                "This registration is already complete. Please sign in.".to_string(),
+            ),
             AuthError::ServiceUnavailable { message, retry_after } => {
                 // Return with Retry-After header if provided
                 let response = (
@@ -768,6 +775,9 @@ impl From<AuthError> for super::headless::HeadlessError {
                 )
             }
             AuthError::Conflict(msg) => HeadlessError::Conflict(msg),
+            AuthError::RegistrationAlreadyCompleted => HeadlessError::Conflict(
+                "This registration is already complete. Please sign in.".to_string(),
+            ),
             AuthError::ServiceUnavailable {
                 message,
                 retry_after,
@@ -1724,6 +1734,17 @@ pub async fn finalize_pending_registration(
     oauth_data: &OAuthCodeData,
     delivery: HeadlessDelivery,
 ) -> Result<FinalizedRegistration, AuthError> {
+    // Terminal: once the registration's exchange code has been redeemed, the row is consumed and
+    // must not re-mint again (keycast#262). Re-clicks before redemption still re-arm a fresh code
+    // (the intended harmless idempotency); re-clicks after completion are refused here.
+    if oauth_data.consumed_at.is_some() {
+        tracing::info!(
+            "Registration already completed (consumed), refusing to re-mint: {}",
+            oauth_data.user_pubkey
+        );
+        return Err(AuthError::RegistrationAlreadyCompleted);
+    }
+
     let email = oauth_data
         .pending_email
         .as_ref()
@@ -1984,6 +2005,12 @@ pub async fn finalize_pending_registration(
         state: oauth_data.state.as_deref(),
         is_headless: oauth_data.is_headless, // Inherit from original registration
     };
+    // At most one live exchange code per registration: drop any previously minted, un-redeemed
+    // exchange code for this user+client before storing the fresh one, so a re-click cannot leave
+    // several valid codes outstanding (keycast#262).
+    oauth_code_repo
+        .delete_unredeemed_exchange_codes(tenant_id, &oauth_data.user_pubkey, &oauth_data.client_id)
+        .await?;
     oauth_code_repo.store(store_params).await?;
 
     if let Some((device_code, redis)) = strict_delivery {
@@ -2081,15 +2108,24 @@ async fn perform_email_verification(
 
         // Complete via the shared finalize path. This intentionally does NOT delete the pending
         // row: re-verifying within the 24h window re-arms a fresh 10-minute code, which makes
-        // link prefetch/preview harmless (keycast#262 Part A).
-        let finalized = finalize_pending_registration(
+        // link prefetch/preview harmless (keycast#262 Part A). Once the registration has been
+        // completed (exchange code redeemed), finalize refuses to re-mint; a re-clicked link then
+        // shows the friendly "already verified" page rather than an error.
+        let finalized = match finalize_pending_registration(
             pool,
             auth_state.state.redis.as_ref(),
             tenant_id,
             &oauth_data,
             HeadlessDelivery::RedisRequired,
         )
-        .await?;
+        .await
+        {
+            Ok(finalized) => finalized,
+            Err(AuthError::RegistrationAlreadyCompleted) => {
+                return Ok(VerifyOutcome::AlreadyVerified)
+            }
+            Err(e) => return Err(e),
+        };
 
         if finalized.is_headless {
             tracing::info!(

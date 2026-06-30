@@ -238,6 +238,23 @@ pub fn spawn_cleanup_task(pool: PgPool) -> tokio::task::JoinHandle<()> {
                     tracing::error!("Cleanup task: failed to delete stale rows: {}", e);
                 }
             }
+
+            // Bound the oauth_codes pending/exchange rows: drop anything expired plus consumed
+            // pending registrations (terminal once their exchange code was redeemed) (keycast#262).
+            let oauth_code_repo =
+                keycast_core::repositories::OAuthCodeRepository::new(pool.clone());
+            match oauth_code_repo.delete_expired_and_consumed().await {
+                Ok(deleted) if deleted > 0 => {
+                    tracing::info!(
+                        "Cleanup task: deleted {} expired/consumed oauth_codes rows",
+                        deleted
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!("Cleanup task: failed to delete oauth_codes rows: {}", e);
+                }
+            }
         }
     })
 }

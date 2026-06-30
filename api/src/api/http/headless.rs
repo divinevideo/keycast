@@ -926,7 +926,8 @@ pub async fn headless_resend_pin(
         return Ok(success());
     };
 
-    // Mint a fresh token + PIN, reset the attempt counter, refresh the 24h verify window.
+    // Mint a fresh token + PIN and reset the attempt counter. The original 24h verify window is
+    // preserved (resend does not extend expires_at) so the pending row stays bounded (keycast#262).
     let new_token = generate_secure_token();
     let new_pin: String = format!("{:06}", rand::thread_rng().gen_range(0..1_000_000));
     let pin_for_hash = new_pin.clone();
@@ -936,15 +937,8 @@ pub async fn headless_resend_pin(
             .map_err(|e| HeadlessError::Internal(format!("Task join error: {}", e)))?
             .map_err(|e| HeadlessError::Internal(format!("PIN hash error: {}", e)))?;
 
-    let new_expires_at = Utc::now() + Duration::hours(EMAIL_VERIFICATION_EXPIRY_HOURS);
     oauth_code_repo
-        .reset_pin_for_resend(
-            &req.device_code,
-            tenant_id,
-            &new_token,
-            &new_pin_hash,
-            new_expires_at,
-        )
+        .reset_pin_for_resend(&req.device_code, tenant_id, &new_token, &new_pin_hash)
         .await?;
 
     // Re-send the link + PIN (best-effort; the user can request another resend after the cooldown).

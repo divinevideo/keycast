@@ -3100,6 +3100,19 @@ async fn handle_authorization_code_grant(
         // Delete the authorization code (one-time use)
         oauth_code_repo.delete(tenant_id, code).await?;
 
+        // Mark the originating pending registration row terminal (keycast#262): once its exchange
+        // code is redeemed, finalize must refuse to re-mint. No-op when there is no pending row.
+        if let Err(e) = oauth_code_repo
+            .mark_pending_consumed(tenant_id, &user_pubkey, &client_id)
+            .await
+        {
+            tracing::warn!(
+                "Failed to mark pending registration consumed for {}: {}",
+                user_pubkey,
+                e
+            );
+        }
+
         // Get user's email for UCAN
         let user_repo = UserRepository::new(pool.clone());
         user_repo.get_email(&user_pubkey, tenant_id).await?
