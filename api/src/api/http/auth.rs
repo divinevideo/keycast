@@ -1983,35 +1983,41 @@ pub async fn finalize_pending_registration(
         None
     };
 
-    // Generate a fresh authorization code (10 minute exchange window — do not lengthen).
-    let new_code: String = rand::thread_rng()
-        .sample_iter(&rand::distributions::Alphanumeric)
-        .take(32)
-        .map(char::from)
-        .collect();
+    // Re-arm idempotently (keycast#262): if a still-live exchange code was already minted for this
+    // registration (an earlier re-click or mail prefetch), reuse it instead of minting a
+    // replacement. A re-mint would strand the code the polling app may already hold. Only mint a
+    // fresh code (10 minute exchange window — do not lengthen) when none is live. The consumed_at
+    // terminal guard above already refuses re-mint once a code has been redeemed.
+    let new_code = if let Some(existing) = oauth_code_repo
+        .find_live_exchange_code(tenant_id, &oauth_data.user_pubkey, &oauth_data.client_id)
+        .await?
+    {
+        existing
+    } else {
+        let minted: String = rand::thread_rng()
+            .sample_iter(&rand::distributions::Alphanumeric)
+            .take(32)
+            .map(char::from)
+            .collect();
 
-    let code_expires_at = Utc::now() + Duration::minutes(10);
-    let store_params = keycast_core::repositories::StoreOAuthCodeParams {
-        tenant_id,
-        code: &new_code,
-        user_pubkey: &oauth_data.user_pubkey,
-        client_id: &oauth_data.client_id,
-        redirect_uri: &oauth_data.redirect_uri,
-        scope: &oauth_data.scope,
-        code_challenge: oauth_data.code_challenge.as_deref(),
-        code_challenge_method: oauth_data.code_challenge_method.as_deref(),
-        expires_at: code_expires_at,
-        previous_auth_id: oauth_data.previous_auth_id,
-        state: oauth_data.state.as_deref(),
-        is_headless: oauth_data.is_headless, // Inherit from original registration
+        let code_expires_at = Utc::now() + Duration::minutes(10);
+        let store_params = keycast_core::repositories::StoreOAuthCodeParams {
+            tenant_id,
+            code: &minted,
+            user_pubkey: &oauth_data.user_pubkey,
+            client_id: &oauth_data.client_id,
+            redirect_uri: &oauth_data.redirect_uri,
+            scope: &oauth_data.scope,
+            code_challenge: oauth_data.code_challenge.as_deref(),
+            code_challenge_method: oauth_data.code_challenge_method.as_deref(),
+            expires_at: code_expires_at,
+            previous_auth_id: oauth_data.previous_auth_id,
+            state: oauth_data.state.as_deref(),
+            is_headless: oauth_data.is_headless, // Inherit from original registration
+        };
+        oauth_code_repo.store(store_params).await?;
+        minted
     };
-    // At most one live exchange code per registration: drop any previously minted, un-redeemed
-    // exchange code for this user+client before storing the fresh one, so a re-click cannot leave
-    // several valid codes outstanding (keycast#262).
-    oauth_code_repo
-        .delete_unredeemed_exchange_codes(tenant_id, &oauth_data.user_pubkey, &oauth_data.client_id)
-        .await?;
-    oauth_code_repo.store(store_params).await?;
 
     if let Some((device_code, redis)) = strict_delivery {
         let key = format!("oauth_poll:{}", device_code);

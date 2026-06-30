@@ -285,30 +285,36 @@ impl OAuthCodeRepository {
         Ok(())
     }
 
-    /// Delete previously minted, un-redeemed exchange codes for a finalized registration so at most
-    /// one exchange code is ever live for it (keycast#262).
+    /// Find a still-live, un-redeemed exchange code already minted for a finalized registration, if
+    /// one exists (keycast#262).
     ///
-    /// Re-verifying within the window (link re-click, link + PIN) mints a fresh exchange code; this
-    /// removes the prior one. Exchange codes are produced by [`Self::store`] and carry neither a
-    /// `device_code` nor a `pending_email`, which is what distinguishes them from the pending
-    /// registration row — so this never deletes the pending row itself.
-    pub async fn delete_unredeemed_exchange_codes(
+    /// Lets finalize re-arm idempotently: a re-click or mail-prefetch within the exchange window
+    /// reuses the code the polling app may already hold rather than minting a replacement and
+    /// stranding the delivered one. Exchange codes are produced by [`Self::store`] and carry neither
+    /// a `device_code` nor a `pending_email`, which distinguishes them from the pending registration
+    /// row; redeemed codes are deleted at token exchange, so a row that still matches is un-redeemed.
+    /// Returns the most recently minted live code when several exist (a rare double-mint race).
+    pub async fn find_live_exchange_code(
         &self,
         tenant_id: i64,
         user_pubkey: &str,
         client_id: &str,
-    ) -> Result<(), RepositoryError> {
-        sqlx::query(
-            "DELETE FROM oauth_codes \
+    ) -> Result<Option<String>, RepositoryError> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT code FROM oauth_codes \
              WHERE tenant_id = $1 AND user_pubkey = $2 AND client_id = $3 \
-               AND device_code IS NULL AND pending_email IS NULL",
+               AND device_code IS NULL AND pending_email IS NULL \
+               AND consumed_at IS NULL AND expires_at > $4 \
+             ORDER BY created_at DESC \
+             LIMIT 1",
         )
         .bind(tenant_id)
         .bind(user_pubkey)
         .bind(client_id)
-        .execute(&self.pool)
+        .bind(Utc::now())
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(())
+        Ok(row.map(|r| r.0))
     }
 
     /// Mark a pending registration row terminal once its exchange code has been redeemed.
@@ -650,7 +656,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_unredeemed_exchange_codes_spares_pending_row() {
+    async fn test_find_live_exchange_code_reuses_not_pending_row() {
         let pool = setup_pool().await;
         let repo = OAuthCodeRepository::new(pool.clone());
 
@@ -665,6 +671,15 @@ mod tests {
             .unwrap();
         let user_pubkey = pending.user_pubkey.clone();
         let client_id = pending.client_id.clone();
+
+        // No exchange code minted yet: the pending row must not be mistaken for one.
+        assert!(
+            repo.find_live_exchange_code(1, &user_pubkey, &client_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "pending registration row must NOT be returned as an exchange code"
+        );
 
         // A previously minted exchange code for the same user+client (no device_code/pending_email).
         let exchange_code = format!("exch_{}", uuid::Uuid::new_v4());
@@ -685,21 +700,63 @@ mod tests {
         .await
         .unwrap();
 
-        repo.delete_unredeemed_exchange_codes(1, &user_pubkey, &client_id)
-            .await
-            .unwrap();
-
-        // Exchange code is gone; pending registration row survives.
-        assert!(
-            repo.find_valid(1, &exchange_code).await.unwrap().is_none(),
-            "prior exchange code must be deleted"
+        // The live exchange code is now found and reused; the pending row is still untouched.
+        assert_eq!(
+            repo.find_live_exchange_code(1, &user_pubkey, &client_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(exchange_code.as_str()),
+            "live exchange code must be returned for reuse"
         );
         assert!(
             repo.find_by_device_code(&device_code, 1)
                 .await
                 .unwrap()
                 .is_some(),
-            "pending registration row must NOT be deleted"
+            "pending registration row must NOT be consumed by the lookup"
+        );
+
+        sqlx::query("DELETE FROM oauth_codes WHERE user_pubkey = $1")
+            .bind(&user_pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_find_live_exchange_code_skips_expired() {
+        let pool = setup_pool().await;
+        let repo = OAuthCodeRepository::new(pool.clone());
+
+        let user_pubkey = format!("pk_{}", uuid::Uuid::new_v4());
+        let client_id = format!("client_{}", uuid::Uuid::new_v4());
+
+        // An already-expired exchange code must not be reused.
+        let expired_code = format!("exch_{}", uuid::Uuid::new_v4());
+        repo.store(StoreOAuthCodeParams {
+            tenant_id: 1,
+            code: &expired_code,
+            user_pubkey: &user_pubkey,
+            client_id: &client_id,
+            redirect_uri: "http://localhost:3000/callback",
+            scope: "policy:social",
+            code_challenge: None,
+            code_challenge_method: None,
+            expires_at: Utc::now() - chrono::Duration::minutes(1),
+            previous_auth_id: None,
+            state: None,
+            is_headless: true,
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            repo.find_live_exchange_code(1, &user_pubkey, &client_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "expired exchange code must NOT be reused"
         );
 
         sqlx::query("DELETE FROM oauth_codes WHERE user_pubkey = $1")
