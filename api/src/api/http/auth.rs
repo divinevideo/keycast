@@ -40,6 +40,9 @@ const MAX_NIP05_USERNAME_LENGTH: usize = 64;
 const USERS_EMAIL_TENANT_CONSTRAINT: &str = "idx_users_email_tenant";
 pub(crate) const INVALID_EMAIL_CODE: &str = "INVALID_EMAIL";
 pub(crate) const INVALID_EMAIL_MESSAGE: &str = "Please enter a valid email address.";
+pub(crate) const EMAIL_ALREADY_EXISTS_CODE: &str = "EMAIL_ALREADY_EXISTS";
+const EMAIL_ALREADY_EXISTS_MESSAGE: &str =
+    "This email is already registered. Please log in instead.";
 
 /// Get token expiry in seconds. Uses `TOKEN_EXPIRY_SECONDS` env var if set,
 /// otherwise defaults to 24 hours (86400 seconds).
@@ -443,10 +446,14 @@ impl IntoResponse for AuthError {
                     "Email conflict while verifying registration: constraint {}",
                     USERS_EMAIL_TENANT_CONSTRAINT
                 );
-                (
+                return (
                     StatusCode::CONFLICT,
-                    "This email is already registered. Please log in instead.".to_string(),
+                    Json(serde_json::json!({
+                        "error": EMAIL_ALREADY_EXISTS_MESSAGE,
+                        "code": EMAIL_ALREADY_EXISTS_CODE,
+                    })),
                 )
+                    .into_response();
             }
             AuthError::Database(e) => {
                 // Log the real error but return generic message to user
@@ -468,10 +475,16 @@ impl IntoResponse for AuthError {
                 StatusCode::UNAUTHORIZED,
                 "Invalid email or password. Please check your credentials and try again.".to_string(),
             ),
-            AuthError::EmailAlreadyExists => (
-                StatusCode::CONFLICT,
-                "This email is already registered. Please log in instead.".to_string(),
-            ),
+            AuthError::EmailAlreadyExists => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": EMAIL_ALREADY_EXISTS_MESSAGE,
+                        "code": EMAIL_ALREADY_EXISTS_CODE,
+                    })),
+                )
+                    .into_response();
+            }
             AuthError::EmailNotVerified => (
                 StatusCode::FORBIDDEN,
                 "Please verify your email address before continuing. Check your inbox for the verification link.".to_string(),
@@ -4549,6 +4562,8 @@ mod tests {
         };
 
         assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response_json(response).await;
+        assert_eq!(body["code"], super::EMAIL_ALREADY_EXISTS_CODE);
 
         cleanup_verify_email_test_data(&pool, &existing_pubkey, &verification_token).await;
         cleanup_verify_email_test_data(&pool, &pending_pubkey, &verification_token).await;
