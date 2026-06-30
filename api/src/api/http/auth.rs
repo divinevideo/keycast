@@ -374,6 +374,13 @@ pub struct AccountStatusResponse {
     pub account_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suspended_reason: Option<String>,
+    /// True for an approved minor (13-15) account (Keycast `users.verified_minor`).
+    /// Returned independently of `account_status`: an approved minor is `active`, so gating
+    /// this behind the non-active check (like `account_status`) would hide the protected-minor
+    /// state from clients. Always present so a `false` reliably signals "not a protected minor".
+    pub verified_minor: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified_minor_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -2345,11 +2352,18 @@ pub async fn get_account_status(
 
     let user_repo = UserRepository::new(pool.clone());
     let user = user_repo
-        .get_account_status(&user_pubkey, tenant_id)
+        .get_account_status_with_minor(&user_pubkey, tenant_id)
         .await?;
 
     match user {
-        Some((email, email_verified, status, suspended_reason)) => {
+        Some((
+            email,
+            email_verified,
+            status,
+            suspended_reason,
+            verified_minor,
+            verified_minor_at,
+        )) => {
             let account_status = if status.is_active() {
                 None
             } else {
@@ -2366,6 +2380,10 @@ pub async fn get_account_status(
                 public_key: user_pubkey,
                 account_status,
                 suspended_reason: reason,
+                // Unconditional, unlike account_status: an approved minor is `active`, so the
+                // protected-minor flag must surface even on an otherwise-normal active account.
+                verified_minor,
+                verified_minor_at,
             }))
         }
         None => Err(AuthError::UserNotFound),

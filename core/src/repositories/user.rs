@@ -642,6 +642,37 @@ impl UserRepository {
         .map_err(Into::into)
     }
 
+    /// Like `get_account_status`, but also returns the approved-minor flag and timestamp.
+    /// Backs `GET /user/account` so clients can detect the protected-minor (13-15) state
+    /// directly from Keycast. Kept separate from `get_account_status` so the oauth
+    /// login/session paths that share that method are untouched.
+    /// Returns (email, email_verified, status, suspended_reason, verified_minor, verified_minor_at).
+    pub async fn get_account_status_with_minor(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<
+        Option<(
+            Option<String>,
+            Option<bool>,
+            UserStatus,
+            Option<String>,
+            bool,
+            Option<DateTime<Utc>>,
+        )>,
+        RepositoryError,
+    > {
+        sqlx::query_as(
+            "SELECT email, email_verified, status, suspended_reason, verified_minor, verified_minor_at \
+             FROM users WHERE pubkey = $1 AND tenant_id = $2",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Get user's account status fields for admin queries.
     /// Returns (status, suspended_reason, suspended_at) or None if user not found.
     pub async fn get_user_status(
