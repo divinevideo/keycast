@@ -724,6 +724,18 @@ async fn record_pin_verify_failure(
     .await;
 }
 
+/// Spend bcrypt work equivalent to a real PIN comparison.
+///
+/// Verify-pin rejects several states before ever reaching the bcrypt compare (unknown
+/// `device_code`, no PIN issued, already locked). Burning a dummy hash on those paths keeps their
+/// latency comparable to a wrong-PIN attempt so the rejected state is not distinguishable by timing.
+async fn burn_dummy_bcrypt() {
+    let _ = tokio::task::spawn_blocking(|| {
+        let _ = bcrypt::hash("dummy", bcrypt::DEFAULT_COST);
+    })
+    .await;
+}
+
 /// POST /api/headless/verify-pin
 ///
 /// In-app fallback for the email verification link (keycast#262): for webviews that never run the
@@ -747,10 +759,7 @@ pub async fn headless_verify_pin(
 
     let Some(pending) = pending else {
         // Burn comparable time so an unknown/expired device_code isn't distinguishable by latency.
-        let _ = tokio::task::spawn_blocking(|| {
-            let _ = bcrypt::hash("dummy", bcrypt::DEFAULT_COST);
-        })
-        .await;
+        burn_dummy_bcrypt().await;
         record_pin_verify_failure(
             pool,
             &headers,
@@ -764,6 +773,9 @@ pub async fn headless_verify_pin(
     };
 
     let Some(pin_hash) = pending.pin_hash.clone() else {
+        // No PIN was issued for this registration. Burn comparable bcrypt work so this is
+        // indistinguishable by latency from a wrong-PIN attempt before rejecting uniformly.
+        burn_dummy_bcrypt().await;
         record_pin_verify_failure(
             pool,
             &headers,
@@ -776,8 +788,15 @@ pub async fn headless_verify_pin(
         return Err(HeadlessError::PinVerificationFailed);
     };
 
-    // Already locked: reject without checking the PIN (uniform error, no lockout signal).
-    if pending.pin_attempts >= MAX_PIN_ATTEMPTS {
+    // Atomically reserve an attempt slot BEFORE the expensive bcrypt compare. The conditional
+    // UPDATE increments only while under the cap, so at most MAX_PIN_ATTEMPTS comparisons can run
+    // for this device_code even across concurrent requests. `None` means the row is at the cap
+    // (locked) — reject uniformly, burning comparable time so lockout is not a timing signal.
+    let Some(attempt) = oauth_code_repo
+        .reserve_pin_attempt(&req.device_code, tenant_id, MAX_PIN_ATTEMPTS)
+        .await?
+    else {
+        burn_dummy_bcrypt().await;
         record_pin_verify_failure(
             pool,
             &headers,
@@ -788,7 +807,7 @@ pub async fn headless_verify_pin(
         )
         .await;
         return Err(HeadlessError::PinVerificationFailed);
-    }
+    };
 
     // Constant-time PIN comparison (bcrypt's own compare; work factor dominates).
     let candidate = req.pin.clone();
@@ -799,11 +818,8 @@ pub async fn headless_verify_pin(
         .unwrap_or(false);
 
     if !valid {
-        let new_count = oauth_code_repo
-            .increment_pin_attempts(&req.device_code, tenant_id)
-            .await?
-            .unwrap_or(0);
-        let reason = if new_count >= MAX_PIN_ATTEMPTS {
+        // The slot was already consumed by the atomic reserve above; just classify and record.
+        let reason = if attempt >= MAX_PIN_ATTEMPTS {
             "pin_locked"
         } else {
             "wrong_pin"

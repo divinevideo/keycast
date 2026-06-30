@@ -221,23 +221,29 @@ impl OAuthCodeRepository {
         Ok(result)
     }
 
-    /// Atomically increment the PIN-attempt counter for a pending registration and return the new
-    /// count. Returns `None` when no pending row matches (unknown/expired `device_code`).
+    /// Atomically reserve one PIN-verification attempt slot for a pending registration, returning
+    /// the new attempt count. Returns `None` when no slot could be reserved — either the row is
+    /// already at `max_attempts` (locked) or no pending row matches the `device_code`.
     ///
-    /// The increment is done in a single `UPDATE ... RETURNING` so concurrent verify-pin requests
-    /// across Cloud Run instances cannot race the cap (an in-memory counter would not be shared state).
-    pub async fn increment_pin_attempts(
+    /// The increment happens in a single conditional `UPDATE ... WHERE pin_attempts < $max
+    /// RETURNING`, so the cap is enforced by the database rather than by a snapshot read. This is
+    /// what bounds brute force: callers reserve a slot BEFORE running the (expensive) bcrypt
+    /// comparison, so at most `max_attempts` comparisons can ever run for a given `device_code`,
+    /// even across concurrent verify-pin requests on different Cloud Run instances.
+    pub async fn reserve_pin_attempt(
         &self,
         device_code: &str,
         tenant_id: i64,
+        max_attempts: i32,
     ) -> Result<Option<i32>, RepositoryError> {
         let row: Option<(i32,)> = sqlx::query_as(
             "UPDATE oauth_codes SET pin_attempts = pin_attempts + 1 \
-             WHERE device_code = $1 AND tenant_id = $2 \
+             WHERE device_code = $1 AND tenant_id = $2 AND pin_attempts < $3 \
              RETURNING pin_attempts",
         )
         .bind(device_code)
         .bind(tenant_id)
+        .bind(max_attempts)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -463,7 +469,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_increment_pin_attempts_accumulates_and_returns() {
+    async fn test_reserve_pin_attempt_accumulates_and_enforces_cap() {
         let pool = setup_pool().await;
         let repo = OAuthCodeRepository::new(pool.clone());
 
@@ -471,13 +477,42 @@ mod tests {
         let expires_at = Utc::now() + chrono::Duration::hours(24);
         insert_pending_registration(&repo, &device_code, Some("pinhash123"), expires_at).await;
 
-        let first = repo.increment_pin_attempts(&device_code, 1).await.unwrap();
+        // Reserve up to the cap; each call returns the post-increment count.
+        let max = 3;
+        let first = repo
+            .reserve_pin_attempt(&device_code, 1, max)
+            .await
+            .unwrap();
         assert_eq!(first, Some(1));
-        let second = repo.increment_pin_attempts(&device_code, 1).await.unwrap();
+        let second = repo
+            .reserve_pin_attempt(&device_code, 1, max)
+            .await
+            .unwrap();
         assert_eq!(second, Some(2));
+        let third = repo
+            .reserve_pin_attempt(&device_code, 1, max)
+            .await
+            .unwrap();
+        assert_eq!(third, Some(3));
+
+        // At the cap: no slot can be reserved (atomic lockout), and the counter does not grow.
+        let locked = repo
+            .reserve_pin_attempt(&device_code, 1, max)
+            .await
+            .unwrap();
+        assert_eq!(locked, None, "reserve must return None once at the cap");
+        let after = repo
+            .find_by_device_code(&device_code, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.pin_attempts, max, "counter must not exceed the cap");
 
         // Unknown device_code returns None (no row updated).
-        let none = repo.increment_pin_attempts("nonexistent", 1).await.unwrap();
+        let none = repo
+            .reserve_pin_attempt("nonexistent", 1, max)
+            .await
+            .unwrap();
         assert_eq!(none, None);
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
@@ -497,8 +532,8 @@ mod tests {
         insert_pending_registration(&repo, &device_code, Some("oldpin"), expires_at).await;
 
         // Burn two attempts.
-        repo.increment_pin_attempts(&device_code, 1).await.unwrap();
-        repo.increment_pin_attempts(&device_code, 1).await.unwrap();
+        repo.reserve_pin_attempt(&device_code, 1, 5).await.unwrap();
+        repo.reserve_pin_attempt(&device_code, 1, 5).await.unwrap();
 
         let new_token = format!("verif_{}", uuid::Uuid::new_v4());
         let new_expires = Utc::now() + chrono::Duration::hours(24);
