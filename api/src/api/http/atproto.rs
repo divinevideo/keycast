@@ -413,13 +413,13 @@ fn map_control_error(error: AtprotoControlError) -> AuthError {
         ),
         AtprotoControlError::ProvisioningTrigger(err) => {
             tracing::warn!("ATProto provisioning trigger failed: {}", err);
-            if err.is_dependency_unavailable() {
-                AuthError::ServiceUnavailable {
-                    message: err.public_message().to_string(),
-                    retry_after: None,
-                }
-            } else {
-                AuthError::Internal(err.public_message().to_string())
+            // Both branches surface as a scoped 503: AuthError::Internal's
+            // IntoResponse discards the message and emits a fixed generic body,
+            // so a non-dependency provisioning failure must also use
+            // ServiceUnavailable to preserve the ATProto-specific text.
+            AuthError::ServiceUnavailable {
+                message: err.public_message().to_string(),
+                retry_after: None,
             }
         }
         AtprotoControlError::Repository(RepositoryError::NotFound(_)) => AuthError::UserNotFound,
@@ -586,6 +586,27 @@ mod tests {
                 message,
                 retry_after: None,
             } if message == "ATProto enablement is temporarily unavailable. Please try again later."
+        ));
+    }
+
+    #[test]
+    fn provisioning_client_error_maps_to_service_unavailable_with_scoped_body() {
+        // A control-plane 4xx is not dependency-unavailable, but it must still
+        // surface as a scoped 503 carrying the ATProto-specific message rather
+        // than AuthError::Internal's fixed generic body.
+        let error = map_control_error(AtprotoControlError::ProvisioningTrigger(
+            crate::atproto_provisioning::AtprotoProvisioningError::UnexpectedStatus {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                body: "bad request".to_string(),
+            },
+        ));
+
+        assert!(matches!(
+            error,
+            AuthError::ServiceUnavailable {
+                message,
+                retry_after: None,
+            } if message == "ATProto provisioning failed. Please try again later."
         ));
     }
 

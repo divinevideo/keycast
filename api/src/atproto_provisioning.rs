@@ -1,7 +1,12 @@
+use std::sync::OnceLock;
+use std::time::Duration;
+
 use reqwest::{Client, Url};
 use serde::Serialize;
 
 const DEFAULT_HANDLE_DOMAIN: &str = "divine.video";
+const CONTROL_PLANE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const CONTROL_PLANE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const ATPROTO_UNAVAILABLE_MESSAGE: &str =
     "ATProto enablement is temporarily unavailable. Please try again later.";
 
@@ -41,6 +46,20 @@ struct EnableProvisioningRequest {
     nostr_pubkey: String,
     handle: String,
     crosspost_enabled: bool,
+}
+
+/// Shared HTTP client for control-plane calls, built once with explicit
+/// connect/request timeouts so an unresponsive control plane fails fast into a
+/// scoped ATProto 503 instead of hanging the request.
+fn control_plane_client() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .connect_timeout(CONTROL_PLANE_CONNECT_TIMEOUT)
+            .timeout(CONTROL_PLANE_REQUEST_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| Client::new())
+    })
 }
 
 fn control_plane_base_url() -> Result<String, AtprotoProvisioningError> {
@@ -92,7 +111,7 @@ pub async fn request_enable(
         crosspost_enabled,
     };
 
-    let client = Client::new();
+    let client = control_plane_client();
     let response = maybe_apply_service_auth(client.post(url).json(&body))
         .send()
         .await?;
@@ -115,7 +134,7 @@ pub async fn request_reenable(nostr_pubkey: &str) -> Result<(), AtprotoProvision
         encoded_pubkey
     );
 
-    let client = Client::new();
+    let client = control_plane_client();
     let response = maybe_apply_service_auth(client.post(url)).send().await?;
 
     if response.status().is_success() {
@@ -136,7 +155,7 @@ pub async fn request_disable(nostr_pubkey: &str) -> Result<(), AtprotoProvisioni
         encoded_pubkey
     );
 
-    let client = Client::new();
+    let client = control_plane_client();
     let response = maybe_apply_service_auth(client.post(url)).send().await?;
 
     if response.status().is_success() {
