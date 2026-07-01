@@ -40,6 +40,9 @@ const MAX_NIP05_USERNAME_LENGTH: usize = 64;
 const USERS_EMAIL_TENANT_CONSTRAINT: &str = "idx_users_email_tenant";
 pub(crate) const INVALID_EMAIL_CODE: &str = "INVALID_EMAIL";
 pub(crate) const INVALID_EMAIL_MESSAGE: &str = "Please enter a valid email address.";
+pub(crate) const EMAIL_ALREADY_EXISTS_CODE: &str = "EMAIL_ALREADY_EXISTS";
+const EMAIL_ALREADY_EXISTS_MESSAGE: &str =
+    "This email is already registered. Please log in instead.";
 
 /// Get token expiry in seconds. Uses `TOKEN_EXPIRY_SECONDS` env var if set,
 /// otherwise defaults to 24 hours (86400 seconds).
@@ -473,6 +476,17 @@ fn has_database_constraint(error: &sqlx::Error, expected_constraint: &str) -> bo
     }
 }
 
+fn coded_error_response(status: StatusCode, message: &str, code: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": message,
+            "code": code,
+        })),
+    )
+        .into_response()
+}
+
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
@@ -483,10 +497,11 @@ impl IntoResponse for AuthError {
                     "Email conflict while verifying registration: constraint {}",
                     USERS_EMAIL_TENANT_CONSTRAINT
                 );
-                (
+                return coded_error_response(
                     StatusCode::CONFLICT,
-                    "This email is already registered. Please log in instead.".to_string(),
-                )
+                    EMAIL_ALREADY_EXISTS_MESSAGE,
+                    EMAIL_ALREADY_EXISTS_CODE,
+                );
             }
             AuthError::Database(e) => {
                 // Log the real error but return generic message to user
@@ -508,10 +523,13 @@ impl IntoResponse for AuthError {
                 StatusCode::UNAUTHORIZED,
                 "Invalid email or password. Please check your credentials and try again.".to_string(),
             ),
-            AuthError::EmailAlreadyExists => (
-                StatusCode::CONFLICT,
-                "This email is already registered. Please log in instead.".to_string(),
-            ),
+            AuthError::EmailAlreadyExists => {
+                return coded_error_response(
+                    StatusCode::CONFLICT,
+                    EMAIL_ALREADY_EXISTS_MESSAGE,
+                    EMAIL_ALREADY_EXISTS_CODE,
+                );
+            }
             AuthError::EmailNotVerified => (
                 StatusCode::FORBIDDEN,
                 "Please verify your email address before continuing. Check your inbox for the verification link.".to_string(),
@@ -557,14 +575,11 @@ impl IntoResponse for AuthError {
                 "This Nostr key is already registered. Please log in instead or use a different key.".to_string(),
             ),
             AuthError::InvalidEmail => {
-                return (
+                return coded_error_response(
                     StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": INVALID_EMAIL_MESSAGE,
-                        "code": INVALID_EMAIL_CODE,
-                    })),
-                )
-                    .into_response();
+                    INVALID_EMAIL_MESSAGE,
+                    INVALID_EMAIL_CODE,
+                );
             },
             AuthError::TokenExpired => (
                 StatusCode::UNAUTHORIZED,
@@ -1578,7 +1593,7 @@ pub async fn verify_email(
             let now = Utc::now();
             let mut tx = pool.begin().await?;
 
-            sqlx::query(
+            if let Err(err) = sqlx::query(
                 "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, email_verification_token, created_at, updated_at)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             )
@@ -1591,7 +1606,17 @@ pub async fn verify_email(
             .bind(now)
             .bind(now)
             .execute(&mut *tx)
-            .await?;
+            .await
+            {
+                if has_database_constraint(&err, USERS_EMAIL_TENANT_CONSTRAINT) {
+                    tx.rollback().await?;
+                    oauth_code_repo
+                        .delete_by_verification_token(&req.token, tenant_id)
+                        .await?;
+                    return Err(AuthError::EmailAlreadyExists);
+                }
+                return Err(err.into());
+            }
 
             sqlx::query(
                 "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
@@ -1613,7 +1638,7 @@ pub async fn verify_email(
             );
         } else {
             // BYOK flow: just create user, keys will come at token exchange
-            user_repo
+            if let Err(err) = user_repo
                 .create_with_password_verified(
                     &oauth_data.user_pubkey,
                     tenant_id,
@@ -1622,7 +1647,16 @@ pub async fn verify_email(
                     true,             // email_verified = true
                     Some(&req.token), // Keep token for idempotent re-verification
                 )
-                .await?;
+                .await
+            {
+                if matches!(err, keycast_core::repositories::RepositoryError::Duplicate) {
+                    oauth_code_repo
+                        .delete_by_verification_token(&req.token, tenant_id)
+                        .await?;
+                    return Err(AuthError::EmailAlreadyExists);
+                }
+                return Err(err.into());
+            }
 
             tracing::info!(
                 "Created user for BYOK OAuth registration: {}",
@@ -4255,6 +4289,16 @@ mod tests {
         assert_eq!(body["error"], "Please enter a valid email address.");
     }
 
+    #[tokio::test]
+    async fn test_duplicate_email_response_has_stable_code() {
+        let response = super::AuthError::EmailAlreadyExists.into_response();
+
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let body = response_json(response).await;
+        assert_eq!(body["code"], super::EMAIL_ALREADY_EXISTS_CODE);
+        assert_eq!(body["error"], super::EMAIL_ALREADY_EXISTS_MESSAGE);
+    }
+
     #[cfg(feature = "integration-tests")]
     use super::{
         generate_ucan_token, login, update_profile, verify_email, ProfileData, VerifyEmailRequest,
@@ -4614,7 +4658,7 @@ mod tests {
 
         let response = match verify_email(
             create_test_tenant(),
-            State(auth_state),
+            State(auth_state.clone()),
             HeaderMap::new(),
             Json(VerifyEmailRequest {
                 token: verification_token.clone(),
@@ -4627,6 +4671,40 @@ mod tests {
         };
 
         assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response_json(response).await;
+        assert_eq!(body["code"], super::EMAIL_ALREADY_EXISTS_CODE);
+
+        let pending_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM oauth_codes
+             WHERE tenant_id = 1 AND pending_email_verification_token = $1",
+        )
+        .bind(&verification_token)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            pending_count.0, 0,
+            "duplicate-email verification should resolve the pending registration"
+        );
+
+        let retry_response = match verify_email(
+            create_test_tenant(),
+            State(auth_state),
+            HeaderMap::new(),
+            Json(VerifyEmailRequest {
+                token: verification_token.clone(),
+            }),
+        )
+        .await
+        {
+            Ok(response) => response.into_response(),
+            Err(err) => err.into_response(),
+        };
+        assert_ne!(
+            retry_response.status(),
+            StatusCode::CONFLICT,
+            "retrying the same token should not loop through duplicate-email insertion"
+        );
 
         cleanup_verify_email_test_data(&pool, &existing_pubkey, &verification_token).await;
         cleanup_verify_email_test_data(&pool, &pending_pubkey, &verification_token).await;

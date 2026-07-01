@@ -57,6 +57,9 @@ components:
         error:
           type: string
           description: Error message
+        code:
+          type: string
+          description: Stable application error code, when available
       required:
         - error
 
@@ -342,7 +345,13 @@ paths:
               schema:
                 $ref: '#/components/schemas/RegisterResponse'
         '400':
-          description: Invalid request (email already exists, weak password, invalid nsec)
+          description: Invalid request (weak password, invalid nsec)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Email already exists
           content:
             application/json:
               schema:
