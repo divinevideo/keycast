@@ -436,6 +436,17 @@ fn has_database_constraint(error: &sqlx::Error, expected_constraint: &str) -> bo
     }
 }
 
+fn coded_error_response(status: StatusCode, message: &str, code: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": message,
+            "code": code,
+        })),
+    )
+        .into_response()
+}
+
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
@@ -446,14 +457,11 @@ impl IntoResponse for AuthError {
                     "Email conflict while verifying registration: constraint {}",
                     USERS_EMAIL_TENANT_CONSTRAINT
                 );
-                return (
+                return coded_error_response(
                     StatusCode::CONFLICT,
-                    Json(serde_json::json!({
-                        "error": EMAIL_ALREADY_EXISTS_MESSAGE,
-                        "code": EMAIL_ALREADY_EXISTS_CODE,
-                    })),
-                )
-                    .into_response();
+                    EMAIL_ALREADY_EXISTS_MESSAGE,
+                    EMAIL_ALREADY_EXISTS_CODE,
+                );
             }
             AuthError::Database(e) => {
                 // Log the real error but return generic message to user
@@ -476,14 +484,11 @@ impl IntoResponse for AuthError {
                 "Invalid email or password. Please check your credentials and try again.".to_string(),
             ),
             AuthError::EmailAlreadyExists => {
-                return (
+                return coded_error_response(
                     StatusCode::CONFLICT,
-                    Json(serde_json::json!({
-                        "error": EMAIL_ALREADY_EXISTS_MESSAGE,
-                        "code": EMAIL_ALREADY_EXISTS_CODE,
-                    })),
-                )
-                    .into_response();
+                    EMAIL_ALREADY_EXISTS_MESSAGE,
+                    EMAIL_ALREADY_EXISTS_CODE,
+                );
             }
             AuthError::EmailNotVerified => (
                 StatusCode::FORBIDDEN,
@@ -530,14 +535,11 @@ impl IntoResponse for AuthError {
                 "This Nostr key is already registered. Please log in instead or use a different key.".to_string(),
             ),
             AuthError::InvalidEmail => {
-                return (
+                return coded_error_response(
                     StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": INVALID_EMAIL_MESSAGE,
-                        "code": INVALID_EMAIL_CODE,
-                    })),
-                )
-                    .into_response();
+                    INVALID_EMAIL_MESSAGE,
+                    INVALID_EMAIL_CODE,
+                );
             },
             AuthError::TokenExpired => (
                 StatusCode::UNAUTHORIZED,
@@ -4188,6 +4190,16 @@ mod tests {
         let body = response_json(response).await;
         assert_eq!(body["code"], super::INVALID_EMAIL_CODE);
         assert_eq!(body["error"], "Please enter a valid email address.");
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_email_response_has_stable_code() {
+        let response = super::AuthError::EmailAlreadyExists.into_response();
+
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let body = response_json(response).await;
+        assert_eq!(body["code"], super::EMAIL_ALREADY_EXISTS_CODE);
+        assert_eq!(body["error"], super::EMAIL_ALREADY_EXISTS_MESSAGE);
     }
 
     #[cfg(feature = "integration-tests")]
