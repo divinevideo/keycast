@@ -144,8 +144,8 @@ impl OAuthCodeRepository {
         .bind(params.device_code)
         .bind(params.is_headless)
         .bind(params.pin_hash)
-        // pin_sent_at tracks the last PIN issuance for the resend cooldown; set when a PIN is issued.
-        .bind(params.pin_hash.map(|_| Utc::now()))
+        // pin_sent_at tracks confirmed delivery; callers set it after the email send succeeds.
+        .bind(None::<DateTime<Utc>>)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -285,6 +285,51 @@ impl OAuthCodeRepository {
         Ok(())
     }
 
+    /// Restore PIN resend fields after replacement email delivery fails.
+    pub async fn restore_pin_after_failed_resend(
+        &self,
+        device_code: &str,
+        tenant_id: i64,
+        verification_token: Option<&str>,
+        pin_hash: Option<&str>,
+        pin_attempts: i32,
+        pin_sent_at: Option<DateTime<Utc>>,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "UPDATE oauth_codes \
+             SET pending_email_verification_token = $1, pin_hash = $2, pin_attempts = $3, \
+                 pin_sent_at = $4 \
+             WHERE device_code = $5 AND tenant_id = $6",
+        )
+        .bind(verification_token)
+        .bind(pin_hash)
+        .bind(pin_attempts)
+        .bind(pin_sent_at)
+        .bind(device_code)
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Mark that a PIN email was successfully handed to the delivery provider.
+    pub async fn mark_pin_sent(
+        &self,
+        device_code: &str,
+        tenant_id: i64,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "UPDATE oauth_codes SET pin_sent_at = $1 \
+             WHERE device_code = $2 AND tenant_id = $3",
+        )
+        .bind(Utc::now())
+        .bind(device_code)
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Clear the failed-attempt counter for a pending registration after a correct PIN (keycast#262).
     ///
     /// `reserve_pin_attempt` increments `pin_attempts` before every bcrypt compare, including the
@@ -323,8 +368,21 @@ impl OAuthCodeRepository {
         user_pubkey: &str,
         client_id: &str,
     ) -> Result<Option<String>, RepositoryError> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT code FROM oauth_codes \
+        Ok(self
+            .find_live_exchange_code_with_expiry(tenant_id, user_pubkey, client_id)
+            .await?
+            .map(|row| row.0))
+    }
+
+    /// Find a still-live exchange code with its DB expiry.
+    pub async fn find_live_exchange_code_with_expiry(
+        &self,
+        tenant_id: i64,
+        user_pubkey: &str,
+        client_id: &str,
+    ) -> Result<Option<(String, DateTime<Utc>)>, RepositoryError> {
+        let row: Option<(String, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT code, expires_at FROM oauth_codes \
              WHERE tenant_id = $1 AND user_pubkey = $2 AND client_id = $3 \
                AND device_code IS NULL AND pending_email IS NULL \
                AND consumed_at IS NULL AND expires_at > $4 \
@@ -337,7 +395,7 @@ impl OAuthCodeRepository {
         .bind(Utc::now())
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|r| r.0))
+        Ok(row)
     }
 
     /// Mark a pending registration row terminal once its exchange code has been redeemed.
@@ -818,6 +876,52 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "expired exchange code must NOT be reused"
+        );
+
+        sqlx::query("DELETE FROM oauth_codes WHERE user_pubkey = $1")
+            .bind(&user_pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_find_live_exchange_code_with_expiry_returns_remaining_db_lifetime() {
+        let pool = setup_pool().await;
+        let repo = OAuthCodeRepository::new(pool.clone());
+
+        let user_pubkey = format!("pk_{}", uuid::Uuid::new_v4());
+        let client_id = format!("client_{}", uuid::Uuid::new_v4());
+        let exchange_code = format!("exch_{}", uuid::Uuid::new_v4());
+        let expires_at = Utc::now() + chrono::Duration::seconds(90);
+
+        repo.store(StoreOAuthCodeParams {
+            tenant_id: 1,
+            code: &exchange_code,
+            user_pubkey: &user_pubkey,
+            client_id: &client_id,
+            redirect_uri: "http://localhost:3000/callback",
+            scope: "policy:social",
+            code_challenge: None,
+            code_challenge_method: None,
+            expires_at,
+            previous_auth_id: None,
+            state: None,
+            is_headless: true,
+        })
+        .await
+        .unwrap();
+
+        let found = repo
+            .find_live_exchange_code_with_expiry(1, &user_pubkey, &client_id)
+            .await
+            .unwrap()
+            .expect("live exchange code should be returned with expiry");
+
+        assert_eq!(found.0, exchange_code);
+        assert!(
+            found.1 <= expires_at && found.1 > Utc::now(),
+            "expiry must come from the DB row so Redis TTL can be bounded"
         );
 
         sqlx::query("DELETE FROM oauth_codes WHERE user_pubkey = $1")

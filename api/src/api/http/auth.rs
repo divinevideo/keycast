@@ -1990,11 +1990,16 @@ pub async fn finalize_pending_registration(
     // terminal guard above already refuses re-mint once a code has been redeemed.
     // `freshly_minted` records whether THIS call created the code (vs reused an existing live one).
     // It gates the delivery-failure cleanup below: a reused code is owned by a prior finalize.
-    let (new_code, freshly_minted) = if let Some(existing) = oauth_code_repo
-        .find_live_exchange_code(tenant_id, &oauth_data.user_pubkey, &oauth_data.client_id)
-        .await?
+    let (new_code, code_expires_at, freshly_minted) = if let Some((existing, expires_at)) =
+        oauth_code_repo
+            .find_live_exchange_code_with_expiry(
+                tenant_id,
+                &oauth_data.user_pubkey,
+                &oauth_data.client_id,
+            )
+            .await?
     {
-        (existing, false)
+        (existing, expires_at, false)
     } else {
         let minted: String = rand::thread_rng()
             .sample_iter(&rand::distributions::Alphanumeric)
@@ -2018,12 +2023,17 @@ pub async fn finalize_pending_registration(
             is_headless: oauth_data.is_headless, // Inherit from original registration
         };
         oauth_code_repo.store(store_params).await?;
-        (minted, true)
+        (minted, code_expires_at, true)
+    };
+    let redis_ttl_seconds = if freshly_minted {
+        600
+    } else {
+        (code_expires_at - Utc::now()).num_seconds().max(1) as u64
     };
 
     if let Some((device_code, redis)) = strict_delivery {
         let key = format!("oauth_poll:{}", device_code);
-        if let Err(e) = redis.setex(&key, 600, &new_code).await {
+        if let Err(e) = redis.setex(&key, redis_ttl_seconds, &new_code).await {
             tracing::error!(
                 event = "headless_poll_delivery_failed",
                 tenant_id = tenant_id,
@@ -2057,7 +2067,7 @@ pub async fn finalize_pending_registration(
         // is also returned synchronously in the response body (so a Redis miss is not fatal).
         if let Some(redis) = redis {
             let key = format!("oauth_poll:{}", device_code);
-            if let Err(e) = redis.setex(&key, 600, &new_code).await {
+            if let Err(e) = redis.setex(&key, redis_ttl_seconds, &new_code).await {
                 tracing::warn!("Failed to store OAuth code in Redis for polling: {}", e);
                 // Continue - redirect flow / synchronous return still works.
             } else {
