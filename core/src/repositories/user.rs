@@ -1405,6 +1405,31 @@ impl UserRepository {
         .map_err(Into::into)
     }
 
+    /// Clear the verified_minor designation (age-up or revocation).
+    /// Idempotent: clearing an already-cleared or never-minor account succeeds.
+    /// Returns NotFound only when the user does not exist. Touches only the two
+    /// minor columns plus updated_at; never alters status/suspended_reason/suspended_at.
+    pub async fn clear_verified_minor(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<(), RepositoryError> {
+        let result = sqlx::query(
+            "UPDATE users SET verified_minor = FALSE, verified_minor_at = NULL, updated_at = $3 \
+             WHERE pubkey = $1 AND tenant_id = $2",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .bind(Utc::now())
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound("user not found".to_string()));
+        }
+        Ok(())
+    }
+
     /// Combined status + verified_minor query for admin status endpoints.
     pub async fn get_full_admin_status(
         &self,
@@ -2296,5 +2321,87 @@ mod tests {
         cleanup_user(&pool, &h1).await;
         cleanup_user(&pool, &h2).await;
         cleanup_user(&pool, &h3).await;
+    }
+
+    #[tokio::test]
+    async fn test_clear_verified_minor_clears_flag_and_timestamp() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let pubkey = Keys::generate().public_key().to_hex();
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, verified_minor, verified_minor_at, created_at, updated_at) \
+             VALUES ($1, 1, TRUE, NOW(), NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        repo.clear_verified_minor(&pubkey, 1).await.unwrap();
+
+        let (verified_minor, verified_minor_at) =
+            repo.get_verified_minor(&pubkey, 1).await.unwrap().unwrap();
+        assert!(!verified_minor);
+        assert!(verified_minor_at.is_none());
+
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_clear_verified_minor_idempotent_on_already_cleared() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let pubkey = Keys::generate().public_key().to_hex();
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        repo.clear_verified_minor(&pubkey, 1).await.unwrap();
+        repo.clear_verified_minor(&pubkey, 1).await.unwrap();
+
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_clear_verified_minor_unknown_pubkey_not_found() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool);
+        let pubkey = Keys::generate().public_key().to_hex();
+
+        let result = repo.clear_verified_minor(&pubkey, 1).await;
+        assert!(matches!(result, Err(RepositoryError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_clear_verified_minor_leaves_status_untouched() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let pubkey = Keys::generate().public_key().to_hex();
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, verified_minor, verified_minor_at, status, suspended_reason, suspended_at, created_at, updated_at) \
+             VALUES ($1, 1, TRUE, NOW(), 'suspended', 'age_review', NOW(), NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        repo.clear_verified_minor(&pubkey, 1).await.unwrap();
+
+        let (status, suspended_reason, suspended_at, verified_minor, _) =
+            repo.get_full_admin_status(&pubkey, 1).await.unwrap().unwrap();
+        assert_eq!(status.as_str(), "suspended");
+        assert_eq!(suspended_reason.as_deref(), Some("age_review"));
+        assert!(suspended_at.is_some());
+        assert!(!verified_minor);
+
+        cleanup_user(&pool, &pubkey).await;
     }
 }
