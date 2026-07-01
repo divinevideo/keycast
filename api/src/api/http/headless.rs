@@ -63,6 +63,26 @@ pub struct HeadlessRegisterResponse {
 
 /// POST /api/headless/register
 ///
+/// Map a policy-lookup error at registration. A genuinely missing policy is a client error
+/// reported as "Unknown policy '<slug>'", but any other repository error (e.g. a DB connection
+/// failure such as 28P01) must surface as `Internal` rather than being masked as a missing
+/// policy — masking a connection error as "Unknown policy" hid a real fault and caused a review
+/// mis-triage (keycast#262).
+fn map_policy_lookup_error(
+    policy_slug: &str,
+    err: keycast_core::repositories::RepositoryError,
+) -> HeadlessError {
+    use keycast_core::repositories::RepositoryError;
+    match err {
+        RepositoryError::NotFound(_) => {
+            HeadlessError::InvalidRequest(format!("Unknown policy '{}'", policy_slug))
+        }
+        other => {
+            HeadlessError::Internal(format!("Failed to look up policy '{policy_slug}': {other}"))
+        }
+    }
+}
+
 /// Register a new user without web UI. Returns device_code for email verification polling.
 ///
 /// Flow:
@@ -100,11 +120,13 @@ pub async fn headless_register(
         let policy_slug = parse_policy_scope(scope)
             .map_err(|e| HeadlessError::InvalidRequest(format!("{:?}", e)))?;
 
-        // Verify policy exists
+        // Verify policy exists. A missing policy is a client error, but a DB failure here must
+        // surface as-is rather than being masked as "Unknown policy" (keycast#262).
         let policy_repo = PolicyRepository::new(pool.clone());
-        policy_repo.find_by_slug(&policy_slug).await.map_err(|_| {
-            HeadlessError::InvalidRequest(format!("Unknown policy '{}'", policy_slug))
-        })?;
+        policy_repo
+            .find_by_slug(&policy_slug)
+            .await
+            .map_err(|e| map_policy_lookup_error(&policy_slug, e))?;
     }
 
     // Use provided nsec or generate new Nostr keypair
@@ -1188,6 +1210,46 @@ mod tests {
         let body = response_json(response).await;
         assert_eq!(body["code"], crate::api::http::auth::INVALID_EMAIL_CODE);
         assert_eq!(body["error"], "Please enter a valid email address.");
+    }
+
+    /// A genuinely missing policy is a client error surfaced as "Unknown policy '<slug>'".
+    #[test]
+    fn test_map_policy_lookup_error_not_found_reports_unknown_policy() {
+        use keycast_core::repositories::RepositoryError;
+        let err = super::map_policy_lookup_error(
+            "full",
+            RepositoryError::NotFound("record not found".to_string()),
+        );
+        match err {
+            super::HeadlessError::InvalidRequest(msg) => {
+                assert_eq!(msg, "Unknown policy 'full'");
+            }
+            other => panic!("expected InvalidRequest for a missing policy, got {other:?}"),
+        }
+    }
+
+    /// A real DB failure (e.g. 28P01 auth error) must NOT be masked as a missing policy —
+    /// masking a connection error as "Unknown policy" caused a review mis-triage (keycast#262).
+    #[test]
+    fn test_map_policy_lookup_error_db_error_is_not_masked() {
+        use keycast_core::repositories::RepositoryError;
+        let err = super::map_policy_lookup_error(
+            "full",
+            RepositoryError::Database("password authentication failed".to_string()),
+        );
+        match err {
+            super::HeadlessError::Internal(msg) => {
+                assert!(
+                    !msg.contains("Unknown policy"),
+                    "a DB error must not be reported as a missing policy, got: {msg}"
+                );
+                assert!(
+                    msg.contains("password authentication failed"),
+                    "the real DB error should surface, got: {msg}"
+                );
+            }
+            other => panic!("expected Internal for a DB failure, got {other:?}"),
+        }
     }
 
     /// headless_register stores a hashed 6-digit PIN on the pending row (keycast#262).
