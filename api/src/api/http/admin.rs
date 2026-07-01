@@ -1944,6 +1944,106 @@ pub async fn set_user_status_admin(
     }))
 }
 
+// --- Clear verified_minor (service-token auth: age-up / revocation) ---
+
+/// Query params for the clear-verified_minor endpoint. Both optional; `actor`
+/// (the moderator's hex pubkey) drives the durable audit row.
+#[derive(Debug, Deserialize)]
+pub struct ClearVerifiedMinorParams {
+    pub actor: Option<String>,
+    pub reason: Option<String>,
+}
+
+/// Bound and strip control characters from a caller-supplied reason before it
+/// is logged or persisted (prevents log injection and unbounded audit rows).
+/// Returns None when empty after cleaning.
+fn sanitize_reason(raw: Option<String>) -> Option<String> {
+    let cleaned: String = raw?
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(500)
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+pub async fn clear_verified_minor_admin(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    headers: HeaderMap,
+    Path(pubkey): Path<String>,
+    Query(params): Query<ClearVerifiedMinorParams>,
+) -> ApiResult<Json<UserStatusResponse>> {
+    authorize_service_token(&headers)?;
+    let tenant_id = tenant.0.id;
+
+    // Validate the optional actor as a 64-char hex pubkey so a T&S action never
+    // silently loses its audit trail to a malformed actor.
+    if let Some(actor) = params.actor.as_deref() {
+        if actor.len() != 64 || !actor.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(ApiError::bad_request(
+                "actor must be a 64-character hex pubkey",
+            ));
+        }
+    }
+
+    let reason_clean = sanitize_reason(params.reason);
+
+    let user_repo = UserRepository::new(auth_state.state.db.clone());
+    user_repo.clear_verified_minor(&pubkey, tenant_id).await?;
+
+    tracing::info!(
+        event = "verified_minor_cleared",
+        pubkey = %pubkey,
+        actor = ?params.actor,
+        reason = ?reason_clean,
+        "Admin cleared verified_minor"
+    );
+
+    // Durable audit row (best-effort) when an actor is supplied. The table's
+    // actor_pubkey is NOT NULL, so no actor -> log-only. A failed insert logs
+    // and the clear still succeeds. (keycast#279 raises the same bar for status changes.)
+    if let Some(actor) = params.actor.as_deref() {
+        let audit_repo = AdminAuditEventRepository::new(auth_state.state.db.clone());
+        if let Err(error) = audit_repo
+            .record(AdminAuditEventRecord {
+                tenant_id,
+                actor_pubkey: actor.to_string(),
+                action: "clear_verified_minor".to_string(),
+                target_resource_type: "user".to_string(),
+                target_resource_id: Some(pubkey.clone()),
+                target_client_id: None,
+                metadata_json: serde_json::json!({ "reason": reason_clean }),
+            })
+            .await
+        {
+            tracing::error!(
+                pubkey = %pubkey,
+                error = %error,
+                "Failed to write admin_audit_events row for verified_minor clear"
+            );
+        }
+    }
+
+    let (status, suspended_reason, suspended_at, verified_minor, verified_minor_at) = user_repo
+        .get_full_admin_status(&pubkey, tenant_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("User not found"))?;
+
+    Ok(Json(UserStatusResponse {
+        pubkey,
+        status: status.as_str().to_string(),
+        suspended_reason,
+        suspended_at,
+        verified_minor,
+        verified_minor_at,
+    }))
+}
+
 // --- Create approved minor account (service-token auth) ---
 
 #[derive(Debug, Deserialize)]
