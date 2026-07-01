@@ -244,6 +244,32 @@ async fn request_enable_rejects_control_plane_url_with_query_or_fragment() {
 
 #[tokio::test]
 #[serial]
+async fn request_enable_rejects_control_plane_url_with_path() {
+    for suffix in ["/api", "/api/", "/nested/path"] {
+        let (base_url, _state) = start_capture_server().await;
+        let _base = EnvGuard::set(
+            "DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL",
+            &format!("{base_url}{suffix}"),
+        );
+        let _domain = EnvGuard::set("DIVINE_HANDLE_DOMAIN", "bsky.example");
+
+        let error = keycast_api::atproto_provisioning::request_enable(
+            "npub1pathcontrolplane",
+            "Alice",
+            true,
+        )
+        .await
+        .expect_err("control-plane URL with a path should fail closed");
+
+        assert!(matches!(
+            error,
+            keycast_api::atproto_provisioning::AtprotoProvisioningError::DependencyNotConfigured
+        ));
+    }
+}
+
+#[tokio::test]
+#[serial]
 async fn request_enable_rejects_non_http_control_plane_url() {
     let _base = EnvGuard::set("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL", "ftp://example.test");
     let _domain = EnvGuard::set("DIVINE_HANDLE_DOMAIN", "bsky.example");
