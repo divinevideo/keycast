@@ -194,7 +194,9 @@ mod tests {
     #[test]
     fn non_root_paths_are_rejected() {
         assert!(has_non_root_path(&parse("https://control.example.com/api")));
-        assert!(has_non_root_path(&parse("https://control.example.com/api/")));
+        assert!(has_non_root_path(&parse(
+            "https://control.example.com/api/"
+        )));
         assert!(has_non_root_path(&parse(
             "https://control.example.com/nested/path"
         )));
