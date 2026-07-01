@@ -6035,7 +6035,10 @@ mod tests {
         let body2 = response_json(second).await;
         let code2 = extract_code_from_redirect(body2["redirect_to"].as_str().unwrap());
 
-        assert_ne!(code1, code2, "each verify must mint a fresh exchange code");
+        assert_eq!(
+            code1, code2,
+            "idempotent re-arm reuses the same live exchange code"
+        );
 
         cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
     }
