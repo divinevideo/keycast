@@ -4730,9 +4730,9 @@ mod tests {
     }
 
     fn create_lazy_auth_state() -> crate::api::http::routes::AuthState {
-        create_lazy_auth_state_with_database_url(
-            "postgres://postgres:password@localhost/keycast_test",
-        )
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string());
+        create_lazy_auth_state_with_database_url(&database_url)
     }
 
     fn create_unit_test_tenant() -> crate::api::tenant::TenantExtractor {

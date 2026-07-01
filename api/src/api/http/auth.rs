@@ -5584,8 +5584,10 @@ mod tests {
     }
 
     fn create_lazy_auth_state() -> crate::api::http::routes::AuthState {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string());
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://postgres:password@localhost/keycast_test")
+            .connect_lazy(&database_url)
             .expect("lazy pool should be created");
         let bcrypt_queue = crate::bcrypt_queue::BcryptQueue::new();
         let secret_pool = keycast_core::secret_pool::SecretPool::new(1);
