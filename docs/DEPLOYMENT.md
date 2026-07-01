@@ -273,7 +273,7 @@ Required env vars to enable it:
 - `ATPROTO_ENTRYWAY_ENABLED=true`
 - `ATPROTO_ENTRYWAY_ORIGIN=https://entryway.divine.video`
 
-`entryway.divine.video` is the only public ATProto Authorization Server host in this setup. `login.divine.video` remains the human-facing DiVine and Nostr login surface.
+`entryway.divine.video` is the only public ATProto Authorization Server host in this setup. `login.divine.video` remains the human-facing Divine and Nostr login surface.
 
 Optional:
 

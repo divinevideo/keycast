@@ -57,7 +57,7 @@
   <div class="section-header">
     <h2>Bluesky Account</h2>
     <p>
-      Claim your DiVine handle, provision your Bluesky identity, and control whether future
+      Claim your Divine handle, provision your Bluesky identity, and control whether future
       cross-posts are allowed.
     </p>
   </div>
