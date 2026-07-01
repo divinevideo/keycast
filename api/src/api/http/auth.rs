@@ -1553,7 +1553,7 @@ pub async fn verify_email(
             let now = Utc::now();
             let mut tx = pool.begin().await?;
 
-            sqlx::query(
+            if let Err(err) = sqlx::query(
                 "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, email_verification_token, created_at, updated_at)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             )
@@ -1566,7 +1566,17 @@ pub async fn verify_email(
             .bind(now)
             .bind(now)
             .execute(&mut *tx)
-            .await?;
+            .await
+            {
+                if has_database_constraint(&err, USERS_EMAIL_TENANT_CONSTRAINT) {
+                    tx.rollback().await?;
+                    oauth_code_repo
+                        .delete_by_verification_token(&req.token, tenant_id)
+                        .await?;
+                    return Err(AuthError::EmailAlreadyExists);
+                }
+                return Err(err.into());
+            }
 
             sqlx::query(
                 "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
@@ -1588,7 +1598,7 @@ pub async fn verify_email(
             );
         } else {
             // BYOK flow: just create user, keys will come at token exchange
-            user_repo
+            if let Err(err) = user_repo
                 .create_with_password_verified(
                     &oauth_data.user_pubkey,
                     tenant_id,
@@ -1597,7 +1607,16 @@ pub async fn verify_email(
                     true,             // email_verified = true
                     Some(&req.token), // Keep token for idempotent re-verification
                 )
-                .await?;
+                .await
+            {
+                if matches!(err, keycast_core::repositories::RepositoryError::Duplicate) {
+                    oauth_code_repo
+                        .delete_by_verification_token(&req.token, tenant_id)
+                        .await?;
+                    return Err(AuthError::EmailAlreadyExists);
+                }
+                return Err(err.into());
+            }
 
             tracing::info!(
                 "Created user for BYOK OAuth registration: {}",
@@ -4561,7 +4580,7 @@ mod tests {
 
         let response = match verify_email(
             create_test_tenant(),
-            State(auth_state),
+            State(auth_state.clone()),
             HeaderMap::new(),
             Json(VerifyEmailRequest {
                 token: verification_token.clone(),
@@ -4576,6 +4595,38 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let body = response_json(response).await;
         assert_eq!(body["code"], super::EMAIL_ALREADY_EXISTS_CODE);
+
+        let pending_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM oauth_codes
+             WHERE tenant_id = 1 AND pending_email_verification_token = $1",
+        )
+        .bind(&verification_token)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            pending_count.0, 0,
+            "duplicate-email verification should resolve the pending registration"
+        );
+
+        let retry_response = match verify_email(
+            create_test_tenant(),
+            State(auth_state),
+            HeaderMap::new(),
+            Json(VerifyEmailRequest {
+                token: verification_token.clone(),
+            }),
+        )
+        .await
+        {
+            Ok(response) => response.into_response(),
+            Err(err) => err.into_response(),
+        };
+        assert_ne!(
+            retry_response.status(),
+            StatusCode::CONFLICT,
+            "retrying the same token should not loop through duplicate-email insertion"
+        );
 
         cleanup_verify_email_test_data(&pool, &existing_pubkey, &verification_token).await;
         cleanup_verify_email_test_data(&pool, &pending_pubkey, &verification_token).await;
