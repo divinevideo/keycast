@@ -62,6 +62,14 @@ fn control_plane_client() -> &'static Client {
     })
 }
 
+/// Returns true when the parsed URL carries a path component beyond the root.
+/// Endpoint URLs are built by string concatenation onto the base, so a non-root
+/// path would mangle the resulting endpoint and must be rejected here (kept
+/// consistent with the startup validation in keycast/src/main.rs).
+fn has_non_root_path(parsed: &Url) -> bool {
+    !matches!(parsed.path(), "" | "/")
+}
+
 fn control_plane_base_url() -> Result<String, AtprotoProvisioningError> {
     let base = std::env::var("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL")
         .ok()
@@ -74,6 +82,7 @@ fn control_plane_base_url() -> Result<String, AtprotoProvisioningError> {
     if !matches!(parsed.scheme(), "http" | "https")
         || parsed.query().is_some()
         || parsed.fragment().is_some()
+        || has_non_root_path(&parsed)
     {
         return Err(AtprotoProvisioningError::DependencyNotConfigured);
     }
@@ -165,4 +174,29 @@ pub async fn request_disable(nostr_pubkey: &str) -> Result<(), AtprotoProvisioni
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     Err(AtprotoProvisioningError::UnexpectedStatus { status, body })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_non_root_path;
+    use reqwest::Url;
+
+    fn parse(url: &str) -> Url {
+        Url::parse(url).expect("test URL should parse")
+    }
+
+    #[test]
+    fn root_paths_are_accepted() {
+        assert!(!has_non_root_path(&parse("https://control.example.com")));
+        assert!(!has_non_root_path(&parse("https://control.example.com/")));
+    }
+
+    #[test]
+    fn non_root_paths_are_rejected() {
+        assert!(has_non_root_path(&parse("https://control.example.com/api")));
+        assert!(has_non_root_path(&parse("https://control.example.com/api/")));
+        assert!(has_non_root_path(&parse(
+            "https://control.example.com/nested/path"
+        )));
+    }
 }

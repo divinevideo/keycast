@@ -486,17 +486,30 @@ fn warn_atproto_control_plane_config() {
         return;
     };
 
+    // Keep these rejections consistent with control_plane_base_url() in
+    // api/src/atproto_provisioning.rs: endpoint URLs are built by concatenating
+    // onto the base, so query strings, fragments, and non-root paths all mangle
+    // the result and must be rejected here too.
     match url::Url::parse(&url) {
         Ok(parsed)
             if matches!(parsed.scheme(), "http" | "https")
                 && parsed.query().is_none()
-                && parsed.fragment().is_none() => {}
+                && parsed.fragment().is_none()
+                && matches!(parsed.path(), "" | "/") => {}
         Ok(parsed)
             if matches!(parsed.scheme(), "http" | "https")
                 && (parsed.query().is_some() || parsed.fragment().is_some()) =>
         {
             warn_atproto_control_plane_config_issue(
                 "DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL must not include query strings or fragments; ATProto provisioning endpoints will return a scoped unavailable response",
+            );
+        }
+        Ok(parsed)
+            if matches!(parsed.scheme(), "http" | "https")
+                && !matches!(parsed.path(), "" | "/") =>
+        {
+            warn_atproto_control_plane_config_issue(
+                "DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL must not include a path component; ATProto provisioning endpoints will return a scoped unavailable response",
             );
         }
         _ => warn_atproto_control_plane_config_issue(
@@ -1284,6 +1297,26 @@ mod tests {
         for url in [
             "https://control-plane.example?tenant=prod",
             "https://control-plane.example#provisioning",
+        ] {
+            set_minimal_valid_environment();
+            std::env::set_var("NODE_ENV", "production");
+            std::env::set_var("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL", url);
+
+            let result = validate_environment();
+
+            assert!(result.is_ok(), "{url} should not block startup");
+
+            clear_minimal_valid_environment();
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_validate_environment_allows_atproto_control_plane_url_with_path() {
+        for url in [
+            "https://control-plane.example/api",
+            "https://control-plane.example/api/",
+            "https://control-plane.example/nested/path",
         ] {
             set_minimal_valid_environment();
             std::env::set_var("NODE_ENV", "production");
