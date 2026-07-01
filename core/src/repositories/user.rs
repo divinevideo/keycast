@@ -2395,8 +2395,11 @@ mod tests {
 
         repo.clear_verified_minor(&pubkey, 1).await.unwrap();
 
-        let (status, suspended_reason, suspended_at, verified_minor, _) =
-            repo.get_full_admin_status(&pubkey, 1).await.unwrap().unwrap();
+        let (status, suspended_reason, suspended_at, verified_minor, _) = repo
+            .get_full_admin_status(&pubkey, 1)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(status.as_str(), "suspended");
         assert_eq!(suspended_reason.as_deref(), Some("age_review"));
         assert!(suspended_at.is_some());

@@ -1958,11 +1958,7 @@ pub struct ClearVerifiedMinorParams {
 /// is logged or persisted (prevents log injection and unbounded audit rows).
 /// Returns None when empty after cleaning.
 fn sanitize_reason(raw: Option<String>) -> Option<String> {
-    let cleaned: String = raw?
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(500)
-        .collect();
+    let cleaned: String = raw?.chars().filter(|c| !c.is_control()).take(500).collect();
     let trimmed = cleaned.trim();
     if trimmed.is_empty() {
         None

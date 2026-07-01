@@ -44,7 +44,10 @@ impl KeyManager for TestKeyManager {
     async fn encrypt(&self, plaintext_bytes: &[u8]) -> Result<Vec<u8>, KeyManagerError> {
         Ok(plaintext_bytes.to_vec())
     }
-    async fn decrypt(&self, ciphertext_bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, KeyManagerError> {
+    async fn decrypt(
+        &self,
+        ciphertext_bytes: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, KeyManagerError> {
         Ok(Zeroizing::new(ciphertext_bytes.to_vec()))
     }
 }
@@ -310,7 +313,10 @@ async fn test_clear_malformed_actor_400_and_flag_intact() {
         .oneshot(
             Request::builder()
                 .method("DELETE")
-                .uri(format!("/admin/users/{}/verified-minor?actor=not-hex", pubkey))
+                .uri(format!(
+                    "/admin/users/{}/verified-minor?actor=not-hex",
+                    pubkey
+                ))
                 .header("authorization", format!("Bearer {}", SERVICE_TOKEN))
                 .body(Body::empty())
                 .unwrap(),
@@ -357,6 +363,8 @@ async fn test_clear_reason_sanitized_in_audit() {
     let rows = read_audit_rows(&pool, &actor).await;
     let reason = rows[0].metadata_json["reason"].as_str().unwrap();
     assert!(!reason.contains('\n'), "control chars must be stripped");
-    assert!(reason.chars().count() <= 500, "reason must be bounded to 500");
+    assert!(
+        reason.chars().count() <= 500,
+        "reason must be bounded to 500"
+    );
 }
-
