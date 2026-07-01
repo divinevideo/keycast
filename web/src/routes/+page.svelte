@@ -417,7 +417,7 @@ $effect(() => {
 							{/if}
 							<a href="/settings/security" class="identity-link">
 								<Gear size={16} />
-								<span>Security &amp; Bluesky</span>
+								<span>Account &amp; Security</span>
 							</a>
 						</div>
 					{/if}
@@ -442,7 +442,7 @@ $effect(() => {
 						<div class="learn-block">
 							<h4><Key size={16} weight="fill" /> Your Keys Explained</h4>
 							<p><strong>Your npub</strong> (public key) is like a username. Share it so others can find you across any Nostr app.</p>
-							<p><strong>Your nsec</strong> (private key) proves you own this identity. Keep it safe! Find it in <a href="/settings/security">Security Settings</a> if you need to export it.</p>
+							<p><strong>Your nsec</strong> (private key) proves you own this identity. Keep it safe! Find it in <a href="/settings/security">Account &amp; Security</a> if you need to export it.</p>
 						</div>
 
 						<div class="learn-block">
@@ -458,7 +458,7 @@ $effect(() => {
 
 						<div class="learn-block">
 							<h4><Export size={16} weight="fill" /> Want Full Control of Your Key?</h4>
-							<p>If you started with email and password but want full control, export your nsec from <a href="/settings/security">Security Settings</a> and move it to:</p>
+							<p>If you started with email and password but want full control, export your nsec from <a href="/settings/security">Account &amp; Security</a> and move it to:</p>
 							<ul class="learn-list">
 								<li><strong>Your phone:</strong> <a href="https://primal.net" target="_blank" rel="noopener noreferrer" class="inline-link">Primal <ArrowSquareOut size={12} /></a> (iOS & Android), <a href="https://github.com/greenart7c3/Amber" target="_blank" rel="noopener noreferrer" class="inline-link">Amber <ArrowSquareOut size={12} /></a> (Android), or <a href="https://nsec.app" target="_blank" rel="noopener noreferrer" class="inline-link">nsec.app <ArrowSquareOut size={12} /></a> (any browser) turn your device into a personal signing server. When a Nostr app needs your signature, it asks your device and your key never leaves it.</li>
 								<li><strong>Your browser:</strong> Extensions like <a href="https://getalby.com" target="_blank" rel="noopener noreferrer" class="inline-link">Alby <ArrowSquareOut size={12} /></a> or <a href="https://chromewebstore.google.com/detail/soapboxpub-signer/nnodjkgakfpkckcnbacpcjbpmlmbihdd" target="_blank" rel="noopener noreferrer" class="inline-link">Soapbox Signer <ArrowSquareOut size={12} /></a> (Chrome, Firefox) keep your key in the browser itself. <a href="https://apps.apple.com/app/nostash/id6499558903" target="_blank" rel="noopener noreferrer" class="inline-link">Nostash <ArrowSquareOut size={12} /></a> does the same for Safari on iOS.</li>

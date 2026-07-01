@@ -229,12 +229,12 @@
 </script>
 
 <svelte:head>
-	<title>Security Settings - {BRAND.name}</title>
+	<title>Account &amp; Security - {BRAND.name}</title>
 </svelte:head>
 
 <div class="security-page">
 	<div class="header">
-		<h1>Security Settings</h1>
+		<h1>Account &amp; Security</h1>
 		<p class="subtitle">Manage your account security and Nostr keys</p>
 	</div>
 
