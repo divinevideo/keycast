@@ -1988,11 +1988,13 @@ pub async fn finalize_pending_registration(
     // replacement. A re-mint would strand the code the polling app may already hold. Only mint a
     // fresh code (10 minute exchange window — do not lengthen) when none is live. The consumed_at
     // terminal guard above already refuses re-mint once a code has been redeemed.
-    let new_code = if let Some(existing) = oauth_code_repo
+    // `freshly_minted` records whether THIS call created the code (vs reused an existing live one).
+    // It gates the delivery-failure cleanup below: a reused code is owned by a prior finalize.
+    let (new_code, freshly_minted) = if let Some(existing) = oauth_code_repo
         .find_live_exchange_code(tenant_id, &oauth_data.user_pubkey, &oauth_data.client_id)
         .await?
     {
-        existing
+        (existing, false)
     } else {
         let minted: String = rand::thread_rng()
             .sample_iter(&rand::distributions::Alphanumeric)
@@ -2016,7 +2018,7 @@ pub async fn finalize_pending_registration(
             is_headless: oauth_data.is_headless, // Inherit from original registration
         };
         oauth_code_repo.store(store_params).await?;
-        minted
+        (minted, true)
     };
 
     if let Some((device_code, redis)) = strict_delivery {
@@ -2030,14 +2032,19 @@ pub async fn finalize_pending_registration(
                 error = %e,
                 "Failed to store headless OAuth code in Redis for polling"
             );
-            if let Err(cleanup_err) = oauth_code_repo.delete(tenant_id, &new_code).await {
-                tracing::error!(
-                    tenant_id = tenant_id,
-                    user_pubkey = %oauth_data.user_pubkey,
-                    code = %new_code,
-                    error = %cleanup_err,
-                    "Failed to clean up OAuth code after Redis polling write failed"
-                );
+            // Only clean up a code we freshly minted on this call. A reused code is owned by a prior
+            // finalize that already handled its own Redis delivery; deleting it here would strand a
+            // code the polling app may already hold (keycast#262). Retry either way.
+            if freshly_minted {
+                if let Err(cleanup_err) = oauth_code_repo.delete(tenant_id, &new_code).await {
+                    tracing::error!(
+                        tenant_id = tenant_id,
+                        user_pubkey = %oauth_data.user_pubkey,
+                        code = %new_code,
+                        error = %cleanup_err,
+                        "Failed to clean up OAuth code after Redis polling write failed"
+                    );
+                }
             }
             return Err(headless_retry_error());
         }
