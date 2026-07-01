@@ -78,3 +78,18 @@ async fn regular_user_reports_not_a_minor() {
     assert!(!verified_minor, "regular user must not read as a minor");
     assert!(verified_minor_at.is_none());
 }
+
+#[tokio::test]
+async fn returns_none_for_unknown_user() {
+    common::assert_test_database_url();
+    let pool = common::setup_test_db().await;
+    let repo = UserRepository::new(pool.clone());
+    let unknown = Keys::generate().public_key().to_hex();
+
+    let row = repo
+        .get_account_status_with_minor(&unknown, TENANT_ID)
+        .await
+        .expect("query ok");
+
+    assert!(row.is_none(), "unknown pubkey must yield None");
+}

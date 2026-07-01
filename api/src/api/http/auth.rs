@@ -383,6 +383,39 @@ pub struct AccountStatusResponse {
     pub verified_minor_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+impl AccountStatusResponse {
+    /// Builds the `GET /user/account` response from a user's account row.
+    ///
+    /// `verified_minor` / `verified_minor_at` are surfaced **unconditionally** (an
+    /// approved minor is `active`), whereas `account_status` / `suspended_reason` are
+    /// only populated when the account is *not* active. Extracted so this branching —
+    /// the load-bearing behavior of this endpoint — is unit-testable without a DB.
+    fn from_account_row(
+        public_key: String,
+        email: Option<String>,
+        email_verified: Option<bool>,
+        status: keycast_core::types::user::UserStatus,
+        suspended_reason: Option<String>,
+        verified_minor: bool,
+        verified_minor_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Self {
+        let active = status.is_active();
+        AccountStatusResponse {
+            email: email.unwrap_or_default(),
+            email_verified: email_verified.unwrap_or(false),
+            public_key,
+            account_status: if active {
+                None
+            } else {
+                Some(status.as_str().to_string())
+            },
+            suspended_reason: if active { None } else { suspended_reason },
+            verified_minor,
+            verified_minor_at,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ProfileData {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2363,29 +2396,15 @@ pub async fn get_account_status(
             suspended_reason,
             verified_minor,
             verified_minor_at,
-        )) => {
-            let account_status = if status.is_active() {
-                None
-            } else {
-                Some(status.as_str().to_string())
-            };
-            let reason = if status.is_active() {
-                None
-            } else {
-                suspended_reason
-            };
-            Ok(Json(AccountStatusResponse {
-                email: email.unwrap_or_default(),
-                email_verified: email_verified.unwrap_or(false),
-                public_key: user_pubkey,
-                account_status,
-                suspended_reason: reason,
-                // Unconditional, unlike account_status: an approved minor is `active`, so the
-                // protected-minor flag must surface even on an otherwise-normal active account.
-                verified_minor,
-                verified_minor_at,
-            }))
-        }
+        )) => Ok(Json(AccountStatusResponse::from_account_row(
+            user_pubkey,
+            email,
+            email_verified,
+            status,
+            suspended_reason,
+            verified_minor,
+            verified_minor_at,
+        ))),
         None => Err(AuthError::UserNotFound),
     }
 }
@@ -3760,7 +3779,48 @@ pub async fn delete_account(
 #[cfg(test)]
 mod tests {
     use super::validate_origin;
+    use super::AccountStatusResponse;
     use axum::response::IntoResponse;
+
+    #[test]
+    fn account_status_active_minor_surfaces_flag_without_status() {
+        let resp = AccountStatusResponse::from_account_row(
+            "pk".to_string(),
+            Some("a@b.com".to_string()),
+            Some(true),
+            keycast_core::types::user::UserStatus::Active,
+            None,
+            true,
+            Some(chrono::Utc::now()),
+        );
+        // verified_minor surfaces even though the account is active (not gated).
+        assert!(resp.verified_minor);
+        assert!(resp.verified_minor_at.is_some());
+        assert!(resp.account_status.is_none());
+        assert!(resp.suspended_reason.is_none());
+        assert_eq!(resp.email, "a@b.com");
+        assert!(resp.email_verified);
+    }
+
+    #[test]
+    fn account_status_suspended_minor_still_surfaces_flag() {
+        let resp = AccountStatusResponse::from_account_row(
+            "pk".to_string(),
+            None,
+            None,
+            keycast_core::types::user::UserStatus::Suspended,
+            Some("reason".to_string()),
+            true,
+            None,
+        );
+        // Regression guard: verified_minor stays true when suspended, while
+        // account_status / suspended_reason now populate.
+        assert!(resp.verified_minor);
+        assert_eq!(resp.account_status.as_deref(), Some("suspended"));
+        assert_eq!(resp.suspended_reason.as_deref(), Some("reason"));
+        assert_eq!(resp.email, ""); // None -> default
+        assert!(!resp.email_verified);
+    }
 
     #[test]
     fn test_validate_origin_https() {
