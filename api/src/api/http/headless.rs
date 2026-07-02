@@ -1167,6 +1167,7 @@ impl From<keycast_core::repositories::RepositoryError> for HeadlessError {
 #[cfg(test)]
 mod tests {
     use nostr_sdk::Keys;
+    #[cfg(feature = "integration-tests")]
     use serial_test::serial;
 
     struct LazyTestKeyManager;
@@ -1236,6 +1237,7 @@ mod tests {
         serde_json::from_slice(&body).expect("response body should be JSON")
     }
 
+    #[cfg(feature = "integration-tests")]
     struct EmailEnvGuard {
         rust_env: Option<String>,
         node_env: Option<String>,
@@ -1243,6 +1245,7 @@ mod tests {
         disable_emails: Option<String>,
     }
 
+    #[cfg(feature = "integration-tests")]
     impl Drop for EmailEnvGuard {
         fn drop(&mut self) {
             restore_env_var("RUST_ENV", self.rust_env.as_deref());
@@ -1252,6 +1255,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "integration-tests")]
     fn restore_env_var(key: &str, value: Option<&str>) {
         if let Some(value) = value {
             std::env::set_var(key, value);
@@ -1260,6 +1264,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "integration-tests")]
     fn force_email_service_failure() -> EmailEnvGuard {
         let guard = EmailEnvGuard {
             rust_env: std::env::var("RUST_ENV").ok(),
