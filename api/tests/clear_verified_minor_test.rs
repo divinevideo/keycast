@@ -378,8 +378,9 @@ async fn test_clear_reason_strips_bidi_format_chars() {
     let pubkey = create_verified_minor_user(&pool).await;
     let actor = Keys::generate().public_key().to_hex();
 
-    // reason with U+202E RIGHT-TO-LEFT OVERRIDE (%E2%80%AE) + U+200B ZERO WIDTH SPACE (%E2%80%8B).
-    let raw_reason = "spoof%E2%80%AEdaen%E2%80%8B";
+    // reason with U+202E RIGHT-TO-LEFT OVERRIDE (%E2%80%AE), U+200B ZERO WIDTH SPACE (%E2%80%8B),
+    // and U+2028/U+2029 LINE/PARAGRAPH SEPARATOR (%E2%80%A8 / %E2%80%A9).
+    let raw_reason = "spoof%E2%80%AEda%E2%80%A8en%E2%80%A9x%E2%80%8B";
     let resp = app
         .oneshot(
             Request::builder()
@@ -399,8 +400,11 @@ async fn test_clear_reason_strips_bidi_format_chars() {
     let rows = read_audit_rows(&pool, &actor).await;
     let reason = rows[0].metadata_json["reason"].as_str().unwrap();
     assert!(
-        !reason.contains('\u{202E}') && !reason.contains('\u{200B}'),
-        "bidi/zero-width format chars must be stripped, got {:?}",
+        !reason.contains('\u{202E}')
+            && !reason.contains('\u{200B}')
+            && !reason.contains('\u{2028}')
+            && !reason.contains('\u{2029}'),
+        "bidi / zero-width / line-separator format chars must be stripped, got {:?}",
         reason
     );
 }

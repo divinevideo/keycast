@@ -1954,12 +1954,14 @@ pub struct ClearVerifiedMinorParams {
     pub reason: Option<String>,
 }
 
-/// True for Unicode bidi/zero-width format characters that `char::is_control`
-/// (category Cc) misses. Stripping these prevents log/console display spoofing
-/// via right-to-left overrides and invisible characters.
-fn is_bidi_or_zero_width(c: char) -> bool {
+/// True for Unicode bidi / zero-width / line-separator characters that
+/// `char::is_control` (category Cc) misses. Stripping these prevents log/console
+/// display spoofing via right-to-left overrides, invisible characters, and
+/// newline-equivalent separators (U+2028/U+2029).
+fn is_unsafe_format_char(c: char) -> bool {
     matches!(c,
         '\u{200B}'..='\u{200F}'   // zero-width space .. right-to-left mark
+        | '\u{2028}'..='\u{2029}' // line / paragraph separator
         | '\u{202A}'..='\u{202E}' // bidi embeddings / overrides
         | '\u{2066}'..='\u{2069}' // bidi isolates
         | '\u{FEFF}'              // zero-width no-break space / BOM
@@ -1972,7 +1974,7 @@ fn is_bidi_or_zero_width(c: char) -> bool {
 fn sanitize_reason(raw: Option<String>) -> Option<String> {
     let cleaned: String = raw?
         .chars()
-        .filter(|c| !c.is_control() && !is_bidi_or_zero_width(*c))
+        .filter(|c| !c.is_control() && !is_unsafe_format_char(*c))
         .take(500)
         .collect();
     let trimmed = cleaned.trim();
