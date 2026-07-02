@@ -1992,11 +1992,7 @@ pub async fn finalize_pending_registration(
     // It gates the delivery-failure cleanup below: a reused code is owned by a prior finalize.
     let (new_code, code_expires_at, freshly_minted) = if let Some((existing, expires_at)) =
         oauth_code_repo
-            .find_live_exchange_code_with_expiry(
-                tenant_id,
-                &oauth_data.user_pubkey,
-                &oauth_data.client_id,
-            )
+            .find_live_exchange_code_with_expiry_for_pending(tenant_id, oauth_data)
             .await?
     {
         (existing, expires_at, false)
@@ -2022,7 +2018,12 @@ pub async fn finalize_pending_registration(
             state: oauth_data.state.as_deref(),
             is_headless: oauth_data.is_headless, // Inherit from original registration
         };
-        oauth_code_repo.store(store_params).await?;
+        if !oauth_code_repo
+            .store_for_pending_registration(store_params, oauth_data)
+            .await?
+        {
+            return Err(AuthError::RegistrationAlreadyCompleted);
+        }
         (minted, code_expires_at, true)
     };
     let redis_ttl_seconds = if freshly_minted {

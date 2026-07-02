@@ -2920,6 +2920,7 @@ async fn handle_authorization_code_grant(
         .find_valid(tenant_id, code)
         .await?
         .ok_or(OAuthError::Unauthorized)?;
+    let auth_code_for_redeem = auth_code.clone();
 
     let user_pubkey = auth_code.user_pubkey;
     let client_id = auth_code.client_id;
@@ -3097,20 +3098,12 @@ async fn handle_authorization_code_grant(
         pending_email_val.clone()
     } else {
         // Normal token exchange (existing user, not registration)
-        // Delete the authorization code (one-time use)
-        oauth_code_repo.delete(tenant_id, code).await?;
-
-        // Mark the originating pending registration row terminal (keycast#262): once its exchange
-        // code is redeemed, finalize must refuse to re-mint. No-op when there is no pending row.
-        if let Err(e) = oauth_code_repo
-            .mark_pending_consumed(tenant_id, &user_pubkey, &client_id)
-            .await
+        // One-time exchange and pending-row completion must be one authoritative DB transition.
+        if !oauth_code_repo
+            .redeem_code_and_mark_pending_consumed(tenant_id, code, &auth_code_for_redeem)
+            .await?
         {
-            tracing::warn!(
-                "Failed to mark pending registration consumed for {}: {}",
-                user_pubkey,
-                e
-            );
+            return Err(OAuthError::Unauthorized);
         }
 
         // Get user's email for UCAN

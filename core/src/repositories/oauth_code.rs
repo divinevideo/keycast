@@ -115,6 +115,54 @@ impl OAuthCodeRepository {
         Ok(())
     }
 
+    /// Store an exchange code only while the matching pending registration is still active.
+    pub async fn store_for_pending_registration(
+        &self,
+        params: StoreOAuthCodeParams<'_>,
+        pending: &OAuthCodeData,
+    ) -> Result<bool, RepositoryError> {
+        let result = sqlx::query(
+            "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, previous_auth_id, state, is_headless, created_at)
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+             WHERE EXISTS (
+                 SELECT 1 FROM oauth_codes pending
+                 WHERE pending.tenant_id = $1
+                   AND pending.user_pubkey = $3
+                   AND pending.client_id = $4
+                   AND pending.redirect_uri = $5
+                   AND pending.scope = $6
+                   AND pending.code_challenge IS NOT DISTINCT FROM $7
+                   AND pending.code_challenge_method IS NOT DISTINCT FROM $8
+                   AND pending.state IS NOT DISTINCT FROM $11
+                   AND pending.is_headless = $12
+                   AND pending.pending_email IS NOT NULL
+                   AND pending.pending_email_verification_token IS NOT DISTINCT FROM $14
+                   AND pending.device_code IS NOT DISTINCT FROM $15
+                   AND pending.consumed_at IS NULL
+                   AND pending.expires_at > $13
+             )",
+        )
+        .bind(params.tenant_id)
+        .bind(params.code)
+        .bind(params.user_pubkey)
+        .bind(params.client_id)
+        .bind(params.redirect_uri)
+        .bind(params.scope)
+        .bind(params.code_challenge)
+        .bind(params.code_challenge_method)
+        .bind(params.expires_at)
+        .bind(params.previous_auth_id)
+        .bind(params.state)
+        .bind(params.is_headless)
+        .bind(Utc::now())
+        .bind(pending.pending_email_verification_token.as_deref())
+        .bind(pending.device_code.as_deref())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Store OAuth code with pending registration data (deferred user creation).
     /// Used by oauth_register to defer user creation until token exchange.
     pub async fn store_with_pending_registration(
@@ -353,74 +401,113 @@ impl OAuthCodeRepository {
         Ok(())
     }
 
-    /// Find a still-live, un-redeemed exchange code already minted for a finalized registration, if
-    /// one exists (keycast#262).
-    ///
-    /// Lets finalize re-arm idempotently: a re-click or mail-prefetch within the exchange window
-    /// reuses the code the polling app may already hold rather than minting a replacement and
-    /// stranding the delivered one. Exchange codes are produced by [`Self::store`] and carry neither
-    /// a `device_code` nor a `pending_email`, which distinguishes them from the pending registration
-    /// row; redeemed codes are deleted at token exchange, so a row that still matches is un-redeemed.
-    /// Returns the most recently minted live code when several exist (a rare double-mint race).
-    pub async fn find_live_exchange_code(
+    /// Find a still-live exchange code matching the same pending registration semantics.
+    pub async fn find_live_exchange_code_with_expiry_for_pending(
         &self,
         tenant_id: i64,
-        user_pubkey: &str,
-        client_id: &str,
-    ) -> Result<Option<String>, RepositoryError> {
-        Ok(self
-            .find_live_exchange_code_with_expiry(tenant_id, user_pubkey, client_id)
-            .await?
-            .map(|row| row.0))
-    }
-
-    /// Find a still-live exchange code with its DB expiry.
-    pub async fn find_live_exchange_code_with_expiry(
-        &self,
-        tenant_id: i64,
-        user_pubkey: &str,
-        client_id: &str,
+        pending: &OAuthCodeData,
     ) -> Result<Option<(String, DateTime<Utc>)>, RepositoryError> {
+        let now = Utc::now();
         let row: Option<(String, DateTime<Utc>)> = sqlx::query_as(
-            "SELECT code, expires_at FROM oauth_codes \
-             WHERE tenant_id = $1 AND user_pubkey = $2 AND client_id = $3 \
-               AND device_code IS NULL AND pending_email IS NULL \
-               AND consumed_at IS NULL AND expires_at > $4 \
-             ORDER BY created_at DESC \
+            "SELECT exchange.code, exchange.expires_at FROM oauth_codes exchange
+             WHERE exchange.tenant_id = $1
+               AND exchange.user_pubkey = $2
+               AND exchange.client_id = $3
+               AND exchange.redirect_uri = $4
+               AND exchange.scope = $5
+               AND exchange.code_challenge IS NOT DISTINCT FROM $6
+               AND exchange.code_challenge_method IS NOT DISTINCT FROM $7
+               AND exchange.state IS NOT DISTINCT FROM $8
+               AND exchange.is_headless = $9
+               AND exchange.device_code IS NULL
+               AND exchange.pending_email IS NULL
+               AND exchange.consumed_at IS NULL
+               AND exchange.expires_at > $10
+               AND EXISTS (
+                   SELECT 1 FROM oauth_codes pending_row
+                   WHERE pending_row.tenant_id = $1
+                     AND pending_row.user_pubkey = $2
+                     AND pending_row.client_id = $3
+                     AND pending_row.redirect_uri = $4
+                     AND pending_row.scope = $5
+                     AND pending_row.code_challenge IS NOT DISTINCT FROM $6
+                     AND pending_row.code_challenge_method IS NOT DISTINCT FROM $7
+                     AND pending_row.state IS NOT DISTINCT FROM $8
+                     AND pending_row.is_headless = $9
+                     AND pending_row.pending_email IS NOT NULL
+                     AND pending_row.pending_email_verification_token IS NOT DISTINCT FROM $11
+                     AND pending_row.device_code IS NOT DISTINCT FROM $12
+                     AND pending_row.consumed_at IS NULL
+                     AND pending_row.expires_at > $10
+               )
+             ORDER BY exchange.created_at DESC
              LIMIT 1",
         )
         .bind(tenant_id)
-        .bind(user_pubkey)
-        .bind(client_id)
-        .bind(Utc::now())
+        .bind(&pending.user_pubkey)
+        .bind(&pending.client_id)
+        .bind(&pending.redirect_uri)
+        .bind(&pending.scope)
+        .bind(pending.code_challenge.as_deref())
+        .bind(pending.code_challenge_method.as_deref())
+        .bind(pending.state.as_deref())
+        .bind(pending.is_headless)
+        .bind(now)
+        .bind(pending.pending_email_verification_token.as_deref())
+        .bind(pending.device_code.as_deref())
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
     }
 
-    /// Mark a pending registration row terminal once its exchange code has been redeemed.
-    ///
-    /// Targets only the pending row (`device_code IS NOT NULL`) for this user + client, and only if
-    /// not already consumed. After this, finalize refuses to re-mint (keycast#262). A no-op for
-    /// normal token exchanges that have no pending row.
-    pub async fn mark_pending_consumed(
+    /// Delete an exchange code and atomically mark the matching pending registration consumed.
+    pub async fn redeem_code_and_mark_pending_consumed(
         &self,
         tenant_id: i64,
-        user_pubkey: &str,
-        client_id: &str,
-    ) -> Result<(), RepositoryError> {
+        code: &str,
+        auth_code: &OAuthCodeData,
+    ) -> Result<bool, RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let deleted = sqlx::query("DELETE FROM oauth_codes WHERE tenant_id = $1 AND code = $2")
+            .bind(tenant_id)
+            .bind(code)
+            .execute(&mut *tx)
+            .await?;
+
+        if deleted.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
         sqlx::query(
-            "UPDATE oauth_codes SET consumed_at = $1 \
-             WHERE tenant_id = $2 AND user_pubkey = $3 AND client_id = $4 \
-               AND device_code IS NOT NULL AND consumed_at IS NULL",
+            "UPDATE oauth_codes SET consumed_at = $1
+             WHERE tenant_id = $2
+               AND user_pubkey = $3
+               AND client_id = $4
+               AND redirect_uri = $5
+               AND scope = $6
+               AND code_challenge IS NOT DISTINCT FROM $7
+               AND code_challenge_method IS NOT DISTINCT FROM $8
+               AND state IS NOT DISTINCT FROM $9
+               AND is_headless = $10
+               AND pending_email IS NOT NULL
+               AND consumed_at IS NULL",
         )
         .bind(Utc::now())
         .bind(tenant_id)
-        .bind(user_pubkey)
-        .bind(client_id)
-        .execute(&self.pool)
+        .bind(&auth_code.user_pubkey)
+        .bind(&auth_code.client_id)
+        .bind(&auth_code.redirect_uri)
+        .bind(&auth_code.scope)
+        .bind(auth_code.code_challenge.as_deref())
+        .bind(auth_code.code_challenge_method.as_deref())
+        .bind(auth_code.state.as_deref())
+        .bind(auth_code.is_headless)
+        .execute(&mut *tx)
         .await?;
-        Ok(())
+
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Delete dead rows: anything past its expiry, plus consumed pending registrations (terminal
@@ -793,7 +880,7 @@ mod tests {
 
         // No exchange code minted yet: the pending row must not be mistaken for one.
         assert!(
-            repo.find_live_exchange_code(1, &user_pubkey, &client_id)
+            repo.find_live_exchange_code_with_expiry_for_pending(1, &pending)
                 .await
                 .unwrap()
                 .is_none(),
@@ -821,10 +908,11 @@ mod tests {
 
         // The live exchange code is now found and reused; the pending row is still untouched.
         assert_eq!(
-            repo.find_live_exchange_code(1, &user_pubkey, &client_id)
+            repo.find_live_exchange_code_with_expiry_for_pending(1, &pending)
                 .await
                 .unwrap()
-                .as_deref(),
+                .as_ref()
+                .map(|row| row.0.as_str()),
             Some(exchange_code.as_str()),
             "live exchange code must be returned for reuse"
         );
@@ -848,16 +936,22 @@ mod tests {
         let pool = setup_pool().await;
         let repo = OAuthCodeRepository::new(pool.clone());
 
-        let user_pubkey = format!("pk_{}", uuid::Uuid::new_v4());
-        let client_id = format!("client_{}", uuid::Uuid::new_v4());
+        let device_code = format!("dc_{}", uuid::Uuid::new_v4());
+        let expires_at = Utc::now() + chrono::Duration::hours(24);
+        insert_pending_registration(&repo, &device_code, Some("pinhash"), expires_at).await;
+        let pending = repo
+            .find_by_device_code(&device_code, 1)
+            .await
+            .unwrap()
+            .unwrap();
 
         // An already-expired exchange code must not be reused.
         let expired_code = format!("exch_{}", uuid::Uuid::new_v4());
         repo.store(StoreOAuthCodeParams {
             tenant_id: 1,
             code: &expired_code,
-            user_pubkey: &user_pubkey,
-            client_id: &client_id,
+            user_pubkey: &pending.user_pubkey,
+            client_id: &pending.client_id,
             redirect_uri: "http://localhost:3000/callback",
             scope: "policy:social",
             code_challenge: None,
@@ -871,7 +965,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            repo.find_live_exchange_code(1, &user_pubkey, &client_id)
+            repo.find_live_exchange_code_with_expiry_for_pending(1, &pending)
                 .await
                 .unwrap()
                 .is_none(),
@@ -879,7 +973,7 @@ mod tests {
         );
 
         sqlx::query("DELETE FROM oauth_codes WHERE user_pubkey = $1")
-            .bind(&user_pubkey)
+            .bind(&pending.user_pubkey)
             .execute(&pool)
             .await
             .unwrap();
@@ -890,16 +984,22 @@ mod tests {
         let pool = setup_pool().await;
         let repo = OAuthCodeRepository::new(pool.clone());
 
-        let user_pubkey = format!("pk_{}", uuid::Uuid::new_v4());
-        let client_id = format!("client_{}", uuid::Uuid::new_v4());
+        let device_code = format!("dc_{}", uuid::Uuid::new_v4());
+        let pending_expires_at = Utc::now() + chrono::Duration::hours(24);
+        insert_pending_registration(&repo, &device_code, Some("pinhash"), pending_expires_at).await;
+        let pending = repo
+            .find_by_device_code(&device_code, 1)
+            .await
+            .unwrap()
+            .unwrap();
         let exchange_code = format!("exch_{}", uuid::Uuid::new_v4());
         let expires_at = Utc::now() + chrono::Duration::seconds(90);
 
         repo.store(StoreOAuthCodeParams {
             tenant_id: 1,
             code: &exchange_code,
-            user_pubkey: &user_pubkey,
-            client_id: &client_id,
+            user_pubkey: &pending.user_pubkey,
+            client_id: &pending.client_id,
             redirect_uri: "http://localhost:3000/callback",
             scope: "policy:social",
             code_challenge: None,
@@ -913,7 +1013,7 @@ mod tests {
         .unwrap();
 
         let found = repo
-            .find_live_exchange_code_with_expiry(1, &user_pubkey, &client_id)
+            .find_live_exchange_code_with_expiry_for_pending(1, &pending)
             .await
             .unwrap()
             .expect("live exchange code should be returned with expiry");
@@ -922,6 +1022,105 @@ mod tests {
         assert!(
             found.1 <= expires_at && found.1 > Utc::now(),
             "expiry must come from the DB row so Redis TTL can be bounded"
+        );
+
+        sqlx::query("DELETE FROM oauth_codes WHERE user_pubkey = $1")
+            .bind(&pending.user_pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_find_live_exchange_code_does_not_cross_pending_oauth_semantics() {
+        let pool = setup_pool().await;
+        let repo = OAuthCodeRepository::new(pool.clone());
+
+        let user_pubkey = nostr_sdk::Keys::generate().public_key().to_hex();
+        let client_id = format!("client_{}", uuid::Uuid::new_v4());
+        let device_a = format!("dc_a_{}", uuid::Uuid::new_v4());
+        let device_b = format!("dc_b_{}", uuid::Uuid::new_v4());
+        let pending_a_code = format!("pending_a_{}", uuid::Uuid::new_v4());
+        let pending_b_code = format!("pending_b_{}", uuid::Uuid::new_v4());
+        let token_a = format!("token_a_{}", uuid::Uuid::new_v4());
+        let token_b = format!("token_b_{}", uuid::Uuid::new_v4());
+        let email_a = format!("same-user-a-{}@example.com", uuid::Uuid::new_v4());
+        let email_b = format!("same-user-b-{}@example.com", uuid::Uuid::new_v4());
+        let expires_at = Utc::now() + chrono::Duration::hours(24);
+
+        repo.store_with_pending_registration(StoreOAuthCodeWithRegistrationParams {
+            tenant_id: 1,
+            code: &pending_a_code,
+            user_pubkey: &user_pubkey,
+            client_id: &client_id,
+            redirect_uri: "http://localhost:3000/callback",
+            scope: "policy:social",
+            code_challenge: Some("challenge-a"),
+            code_challenge_method: Some("S256"),
+            expires_at,
+            pending_email: &email_a,
+            pending_password_hash: "hashed",
+            pending_email_verification_token: &token_a,
+            pending_encrypted_secret: Some(b"secret-a"),
+            state: Some("state-a"),
+            device_code: Some(&device_a),
+            is_headless: true,
+            pin_hash: Some("pin-a"),
+        })
+        .await
+        .unwrap();
+        repo.store_with_pending_registration(StoreOAuthCodeWithRegistrationParams {
+            tenant_id: 1,
+            code: &pending_b_code,
+            user_pubkey: &user_pubkey,
+            client_id: &client_id,
+            redirect_uri: "http://localhost:3000/callback",
+            scope: "policy:social",
+            code_challenge: Some("challenge-b"),
+            code_challenge_method: Some("S256"),
+            expires_at,
+            pending_email: &email_b,
+            pending_password_hash: "hashed",
+            pending_email_verification_token: &token_b,
+            pending_encrypted_secret: Some(b"secret-b"),
+            state: Some("state-b"),
+            device_code: Some(&device_b),
+            is_headless: true,
+            pin_hash: Some("pin-b"),
+        })
+        .await
+        .unwrap();
+
+        let exchange_a = format!("exch_a_{}", uuid::Uuid::new_v4());
+        repo.store(StoreOAuthCodeParams {
+            tenant_id: 1,
+            code: &exchange_a,
+            user_pubkey: &user_pubkey,
+            client_id: &client_id,
+            redirect_uri: "http://localhost:3000/callback",
+            scope: "policy:social",
+            code_challenge: Some("challenge-a"),
+            code_challenge_method: Some("S256"),
+            expires_at: Utc::now() + chrono::Duration::minutes(10),
+            previous_auth_id: None,
+            state: Some("state-a"),
+            is_headless: true,
+        })
+        .await
+        .unwrap();
+
+        let pending_b = repo
+            .find_by_device_code(&device_b, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        let found = repo
+            .find_live_exchange_code_with_expiry_for_pending(1, &pending_b)
+            .await
+            .unwrap();
+        assert!(
+            found.is_none(),
+            "second same-user/client pending registration must not receive first registration's exchange code"
         );
 
         sqlx::query("DELETE FROM oauth_codes WHERE user_pubkey = $1")
@@ -946,7 +1145,26 @@ mod tests {
             .unwrap();
         assert!(pending.consumed_at.is_none(), "starts un-consumed");
 
-        repo.mark_pending_consumed(1, &pending.user_pubkey, &pending.client_id)
+        let exchange_code = format!("exch_{}", uuid::Uuid::new_v4());
+        repo.store(StoreOAuthCodeParams {
+            tenant_id: 1,
+            code: &exchange_code,
+            user_pubkey: &pending.user_pubkey,
+            client_id: &pending.client_id,
+            redirect_uri: &pending.redirect_uri,
+            scope: &pending.scope,
+            code_challenge: pending.code_challenge.as_deref(),
+            code_challenge_method: pending.code_challenge_method.as_deref(),
+            expires_at: Utc::now() + chrono::Duration::minutes(10),
+            previous_auth_id: pending.previous_auth_id,
+            state: pending.state.as_deref(),
+            is_headless: pending.is_headless,
+        })
+        .await
+        .unwrap();
+        let auth_code = repo.find_valid(1, &exchange_code).await.unwrap().unwrap();
+
+        repo.redeem_code_and_mark_pending_consumed(1, &exchange_code, &auth_code)
             .await
             .unwrap();
 
@@ -962,6 +1180,116 @@ mod tests {
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
             .bind(&device_code)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_mark_pending_consumed_does_not_cross_pending_oauth_semantics() {
+        let pool = setup_pool().await;
+        let repo = OAuthCodeRepository::new(pool.clone());
+
+        let user_pubkey = nostr_sdk::Keys::generate().public_key().to_hex();
+        let client_id = format!("client_{}", uuid::Uuid::new_v4());
+        let device_a = format!("dc_a_{}", uuid::Uuid::new_v4());
+        let device_b = format!("dc_b_{}", uuid::Uuid::new_v4());
+        let pending_a_code = format!("pending_a_{}", uuid::Uuid::new_v4());
+        let pending_b_code = format!("pending_b_{}", uuid::Uuid::new_v4());
+        let token_a = format!("token_a_{}", uuid::Uuid::new_v4());
+        let token_b = format!("token_b_{}", uuid::Uuid::new_v4());
+        let email_a = format!("consume-a-{}@example.com", uuid::Uuid::new_v4());
+        let email_b = format!("consume-b-{}@example.com", uuid::Uuid::new_v4());
+        let expires_at = Utc::now() + chrono::Duration::hours(24);
+
+        repo.store_with_pending_registration(StoreOAuthCodeWithRegistrationParams {
+            tenant_id: 1,
+            code: &pending_a_code,
+            user_pubkey: &user_pubkey,
+            client_id: &client_id,
+            redirect_uri: "http://localhost:3000/callback",
+            scope: "policy:social",
+            code_challenge: Some("challenge-a"),
+            code_challenge_method: Some("S256"),
+            expires_at,
+            pending_email: &email_a,
+            pending_password_hash: "hashed",
+            pending_email_verification_token: &token_a,
+            pending_encrypted_secret: Some(b"secret-a"),
+            state: Some("state-a"),
+            device_code: Some(&device_a),
+            is_headless: true,
+            pin_hash: Some("pin-a"),
+        })
+        .await
+        .unwrap();
+        repo.store_with_pending_registration(StoreOAuthCodeWithRegistrationParams {
+            tenant_id: 1,
+            code: &pending_b_code,
+            user_pubkey: &user_pubkey,
+            client_id: &client_id,
+            redirect_uri: "http://localhost:3000/callback",
+            scope: "policy:social",
+            code_challenge: Some("challenge-b"),
+            code_challenge_method: Some("S256"),
+            expires_at,
+            pending_email: &email_b,
+            pending_password_hash: "hashed",
+            pending_email_verification_token: &token_b,
+            pending_encrypted_secret: Some(b"secret-b"),
+            state: Some("state-b"),
+            device_code: Some(&device_b),
+            is_headless: true,
+            pin_hash: Some("pin-b"),
+        })
+        .await
+        .unwrap();
+
+        let exchange_a = format!("exch_a_{}", uuid::Uuid::new_v4());
+        repo.store(StoreOAuthCodeParams {
+            tenant_id: 1,
+            code: &exchange_a,
+            user_pubkey: &user_pubkey,
+            client_id: &client_id,
+            redirect_uri: "http://localhost:3000/callback",
+            scope: "policy:social",
+            code_challenge: Some("challenge-a"),
+            code_challenge_method: Some("S256"),
+            expires_at: Utc::now() + chrono::Duration::minutes(10),
+            previous_auth_id: None,
+            state: Some("state-a"),
+            is_headless: true,
+        })
+        .await
+        .unwrap();
+        let auth_code = repo.find_valid(1, &exchange_a).await.unwrap().unwrap();
+
+        repo.redeem_code_and_mark_pending_consumed(1, &exchange_a, &auth_code)
+            .await
+            .unwrap();
+
+        let pending_a = repo
+            .find_by_device_code(&device_a, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        let pending_b = repo
+            .find_by_device_code(&device_b, 1)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            pending_a.consumed_at.is_some(),
+            "the intended pending registration should be consumed"
+        );
+        assert!(
+            pending_b.consumed_at.is_none(),
+            "a different same-user/client pending registration must remain active"
+        );
+
+        sqlx::query("DELETE FROM oauth_codes WHERE user_pubkey = $1")
+            .bind(&user_pubkey)
             .execute(&pool)
             .await
             .unwrap();
@@ -1001,12 +1329,15 @@ mod tests {
             Utc::now() + chrono::Duration::hours(24),
         )
         .await;
-        let consumed = repo
+        let _consumed = repo
             .find_by_device_code(&consumed_dc, 1)
             .await
             .unwrap()
             .unwrap();
-        repo.mark_pending_consumed(1, &consumed.user_pubkey, &consumed.client_id)
+        sqlx::query("UPDATE oauth_codes SET consumed_at = $1 WHERE device_code = $2")
+            .bind(Utc::now())
+            .bind(&consumed_dc)
+            .execute(&pool)
             .await
             .unwrap();
 
