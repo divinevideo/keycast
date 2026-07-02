@@ -470,7 +470,7 @@ async fn crosspost_enable_dependency_failure_returns_service_unavailable() {
         error,
         AuthError::ServiceUnavailable {
             message,
-            retry_after: None,
+            retry_after: Some(30),
         } if message == "ATProto enablement is temporarily unavailable. Please try again later."
     ));
 }

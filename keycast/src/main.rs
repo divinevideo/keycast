@@ -486,40 +486,15 @@ fn warn_atproto_control_plane_config() {
         return;
     };
 
-    // Keep these rejections consistent with control_plane_base_url() in
-    // api/src/atproto_provisioning.rs: endpoint URLs are built by concatenating
-    // onto the base, so query strings, fragments, and non-root paths all mangle
-    // the result and must be rejected here too.
-    match url::Url::parse(&url) {
-        Ok(parsed)
-            if matches!(parsed.scheme(), "http" | "https")
-                && parsed.query().is_none()
-                && parsed.fragment().is_none()
-                && matches!(parsed.path(), "" | "/") => {}
-        Ok(parsed)
-            if matches!(parsed.scheme(), "http" | "https")
-                && (parsed.query().is_some() || parsed.fragment().is_some()) =>
-        {
-            warn_atproto_control_plane_config_issue(
-                "DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL must not include query strings or fragments; ATProto provisioning endpoints will return a scoped unavailable response",
-            );
-        }
-        Ok(parsed)
-            if matches!(parsed.scheme(), "http" | "https")
-                && !matches!(parsed.path(), "" | "/") =>
-        {
-            warn_atproto_control_plane_config_issue(
-                "DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL must not include a path component; ATProto provisioning endpoints will return a scoped unavailable response",
-            );
-        }
-        _ => warn_atproto_control_plane_config_issue(
-            "DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL must be a valid http(s) URL; ATProto provisioning endpoints will return a scoped unavailable response",
-        ),
+    if let Err(error) = keycast_api::atproto_provisioning::validate_control_plane_base_url(&url) {
+        warn_atproto_control_plane_config_issue(&format!(
+            "DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL {error}; ATProto provisioning endpoints will return a scoped unavailable response"
+        ));
     }
 }
 
-fn warn_atproto_control_plane_config_issue(message: &'static str) {
-    tracing::warn!(message);
+fn warn_atproto_control_plane_config_issue(message: &str) {
+    tracing::warn!("{}", message);
     eprintln!("Configuration warning: {message}");
 }
 

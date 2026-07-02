@@ -419,7 +419,7 @@ fn map_control_error(error: AtprotoControlError) -> AuthError {
             // ServiceUnavailable to preserve the ATProto-specific text.
             AuthError::ServiceUnavailable {
                 message: err.public_message().to_string(),
-                retry_after: None,
+                retry_after: Some(30),
             }
         }
         AtprotoControlError::Repository(RepositoryError::NotFound(_)) => AuthError::UserNotFound,
@@ -584,7 +584,7 @@ mod tests {
             error,
             AuthError::ServiceUnavailable {
                 message,
-                retry_after: None,
+                retry_after: Some(30),
             } if message == "ATProto enablement is temporarily unavailable. Please try again later."
         ));
     }
@@ -605,7 +605,7 @@ mod tests {
             error,
             AuthError::ServiceUnavailable {
                 message,
-                retry_after: None,
+                retry_after: Some(30),
             } if message == "ATProto provisioning failed. Please try again later."
         ));
     }

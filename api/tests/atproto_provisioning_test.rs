@@ -33,6 +33,12 @@ impl EnvGuard {
         std::env::set_var(key, value);
         Self { key, previous }
     }
+
+    fn remove(key: &'static str) -> Self {
+        let previous = std::env::var(key).ok();
+        std::env::remove_var(key);
+        Self { key, previous }
+    }
 }
 
 impl Drop for EnvGuard {
@@ -146,7 +152,7 @@ async fn request_enable_posts_crosspost_enabled_flag() {
 #[tokio::test]
 #[serial]
 async fn request_enable_fails_closed_when_control_plane_url_is_missing() {
-    std::env::remove_var("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL");
+    let _base = EnvGuard::remove("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL");
     let _domain = EnvGuard::set("DIVINE_HANDLE_DOMAIN", "bsky.example");
 
     let error = keycast_api::atproto_provisioning::request_enable(

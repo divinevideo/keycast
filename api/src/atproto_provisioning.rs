@@ -10,6 +10,18 @@ const CONTROL_PLANE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const ATPROTO_UNAVAILABLE_MESSAGE: &str =
     "ATProto enablement is temporarily unavailable. Please try again later.";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ControlPlaneUrlError {
+    #[error("must be a valid http(s) URL")]
+    InvalidUrl,
+    #[error("must be a valid http(s) URL")]
+    InvalidScheme,
+    #[error("must not include query strings or fragments")]
+    QueryOrFragment,
+    #[error("must not include a path component")]
+    PathComponent,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AtprotoProvisioningError {
     #[error("ATProto control-plane dependency is not configured")]
@@ -62,12 +74,27 @@ fn control_plane_client() -> &'static Client {
     })
 }
 
-/// Returns true when the parsed URL carries a path component beyond the root.
-/// Endpoint URLs are built by string concatenation onto the base, so a non-root
-/// path would mangle the resulting endpoint and must be rejected here (kept
-/// consistent with the startup validation in keycast/src/main.rs).
 fn has_non_root_path(parsed: &Url) -> bool {
     !matches!(parsed.path(), "" | "/")
+}
+
+/// Validates the control-plane base URL before endpoint paths are appended.
+pub fn validate_control_plane_base_url(base: &str) -> Result<(), ControlPlaneUrlError> {
+    let parsed = Url::parse(base).map_err(|_| ControlPlaneUrlError::InvalidUrl)?;
+
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ControlPlaneUrlError::InvalidScheme);
+    }
+
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(ControlPlaneUrlError::QueryOrFragment);
+    }
+
+    if has_non_root_path(&parsed) {
+        return Err(ControlPlaneUrlError::PathComponent);
+    }
+
+    Ok(())
 }
 
 fn control_plane_base_url() -> Result<String, AtprotoProvisioningError> {
@@ -77,15 +104,8 @@ fn control_plane_base_url() -> Result<String, AtprotoProvisioningError> {
         .filter(|value| !value.is_empty())
         .ok_or(AtprotoProvisioningError::DependencyNotConfigured)?;
 
-    let parsed =
-        Url::parse(&base).map_err(|_| AtprotoProvisioningError::DependencyNotConfigured)?;
-    if !matches!(parsed.scheme(), "http" | "https")
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-        || has_non_root_path(&parsed)
-    {
-        return Err(AtprotoProvisioningError::DependencyNotConfigured);
-    }
+    validate_control_plane_base_url(&base)
+        .map_err(|_| AtprotoProvisioningError::DependencyNotConfigured)?;
 
     Ok(base)
 }
@@ -178,27 +198,50 @@ pub async fn request_disable(nostr_pubkey: &str) -> Result<(), AtprotoProvisioni
 
 #[cfg(test)]
 mod tests {
-    use super::has_non_root_path;
-    use reqwest::Url;
-
-    fn parse(url: &str) -> Url {
-        Url::parse(url).expect("test URL should parse")
-    }
+    use super::{validate_control_plane_base_url, ControlPlaneUrlError};
 
     #[test]
     fn root_paths_are_accepted() {
-        assert!(!has_non_root_path(&parse("https://control.example.com")));
-        assert!(!has_non_root_path(&parse("https://control.example.com/")));
+        assert!(validate_control_plane_base_url("https://control.example.com").is_ok());
+        assert!(validate_control_plane_base_url("https://control.example.com/").is_ok());
     }
 
     #[test]
     fn non_root_paths_are_rejected() {
-        assert!(has_non_root_path(&parse("https://control.example.com/api")));
-        assert!(has_non_root_path(&parse(
-            "https://control.example.com/api/"
-        )));
-        assert!(has_non_root_path(&parse(
-            "https://control.example.com/nested/path"
-        )));
+        for url in [
+            "https://control.example.com/api",
+            "https://control.example.com/api/",
+            "https://control.example.com/nested/path",
+        ] {
+            assert_eq!(
+                validate_control_plane_base_url(url),
+                Err(ControlPlaneUrlError::PathComponent)
+            );
+        }
+    }
+
+    #[test]
+    fn query_strings_and_fragments_are_rejected() {
+        for url in [
+            "https://control.example.com?tenant=prod",
+            "https://control.example.com#provisioning",
+        ] {
+            assert_eq!(
+                validate_control_plane_base_url(url),
+                Err(ControlPlaneUrlError::QueryOrFragment)
+            );
+        }
+    }
+
+    #[test]
+    fn non_http_urls_are_rejected() {
+        assert_eq!(
+            validate_control_plane_base_url("ftp://control.example.com"),
+            Err(ControlPlaneUrlError::InvalidScheme)
+        );
+        assert_eq!(
+            validate_control_plane_base_url("not a url"),
+            Err(ControlPlaneUrlError::InvalidUrl)
+        );
     }
 }
