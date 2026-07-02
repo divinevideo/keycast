@@ -1954,11 +1954,27 @@ pub struct ClearVerifiedMinorParams {
     pub reason: Option<String>,
 }
 
-/// Bound and strip control characters from a caller-supplied reason before it
-/// is logged or persisted (prevents log injection and unbounded audit rows).
-/// Returns None when empty after cleaning.
+/// True for Unicode bidi/zero-width format characters that `char::is_control`
+/// (category Cc) misses. Stripping these prevents log/console display spoofing
+/// via right-to-left overrides and invisible characters.
+fn is_bidi_or_zero_width(c: char) -> bool {
+    matches!(c,
+        '\u{200B}'..='\u{200F}'   // zero-width space .. right-to-left mark
+        | '\u{202A}'..='\u{202E}' // bidi embeddings / overrides
+        | '\u{2066}'..='\u{2069}' // bidi isolates
+        | '\u{FEFF}'              // zero-width no-break space / BOM
+    )
+}
+
+/// Bound and strip control + bidi/zero-width characters from a caller-supplied
+/// reason before it is logged or persisted (prevents log injection, display
+/// spoofing, and unbounded audit rows). Returns None when empty after cleaning.
 fn sanitize_reason(raw: Option<String>) -> Option<String> {
-    let cleaned: String = raw?.chars().filter(|c| !c.is_control()).take(500).collect();
+    let cleaned: String = raw?
+        .chars()
+        .filter(|c| !c.is_control() && !is_bidi_or_zero_width(*c))
+        .take(500)
+        .collect();
     let trimmed = cleaned.trim();
     if trimmed.is_empty() {
         None

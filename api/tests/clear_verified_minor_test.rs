@@ -368,3 +368,70 @@ async fn test_clear_reason_sanitized_in_audit() {
         "reason must be bounded to 500"
     );
 }
+
+#[tokio::test]
+async fn test_clear_reason_strips_bidi_format_chars() {
+    common::assert_test_database_url();
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+    let pool = common::setup_test_db().await;
+    let app = build_app(create_test_auth_state(pool.clone()));
+    let pubkey = create_verified_minor_user(&pool).await;
+    let actor = Keys::generate().public_key().to_hex();
+
+    // reason with U+202E RIGHT-TO-LEFT OVERRIDE (%E2%80%AE) + U+200B ZERO WIDTH SPACE (%E2%80%8B).
+    let raw_reason = "spoof%E2%80%AEdaen%E2%80%8B";
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/admin/users/{}/verified-minor?actor={}&reason={}",
+                    pubkey, actor, raw_reason
+                ))
+                .header("authorization", format!("Bearer {}", SERVICE_TOKEN))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rows = read_audit_rows(&pool, &actor).await;
+    let reason = rows[0].metadata_json["reason"].as_str().unwrap();
+    assert!(
+        !reason.contains('\u{202E}') && !reason.contains('\u{200B}'),
+        "bidi/zero-width format chars must be stripped, got {:?}",
+        reason
+    );
+}
+
+#[tokio::test]
+async fn test_clear_empty_actor_is_400() {
+    common::assert_test_database_url();
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+    let pool = common::setup_test_db().await;
+    let app = build_app(create_test_auth_state(pool.clone()));
+    let pubkey = create_verified_minor_user(&pool).await;
+
+    // An empty ?actor= is treated as malformed (fail loud) rather than silently
+    // dropping the audit trail. The flag must survive.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/admin/users/{}/verified-minor?actor=", pubkey))
+                .header("authorization", format!("Bearer {}", SERVICE_TOKEN))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let row: (bool,) = sqlx::query_as("SELECT verified_minor FROM users WHERE pubkey = $1")
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(row.0);
+}

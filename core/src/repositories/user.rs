@@ -2369,6 +2369,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_clear_verified_minor_is_tenant_scoped() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let pubkey = Keys::generate().public_key().to_hex();
+
+        // verified-minor under tenant 1
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, verified_minor, verified_minor_at, created_at, updated_at) \
+             VALUES ($1, 1, TRUE, NOW(), NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Clearing under a different tenant must not match the row.
+        let result = repo.clear_verified_minor(&pubkey, 2).await;
+        assert!(matches!(result, Err(RepositoryError::NotFound(_))));
+
+        // Tenant-1 flag is untouched.
+        let (verified_minor, verified_minor_at) =
+            repo.get_verified_minor(&pubkey, 1).await.unwrap().unwrap();
+        assert!(
+            verified_minor,
+            "tenant-1 flag must survive a tenant-2 clear attempt"
+        );
+        assert!(verified_minor_at.is_some());
+
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
     async fn test_clear_verified_minor_unknown_pubkey_not_found() {
         let pool = setup_pool().await;
         let repo = UserRepository::new(pool);
