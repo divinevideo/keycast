@@ -439,3 +439,116 @@ async fn test_clear_empty_actor_is_400() {
         .unwrap();
     assert!(row.0);
 }
+
+#[tokio::test]
+async fn test_clear_retry_writes_no_second_audit_row() {
+    common::assert_test_database_url();
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+    let pool = common::setup_test_db().await;
+    let pubkey = create_verified_minor_user(&pool).await;
+    let actor = Keys::generate().public_key().to_hex();
+
+    let uri = format!(
+        "/admin/users/{}/verified-minor?actor={}&reason=revoked",
+        pubkey, actor
+    );
+
+    // First call is a real transition -> exactly one audit row.
+    let resp = build_app(create_test_auth_state(pool.clone()))
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(uri.clone())
+                .header("authorization", format!("Bearer {}", SERVICE_TOKEN))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Retry after the flag is already cleared: no-op, must not append a second
+    // row asserting a transition that never happened.
+    let resp = build_app(create_test_auth_state(pool.clone()))
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(uri.clone())
+                .header("authorization", format!("Bearer {}", SERVICE_TOKEN))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let rows = read_audit_rows(&pool, &actor).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "a no-op retry must not write a second audit row"
+    );
+}
+
+#[tokio::test]
+async fn test_clear_invalidates_outstanding_claim_token() {
+    common::assert_test_database_url();
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+    let pool = common::setup_test_db().await;
+    let app = build_app(create_test_auth_state(pool.clone()));
+    let pubkey = create_verified_minor_user(&pool).await;
+
+    // A live claim link issued before the account is revoked.
+    let token = format!("tok_{}", Keys::generate().public_key().to_hex());
+    sqlx::query(
+        "INSERT INTO account_claim_tokens (token, user_pubkey, expires_at, created_at, tenant_id) \
+         VALUES ($1, $2, NOW() + INTERVAL '7 days', NOW(), $3)",
+    )
+    .bind(&token)
+    .bind(&pubkey)
+    .bind(TENANT_ID)
+    .execute(&pool)
+    .await
+    .expect("create claim token");
+
+    let actor = Keys::generate().public_key().to_hex();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/admin/users/{}/verified-minor?actor={}&reason=revoked",
+                    pubkey, actor
+                ))
+                .header("authorization", format!("Bearer {}", SERVICE_TOKEN))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The outstanding link must no longer be redeemable, so a revoked-before-claim
+    // account can never be claimed into a normal account with no minor protections.
+    let valid_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM account_claim_tokens \
+         WHERE user_pubkey = $1 AND used_at IS NULL AND invalidated_at IS NULL AND expires_at > NOW()",
+    )
+    .bind(&pubkey)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        valid_count.0, 0,
+        "revoking verified_minor must invalidate the outstanding claim link"
+    );
+
+    // Invalidation is attributed to the moderator that drove the revoke.
+    let invalidated_by: (Option<String>,) =
+        sqlx::query_as("SELECT invalidated_by FROM account_claim_tokens WHERE token = $1")
+            .bind(&token)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(invalidated_by.0.as_deref(), Some(actor.as_str()));
+}

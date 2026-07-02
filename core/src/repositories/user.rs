@@ -1409,25 +1409,42 @@ impl UserRepository {
     /// Idempotent: clearing an already-cleared or never-minor account succeeds.
     /// Returns NotFound only when the user does not exist. Touches only the two
     /// minor columns plus updated_at; never alters status/suspended_reason/suspended_at.
+    ///
+    /// Returns `true` only when a real transition happened (the flag was set and
+    /// is now cleared). A no-op clear (already-cleared or never-minor) returns
+    /// `false` and leaves `updated_at` untouched, so callers can audit exactly
+    /// the transitions that actually occurred rather than every retry.
+    ///
+    /// The three cases are distinguished in a single statement so that a missing
+    /// user (NotFound) never collapses into an already-cleared no-op: `existing`
+    /// probes for the row, `changed` conditionally updates only a set flag, and
+    /// the outer SELECT reports both.
     pub async fn clear_verified_minor(
         &self,
         pubkey: &str,
         tenant_id: i64,
-    ) -> Result<(), RepositoryError> {
-        let result = sqlx::query(
-            "UPDATE users SET verified_minor = FALSE, verified_minor_at = NULL, updated_at = $3 \
-             WHERE pubkey = $1 AND tenant_id = $2",
+    ) -> Result<bool, RepositoryError> {
+        let (user_exists, transitioned): (bool, bool) = sqlx::query_as(
+            "WITH existing AS ( \
+                 SELECT 1 FROM users WHERE pubkey = $1 AND tenant_id = $2 \
+             ), changed AS ( \
+                 UPDATE users \
+                 SET verified_minor = FALSE, verified_minor_at = NULL, updated_at = $3 \
+                 WHERE pubkey = $1 AND tenant_id = $2 AND verified_minor = TRUE \
+                 RETURNING 1 \
+             ) \
+             SELECT EXISTS (SELECT 1 FROM existing), EXISTS (SELECT 1 FROM changed)",
         )
         .bind(pubkey)
         .bind(tenant_id)
         .bind(Utc::now())
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
 
-        if result.rows_affected() == 0 {
+        if !user_exists {
             return Err(RepositoryError::NotFound("user not found".to_string()));
         }
-        Ok(())
+        Ok(transitioned)
     }
 
     /// Combined status + verified_minor query for admin status endpoints.
@@ -2338,7 +2355,8 @@ mod tests {
         .await
         .unwrap();
 
-        repo.clear_verified_minor(&pubkey, 1).await.unwrap();
+        let transitioned = repo.clear_verified_minor(&pubkey, 1).await.unwrap();
+        assert!(transitioned, "clearing a set flag is a real transition");
 
         let (verified_minor, verified_minor_at) =
             repo.get_verified_minor(&pubkey, 1).await.unwrap().unwrap();
@@ -2362,8 +2380,47 @@ mod tests {
         .await
         .unwrap();
 
-        repo.clear_verified_minor(&pubkey, 1).await.unwrap();
-        repo.clear_verified_minor(&pubkey, 1).await.unwrap();
+        // A never-minor / already-cleared account clears successfully but is not
+        // a real transition, so both calls report `false`.
+        assert!(!repo.clear_verified_minor(&pubkey, 1).await.unwrap());
+        assert!(!repo.clear_verified_minor(&pubkey, 1).await.unwrap());
+
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_clear_verified_minor_noop_does_not_bump_updated_at() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let pubkey = Keys::generate().public_key().to_hex();
+
+        // Never-minor account with a fixed, in-the-past updated_at.
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, created_at, updated_at) \
+             VALUES ($1, 1, NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day')",
+        )
+        .bind(&pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let before: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT updated_at FROM users WHERE pubkey = $1")
+                .bind(&pubkey)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        // No-op clear: must not report a transition and must not touch updated_at.
+        assert!(!repo.clear_verified_minor(&pubkey, 1).await.unwrap());
+
+        let after: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT updated_at FROM users WHERE pubkey = $1")
+                .bind(&pubkey)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(before, after, "a no-op clear must not bump updated_at");
 
         cleanup_user(&pool, &pubkey).await;
     }
@@ -2425,7 +2482,7 @@ mod tests {
         .await
         .unwrap();
 
-        repo.clear_verified_minor(&pubkey, 1).await.unwrap();
+        assert!(repo.clear_verified_minor(&pubkey, 1).await.unwrap());
 
         let (status, suspended_reason, suspended_at, verified_minor, _) = repo
             .get_full_admin_status(&pubkey, 1)

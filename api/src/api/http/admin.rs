@@ -2008,39 +2008,86 @@ pub async fn clear_verified_minor_admin(
     let reason_clean = sanitize_reason(params.reason);
 
     let user_repo = UserRepository::new(auth_state.state.db.clone());
-    user_repo.clear_verified_minor(&pubkey, tenant_id).await?;
+    let transitioned = user_repo.clear_verified_minor(&pubkey, tenant_id).await?;
 
     tracing::info!(
         event = "verified_minor_cleared",
         pubkey = %pubkey,
         actor = ?params.actor,
         reason = ?reason_clean,
+        transitioned,
         "Admin cleared verified_minor"
     );
 
-    // Durable audit row (best-effort) when an actor is supplied. The table's
-    // actor_pubkey is NOT NULL, so no actor -> log-only. A failed insert logs
-    // and the clear still succeeds. (keycast#279 raises the same bar for status changes.)
-    if let Some(actor) = params.actor.as_deref() {
-        let audit_repo = AdminAuditEventRepository::new(auth_state.state.db.clone());
-        if let Err(error) = audit_repo
-            .record(AdminAuditEventRecord {
-                tenant_id,
-                actor_pubkey: actor.to_string(),
-                action: "clear_verified_minor".to_string(),
-                target_resource_type: "user".to_string(),
-                target_resource_id: Some(pubkey.clone()),
-                target_client_id: None,
-                metadata_json: serde_json::json!({ "reason": reason_clean }),
-            })
-            .await
-        {
+    // Durable audit row (best-effort) only for a real transition and only when an
+    // actor is supplied. Gating on `transitioned` keeps a relay-manager retry after
+    // a lost response, or a duplicate revocation, from appending a second event
+    // asserting a state change that never happened. The table's actor_pubkey is
+    // NOT NULL, so no actor -> log-only. A failed insert logs and the clear still
+    // succeeds. (keycast#279 raises the same bar for status changes.)
+    if transitioned {
+        if let Some(actor) = params.actor.as_deref() {
+            let audit_repo = AdminAuditEventRepository::new(auth_state.state.db.clone());
+            if let Err(error) = audit_repo
+                .record(AdminAuditEventRecord {
+                    tenant_id,
+                    actor_pubkey: actor.to_string(),
+                    action: "clear_verified_minor".to_string(),
+                    target_resource_type: "user".to_string(),
+                    target_resource_id: Some(pubkey.clone()),
+                    target_client_id: None,
+                    metadata_json: serde_json::json!({ "reason": reason_clean }),
+                })
+                .await
+            {
+                tracing::error!(
+                    pubkey = %pubkey,
+                    error = %error,
+                    "Failed to write admin_audit_events row for verified_minor clear"
+                );
+            }
+        }
+    }
+
+    // Close the revocation door. Clearing the flag alone leaves any claim link
+    // issued before the clear live, and claim redemption gates only on token
+    // validity -- not on status or verified_minor -- so a minor account revoked
+    // before it is claimed could still be claimed and land as a normal account
+    // with no minor protections. Invalidate outstanding tokens so that path is
+    // shut regardless of whether relay-manager also changes status.
+    //
+    // Run this unconditionally, not just on a transition: a retry after a
+    // mid-request crash (flag already cleared, tokens not yet invalidated) must
+    // still close the door. `invalidate_valid_for_user` only touches still-valid,
+    // unused tokens, so it is idempotent and a no-op for an already-claimed
+    // (age-up) account. Unlike the best-effort audit row this is a safety
+    // invariant: a failure fails the request so the idempotent caller retries
+    // rather than silently leaving the link open.
+    let claim_token_repo = ClaimTokenRepository::new(auth_state.state.db.clone());
+    let invalidated_by = params
+        .actor
+        .as_deref()
+        .unwrap_or("system:verified_minor_clear");
+    let invalidated = match claim_token_repo
+        .invalidate_valid_for_user(&pubkey, tenant_id, invalidated_by, reason_clean.as_deref())
+        .await
+    {
+        Ok(count) => count,
+        Err(error) => {
             tracing::error!(
                 pubkey = %pubkey,
                 error = %error,
-                "Failed to write admin_audit_events row for verified_minor clear"
+                "Failed to invalidate outstanding claim tokens on verified_minor clear"
             );
+            return Err(error.into());
         }
+    };
+    if invalidated > 0 {
+        tracing::info!(
+            pubkey = %pubkey,
+            invalidated,
+            "Invalidated outstanding claim tokens on verified_minor clear"
+        );
     }
 
     let (status, suspended_reason, suspended_at, verified_minor, verified_minor_at) = user_repo

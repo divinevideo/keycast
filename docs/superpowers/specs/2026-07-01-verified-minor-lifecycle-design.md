@@ -47,30 +47,39 @@ Folding a status change into the clear would make it unusable for age-up and wou
 ```rust
 /// Clear the verified_minor designation (age-up or revocation).
 /// Idempotent: clearing an already-cleared or never-minor account succeeds.
-/// Returns NotFound only when the user does not exist.
+/// Returns NotFound only when the user does not exist. Returns `true` only on a
+/// real transition (flag was set, now cleared); a no-op returns `false` and
+/// leaves `updated_at` untouched, so callers audit only real transitions.
 pub async fn clear_verified_minor(
     &self,
     pubkey: &str,
     tenant_id: i64,
-) -> Result<(), RepositoryError> {
-    let result = sqlx::query(
-        "UPDATE users SET verified_minor = FALSE, verified_minor_at = NULL, updated_at = $3 \
-         WHERE pubkey = $1 AND tenant_id = $2",
+) -> Result<bool, RepositoryError> {
+    let (user_exists, transitioned): (bool, bool) = sqlx::query_as(
+        "WITH existing AS ( \
+             SELECT 1 FROM users WHERE pubkey = $1 AND tenant_id = $2 \
+         ), changed AS ( \
+             UPDATE users \
+             SET verified_minor = FALSE, verified_minor_at = NULL, updated_at = $3 \
+             WHERE pubkey = $1 AND tenant_id = $2 AND verified_minor = TRUE \
+             RETURNING 1 \
+         ) \
+         SELECT EXISTS (SELECT 1 FROM existing), EXISTS (SELECT 1 FROM changed)",
     )
     .bind(pubkey)
     .bind(tenant_id)
     .bind(Utc::now())
-    .execute(&self.pool)
+    .fetch_one(&self.pool)
     .await?;
 
-    if result.rows_affected() == 0 {
+    if !user_exists {
         return Err(RepositoryError::NotFound("user not found".to_string()));
     }
-    Ok(())
+    Ok(transitioned)
 }
 ```
 
-Idempotency rests on Postgres counting every WHERE-matched row as affected by an UPDATE even when column values are unchanged: an existing user yields `rows_affected() == 1` regardless of the prior flag value (success no-op when already false), and a missing user yields `0` (NotFound). The method touches only the two minor columns plus `updated_at`; it never alters `status`, `suspended_reason`, or `suspended_at`.
+The three cases are distinguished in one statement so a missing user (NotFound) never collapses into an already-cleared no-op — the trap of a bare `WHERE verified_minor = TRUE` on the `UPDATE`, which would report `rows_affected() == 0` for both. `existing` probes for the row (existence, independent of flag value), `changed` conditionally updates only a set flag and reports via `RETURNING` whether a real transition happened, and the outer `SELECT` returns both. A no-op clear (already-cleared or never-minor) therefore does **not** bump `updated_at` and reports `false`, so the endpoint can write an audit row for exactly the transitions that occurred rather than for every retry. The method touches only the two minor columns plus `updated_at`; it never alters `status`, `suspended_reason`, or `suspended_at`.
 
 ### Endpoint
 
@@ -88,13 +97,18 @@ Handler `clear_verified_minor_admin`:
 2. Extract `tenant_id` from `TenantExtractor`.
 3. If `actor` is present, validate it as a 64-char hex pubkey (`len() == 64 && chars().all(|c| c.is_ascii_hexdigit())`, the idiom already used at admin.rs:1475). Reject with 400 on a malformed actor, so a T&S action never silently loses its audit trail.
 4. Sanitize `reason` before it is logged or stored: bound to 500 chars and strip control characters (newlines and CR included), per the standing "sanitize caller-supplied values before logging" rule. Call the result `reason_clean`.
-5. `user_repo.clear_verified_minor(&pubkey, tenant_id).await?` (maps `RepositoryError::NotFound` to 404 via error.rs:45).
+5. `let transitioned = user_repo.clear_verified_minor(&pubkey, tenant_id).await?` (maps `RepositoryError::NotFound` to 404 via error.rs:45).
 6. Audit the action:
-   - Always emit a structured log line: `tracing::info!(event = "verified_minor_cleared", pubkey = %pubkey, actor = ?actor, reason = ?reason_clean, "Admin cleared verified_minor")`.
-   - When `actor` is present, also write a durable `admin_audit_events` row, best-effort (log-and-continue on failure, mirroring `record_registered_client_audit` at admin.rs:1554): action `clear_verified_minor`, `actor_pubkey = actor`, `target_resource_type = "user"`, `target_resource_id = Some(pubkey)`, `metadata_json = { "reason": reason_clean }`. The table's `actor_pubkey` is `NOT NULL`, so a durable row is written only when an actor is supplied; without one we fall back to log-only. (keycast#279 raises the same durable-audit bar for suspend/ban so the two enforcement actions match.)
-7. `user_repo.get_full_admin_status(&pubkey, tenant_id).await?` and return the existing `UserStatusResponse` (so the caller sees `verified_minor: false`, `verified_minor_at: null`, and the unchanged status). Reusing `UserStatusResponse` keeps the response contract identical to `GET`/`PUT .../status`.
+   - Always emit a structured log line: `tracing::info!(event = "verified_minor_cleared", pubkey = %pubkey, actor = ?actor, reason = ?reason_clean, transitioned, "Admin cleared verified_minor")`.
+   - When `transitioned` **and** `actor` is present, also write a durable `admin_audit_events` row, best-effort (log-and-continue on failure, mirroring `record_registered_client_audit` at admin.rs:1554): action `clear_verified_minor`, `actor_pubkey = actor`, `target_resource_type = "user"`, `target_resource_id = Some(pubkey)`, `metadata_json = { "reason": reason_clean }`. Gating on `transitioned` keeps a relay-manager retry after a lost response, or a duplicate revocation, from appending a second event asserting a state change that never happened. The table's `actor_pubkey` is `NOT NULL`, so a durable row is written only when an actor is supplied; without one we fall back to log-only. (keycast#279 raises the same durable-audit bar for suspend/ban so the two enforcement actions match.)
+7. Close the revocation door: `claim_token_repo.invalidate_valid_for_user(&pubkey, tenant_id, actor.unwrap_or("system:verified_minor_clear"), reason_clean)`. See "Claim-link closure" below. Run this unconditionally (not gated on `transitioned`) so a retry after a mid-request crash still closes the door; on error, log and return the error so the idempotent caller retries.
+8. `user_repo.get_full_admin_status(&pubkey, tenant_id).await?` and return the existing `UserStatusResponse` (so the caller sees `verified_minor: false`, `verified_minor_at: null`, and the unchanged status). Reusing `UserStatusResponse` keeps the response contract identical to `GET`/`PUT .../status`.
 
 The audit write is best-effort enrichment: a failed `admin_audit_events` insert logs an error and the clear still succeeds. The clear is the primary operation.
+
+### Claim-link closure
+
+Clearing `verified_minor` alone leaves any claim link issued before the clear live. Claim redemption (`claim.rs::claim_post`) gates only on token validity — it does **not** check `status` or `verified_minor` (status is fetched afterward only to stamp the UCAN fact). So a minor account revoked before it is claimed could still be claimed and land as a normal account with no minor protections, and a relay-manager status change alone would not stop it. The endpoint therefore invalidates outstanding claim tokens itself (via the existing `invalidate_valid_for_user`, which only touches still-valid, unused tokens and is thus idempotent and a no-op for an already-claimed age-up account). Unlike the best-effort audit row, this is a safety invariant: a failure fails the request so the caller retries rather than silently leaving the link open. This keeps the door closed independent of relay-manager#147.
 
 Route registration in `routes.rs`:
 
@@ -114,20 +128,23 @@ Route registration in `routes.rs`:
 ## Testing (TDD)
 
 **Repository (integration, Postgres, mirrors existing `user.rs` tests):**
-1. Clears a verified minor: after `create_minor_account` then `clear_verified_minor`, `get_verified_minor` returns `(false, None)`.
-2. Idempotent: calling `clear_verified_minor` on an already-cleared user returns `Ok(())`.
-3. Unknown pubkey returns `RepositoryError::NotFound`.
-4. Does not disturb status: a suspended verified-minor keeps `status = suspended` and its `suspended_reason`/`suspended_at` after clearing.
+1. Clears a verified minor: after `create_minor_account` then `clear_verified_minor`, `get_verified_minor` returns `(false, None)`; the call returns `Ok(true)` (real transition).
+2. Idempotent: calling `clear_verified_minor` on an already-cleared / never-minor user returns `Ok(false)` on both calls (no transition).
+3. No-op does not bump `updated_at`: a no-op clear leaves `updated_at` unchanged (and returns `Ok(false)`).
+4. Unknown pubkey returns `RepositoryError::NotFound` (never collapsed into a no-op).
+5. Does not disturb status: a suspended verified-minor keeps `status = suspended` and its `suspended_reason`/`suspended_at` after clearing.
 
 **Endpoint (integration, service-token):**
-5. `DELETE` with a valid service token clears the flag and returns `UserStatusResponse` with `verified_minor == false` and `verified_minor_at == None`.
-6. `DELETE` with a missing/invalid service token returns 401.
-7. `DELETE` on an unknown pubkey returns 404.
-8. `DELETE` with a valid `actor` writes an `admin_audit_events` row: action `clear_verified_minor`, `actor_pubkey == actor`, `target_resource_id == pubkey`, `metadata_json.reason == reason_clean`.
-9. `DELETE` without `actor` writes no audit row and still succeeds (log-only fallback).
-10. `DELETE` with a malformed `actor` (not 64 hex chars) returns 400 and does not clear the flag.
-11. `reason` containing control characters or exceeding 500 chars is sanitized (bounded and stripped) in both the log line and the stored `metadata_json`.
+6. `DELETE` with a valid service token clears the flag and returns `UserStatusResponse` with `verified_minor == false` and `verified_minor_at == None`.
+7. `DELETE` with a missing/invalid service token returns 401.
+8. `DELETE` on an unknown pubkey returns 404.
+9. `DELETE` with a valid `actor` writes an `admin_audit_events` row: action `clear_verified_minor`, `actor_pubkey == actor`, `target_resource_id == pubkey`, `metadata_json.reason == reason_clean`.
+10. `DELETE` without `actor` writes no audit row and still succeeds (log-only fallback).
+11. `DELETE` with a malformed `actor` (not 64 hex chars) returns 400 and does not clear the flag.
+12. `reason` containing control / bidi / zero-width chars or exceeding 500 chars is sanitized (bounded and stripped) in both the log line and the stored `metadata_json`.
+13. A no-op retry (a second `DELETE` with `actor` after the flag is already cleared) writes no second audit row.
+14. `DELETE` invalidates an outstanding claim token for the pubkey (no valid token remains; `invalidated_by == actor`), so a revoked-before-claim account can no longer be claimed.
 
 ## Acceptance
 
-An approved minor account, when cleared through this endpoint, has `verified_minor` set false and `verified_minor_at` set null, with account status untouched, and (when an `actor` is supplied) a durable `admin_audit_events` row recording who cleared it and why, so that via divine-relay-manager#147 revoking approval lifts protections automatically across clients. The "re-apply restrictions" clause and age-up detection are deferred to divine-relay-manager#147 and support-trust-safety#179 respectively.
+An approved minor account, when cleared through this endpoint, has `verified_minor` set false and `verified_minor_at` set null, with account status untouched, any outstanding claim link invalidated, and (when the clear is a real transition and an `actor` is supplied) a durable `admin_audit_events` row recording who cleared it and why, so that via divine-relay-manager#147 revoking approval lifts protections automatically across clients. The "re-apply restrictions" clause and age-up detection are deferred to divine-relay-manager#147 and support-trust-safety#179 respectively.
