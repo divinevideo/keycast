@@ -480,40 +480,42 @@ impl OAuthCodeRepository {
             return Ok(false);
         }
 
-        let updated = sqlx::query(
-            "UPDATE oauth_codes SET consumed_at = $1
-             WHERE tenant_id = $2
-               AND user_pubkey = $3
-               AND client_id = $4
-               AND redirect_uri = $5
-               AND scope = $6
-               AND code_challenge IS NOT DISTINCT FROM $7
-               AND code_challenge_method IS NOT DISTINCT FROM $8
-               AND state IS NOT DISTINCT FROM $9
-               AND is_headless = $10
-               AND pending_email IS NOT NULL
-               AND pending_email_verification_token IS NOT DISTINCT FROM $11
-               AND device_code IS NOT DISTINCT FROM $12
-               AND consumed_at IS NULL",
-        )
-        .bind(Utc::now())
-        .bind(tenant_id)
-        .bind(&auth_code.user_pubkey)
-        .bind(&auth_code.client_id)
-        .bind(&auth_code.redirect_uri)
-        .bind(&auth_code.scope)
-        .bind(auth_code.code_challenge.as_deref())
-        .bind(auth_code.code_challenge_method.as_deref())
-        .bind(auth_code.state.as_deref())
-        .bind(auth_code.is_headless)
-        .bind(auth_code.pending_email_verification_token.as_deref())
-        .bind(auth_code.device_code.as_deref())
-        .execute(&mut *tx)
-        .await?;
+        if auth_code.pending_email_verification_token.is_some() {
+            let updated = sqlx::query(
+                "UPDATE oauth_codes SET consumed_at = $1
+                 WHERE tenant_id = $2
+                   AND user_pubkey = $3
+                   AND client_id = $4
+                   AND redirect_uri = $5
+                   AND scope = $6
+                   AND code_challenge IS NOT DISTINCT FROM $7
+                   AND code_challenge_method IS NOT DISTINCT FROM $8
+                   AND state IS NOT DISTINCT FROM $9
+                   AND is_headless = $10
+                   AND pending_email IS NOT NULL
+                   AND pending_email_verification_token IS NOT DISTINCT FROM $11
+                   AND device_code IS NOT DISTINCT FROM $12
+                   AND consumed_at IS NULL",
+            )
+            .bind(Utc::now())
+            .bind(tenant_id)
+            .bind(&auth_code.user_pubkey)
+            .bind(&auth_code.client_id)
+            .bind(&auth_code.redirect_uri)
+            .bind(&auth_code.scope)
+            .bind(auth_code.code_challenge.as_deref())
+            .bind(auth_code.code_challenge_method.as_deref())
+            .bind(auth_code.state.as_deref())
+            .bind(auth_code.is_headless)
+            .bind(auth_code.pending_email_verification_token.as_deref())
+            .bind(auth_code.device_code.as_deref())
+            .execute(&mut *tx)
+            .await?;
 
-        if updated.rows_affected() != 1 {
-            tx.rollback().await?;
-            return Ok(false);
+            if updated.rows_affected() != 1 {
+                tx.rollback().await?;
+                return Ok(false);
+            }
         }
 
         tx.commit().await?;

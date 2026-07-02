@@ -4700,7 +4700,8 @@ mod tests {
             .connect_lazy(database_url)
             .expect("lazy pool should be created");
         let bcrypt_queue = crate::bcrypt_queue::BcryptQueue::new();
-        let secret_pool = keycast_core::secret_pool::SecretPool::new(1);
+        let secret_pool = Box::leak(Box::new(keycast_core::secret_pool::SecretPool::new(1)));
+        let _secret_pool_producer = secret_pool.spawn_producer();
         let tenant_cache = moka::future::Cache::builder().max_capacity(10).build();
         let key_manager: std::sync::Arc<Box<dyn keycast_core::encryption::KeyManager>> =
             std::sync::Arc::new(Box::new(LazyTestKeyManager));
@@ -5128,6 +5129,100 @@ mod tests {
             assert_eq!(response.status(), expected_status);
             assert_eq!(response_json(response).await, expected_body);
         }
+    }
+
+    #[tokio::test]
+    async fn test_oauth_token_exchanges_plain_existing_user_code() {
+        std::env::set_var("BUNKER_RELAYS", "wss://relay.example.test");
+        let auth_state = create_lazy_auth_state();
+        let pool = auth_state.state.db.clone();
+        let keys = Keys::generate();
+        let user_pubkey = keys.public_key().to_hex();
+        let nsec = keys.secret_key().to_bech32().unwrap();
+        let email = format!("oauth-token-existing-{}@example.com", uuid::Uuid::new_v4());
+        let code = format!("oauth_token_existing_{}", uuid::Uuid::new_v4());
+        let client_id = format!("client_{}", uuid::Uuid::new_v4());
+        let redirect_uri = "http://localhost:3000/callback";
+
+        sqlx::query("INSERT INTO users (pubkey, tenant_id, email, created_at, updated_at) VALUES ($1, 1, $2, NOW(), NOW())")
+            .bind(&user_pubkey)
+            .bind(&email)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        store_oauth_code(
+            &pool,
+            1,
+            &code,
+            &user_pubkey,
+            &client_id,
+            redirect_uri,
+            "policy:social",
+            None,
+            None,
+            Utc::now() + Duration::minutes(10),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let response = match token(
+            create_unit_test_tenant(),
+            axum::extract::State(auth_state),
+            axum::Json(TokenRequest {
+                grant_type: Some("authorization_code".to_string()),
+                code: Some(code.clone()),
+                client_id,
+                redirect_uri: Some(redirect_uri.to_string()),
+                code_verifier: Some(format!("verifier.{}", nsec)),
+                refresh_token: None,
+            }),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => error.into_response(),
+        };
+        let status = response.status();
+        let body = response_json(response).await;
+
+        sqlx::query(
+            "DELETE FROM oauth_refresh_tokens
+             WHERE authorization_id IN (
+                 SELECT id FROM oauth_authorizations WHERE user_pubkey = $1 AND tenant_id = 1
+             )",
+        )
+        .bind(&user_pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM oauth_authorizations WHERE user_pubkey = $1 AND tenant_id = 1")
+            .bind(&user_pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM personal_keys WHERE user_pubkey = $1 AND tenant_id = 1")
+            .bind(&user_pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM oauth_codes WHERE code = $1 OR user_pubkey = $2")
+            .bind(&code)
+            .bind(&user_pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM users WHERE pubkey = $1 AND tenant_id = 1")
+            .bind(&user_pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(status, StatusCode::OK, "unexpected token response: {body}");
+        assert!(body["access_token"].is_string(), "token response: {body}");
+        assert!(body["bunker_url"].is_string(), "token response: {body}");
     }
 
     #[tokio::test]
