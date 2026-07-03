@@ -1581,13 +1581,79 @@ pub async fn verify_email(
 
         // Create user with email_verified=true (they just verified!)
         let user_repo = UserRepository::new(pool.clone());
-        let user_already_exists = user_repo.exists(&oauth_data.user_pubkey, tenant_id).await?;
+        let existing_user = user_repo
+            .oauth_registration_state(&oauth_data.user_pubkey, tenant_id)
+            .await?;
 
-        if user_already_exists {
-            tracing::info!(
-                "Retrying OAuth email verification for existing user: {}",
-                oauth_data.user_pubkey
-            );
+        if let Some(existing) = existing_user {
+            match existing.email.as_deref() {
+                Some(existing_email) if existing_email == email => {
+                    // Genuine retry: a prior attempt already applied the pending
+                    // credentials. Backfill the personal key if that attempt (or
+                    // another creation path) left it missing.
+                    tracing::info!(
+                        "Retrying OAuth email verification for existing user: {}",
+                        oauth_data.user_pubkey
+                    );
+                    if oauth_data.pending_encrypted_secret.is_some() && !existing.has_personal_key {
+                        user_repo
+                            .complete_pending_oauth_registration(
+                                &oauth_data.user_pubkey,
+                                tenant_id,
+                                email,
+                                password_hash,
+                                &req.token,
+                                oauth_data.pending_encrypted_secret.as_deref(),
+                            )
+                            .await?;
+                        tracing::info!(
+                            "Backfilled missing personal key during OAuth verification retry: {}",
+                            oauth_data.user_pubkey
+                        );
+                    }
+                }
+                Some(_) => {
+                    // The pubkey is already bound to a different email. Never
+                    // overwrite an existing account's credentials from an
+                    // unauthenticated verification link.
+                    tracing::warn!(
+                        "OAuth email verification for pubkey {} conflicts with an existing account email",
+                        oauth_data.user_pubkey
+                    );
+                    oauth_code_repo
+                        .delete_by_verification_token(&req.token, tenant_id)
+                        .await?;
+                    return Err(AuthError::DuplicateKey);
+                }
+                None => {
+                    // Bare row pre-created by another path (team membership,
+                    // authorization pre-creation): apply the pending registration
+                    // instead of silently dropping it.
+                    if let Err(err) = user_repo
+                        .complete_pending_oauth_registration(
+                            &oauth_data.user_pubkey,
+                            tenant_id,
+                            email,
+                            password_hash,
+                            &req.token,
+                            oauth_data.pending_encrypted_secret.as_deref(),
+                        )
+                        .await
+                    {
+                        if matches!(err, keycast_core::repositories::RepositoryError::Duplicate) {
+                            oauth_code_repo
+                                .delete_by_verification_token(&req.token, tenant_id)
+                                .await?;
+                            return Err(AuthError::EmailAlreadyExists);
+                        }
+                        return Err(err.into());
+                    }
+                    tracing::info!(
+                        "Applied pending OAuth registration to pre-existing user row: {}",
+                        oauth_data.user_pubkey
+                    );
+                }
+            }
         } else if let Some(ref encrypted_secret) = oauth_data.pending_encrypted_secret {
             // Auto-generated or direct nsec: create user + personal_keys
             // Use a transaction to ensure atomicity
@@ -4807,6 +4873,129 @@ mod tests {
 
         cleanup_verify_email_test_data(&pool, &existing_pubkey, &verification_token).await;
         cleanup_verify_email_test_data(&pool, &pending_pubkey, &verification_token).await;
+    }
+
+    #[cfg(feature = "integration-tests")]
+    async fn insert_pending_oauth_registration(
+        pool: &PgPool,
+        pubkey: &str,
+        email: &str,
+        verification_token: &str,
+        password_hash: &str,
+        encrypted_secret: Option<&[u8]>,
+    ) {
+        let placeholder_code = format!("placeholder_{}", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO oauth_codes (
+                tenant_id, code, user_pubkey, client_id, redirect_uri, scope,
+                expires_at, created_at, pending_email, pending_password_hash,
+                pending_email_verification_token, pending_encrypted_secret
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8, $9, $10, $11)",
+        )
+        .bind(1_i64)
+        .bind(&placeholder_code)
+        .bind(pubkey)
+        .bind("TestApp")
+        .bind("https://test.example.com/callback")
+        .bind("policy:social")
+        .bind(Utc::now() + Duration::hours(24))
+        .bind(email)
+        .bind(password_hash)
+        .bind(verification_token)
+        .bind(encrypted_secret)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_email_applies_pending_registration_to_bare_user_row() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+        let pending_keys = Keys::generate();
+        let pubkey = pending_keys.public_key().to_hex();
+        let email = format!("verify-bare-row-{}@example.com", Uuid::new_v4());
+        let verification_token = format!("verify_{}", Uuid::new_v4());
+        let password_hash = bcrypt::hash("testpassword123", bcrypt::DEFAULT_COST).unwrap();
+        let encrypted_secret = pending_keys.secret_key().to_secret_bytes().to_vec();
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &verification_token).await;
+
+        // Bare row pre-created by another path (team add, authorization pre-create)
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
+             VALUES ($1, 1, NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        insert_pending_oauth_registration(
+            &pool,
+            &pubkey,
+            &email,
+            &verification_token,
+            &password_hash,
+            Some(&encrypted_secret),
+        )
+        .await;
+
+        let response = match verify_email(
+            create_test_tenant(),
+            State(auth_state),
+            HeaderMap::new(),
+            Json(VerifyEmailRequest {
+                token: verification_token.clone(),
+            }),
+        )
+        .await
+        {
+            Ok(response) => response.into_response(),
+            Err(err) => err.into_response(),
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let row: (Option<String>, Option<String>, bool) = sqlx::query_as(
+            "SELECT email, password_hash, email_verified FROM users
+             WHERE pubkey = $1 AND tenant_id = 1",
+        )
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row.0.as_deref(),
+            Some(email.as_str()),
+            "pending email must be applied to the pre-existing bare row"
+        );
+        assert_eq!(
+            row.1.as_deref(),
+            Some(password_hash.as_str()),
+            "pending password must be applied to the pre-existing bare row"
+        );
+        assert!(row.2, "email must be marked verified");
+
+        let key_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM personal_keys WHERE user_pubkey = $1")
+                .bind(&pubkey)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(key_count.0, 1, "personal key must be created");
+
+        let usable_code_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM oauth_codes
+             WHERE tenant_id = 1 AND user_pubkey = $1 AND pending_email IS NULL",
+        )
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(usable_code_count.0, 1, "OAuth code should be minted");
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &verification_token).await;
     }
 
     #[cfg(feature = "integration-tests")]
