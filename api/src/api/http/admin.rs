@@ -1963,8 +1963,10 @@ fn is_unsafe_format_char(c: char) -> bool {
         '\u{200B}'..='\u{200F}'   // zero-width space .. right-to-left mark
         | '\u{2028}'..='\u{2029}' // line / paragraph separator
         | '\u{202A}'..='\u{202E}' // bidi embeddings / overrides
+        | '\u{2060}'..='\u{2064}' // word joiner + invisible math operators
         | '\u{2066}'..='\u{2069}' // bidi isolates
         | '\u{FEFF}'              // zero-width no-break space / BOM
+        | '\u{FFF9}'..='\u{FFFB}' // interlinear annotation anchors
     )
 }
 

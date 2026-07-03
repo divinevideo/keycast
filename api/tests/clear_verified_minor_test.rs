@@ -379,8 +379,9 @@ async fn test_clear_reason_strips_bidi_format_chars() {
     let actor = Keys::generate().public_key().to_hex();
 
     // reason with U+202E RIGHT-TO-LEFT OVERRIDE (%E2%80%AE), U+200B ZERO WIDTH SPACE (%E2%80%8B),
-    // and U+2028/U+2029 LINE/PARAGRAPH SEPARATOR (%E2%80%A8 / %E2%80%A9).
-    let raw_reason = "spoof%E2%80%AEda%E2%80%A8en%E2%80%A9x%E2%80%8B";
+    // U+2028/U+2029 LINE/PARAGRAPH SEPARATOR (%E2%80%A8 / %E2%80%A9), U+2060 WORD JOINER
+    // (%E2%81%A0), and U+FFF9 INTERLINEAR ANNOTATION ANCHOR (%EF%BF%B9).
+    let raw_reason = "spoof%E2%80%AEda%E2%80%A8en%E2%80%A9x%E2%80%8Bj%E2%81%A0a%EF%BF%B9b";
     let resp = app
         .oneshot(
             Request::builder()
@@ -403,8 +404,10 @@ async fn test_clear_reason_strips_bidi_format_chars() {
         !reason.contains('\u{202E}')
             && !reason.contains('\u{200B}')
             && !reason.contains('\u{2028}')
-            && !reason.contains('\u{2029}'),
-        "bidi / zero-width / line-separator format chars must be stripped, got {:?}",
+            && !reason.contains('\u{2029}')
+            && !reason.contains('\u{2060}')
+            && !reason.contains('\u{FFF9}'),
+        "bidi / zero-width / line-separator / word-joiner / annotation format chars must be stripped, got {:?}",
         reason
     );
 }
@@ -551,4 +554,117 @@ async fn test_clear_invalidates_outstanding_claim_token() {
             .await
             .unwrap();
     assert_eq!(invalidated_by.0.as_deref(), Some(actor.as_str()));
+}
+
+/// Claim-link closure is a safety invariant that must hold even without a
+/// moderator actor (e.g. an automated age-up clear). Invalidation runs
+/// unconditionally, and the actor-less path attributes the invalidation to the
+/// `system:verified_minor_clear` sentinel. Without this test a future refactor
+/// that accidentally gated invalidation on `actor` would leave the door open
+/// with green tests.
+#[tokio::test]
+async fn test_clear_without_actor_still_invalidates_claim_token() {
+    common::assert_test_database_url();
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+    let pool = common::setup_test_db().await;
+    let app = build_app(create_test_auth_state(pool.clone()));
+    let pubkey = create_verified_minor_user(&pool).await;
+
+    let token = format!("tok_{}", Keys::generate().public_key().to_hex());
+    sqlx::query(
+        "INSERT INTO account_claim_tokens (token, user_pubkey, expires_at, created_at, tenant_id) \
+         VALUES ($1, $2, NOW() + INTERVAL '7 days', NOW(), $3)",
+    )
+    .bind(&token)
+    .bind(&pubkey)
+    .bind(TENANT_ID)
+    .execute(&pool)
+    .await
+    .expect("create claim token");
+
+    // No `actor` query param: still a valid clear, still must close the door.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/admin/users/{}/verified-minor", pubkey))
+                .header("authorization", format!("Bearer {}", SERVICE_TOKEN))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let (invalidated_at, invalidated_by): (Option<chrono::DateTime<Utc>>, Option<String>) =
+        sqlx::query_as(
+            "SELECT invalidated_at, invalidated_by FROM account_claim_tokens WHERE token = $1",
+        )
+        .bind(&token)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        invalidated_at.is_some(),
+        "an actor-less clear must still invalidate the outstanding claim link"
+    );
+    assert_eq!(
+        invalidated_by.as_deref(),
+        Some("system:verified_minor_clear"),
+        "actor-less invalidation is attributed to the system sentinel"
+    );
+}
+
+/// Token invalidation is tenant-scoped. `invalidate_valid_for_user` filters on
+/// `tenant_id`, so a token row carrying a different tenant must survive a clear
+/// driven under tenant 1 (the endpoint's tenant). The claim-token FK is only on
+/// `user_pubkey`, not `(user_pubkey, tenant_id)`, so a same-pubkey row under a
+/// foreign tenant is representable and must not be swept.
+#[tokio::test]
+async fn test_clear_does_not_invalidate_other_tenant_claim_token() {
+    common::assert_test_database_url();
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+    let pool = common::setup_test_db().await;
+    let app = build_app(create_test_auth_state(pool.clone()));
+    let pubkey = create_verified_minor_user(&pool).await;
+
+    // Same pubkey, but the token belongs to a different tenant's view.
+    const OTHER_TENANT_ID: i64 = 2;
+    let foreign_token = format!("tok_{}", Keys::generate().public_key().to_hex());
+    sqlx::query(
+        "INSERT INTO account_claim_tokens (token, user_pubkey, expires_at, created_at, tenant_id) \
+         VALUES ($1, $2, NOW() + INTERVAL '7 days', NOW(), $3)",
+    )
+    .bind(&foreign_token)
+    .bind(&pubkey)
+    .bind(OTHER_TENANT_ID)
+    .execute(&pool)
+    .await
+    .expect("create foreign-tenant claim token");
+
+    // Clear runs under tenant 1 (build_app's TenantExtractor).
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/admin/users/{}/verified-minor", pubkey))
+                .header("authorization", format!("Bearer {}", SERVICE_TOKEN))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The tenant-2 token must be untouched: still valid, never invalidated.
+    let (invalidated_at,): (Option<chrono::DateTime<Utc>>,) =
+        sqlx::query_as("SELECT invalidated_at FROM account_claim_tokens WHERE token = $1")
+            .bind(&foreign_token)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        invalidated_at.is_none(),
+        "a clear under tenant 1 must not invalidate another tenant's claim token"
+    );
 }
