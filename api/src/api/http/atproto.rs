@@ -55,8 +55,8 @@ pub enum AtprotoControlError {
     UsernameNotClaimed,
     #[error("requested username does not match claimed username")]
     UsernameMismatch,
-    #[error("provisioning trigger failed: {0}")]
-    ProvisioningTrigger(String),
+    #[error("{}", .0.public_message())]
+    ProvisioningTrigger(crate::atproto_provisioning::AtprotoProvisioningError),
     #[error("repository error: {0}")]
     Repository(#[from] RepositoryError),
 }
@@ -149,17 +149,17 @@ where
         .ok_or(AtprotoControlError::UsernameNotClaimed)?;
 
     if let Err(error) = trigger(user_pubkey.to_string(), username.clone()).await {
-        let error_message = error.to_string();
+        let error_message = error.public_message();
         repo.set_atproto_state(
             user_pubkey,
             tenant_id,
             true,
             Some("failed"),
             None,
-            Some(&error_message),
+            Some(error_message),
         )
         .await?;
-        return Err(AtprotoControlError::ProvisioningTrigger(error_message));
+        return Err(AtprotoControlError::ProvisioningTrigger(error));
     }
 
     Ok(response)
@@ -200,17 +200,17 @@ where
     let response = reenable_user_atproto(repo, tenant_id, user_pubkey).await?;
 
     if let Err(error) = trigger(user_pubkey.to_string()).await {
-        let error_message = error.to_string();
+        let error_message = error.public_message();
         repo.set_atproto_state(
             user_pubkey,
             tenant_id,
             true,
             Some("failed"),
             None,
-            Some(&error_message),
+            Some(error_message),
         )
         .await?;
-        return Err(AtprotoControlError::ProvisioningTrigger(error_message));
+        return Err(AtprotoControlError::ProvisioningTrigger(error));
     }
 
     Ok(response)
@@ -307,7 +307,7 @@ where
 
     trigger(user_pubkey.to_string())
         .await
-        .map_err(|error| AtprotoControlError::ProvisioningTrigger(error.to_string()))?;
+        .map_err(AtprotoControlError::ProvisioningTrigger)?;
 
     disable_user_atproto_and_revoke_sessions(user_repo, session_repo, tenant_id, user_pubkey).await
 }
@@ -413,9 +413,12 @@ fn map_control_error(error: AtprotoControlError) -> AuthError {
         ),
         AtprotoControlError::ProvisioningTrigger(err) => {
             tracing::warn!("ATProto provisioning trigger failed: {}", err);
+            // Both branches surface as a scoped 503: AuthError::Internal's
+            // IntoResponse discards the message and emits a fixed generic body,
+            // so a non-dependency provisioning failure must also use
+            // ServiceUnavailable to preserve the ATProto-specific text.
             AuthError::ServiceUnavailable {
-                message: "ATProto setup is temporarily unavailable. Please try again shortly."
-                    .to_string(),
+                message: err.public_message().to_string(),
                 retry_after: Some(30),
             }
         }
@@ -572,15 +575,39 @@ mod tests {
     use keycast_core::repositories::RepositoryError;
 
     #[test]
-    fn provisioning_trigger_maps_to_targeted_service_unavailable() {
+    fn provisioning_dependency_failure_maps_to_service_unavailable() {
         let error = map_control_error(AtprotoControlError::ProvisioningTrigger(
-            "request failed: connection refused".to_string(),
+            crate::atproto_provisioning::AtprotoProvisioningError::DependencyNotConfigured,
         ));
 
-        assert!(
-            matches!(error, AuthError::ServiceUnavailable { .. }),
-            "provisioning dependency failures should not be classified as internal errors"
-        );
+        assert!(matches!(
+            error,
+            AuthError::ServiceUnavailable {
+                message,
+                retry_after: Some(30),
+            } if message == "ATProto enablement is temporarily unavailable. Please try again later."
+        ));
+    }
+
+    #[test]
+    fn provisioning_client_error_maps_to_service_unavailable_with_scoped_body() {
+        // A control-plane 4xx is not dependency-unavailable, but it must still
+        // surface as a scoped 503 carrying the ATProto-specific message rather
+        // than AuthError::Internal's fixed generic body.
+        let error = map_control_error(AtprotoControlError::ProvisioningTrigger(
+            crate::atproto_provisioning::AtprotoProvisioningError::UnexpectedStatus {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                body: "bad request".to_string(),
+            },
+        ));
+
+        assert!(matches!(
+            error,
+            AuthError::ServiceUnavailable {
+                message,
+                retry_after: Some(30),
+            } if message == "ATProto provisioning failed. Please try again later."
+        ));
     }
 
     #[test]

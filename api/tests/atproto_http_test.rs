@@ -118,7 +118,7 @@ async fn status_returns_username_and_lifecycle_fields() {
 }
 
 #[tokio::test]
-async fn enable_trigger_failure_marks_failed_state() {
+async fn enable_dependency_failure_marks_failed_state_with_safe_message() {
     let pool = common::setup_test_db().await;
     let repo = UserRepository::new(pool.clone());
     let tenant_id = 1_i64;
@@ -144,18 +144,16 @@ async fn enable_trigger_failure_marks_failed_state() {
         &user_pubkey,
         &username,
         |_pubkey, _username| async {
-            Err(
-                keycast_api::atproto_provisioning::AtprotoProvisioningError::UnexpectedStatus {
-                    status: StatusCode::BAD_GATEWAY,
-                    body: "gateway unavailable".to_string(),
-                },
-            )
+            Err(keycast_api::atproto_provisioning::AtprotoProvisioningError::DependencyNotConfigured)
         },
     )
     .await
-    .expect_err("enable should surface trigger failure");
+    .expect_err("enable should surface dependency failure");
 
-    assert!(error.to_string().contains("gateway unavailable"));
+    assert_eq!(
+        error.to_string(),
+        "ATProto enablement is temporarily unavailable. Please try again later."
+    );
 
     let response = get_user_atproto_status(&repo, tenant_id, &user_pubkey)
         .await
@@ -166,7 +164,7 @@ async fn enable_trigger_failure_marks_failed_state() {
     assert_eq!(response.did, None);
     assert_eq!(
         response.error.as_deref(),
-        Some("provisioning service returned 502 Bad Gateway: gateway unavailable"),
+        Some("ATProto enablement is temporarily unavailable. Please try again later."),
     );
 }
 
@@ -209,7 +207,10 @@ async fn disable_trigger_failure_preserves_existing_state() {
     .await
     .expect_err("disable should surface trigger failure");
 
-    assert!(error.to_string().contains("disable failed"));
+    assert_eq!(
+        error.to_string(),
+        "ATProto enablement is temporarily unavailable. Please try again later."
+    );
 
     let response = get_user_atproto_status(&repo, tenant_id, &user_pubkey)
         .await
@@ -423,6 +424,55 @@ async fn crosspost_enable_uses_opt_in_trigger_for_initial_enable() {
     assert_eq!(opt_in_calls.load(Ordering::SeqCst), 1);
     assert_eq!(reenable_calls.load(Ordering::SeqCst), 0);
     assert_eq!(disable_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn crosspost_enable_dependency_failure_returns_service_unavailable() {
+    let pool = common::setup_test_db().await;
+    let repo = UserRepository::new(pool.clone());
+    let session_repo = AtprotoOAuthSessionRepository::new(pool.clone());
+    let tenant_id = 1_i64;
+
+    let keys = Keys::generate();
+    let user_pubkey = keys.public_key().to_hex();
+    let username = format!("alice-crosspost-unavailable-{}", &user_pubkey[..8]);
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, username, atproto_enabled, atproto_state, created_at, updated_at)
+         VALUES ($1, $2, $3, false, NULL, NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .bind(&username)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    let error = set_user_atproto_crosspost(
+        SetCrosspostContext {
+            user_repo: &repo,
+            session_repo: &session_repo,
+            tenant_id,
+            authenticated_user_pubkey: &user_pubkey,
+            requested_pubkey: &user_pubkey,
+            enabled: true,
+        },
+        |_pubkey, _requested_username, _crosspost_enabled| async {
+            Err(keycast_api::atproto_provisioning::AtprotoProvisioningError::DependencyNotConfigured)
+        },
+        |_pubkey| async { Ok(()) },
+        |_pubkey| async { Ok(()) },
+    )
+    .await
+    .expect_err("dependency failure should become service unavailable");
+
+    assert!(matches!(
+        error,
+        AuthError::ServiceUnavailable {
+            message,
+            retry_after: Some(30),
+        } if message == "ATProto enablement is temporarily unavailable. Please try again later."
+    ));
 }
 
 #[tokio::test]

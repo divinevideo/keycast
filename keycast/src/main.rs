@@ -461,6 +461,8 @@ fn validate_environment() -> Result<(), String> {
         errors.push(Box::leak(e.into_boxed_str()));
     }
 
+    warn_atproto_control_plane_config();
+
     if !errors.is_empty() {
         return Err(format!(
             "Missing required environment variables:\n  - {}\n\nSee .env.example for configuration guide.",
@@ -469,6 +471,31 @@ fn validate_environment() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn warn_atproto_control_plane_config() {
+    let configured = env::var("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let Some(url) = configured else {
+        warn_atproto_control_plane_config_issue(
+            "DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL is not set; ATProto provisioning endpoints will return a scoped unavailable response",
+        );
+        return;
+    };
+
+    if let Err(error) = keycast_api::atproto_provisioning::validate_control_plane_base_url(&url) {
+        warn_atproto_control_plane_config_issue(&format!(
+            "DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL {error}; ATProto provisioning endpoints will return a scoped unavailable response"
+        ));
+    }
+}
+
+fn warn_atproto_control_plane_config_issue(message: &str) {
+    tracing::warn!("{}", message);
+    eprintln!("Configuration warning: {message}");
 }
 
 async fn wait_for_shutdown_signal() {
@@ -1122,6 +1149,36 @@ mod tests {
     use serial_test::serial;
     use tower::ServiceExt;
 
+    fn set_minimal_valid_environment() {
+        std::env::set_var(
+            "DATABASE_URL",
+            "postgres://postgres:password@localhost/keycast_test",
+        );
+        std::env::set_var("ALLOWED_ORIGINS", "http://localhost:5173");
+        std::env::set_var("SERVER_NSEC", "a".repeat(64));
+        std::env::set_var("REDIS_URL", "redis://localhost:16379");
+        std::env::set_var("KMS_PROVIDER", "file");
+        std::env::set_var("MASTER_KEY_PATH", "./master.key");
+        std::env::set_var("DISABLE_EMAILS", "true");
+    }
+
+    fn clear_minimal_valid_environment() {
+        for key in [
+            "DATABASE_URL",
+            "ALLOWED_ORIGINS",
+            "SERVER_NSEC",
+            "REDIS_URL",
+            "KMS_PROVIDER",
+            "MASTER_KEY_PATH",
+            "DISABLE_EMAILS",
+            "NODE_ENV",
+            "RUST_ENV",
+            "DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL",
+        ] {
+            std::env::remove_var(key);
+        }
+    }
+
     #[test]
     #[serial]
     fn test_resolve_kms_provider_legacy_file_default() {
@@ -1179,6 +1236,73 @@ mod tests {
         let result = resolve_kms_provider();
         assert!(result.is_err());
         std::env::remove_var("KMS_PROVIDER");
+    }
+
+    #[test]
+    #[serial]
+    fn test_validate_environment_allows_missing_atproto_control_plane_in_production() {
+        set_minimal_valid_environment();
+        std::env::set_var("NODE_ENV", "production");
+        std::env::remove_var("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL");
+
+        let result = validate_environment();
+
+        assert!(result.is_ok());
+
+        clear_minimal_valid_environment();
+    }
+
+    #[test]
+    #[serial]
+    fn test_validate_environment_allows_invalid_atproto_control_plane_url() {
+        set_minimal_valid_environment();
+        std::env::set_var("NODE_ENV", "production");
+        std::env::set_var("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL", "not a url");
+
+        let result = validate_environment();
+
+        assert!(result.is_ok());
+
+        clear_minimal_valid_environment();
+    }
+
+    #[test]
+    #[serial]
+    fn test_validate_environment_allows_atproto_control_plane_url_with_query_or_fragment() {
+        for url in [
+            "https://control-plane.example?tenant=prod",
+            "https://control-plane.example#provisioning",
+        ] {
+            set_minimal_valid_environment();
+            std::env::set_var("NODE_ENV", "production");
+            std::env::set_var("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL", url);
+
+            let result = validate_environment();
+
+            assert!(result.is_ok(), "{url} should not block startup");
+
+            clear_minimal_valid_environment();
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_validate_environment_allows_atproto_control_plane_url_with_path() {
+        for url in [
+            "https://control-plane.example/api",
+            "https://control-plane.example/api/",
+            "https://control-plane.example/nested/path",
+        ] {
+            set_minimal_valid_environment();
+            std::env::set_var("NODE_ENV", "production");
+            std::env::set_var("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL", url);
+
+            let result = validate_environment();
+
+            assert!(result.is_ok(), "{url} should not block startup");
+
+            clear_minimal_valid_environment();
+        }
     }
 
     #[test]
