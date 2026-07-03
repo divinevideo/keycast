@@ -50,7 +50,7 @@ const USERS_EMAIL_TENANT_CONSTRAINT: &str = "idx_users_email_tenant";
 pub(crate) const INVALID_EMAIL_CODE: &str = "INVALID_EMAIL";
 pub(crate) const INVALID_EMAIL_MESSAGE: &str = "Please enter a valid email address.";
 pub(crate) const EMAIL_ALREADY_EXISTS_CODE: &str = "EMAIL_ALREADY_EXISTS";
-const EMAIL_ALREADY_EXISTS_MESSAGE: &str =
+pub(crate) const EMAIL_ALREADY_EXISTS_MESSAGE: &str =
     "This email is already registered. Please log in instead.";
 pub(crate) const EMAIL_NOT_VERIFIED_CODE: &str = "EMAIL_NOT_VERIFIED";
 pub(crate) const EMAIL_NOT_VERIFIED_MESSAGE: &str =
@@ -764,15 +764,14 @@ impl From<AuthError> for super::headless::HeadlessError {
     fn from(e: AuthError) -> Self {
         use super::headless::HeadlessError;
         match e {
-            AuthError::EmailAlreadyExists => HeadlessError::Conflict(
-                "This email is already registered. Please log in instead.".to_string(),
-            ),
+            // Dedicated variant so the response body carries the documented EMAIL_ALREADY_EXISTS
+            // code byte-identical to the link path (keycast#198/#236 contract), while the shared
+            // Conflict variant keeps emitting the generic CONFLICT code for its other cases.
+            AuthError::EmailAlreadyExists => HeadlessError::EmailAlreadyExists,
             AuthError::Database(ref db_err)
                 if has_database_constraint(db_err, USERS_EMAIL_TENANT_CONSTRAINT) =>
             {
-                HeadlessError::Conflict(
-                    "This email is already registered. Please log in instead.".to_string(),
-                )
+                HeadlessError::EmailAlreadyExists
             }
             AuthError::Conflict(msg) => HeadlessError::Conflict(msg),
             AuthError::RegistrationAlreadyCompleted => HeadlessError::Conflict(

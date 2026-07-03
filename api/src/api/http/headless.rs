@@ -18,8 +18,9 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use super::auth::{
-    generate_secure_token, normalize_registration_email, EMAIL_VERIFICATION_EXPIRY_HOURS,
-    INVALID_EMAIL_CODE, INVALID_EMAIL_MESSAGE,
+    generate_secure_token, normalize_registration_email, EMAIL_ALREADY_EXISTS_CODE,
+    EMAIL_ALREADY_EXISTS_MESSAGE, EMAIL_VERIFICATION_EXPIRY_HOURS, INVALID_EMAIL_CODE,
+    INVALID_EMAIL_MESSAGE,
 };
 use super::oauth::{extract_origin, parse_policy_scope};
 
@@ -1068,6 +1069,9 @@ pub enum HeadlessError {
     InvalidEmail,
     InvalidRequest(String),
     Conflict(String),
+    /// Duplicate email during registration finalize. Dedicated variant (not `Conflict`) so the
+    /// body carries the documented `EMAIL_ALREADY_EXISTS` code byte-identical to the link path.
+    EmailAlreadyExists,
     Internal(String),
     /// Uniform rejection for every verify-pin failure mode (unknown device_code, wrong/locked/
     /// expired PIN) — never reveals which, nor lockout state (anti-enumeration).
@@ -1098,6 +1102,11 @@ impl IntoResponse for HeadlessError {
             ),
             HeadlessError::InvalidRequest(msg) => (StatusCode::BAD_REQUEST, msg, "INVALID_REQUEST"),
             HeadlessError::Conflict(msg) => (StatusCode::CONFLICT, msg, "CONFLICT"),
+            HeadlessError::EmailAlreadyExists => (
+                StatusCode::CONFLICT,
+                EMAIL_ALREADY_EXISTS_MESSAGE.to_string(),
+                EMAIL_ALREADY_EXISTS_CODE,
+            ),
             HeadlessError::PinVerificationFailed => (
                 StatusCode::UNAUTHORIZED,
                 "Invalid or expired verification code. Please try again or request a new one."
@@ -1674,6 +1683,12 @@ mod tests {
 
         let response = call_verify_pin(auth_state, &device_code, "123456").await;
         assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let body = response_json(response).await;
+        assert_eq!(
+            body["code"],
+            super::super::auth::EMAIL_ALREADY_EXISTS_CODE,
+            "PIN path must emit the same documented duplicate-email code as the link path"
+        );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
             .bind(&device_code)
