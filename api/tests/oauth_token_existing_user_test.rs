@@ -2,12 +2,12 @@
 
 // ABOUTME: Integration coverage for exchanging standard OAuth codes for existing users.
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{extract::State, http::StatusCode, response::IntoResponse};
 use chrono::{Duration, Utc};
 use keycast_api::{
     api::{
         http::{
-            oauth::{token, TokenRequest},
+            oauth::{token, TokenRequest, TokenRequestBody},
             routes::AuthState,
         },
         tenant::{Tenant, TenantExtractor},
@@ -73,6 +73,7 @@ fn create_auth_state(pool: PgPool) -> AuthState {
             bcrypt_sender: bcrypt_queue.sender(),
             redis: None,
             secret_pool: secret_pool.receiver(),
+            activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),
         }),
         auth_tx: None,
     }
@@ -170,7 +171,7 @@ async fn oauth_token_exchanges_plain_existing_user_code() {
     let response = match token(
         create_test_tenant(),
         State(auth_state),
-        Json(TokenRequest {
+        TokenRequestBody(TokenRequest {
             grant_type: Some("authorization_code".to_string()),
             code: Some(code.clone()),
             client_id,

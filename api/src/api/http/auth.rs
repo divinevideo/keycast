@@ -1727,6 +1727,8 @@ async fn delete_pending_registration(
 /// window re-arms a fresh exchange code, which is what makes link prefetch/preview harmless: a
 /// mail-scanner GET can no longer materialize the user, mint a short-lived code, delete the row,
 /// and strand the user's real visit. The row expires on its own at the end of the verify window.
+/// The one exception is a duplicate email (#236): that registration can never complete, so the
+/// pending row is deleted to make the 409 terminal instead of looping on every retry.
 pub async fn finalize_pending_registration(
     pool: &PgPool,
     redis: Option<&crate::redis::PrefixedRedis>,
@@ -1845,7 +1847,8 @@ pub async fn finalize_pending_registration(
                     .await
                 {
                     if matches!(err, keycast_core::repositories::RepositoryError::Duplicate) {
-                        delete_pending_registration(&oauth_code_repo, kept_token, tenant_id).await?;
+                        delete_pending_registration(&oauth_code_repo, kept_token, tenant_id)
+                            .await?;
                         return Err(AuthError::EmailAlreadyExists);
                     }
                     return Err(err.into());
@@ -1888,8 +1891,11 @@ pub async fn finalize_pending_registration(
         {
             Ok(row) => row,
             Err(err) if has_database_constraint(&err, USERS_EMAIL_TENANT_CONSTRAINT) => {
-                // Duplicate email: this registration can never complete, so the pending row is
-                // terminal — delete it rather than leaving a row that only ever 409s.
+                // Duplicate email: this registration can never complete (the email belongs to
+                // another user), so terminate it — delete the pending row so the 409 is terminal
+                // and a retried token no longer loops through duplicate insertion (#236). This is
+                // the one exception to the keep-the-pending-row re-arm rule: no exchange code can
+                // ever be minted from this row, so deleting it strands nothing.
                 tx.rollback().await?;
                 delete_pending_registration(&oauth_code_repo, kept_token, tenant_id).await?;
                 return Err(AuthError::EmailAlreadyExists);
@@ -1939,6 +1945,7 @@ pub async fn finalize_pending_registration(
             .await
         {
             if matches!(err, keycast_core::repositories::RepositoryError::Duplicate) {
+                // Same terminal duplicate-email handling as the keyed path above (#236).
                 delete_pending_registration(&oauth_code_repo, kept_token, tenant_id).await?;
                 return Err(AuthError::EmailAlreadyExists);
             }

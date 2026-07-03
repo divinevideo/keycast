@@ -4134,8 +4134,8 @@ mod tests {
             Some(&token),
             Some(&secret),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         let row: (Option<String>, Option<String>, bool, Option<String>) = sqlx::query_as(
             "SELECT email, password_hash, email_verified, email_verification_token
