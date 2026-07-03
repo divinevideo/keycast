@@ -61,8 +61,8 @@ const READYZ_DB_TIMEOUT: Duration = Duration::from_millis(800);
 ///
 /// Cloud Run has **no** readiness-probe-driven endpoint removal: a terminating
 /// instance is removed from routing by the platform, and peer rebalancing comes
-/// from the cluster coordinator's `leave` event (see the SIGTERM-time
-/// deregister in `async_main`), not from this pause. Set
+/// from the cluster coordinator's `leave` event (published at the start of
+/// phase 3 — see `deregister_within_signer_budget`), not from this pause. Set
 /// `SHUTDOWN_PRE_DRAIN_SECS=0` there. Override with `SHUTDOWN_PRE_DRAIN_SECS`
 /// (e.g. `0` in local dev / tests).
 const DEFAULT_SHUTDOWN_PRE_DRAIN_SECS: u64 = 15;
@@ -78,9 +78,12 @@ const DEFAULT_SHUTDOWN_PRE_DRAIN_SECS: u64 = 15;
 /// `SHUTDOWN_HTTP_DRAIN_SECS`.
 const DEFAULT_SHUTDOWN_HTTP_DRAIN_SECS: u64 = 40;
 
-/// Maximum time we wait for the relay queue, NIP-46 signer, and tracked
-/// background tasks to finish before/while tearing down the relay client.
-/// Override with `SHUTDOWN_SIGNER_DRAIN_SECS`.
+/// Budget for the whole of phase 3: the bounded cluster deregister
+/// (`CLUSTER_DEREGISTER_TIMEOUT`, carved out of this budget — see
+/// `deregister_within_signer_budget`) followed by the relay queue, NIP-46
+/// signer, and tracked background task drain before/while tearing down the
+/// relay client. Must comfortably exceed `CLUSTER_DEREGISTER_TIMEOUT` or the
+/// drain is starved. Override with `SHUTDOWN_SIGNER_DRAIN_SECS`.
 const DEFAULT_SHUTDOWN_SIGNER_DRAIN_SECS: u64 = 10;
 
 /// Upper bound on the platform's post-SIGTERM grace (the kubelet's
@@ -114,12 +117,15 @@ const DEFAULT_SHUTDOWN_TEARDOWN_MARGIN_SECS: u64 = 10;
 /// always has time to flush.
 const POOL_CLOSE_LOG_HEADROOM: Duration = Duration::from_secs(2);
 
-/// Upper bound on the SIGTERM-time cluster deregister (publish `leave` +
-/// remove from the registry). This runs concurrently with the pre-drain pause,
-/// so on GKE (pre_drain ≥ this) it adds no wall-clock; on Cloud Run
-/// (pre_drain = 0) it is the only phase-1 cost, kept small so a dead Redis
-/// cannot stall shutdown past the grace period. The Cloud Run drain budgets in
-/// `cloudbuild.yaml` are sized to absorb this worst case.
+/// Upper bound on the shutdown-time cluster deregister (publish `leave` +
+/// remove from the registry). It opens phase 3 — immediately before the relay
+/// queue closes — and is carved OUT of the `signer_drain` budget (further
+/// capped at `signer_drain` itself; see `deregister_within_signer_budget`), so
+/// it never adds wall-clock on top of the phase budgets that
+/// `validate_shutdown_timings`/`clamp_shutdown_timings` prove fit the grace
+/// ceiling. Kept small so a dead Redis cannot eat the drain budget.
+/// `signer_drain` must comfortably exceed this or the queue drain is starved —
+/// the Cloud Run sizing in `cloudbuild.yaml` accounts for it explicitly.
 const CLUSTER_DEREGISTER_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Slice of the phase-3 `signer_drain` budget reserved for a best-effort relay
@@ -154,7 +160,9 @@ struct ShutdownTimings {
 impl ShutdownTimings {
     /// Sum of all three phase durations. Does NOT include the teardown
     /// margin — add that separately when comparing against a grace-period
-    /// ceiling.
+    /// ceiling. The phase-3 cluster deregister needs no separate term:
+    /// it is carved out of `signer_drain` (see
+    /// `deregister_within_signer_budget`), so this sum already covers it.
     fn total_budget(&self) -> Duration {
         self.pre_drain + self.http_drain + self.signer_drain
     }
@@ -490,6 +498,67 @@ fn abort_join_handles(handles: &[tokio::task::AbortHandle]) {
     }
 }
 
+/// Outcome of the bounded SIGTERM-time cluster deregister that opens phase 3.
+/// All variants continue shutdown; `Failed`/`TimedOut` mean peers converge via
+/// heartbeat staleness instead of the explicit `leave` event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClusterDeregisterOutcome {
+    /// `leave` published and instance removed from the registry.
+    Deregistered,
+    /// The deregister returned an error (e.g. Redis unreachable).
+    Failed,
+    /// The deregister exceeded its slice of the `signer_drain` budget.
+    TimedOut,
+}
+
+/// Run the bounded cluster deregister that opens phase 3 and return the
+/// signer-drain budget left for the relay/tracker drain.
+///
+/// Publishing the cluster `leave` here — immediately before the relay queue
+/// closes — makes peers rebuild the hashring and take over this shard while
+/// we drain, shrinking the dual-ownership window (peer and this instance both
+/// handling the same bunker pubkeys) to Pub/Sub propagation time. Handover is
+/// deliberately at-least-once: duplicates over drops.
+///
+/// Budget accounting: the deregister is bounded by
+/// `CLUSTER_DEREGISTER_TIMEOUT.min(signer_drain)` and its elapsed wall-clock
+/// is subtracted from the returned drain budget, so phase 3's total
+/// (deregister + drain) never exceeds `signer_drain`. That keeps the
+/// deregister inside the budget already proven to fit the grace ceiling by
+/// `validate_shutdown_timings`/`clamp_shutdown_timings` — no unmodeled
+/// overhang, no reliance on slack in other constants.
+async fn deregister_within_signer_budget<F, E>(
+    deregister: F,
+    signer_drain: Duration,
+) -> (ClusterDeregisterOutcome, Duration)
+where
+    F: std::future::Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    let budget = CLUSTER_DEREGISTER_TIMEOUT.min(signer_drain);
+    // tokio::time::Instant (not std) so paused-clock tests measure the same
+    // virtual time the timeout runs on.
+    let started = tokio::time::Instant::now();
+    let outcome = match tokio::time::timeout(budget, deregister).await {
+        Ok(Ok(())) => {
+            tracing::info!("Graceful shutdown: cluster leave published, instance deregistered");
+            ClusterDeregisterOutcome::Deregistered
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "Graceful shutdown: cluster deregister failed; peers will converge via heartbeat staleness");
+            ClusterDeregisterOutcome::Failed
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = budget.as_secs(),
+                "Graceful shutdown: cluster deregister timed out (Redis slow/down); continuing"
+            );
+            ClusterDeregisterOutcome::TimedOut
+        }
+    };
+    (outcome, signer_drain.saturating_sub(started.elapsed()))
+}
+
 /// Run phase 3 under the shared `budget`, split into a drain sub-budget and a
 /// reserved relay-close slice (`RELAY_CLOSE_BUDGET`, capped at half the budget):
 ///
@@ -513,9 +582,11 @@ fn abort_join_handles(handles: &[tokio::task::AbortHandle]) {
 ///
 /// Budget contract: drain sub-budget + relay-close slice == `budget`, and only
 /// one of them runs the relay close, so total wall-clock never exceeds `budget`.
-/// This preserves the design contract enforced by `validate_shutdown_timings`/
-/// `clamp_shutdown_timings`: `pre_drain + http_drain + signer_drain +
-/// teardown_margin <= grace ceiling`.
+/// In production `budget` is the `signer_drain` remainder returned by
+/// `deregister_within_signer_budget`, so the whole of phase 3 (deregister +
+/// drain) stays within `signer_drain`. This preserves the design contract
+/// enforced by `validate_shutdown_timings`/`clamp_shutdown_timings`:
+/// `pre_drain + http_drain + signer_drain + teardown_margin <= grace ceiling`.
 ///
 /// `client_shutdown` is a factory (`Fn() -> Future`) rather than a single
 /// future so it can be invoked again on the timeout path. It is generic, along
@@ -1754,37 +1825,13 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     );
 
     // Phase 1: flip readiness and sleep so endpoint/NEG detach (GKE)
-    // propagates, AND concurrently publish the cluster `leave` event so peers
-    // rebalance off this instance immediately. The deregister is the *only*
-    // rebalance trigger on Cloud Run (no readiness-driven endpoint removal);
-    // on GKE it runs alongside endpoint detach. We join the two so peers learn
-    // we are leaving before we tear down relays, but bound the deregister so a
-    // dead Redis cannot stall shutdown. The heartbeat task is stopped as part
-    // of the deregister (it cancels the shared token), so it cannot re-register
-    // us after this point.
-    let deregister = async {
-        match tokio::time::timeout(
-            CLUSTER_DEREGISTER_TIMEOUT,
-            coordinator.deregister_and_stop_heartbeat(),
-        )
-        .await
-        {
-            Ok(Ok(())) => {
-                tracing::info!("Graceful shutdown: cluster leave published, instance deregistered")
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, "Graceful shutdown: cluster deregister failed; peers will converge via heartbeat staleness")
-            }
-            Err(_) => tracing::warn!(
-                timeout_secs = CLUSTER_DEREGISTER_TIMEOUT.as_secs(),
-                "Graceful shutdown: cluster deregister timed out (Redis slow/down); continuing"
-            ),
-        }
-    };
-    tokio::join!(
-        pre_drain_pause(&shutting_down, timings.pre_drain),
-        deregister
-    );
+    // propagates. The cluster `leave` is deliberately NOT published yet: this
+    // instance keeps sole ownership of its shard while it is still processing
+    // NIP-46 work (phases 1-2), and deregisters at the start of phase 3
+    // instead — right before the relay queue closes — so the dual-ownership
+    // window where a peer and this instance both handle the same bunker
+    // pubkeys shrinks from pre_drain+http_drain to Pub/Sub propagation time.
+    pre_drain_pause(&shutting_down, timings.pre_drain).await;
 
     // Phase 2: tell axum to stop accepting new HTTP connections and wait for
     // in-flight requests to finish.
@@ -1816,30 +1863,44 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         }
     }
 
-    // Phase 3: close the relay queue so relay workers stop accepting new
-    // events, drain queued relay work while the relay client remains connected,
-    // then tear down the relay client (stopping signer.run() subscription) and
-    // wait for signer + other tracked tasks. We do this **after** HTTP drain so
-    // NIP-46 requests that arrived before SIGTERM have a chance to complete and
-    // publish responses back to the requesting client before we disconnect from
-    // the relays. The cluster `leave` was already published in phase 1 (the
-    // coordinator is an `Arc` shared with the signer/workers and has no Drop
-    // hook, so it is NOT deregistered implicitly on return — see the explicit
-    // `deregister_and_stop_heartbeat` above).
+    // Phase 3: publish the cluster `leave` and deregister FIRST (bounded,
+    // carved out of the signer_drain budget — see
+    // `deregister_within_signer_budget`), so peers rebuild the hashring and
+    // take over this shard while we close and drain the relay queue right
+    // after. The deregister is the *only* rebalance trigger on Cloud Run (no
+    // readiness-driven endpoint removal); on GKE it follows endpoint detach.
+    // The coordinator is an `Arc` shared with the signer/workers and has no
+    // Drop hook, so it is NOT deregistered implicitly on return — this
+    // explicit call is required. The heartbeat task is stopped as part of the
+    // deregister (it cancels the shared token), so it cannot re-register us
+    // after this point.
     //
-    // `drain_signer_or_abort` bounds the whole of phase 3 by
-    // `timings.signer_drain` (split into a drain sub-budget plus a reserved
-    // relay-close slice) so `signer_drain` is a real bound — previously only
-    // the trailing `task_tracker.wait()` was bounded, leaving
+    // Then close the relay queue so relay workers stop accepting new events,
+    // drain queued relay work while the relay client remains connected, then
+    // tear down the relay client (stopping signer.run()'s subscription) and
+    // wait for signer + other tracked tasks. This runs **after** HTTP drain so
+    // NIP-46 requests that arrived before the queue closed have a chance to
+    // complete and publish responses back to the requesting client before we
+    // disconnect from the relays.
+    //
+    // `drain_signer_or_abort` bounds the drain by the signer budget REMAINING
+    // after the deregister (split into a drain sub-budget plus a reserved
+    // relay-close slice) so `signer_drain` is a real bound on the whole of
+    // phase 3, deregister included — previously only the trailing
+    // `task_tracker.wait()` was bounded, leaving
     // `client_for_shutdown.shutdown()` (a nostr_sdk WebSocket close handshake)
     // unbounded in practice. A hung close could therefore blow past the grace
     // period and swallow phase 4. The reserved slice also guarantees a graceful
     // relay close is attempted even when the drain itself times out.
     tracing::info!(
         elapsed_secs = shutdown_started_at.elapsed().as_secs(),
-        "Graceful shutdown: draining relay workers, then tearing down NIP-46 relay client and signer tasks"
+        "Graceful shutdown: deregistering from cluster, then draining relay workers and tearing down NIP-46 relay client and signer tasks"
     );
-    let signer_drain_budget = timings.signer_drain;
+    let (_deregister_outcome, signer_drain_budget) = deregister_within_signer_budget(
+        coordinator.deregister_and_stop_heartbeat(),
+        timings.signer_drain,
+    )
+    .await;
     let signer_handle_for_abort = signer_handle;
     let close_relay_queue = move || relay_queue.close();
     // Factory (not a single future) so the relay close can be re-attempted on
@@ -1864,8 +1925,9 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         }
         SignerDrainOutcome::AbortedAfterTimeout => {
             tracing::warn!(
-                signer_drain_secs = signer_drain_budget.as_secs(),
-                "Signer drain timed out (client.shutdown(), relay workers, and/or task_tracker.wait() exceeded signer_drain budget); aborted signer and relay workers"
+                signer_drain_secs = timings.signer_drain.as_secs(),
+                drain_budget_secs = signer_drain_budget.as_secs(),
+                "Signer drain timed out (client.shutdown(), relay workers, and/or task_tracker.wait() exceeded the signer_drain budget remaining after the cluster deregister); aborted signer and relay workers"
             );
         }
     }
@@ -2989,6 +3051,65 @@ mod tests {
     // are inside. On timeout it invokes the caller-supplied abort callback
     // (which aborts the
     // signer JoinHandle in production).
+
+    #[tokio::test(start_paused = true)]
+    async fn test_deregister_within_signer_budget_fast_path_keeps_full_drain_budget() {
+        // An instant deregister must not eat into the drain budget.
+        let signer_drain = Duration::from_secs(10);
+        let (outcome, remaining) =
+            deregister_within_signer_budget(async { Ok::<(), String>(()) }, signer_drain).await;
+        assert_eq!(outcome, ClusterDeregisterOutcome::Deregistered);
+        assert_eq!(remaining, signer_drain);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_deregister_within_signer_budget_hung_deregister_capped_at_cluster_timeout() {
+        // A hung Redis costs at most CLUSTER_DEREGISTER_TIMEOUT of the
+        // signer_drain budget; the rest stays available for the queue drain.
+        let signer_drain = Duration::from_secs(10);
+        let started = tokio::time::Instant::now();
+        let (outcome, remaining) = deregister_within_signer_budget(
+            std::future::pending::<Result<(), String>>(),
+            signer_drain,
+        )
+        .await;
+        assert_eq!(outcome, ClusterDeregisterOutcome::TimedOut);
+        assert_eq!(started.elapsed(), CLUSTER_DEREGISTER_TIMEOUT);
+        assert_eq!(remaining, signer_drain - CLUSTER_DEREGISTER_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_deregister_within_signer_budget_hung_deregister_capped_at_signer_drain() {
+        // When signer_drain is smaller than CLUSTER_DEREGISTER_TIMEOUT the
+        // phase-3 wall clock must still never exceed signer_drain — the
+        // deregister is carved out of the phase budget, not added on top.
+        let signer_drain = Duration::from_secs(1);
+        assert!(signer_drain < CLUSTER_DEREGISTER_TIMEOUT);
+        let started = tokio::time::Instant::now();
+        let (outcome, remaining) = deregister_within_signer_budget(
+            std::future::pending::<Result<(), String>>(),
+            signer_drain,
+        )
+        .await;
+        assert_eq!(outcome, ClusterDeregisterOutcome::TimedOut);
+        assert_eq!(started.elapsed(), signer_drain);
+        assert_eq!(remaining, Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_deregister_within_signer_budget_error_path_keeps_drain_budget() {
+        // A fast Redis error (connection refused) must not eat the drain
+        // budget either; shutdown continues and peers converge via heartbeat
+        // staleness.
+        let signer_drain = Duration::from_secs(10);
+        let (outcome, remaining) = deregister_within_signer_budget(
+            async { Err::<(), String>("redis connection refused".to_string()) },
+            signer_drain,
+        )
+        .await;
+        assert_eq!(outcome, ClusterDeregisterOutcome::Failed);
+        assert_eq!(remaining, signer_drain);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn test_drain_signer_or_abort_returns_completed_when_both_finish_before_budget() {
