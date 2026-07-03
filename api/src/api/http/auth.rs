@@ -2433,6 +2433,27 @@ pub async fn verify_email_get(
             "Link expired",
             "This verification link has expired. Please request a new one from the app.",
         ),
+        // Retryable: verification succeeded except for code delivery (e.g. Redis hiccup). The
+        // link is still good — render a non-terminal page that retries itself, never a bare 2xx
+        // that reads as success and never the terminal invalid-link page.
+        Err(AuthError::ServiceUnavailable { retry_after, .. }) => {
+            verify_html_retry_page(retry_after.unwrap_or(5))
+        }
+        // Terminal: the email belongs to another account (mirrors the POST path's 409).
+        Err(AuthError::EmailAlreadyExists) => verify_html_page(
+            StatusCode::CONFLICT,
+            "Email already registered",
+            "This email is already registered. Please log in instead.",
+        ),
+        Err(AuthError::Database(err))
+            if has_database_constraint(&err, USERS_EMAIL_TENANT_CONSTRAINT) =>
+        {
+            verify_html_page(
+                StatusCode::CONFLICT,
+                "Email already registered",
+                "This email is already registered. Please log in instead.",
+            )
+        }
         Err(_) => verify_html_page(
             StatusCode::OK,
             "Verification failed",
@@ -2441,10 +2462,39 @@ pub async fn verify_email_get(
     }
 }
 
+/// Render the retryable-failure page for the GET verify flow: 503 + `Retry-After` plus an HTML
+/// meta refresh, so both HTTP clients and webview users (who may have no address bar to reload
+/// with) retry automatically instead of reading a dead end.
+fn verify_html_retry_page(retry_after_secs: u32) -> Response {
+    let mut response = verify_html_page_with_refresh(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Almost there…",
+        "Your email is verified, but sign-in is still finishing. This page will retry automatically in a few seconds.",
+        Some(retry_after_secs),
+    );
+    if let Ok(value) = retry_after_secs.to_string().parse() {
+        response.headers_mut().insert("Retry-After", value);
+    }
+    response
+}
+
 /// Render a minimal, self-contained HTML status page for the GET verify flow.
 fn verify_html_page(status: StatusCode, heading: &str, message: &str) -> Response {
+    verify_html_page_with_refresh(status, heading, message, None)
+}
+
+/// [`verify_html_page`] with an optional `<meta http-equiv="refresh">` interval in seconds.
+fn verify_html_page_with_refresh(
+    status: StatusCode,
+    heading: &str,
+    message: &str,
+    refresh_secs: Option<u32>,
+) -> Response {
+    let refresh_tag = refresh_secs
+        .map(|secs| format!("<meta http-equiv=\"refresh\" content=\"{secs}\">"))
+        .unwrap_or_default();
     let body = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">{refresh_tag}\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <title>{heading}</title>\
          <style>body{{font-family:system-ui,-apple-system,sans-serif;background:#0d1117;color:#e6edf3;\
@@ -6289,6 +6339,110 @@ mod tests {
             content_type.contains("text/html"),
             "invalid-token GET verify should render HTML, got {content_type}"
         );
+    }
+
+    /// GET verify hitting the duplicate-email conflict must render the "log in instead" page with
+    /// a 409, not the generic invalid-link page (f4): the registration is terminally dead, and
+    /// the page must say why.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_email_get_duplicate_email_shows_login_page() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+        let existing_pubkey = Keys::generate().public_key().to_hex();
+        let duplicate_email = format!("verify-get-dup-{}@example.com", Uuid::new_v4());
+        let password_hash = bcrypt::hash("testpassword123", bcrypt::DEFAULT_COST).unwrap();
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
+             VALUES ($1, 1, $2, $3, true, NOW(), NOW())",
+        )
+        .bind(&existing_pubkey)
+        .bind(&duplicate_email)
+        .bind(&password_hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (pending_pubkey, token) =
+            insert_oauth_pending_registration(&pool, &duplicate_email).await;
+
+        let response = verify_email_get(
+            create_test_tenant(),
+            State(auth_state),
+            HeaderMap::new(),
+            axum::extract::Query(VerifyEmailQuery {
+                token: Some(token.clone()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "duplicate email on GET verify should surface as 409"
+        );
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body_bytes);
+        assert!(
+            body.contains("already registered"),
+            "page must tell the user the email is already registered: {body}"
+        );
+
+        cleanup_verify_email_test_data(&pool, &existing_pubkey, &token).await;
+        cleanup_verify_email_test_data(&pool, &pending_pubkey, &token).await;
+    }
+
+    /// GET verify for a headless registration when Redis is unavailable must render a
+    /// retry-friendly 503 page (finalize returns ServiceUnavailable), not a terminal
+    /// "verification failed" page: the link is still good and a refresh will succeed (f4).
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_email_get_headless_without_redis_returns_retry_page() {
+        let pool = create_test_db().await;
+        // No Redis on this state: the headless RedisRequired path must fail retryably.
+        let auth_state = create_test_auth_state(pool.clone());
+        let email = format!("verify-get-noredis-{}@example.com", Uuid::new_v4());
+        let (pubkey, token, _device_code) =
+            insert_headless_pending_registration(&pool, &email).await;
+
+        let response = verify_email_get(
+            create_test_tenant(),
+            State(auth_state),
+            HeaderMap::new(),
+            axum::extract::Query(VerifyEmailQuery {
+                token: Some(token.clone()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "retryable failure must not render as a 2xx success-looking page"
+        );
+        assert!(
+            response.headers().get("Retry-After").is_some(),
+            "retryable page should carry Retry-After"
+        );
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body_bytes);
+        assert!(
+            body.contains("http-equiv=\"refresh\""),
+            "retry page should auto-refresh so webview users are not stranded: {body}"
+        );
+        assert!(
+            !body.contains("invalid"),
+            "retry page must not read as a terminal failure: {body}"
+        );
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
     }
 
     /// Acceptance: the link path and the PIN path produce identical materialization, because both
