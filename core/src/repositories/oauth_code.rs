@@ -273,8 +273,13 @@ impl OAuthCodeRepository {
     }
 
     /// Atomically reserve one PIN-verification attempt slot for a pending registration, returning
-    /// the new attempt count. Returns `None` when no slot could be reserved — either the row is
-    /// already at `max_attempts` (locked) or no pending row matches the `device_code`.
+    /// the new attempt count. Returns `None` when no slot could be reserved — the row is already
+    /// at `max_attempts` (locked), no live pending row matches the `device_code`, or the
+    /// registration was already consumed (exchange code redeemed).
+    ///
+    /// Scoped to the pending registration row itself (`pending_email IS NOT NULL AND consumed_at
+    /// IS NULL`): minted exchange-code rows copy `device_code` from the pending row, and a
+    /// device_code-only UPDATE would mutate those siblings too.
     ///
     /// The increment happens in a single conditional `UPDATE ... WHERE pin_attempts < $max
     /// RETURNING`, so the cap is enforced by the database rather than by a snapshot read. This is
@@ -290,6 +295,7 @@ impl OAuthCodeRepository {
         let row: Option<(i32,)> = sqlx::query_as(
             "UPDATE oauth_codes SET pin_attempts = pin_attempts + 1 \
              WHERE device_code = $1 AND tenant_id = $2 AND pin_attempts < $3 \
+               AND pending_email IS NOT NULL AND consumed_at IS NULL \
              RETURNING pin_attempts",
         )
         .bind(device_code)
@@ -310,6 +316,14 @@ impl OAuthCodeRepository {
     /// Deliberately does NOT touch `expires_at`: the pending row keeps its original 24h registration
     /// window. Otherwise repeated resends could extend a pending row indefinitely, defeating the
     /// row's finite lifecycle (keycast#262).
+    ///
+    /// Deliberately NOT scoped to the pending row (unlike [`Self::reserve_pin_attempt`] /
+    /// [`Self::reset_pin_attempts`]): this rewrites `pending_email_verification_token`, which
+    /// minted sibling exchange-code rows copy and which redemption correlates on (see
+    /// `redeem_code_and_mark_pending_consumed`). Restricting the UPDATE to the pending row would
+    /// desynchronize the token between a pre-resend minted code and the pending row, so redeeming
+    /// that code would no longer mark the registration consumed. If you need to narrow this,
+    /// change the redemption correlation key first.
     pub async fn reset_pin_for_resend(
         &self,
         device_code: &str,
@@ -334,6 +348,10 @@ impl OAuthCodeRepository {
     }
 
     /// Restore PIN resend fields after replacement email delivery fails.
+    ///
+    /// Like [`Self::reset_pin_for_resend`], deliberately NOT scoped to the pending row: it must
+    /// undo that call's token rewrite on every row sharing the `device_code` (see the coupling
+    /// note there).
     pub async fn restore_pin_after_failed_resend(
         &self,
         device_code: &str,
@@ -385,6 +403,9 @@ impl OAuthCodeRepository {
     /// lockout cap and a duplicate/retried verify of the same correct PIN could spuriously lock out.
     /// Resetting to zero on success keeps the invariant that only *failed* attempts lock, without
     /// weakening the brute-force cap: this is reachable only with a correct PIN.
+    ///
+    /// Scoped to the live pending registration row like [`Self::reserve_pin_attempt`]; minted
+    /// sibling exchange-code rows share the `device_code` and must not be touched.
     pub async fn reset_pin_attempts(
         &self,
         device_code: &str,
@@ -392,7 +413,8 @@ impl OAuthCodeRepository {
     ) -> Result<(), RepositoryError> {
         sqlx::query(
             "UPDATE oauth_codes SET pin_attempts = 0 \
-             WHERE device_code = $1 AND tenant_id = $2",
+             WHERE device_code = $1 AND tenant_id = $2 \
+               AND pending_email IS NOT NULL AND consumed_at IS NULL",
         )
         .bind(device_code)
         .bind(tenant_id)
@@ -805,6 +827,103 @@ mod tests {
         assert_eq!(
             after.pin_attempts, 0,
             "successful verify must clear the failed-attempt counter"
+        );
+
+        sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_pin_attempt_ops_target_only_live_pending_row() {
+        let pool = setup_pool().await;
+        let repo = OAuthCodeRepository::new(pool.clone());
+
+        let device_code = format!("dc_{}", uuid::Uuid::new_v4());
+        let expires_at = Utc::now() + chrono::Duration::hours(24);
+        insert_pending_registration(&repo, &device_code, Some("pinhash123"), expires_at).await;
+        let pending = repo
+            .find_by_device_code(&device_code, 1)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Mint a sibling exchange-code row: it copies device_code (and the verification token)
+        // from the pending row but is not itself a pending registration (pending_email is NULL).
+        let minted_code = format!("minted_{}", uuid::Uuid::new_v4());
+        let stored = repo
+            .store_for_pending_registration(
+                StoreOAuthCodeParams {
+                    tenant_id: 1,
+                    code: &minted_code,
+                    user_pubkey: &pending.user_pubkey,
+                    client_id: &pending.client_id,
+                    redirect_uri: &pending.redirect_uri,
+                    scope: &pending.scope,
+                    code_challenge: None,
+                    code_challenge_method: None,
+                    expires_at: Utc::now() + chrono::Duration::minutes(10),
+                    previous_auth_id: None,
+                    state: None,
+                    is_headless: true,
+                },
+                &pending,
+            )
+            .await
+            .unwrap();
+        assert!(stored, "sibling exchange code should be minted");
+
+        let sibling_attempts = |pool: PgPool, code: String| async move {
+            let row: (i32,) =
+                sqlx::query_as("SELECT pin_attempts FROM oauth_codes WHERE code = $1")
+                    .bind(&code)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            row.0
+        };
+
+        // Reserving an attempt must touch only the pending row, never the minted sibling.
+        let reserved = repo.reserve_pin_attempt(&device_code, 1, 5).await.unwrap();
+        assert_eq!(reserved, Some(1));
+        assert_eq!(
+            sibling_attempts(pool.clone(), minted_code.clone()).await,
+            0,
+            "reserve_pin_attempt must not increment the minted sibling row"
+        );
+
+        // Resetting on success must also leave the sibling row alone.
+        sqlx::query("UPDATE oauth_codes SET pin_attempts = 2 WHERE code = $1")
+            .bind(&minted_code)
+            .execute(&pool)
+            .await
+            .unwrap();
+        repo.reset_pin_attempts(&device_code, 1).await.unwrap();
+        let pending_after = repo
+            .find_by_device_code(&device_code, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending_after.pin_attempts, 0);
+        assert_eq!(
+            sibling_attempts(pool.clone(), minted_code.clone()).await,
+            2,
+            "reset_pin_attempts must not touch the minted sibling row"
+        );
+
+        // Once the registration is consumed (exchange code redeemed), no attempt slot may be
+        // reserved: the terminal marker must end the PIN lifecycle too.
+        sqlx::query("UPDATE oauth_codes SET consumed_at = NOW() WHERE device_code = $1 AND pending_email IS NOT NULL")
+            .bind(&device_code)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let after_consumed = repo.reserve_pin_attempt(&device_code, 1, 5).await.unwrap();
+        assert_eq!(
+            after_consumed, None,
+            "reserve_pin_attempt must not reserve a slot on a consumed registration"
         );
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
