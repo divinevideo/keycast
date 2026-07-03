@@ -5000,6 +5000,253 @@ mod tests {
 
     #[cfg(feature = "integration-tests")]
     #[tokio::test]
+    async fn test_verify_email_retry_backfills_missing_personal_key() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+        let pending_keys = Keys::generate();
+        let pubkey = pending_keys.public_key().to_hex();
+        let email = format!("verify-backfill-{}@example.com", Uuid::new_v4());
+        let verification_token = format!("verify_{}", Uuid::new_v4());
+        let password_hash = bcrypt::hash("testpassword123", bcrypt::DEFAULT_COST).unwrap();
+        let encrypted_secret = pending_keys.secret_key().to_secret_bytes().to_vec();
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &verification_token).await;
+
+        // Row already carries the pending email (prior retry applied it) but the
+        // personal key is missing — e.g. a registration dropped by the old
+        // idempotency-by-existence bug.
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
+             VALUES ($1, 1, $2, $3, true, NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .bind(&email)
+        .bind(&password_hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        insert_pending_oauth_registration(
+            &pool,
+            &pubkey,
+            &email,
+            &verification_token,
+            &password_hash,
+            Some(&encrypted_secret),
+        )
+        .await;
+
+        let response = match verify_email(
+            create_test_tenant(),
+            State(auth_state),
+            HeaderMap::new(),
+            Json(VerifyEmailRequest {
+                token: verification_token.clone(),
+            }),
+        )
+        .await
+        {
+            Ok(response) => response.into_response(),
+            Err(err) => err.into_response(),
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let stored_secrets: Vec<(Vec<u8>,)> =
+            sqlx::query_as("SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1")
+                .bind(&pubkey)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored_secrets.len(),
+            1,
+            "retry must backfill exactly one personal key"
+        );
+        assert_eq!(
+            stored_secrets[0].0, encrypted_secret,
+            "backfilled key must hold the pending secret"
+        );
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &verification_token).await;
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_email_conflicting_account_email_returns_conflict_without_minting() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+        let pending_keys = Keys::generate();
+        let pubkey = pending_keys.public_key().to_hex();
+        let existing_email = format!("verify-existing-{}@example.com", Uuid::new_v4());
+        let pending_email = format!("verify-pending-{}@example.com", Uuid::new_v4());
+        let verification_token = format!("verify_{}", Uuid::new_v4());
+        let password_hash = bcrypt::hash("testpassword123", bcrypt::DEFAULT_COST).unwrap();
+        let encrypted_secret = pending_keys.secret_key().to_secret_bytes().to_vec();
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &verification_token).await;
+
+        // The pubkey is already bound to a different email.
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
+             VALUES ($1, 1, $2, $3, true, NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .bind(&existing_email)
+        .bind(&password_hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        insert_pending_oauth_registration(
+            &pool,
+            &pubkey,
+            &pending_email,
+            &verification_token,
+            &password_hash,
+            Some(&encrypted_secret),
+        )
+        .await;
+
+        let response = match verify_email(
+            create_test_tenant(),
+            State(auth_state),
+            HeaderMap::new(),
+            Json(VerifyEmailRequest {
+                token: verification_token.clone(),
+            }),
+        )
+        .await
+        {
+            Ok(response) => response.into_response(),
+            Err(err) => err.into_response(),
+        };
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let row: (Option<String>,) =
+            sqlx::query_as("SELECT email FROM users WHERE pubkey = $1 AND tenant_id = 1")
+                .bind(&pubkey)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            row.0.as_deref(),
+            Some(existing_email.as_str()),
+            "existing account email must not be overwritten"
+        );
+
+        let minted_code_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM oauth_codes
+             WHERE tenant_id = 1 AND user_pubkey = $1 AND pending_email IS NULL",
+        )
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(minted_code_count.0, 0, "no OAuth code may be minted");
+
+        let pending_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM oauth_codes
+             WHERE tenant_id = 1 AND pending_email_verification_token = $1",
+        )
+        .bind(&verification_token)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            pending_count.0, 0,
+            "unresolvable pending registration should be cleaned up"
+        );
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &verification_token).await;
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_email_bare_row_with_taken_email_returns_email_conflict() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+        let owner_pubkey = Keys::generate().public_key().to_hex();
+        let pending_keys = Keys::generate();
+        let pending_pubkey = pending_keys.public_key().to_hex();
+        let email = format!("verify-taken-{}@example.com", Uuid::new_v4());
+        let verification_token = format!("verify_{}", Uuid::new_v4());
+        let password_hash = bcrypt::hash("testpassword123", bcrypt::DEFAULT_COST).unwrap();
+        let encrypted_secret = pending_keys.secret_key().to_secret_bytes().to_vec();
+
+        cleanup_verify_email_test_data(&pool, &owner_pubkey, &verification_token).await;
+        cleanup_verify_email_test_data(&pool, &pending_pubkey, &verification_token).await;
+
+        // Another user owns the pending email; the pending pubkey has a bare row.
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
+             VALUES ($1, 1, $2, $3, true, NOW(), NOW())",
+        )
+        .bind(&owner_pubkey)
+        .bind(&email)
+        .bind(&password_hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
+             VALUES ($1, 1, NOW(), NOW())",
+        )
+        .bind(&pending_pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        insert_pending_oauth_registration(
+            &pool,
+            &pending_pubkey,
+            &email,
+            &verification_token,
+            &password_hash,
+            Some(&encrypted_secret),
+        )
+        .await;
+
+        let response = match verify_email(
+            create_test_tenant(),
+            State(auth_state),
+            HeaderMap::new(),
+            Json(VerifyEmailRequest {
+                token: verification_token.clone(),
+            }),
+        )
+        .await
+        {
+            Ok(response) => response.into_response(),
+            Err(err) => err.into_response(),
+        };
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response_json(response).await;
+        assert_eq!(body["code"], super::EMAIL_ALREADY_EXISTS_CODE);
+
+        let row: (Option<String>,) =
+            sqlx::query_as("SELECT email FROM users WHERE pubkey = $1 AND tenant_id = 1")
+                .bind(&pending_pubkey)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0, None, "bare row must stay untouched on conflict");
+
+        let minted_code_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM oauth_codes
+             WHERE tenant_id = 1 AND user_pubkey = $1 AND pending_email IS NULL",
+        )
+        .bind(&pending_pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(minted_code_count.0, 0, "no OAuth code may be minted");
+
+        cleanup_verify_email_test_data(&pool, &owner_pubkey, &verification_token).await;
+        cleanup_verify_email_test_data(&pool, &pending_pubkey, &verification_token).await;
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
     async fn test_update_profile_username_taken_returns_conflict() {
         let pool = create_test_db().await;
         let auth_state = create_test_auth_state(pool.clone());
