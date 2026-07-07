@@ -1714,37 +1714,6 @@ impl UserRepository {
         Ok(ClaimConsumeOutcome::Claimed { user_pubkey })
     }
 
-    /// Claim a preloaded account by setting email and password.
-    /// Also marks email as verified (claim link is proof of ownership).
-    pub async fn claim_account(
-        &self,
-        pubkey: &str,
-        tenant_id: i64,
-        email: &str,
-        password_hash: &str,
-    ) -> Result<(), RepositoryError> {
-        let result = sqlx::query(
-            "UPDATE users
-             SET email = $1, password_hash = $2, email_verified = true, updated_at = $3
-             WHERE pubkey = $4 AND tenant_id = $5 AND email IS NULL",
-        )
-        .bind(email)
-        .bind(password_hash)
-        .bind(Utc::now())
-        .bind(pubkey)
-        .bind(tenant_id)
-        .execute(&self.pool)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(RepositoryError::NotFound(
-                "User not found or already claimed".to_string(),
-            ));
-        }
-
-        Ok(())
-    }
-
     /// Check if email is already in use.
     pub async fn email_exists(&self, email: &str, tenant_id: i64) -> Result<bool, RepositoryError> {
         let result: Option<(String,)> =
