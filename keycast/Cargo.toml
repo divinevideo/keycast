@@ -42,3 +42,6 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 serial_test = "3.2"
+# `test-util` enables `tokio::time::pause` / `advance` for deterministic timing
+# tests of the shutdown sequence. Not part of the `full` feature set.
+tokio = { version = "1", features = ["full", "test-util"] }

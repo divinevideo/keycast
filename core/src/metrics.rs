@@ -50,8 +50,12 @@ pub struct Metrics {
     pub nip46_requests_handler_not_found: AtomicU64,
     /// NIP-46 requests successfully processed
     pub nip46_requests_processed: AtomicU64,
-    /// NIP-46 requests dropped due to queue full (backpressure)
+    /// NIP-46 requests dropped due to queue full (overload backpressure)
     pub nip46_requests_queue_dropped: AtomicU64,
+    /// NIP-46 requests rejected because the queue was closed (graceful
+    /// shutdown). Tracked separately from `queue_dropped` so shutdown-time
+    /// rejections are not misread as overload.
+    pub nip46_requests_queue_closed: AtomicU64,
     /// NIP-46 tombstone responses sent (revoked/expired authorizations)
     pub nip46_tombstone_responses: AtomicU64,
 
@@ -104,6 +108,7 @@ impl Metrics {
             nip46_requests_handler_not_found: AtomicU64::new(0),
             nip46_requests_processed: AtomicU64::new(0),
             nip46_requests_queue_dropped: AtomicU64::new(0),
+            nip46_requests_queue_closed: AtomicU64::new(0),
             nip46_tombstone_responses: AtomicU64::new(0),
             // HTTP RPC metrics
             http_rpc_requests_total: AtomicU64::new(0),
@@ -161,6 +166,11 @@ impl Metrics {
 
     pub fn inc_queue_dropped(&self) {
         self.nip46_requests_queue_dropped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_queue_closed(&self) {
+        self.nip46_requests_queue_closed
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -343,11 +353,18 @@ impl Metrics {
             self.nip46_requests_processed.load(Ordering::Relaxed)
         ));
 
-        output.push_str("\n# HELP keycast_nip46_queue_dropped_total NIP-46 requests dropped due to queue full (backpressure)\n");
+        output.push_str("\n# HELP keycast_nip46_queue_dropped_total NIP-46 requests dropped due to queue full (overload backpressure)\n");
         output.push_str("# TYPE keycast_nip46_queue_dropped_total counter\n");
         output.push_str(&format!(
             "keycast_nip46_queue_dropped_total {}\n",
             self.nip46_requests_queue_dropped.load(Ordering::Relaxed)
+        ));
+
+        output.push_str("\n# HELP keycast_nip46_queue_closed_total NIP-46 requests rejected because the queue was closed (graceful shutdown)\n");
+        output.push_str("# TYPE keycast_nip46_queue_closed_total counter\n");
+        output.push_str(&format!(
+            "keycast_nip46_queue_closed_total {}\n",
+            self.nip46_requests_queue_closed.load(Ordering::Relaxed)
         ));
 
         output.push_str("\n# HELP keycast_nip46_tombstone_responses_total NIP-46 error responses sent for revoked/expired authorizations\n");
