@@ -71,6 +71,21 @@ pub struct AdminUserDetails {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Outcome of atomically consuming a claim token and claiming the account.
+/// Only `Claimed` mutates anything; the other outcomes guarantee both the
+/// token and the user row are untouched (see
+/// `UserRepository::claim_account_consuming_token`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimConsumeOutcome {
+    /// Token consumed and account claimed in one transaction.
+    Claimed { user_pubkey: String },
+    /// Token was used, admin-invalidated, expired, or unknown — nothing mutated.
+    TokenNotConsumable,
+    /// Token was valid but the user row was not claimable (already has an
+    /// email) — the token consume was rolled back, nothing mutated.
+    UserNotClaimable,
+}
+
 /// Repository for user-related database operations.
 #[derive(Debug, Clone)]
 pub struct UserRepository {
@@ -1405,6 +1420,48 @@ impl UserRepository {
         .map_err(Into::into)
     }
 
+    /// Clear the verified_minor designation (age-up or revocation).
+    /// Idempotent: clearing an already-cleared or never-minor account succeeds.
+    /// Returns NotFound only when the user does not exist. Touches only the two
+    /// minor columns plus updated_at; never alters status/suspended_reason/suspended_at.
+    ///
+    /// Returns `true` only when a real transition happened (the flag was set and
+    /// is now cleared). A no-op clear (already-cleared or never-minor) returns
+    /// `false` and leaves `updated_at` untouched, so callers can audit exactly
+    /// the transitions that actually occurred rather than every retry.
+    ///
+    /// The three cases are distinguished in a single statement so that a missing
+    /// user (NotFound) never collapses into an already-cleared no-op: `existing`
+    /// probes for the row, `changed` conditionally updates only a set flag, and
+    /// the outer SELECT reports both.
+    pub async fn clear_verified_minor(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<bool, RepositoryError> {
+        let (user_exists, transitioned): (bool, bool) = sqlx::query_as(
+            "WITH existing AS ( \
+                 SELECT 1 FROM users WHERE pubkey = $1 AND tenant_id = $2 \
+             ), changed AS ( \
+                 UPDATE users \
+                 SET verified_minor = FALSE, verified_minor_at = NULL, updated_at = $3 \
+                 WHERE pubkey = $1 AND tenant_id = $2 AND verified_minor = TRUE \
+                 RETURNING 1 \
+             ) \
+             SELECT EXISTS (SELECT 1 FROM existing), EXISTS (SELECT 1 FROM changed)",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .bind(Utc::now())
+        .fetch_one(&self.pool)
+        .await?;
+
+        if !user_exists {
+            return Err(RepositoryError::NotFound("user not found".to_string()));
+        }
+        Ok(transitioned)
+    }
+
     /// Combined status + verified_minor query for admin status endpoints.
     pub async fn get_full_admin_status(
         &self,
@@ -1595,15 +1652,46 @@ impl UserRepository {
         .map_err(Into::into)
     }
 
-    /// Claim a preloaded account by setting email and password.
-    /// Also marks email as verified (claim link is proof of ownership).
-    pub async fn claim_account(
+    /// Atomically consume a still-valid claim token and claim the account in
+    /// one transaction (#280 review). The consume re-checks full validity
+    /// (`used_at IS NULL AND invalidated_at IS NULL AND expires_at > NOW()`)
+    /// under the row lock, mirroring the predicates of
+    /// `ClaimTokenRepository::invalidate_valid_for_user`. A concurrent admin
+    /// invalidation (e.g. clear-verified-minor revoking an unclaimed minor's
+    /// outstanding link) therefore either commits first — we consume nothing
+    /// and the user is untouched — or blocks on the row lock and matches
+    /// nothing after we commit. The user mutation only happens if the token
+    /// consume succeeded, and rolls back if the user row itself is not
+    /// claimable, so a failed claim never burns the token.
+    pub async fn claim_account_consuming_token(
         &self,
-        pubkey: &str,
+        token: &str,
         tenant_id: i64,
         email: &str,
         password_hash: &str,
-    ) -> Result<(), RepositoryError> {
+    ) -> Result<ClaimConsumeOutcome, RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+
+        let consumed: Option<(String,)> = sqlx::query_as(
+            "UPDATE account_claim_tokens
+             SET used_at = NOW()
+             WHERE token = $1
+               AND tenant_id = $2
+               AND used_at IS NULL
+               AND invalidated_at IS NULL
+               AND expires_at > NOW()
+             RETURNING user_pubkey",
+        )
+        .bind(token)
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some((user_pubkey,)) = consumed else {
+            tx.rollback().await?;
+            return Ok(ClaimConsumeOutcome::TokenNotConsumable);
+        };
+
         let result = sqlx::query(
             "UPDATE users
              SET email = $1, password_hash = $2, email_verified = true, updated_at = $3
@@ -1612,18 +1700,18 @@ impl UserRepository {
         .bind(email)
         .bind(password_hash)
         .bind(Utc::now())
-        .bind(pubkey)
+        .bind(&user_pubkey)
         .bind(tenant_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         if result.rows_affected() == 0 {
-            return Err(RepositoryError::NotFound(
-                "User not found or already claimed".to_string(),
-            ));
+            tx.rollback().await?;
+            return Ok(ClaimConsumeOutcome::UserNotClaimable);
         }
 
-        Ok(())
+        tx.commit().await?;
+        Ok(ClaimConsumeOutcome::Claimed { user_pubkey })
     }
 
     /// Check if email is already in use.
@@ -2296,5 +2384,162 @@ mod tests {
         cleanup_user(&pool, &h1).await;
         cleanup_user(&pool, &h2).await;
         cleanup_user(&pool, &h3).await;
+    }
+
+    #[tokio::test]
+    async fn test_clear_verified_minor_clears_flag_and_timestamp() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let pubkey = Keys::generate().public_key().to_hex();
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, verified_minor, verified_minor_at, created_at, updated_at) \
+             VALUES ($1, 1, TRUE, NOW(), NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let transitioned = repo.clear_verified_minor(&pubkey, 1).await.unwrap();
+        assert!(transitioned, "clearing a set flag is a real transition");
+
+        let (verified_minor, verified_minor_at) =
+            repo.get_verified_minor(&pubkey, 1).await.unwrap().unwrap();
+        assert!(!verified_minor);
+        assert!(verified_minor_at.is_none());
+
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_clear_verified_minor_idempotent_on_already_cleared() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let pubkey = Keys::generate().public_key().to_hex();
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // A never-minor / already-cleared account clears successfully but is not
+        // a real transition, so both calls report `false`.
+        assert!(!repo.clear_verified_minor(&pubkey, 1).await.unwrap());
+        assert!(!repo.clear_verified_minor(&pubkey, 1).await.unwrap());
+
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_clear_verified_minor_noop_does_not_bump_updated_at() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let pubkey = Keys::generate().public_key().to_hex();
+
+        // Never-minor account with a fixed, in-the-past updated_at.
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, created_at, updated_at) \
+             VALUES ($1, 1, NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day')",
+        )
+        .bind(&pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let before: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT updated_at FROM users WHERE pubkey = $1")
+                .bind(&pubkey)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        // No-op clear: must not report a transition and must not touch updated_at.
+        assert!(!repo.clear_verified_minor(&pubkey, 1).await.unwrap());
+
+        let after: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT updated_at FROM users WHERE pubkey = $1")
+                .bind(&pubkey)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(before, after, "a no-op clear must not bump updated_at");
+
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_clear_verified_minor_is_tenant_scoped() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let pubkey = Keys::generate().public_key().to_hex();
+
+        // verified-minor under tenant 1
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, verified_minor, verified_minor_at, created_at, updated_at) \
+             VALUES ($1, 1, TRUE, NOW(), NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Clearing under a different tenant must not match the row.
+        let result = repo.clear_verified_minor(&pubkey, 2).await;
+        assert!(matches!(result, Err(RepositoryError::NotFound(_))));
+
+        // Tenant-1 flag is untouched.
+        let (verified_minor, verified_minor_at) =
+            repo.get_verified_minor(&pubkey, 1).await.unwrap().unwrap();
+        assert!(
+            verified_minor,
+            "tenant-1 flag must survive a tenant-2 clear attempt"
+        );
+        assert!(verified_minor_at.is_some());
+
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_clear_verified_minor_unknown_pubkey_not_found() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool);
+        let pubkey = Keys::generate().public_key().to_hex();
+
+        let result = repo.clear_verified_minor(&pubkey, 1).await;
+        assert!(matches!(result, Err(RepositoryError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_clear_verified_minor_leaves_status_untouched() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let pubkey = Keys::generate().public_key().to_hex();
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, verified_minor, verified_minor_at, status, suspended_reason, suspended_at, created_at, updated_at) \
+             VALUES ($1, 1, TRUE, NOW(), 'suspended', 'age_review', NOW(), NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(repo.clear_verified_minor(&pubkey, 1).await.unwrap());
+
+        let (status, suspended_reason, suspended_at, verified_minor, _) = repo
+            .get_full_admin_status(&pubkey, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.as_str(), "suspended");
+        assert_eq!(suspended_reason.as_deref(), Some("age_review"));
+        assert!(suspended_at.is_some());
+        assert!(!verified_minor);
+
+        cleanup_user(&pool, &pubkey).await;
     }
 }

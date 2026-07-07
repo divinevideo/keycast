@@ -1944,6 +1944,169 @@ pub async fn set_user_status_admin(
     }))
 }
 
+// --- Clear verified_minor (service-token auth: age-up / revocation) ---
+
+/// Query params for the clear-verified_minor endpoint. Both optional; `actor`
+/// (the moderator's hex pubkey) drives the durable audit row.
+#[derive(Debug, Deserialize)]
+pub struct ClearVerifiedMinorParams {
+    pub actor: Option<String>,
+    pub reason: Option<String>,
+}
+
+/// True for Unicode bidi / zero-width / line-separator characters that
+/// `char::is_control` (category Cc) misses. Stripping these prevents log/console
+/// display spoofing via right-to-left overrides, invisible characters, and
+/// newline-equivalent separators (U+2028/U+2029).
+fn is_unsafe_format_char(c: char) -> bool {
+    matches!(c,
+        '\u{200B}'..='\u{200F}'   // zero-width space .. right-to-left mark
+        | '\u{2028}'..='\u{2029}' // line / paragraph separator
+        | '\u{202A}'..='\u{202E}' // bidi embeddings / overrides
+        | '\u{2060}'..='\u{2064}' // word joiner + invisible math operators
+        | '\u{2066}'..='\u{2069}' // bidi isolates
+        | '\u{FEFF}'              // zero-width no-break space / BOM
+        | '\u{FFF9}'..='\u{FFFB}' // interlinear annotation anchors
+    )
+}
+
+/// Bound and strip control + bidi/zero-width characters from a caller-supplied
+/// reason before it is logged or persisted (prevents log injection, display
+/// spoofing, and unbounded audit rows). Returns None when empty after cleaning.
+fn sanitize_reason(raw: Option<String>) -> Option<String> {
+    let cleaned: String = raw?
+        .chars()
+        .filter(|c| !c.is_control() && !is_unsafe_format_char(*c))
+        .take(500)
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+pub async fn clear_verified_minor_admin(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    headers: HeaderMap,
+    Path(pubkey): Path<String>,
+    Query(params): Query<ClearVerifiedMinorParams>,
+) -> ApiResult<Json<UserStatusResponse>> {
+    authorize_service_token(&headers)?;
+    let tenant_id = tenant.0.id;
+
+    // Validate the optional actor as a 64-char hex pubkey so a T&S action never
+    // silently loses its audit trail to a malformed actor.
+    if let Some(actor) = params.actor.as_deref() {
+        if actor.len() != 64 || !actor.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(ApiError::bad_request(
+                "actor must be a 64-character hex pubkey",
+            ));
+        }
+    }
+
+    let reason_clean = sanitize_reason(params.reason);
+
+    let user_repo = UserRepository::new(auth_state.state.db.clone());
+    let transitioned = user_repo.clear_verified_minor(&pubkey, tenant_id).await?;
+
+    tracing::info!(
+        event = "verified_minor_cleared",
+        pubkey = %pubkey,
+        actor = ?params.actor,
+        reason = ?reason_clean,
+        transitioned,
+        "Admin cleared verified_minor"
+    );
+
+    // Durable audit row (best-effort) only for a real transition and only when an
+    // actor is supplied. Gating on `transitioned` keeps a relay-manager retry after
+    // a lost response, or a duplicate revocation, from appending a second event
+    // asserting a state change that never happened. The table's actor_pubkey is
+    // NOT NULL, so no actor -> log-only. A failed insert logs and the clear still
+    // succeeds. (keycast#279 raises the same bar for status changes.)
+    if transitioned {
+        if let Some(actor) = params.actor.as_deref() {
+            let audit_repo = AdminAuditEventRepository::new(auth_state.state.db.clone());
+            if let Err(error) = audit_repo
+                .record(AdminAuditEventRecord {
+                    tenant_id,
+                    actor_pubkey: actor.to_string(),
+                    action: "clear_verified_minor".to_string(),
+                    target_resource_type: "user".to_string(),
+                    target_resource_id: Some(pubkey.clone()),
+                    target_client_id: None,
+                    metadata_json: serde_json::json!({ "reason": reason_clean }),
+                })
+                .await
+            {
+                tracing::error!(
+                    pubkey = %pubkey,
+                    error = %error,
+                    "Failed to write admin_audit_events row for verified_minor clear"
+                );
+            }
+        }
+    }
+
+    // Close the revocation door. Clearing the flag alone leaves any claim link
+    // issued before the clear live, and claim redemption gates only on token
+    // validity -- not on status or verified_minor -- so a minor account revoked
+    // before it is claimed could still be claimed and land as a normal account
+    // with no minor protections. Invalidate outstanding tokens so that path is
+    // shut regardless of whether relay-manager also changes status.
+    //
+    // Run this unconditionally, not just on a transition: a retry after a
+    // mid-request crash (flag already cleared, tokens not yet invalidated) must
+    // still close the door. `invalidate_valid_for_user` only touches still-valid,
+    // unused tokens, so it is idempotent and a no-op for an already-claimed
+    // (age-up) account. Unlike the best-effort audit row this is a safety
+    // invariant: a failure fails the request so the idempotent caller retries
+    // rather than silently leaving the link open.
+    let claim_token_repo = ClaimTokenRepository::new(auth_state.state.db.clone());
+    let invalidated_by = params
+        .actor
+        .as_deref()
+        .unwrap_or("system:verified_minor_clear");
+    let invalidated = match claim_token_repo
+        .invalidate_valid_for_user(&pubkey, tenant_id, invalidated_by, reason_clean.as_deref())
+        .await
+    {
+        Ok(count) => count,
+        Err(error) => {
+            tracing::error!(
+                pubkey = %pubkey,
+                error = %error,
+                "Failed to invalidate outstanding claim tokens on verified_minor clear"
+            );
+            return Err(error.into());
+        }
+    };
+    if invalidated > 0 {
+        tracing::info!(
+            pubkey = %pubkey,
+            invalidated,
+            "Invalidated outstanding claim tokens on verified_minor clear"
+        );
+    }
+
+    let (status, suspended_reason, suspended_at, verified_minor, verified_minor_at) = user_repo
+        .get_full_admin_status(&pubkey, tenant_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("User not found"))?;
+
+    Ok(Json(UserStatusResponse {
+        pubkey,
+        status: status.as_str().to_string(),
+        suspended_reason,
+        suspended_at,
+        verified_minor,
+        verified_minor_at,
+    }))
+}
+
 // --- Create approved minor account (service-token auth) ---
 
 #[derive(Debug, Deserialize)]

@@ -240,6 +240,10 @@ pub fn api_routes(
             "/admin/users/:pubkey/status",
             get(admin::get_user_status_admin).put(admin::set_user_status_admin),
         )
+        .route(
+            "/admin/users/:pubkey/verified-minor",
+            delete(admin::clear_verified_minor_admin),
+        )
         .route("/admin/users/batch-lookup", post(admin::batch_lookup_users))
         .route(
             "/admin/create-minor-account",
