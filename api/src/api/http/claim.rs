@@ -363,22 +363,52 @@ pub async fn claim_post(
     let password_hash = bcrypt::hash(&form.password, bcrypt::DEFAULT_COST)
         .map_err(|e| ClaimError::Internal(format!("Password hashing failed: {}", e)))?;
 
-    // Update user with email and password_hash
-    user_repo
-        .claim_account(
-            &claim_token.user_pubkey,
-            tenant_id,
-            &form.email,
-            &password_hash,
-        )
+    // Consume the token and claim the account atomically (#280 review): the
+    // classification above is a point-in-time read, so an admin invalidation
+    // (e.g. clear-verified-minor revoking this account's outstanding link) can
+    // land between it and this point. The single-transaction consume re-checks
+    // validity under the row lock and only mutates the user if it wins, so a
+    // revoked link can never complete a claim.
+    use keycast_core::repositories::ClaimConsumeOutcome;
+    let outcome = user_repo
+        .claim_account_consuming_token(&form.token, tenant_id, &form.email, &password_hash)
         .await
         .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?;
 
-    // Mark token as used
-    claim_token_repo
-        .mark_used(&form.token)
-        .await
-        .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?;
+    match outcome {
+        ClaimConsumeOutcome::Claimed { user_pubkey } if user_pubkey == claim_token.user_pubkey => {}
+        ClaimConsumeOutcome::Claimed { user_pubkey } => {
+            return Err(ClaimError::Internal(format!(
+                "Claimed pubkey mismatch: token row {} vs classified {}",
+                user_pubkey, claim_token.user_pubkey
+            )));
+        }
+        ClaimConsumeOutcome::TokenNotConsumable => {
+            // Token died between classification and consume — re-classify so
+            // the user gets the state-specific error page.
+            return Err(
+                match claim_token_repo
+                    .classify(&form.token, tenant_id)
+                    .await
+                    .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?
+                {
+                    ClaimTokenState::AlreadyClaimed(_) => ClaimError::TokenAlreadyClaimed,
+                    ClaimTokenState::AdminInvalidated(_) => ClaimError::TokenAdminInvalidated,
+                    ClaimTokenState::Replaced { .. } => ClaimError::TokenReplaced,
+                    ClaimTokenState::Expired(_) => ClaimError::TokenExpired,
+                    ClaimTokenState::Unrecognized => ClaimError::TokenUnrecognized,
+                    // A token that failed the consume cannot classify Valid
+                    // (used/invalidated/expired are one-way); treat as internal.
+                    ClaimTokenState::Valid(_) => ClaimError::Internal(
+                        "Token consume failed but token classifies as valid".to_string(),
+                    ),
+                },
+            );
+        }
+        ClaimConsumeOutcome::UserNotClaimable => {
+            return Err(ClaimError::TokenAlreadyClaimed);
+        }
+    }
 
     tracing::info!(
         "Account claimed: pubkey={}, email={}",

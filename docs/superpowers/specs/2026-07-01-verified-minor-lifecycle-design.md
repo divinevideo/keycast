@@ -110,6 +110,10 @@ The audit write is best-effort enrichment: a failed `admin_audit_events` insert 
 
 Clearing `verified_minor` alone leaves any claim link issued before the clear live. Claim redemption (`claim.rs::claim_post`) gates only on token validity — it does **not** check `status` or `verified_minor` (status is fetched afterward only to stamp the UCAN fact). So a minor account revoked before it is claimed could still be claimed and land as a normal account with no minor protections, and a relay-manager status change alone would not stop it. The endpoint therefore invalidates outstanding claim tokens itself (via the existing `invalidate_valid_for_user`, which only touches still-valid, unused tokens and is thus idempotent and a no-op for an already-claimed age-up account). Unlike the best-effort audit row, this is a safety invariant: a failure fails the request so the caller retries rather than silently leaving the link open. This keeps the door closed independent of relay-manager#147.
 
+#### Atomic consume (race closure, #280 review)
+
+The straight-line invalidation above still left a concurrent window (flagged by Liz in review): `claim_post` could classify the token as Valid, the clear endpoint could then invalidate it, and the claim would still complete because `mark_used` re-checked only `used_at IS NULL` — after the user row had already been mutated. Token consumption is therefore atomic with validity: `UserRepository::claim_account_consuming_token` runs a single transaction whose consume step re-checks the full validity predicate (`used_at IS NULL AND invalidated_at IS NULL AND expires_at > NOW()`) under the row lock — deliberately mirroring `invalidate_valid_for_user`'s predicate, so under concurrency exactly one side can win — and only then claims the user row, rolling back the consume if the user is not claimable (a failed claim never burns the token). `claim_post` treats this consume as the authoritative gate; the upfront classification remains only for friendly pre-password error pages, and a token that dies between classification and consume is re-classified to render its state-specific page. Regression coverage: `api/tests/claim_consume_race_test.rs` (invalidated-between-classify-and-consume, expired, reuse, rollback, and a concurrent invalidate-vs-claim exactly-one-wins invariant).
+
 Route registration in `routes.rs`:
 
 ```rust
@@ -144,6 +148,7 @@ Route registration in `routes.rs`:
 12. `reason` containing control / bidi / zero-width chars or exceeding 500 chars is sanitized (bounded and stripped) in both the log line and the stored `metadata_json`.
 13. A no-op retry (a second `DELETE` with `actor` after the flag is already cleared) writes no second audit row.
 14. `DELETE` invalidates an outstanding claim token for the pubkey (no valid token remains; `invalidated_by == actor`), so a revoked-before-claim account can no longer be claimed.
+15. Claim-consume race (`claim_consume_race_test.rs`): a token invalidated after classification is refused with no user mutation and no `used_at`; an expired or already-used token is refused; a failed user claim rolls back the token consume; under a true concurrent invalidate-vs-claim, exactly one side wins and the user is mutated iff the consume won.
 
 ## Acceptance
 

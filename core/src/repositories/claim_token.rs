@@ -72,6 +72,11 @@ impl ClaimTokenRepository {
 
     /// Mark a claim token as used.
     /// Returns the updated token, or None if token not found or already used.
+    ///
+    /// NOTE: the claim flow itself must NOT use this — it re-checks only
+    /// `used_at`, not `invalidated_at`/`expires_at`. `claim_post` consumes
+    /// tokens via `UserRepository::claim_account_consuming_token`, which is
+    /// atomic with full validity (#280 review). Kept for tests/fixtures.
     pub async fn mark_used(&self, token: &str) -> Result<Option<ClaimToken>, RepositoryError> {
         sqlx::query_as::<_, ClaimToken>(
             "UPDATE account_claim_tokens

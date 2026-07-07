@@ -71,6 +71,21 @@ pub struct AdminUserDetails {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Outcome of atomically consuming a claim token and claiming the account.
+/// Only `Claimed` mutates anything; the other outcomes guarantee both the
+/// token and the user row are untouched (see
+/// `UserRepository::claim_account_consuming_token`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimConsumeOutcome {
+    /// Token consumed and account claimed in one transaction.
+    Claimed { user_pubkey: String },
+    /// Token was used, admin-invalidated, expired, or unknown — nothing mutated.
+    TokenNotConsumable,
+    /// Token was valid but the user row was not claimable (already has an
+    /// email) — the token consume was rolled back, nothing mutated.
+    UserNotClaimable,
+}
+
 /// Repository for user-related database operations.
 #[derive(Debug, Clone)]
 pub struct UserRepository {
@@ -1635,6 +1650,68 @@ impl UserRepository {
         .fetch_optional(&self.pool)
         .await
         .map_err(Into::into)
+    }
+
+    /// Atomically consume a still-valid claim token and claim the account in
+    /// one transaction (#280 review). The consume re-checks full validity
+    /// (`used_at IS NULL AND invalidated_at IS NULL AND expires_at > NOW()`)
+    /// under the row lock, mirroring the predicates of
+    /// `ClaimTokenRepository::invalidate_valid_for_user`. A concurrent admin
+    /// invalidation (e.g. clear-verified-minor revoking an unclaimed minor's
+    /// outstanding link) therefore either commits first — we consume nothing
+    /// and the user is untouched — or blocks on the row lock and matches
+    /// nothing after we commit. The user mutation only happens if the token
+    /// consume succeeded, and rolls back if the user row itself is not
+    /// claimable, so a failed claim never burns the token.
+    pub async fn claim_account_consuming_token(
+        &self,
+        token: &str,
+        tenant_id: i64,
+        email: &str,
+        password_hash: &str,
+    ) -> Result<ClaimConsumeOutcome, RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+
+        let consumed: Option<(String,)> = sqlx::query_as(
+            "UPDATE account_claim_tokens
+             SET used_at = NOW()
+             WHERE token = $1
+               AND tenant_id = $2
+               AND used_at IS NULL
+               AND invalidated_at IS NULL
+               AND expires_at > NOW()
+             RETURNING user_pubkey",
+        )
+        .bind(token)
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some((user_pubkey,)) = consumed else {
+            tx.rollback().await?;
+            return Ok(ClaimConsumeOutcome::TokenNotConsumable);
+        };
+
+        let result = sqlx::query(
+            "UPDATE users
+             SET email = $1, password_hash = $2, email_verified = true, updated_at = $3
+             WHERE pubkey = $4 AND tenant_id = $5 AND email IS NULL",
+        )
+        .bind(email)
+        .bind(password_hash)
+        .bind(Utc::now())
+        .bind(&user_pubkey)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(ClaimConsumeOutcome::UserNotClaimable);
+        }
+
+        tx.commit().await?;
+        Ok(ClaimConsumeOutcome::Claimed { user_pubkey })
     }
 
     /// Claim a preloaded account by setting email and password.
