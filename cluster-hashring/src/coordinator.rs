@@ -3,6 +3,7 @@ use crate::{Error, HashRing, RedisRegistry};
 use arc_swap::ArcSwap;
 use redis::aio::PubSub;
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -245,7 +246,16 @@ impl ClusterCoordinator {
                     _ = sync_interval.tick() => {
                         // Periodic full sync as backup
                         let mut reg = registry.lock().await;
-                        match reg.get_active_instances().await {
+                        let Some(instances_result) =
+                            await_unless_cancelled(&cancel_token, reg.get_active_instances()).await
+                        else {
+                            tracing::debug!(
+                                "Full sync observed cancellation under lock; stopping sync"
+                            );
+                            break;
+                        };
+
+                        match instances_result {
                             Ok(instances) => {
                                 let current_members: HashSet<String> = instances.iter().cloned().collect();
 
@@ -548,12 +558,43 @@ impl ClusterCoordinator {
     }
 }
 
+async fn await_unless_cancelled<T>(
+    cancel_token: &CancellationToken,
+    future: impl Future<Output = T>,
+) -> Option<T> {
+    if cancel_token.is_cancelled() {
+        return None;
+    }
+
+    tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => None,
+        result = future => Some(result),
+    }
+}
+
 use futures_util::StreamExt;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
     use uuid::Uuid;
+
+    struct PollFlagFuture {
+        was_polled: Arc<AtomicBool>,
+    }
+
+    impl Future for PollFlagFuture {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.was_polled.store(true, Ordering::SeqCst);
+            Poll::Pending
+        }
+    }
 
     fn get_redis_url() -> String {
         std::env::var("TEST_REDIS_URL").unwrap_or_else(|_| "redis://localhost:16379".to_string())
@@ -570,6 +611,61 @@ mod tests {
         let left = MembershipEvent::Left("xyz-789".to_string());
         assert_eq!(joined, MembershipEvent::Joined("abc-123".to_string()));
         assert_eq!(left, MembershipEvent::Left("xyz-789".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_await_unless_cancelled_skips_future_when_already_cancelled() {
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+        let was_polled = Arc::new(AtomicBool::new(false));
+
+        let result = await_unless_cancelled(
+            &cancel_token,
+            PollFlagFuture {
+                was_polled: was_polled.clone(),
+            },
+        )
+        .await;
+
+        assert!(result.is_none());
+        assert!(
+            !was_polled.load(Ordering::SeqCst),
+            "cancelled full sync must not poll the Redis fetch future"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_await_unless_cancelled_returns_when_cancelled_while_pending() {
+        let cancel_token = CancellationToken::new();
+        let was_polled = Arc::new(AtomicBool::new(false));
+
+        let waiter = tokio::spawn({
+            let cancel_token = cancel_token.clone();
+            let was_polled = was_polled.clone();
+            async move {
+                await_unless_cancelled(
+                    &cancel_token,
+                    PollFlagFuture {
+                        was_polled: was_polled.clone(),
+                    },
+                )
+                .await
+            }
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            was_polled.load(Ordering::SeqCst),
+            "pending future should be polled before cancellation"
+        );
+
+        cancel_token.cancel();
+        let result = tokio::time::timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("cancellation-aware wait should not remain stuck behind pending full sync")
+            .expect("waiter task should not panic");
+
+        assert!(result.is_none());
     }
 
     #[tokio::test]
