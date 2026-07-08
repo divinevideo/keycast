@@ -2432,9 +2432,8 @@ pub async fn verify_email_get(
             "Link expired",
             "This verification link has expired. Please request a new one from the app.",
         ),
-        // Retryable: verification succeeded except for code delivery (e.g. Redis hiccup). The
-        // link is still good — render a non-terminal page that retries itself, never a bare 2xx
-        // that reads as success and never the terminal invalid-link page.
+        // Retryable: the link may still be good, so render a non-terminal page that retries
+        // itself instead of a success-looking 2xx or terminal invalid-link page.
         Err(AuthError::ServiceUnavailable { retry_after, .. }) => {
             verify_html_retry_page(retry_after.unwrap_or(5))
         }
@@ -2453,7 +2452,24 @@ pub async fn verify_email_get(
                 "This email is already registered. Please log in instead.",
             )
         }
-        Err(_) => verify_html_page(
+        Err(AuthError::Database(_))
+        | Err(AuthError::PasswordHash(_))
+        | Err(AuthError::Encryption(_))
+        | Err(AuthError::Internal(_))
+        | Err(AuthError::EmailSendFailed(_)) => verify_html_retry_page(5),
+        Err(AuthError::InvalidCredentials)
+        | Err(AuthError::EmailNotVerified)
+        | Err(AuthError::UserNotFound)
+        | Err(AuthError::MissingToken)
+        | Err(AuthError::InvalidToken)
+        | Err(AuthError::TokenExpired)
+        | Err(AuthError::DuplicateKey)
+        | Err(AuthError::InvalidEmail)
+        | Err(AuthError::BadRequest(_))
+        | Err(AuthError::Forbidden(_))
+        | Err(AuthError::RegistrationExpired)
+        | Err(AuthError::RegistrationAlreadyCompleted)
+        | Err(AuthError::Conflict(_)) => verify_html_page(
             StatusCode::OK,
             "Verification failed",
             "This verification link is invalid or has expired. If you already verified, you can log in.",
@@ -2468,7 +2484,7 @@ fn verify_html_retry_page(retry_after_secs: u32) -> Response {
     let mut response = verify_html_page_with_refresh(
         StatusCode::SERVICE_UNAVAILABLE,
         "Almost there…",
-        "Your email is verified, but sign-in is still finishing. This page will retry automatically in a few seconds.",
+        "We hit a temporary problem verifying your link. This page will retry automatically in a few seconds.",
         Some(retry_after_secs),
     );
     if let Ok(value) = retry_after_secs.to_string().parse() {
@@ -6439,6 +6455,14 @@ mod tests {
         assert!(
             !body.contains("invalid"),
             "retry page must not read as a terminal failure: {body}"
+        );
+        assert!(
+            !body.contains("Your email is verified"),
+            "retry page must not claim verification succeeded before retryable work completes: {body}"
+        );
+        assert!(
+            body.contains("temporary problem verifying your link"),
+            "retry page should explain the temporary verification problem neutrally: {body}"
         );
 
         cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
