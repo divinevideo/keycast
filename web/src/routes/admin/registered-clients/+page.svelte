@@ -457,32 +457,34 @@
 								</td>
 								<td class="uris-cell" data-label="Allowed redirect URIs">
 									{#if editingId === c.id}
-										{#each editUris as _u, i}
-											<div class="uri-row">
-												<input
-													type="text"
-													bind:value={editUris[i]}
-													disabled={isSaving}
-												/>
-												<button
-													type="button"
-													class="btn-icon-sm"
-													onclick={() => removeEditUriRow(i)}
-													title="Remove"
-													disabled={isSaving}
-												>
-													<X size={14} />
-												</button>
-											</div>
-										{/each}
-										<button
-											type="button"
-											class="btn-link"
-											onclick={addEditUriRow}
-											disabled={isSaving}
-										>
-											<Plus size={14} /> Add URI
-										</button>
+										<div class="uri-list">
+											{#each editUris as _u, i}
+												<div class="uri-row">
+													<input
+														type="text"
+														bind:value={editUris[i]}
+														disabled={isSaving}
+													/>
+													<button
+														type="button"
+														class="btn-icon-sm"
+														onclick={() => removeEditUriRow(i)}
+														title="Remove"
+														disabled={isSaving}
+													>
+														<X size={14} />
+													</button>
+												</div>
+											{/each}
+											<button
+												type="button"
+												class="btn-link"
+												onclick={addEditUriRow}
+												disabled={isSaving}
+											>
+												<Plus size={14} /> Add URI
+											</button>
+										</div>
 									{:else}
 										<ul class="uri-list-display">
 											{#each c.allowed_redirect_uris as uri}
