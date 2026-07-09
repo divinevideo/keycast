@@ -494,39 +494,41 @@
 								<td class="date-cell" data-label="Created">{formatDate(c.created_at)}</td>
 								<td class="date-cell" data-label="Updated">{formatDate(c.updated_at)}</td>
 								<td class="actions-cell" data-label="Actions">
-									{#if editingId === c.id}
-										<button
-											class="btn-icon"
-											onclick={() => saveEdit(c)}
-											disabled={isSaving}
-											title="Save"
-										>
-											<FloppyDisk size={18} />
-										</button>
-										<button
-											class="btn-icon"
-											onclick={cancelEdit}
-											disabled={isSaving}
-											title="Cancel"
-										>
-											<X size={18} />
-										</button>
-									{:else}
-										<button
-											class="btn-icon"
-											onclick={() => startEdit(c)}
-											title="Edit"
-										>
-											<PencilSimple size={18} />
-										</button>
-										<button
-											class="btn-icon danger"
-											onclick={() => openDelete(c)}
-											title="Delete"
-										>
-											<Trash size={18} />
-										</button>
-									{/if}
+									<div class="cell-actions">
+										{#if editingId === c.id}
+											<button
+												class="btn-icon"
+												onclick={() => saveEdit(c)}
+												disabled={isSaving}
+												title="Save"
+											>
+												<FloppyDisk size={18} />
+											</button>
+											<button
+												class="btn-icon"
+												onclick={cancelEdit}
+												disabled={isSaving}
+												title="Cancel"
+											>
+												<X size={18} />
+											</button>
+										{:else}
+											<button
+												class="btn-icon"
+												onclick={() => startEdit(c)}
+												title="Edit"
+											>
+												<PencilSimple size={18} />
+											</button>
+											<button
+												class="btn-icon danger"
+												onclick={() => openDelete(c)}
+												title="Delete"
+											>
+												<Trash size={18} />
+											</button>
+										{/if}
+									</div>
 								</td>
 							</tr>
 						{/each}
@@ -890,7 +892,7 @@
 
 	.clients-table th:nth-child(3),
 	.clients-table td:nth-child(3) {
-		width: 37%;
+		width: 32%;
 	}
 
 	.clients-table th:nth-child(4),
@@ -900,9 +902,11 @@
 		width: 13%;
 	}
 
+	/* Actions holds two fixed-size icon buttons, so it needs a fixed width
+	   rather than a percentage share that collapses on narrower viewports. */
 	.clients-table th:nth-child(6),
 	.clients-table td:nth-child(6) {
-		width: 6%;
+		width: 6.5rem;
 	}
 
 	.clients-table th {
@@ -934,6 +938,14 @@
 	.actions-cell {
 		white-space: nowrap;
 		text-align: right;
+	}
+
+	/* Group the action buttons so the stacked (mobile) grid treats them as a
+	   single value, instead of auto-flowing the second button under the label. */
+	.cell-actions {
+		display: inline-flex;
+		gap: 0.25rem;
+		align-items: center;
 	}
 
 	.clients-table code,
