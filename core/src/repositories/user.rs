@@ -1382,6 +1382,34 @@ impl UserRepository {
         .map_err(Into::into)
     }
 
+    /// Insert a missing personal key for an existing OAuth user.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Database`] if the insert query fails.
+    pub async fn backfill_personal_key(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+        encrypted_secret: &[u8],
+    ) -> Result<(), RepositoryError> {
+        let now = Utc::now();
+
+        sqlx::query(
+            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
+             SELECT $1, $2, $3, $4, $4
+             WHERE NOT EXISTS (SELECT 1 FROM personal_keys WHERE user_pubkey = $1)",
+        )
+        .bind(pubkey)
+        .bind(encrypted_secret)
+        .bind(tenant_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     /// Apply a pending OAuth registration to an existing users row.
     ///
     /// Sets email/password/verified state on the row and inserts the personal
@@ -1407,7 +1435,7 @@ impl UserRepository {
             "UPDATE users
              SET email = $1, password_hash = $2, email_verified = true,
                  email_verification_token = $3, updated_at = $4
-             WHERE pubkey = $5 AND tenant_id = $6",
+             WHERE pubkey = $5 AND tenant_id = $6 AND email IS NULL",
         )
         .bind(email)
         .bind(password_hash)
@@ -1420,6 +1448,18 @@ impl UserRepository {
         .rows_affected();
 
         if updated == 0 {
+            let exists = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE pubkey = $1 AND tenant_id = $2)",
+            )
+            .bind(pubkey)
+            .bind(tenant_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+            if exists {
+                return Err(RepositoryError::Duplicate);
+            }
+
             return Err(RepositoryError::NotFound(format!(
                 "no users row for pubkey {} in tenant {}",
                 pubkey, tenant_id
@@ -2866,6 +2906,61 @@ mod tests {
         assert!(!row.1, "failed completion must roll back email_verified");
 
         cleanup_user(&pool, &owner_pubkey).await;
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_complete_pending_oauth_registration_bound_row_returns_duplicate() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let suffix = test_suffix();
+        let pubkey = Keys::generate().public_key().to_hex();
+        let existing_email = format!("oauth-bound-existing-{}@example.com", suffix);
+        let pending_email = format!("oauth-bound-pending-{}@example.com", suffix);
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
+             VALUES ($1, 1, $2, 'existing-hash', true, NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .bind(&existing_email)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = repo
+            .complete_pending_oauth_registration(
+                &pubkey,
+                1,
+                &pending_email,
+                "pending-hash",
+                "token",
+                Some(&[1_u8; 32]),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(RepositoryError::Duplicate)),
+            "completing a row already bound to an email must fail with Duplicate, got: {result:?}"
+        );
+
+        let row: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT email, password_hash FROM users WHERE pubkey = $1 AND tenant_id = 1",
+        )
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0.as_deref(), Some(existing_email.as_str()));
+        assert_eq!(row.1.as_deref(), Some("existing-hash"));
+
+        let key_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM personal_keys WHERE user_pubkey = $1")
+                .bind(&pubkey)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(key_count.0, 0, "failed completion must not insert a key");
+
         cleanup_user(&pool, &pubkey).await;
     }
 

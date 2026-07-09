@@ -1595,15 +1595,15 @@ pub async fn verify_email(
                         "Retrying OAuth email verification for existing user: {}",
                         oauth_data.user_pubkey
                     );
-                    if oauth_data.pending_encrypted_secret.is_some() && !existing.has_personal_key {
+                    if let (Some(encrypted_secret), false) = (
+                        oauth_data.pending_encrypted_secret.as_deref(),
+                        existing.has_personal_key,
+                    ) {
                         user_repo
-                            .complete_pending_oauth_registration(
+                            .backfill_personal_key(
                                 &oauth_data.user_pubkey,
                                 tenant_id,
-                                email,
-                                password_hash,
-                                &req.token,
-                                oauth_data.pending_encrypted_secret.as_deref(),
+                                encrypted_secret,
                             )
                             .await?;
                         tracing::info!(
@@ -5008,6 +5008,8 @@ mod tests {
         let email = format!("verify-backfill-{}@example.com", Uuid::new_v4());
         let verification_token = format!("verify_{}", Uuid::new_v4());
         let password_hash = bcrypt::hash("testpassword123", bcrypt::DEFAULT_COST).unwrap();
+        let changed_password_hash =
+            bcrypt::hash("changedpassword123", bcrypt::DEFAULT_COST).unwrap();
         let encrypted_secret = pending_keys.secret_key().to_secret_bytes().to_vec();
 
         cleanup_verify_email_test_data(&pool, &pubkey, &verification_token).await;
@@ -5021,7 +5023,7 @@ mod tests {
         )
         .bind(&pubkey)
         .bind(&email)
-        .bind(&password_hash)
+        .bind(&changed_password_hash)
         .execute(&pool)
         .await
         .unwrap();
@@ -5065,6 +5067,17 @@ mod tests {
         assert_eq!(
             stored_secrets[0].0, encrypted_secret,
             "backfilled key must hold the pending secret"
+        );
+
+        let stored_password_hash: (String,) =
+            sqlx::query_as("SELECT password_hash FROM users WHERE pubkey = $1 AND tenant_id = 1")
+                .bind(&pubkey)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored_password_hash.0, changed_password_hash,
+            "retry key backfill must not rewrite existing credentials"
         );
 
         cleanup_verify_email_test_data(&pool, &pubkey, &verification_token).await;
