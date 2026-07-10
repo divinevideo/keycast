@@ -162,10 +162,15 @@ pub async fn nostr_rpc(
 
     // For mutating operations (sign/encrypt/decrypt), check user account status.
     // get_public_key is NOT gated -- suspended users need to retrieve their pubkey.
+    // The same per-request row also carries verified_minor, which drives the DM
+    // containment gate below (support-trust-safety#183); reading it here (not
+    // from the cached handler) means protection flips apply immediately.
     let needs_status_check = !matches!(req.method.as_str(), "get_public_key");
-    if needs_status_check {
-        check_user_status_active(pool, &handler.user_pubkey_hex(), tenant_id).await?;
-    }
+    let verified_minor = if needs_status_check {
+        check_user_status_active(pool, &handler.user_pubkey_hex(), tenant_id).await?
+    } else {
+        false
+    };
 
     // Dispatch based on method - all permission checks use cached data (no DB hits)
     let result = match req.method.as_str() {
@@ -173,6 +178,10 @@ pub async fn nostr_rpc(
 
         "sign_event" => {
             let unsigned_event = parse_unsigned_event(&req.params)?;
+
+            if verified_minor {
+                enforce_minor_dm_sign(&handler, &unsigned_event)?;
+            }
 
             // Handler validates expiration, revocation, and permissions (all cached)
             let signed = handler.sign_event(unsigned_event).await?;
@@ -192,6 +201,10 @@ pub async fn nostr_rpc(
 
         "nip44_encrypt" => {
             let (recipient_pubkey, plaintext) = parse_encrypt_params(&req.params)?;
+
+            if verified_minor {
+                enforce_minor_dm_encrypt(&handler, &recipient_pubkey)?;
+            }
 
             // Handler validates expiration, revocation, and permissions (all cached)
             // Crypto runs on spawn_blocking to avoid blocking async workers
@@ -250,6 +263,10 @@ pub async fn nostr_rpc(
         "nip04_encrypt" => {
             let (recipient_pubkey, plaintext) = parse_encrypt_params(&req.params)?;
 
+            if verified_minor {
+                enforce_minor_dm_encrypt(&handler, &recipient_pubkey)?;
+            }
+
             // Handler validates expiration, revocation, and permissions (all cached)
             // Crypto runs on spawn_blocking to avoid blocking async workers
             let ciphertext = handler.nip04_encrypt(&recipient_pubkey, &plaintext).await?;
@@ -287,26 +304,70 @@ pub async fn nostr_rpc(
 
 /// Check that the user's account is active before allowing mutating operations.
 /// This runs a DB query per request (not cached) so status changes take effect immediately.
+/// Returns the account's `verified_minor` flag (same row, no extra query) for
+/// the DM containment gate; a missing user row is a refusal, never a default.
 async fn check_user_status_active(
     pool: &sqlx::PgPool,
     user_pubkey_hex: &str,
     tenant_id: i64,
-) -> Result<(), RpcError> {
-    let status: Option<(String,)> =
-        sqlx::query_as("SELECT status FROM users WHERE pubkey = $1 AND tenant_id = $2")
-            .bind(user_pubkey_hex)
-            .bind(tenant_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| {
-                RpcError::Internal(format!("Database error checking user status: {}", e))
-            })?;
+) -> Result<bool, RpcError> {
+    let status: Option<(String, bool)> = sqlx::query_as(
+        "SELECT status, verified_minor FROM users WHERE pubkey = $1 AND tenant_id = $2",
+    )
+    .bind(user_pubkey_hex)
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| RpcError::Internal(format!("Database error checking user status: {}", e)))?;
 
     match status {
-        Some((s,)) if s == "active" => Ok(()),
+        Some((s, verified_minor)) if s == "active" => Ok(verified_minor),
         Some(_) => Err(RpcError::AccountSuspended("Account restricted".to_string())),
         None => Err(RpcError::Auth(AuthError::InvalidToken)),
     }
+}
+
+/// Uniform client-facing message for verified_minor DM gate refusals — matches
+/// the policy-denial message so account state is not leaked through error text.
+const MINOR_DM_DENIED_MSG: &str = "Operation denied by policy";
+
+/// Apply the verified_minor DM containment gate to a sign request
+/// (support-trust-safety#183). The denial detail is logged server-side only.
+fn enforce_minor_dm_sign(
+    handler: &Arc<HttpRpcHandler>,
+    unsigned: &UnsignedEvent,
+) -> Result<(), RpcError> {
+    keycast_core::verified_minor_dm::validate_minor_sign(handler.keys(), unsigned).map_err(
+        |denied| {
+            tracing::warn!(
+                event = "minor_dm_gate.sign_denied",
+                user_pubkey = %handler.user_pubkey_hex(),
+                kind = unsigned.kind.as_u16(),
+                reason = %denied,
+                "verified_minor DM sign refused"
+            );
+            RpcError::Auth(AuthError::Forbidden(MINOR_DM_DENIED_MSG.into()))
+        },
+    )
+}
+
+/// Apply the verified_minor DM containment gate to an encrypt request
+/// (support-trust-safety#183). The denial detail is logged server-side only.
+fn enforce_minor_dm_encrypt(
+    handler: &Arc<HttpRpcHandler>,
+    recipient: &PublicKey,
+) -> Result<(), RpcError> {
+    keycast_core::verified_minor_dm::validate_minor_encrypt(&handler.public_key(), recipient)
+        .map_err(|denied| {
+            tracing::warn!(
+                event = "minor_dm_gate.encrypt_denied",
+                user_pubkey = %handler.user_pubkey_hex(),
+                recipient = %recipient.to_hex(),
+                reason = %denied,
+                "verified_minor DM encrypt refused"
+            );
+            RpcError::Auth(AuthError::Forbidden(MINOR_DM_DENIED_MSG.into()))
+        })
 }
 
 /// Load an HttpRpcHandler on-demand from DB and cache it
