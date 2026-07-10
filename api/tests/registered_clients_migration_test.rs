@@ -37,6 +37,36 @@ async fn migrations_register_divine_invite_admin_oauth_client() {
 }
 
 #[tokio::test]
+async fn migrations_register_divine_crossposter_oauth_client() {
+    let pool = common::setup_test_db().await;
+    let repo = RegisteredClientRepository::new(pool);
+
+    let allowed_redirects = repo
+        .get_allowed_redirect_uris("Divine Crossposter", 1)
+        .await
+        .unwrap()
+        .expect("Divine Crossposter should be seeded as a registered OAuth client");
+
+    assert_eq!(
+        allowed_redirects,
+        vec!["https://crossposter.divine.video/".to_string()]
+    );
+
+    repo.validate_redirect_uri("Divine Crossposter", "https://crossposter.divine.video/", 1)
+        .await
+        .unwrap();
+
+    assert!(repo
+        .validate_redirect_uri(
+            "Divine Crossposter",
+            "https://crossposter.divine.video/callback",
+            1,
+        )
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn registered_clients_tenant_id_is_bigint() {
     // Every other tenant_id column in this schema is BIGINT (tenants.id,
     // users.tenant_id, oauth_authorizations.tenant_id, etc.). 0008 originally
