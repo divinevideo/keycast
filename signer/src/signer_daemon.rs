@@ -87,6 +87,287 @@ impl Nip46Handler {
         }
     }
 
+    /// The bunker (wire) public key for this handler. Test-only accessor so the
+    /// relay-reply tests can decrypt the response event addressed to the client.
+    #[doc(hidden)]
+    pub fn bunker_public_key(&self) -> PublicKey {
+        self.bunker_keys.public_key()
+    }
+
+    /// Build the encrypted NIP-46 wire response event for a request.
+    ///
+    /// Dispatches `method`, converts an EXPECTED per-request denial (see
+    /// [`SignerError::is_expected_client_denial`]) into a JSON-RPC `{id, error}`
+    /// reply, and builds+signs the encrypted `NostrConnect` response event
+    /// addressed to the client. Returns `Err` ONLY for internal failures (the
+    /// caller logs those); every expected denial yields an `{id, error}`
+    /// response event so the client gets a clean refusal, never a relay timeout.
+    ///
+    /// Extracted from `handle_nip46_request` so the relay reply path is testable
+    /// without a live relay/coordinator (keeps the handler thin per the layering
+    /// guideline). `request_event_pubkey` / `request_event_id` are the client's
+    /// request event pubkey (response encryption target + `p` tag) and id
+    /// (`e` tag); `use_nip44` mirrors how the request itself was decrypted.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn build_nip46_response_event(
+        &self,
+        method: &str,
+        request: &serde_json::Value,
+        request_id: &serde_json::Value,
+        client_pubkey: &str,
+        request_event_pubkey: PublicKey,
+        request_event_id: EventId,
+        use_nip44: bool,
+    ) -> SignerResult<Event> {
+        // Dispatch the method; convert an EXPECTED per-request denial into a
+        // JSON-RPC {id, error} reply so the client gets a clean refusal instead
+        // of a relay timeout. Internal failures propagate to be logged.
+        let response = match self
+            .dispatch_nip46_method(method, request, request_id, client_pubkey)
+            .await
+        {
+            Ok(value) => value,
+            Err(e) if e.is_expected_client_denial() => {
+                tracing::info!(
+                    event = "nip46.denial_response",
+                    method = %method,
+                    reason = %e,
+                    "returning JSON-RPC error for expected per-request denial"
+                );
+                serde_json::json!({ "id": request_id, "error": e.to_string() })
+            }
+            Err(e) => return Err(e),
+        };
+
+        // Encrypt the response to the client with the same scheme the request
+        // arrived under (CPU-bound, spawn_blocking).
+        let response_str = response.to_string();
+        let encrypted_response = {
+            let secret = self.bunker_keys.secret_key().clone();
+            let pubkey = request_event_pubkey;
+            let text = response_str;
+            tokio::task::spawn_blocking(move || {
+                if use_nip44 {
+                    nip44::encrypt(&secret, &pubkey, &text, nip44::Version::V2)
+                        .map_err(SignerError::from)
+                } else {
+                    nip04::encrypt(&secret, &pubkey, &text).map_err(SignerError::from)
+                }
+            })
+            .await
+            .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
+        };
+
+        // Build + sign the NostrConnect response event addressed to the client.
+        let response_event = {
+            let keys = self.bunker_keys.clone();
+            let content = encrypted_response;
+            let sender = request_event_pubkey;
+            let event_id = request_event_id.to_hex();
+            tokio::task::spawn_blocking(move || {
+                EventBuilder::new(Kind::NostrConnect, content)
+                    .tags(vec![
+                        Tag::public_key(sender),
+                        Tag::parse(vec!["e".to_string(), event_id]).unwrap(),
+                    ])
+                    .sign_with_keys(&keys)
+            })
+            .await
+            .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
+        };
+
+        Ok(response_event)
+    }
+
+    /// Dispatch a decrypted NIP-46 method to its JSON-RPC result value, or a
+    /// `SignerError`. Split out of `handle_nip46_request` so the reply path is
+    /// testable and the wire handler stays thin. `?` here surfaces denials as
+    /// `Err`, which the caller ([`Nip46Handler::build_nip46_response_event`])
+    /// converts into a JSON-RPC `{id, error}` reply for expected denials.
+    async fn dispatch_nip46_method(
+        &self,
+        method: &str,
+        request: &serde_json::Value,
+        request_id: &serde_json::Value,
+        client_pubkey: &str,
+    ) -> SignerResult<serde_json::Value> {
+        Ok(match method {
+            "sign_event" => {
+                // handle_sign_event already returns a full response with id
+                self.handle_sign_event(request).await?
+            }
+            "get_public_key" => serde_json::json!({
+                "id": request_id,
+                "result": self.user_keys.public_key().to_hex()
+            }),
+            "connect" => {
+                // Process connect with client pubkey tracking (NIP-46 security)
+                if let Some(provided_secret) = request["params"][1].as_str() {
+                    match self.process_connect(client_pubkey, provided_secret).await {
+                        Ok(result) => serde_json::json!({"id": request_id, "result": result}),
+                        Err(e) => serde_json::json!({"id": request_id, "error": e.to_string()}),
+                    }
+                } else {
+                    // No secret provided - still track client pubkey for future validation
+                    serde_json::json!({"id": request_id, "result": "ack"})
+                }
+            }
+            "nip44_encrypt" => {
+                // params: [third_party_pubkey, plaintext]
+                let third_party_hex = request["params"][0]
+                    .as_str()
+                    .ok_or(SignerError::MissingParameter("pubkey"))?;
+                let plaintext = request["params"][1]
+                    .as_str()
+                    .ok_or(SignerError::MissingParameter("plaintext"))?;
+
+                let third_party_pubkey = PublicKey::from_hex(third_party_hex)
+                    .map_err(|e| SignerError::invalid_key(e.to_string()))?;
+
+                // Validate policy before encryption
+                self.validate_permissions_for_encrypt(plaintext, &third_party_pubkey)
+                    .await?;
+
+                // CPU-bound crypto wrapped in spawn_blocking
+                let ciphertext = {
+                    let secret = self.user_keys.secret_key().clone();
+                    let pubkey = third_party_pubkey;
+                    let text = plaintext.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        nip44::encrypt(&secret, &pubkey, &text, nip44::Version::V2)
+                    })
+                    .await
+                    .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
+                };
+
+                // Log activity in background (non-blocking)
+                self.spawn_update_activity();
+
+                serde_json::json!({
+                    "id": request_id,
+                    "result": ciphertext
+                })
+            }
+            "nip44_decrypt" => {
+                // params: [third_party_pubkey, ciphertext]
+                let third_party_hex = request["params"][0]
+                    .as_str()
+                    .ok_or(SignerError::MissingParameter("pubkey"))?;
+                let ciphertext = request["params"][1]
+                    .as_str()
+                    .ok_or(SignerError::MissingParameter("ciphertext"))?;
+
+                let third_party_pubkey = PublicKey::from_hex(third_party_hex)
+                    .map_err(|e| SignerError::invalid_key(e.to_string()))?;
+
+                // Validate policy before decryption
+                self.validate_permissions_for_decrypt(ciphertext, &third_party_pubkey)
+                    .await?;
+
+                // CPU-bound crypto wrapped in spawn_blocking
+                // Returns SecretString for automatic memory zeroization on drop
+                let plaintext: SecretString = {
+                    let secret = self.user_keys.secret_key().clone();
+                    let pubkey = third_party_pubkey;
+                    let text = ciphertext.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        nip44::decrypt(&secret, &pubkey, &text).map(SecretString::from)
+                    })
+                    .await
+                    .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
+                };
+
+                // Log activity in background (non-blocking)
+                self.spawn_update_activity();
+
+                // Expose secret only at serialization boundary
+                serde_json::json!({
+                    "id": request_id,
+                    "result": plaintext.expose_secret()
+                })
+            }
+            "nip04_encrypt" => {
+                // params: [third_party_pubkey, plaintext]
+                let third_party_hex = request["params"][0]
+                    .as_str()
+                    .ok_or(SignerError::MissingParameter("pubkey"))?;
+                let plaintext = request["params"][1]
+                    .as_str()
+                    .ok_or(SignerError::MissingParameter("plaintext"))?;
+
+                let third_party_pubkey = PublicKey::from_hex(third_party_hex)
+                    .map_err(|e| SignerError::invalid_key(e.to_string()))?;
+
+                // Validate policy before encryption
+                self.validate_permissions_for_encrypt(plaintext, &third_party_pubkey)
+                    .await?;
+
+                // CPU-bound crypto wrapped in spawn_blocking
+                let ciphertext = {
+                    let secret = self.user_keys.secret_key().clone();
+                    let pubkey = third_party_pubkey;
+                    let text = plaintext.to_string();
+                    tokio::task::spawn_blocking(move || nip04::encrypt(&secret, &pubkey, &text))
+                        .await
+                        .map_err(|e| {
+                            SignerError::internal(format!("spawn_blocking failed: {}", e))
+                        })??
+                };
+
+                // Log activity in background (non-blocking)
+                self.spawn_update_activity();
+
+                serde_json::json!({
+                    "id": request_id,
+                    "result": ciphertext
+                })
+            }
+            "nip04_decrypt" => {
+                // params: [third_party_pubkey, ciphertext]
+                let third_party_hex = request["params"][0]
+                    .as_str()
+                    .ok_or(SignerError::MissingParameter("pubkey"))?;
+                let ciphertext = request["params"][1]
+                    .as_str()
+                    .ok_or(SignerError::MissingParameter("ciphertext"))?;
+
+                let third_party_pubkey = PublicKey::from_hex(third_party_hex)
+                    .map_err(|e| SignerError::invalid_key(e.to_string()))?;
+
+                // Validate policy before decryption
+                self.validate_permissions_for_decrypt(ciphertext, &third_party_pubkey)
+                    .await?;
+
+                // CPU-bound crypto wrapped in spawn_blocking
+                // Returns SecretString for automatic memory zeroization on drop
+                let plaintext: SecretString = {
+                    let secret = self.user_keys.secret_key().clone();
+                    let pubkey = third_party_pubkey;
+                    let text = ciphertext.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        nip04::decrypt(&secret, &pubkey, &text).map(SecretString::from)
+                    })
+                    .await
+                    .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
+                };
+
+                // Log activity in background (non-blocking)
+                self.spawn_update_activity();
+
+                // Expose secret only at serialization boundary
+                serde_json::json!({
+                    "id": request_id,
+                    "result": plaintext.expose_secret()
+                })
+            }
+            _ => {
+                tracing::warn!("Unsupported NIP-46 method: {}", method);
+                serde_json::json!({"id": request_id, "error": format!("Unsupported method: {}", method)})
+            }
+        })
+    }
+
     /// Check if this handler is a tombstone (revoked or expired)
     pub fn is_tombstone(&self) -> bool {
         self.status != HandlerStatus::Active
@@ -1477,235 +1758,22 @@ impl UnifiedSigner {
             }
         }
 
-        // Handle different NIP-46 methods
-        let result = match method {
-            "sign_event" => {
-                let signed = handler.handle_sign_event(&request).await?;
-                // handle_sign_event already returns full response with id
-                signed
-            }
-            "get_public_key" => {
-                serde_json::json!({
-                    "id": request_id,
-                    "result": handler.user_keys.public_key().to_hex()
-                })
-            }
-            "connect" => {
-                // Process connect with client pubkey tracking (NIP-46 security)
-                // client_pubkey already extracted above from event.pubkey
-                if let Some(provided_secret) = request["params"][1].as_str() {
-                    match handler
-                        .process_connect(&client_pubkey, provided_secret)
-                        .await
-                    {
-                        Ok(result) => serde_json::json!({"id": request_id, "result": result}),
-                        Err(e) => serde_json::json!({"id": request_id, "error": e.to_string()}),
-                    }
-                } else {
-                    // No secret provided - still track client pubkey for future validation
-                    serde_json::json!({"id": request_id, "result": "ack"})
-                }
-            }
-            "nip44_encrypt" => {
-                // params: [third_party_pubkey, plaintext]
-                let third_party_hex = request["params"][0]
-                    .as_str()
-                    .ok_or(SignerError::MissingParameter("pubkey"))?;
-                let plaintext = request["params"][1]
-                    .as_str()
-                    .ok_or(SignerError::MissingParameter("plaintext"))?;
-
-                let third_party_pubkey = PublicKey::from_hex(third_party_hex)
-                    .map_err(|e| SignerError::invalid_key(e.to_string()))?;
-
-                // Validate policy before encryption
-                handler
-                    .validate_permissions_for_encrypt(plaintext, &third_party_pubkey)
-                    .await?;
-
-                // CPU-bound crypto wrapped in spawn_blocking
-                let ciphertext = {
-                    let secret = handler.user_keys.secret_key().clone();
-                    let pubkey = third_party_pubkey;
-                    let text = plaintext.to_string();
-                    tokio::task::spawn_blocking(move || {
-                        nip44::encrypt(&secret, &pubkey, &text, nip44::Version::V2)
-                    })
-                    .await
-                    .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
-                };
-
-                // Log activity in background (non-blocking)
-                handler.spawn_update_activity();
-
-                serde_json::json!({
-                    "id": request_id,
-                    "result": ciphertext
-                })
-            }
-            "nip44_decrypt" => {
-                // params: [third_party_pubkey, ciphertext]
-                let third_party_hex = request["params"][0]
-                    .as_str()
-                    .ok_or(SignerError::MissingParameter("pubkey"))?;
-                let ciphertext = request["params"][1]
-                    .as_str()
-                    .ok_or(SignerError::MissingParameter("ciphertext"))?;
-
-                let third_party_pubkey = PublicKey::from_hex(third_party_hex)
-                    .map_err(|e| SignerError::invalid_key(e.to_string()))?;
-
-                // Validate policy before decryption
-                handler
-                    .validate_permissions_for_decrypt(ciphertext, &third_party_pubkey)
-                    .await?;
-
-                // CPU-bound crypto wrapped in spawn_blocking
-                // Returns SecretString for automatic memory zeroization on drop
-                let plaintext: SecretString = {
-                    let secret = handler.user_keys.secret_key().clone();
-                    let pubkey = third_party_pubkey;
-                    let text = ciphertext.to_string();
-                    tokio::task::spawn_blocking(move || {
-                        nip44::decrypt(&secret, &pubkey, &text).map(SecretString::from)
-                    })
-                    .await
-                    .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
-                };
-
-                // Log activity in background (non-blocking)
-                handler.spawn_update_activity();
-
-                // Expose secret only at serialization boundary
-                serde_json::json!({
-                    "id": request_id,
-                    "result": plaintext.expose_secret()
-                })
-            }
-            "nip04_encrypt" => {
-                // params: [third_party_pubkey, plaintext]
-                let third_party_hex = request["params"][0]
-                    .as_str()
-                    .ok_or(SignerError::MissingParameter("pubkey"))?;
-                let plaintext = request["params"][1]
-                    .as_str()
-                    .ok_or(SignerError::MissingParameter("plaintext"))?;
-
-                let third_party_pubkey = PublicKey::from_hex(third_party_hex)
-                    .map_err(|e| SignerError::invalid_key(e.to_string()))?;
-
-                // Validate policy before encryption
-                handler
-                    .validate_permissions_for_encrypt(plaintext, &third_party_pubkey)
-                    .await?;
-
-                // CPU-bound crypto wrapped in spawn_blocking
-                let ciphertext = {
-                    let secret = handler.user_keys.secret_key().clone();
-                    let pubkey = third_party_pubkey;
-                    let text = plaintext.to_string();
-                    tokio::task::spawn_blocking(move || nip04::encrypt(&secret, &pubkey, &text))
-                        .await
-                        .map_err(|e| {
-                            SignerError::internal(format!("spawn_blocking failed: {}", e))
-                        })??
-                };
-
-                // Log activity in background (non-blocking)
-                handler.spawn_update_activity();
-
-                serde_json::json!({
-                    "id": request_id,
-                    "result": ciphertext
-                })
-            }
-            "nip04_decrypt" => {
-                // params: [third_party_pubkey, ciphertext]
-                let third_party_hex = request["params"][0]
-                    .as_str()
-                    .ok_or(SignerError::MissingParameter("pubkey"))?;
-                let ciphertext = request["params"][1]
-                    .as_str()
-                    .ok_or(SignerError::MissingParameter("ciphertext"))?;
-
-                let third_party_pubkey = PublicKey::from_hex(third_party_hex)
-                    .map_err(|e| SignerError::invalid_key(e.to_string()))?;
-
-                // Validate policy before decryption
-                handler
-                    .validate_permissions_for_decrypt(ciphertext, &third_party_pubkey)
-                    .await?;
-
-                // CPU-bound crypto wrapped in spawn_blocking
-                // Returns SecretString for automatic memory zeroization on drop
-                let plaintext: SecretString = {
-                    let secret = handler.user_keys.secret_key().clone();
-                    let pubkey = third_party_pubkey;
-                    let text = ciphertext.to_string();
-                    tokio::task::spawn_blocking(move || {
-                        nip04::decrypt(&secret, &pubkey, &text).map(SecretString::from)
-                    })
-                    .await
-                    .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
-                };
-
-                // Log activity in background (non-blocking)
-                handler.spawn_update_activity();
-
-                // Expose secret only at serialization boundary
-                serde_json::json!({
-                    "id": request_id,
-                    "result": plaintext.expose_secret()
-                })
-            }
-            _ => {
-                tracing::warn!("Unsupported NIP-46 method: {}", method);
-                serde_json::json!({"id": request_id, "error": format!("Unsupported method: {}", method)})
-            }
-        };
-
-        let response = result;
-
-        // Encrypt response using the same method as the request (CPU-bound, use spawn_blocking)
-        let response_str = response.to_string();
-        let encrypted_response = {
-            let secret = bunker_secret.clone();
-            let pubkey = event.pubkey;
-            let text = response_str.clone();
-            let use_44 = use_nip44;
-            tokio::task::spawn_blocking(move || {
-                if use_44 {
-                    tracing::debug!("Encrypting response with NIP-44");
-                    nip44::encrypt(&secret, &pubkey, &text, nip44::Version::V2)
-                        .map_err(SignerError::from)
-                } else {
-                    tracing::debug!("Encrypting response with NIP-04");
-                    nip04::encrypt(&secret, &pubkey, &text).map_err(SignerError::from)
-                }
-            })
-            .await
-            .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
-        };
-
-        // Build and publish response event (signing is CPU-bound, use spawn_blocking)
-        tracing::debug!("Sending NIP-46 response to {}", event.pubkey);
-
-        let response_event = {
-            let keys = handler.bunker_keys.clone();
-            let content = encrypted_response;
-            let sender = event.pubkey;
-            let event_id = event.id.to_hex();
-            tokio::task::spawn_blocking(move || {
-                EventBuilder::new(Kind::NostrConnect, content)
-                    .tags(vec![
-                        Tag::public_key(sender),
-                        Tag::parse(vec!["e".to_string(), event_id]).unwrap(),
-                    ])
-                    .sign_with_keys(&keys)
-            })
-            .await
-            .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
-        };
+        // Dispatch the method and build the encrypted response event. Expected
+        // per-request denials (permission denied, bad params/key) become a clean
+        // JSON-RPC {id, error} reply here instead of ?-propagating out of this
+        // handler and leaving the client to time out; only internal failures
+        // still propagate to be logged. See build_nip46_response_event.
+        let response_event = handler
+            .build_nip46_response_event(
+                method,
+                &request,
+                &request_id,
+                &client_pubkey,
+                event.pubkey,
+                event.id,
+                use_nip44,
+            )
+            .await?;
 
         tracing::debug!(
             "Sending response event {} (size: {} bytes)",

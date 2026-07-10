@@ -121,7 +121,50 @@ impl SignerError {
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::Internal(msg.into())
     }
+
+    /// Whether this error is an EXPECTED per-request denial that the client
+    /// caused (or a policy denies), as opposed to an internal server failure.
+    ///
+    /// On the NIP-46 relay path these are converted into a JSON-RPC
+    /// `{id, error}` reply so the client gets a clean refusal instead of a
+    /// silent relay timeout; internal failures still propagate to be logged.
+    /// The denial message is safe to surface (uniform policy text / the bad
+    /// parameter name), whereas internal errors must not leak server detail.
+    pub fn is_expected_client_denial(&self) -> bool {
+        matches!(
+            self,
+            Self::PermissionDenied(_)
+                | Self::MissingParameter(_)
+                | Self::InvalidKey(_)
+                | Self::InvalidRequest(_)
+        )
+    }
 }
 
 /// Result type for signer operations
 pub type SignerResult<T> = Result<T, SignerError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expected_client_denials_are_classified() {
+        assert!(SignerError::permission_denied("Operation denied by policy")
+            .is_expected_client_denial());
+        assert!(SignerError::MissingParameter("pubkey").is_expected_client_denial());
+        assert!(SignerError::invalid_key("bad hex").is_expected_client_denial());
+        assert!(SignerError::invalid_request("malformed").is_expected_client_denial());
+    }
+
+    #[test]
+    fn internal_errors_are_not_client_denials() {
+        // These must propagate (and be logged), never surface to the client as
+        // a JSON-RPC error with server detail.
+        assert!(!SignerError::internal("boom").is_expected_client_denial());
+        assert!(!SignerError::encryption("crypto failed").is_expected_client_denial());
+        assert!(!SignerError::data_corruption("bad row").is_expected_client_denial());
+        assert!(!SignerError::relay("relay down").is_expected_client_denial());
+        assert!(!SignerError::invalid_permission("bad policy").is_expected_client_denial());
+    }
+}

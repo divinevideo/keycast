@@ -298,3 +298,152 @@ async fn daemon_non_minor_encrypt_unaffected() {
         .await
         .expect("non-minor encrypt to anyone must be allowed");
 }
+
+// ============================================================================
+// relay reply path (build_nip46_response_event) — a denial must PRODUCE an
+// encrypted {id, error} response event, not ?-propagate (which timed the client
+// out). support-trust-safety#183 review (dcadenas).
+// ============================================================================
+
+/// Decrypt a bunker→client NIP-44 wire response and parse its JSON-RPC body.
+fn decrypt_response(
+    client: &Keys,
+    bunker_pubkey: &PublicKey,
+    response: &Event,
+) -> serde_json::Value {
+    assert_eq!(
+        response.kind,
+        Kind::NostrConnect,
+        "response must be a NIP-46 wire event"
+    );
+    let content = nip44::decrypt(client.secret_key(), bunker_pubkey, &response.content)
+        .expect("client must be able to decrypt the bunker's response");
+    serde_json::from_str(&content).expect("response body must be valid JSON-RPC")
+}
+
+#[tokio::test]
+async fn daemon_relay_denied_minor_sign_produces_error_response_event() {
+    let pool = setup_test_db().await;
+    let km = FileKeyManager::new().expect("key manager");
+    let (handler, user_keys) = create_oauth_handler(&pool, &km, true).await; // verified_minor
+    let client = Keys::generate();
+    let mallory = Keys::generate();
+
+    // sign_event request for a kind-14 DM to a non-approved recipient (denied).
+    let unsigned = dm_rumor(14, &user_keys, &[mallory.public_key()]);
+    let request = serde_json::json!({
+        "id": "req-sign",
+        "method": "sign_event",
+        "params": [serde_json::to_string(&unsigned).unwrap()],
+    });
+
+    let response = handler
+        .build_nip46_response_event(
+            "sign_event",
+            &request,
+            &serde_json::json!("req-sign"),
+            &client.public_key().to_hex(),
+            client.public_key(),
+            EventId::all_zeros(),
+            true,
+        )
+        .await
+        .expect("a denial must PRODUCE a response event, not propagate an error");
+
+    let body = decrypt_response(&client, &handler.bunker_public_key(), &response);
+    assert_eq!(body["id"], "req-sign");
+    assert!(
+        body["error"]
+            .as_str()
+            .expect("error is a string")
+            .contains("Operation denied by policy"),
+        "denial must carry the uniform policy message, got: {}",
+        body["error"]
+    );
+    assert!(
+        body.get("result").is_none(),
+        "a denial must not carry a result"
+    );
+}
+
+#[tokio::test]
+async fn daemon_relay_denied_minor_encrypt_produces_error_response_event() {
+    let pool = setup_test_db().await;
+    let km = FileKeyManager::new().expect("key manager");
+    let (handler, _user_keys) = create_oauth_handler(&pool, &km, true).await; // verified_minor
+    let client = Keys::generate();
+    let mallory = Keys::generate();
+
+    let request = serde_json::json!({
+        "id": "req-enc",
+        "method": "nip44_encrypt",
+        "params": [mallory.public_key().to_hex(), "secret text"],
+    });
+
+    let response = handler
+        .build_nip46_response_event(
+            "nip44_encrypt",
+            &request,
+            &serde_json::json!("req-enc"),
+            &client.public_key().to_hex(),
+            client.public_key(),
+            EventId::all_zeros(),
+            true,
+        )
+        .await
+        .expect("an encrypt denial must produce a response event, not propagate");
+
+    let body = decrypt_response(&client, &handler.bunker_public_key(), &response);
+    assert_eq!(body["id"], "req-enc");
+    assert!(
+        body["error"]
+            .as_str()
+            .expect("error is a string")
+            .contains("Operation denied by policy"),
+        "denial must carry the uniform policy message, got: {}",
+        body["error"]
+    );
+    assert!(body.get("result").is_none());
+}
+
+#[tokio::test]
+async fn daemon_relay_non_minor_sign_produces_result_response_event() {
+    let pool = setup_test_db().await;
+    let km = FileKeyManager::new().expect("key manager");
+    let (handler, user_keys) = create_oauth_handler(&pool, &km, false).await; // non-minor
+    let client = Keys::generate();
+    let mallory = Keys::generate();
+
+    // A non-minor may sign a DM to anyone: the happy path must still build a
+    // {id, result} response event.
+    let unsigned = dm_rumor(14, &user_keys, &[mallory.public_key()]);
+    let request = serde_json::json!({
+        "id": "req-ok",
+        "method": "sign_event",
+        "params": [serde_json::to_string(&unsigned).unwrap()],
+    });
+
+    let response = handler
+        .build_nip46_response_event(
+            "sign_event",
+            &request,
+            &serde_json::json!("req-ok"),
+            &client.public_key().to_hex(),
+            client.public_key(),
+            EventId::all_zeros(),
+            true,
+        )
+        .await
+        .expect("non-minor sign must produce a response event");
+
+    let body = decrypt_response(&client, &handler.bunker_public_key(), &response);
+    assert_eq!(body["id"], "req-ok");
+    assert!(
+        body.get("error").is_none(),
+        "the happy path carries no error"
+    );
+    assert!(
+        body.get("result").is_some(),
+        "the happy path carries the signed result"
+    );
+}
