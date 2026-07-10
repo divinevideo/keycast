@@ -134,16 +134,32 @@ async fn daemon_minor_sign_rumor_to_arbitrary_recipient_refused() {
 }
 
 #[tokio::test]
-async fn daemon_minor_sign_rumor_to_pinned_official_allowed() {
+async fn daemon_minor_sign_rumor_kind_14_refused_outright() {
+    // Conformant NIP-17 never signs a rumor via a remote signer; refused
+    // regardless of recipient.
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("key manager");
     let (handler, user_keys) = create_oauth_handler(&pool, &key_manager, true).await;
 
     let unsigned = dm_rumor(14, &user_keys, &[hq_pubkey()]);
+    let err = handler
+        .sign_event_direct(unsigned)
+        .await
+        .expect_err("minor kind-14 rumor must be refused even to an official");
+    assert_denied(err);
+}
+
+#[tokio::test]
+async fn daemon_minor_sign_nip04_kind_4_to_official_allowed() {
+    let pool = setup_test_db().await;
+    let key_manager = FileKeyManager::new().expect("key manager");
+    let (handler, user_keys) = create_oauth_handler(&pool, &key_manager, true).await;
+
+    let unsigned = dm_rumor(4, &user_keys, &[hq_pubkey()]);
     let signed = handler
         .sign_event_direct(unsigned)
         .await
-        .expect("minor DM rumor to pinned official must sign");
+        .expect("minor NIP-04 DM to a pinned official must sign");
     signed.verify().expect("valid signature");
 }
 

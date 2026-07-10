@@ -22,6 +22,7 @@ use keycast_api::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::KeyManager;
 use keycast_core::secret_pool::SecretPool;
+use keycast_core::signing_handler::{SignerHandlersCache, SigningHandler};
 use keycast_core::verified_minor_dm::PINNED_MINOR_CONTACTABLE_PUBKEYS;
 use moka::future::Cache;
 use nostr_sdk::nips::nip44;
@@ -29,6 +30,7 @@ use nostr_sdk::prelude::*;
 use serde_json::{json, Value};
 use serial_test::serial;
 use sqlx::PgPool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use ucan::builder::UcanBuilder;
 use uuid::Uuid;
@@ -216,6 +218,7 @@ struct TestAccount {
     keys: Keys,
     pubkey: String,
     token: String,
+    bunker_pubkey: String,
 }
 
 async fn setup_account(
@@ -237,6 +240,7 @@ async fn setup_account(
         keys,
         pubkey,
         token,
+        bunker_pubkey,
     }
 }
 
@@ -326,7 +330,11 @@ async fn minor_rpc_sign_rumor_to_arbitrary_recipient_refused() {
 
 #[tokio::test]
 #[serial]
-async fn minor_rpc_sign_rumor_to_pinned_official_allowed() {
+async fn minor_rpc_sign_rumor_kind_14_refused_outright_even_to_official() {
+    // A conformant NIP-17 client never signs a kind-14 rumor via a remote
+    // signer (rumors are unsigned); signing one only serves a covert channel,
+    // so it is refused regardless of recipient. The legit DM-to-official path
+    // is nip44_encrypt + the kind-13 seal (see minor_rpc_seal_flow_...).
     let pool = setup_db().await;
     let tenant_id = create_test_tenant(&pool).await;
     let key_manager = FileKeyManager::new().expect("key manager");
@@ -336,7 +344,7 @@ async fn minor_rpc_sign_rumor_to_pinned_official_allowed() {
         Arc::new(Box::new(key_manager) as Box<dyn KeyManager>),
     );
 
-    let response = invoke_rpc(
+    let err = invoke_rpc(
         tenant_id,
         auth_state,
         &minor.token,
@@ -344,11 +352,74 @@ async fn minor_rpc_sign_rumor_to_pinned_official_allowed() {
         vec![unsigned_dm_json(14, &minor.keys, &[hq_pubkey()])],
     )
     .await
-    .expect("minor DM rumor to pinned official must sign");
-    let signed: Event =
-        serde_json::from_value(response.result.expect("result present")).expect("valid event");
-    signed.verify().expect("valid signature");
-    assert_eq!(signed.kind.as_u16(), 14);
+    .expect_err("minor kind-14 rumor must be refused even to an official");
+    assert_rpc_denied(err);
+}
+
+#[tokio::test]
+#[serial]
+async fn minor_rpc_sign_gift_wrap_with_decoy_official_p_tag_refused() {
+    // The bypass the adversarial review found: a kind-1059 whose content is
+    // ciphertext readable by a colluding non-approved party, hidden behind a
+    // decoy approved `p` tag. Refusing 1059 outright closes it.
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let key_manager = FileKeyManager::new().expect("key manager");
+    let minor = setup_account(&pool, tenant_id, &key_manager, true).await;
+    let auth_state = create_test_auth_state(
+        pool.clone(),
+        Arc::new(Box::new(key_manager) as Box<dyn KeyManager>),
+    );
+
+    let err = invoke_rpc(
+        tenant_id,
+        auth_state,
+        &minor.token,
+        "sign_event",
+        vec![unsigned_dm_json(1059, &minor.keys, &[hq_pubkey()])],
+    )
+    .await
+    .expect_err("minor gift wrap with a decoy official p-tag must be refused");
+    assert_rpc_denied(err);
+}
+
+#[tokio::test]
+#[serial]
+async fn minor_rpc_sign_nip04_kind_4_gated_by_p_tag() {
+    // NIP-04 kind-4 DM is a real send path (video share, dm NIP-04 helper): the
+    // recipient IS the p tag, so it stays p-tag-gated — allowed to an official,
+    // refused to an arbitrary recipient.
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let key_manager = FileKeyManager::new().expect("key manager");
+    let minor = setup_account(&pool, tenant_id, &key_manager, true).await;
+    let auth_state = create_test_auth_state(
+        pool.clone(),
+        Arc::new(Box::new(key_manager) as Box<dyn KeyManager>),
+    );
+    let mallory = Keys::generate();
+
+    let signed = invoke_rpc(
+        tenant_id,
+        auth_state.clone(),
+        &minor.token,
+        "sign_event",
+        vec![unsigned_dm_json(4, &minor.keys, &[hq_pubkey()])],
+    )
+    .await
+    .expect("minor kind-4 DM to an official must sign");
+    assert!(signed.result.is_some());
+
+    let err = invoke_rpc(
+        tenant_id,
+        auth_state,
+        &minor.token,
+        "sign_event",
+        vec![unsigned_dm_json(4, &minor.keys, &[mallory.public_key()])],
+    )
+    .await
+    .expect_err("minor kind-4 DM to an arbitrary recipient must be refused");
+    assert_rpc_denied(err);
 }
 
 #[tokio::test]
@@ -774,7 +845,7 @@ async fn minor_user_sign_endpoint_refuses_dm_to_arbitrary_recipient() {
 
 #[tokio::test]
 #[serial]
-async fn minor_user_sign_endpoint_allows_dm_to_pinned_official() {
+async fn minor_user_sign_endpoint_allows_nip04_dm_to_pinned_official() {
     let pool = setup_db().await;
     let tenant_id = create_test_tenant(&pool).await;
     let key_manager = FileKeyManager::new().expect("key manager");
@@ -788,10 +859,10 @@ async fn minor_user_sign_endpoint_allows_dm_to_pinned_official() {
         tenant_id,
         auth_state,
         &minor.token,
-        unsigned_dm_json(14, &minor.keys, &[hq_pubkey()]),
+        unsigned_dm_json(4, &minor.keys, &[hq_pubkey()]),
     )
     .await
-    .expect("minor DM to pinned official via /user/sign must sign");
+    .expect("minor NIP-04 DM to pinned official via /user/sign must sign");
     let signed: Event = serde_json::from_value(signed).expect("valid event");
     signed.verify().expect("valid signature");
 }
@@ -818,4 +889,101 @@ async fn non_minor_user_sign_endpoint_dm_unaffected() {
     .await
     .expect("non-minor DM via /user/sign must sign");
     assert!(signed.is_object());
+}
+
+// ============================================================================
+// /api/user/sign fast path (signer_handlers: Some) — denial must be a clean 403
+// ============================================================================
+
+/// A cached signing handler that records whether it was invoked. If the fast
+/// path's minor gate fires correctly, `sign_event_direct` is never reached.
+struct RecordingSignerHandler {
+    keys: Keys,
+    signed: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl SigningHandler for RecordingSignerHandler {
+    async fn sign_event_direct(
+        &self,
+        unsigned_event: UnsignedEvent,
+    ) -> Result<Event, Box<dyn std::error::Error + Send + Sync>> {
+        self.signed.store(true, Ordering::SeqCst);
+        unsigned_event
+            .sign(&self.keys)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    }
+    fn authorization_id(&self) -> i64 {
+        1
+    }
+    fn user_pubkey(&self) -> String {
+        self.keys.public_key().to_hex()
+    }
+    fn get_keys(&self) -> Keys {
+        self.keys.clone()
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn minor_user_sign_fast_path_denial_is_forbidden_not_503() {
+    // I1: on the hot fast path (cached signer handler present), a minor-gate
+    // denial must return a clean 403 Forbidden with the uniform message, not
+    // the 503 the handler's error mapping would produce — and must refuse
+    // BEFORE the handler signs anything.
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let key_manager = FileKeyManager::new().expect("key manager");
+    let minor = setup_account(&pool, tenant_id, &key_manager, true).await;
+
+    // Install a cached handler keyed by this account's bunker pubkey so the
+    // fast path is taken.
+    let signed_flag = Arc::new(AtomicBool::new(false));
+    let handlers: SignerHandlersCache = Cache::builder().max_capacity(10).build();
+    handlers
+        .insert(
+            minor.bunker_pubkey.clone(),
+            Arc::new(RecordingSignerHandler {
+                keys: minor.keys.clone(),
+                signed: signed_flag.clone(),
+            }),
+        )
+        .await;
+
+    let mut auth_state = create_test_auth_state(
+        pool.clone(),
+        Arc::new(Box::new(key_manager) as Box<dyn KeyManager>),
+    );
+    // Rebuild state with signer_handlers present (fast path enabled).
+    auth_state.state = Arc::new(KeycastState {
+        db: pool.clone(),
+        key_manager: auth_state.state.key_manager.clone(),
+        signer_handlers: Some(handlers),
+        http_handler_cache: new_http_handler_cache(),
+        server_keys: Keys::generate(),
+        tenant_cache: Cache::builder().max_capacity(10).build(),
+        bcrypt_sender: BcryptQueue::new().sender(),
+        redis: None,
+        secret_pool: SecretPool::new(1).receiver(),
+    });
+    let mallory = Keys::generate();
+
+    let err = invoke_user_sign(
+        tenant_id,
+        auth_state,
+        &minor.token,
+        unsigned_dm_json(4, &minor.keys, &[mallory.public_key()]),
+    )
+    .await
+    .expect_err("fast-path minor DM to arbitrary recipient must be refused");
+
+    match err {
+        AuthError::Forbidden(msg) => assert_eq!(msg, DENIED_MSG),
+        other => panic!("expected Forbidden({DENIED_MSG}) on the fast path, got: {other:?}"),
+    }
+    assert!(
+        !signed_flag.load(Ordering::SeqCst),
+        "fast-path gate must refuse BEFORE the handler signs"
+    );
 }

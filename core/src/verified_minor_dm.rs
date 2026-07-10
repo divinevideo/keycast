@@ -24,22 +24,50 @@
 //!
 //! # What is gated (egress only)
 //!
+//! The recipient of a DM is bound by whoever can *decrypt* it, not by the
+//! attacker-controlled `p` tag: the NIP-44 / NIP-04 conversation key is
+//! *symmetric* ECDH, so a colluding non-approved party can compute the
+//! minor↔them key from their own secret and the minor's public key and forge
+//! minor-keyed ciphertext without ever calling Keycast. Binding on the `p` tag
+//! alone is therefore spoofable. Each shape is gated at the point its true
+//! recipient is actually determinable:
+//!
 //! * `nip04_encrypt` / `nip44_encrypt`: recipient must be the user or pinned.
-//! * `sign_event` kind 4 (NIP-04 DM), kinds 14/15 (NIP-17 rumors), kind 1059
-//!   (gift wrap): every `p` tag must resolve to the user or a pinned account,
-//!   and at least one `p` tag must be present.
+//!   This is the primitive that produces DM ciphertext, so it blocks a
+//!   non-colluding minor from encrypting to a stranger at all.
 //! * `sign_event` kind 13 (NIP-59 seal): the seal names no recipient — its
 //!   content is NIP-44 ciphertext under the conversation key of the *unstated*
 //!   receiver. The recipient is recovered by trial-decrypting against the
 //!   user's conversation keys with each approved pubkey (NIP-44 v2 is
-//!   authenticated, so this is deterministic); the inner rumor's `p` tags must
-//!   also all be approved. Anything that does not decrypt is refused.
+//!   authenticated, so this is deterministic); the inner rumor's `p` tags and
+//!   the seal's own `p` tags must also all be approved. This is the real NIP-17
+//!   containment point.
+//! * `sign_event` kind 4 (NIP-04 DM): a complete, normal-client-rendered DM
+//!   whose recipient IS the `p` tag (NIP-04 content is unauthenticated, so the
+//!   reader cannot be verified by decryption). Every `p` tag must be approved,
+//!   which keeps a minor-signed kind-4 facially addressed to an approved party.
+//! * `sign_event` kinds 14/15 (NIP-17 rumor) and 1059 (gift wrap): **refused
+//!   outright.** A conformant client never asks a remote signer to sign these
+//!   with the user's key (rumors are unsigned; wraps use a one-time ephemeral
+//!   key), so a `p`-tag check there is pure false confidence. The legitimate
+//!   NIP-17 DM to an approved official flows through `nip44_encrypt` (gated) +
+//!   the kind-13 seal (gated).
 //!
 //! Decrypt/unwrap (ingress) is intentionally untouched — #183 scopes
 //! containment to egress.
 //!
-//! Fail closed: an unresolvable recipient, an unparseable `p` tag, or a seal
-//! that decrypts to nothing is a refusal, never a pass-through.
+//! Fail closed: an unresolvable recipient, an unparseable `p` tag, a seal that
+//! decrypts to nothing, or an unverifiable DM-carrier kind is a refusal, never
+//! a pass-through.
+//!
+//! # Accepted ceiling
+//!
+//! A minor can freely sign public posts (e.g. kind 1), whose content is
+//! arbitrary — so a minor + a colluding recipient can always steganographically
+//! encode a payload the recipient extracts out-of-band. No server-side gate can
+//! close that (it is not a DM shape any normal client renders as a DM). This
+//! gate's job is narrower and achievable: Keycast will not produce a DM-shaped,
+//! normal-client-deliverable artifact addressed to a non-approved recipient.
 
 use nostr_sdk::nips::nip44;
 use nostr_sdk::{Keys, Kind, PublicKey, Tag, UnsignedEvent};
@@ -76,6 +104,10 @@ pub enum MinorDmDenied {
     /// A kind-13 seal decrypted, but the inner rumor is not a well-formed
     /// event JSON we can extract recipients from. Fail closed.
     SealRumorInvalid,
+    /// A DM-carrier kind (NIP-17 rumor 14/15, gift wrap 1059) whose recipient
+    /// cannot be verified at signing time and which a conformant client never
+    /// asks a remote signer to sign — refused outright. See [`validate_minor_sign`].
+    UnverifiableDmKind,
 }
 
 impl std::fmt::Display for MinorDmDenied {
@@ -85,6 +117,7 @@ impl std::fmt::Display for MinorDmDenied {
             MinorDmDenied::RecipientUnresolvable => "recipient unresolvable",
             MinorDmDenied::SealNotDecryptable => "seal not decryptable to an approved recipient",
             MinorDmDenied::SealRumorInvalid => "sealed rumor malformed",
+            MinorDmDenied::UnverifiableDmKind => "DM-carrier kind not signable by a minor",
         };
         write!(f, "verified_minor DM gate: {}", reason)
     }
@@ -134,12 +167,37 @@ pub fn validate_minor_encrypt(
 /// Takes the user's [`Keys`] (not just the pubkey) because a kind-13 seal
 /// names no recipient — recovering it requires trial-decrypting the content
 /// under the user's conversation keys with each approved pubkey.
+///
+/// Recipient binding differs by shape, because binding the *spoofable `p` tag*
+/// alone is not containment (the NIP-44 / NIP-04 conversation key is symmetric
+/// ECDH, so a colluding non-approved party can forge minor-keyed ciphertext and
+/// hide it behind a decoy approved `p` tag):
+///
+/// - **kind 4 (NIP-04 DM)** is a complete, normal-client-rendered DM whose
+///   recipient IS the `p` tag; NIP-04 content is unauthenticated AES-CBC, so we
+///   cannot verify the true reader by decryption. We require the `p` tag(s)
+///   approved, which keeps a minor-signed kind-4 facially addressed to an
+///   approved party; the gated `nip04_encrypt` primitive blocks producing the
+///   ciphertext for a non-colluding stranger. Residual: a colluding recipient
+///   can still read a decoy-`p`-tagged payload — the public-post steganography
+///   ceiling, reachable via any signable kind (e.g. a plain kind-1 note) and
+///   not closable server-side.
+/// - **kind 13 (NIP-59 seal)** names no recipient; we recover it by
+///   trial-decrypting the content against the approved conversation keys
+///   (authenticated NIP-44 v2 makes this deterministic). This is the real
+///   NIP-17 containment point.
+/// - **kinds 14/15 (NIP-17 rumor) and 1059 (gift wrap)** are refused outright.
+///   A conformant client NEVER asks a remote signer to sign these with the
+///   user's key: rumors are unsigned (NIP-59), and gift wraps are signed by a
+///   one-time ephemeral key, not the sender's. Signing one with the minor's key
+///   only serves a covert channel, and a `p`-tag check there is pure false
+///   confidence (see above). The legitimate NIP-17 DM to an approved official
+///   flows entirely through `nip44_encrypt` (gated) + the kind-13 seal (gated).
 pub fn validate_minor_sign(user_keys: &Keys, event: &UnsignedEvent) -> Result<(), MinorDmDenied> {
     match event.kind.as_u16() {
-        4 | 14 | 15 | 1059 => {
-            validate_p_tag_recipients(&user_keys.public_key(), event.tags.as_slice())
-        }
-        13 => validate_seal(user_keys, &event.content),
+        4 => validate_p_tag_recipients(&user_keys.public_key(), event.tags.as_slice()),
+        13 => validate_seal(user_keys, event),
+        14 | 15 | 1059 => Err(MinorDmDenied::UnverifiableDmKind),
         _ => Ok(()),
     }
 }
@@ -148,13 +206,46 @@ pub fn validate_minor_sign(user_keys: &Keys, event: &UnsignedEvent) -> Result<()
 /// `p` tag must be present — a DM shape with no recipient is unresolvable and
 /// therefore refused.
 fn validate_p_tag_recipients(user_pubkey: &PublicKey, tags: &[Tag]) -> Result<(), MinorDmDenied> {
-    let mut found_recipient = false;
+    let has_p_tag = tags
+        .iter()
+        .any(|tag| tag.as_slice().first().map(String::as_str) == Some("p"));
+    if !has_p_tag {
+        return Err(MinorDmDenied::RecipientUnresolvable);
+    }
+    validate_p_tags_approved(user_pubkey, tags)
+}
+
+/// A kind-13 seal's true recipient is whoever holds the other half of the
+/// NIP-44 conversation key its content was encrypted under. NIP-44 v2 is
+/// authenticated (HMAC), so trial decryption against the small approved set
+/// deterministically recovers the recipient — or proves it is not approved.
+///
+/// Per NIP-59 a seal carries no tags, but any `p` tags a client does attach
+/// would become relay-routable metadata, so they must be approved too (a
+/// near-free defense-in-depth check; content stays bound by decryption). The
+/// crypto here (≤3 ECDH + HKDF + a bounded NIP-44 decrypt) runs inline: it is
+/// sub-millisecond and bounded, unlike the unwrap-batch path that fans out.
+fn validate_seal(user_keys: &Keys, event: &UnsignedEvent) -> Result<(), MinorDmDenied> {
+    let user_pubkey = user_keys.public_key();
+    validate_p_tags_approved(&user_pubkey, event.tags.as_slice())?;
+    let candidates = [user_pubkey, PINNED_KEYS[0], PINNED_KEYS[1]];
+    for candidate in &candidates {
+        if let Ok(plaintext) = nip44::decrypt(user_keys.secret_key(), candidate, &event.content) {
+            return validate_sealed_rumor(&user_pubkey, &plaintext);
+        }
+    }
+    Err(MinorDmDenied::SealNotDecryptable)
+}
+
+/// Reject any `p` tag that is not a parseable, approved pubkey. Unlike
+/// [`validate_p_tag_recipients`], zero `p` tags is fine here — used where the
+/// recipient is established by other means (the seal's decryption target).
+fn validate_p_tags_approved(user_pubkey: &PublicKey, tags: &[Tag]) -> Result<(), MinorDmDenied> {
     for tag in tags {
         let slice = tag.as_slice();
         if slice.first().map(String::as_str) != Some("p") {
             continue;
         }
-        found_recipient = true;
         let recipient = slice
             .get(1)
             .and_then(|hex| PublicKey::from_hex(hex).ok())
@@ -163,26 +254,7 @@ fn validate_p_tag_recipients(user_pubkey: &PublicKey, tags: &[Tag]) -> Result<()
             return Err(MinorDmDenied::RecipientNotApproved);
         }
     }
-    if found_recipient {
-        Ok(())
-    } else {
-        Err(MinorDmDenied::RecipientUnresolvable)
-    }
-}
-
-/// A kind-13 seal's true recipient is whoever holds the other half of the
-/// NIP-44 conversation key its content was encrypted under. NIP-44 v2 is
-/// authenticated (HMAC), so trial decryption against the small approved set
-/// deterministically recovers the recipient — or proves it is not approved.
-fn validate_seal(user_keys: &Keys, content: &str) -> Result<(), MinorDmDenied> {
-    let user_pubkey = user_keys.public_key();
-    let candidates = [user_pubkey, PINNED_KEYS[0], PINNED_KEYS[1]];
-    for candidate in &candidates {
-        if let Ok(plaintext) = nip44::decrypt(user_keys.secret_key(), candidate, content) {
-            return validate_sealed_rumor(&user_pubkey, &plaintext);
-        }
-    }
-    Err(MinorDmDenied::SealNotDecryptable)
+    Ok(())
 }
 
 /// The decrypted seal payload must be an event-shaped JSON object whose `p`
@@ -314,72 +386,56 @@ mod tests {
         );
     }
 
-    // -- sign gate: non-DM kinds untouched --------------------------------------
+    // -- sign gate: rumor/wrap kinds (14 / 15 / 1059) refused outright ----------
+    //
+    // A conformant client never asks a remote signer to sign these with the
+    // user's key (rumors are unsigned; wraps use a one-time ephemeral key), and
+    // a `p`-tag check on them is spoofable (symmetric ECDH). So they are refused
+    // regardless of recipient — closing the decoy-`p`-tag covert channel.
 
     #[test]
-    fn non_dm_kinds_sign_normally_even_with_arbitrary_p_tags() {
-        let user = Keys::generate();
-        let mallory = Keys::generate();
-        // Kind 1 note mentioning an arbitrary pubkey: public posting, not a DM.
-        let event = dm_shaped_event(1, &user, &[mallory.public_key()]);
-        assert_eq!(validate_minor_sign(&user, &event), Ok(()));
-    }
-
-    // -- sign gate: p-tag kinds (4 / 14 / 15 / 1059) ----------------------------
-
-    #[test]
-    fn rumor_to_pinned_official_is_allowed() {
+    fn rumor_kind_14_refused_outright_even_to_pinned_official() {
         let user = Keys::generate();
         let event = dm_shaped_event(14, &user, &[hq_pubkey()]);
-        assert_eq!(validate_minor_sign(&user, &event), Ok(()));
-    }
-
-    #[test]
-    fn rumor_to_arbitrary_recipient_is_refused() {
-        let user = Keys::generate();
-        let mallory = Keys::generate();
-        let event = dm_shaped_event(14, &user, &[mallory.public_key()]);
         assert_eq!(
             validate_minor_sign(&user, &event),
-            Err(MinorDmDenied::RecipientNotApproved)
+            Err(MinorDmDenied::UnverifiableDmKind)
         );
     }
 
     #[test]
-    fn group_rumor_including_one_unapproved_recipient_is_refused() {
-        // All-or-nothing, matching the clients' group send semantics.
+    fn file_message_kind_15_refused_outright() {
         let user = Keys::generate();
-        let mallory = Keys::generate();
-        let event = dm_shaped_event(14, &user, &[hq_pubkey(), mallory.public_key()]);
-        assert_eq!(
-            validate_minor_sign(&user, &event),
-            Err(MinorDmDenied::RecipientNotApproved)
-        );
-    }
-
-    #[test]
-    fn rumor_without_p_tags_is_refused_fail_closed() {
-        let user = Keys::generate();
-        let event = dm_shaped_event(14, &user, &[]);
-        assert_eq!(
-            validate_minor_sign(&user, &event),
-            Err(MinorDmDenied::RecipientUnresolvable)
-        );
-    }
-
-    #[test]
-    fn file_message_rumor_kind_15_is_gated_like_kind_14() {
-        let user = Keys::generate();
-        let mallory = Keys::generate();
         assert_eq!(
             validate_minor_sign(&user, &dm_shaped_event(15, &user, &[hq_pubkey()])),
-            Ok(())
-        );
-        assert_eq!(
-            validate_minor_sign(&user, &dm_shaped_event(15, &user, &[mallory.public_key()])),
-            Err(MinorDmDenied::RecipientNotApproved)
+            Err(MinorDmDenied::UnverifiableDmKind)
         );
     }
+
+    #[test]
+    fn gift_wrap_kind_1059_refused_outright() {
+        let user = Keys::generate();
+        assert_eq!(
+            validate_minor_sign(&user, &dm_shaped_event(1059, &user, &[hq_pubkey()])),
+            Err(MinorDmDenied::UnverifiableDmKind)
+        );
+    }
+
+    #[test]
+    fn gift_wrap_with_decoy_approved_p_tag_is_refused_bypass_closed() {
+        // The bypass the adversarial review found: a 1059 whose content is
+        // ciphertext readable by a colluding non-approved party, hidden behind a
+        // decoy approved `p` tag. Refusing 1059 outright closes it — a p-tag
+        // check would have PASSED this and signed a covert channel.
+        let user = Keys::generate();
+        let event = dm_shaped_event(1059, &user, &[hq_pubkey()]);
+        assert_eq!(
+            validate_minor_sign(&user, &event),
+            Err(MinorDmDenied::UnverifiableDmKind)
+        );
+    }
+
+    // -- sign gate: NIP-04 DM (kind 4) stays p-tag-gated ------------------------
 
     #[test]
     fn nip04_dm_kind_4_is_gated_by_p_tags() {
@@ -400,31 +456,22 @@ mod tests {
     }
 
     #[test]
-    fn gift_wrap_kind_1059_is_gated_by_p_tags() {
+    fn nip04_group_including_one_unapproved_recipient_is_refused() {
+        // All-or-nothing across p tags.
         let user = Keys::generate();
         let mallory = Keys::generate();
+        let event = dm_shaped_event(4, &user, &[hq_pubkey(), mallory.public_key()]);
         assert_eq!(
-            validate_minor_sign(&user, &dm_shaped_event(1059, &user, &[hq_pubkey()])),
-            Ok(())
-        );
-        assert_eq!(
-            validate_minor_sign(
-                &user,
-                &dm_shaped_event(1059, &user, &[mallory.public_key()])
-            ),
+            validate_minor_sign(&user, &event),
             Err(MinorDmDenied::RecipientNotApproved)
-        );
-        assert_eq!(
-            validate_minor_sign(&user, &dm_shaped_event(1059, &user, &[])),
-            Err(MinorDmDenied::RecipientUnresolvable)
         );
     }
 
     #[test]
-    fn dm_with_malformed_p_tag_is_refused_fail_closed() {
+    fn nip04_with_malformed_p_tag_is_refused_fail_closed() {
         let user = Keys::generate();
         let tag = Tag::custom(TagKind::custom("p"), ["not-a-valid-pubkey"]);
-        let event = EventBuilder::new(Kind::from(14u16), "hi")
+        let event = EventBuilder::new(Kind::from(4u16), "hi")
             .tags([tag])
             .build(user.public_key());
         assert_eq!(
@@ -434,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn dm_p_tag_with_relay_hint_extra_elements_still_validates() {
+    fn nip04_p_tag_with_relay_hint_extra_elements_still_validates() {
         // ["p", "<hex>", "<relay-url>"] is a legal NIP-10-style tag form.
         let user = Keys::generate();
         let tag = Tag::parse([
@@ -443,10 +490,45 @@ mod tests {
             "wss://relay.example.com".to_string(),
         ])
         .unwrap();
-        let event = EventBuilder::new(Kind::from(14u16), "hi")
+        let event = EventBuilder::new(Kind::from(4u16), "hi")
             .tags([tag])
             .build(user.public_key());
         assert_eq!(validate_minor_sign(&user, &event), Ok(()));
+    }
+
+    #[test]
+    fn non_dm_kind_1_ignores_content_and_p_tags() {
+        // Public posting is out of scope: a kind-1 note may carry any content
+        // (including arbitrary ciphertext) and any p tags — the steganography
+        // ceiling lives here and is not closable server-side.
+        let user = Keys::generate();
+        let mallory = Keys::generate();
+        let event = dm_shaped_event(1, &user, &[mallory.public_key()]);
+        assert_eq!(validate_minor_sign(&user, &event), Ok(()));
+    }
+
+    #[test]
+    fn gated_kind_set_matches_validator_arms() {
+        // Anti-drift (M2): every kind is_minor_gated_kind marks must be actively
+        // handled by validate_minor_sign (never fall to the permissive `_` arm),
+        // and every non-gated kind must pass even when DM-shaped. Uses a garbage
+        // seal for 13 (fails closed) and an unapproved p tag for 4.
+        let user = Keys::generate();
+        let mallory = Keys::generate();
+        for kind in 0u16..=1100 {
+            let gated = is_minor_gated_kind(Kind::from(kind));
+            let event = if kind == 13 {
+                EventBuilder::new(Kind::from(13u16), "not-ciphertext").build(user.public_key())
+            } else {
+                dm_shaped_event(kind, &user, &[mallory.public_key()])
+            };
+            let result = validate_minor_sign(&user, &event);
+            assert_eq!(
+                result.is_err(),
+                gated,
+                "kind {kind}: gated={gated} but validator result={result:?}"
+            );
+        }
     }
 
     // -- sign gate: kind-13 seal (trial decryption) ------------------------------
@@ -550,5 +632,38 @@ mod tests {
             validate_minor_sign(&user, &event),
             Err(MinorDmDenied::SealRumorInvalid)
         );
+    }
+
+    #[test]
+    fn seal_with_unapproved_outer_p_tag_is_refused() {
+        // M1: a seal decrypting to an approved recipient but carrying an
+        // unapproved `p` tag on the seal EVENT itself (relay-routable metadata)
+        // is refused before any decryption.
+        let user = Keys::generate();
+        let mallory = Keys::generate();
+        let rumor = rumor_json(&user, &[hq_pubkey()]);
+        let content =
+            nip44::encrypt(user.secret_key(), &hq_pubkey(), &rumor, nip44::Version::V2).unwrap();
+        let event = EventBuilder::new(Kind::from(13u16), content)
+            .tags([Tag::public_key(mallory.public_key())])
+            .build(user.public_key());
+        assert_eq!(
+            validate_minor_sign(&user, &event),
+            Err(MinorDmDenied::RecipientNotApproved)
+        );
+    }
+
+    #[test]
+    fn seal_with_approved_outer_p_tag_is_allowed() {
+        // The benign case of the M1 check: an outer `p` tag naming the approved
+        // recipient (as some clients do for routing) does not trip the gate.
+        let user = Keys::generate();
+        let rumor = rumor_json(&user, &[hq_pubkey()]);
+        let content =
+            nip44::encrypt(user.secret_key(), &hq_pubkey(), &rumor, nip44::Version::V2).unwrap();
+        let event = EventBuilder::new(Kind::from(13u16), content)
+            .tags([Tag::public_key(hq_pubkey())])
+            .build(user.public_key());
+        assert_eq!(validate_minor_sign(&user, &event), Ok(()));
     }
 }

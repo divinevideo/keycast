@@ -3208,6 +3208,28 @@ pub struct PubkeyResponse {
     pub npub: String,   // bech32 format
 }
 
+/// Apply the verified_minor DM containment gate (support-trust-safety#183) to a
+/// `/user/sign` request, on either the fast or slow path. Refusals surface the
+/// uniform policy-denial message (no account-state leak); the specific reason is
+/// logged server-side only. `keys` is the user's signing keypair (needed to
+/// recover a kind-13 seal's recipient by trial decryption).
+fn enforce_minor_dm_sign(
+    keys: &Keys,
+    unsigned_event: &UnsignedEvent,
+    user_pubkey: &str,
+) -> Result<(), AuthError> {
+    keycast_core::verified_minor_dm::validate_minor_sign(keys, unsigned_event).map_err(|denied| {
+        tracing::warn!(
+            event = "minor_dm_gate.sign_denied",
+            user_pubkey = %user_pubkey,
+            kind = unsigned_event.kind.as_u16(),
+            reason = %denied,
+            "verified_minor DM sign refused (/user/sign)"
+        );
+        AuthError::Forbidden("Operation denied by policy".to_string())
+    })
+}
+
 /// Fast HTTP signing endpoint - sign an event without NIP-46 relay overhead
 /// This is 10-50x faster than NIP-46 for quick operations
 pub async fn sign_event(
@@ -3244,6 +3266,21 @@ pub async fn sign_event(
     )
     .await?;
 
+    // verified_minor DM containment (support-trust-safety#183) applies to BOTH
+    // the fast and slow paths. Fetch the flag once here (only for DM-shaped
+    // kinds) so the hot fast path returns a clean 403 too, rather than the
+    // signer handler's error mapping to a 503. A missing user row fails closed.
+    let verified_minor =
+        if keycast_core::verified_minor_dm::is_minor_gated_kind(unsigned_event.kind) {
+            user_repo
+                .get_verified_minor(&user_pubkey, tenant_id)
+                .await?
+                .ok_or_else(|| AuthError::Forbidden("Operation denied by policy".to_string()))?
+                .0
+        } else {
+            false
+        };
+
     // FAST PATH: Try to use cached signer handler if in unified mode
     if let Some(ref handlers) = auth_state.state.signer_handlers {
         tracing::info!(
@@ -3261,6 +3298,13 @@ pub async fn sign_event(
         if let Some(bunker_key) = bunker_pubkey {
             if let Some(handler) = handlers.get(&bunker_key).await {
                 tracing::info!("✅ Using cached handler for user {}", user_pubkey);
+
+                // DM containment on the fast path returns a clean 403 here; the
+                // signer handler also gates as a backstop, but its error would
+                // map to a 503 through the Internal wrapper below.
+                if verified_minor {
+                    enforce_minor_dm_sign(&handler.get_keys(), &unsigned_event, &user_pubkey)?;
+                }
 
                 let signed_event = handler
                     .sign_event_direct(unsigned_event)
@@ -3307,33 +3351,10 @@ pub async fn sign_event(
         .map_err(|e| AuthError::Internal(format!("Invalid secret key bytes: {}", e)))?;
     let keys = Keys::new(secret_key.into());
 
-    // verified_minor DM containment (support-trust-safety#183). The fast path
-    // above enforces this inside the signer handler; this covers the slow path.
-    // Gated here (after key decryption) because a kind-13 seal's recipient can
-    // only be recovered with the user's conversation keys.
-    if keycast_core::verified_minor_dm::is_minor_gated_kind(unsigned_event.kind) {
-        let verified_minor = user_repo
-            .get_verified_minor(&user_pubkey, tenant_id)
-            .await?
-            // Fail closed: DM-shaped signing with unresolvable minor status
-            // is refused (unreachable in practice — personal_keys FK-cascades
-            // with users — but the gate must not default open).
-            .ok_or_else(|| AuthError::Forbidden("Operation denied by policy".to_string()))?
-            .0;
-        if verified_minor {
-            keycast_core::verified_minor_dm::validate_minor_sign(&keys, &unsigned_event).map_err(
-                |denied| {
-                    tracing::warn!(
-                        event = "minor_dm_gate.sign_denied",
-                        user_pubkey = %user_pubkey,
-                        kind = unsigned_event.kind.as_u16(),
-                        reason = %denied,
-                        "verified_minor DM sign refused (/user/sign slow path)"
-                    );
-                    AuthError::Forbidden("Operation denied by policy".to_string())
-                },
-            )?;
-        }
+    // verified_minor DM containment on the slow path (support-trust-safety#183);
+    // `verified_minor` was resolved once above and shared with the fast path.
+    if verified_minor {
+        enforce_minor_dm_sign(&keys, &unsigned_event, &user_pubkey)?;
     }
 
     // Permission validation already done above (before fast path check)
