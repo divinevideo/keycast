@@ -262,3 +262,7 @@ See [docs/TEAMS.md](./docs/TEAMS.md) for team key management documentation.
 ## License
 
 [MIT](LICENSE)
+
+---
+
+Part of [Divine](https://divine.video) — your playground for human creativity · [Brand guidelines](https://github.com/divinevideo/brand-guidelines)
