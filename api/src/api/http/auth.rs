@@ -3841,6 +3841,45 @@ pub struct ChangeKeyResponse {
     pub message: String,
 }
 
+/// Refuse a raw-key egress operation (export-key / change-key) for a
+/// `verified_minor` account (support-trust-safety#188).
+///
+/// This is the server-side complement to the app-side affordance removal
+/// (#182): Keycast holds the key for a custodial minor, so an ungated
+/// export/change-key over the headless API would let the minor extract or swap
+/// their key with just their password and bypass every other guardrail. Called
+/// at the top of the handler, before the password check and before any key
+/// material is touched, so the least code runs between authentication and the
+/// refusal. The block lifts automatically when `verified_minor` is cleared
+/// (age-up / revocation) — the same flag that drives the DM gate.
+///
+/// Fail closed: only an explicit non-minor status proceeds; `verified_minor` OR
+/// an unresolvable account (no row) is refused. The uniform policy-denial
+/// message leaks no account state; the specific reason is logged server-side.
+async fn refuse_key_egress_for_verified_minor(
+    user_repo: &UserRepository,
+    tenant_id: i64,
+    user_pubkey: &str,
+    operation: &str,
+) -> Result<(), AuthError> {
+    let is_non_minor = matches!(
+        user_repo.get_verified_minor(user_pubkey, tenant_id).await?,
+        Some((false, _))
+    );
+    if !is_non_minor {
+        tracing::warn!(
+            event = "minor_key_egress_denied",
+            user_pubkey = %user_pubkey,
+            operation = %operation,
+            "verified_minor raw-key egress refused"
+        );
+        return Err(AuthError::Forbidden(
+            "Operation denied by policy".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Export user's private key (requires password and verified email)
 pub async fn export_key(
     tenant: crate::api::tenant::TenantExtractor,
@@ -3852,6 +3891,10 @@ pub async fn export_key(
     let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
+    let user_repo = UserRepository::new(pool.clone());
+
+    // verified_minor accounts cannot export their raw key (support-trust-safety#188).
+    refuse_key_egress_for_verified_minor(&user_repo, tenant_id, &user_pubkey, "export_key").await?;
 
     // Extract password and format from request
     let password = req
@@ -3862,7 +3905,6 @@ pub async fn export_key(
     let format = req.get("format").and_then(|v| v.as_str()).unwrap_or("nsec");
 
     // Verify password and email verification status
-    let user_repo = UserRepository::new(pool.clone());
     let result = user_repo
         .find_with_password_and_verified(&user_pubkey, tenant_id)
         .await?;
@@ -3926,9 +3968,12 @@ pub async fn change_key(
     let old_pubkey = extract_user_from_token(&headers, tenant_id).await?;
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
+    let user_repo = UserRepository::new(pool.clone());
+
+    // verified_minor accounts cannot swap to a self-held key (support-trust-safety#188).
+    refuse_key_egress_for_verified_minor(&user_repo, tenant_id, &old_pubkey, "change_key").await?;
 
     // Get user's email and verify password
-    let user_repo = UserRepository::new(pool.clone());
     let (email, password_hash) = user_repo
         .get_credentials(&old_pubkey, tenant_id)
         .await?
