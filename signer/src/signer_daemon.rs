@@ -122,24 +122,51 @@ impl Nip46Handler {
 
     /// Check that the user's account is active (not suspended or banned).
     /// Only applies to OAuth authorizations (personal keys tied to a user account).
-    /// Team authorizations don't have user rows — they're managed through team admin.
-    async fn check_user_active(&self) -> SignerResult<()> {
+    /// Team authorizations don't have user rows — they're managed through team
+    /// admin, are not minor accounts, and return `false` for the flag.
+    ///
+    /// Returns the account's `verified_minor` flag (same row, no extra query)
+    /// so callers can apply the DM containment gate (support-trust-safety#183).
+    async fn check_user_active(&self) -> SignerResult<bool> {
         if !self.is_oauth {
-            return Ok(());
+            return Ok(false);
         }
         let user_pubkey = self.user_keys.public_key().to_hex();
-        let status: Option<(String,)> =
-            sqlx::query_as("SELECT status FROM users WHERE pubkey = $1 AND tenant_id = $2")
-                .bind(&user_pubkey)
-                .bind(self.tenant_id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let status: Option<(String, bool)> = sqlx::query_as(
+            "SELECT status, verified_minor FROM users WHERE pubkey = $1 AND tenant_id = $2",
+        )
+        .bind(&user_pubkey)
+        .bind(self.tenant_id)
+        .fetch_optional(&self.pool)
+        .await?;
 
         match status {
-            Some((s,)) if s == "active" => Ok(()),
+            Some((s, verified_minor)) if s == "active" => Ok(verified_minor),
             Some(_) => Err(SignerError::permission_denied("Account restricted")),
             None => Err(SignerError::permission_denied("User not found")),
         }
+    }
+
+    /// Account-level gates that must run before any signing: active status and
+    /// the verified_minor DM containment gate (support-trust-safety#183).
+    /// Both relay-dispatched (`handle_sign_event`) and direct
+    /// (`sign_event_direct`) signing must pass through here.
+    async fn check_user_sign_gates(&self, unsigned_event: &UnsignedEvent) -> SignerResult<()> {
+        let verified_minor = self.check_user_active().await?;
+        if verified_minor {
+            keycast_core::verified_minor_dm::validate_minor_sign(&self.user_keys, unsigned_event)
+                .map_err(|denied| {
+                tracing::warn!(
+                    event = "minor_dm_gate.sign_denied",
+                    user_pubkey = %self.user_keys.public_key().to_hex(),
+                    kind = unsigned_event.kind.as_u16(),
+                    reason = %denied,
+                    "verified_minor DM sign refused (NIP-46 signer)"
+                );
+                SignerError::permission_denied("Operation denied by policy")
+            })?;
+        }
+        Ok(())
     }
 
     /// Validate permissions before signing an event.
@@ -194,7 +221,26 @@ impl Nip46Handler {
         plaintext: &str,
         recipient_pubkey: &PublicKey,
     ) -> SignerResult<()> {
-        self.check_user_active().await?;
+        let verified_minor = self.check_user_active().await?;
+        // verified_minor DM containment (support-trust-safety#183): the
+        // encryption primitive is where a NIP-17 seal's recipient is in the
+        // clear, so this is the containment point for DM egress.
+        if verified_minor {
+            keycast_core::verified_minor_dm::validate_minor_encrypt(
+                &self.user_keys.public_key(),
+                recipient_pubkey,
+            )
+            .map_err(|denied| {
+                tracing::warn!(
+                    event = "minor_dm_gate.encrypt_denied",
+                    user_pubkey = %self.user_keys.public_key().to_hex(),
+                    recipient = %recipient_pubkey.to_hex(),
+                    reason = %denied,
+                    "verified_minor DM encrypt refused (NIP-46 signer)"
+                );
+                SignerError::permission_denied("Operation denied by policy")
+            })?;
+        }
         // Load permissions based on authorization type
         let permissions = if self.is_oauth {
             let oauth_auth =
@@ -241,6 +287,8 @@ impl Nip46Handler {
         ciphertext: &str,
         sender_pubkey: &PublicKey,
     ) -> SignerResult<()> {
+        // Status gate only: decrypt is ingress, out of the DM containment
+        // gate's egress-only scope (support-trust-safety#183).
         self.check_user_active().await?;
         // Load permissions based on authorization type
         let permissions = if self.is_oauth {
@@ -1698,8 +1746,8 @@ impl SigningHandler for Nip46Handler {
             self.authorization_id
         );
 
-        // Check account status and policy permissions before signing
-        self.check_user_active().await?;
+        // Check account status, minor DM gate, and policy permissions before signing
+        self.check_user_sign_gates(&unsigned_event).await?;
         self.validate_permissions_for_sign(&unsigned_event).await?;
 
         // Canonicalize the pubkey to match the signer keys, matching SigningSession::sign_event behavior.
@@ -1798,8 +1846,8 @@ impl Nip46Handler {
             content,
         );
 
-        // Check account status and policy permissions before signing
-        self.check_user_active().await?;
+        // Check account status, minor DM gate, and policy permissions before signing
+        self.check_user_sign_gates(&unsigned_event).await?;
         self.validate_permissions_for_sign(&unsigned_event).await?;
 
         // Sign the event with user keys (CPU-bound, use spawn_blocking)

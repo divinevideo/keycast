@@ -229,9 +229,15 @@ async fn setup_account(
     insert_user(pool, tenant_id, &pubkey, verified_minor).await;
     create_personal_key(pool, tenant_id, &pubkey, &keys, key_manager).await;
     let redirect_origin = format!("https://minor-dm-{}.example.com", Uuid::new_v4());
-    let bunker_pubkey = create_oauth_authorization(pool, tenant_id, &pubkey, &redirect_origin).await;
-    let token = build_self_signed_ucan(&keys, tenant_id, &redirect_origin, Some(&bunker_pubkey)).await;
-    TestAccount { keys, pubkey, token }
+    let bunker_pubkey =
+        create_oauth_authorization(pool, tenant_id, &pubkey, &redirect_origin).await;
+    let token =
+        build_self_signed_ucan(&keys, tenant_id, &redirect_origin, Some(&bunker_pubkey)).await;
+    TestAccount {
+        keys,
+        pubkey,
+        token,
+    }
 }
 
 async fn invoke_rpc(
@@ -280,7 +286,10 @@ const DENIED_MSG: &str = "Operation denied by policy";
 fn assert_rpc_denied(err: RpcError) {
     match err {
         RpcError::Auth(AuthError::Forbidden(msg)) => {
-            assert_eq!(msg, DENIED_MSG, "denial must use the uniform policy message");
+            assert_eq!(
+                msg, DENIED_MSG,
+                "denial must use the uniform policy message"
+            );
         }
         other => panic!("expected Forbidden({DENIED_MSG}), got: {other:?}"),
     }

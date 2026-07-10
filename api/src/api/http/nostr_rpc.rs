@@ -311,15 +311,14 @@ async fn check_user_status_active(
     user_pubkey_hex: &str,
     tenant_id: i64,
 ) -> Result<bool, RpcError> {
-    let status: Option<(String, bool)> =
-        sqlx::query_as("SELECT status, verified_minor FROM users WHERE pubkey = $1 AND tenant_id = $2")
-            .bind(user_pubkey_hex)
-            .bind(tenant_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| {
-                RpcError::Internal(format!("Database error checking user status: {}", e))
-            })?;
+    let status: Option<(String, bool)> = sqlx::query_as(
+        "SELECT status, verified_minor FROM users WHERE pubkey = $1 AND tenant_id = $2",
+    )
+    .bind(user_pubkey_hex)
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| RpcError::Internal(format!("Database error checking user status: {}", e)))?;
 
     match status {
         Some((s, verified_minor)) if s == "active" => Ok(verified_minor),

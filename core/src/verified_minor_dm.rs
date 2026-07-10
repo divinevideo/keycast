@@ -147,10 +147,7 @@ pub fn validate_minor_sign(user_keys: &Keys, event: &UnsignedEvent) -> Result<()
 /// Every `p` tag must carry a parseable, approved pubkey, and at least one
 /// `p` tag must be present — a DM shape with no recipient is unresolvable and
 /// therefore refused.
-fn validate_p_tag_recipients(
-    user_pubkey: &PublicKey,
-    tags: &[Tag],
-) -> Result<(), MinorDmDenied> {
+fn validate_p_tag_recipients(user_pubkey: &PublicKey, tags: &[Tag]) -> Result<(), MinorDmDenied> {
     let mut found_recipient = false;
     for tag in tags {
         let slice = tag.as_slice();
@@ -192,10 +189,7 @@ fn validate_seal(user_keys: &Keys, content: &str) -> Result<(), MinorDmDenied> {
 /// tags (the rumor's stated recipients, possibly a group) are all approved.
 /// No `p` tags is fine: the actual recipient is already proven by which
 /// conversation key decrypted the seal.
-fn validate_sealed_rumor(
-    user_pubkey: &PublicKey,
-    plaintext: &str,
-) -> Result<(), MinorDmDenied> {
+fn validate_sealed_rumor(user_pubkey: &PublicKey, plaintext: &str) -> Result<(), MinorDmDenied> {
     let rumor: serde_json::Value =
         serde_json::from_str(plaintext).map_err(|_| MinorDmDenied::SealRumorInvalid)?;
     let tags = rumor
@@ -414,7 +408,10 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            validate_minor_sign(&user, &dm_shaped_event(1059, &user, &[mallory.public_key()])),
+            validate_minor_sign(
+                &user,
+                &dm_shaped_event(1059, &user, &[mallory.public_key()])
+            ),
             Err(MinorDmDenied::RecipientNotApproved)
         );
         assert_eq!(

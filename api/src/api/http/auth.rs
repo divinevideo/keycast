@@ -3318,13 +3318,11 @@ pub async fn sign_event(
             // Fail closed: DM-shaped signing with unresolvable minor status
             // is refused (unreachable in practice — personal_keys FK-cascades
             // with users — but the gate must not default open).
-            .ok_or_else(|| {
-                AuthError::Forbidden("Operation denied by policy".to_string())
-            })?
+            .ok_or_else(|| AuthError::Forbidden("Operation denied by policy".to_string()))?
             .0;
         if verified_minor {
-            keycast_core::verified_minor_dm::validate_minor_sign(&keys, &unsigned_event)
-                .map_err(|denied| {
+            keycast_core::verified_minor_dm::validate_minor_sign(&keys, &unsigned_event).map_err(
+                |denied| {
                     tracing::warn!(
                         event = "minor_dm_gate.sign_denied",
                         user_pubkey = %user_pubkey,
@@ -3333,7 +3331,8 @@ pub async fn sign_event(
                         "verified_minor DM sign refused (/user/sign slow path)"
                     );
                     AuthError::Forbidden("Operation denied by policy".to_string())
-                })?;
+                },
+            )?;
         }
     }
 
