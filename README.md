@@ -1,14 +1,18 @@
 # Keycast
 
-OAuth 2.0 remote signing for Nostr. Users authenticate once, apps get signing access via REST API or NIP-46.
+Keycast is the authentication and remote-signing service for [Divine](https://divine.video). Users sign in once, and apps get permission to sign Nostr events on their behalf — over a plain HTTPS API or over NIP-46 — without ever handling a raw private key. Keys are encrypted server-side; signing happens in Keycast. It runs in production at [login.divine.video](https://login.divine.video).
 
-## What is Keycast?
+## Features
 
-Keycast is a managed key custody service for Nostr apps. Users create an account (or import their nsec), and apps request signing permission via OAuth. Keys are encrypted server-side; signing happens via HTTP RPC or NIP-46 bunker URL.
-
-**For mobile apps**: No browser extensions, no relay infrastructure to manage. One OAuth flow, then sign events via HTTPS or connect with the returned bunker URL.
-
-**For users**: One identity across all apps. Revoke access per-app anytime. Import existing keys or let Keycast generate one.
+- **OAuth 2.0 with PKCE** — standard authorization-code flow. Apps redirect users to Keycast, users authenticate or register, and apps receive an access token plus a NIP-46 bunker URL.
+- **Two signing transports** — sign via HTTP RPC (`POST /api/nostr` with a bearer token) for low latency, or via a NIP-46 bunker URL over relays for compatibility with existing Nostr tooling. Both produce identical signed events.
+- **UCAN-based sessions** — access is carried by UCAN capability tokens, presented as a bearer token or a `keycast_session` cookie. There is a single auth path, not parallel token schemes.
+- **Server-side key custody** — private keys are encrypted at rest with AES-256-GCM. The master key lives in a pluggable key manager: a local file, Google Cloud KMS, or AWS KMS.
+- **Email/password accounts with key import** — users can let Keycast generate a Nostr key or import an existing `nsec`. Email verification and password reset are built in.
+- **Fine-grained permissions** — each authorization references a policy built from reusable permission templates (allowed event kinds, encryption targets, and so on). The signer checks the policy before every signature.
+- **Multi-tenant** — one deployment serves multiple domains, isolating users, OAuth clients, and policies per tenant.
+- **Team key management** — shared team keys with role-based access, inherited from the project's origins (see [History](#history--team-key-management)).
+- **Horizontal scale** — instances coordinate through a Redis/Valkey consistent hashring so NIP-46 relay traffic is distributed without duplicate signing.
 
 ## Client Libraries
 
@@ -16,6 +20,8 @@ Keycast is a managed key custody service for Nostr apps. Users create an account
 |----------|---------|------|
 | Flutter/Dart | keycast_flutter | [Demo + Guide](https://github.com/divinevideo/keycast_flutter_demo) |
 | JS/TS | keycast-login | [README](./keycast-login) |
+
+For other languages, call the [HTTP API](#http-api) directly.
 
 ## Quick Start
 
@@ -89,7 +95,7 @@ if (session) {
 }
 ```
 
-See [keycast-login README](./keycast-login/README.md) for full API reference including BYOK (Bring Your Own Key) flows.
+See the [keycast-login README](./keycast-login/README.md) for the full API reference, including BYOK (Bring Your Own Key) flows.
 
 ### HTTP API
 
@@ -125,139 +131,167 @@ curl -X POST https://login.divine.video/api/nostr \
   }'
 ```
 
-## How It Works
+An OpenAPI description is served at `/docs/openapi.json` and lives at [`api/openapi.yaml`](./api/openapi.yaml).
 
-**OAuth flow**: App redirects to Keycast. User authenticates (or registers). App receives access token and bunker URL.
+## Architecture
 
-**Two signing transports**:
+Keycast is a Rust [Cargo workspace](./Cargo.toml) plus a SvelteKit web frontend. Everything runs from one binary — the API server and the NIP-46 signer share a process so decrypted keys can be cached in memory and reused across both signing paths.
 
-| Transport | Latency | Use Case |
-|-----------|---------|----------|
-| HTTP RPC | ~50ms | Direct HTTPS with access token |
-| NIP-46 | ~200-500ms | Standard Nostr protocol via relays |
+### Crates
 
-Both return the same signed events. Use HTTP RPC for lower latency; use NIP-46 bunker URL with existing nostr-tools/NDK integrations.
+| Crate | Role |
+|-------|------|
+| [`keycast`](./keycast) | The unified binary ([`keycast/src/main.rs`](./keycast/src/main.rs)). Boots the Axum HTTP server and the signer daemon in one process, wires up the database, key manager, and cluster coordinator, and handles graceful shutdown. Also runs migrations with `keycast --migrate`. |
+| [`api`](./api) | Axum HTTP layer (`keycast_api`): OAuth endpoints, email/password auth, sessions, user and profile management, the `/api/nostr` HTTP RPC signing path, admin tooling, teams, policies, and ATProto provisioning. UCAN/DPoP verification lives in [`api/src/ucan_auth/`](./api/src/ucan_auth). Handlers stay thin and defer to `core`. |
+| [`core`](./core) | Shared business logic (`keycast_core`): database models, the encryption/key-manager abstractions, UCAN and session handling, OAuth state, signing handlers, and the `CustomPermission` trait. Treated as the source of truth; encrypted key material only leaves `core`'s key-manager abstractions while actively signing. |
+| [`signer`](./signer) | The NIP-46 signer daemon (`keycast_signer`): subscribes to the configured relays, routes incoming kind-24133 requests by recipient pubkey, and drives a work queue that decrypts, checks policy, signs, and replies. |
+| [`cluster-hashring`](./cluster-hashring) | Redis/Valkey-backed cluster coordination: instance registration, heartbeats, and a consistent hashring (with Valkey IAM support) that assigns each bunker pubkey to exactly one instance so relay traffic is not signed twice. |
+| [`tools/loadtest`](./tools/loadtest) | Load-testing tool for the signing paths. |
 
-**Key encryption**: AES-256-GCM at rest in PostgreSQL. Configure key management with `KMS_PROVIDER=file|gcp|aws`.
+The SvelteKit frontend lives in [`web/`](./web) (Bun for package management). Database migrations live in [`database/migrations/`](./database/migrations).
 
-## API Reference
+### How OAuth, UCAN, and NIP-46 fit together
 
-### OAuth Endpoints
+1. An app sends the user to `/api/oauth/authorize` with its `client_id` and a PKCE challenge.
+2. The user authenticates (or registers) and approves the request. Keycast issues a short-lived authorization code.
+3. The app exchanges the code at `/api/oauth/token` and receives two things: an **access token** (a UCAN capability token) and a **bunker URL** (`bunker://<pubkey>?relay=…&secret=…`).
+4. From there the app can sign either way:
+   - **HTTP RPC** — `POST /api/nostr` with `Authorization: Bearer <access_token>`. The unified binary signs from its in-memory key cache for low latency.
+   - **NIP-46** — connect to the bunker URL over the configured relays. The signer daemon picks up the request, checks the authorization's policy, signs, and replies on the relay.
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/oauth/authorize` | GET | Start OAuth flow (redirect user here) |
-| `/api/oauth/token` | POST | Exchange code for access_token + bunker_url |
+Every authorization carries a policy, and the signer enforces it before producing a signature. Revocation is a soft delete (`revoked_at`), so a user can approve the same app on multiple devices and revoke any one of them independently.
 
-### RPC Methods
+### Where it fits in the Divine platform
 
-POST to `/api/nostr` with `Authorization: Bearer <access_token>`:
+Keycast is Divine's login and signing service. Divine apps — web and mobile — send users through Keycast's OAuth flow to get a Divine identity, then sign Nostr events through it rather than shipping key material into each client. It can also provision ATProto/Bluesky handles for those identities when a control plane is configured. Because keys stay in Keycast, the rest of the platform never has to hold a user's private key.
 
-| Method | Description |
-|--------|-------------|
-| `get_public_key` | Get user's public key (hex) |
-| `sign_event` | Sign an unsigned event |
-| `nip44_encrypt` / `nip44_decrypt` | NIP-44 encryption |
-| `nip04_encrypt` / `nip04_decrypt` | NIP-04 encryption |
+For a deeper walkthrough of the data model and flows, see [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md).
 
-## Self-Hosting
+## Getting Started
+
+### Prerequisites
+
+- Rust (the toolchain is pinned in [`rust-toolchain.toml`](./rust-toolchain.toml))
+- [Bun](https://bun.sh) for the web app and the dev scripts
+- Docker (Postgres and Redis are provided via [`docker-compose.deps.yml`](./docker-compose.deps.yml))
+- For the full test/dev loop: `sqlx-cli`, `cargo-nextest`, and `cargo-watch`
+
+### Local development
 
 ```bash
-git clone https://github.com/ArcadeLabsInc/keycast.git
+git clone https://github.com/divinevideo/keycast.git
 cd keycast
+
 bun install
 
-# Generate encryption key
+# Generate a local master encryption key
 bun run key:generate
 
 # Configure environment
 cp .env.example .env
-# Edit DATABASE_URL, SERVER_NSEC, ALLOWED_ORIGINS
+# Edit at least DATABASE_URL, SERVER_NSEC, ALLOWED_ORIGINS, BUNKER_RELAYS, REDIS_URL
 
-# Run with Docker
+# Start Postgres + Redis, the Rust API + signer (cargo watch), and the web app
+bun run dev
+```
+
+`bun run dev` runs the API and signer (the `keycast` binary) alongside the SvelteKit frontend. Common tasks:
+
+```bash
+bun run build        # cargo build --release --bin keycast
+bun run db:migrate   # apply database migrations
+bun run db:reset     # recreate the local dev database
+bun run test         # full workspace + integration test suite (spins up Postgres + Redis)
+bun run check        # cargo fmt --check, clippy, and cargo test --workspace
+```
+
+See [`docs/DEVELOPMENT.md`](./docs/DEVELOPMENT.md) for the full local setup, and [`AGENTS.md`](./AGENTS.md) / [`CONTRIBUTING.md`](./CONTRIBUTING.md) for workflow and contribution guidelines.
+
+### Self-hosting with Docker
+
+```bash
+cp .env.example .env
+# Edit DATABASE_URL, SERVER_NSEC, ALLOWED_ORIGINS, BUNKER_RELAYS, REDIS_URL, etc.
+
+bun run key:generate       # generate the master encryption key
 docker compose up -d --build
 ```
 
-See [DEVELOPMENT.md](./docs/DEVELOPMENT.md) for local development setup.
+## Configuration
 
-### Environment Variables
+Configuration is read from the environment (a `.env` file works locally). The binary validates required variables at startup and exits with a clear error if any are missing. See [`.env.example`](./.env.example) for the fully annotated list.
 
-#### Required
+### Required
 
 | Variable | Description |
 |----------|-------------|
 | `DATABASE_URL` | PostgreSQL connection string |
-| `SERVER_NSEC` | Server's Nostr secret key for signing tokens |
-| `MASTER_KEY_PATH` | Path to encryption key file |
+| `REDIS_URL` | Redis/Valkey URL for cluster coordination |
+| `SERVER_NSEC` | Server's Nostr secret key, used to sign UCAN session tokens (hex or `nsec`) |
+| `ALLOWED_ORIGINS` | Comma-separated CORS origins (wildcard subdomains supported) |
+| `BUNKER_RELAYS` | Comma-separated NIP-46 relay URLs the signer connects to (no default) |
+| `MASTER_KEY_PATH` | Path to the master key file — required when `KMS_PROVIDER=file` |
 
-#### Email (SendGrid)
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SENDGRID_API_KEY` | *(none)* | If set, uses SendGrid; otherwise logs emails to console |
-| `FROM_EMAIL` | `noreply@keycast.app` | Sender email address |
-| `FROM_NAME` | `Divine` | Sender display name |
-| `BASE_URL` | `https://login.divine.video` | Base URL for email verification links |
-| `DISABLE_EMAILS` | *(none)* | If set (any value), skips sending emails |
-
-#### Authentication & OAuth
+### Encryption / KMS
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TOKEN_EXPIRY_SECONDS` | `86400` (24 hours) | JWT token expiry |
-| `APP_URL` | `https://login.divine.video` | Fallback URL for OAuth callbacks |
-| `ALLOWED_PUBKEYS` | *(none)* | Comma-separated admin pubkeys whitelist |
-| `ALLOWED_ORIGINS` | *(none)* | CORS origins (comma-separated) |
-| `DPOP_REPLAY_FAIL_OPEN` | `false` | DPoP replay cache outage mode (`false` fail-closed when Redis is unavailable/not configured, `true` dev-only per-instance fallback) |
-
-#### Multi-tenancy
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `BUNKER_RELAYS` | *(required)* | NIP-46 relay URLs (comma-separated) |
-| `ALLOWED_TENANT_DOMAINS` | *(none)* | If set, restricts auto-provisioning to these domains |
-
-#### Performance
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `HANDLER_CACHE_SIZE` | `1000000` | Max entries in HTTP handler cache |
-
-#### Encryption
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `KMS_PROVIDER` | `file` | Key manager backend: `file`, `gcp`, or `aws` |
+| `KMS_PROVIDER` | `file` | Master-key backend: `file`, `gcp`, or `aws` |
 | `MASTER_KEY_PATH` | `./master.key` | Required when `KMS_PROVIDER=file` |
 | `GCP_PROJECT_ID` | *(none)* | Required when `KMS_PROVIDER=gcp` |
-| `AWS_KMS_KEY_ID` | *(none)* | Required when `KMS_PROVIDER=aws` (key ID/ARN/alias) |
+| `AWS_KMS_KEY_ID` | *(none)* | Required when `KMS_PROVIDER=aws` (key ID, ARN, or alias) |
 | `AWS_REGION` | `us-east-1` | AWS KMS region when `KMS_PROVIDER=aws` |
 | `USE_GCP_KMS` | *(legacy)* | Backward compatibility only; if `KMS_PROVIDER` is also set, `KMS_PROVIDER` wins |
 
-#### KMS Provider Migration (`USE_GCP_KMS` -> `KMS_PROVIDER`)
+Build with AWS support when using `KMS_PROVIDER=aws`: `cargo build --release --bin keycast --features aws`. The key needs `kms:Encrypt`, `kms:Decrypt`, and `kms:DescribeKey`.
 
-- Legacy behavior: when `KMS_PROVIDER` is unset, `USE_GCP_KMS=true` selects `gcp`, otherwise `file`.
-- Recommended behavior: set `KMS_PROVIDER` explicitly in every environment.
-- If both variables are set and disagree, runtime uses `KMS_PROVIDER` as source of truth.
-- Safe rollout:
-  1. Set `KMS_PROVIDER` to your current effective provider.
-  2. Deploy and verify startup/config validation succeeds.
-  3. Remove legacy `USE_GCP_KMS` once validated.
+### Multi-tenancy
 
-#### AWS KMS Notes
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ALLOWED_TENANT_DOMAINS` | *(none)* | Restricts serving to these domains (recommended for production) |
+| `ENABLE_TENANT_AUTO_PROVISIONING` | `false` | Auto-create a tenant for unknown domains (development only) |
 
-- Build with AWS support when using `KMS_PROVIDER=aws`:
-  - `cargo build --release --bin keycast --features aws`
-- Minimum IAM permissions for the configured KMS key:
-  - `kms:Encrypt`
-  - `kms:Decrypt`
-  - `kms:DescribeKey`
+If neither is set, requests from unknown domains are rejected.
+
+### Email (SendGrid)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SENDGRID_API_KEY` | *(none)* | If set, sends via SendGrid; required in production unless `DISABLE_EMAILS=true` |
+| `DISABLE_EMAILS` | *(none)* | Set to `true` to explicitly disable email delivery |
+| `FROM_EMAIL` | — | Sender email address |
+| `FROM_NAME` | `Divine` | Sender display name |
+| `BASE_URL` | — | Base URL used in email verification links |
+
+### Other common variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `APP_URL` | `https://login.divine.video` | Fallback URL for OAuth callbacks / frontend runtime config |
+| `ALLOWED_PUBKEYS` | *(none)* | Comma-separated admin pubkey allowlist |
+| `DPOP_REPLAY_FAIL_OPEN` | `false` | DPoP replay-cache outage mode (`false` = fail-closed) |
+| `DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL` | *(none)* | ATProto provisioning control plane; endpoints fail closed if unset |
+| `SHOW_TEAMS_FUNCTIONALITY` | `false` | Show the team-management UI in the frontend |
+| `RUST_LOG` | `info` | Log filter |
+
+## Deployment
+
+Production runs on Google Cloud in `us-central1`. The deploy pipeline is a single command:
+
+```bash
+bun run deploy   # gcloud builds submit --config=cloudbuild.yaml
+```
+
+[`cloudbuild.yaml`](./cloudbuild.yaml) builds the container image, runs database migrations as a job (`keycast --migrate`, using SQLx's embedded migrator), and rolls out the new revision. Migrations run before the new revision takes traffic so the schema always matches the running code.
+
+Because decrypted keys are cached per instance and the NIP-46 signer holds long-lived relay connections, the service runs with a minimum instance count and session affinity, and the binary implements a phased graceful shutdown sized to the platform's SIGTERM grace period. For the full production topology, resources, and operational runbook, see [`docs/DEPLOYMENT.md`](./docs/DEPLOYMENT.md).
 
 ## History & Team Key Management
 
-Keycast started as a team-based key management system, forked from [erskingardner/keycast](https://github.com/erskingardner/keycast). That original functionality—shared team keys with role-based access and custom permission policies—is still available but works via manual bunker URL distribution rather than OAuth.
+Keycast started as a team-based key management system, forked from [erskingardner/keycast](https://github.com/erskingardner/keycast). That original functionality — shared team keys with role-based access and custom permission policies — is still available but works via manual bunker URL distribution rather than OAuth.
 
-See [docs/TEAMS.md](./docs/TEAMS.md) for team key management documentation.
+See [`docs/TEAMS.md`](./docs/TEAMS.md) for team key management documentation.
 
 ## License
 
@@ -266,3 +300,5 @@ See [docs/TEAMS.md](./docs/TEAMS.md) for team key management documentation.
 ---
 
 Part of [Divine](https://divine.video) — your playground for human creativity · [Brand guidelines](https://github.com/divinevideo/brand-guidelines)
+</content>
+</invoke>
