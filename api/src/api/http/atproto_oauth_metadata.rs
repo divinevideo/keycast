@@ -21,8 +21,9 @@ pub struct AuthorizationServerMetadata {
 }
 
 pub fn authorization_server_origin() -> String {
-    std::env::var("APP_URL")
+    std::env::var("ATPROTO_ENTRYWAY_ORIGIN")
         .ok()
+        .or_else(|| std::env::var("APP_URL").ok())
         .or_else(|| std::env::var("VITE_DOMAIN").ok())
         .and_then(|raw| {
             Url::parse(&raw).ok().and_then(|url| {
