@@ -2553,6 +2553,7 @@ mod tests {
         cleanup_user(&pool, &h2).await;
         cleanup_user(&pool, &h3).await;
     }
+
     #[tokio::test]
     async fn test_clear_verified_minor_clears_flag_and_timestamp() {
         let pool = setup_pool().await;
