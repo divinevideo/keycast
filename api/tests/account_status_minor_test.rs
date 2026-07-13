@@ -5,7 +5,7 @@
 
 mod common;
 
-use keycast_core::repositories::UserRepository;
+use keycast_core::repositories::{AccountStatusWithMinorRow, UserRepository};
 use nostr_sdk::Keys;
 use sqlx::PgPool;
 
@@ -43,11 +43,16 @@ async fn approved_minor_surfaces_flag_while_active() {
     let repo = UserRepository::new(pool.clone());
     let pubkey = insert_user(&pool, true).await;
 
-    let (_email, _email_verified, status, _suspended_reason, verified_minor, verified_minor_at) =
-        repo.get_account_status_with_minor(&pubkey, TENANT_ID)
-            .await
-            .expect("query ok")
-            .expect("user exists");
+    let AccountStatusWithMinorRow {
+        status,
+        verified_minor,
+        verified_minor_at,
+        ..
+    } = repo
+        .get_account_status_with_minor(&pubkey, TENANT_ID)
+        .await
+        .expect("query ok")
+        .expect("user exists");
 
     // The whole point of keycast#263: an approved minor is `active`, yet the flag must
     // still come through so clients can detect the protected-minor state.
@@ -69,7 +74,11 @@ async fn regular_user_reports_not_a_minor() {
     let repo = UserRepository::new(pool.clone());
     let pubkey = insert_user(&pool, false).await;
 
-    let (.., verified_minor, verified_minor_at) = repo
+    let AccountStatusWithMinorRow {
+        verified_minor,
+        verified_minor_at,
+        ..
+    } = repo
         .get_account_status_with_minor(&pubkey, TENANT_ID)
         .await
         .expect("query ok")

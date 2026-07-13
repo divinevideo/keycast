@@ -18,8 +18,9 @@ use crate::brand::BRAND_NAME;
 use crate::nip98;
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
-    CreateOAuthAuthorizationParams, OAuthAuthorizationRepository, OAuthCodeRepository,
-    PersonalKeysRepository, PolicyRepository, UserRepository,
+    AccountStatusWithMinorRow, CreateOAuthAuthorizationParams, OAuthAuthorizationRepository,
+    OAuthCodeRepository, PersonalKeysRepository, PolicyRepository, UserRepository,
+    VerifiedMinorRow,
 };
 use keycast_core::traits::CustomPermission;
 use nostr_sdk::{Keys, PublicKey, ToBech32, UnsignedEvent};
@@ -2426,14 +2427,14 @@ pub async fn get_account_status(
         .await?;
 
     match user {
-        Some((
+        Some(AccountStatusWithMinorRow {
             email,
             email_verified,
             status,
             suspended_reason,
             verified_minor,
             verified_minor_at,
-        )) => Ok(Json(AccountStatusResponse::from_account_row(
+        }) => Ok(Json(AccountStatusResponse::from_account_row(
             user_pubkey,
             email,
             email_verified,
@@ -3276,7 +3277,7 @@ pub async fn sign_event(
                 .get_verified_minor(&user_pubkey, tenant_id)
                 .await?
                 .ok_or_else(|| AuthError::Forbidden("Operation denied by policy".to_string()))?
-                .0
+                .verified_minor
         } else {
             false
         };
@@ -3914,7 +3915,10 @@ async fn refuse_key_egress_for_verified_minor(
 ) -> Result<(), AuthError> {
     let is_non_minor = matches!(
         user_repo.get_verified_minor(user_pubkey, tenant_id).await?,
-        Some((false, _))
+        Some(VerifiedMinorRow {
+            verified_minor: false,
+            ..
+        })
     );
     if !is_non_minor {
         tracing::warn!(
