@@ -15,8 +15,8 @@ use crate::api::error::{ApiError, ApiResult};
 use crate::api::extractors::UcanAuth;
 use keycast_core::repositories::{
     test_redirect_pattern, AdminAuditEventRecord, AdminAuditEventRepository, AuthEventRepository,
-    ClaimTokenRepository, OAuthAuthorizationRepository, RegisteredClient,
-    RegisteredClientRepository, RepositoryError, UserRepository,
+    ClaimTokenRepository, FullAdminStatusRow, OAuthAuthorizationRepository, RegisteredClient,
+    RegisteredClientRepository, RepositoryError, UserRepository, VerifiedMinorRow,
 };
 use keycast_core::types::claim_token::generate_claim_token;
 use keycast_core::types::user::UserStatus;
@@ -1860,7 +1860,13 @@ pub async fn get_user_status_admin(
     let tenant_id = tenant.0.id;
     let user_repo = UserRepository::new(auth_state.state.db.clone());
 
-    let (status, suspended_reason, suspended_at, verified_minor, verified_minor_at) = user_repo
+    let FullAdminStatusRow {
+        status,
+        suspended_reason,
+        suspended_at,
+        verified_minor,
+        verified_minor_at,
+    } = user_repo
         .get_full_admin_status(&pubkey, tenant_id)
         .await?
         .ok_or_else(|| ApiError::not_found("User not found"))?;
@@ -1929,10 +1935,16 @@ pub async fn set_user_status_admin(
 
     // set_user_status doesn't return verified_minor, so fetch it separately.
     // This is the write path (infrequent), so the extra query is acceptable.
-    let (verified_minor, verified_minor_at) = user_repo
+    let VerifiedMinorRow {
+        verified_minor,
+        verified_minor_at,
+    } = user_repo
         .get_verified_minor(&pubkey, tenant_id)
         .await?
-        .unwrap_or((false, None));
+        .unwrap_or(VerifiedMinorRow {
+            verified_minor: false,
+            verified_minor_at: None,
+        });
 
     Ok(Json(UserStatusResponse {
         pubkey,
@@ -2092,7 +2104,13 @@ pub async fn clear_verified_minor_admin(
         );
     }
 
-    let (status, suspended_reason, suspended_at, verified_minor, verified_minor_at) = user_repo
+    let FullAdminStatusRow {
+        status,
+        suspended_reason,
+        suspended_at,
+        verified_minor,
+        verified_minor_at,
+    } = user_repo
         .get_full_admin_status(&pubkey, tenant_id)
         .await?
         .ok_or_else(|| ApiError::not_found("User not found"))?;

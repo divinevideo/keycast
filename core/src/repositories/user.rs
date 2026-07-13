@@ -71,6 +71,51 @@ pub struct AdminUserDetails {
     pub updated_at: DateTime<Utc>,
 }
 
+// Row structs backing the account-status / verified_minor safeguard queries below.
+// `FromRow` maps by column name, so callers read named fields and the six-column
+// shape can no longer be mis-ordered the way a positional tuple can. These are
+// per-method rather than one over-selecting struct so every query's `SELECT` list
+// stays byte-for-byte identical, including the oauth hot-path `get_account_status`.
+
+/// Email + status for `get_account_status` (oauth login/session path).
+#[derive(Debug, FromRow)]
+pub struct AccountStatusRow {
+    pub email: Option<String>,
+    pub email_verified: Option<bool>,
+    pub status: UserStatus,
+    pub suspended_reason: Option<String>,
+}
+
+/// `AccountStatusRow` plus the approved-minor flag/timestamp for
+/// `get_account_status_with_minor` (backs `GET /user/account`).
+#[derive(Debug, FromRow)]
+pub struct AccountStatusWithMinorRow {
+    pub email: Option<String>,
+    pub email_verified: Option<bool>,
+    pub status: UserStatus,
+    pub suspended_reason: Option<String>,
+    pub verified_minor: bool,
+    pub verified_minor_at: Option<DateTime<Utc>>,
+}
+
+/// Verified-minor flag + timestamp for `get_verified_minor`.
+#[derive(Debug, FromRow)]
+pub struct VerifiedMinorRow {
+    pub verified_minor: bool,
+    pub verified_minor_at: Option<DateTime<Utc>>,
+}
+
+/// Status + suspension + verified-minor fields for `get_full_admin_status`
+/// (admin status endpoints).
+#[derive(Debug, FromRow)]
+pub struct FullAdminStatusRow {
+    pub status: UserStatus,
+    pub suspended_reason: Option<String>,
+    pub suspended_at: Option<DateTime<Utc>>,
+    pub verified_minor: bool,
+    pub verified_minor_at: Option<DateTime<Utc>>,
+}
+
 /// Outcome of atomically consuming a claim token and claiming the account.
 /// Only `Claimed` mutates anything; the other outcomes guarantee both the
 /// token and the user row are untouched (see
@@ -936,8 +981,7 @@ impl UserRepository {
         &self,
         pubkey: &str,
         tenant_id: i64,
-    ) -> Result<Option<(Option<String>, Option<bool>, UserStatus, Option<String>)>, RepositoryError>
-    {
+    ) -> Result<Option<AccountStatusRow>, RepositoryError> {
         sqlx::query_as(
             "SELECT email, email_verified, status, suspended_reason FROM users WHERE pubkey = $1 AND tenant_id = $2",
         )
@@ -948,26 +992,16 @@ impl UserRepository {
         .map_err(Into::into)
     }
 
-    /// Like `get_account_status`, but also returns the approved-minor flag and timestamp.
+    /// Like `get_account_status`, but also returns the approved-minor flag and timestamp
+    /// (see [`AccountStatusWithMinorRow`]).
     /// Backs `GET /user/account` so clients can detect the protected-minor (13-15) state
     /// directly from Keycast. Kept separate from `get_account_status` so the oauth
     /// login/session paths that share that method are untouched.
-    /// Returns (email, email_verified, status, suspended_reason, verified_minor, verified_minor_at).
     pub async fn get_account_status_with_minor(
         &self,
         pubkey: &str,
         tenant_id: i64,
-    ) -> Result<
-        Option<(
-            Option<String>,
-            Option<bool>,
-            UserStatus,
-            Option<String>,
-            bool,
-            Option<DateTime<Utc>>,
-        )>,
-        RepositoryError,
-    > {
+    ) -> Result<Option<AccountStatusWithMinorRow>, RepositoryError> {
         sqlx::query_as(
             "SELECT email, email_verified, status, suspended_reason, verified_minor, verified_minor_at \
              FROM users WHERE pubkey = $1 AND tenant_id = $2",
@@ -1409,7 +1443,7 @@ impl UserRepository {
         &self,
         pubkey: &str,
         tenant_id: i64,
-    ) -> Result<Option<(bool, Option<DateTime<Utc>>)>, RepositoryError> {
+    ) -> Result<Option<VerifiedMinorRow>, RepositoryError> {
         sqlx::query_as(
             "SELECT verified_minor, verified_minor_at FROM users WHERE pubkey = $1 AND tenant_id = $2",
         )
@@ -1467,16 +1501,7 @@ impl UserRepository {
         &self,
         pubkey: &str,
         tenant_id: i64,
-    ) -> Result<
-        Option<(
-            UserStatus,
-            Option<String>,
-            Option<DateTime<Utc>>,
-            bool,
-            Option<DateTime<Utc>>,
-        )>,
-        RepositoryError,
-    > {
+    ) -> Result<Option<FullAdminStatusRow>, RepositoryError> {
         sqlx::query_as(
             "SELECT status, suspended_reason, suspended_at, verified_minor, verified_minor_at \
              FROM users WHERE pubkey = $1 AND tenant_id = $2",
@@ -2404,8 +2429,10 @@ mod tests {
         let transitioned = repo.clear_verified_minor(&pubkey, 1).await.unwrap();
         assert!(transitioned, "clearing a set flag is a real transition");
 
-        let (verified_minor, verified_minor_at) =
-            repo.get_verified_minor(&pubkey, 1).await.unwrap().unwrap();
+        let VerifiedMinorRow {
+            verified_minor,
+            verified_minor_at,
+        } = repo.get_verified_minor(&pubkey, 1).await.unwrap().unwrap();
         assert!(!verified_minor);
         assert!(verified_minor_at.is_none());
 
@@ -2492,8 +2519,10 @@ mod tests {
         assert!(matches!(result, Err(RepositoryError::NotFound(_))));
 
         // Tenant-1 flag is untouched.
-        let (verified_minor, verified_minor_at) =
-            repo.get_verified_minor(&pubkey, 1).await.unwrap().unwrap();
+        let VerifiedMinorRow {
+            verified_minor,
+            verified_minor_at,
+        } = repo.get_verified_minor(&pubkey, 1).await.unwrap().unwrap();
         assert!(
             verified_minor,
             "tenant-1 flag must survive a tenant-2 clear attempt"
@@ -2530,7 +2559,13 @@ mod tests {
 
         assert!(repo.clear_verified_minor(&pubkey, 1).await.unwrap());
 
-        let (status, suspended_reason, suspended_at, verified_minor, _) = repo
+        let FullAdminStatusRow {
+            status,
+            suspended_reason,
+            suspended_at,
+            verified_minor,
+            ..
+        } = repo
             .get_full_admin_status(&pubkey, 1)
             .await
             .unwrap()

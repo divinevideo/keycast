@@ -531,12 +531,12 @@ pub async fn auth_status(
 
         // Return authenticated with pubkey, optionally with email info if user exists in DB
         // NIP-07 admins may not have a user record, but their UCAN session is still valid
-        if let Some((email, email_verified, _status, _reason)) = user_info {
+        if let Some(account) = user_info {
             Ok(Json(AuthStatusResponse {
                 authenticated: true,
                 pubkey: Some(user_pubkey),
-                email,
-                email_verified,
+                email: account.email,
+                email_verified: account.email_verified,
             }))
         } else {
             // User not in DB (NIP-07 admin) - still authenticated via UCAN
@@ -625,7 +625,7 @@ pub async fn authorize_get(
                     tracing::warn!("UCAN cookie has pubkey {} but user doesn't exist in tenant {}, clearing stale cookie", pubkey, tenant_id);
                     (None, true, None) // User was deleted, clear the cookie
                 }
-                Some((email, _verified, _status, _reason)) => (user_pubkey, false, email),
+                Some(account) => (user_pubkey, false, account.email),
             }
         }
     } else {
