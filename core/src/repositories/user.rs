@@ -1414,11 +1414,15 @@ impl UserRepository {
     ///
     /// Sets email/password/verified state on the row and inserts the personal
     /// key if one is pending and none exists yet, all in one transaction.
+    /// If the row already carries the pending email (a concurrent request won
+    /// the completion race), this is success: existing credentials are never
+    /// rewritten and only a missing personal key is backfilled.
     ///
     /// # Errors
     ///
     /// Returns [`RepositoryError::NotFound`] if no row exists for this pubkey.
-    /// Returns [`RepositoryError::Duplicate`] if the email is owned by another user.
+    /// Returns [`RepositoryError::Duplicate`] if the email is owned by another
+    /// user or the row is already bound to a different email.
     pub async fn complete_pending_oauth_registration(
         &self,
         pubkey: &str,
@@ -1448,22 +1452,26 @@ impl UserRepository {
         .rows_affected();
 
         if updated == 0 {
-            let exists = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM users WHERE pubkey = $1 AND tenant_id = $2)",
+            let existing_email = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT email FROM users WHERE pubkey = $1 AND tenant_id = $2",
             )
             .bind(pubkey)
             .bind(tenant_id)
-            .fetch_one(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await?;
 
-            if exists {
-                return Err(RepositoryError::Duplicate);
+            match existing_email {
+                // A concurrent request already applied this exact registration;
+                // fall through so a missing personal key can still be backfilled.
+                Some(Some(existing)) if existing == email => {}
+                Some(_) => return Err(RepositoryError::Duplicate),
+                None => {
+                    return Err(RepositoryError::NotFound(format!(
+                        "no users row for pubkey {} in tenant {}",
+                        pubkey, tenant_id
+                    )));
+                }
             }
-
-            return Err(RepositoryError::NotFound(format!(
-                "no users row for pubkey {} in tenant {}",
-                pubkey, tenant_id
-            )));
         }
 
         if let Some(secret) = encrypted_secret {
@@ -2960,6 +2968,65 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(key_count.0, 0, "failed completion must not insert a key");
+
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_complete_pending_oauth_registration_already_applied_email_is_idempotent() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let suffix = test_suffix();
+        let pubkey = Keys::generate().public_key().to_hex();
+        let email = format!("oauth-applied-{}@example.com", suffix);
+        let secret = vec![5_u8; 32];
+
+        // Simulate losing the completion race: a concurrent request already
+        // bound the row to the pending email, but the personal key is missing.
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
+             VALUES ($1, 1, $2, 'existing-hash', true, NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .bind(&email)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        repo.complete_pending_oauth_registration(
+            &pubkey,
+            1,
+            &email,
+            "pending-hash",
+            "token",
+            Some(&secret),
+        )
+        .await
+        .expect("row already bound to the pending email must be treated as success");
+
+        let row: (Option<String>,) =
+            sqlx::query_as("SELECT password_hash FROM users WHERE pubkey = $1 AND tenant_id = 1")
+                .bind(&pubkey)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            row.0.as_deref(),
+            Some("existing-hash"),
+            "idempotent completion must not rewrite existing credentials"
+        );
+
+        let keys: Vec<(Vec<u8>,)> =
+            sqlx::query_as("SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1")
+                .bind(&pubkey)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(keys.len(), 1, "missing personal key must be backfilled");
+        assert_eq!(
+            keys[0].0, secret,
+            "backfilled key must hold the pending secret"
+        );
 
         cleanup_user(&pool, &pubkey).await;
     }
