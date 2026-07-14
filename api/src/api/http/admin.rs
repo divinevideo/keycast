@@ -1885,6 +1885,11 @@ pub async fn get_user_status_admin(
 pub struct SetUserStatusRequest {
     pub status: String,
     pub reason: Option<String>,
+    /// Moderator's hex pubkey. Optional; when present and the status actually
+    /// changes it drives the durable admin_audit_events row. That table's
+    /// actor_pubkey is NOT NULL, so an absent actor falls back to log-only
+    /// (same contract as clear_verified_minor_admin).
+    pub actor: Option<String>,
 }
 
 pub async fn set_user_status_admin(
@@ -1909,16 +1914,33 @@ pub async fn set_user_status_admin(
         }
     };
 
-    if !status.is_active() && req.reason.as_ref().is_none_or(|r| r.trim().is_empty()) {
+    // Validate the optional actor as a 64-char hex pubkey so a T&S action never
+    // silently loses its audit trail to a malformed actor (mirrors
+    // clear_verified_minor_admin).
+    if let Some(actor) = req.actor.as_deref() {
+        if actor.len() != 64 || !actor.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(ApiError::bad_request(
+                "actor must be a 64-character hex pubkey",
+            ));
+        }
+    }
+
+    // Sanitize the caller-supplied reason (strip control/bidi/zero-width, bound to
+    // 500) before it is logged OR persisted -- to the suspended_reason column and
+    // the audit metadata alike. A suspend/ban whose reason is empty after cleaning
+    // is rejected as missing, same as an absent reason.
+    let reason_clean = sanitize_reason(req.reason.clone());
+    if !status.is_active() && reason_clean.is_none() {
         return Err(ApiError::bad_request(
             "reason is required when status is suspended or banned",
         ));
     }
 
+    // active clears the reason; suspended/banned carry the sanitized reason.
     let reason = if status.is_active() {
         None
     } else {
-        req.reason.as_deref().map(str::trim)
+        reason_clean.as_deref()
     };
     let (old_status, updated_status, suspended_reason, suspended_at) = user_repo
         .set_user_status(&pubkey, tenant_id, &status, reason)
@@ -1929,9 +1951,44 @@ pub async fn set_user_status_admin(
         pubkey = %pubkey,
         old_status = %old_status.as_str(),
         new_status = %updated_status.as_str(),
-        reason = ?req.reason,
+        actor = ?req.actor,
+        reason = ?reason,
         "Admin changed user status"
     );
+
+    // Durable audit row (best-effort) only for a real status transition and only
+    // when an actor is supplied -- the same bar clear_verified_minor sets. Gating
+    // on the status actually changing keeps a relay-manager retry after a lost
+    // response from appending a second event asserting a change that never
+    // happened. The table's actor_pubkey is NOT NULL, so no actor -> log-only. A
+    // failed insert logs and the status change still succeeds. (keycast#279)
+    if old_status.as_str() != updated_status.as_str() {
+        if let Some(actor) = req.actor.as_deref() {
+            let audit_repo = AdminAuditEventRepository::new(auth_state.state.db.clone());
+            if let Err(error) = audit_repo
+                .record(AdminAuditEventRecord {
+                    tenant_id,
+                    actor_pubkey: actor.to_string(),
+                    action: "set_user_status".to_string(),
+                    target_resource_type: "user".to_string(),
+                    target_resource_id: Some(pubkey.clone()),
+                    target_client_id: None,
+                    metadata_json: serde_json::json!({
+                        "old_status": old_status.as_str(),
+                        "new_status": updated_status.as_str(),
+                        "reason": reason,
+                    }),
+                })
+                .await
+            {
+                tracing::error!(
+                    pubkey = %pubkey,
+                    error = %error,
+                    "Failed to write admin_audit_events row for user status change"
+                );
+            }
+        }
+    }
 
     // set_user_status doesn't return verified_minor, so fetch it separately.
     // This is the write path (infrequent), so the extra query is acceptable.
