@@ -3,7 +3,9 @@
 	import { BRAND } from '$lib/brand';
 	import { KeycastApi } from '$lib/keycast_api.svelte';
 	import { redirectToLoginOnAuthError } from '$lib/utils/auth';
+	import { deeplinkQuery } from '$lib/utils/deeplink';
 	import { goto } from '$app/navigation';
+	import { page } from '$app/stores';
 	import Loader from '$lib/components/Loader.svelte';
 	import InvalidateClaimTokenModal from '$lib/components/InvalidateClaimTokenModal.svelte';
 	import { ShieldCheck, Warning, MagnifyingGlass, User, Key, Calendar, Globe, Copy, Check, CheckCircle, XCircle, Link, CaretDown, CaretRight } from 'phosphor-svelte';
@@ -74,11 +76,22 @@
 			adminRole = response.role;
 		} catch (err) {
 			if (redirectToLoginOnAuthError(err)) return;
-			goto('/login?redirect=/support-admin', { replaceState: true });
+			// Preserve the deeplink (e.g. ?q=<pubkey>) across the login bounce; safeRedirectPath
+			// keeps the query on the login side. (The 401 path already does this via the helper.)
+			const dest = $page.url.pathname + $page.url.search;
+			goto(`/login?redirect=${encodeURIComponent(dest)}`, { replaceState: true });
 			return;
 		}
 
 		status = 'ready';
+
+		// Deeplink: /support-admin?q=<pubkey|npub|email|username> runs the lookup on load, so
+		// links from support tools (e.g. the Zendesk report note) resolve in one click.
+		const q = deeplinkQuery($page.url.searchParams);
+		if (q) {
+			searchQuery = q;
+			void searchUser();
+		}
 	});
 
 	async function searchUser() {
