@@ -14,6 +14,12 @@ describe("deeplinkQuery", () => {
         );
     });
 
+    test("keeps internal whitespace, trimming only the ends", () => {
+        expect(deeplinkQuery(new URLSearchParams("q=%20foo%20bar%20"))).toBe(
+            "foo bar",
+        );
+    });
+
     test("returns null when q is absent", () => {
         expect(deeplinkQuery(new URLSearchParams(""))).toBeNull();
     });
