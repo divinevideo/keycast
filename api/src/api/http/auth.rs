@@ -2193,7 +2193,7 @@ async fn perform_email_verification(
     let verification_expired = token_data
         .email_verification_expires_at
         .as_ref()
-        .is_some_and(|expires| expires < &Utc::now());
+        .is_none_or(|expires| expires < &Utc::now());
 
     // Keep an already-verified first-party token useful for the rest of its original verification
     // window. A mail scanner may be the first caller that flips email_verified; the user's later
@@ -6235,7 +6235,7 @@ mod tests {
 
         let user_get = verify_email_get(
             create_test_tenant(),
-            State(auth_state),
+            State(auth_state.clone()),
             HeaderMap::new(),
             Query(VerifyEmailQuery {
                 token: Some(first_party_token.clone()),
@@ -6254,6 +6254,31 @@ mod tests {
         );
 
         sqlx::query(
+            "UPDATE users SET email_verification_expires_at = NULL \
+             WHERE pubkey = $1 AND tenant_id = 1",
+        )
+        .bind(&first_party_pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let missing_expiry_reclick = verify_email_get(
+            create_test_tenant(),
+            State(auth_state.clone()),
+            HeaderMap::new(),
+            Query(VerifyEmailQuery {
+                token: Some(first_party_token.clone()),
+            }),
+        )
+        .await;
+        assert_eq!(missing_expiry_reclick.status(), StatusCode::OK);
+        assert!(
+            !missing_expiry_reclick
+                .headers()
+                .contains_key(axum::http::header::SET_COOKIE),
+            "an already-verified row without a concrete expiry must not mint a session"
+        );
+
+        sqlx::query(
             "UPDATE users SET email_verification_expires_at = NOW() - INTERVAL '1 second' \
              WHERE pubkey = $1 AND tenant_id = 1",
         )
@@ -6263,7 +6288,7 @@ mod tests {
         .unwrap();
         let expired_reclick = verify_email_get(
             create_test_tenant(),
-            State(create_test_auth_state(pool.clone())),
+            State(auth_state),
             HeaderMap::new(),
             Query(VerifyEmailQuery {
                 token: Some(first_party_token.clone()),
