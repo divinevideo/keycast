@@ -14,9 +14,10 @@ use super::routes::AuthState;
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::extractors::UcanAuth;
 use keycast_core::repositories::{
-    test_redirect_pattern, AdminAuditEventRecord, AdminAuditEventRepository, AuthEventRepository,
-    ClaimTokenRepository, FullAdminStatusRow, OAuthAuthorizationRepository, RegisteredClient,
-    RegisteredClientRepository, RepositoryError, UserRepository, VerifiedMinorRow,
+    test_redirect_pattern, AdminAuditEventRecord, AdminAuditEventRepository, AdminUserDetails,
+    AuthEventRepository, ClaimTokenRepository, FullAdminStatusRow, OAuthAuthorizationRepository,
+    RegisteredClient, RegisteredClientRepository, RepositoryError, UserRepository,
+    VerifiedMinorRow,
 };
 use keycast_core::types::claim_token::generate_claim_token;
 use keycast_core::types::user::UserStatus;
@@ -889,6 +890,7 @@ pub struct UserLookupQuery {
 #[derive(Debug, Serialize)]
 pub struct UserLookupResponse {
     pub results: Vec<UserLookupDetails>,
+    pub suggestions: Vec<UserLookupDetails>,
     pub total: usize,
 }
 
@@ -909,8 +911,74 @@ pub struct UserLookupDetails {
     pub last_active: Option<String>,
 }
 
-/// Look up users by email, username, vine_id, or pubkey. Available to support admins and above.
-/// Returns multiple results for username searches (case-insensitive, dot/hyphen normalized).
+async fn enrich_user_lookup_details(
+    details: AdminUserDetails,
+    oauth_repo: &OAuthAuthorizationRepository,
+    tenant_id: i64,
+) -> UserLookupDetails {
+    let sessions = oauth_repo
+        .list_active_sessions(&details.pubkey, tenant_id)
+        .await
+        .unwrap_or_default();
+
+    let last_active = sessions
+        .iter()
+        .filter_map(|session| session.5.as_deref())
+        .max()
+        .map(String::from);
+
+    UserLookupDetails {
+        pubkey: details.pubkey,
+        email: details.email,
+        email_verified: details.email_verified,
+        username: details.username,
+        display_name: details.display_name,
+        vine_id: details.vine_id,
+        has_personal_key: details.has_personal_key,
+        status: details.status.as_str().to_string(),
+        suspended_reason: details.suspended_reason,
+        active_sessions: sessions.len() as i64,
+        created_at: details.created_at.to_rfc3339(),
+        last_active,
+    }
+}
+
+#[cfg(test)]
+mod user_lookup_response_tests {
+    use super::{UserLookupDetails, UserLookupResponse};
+
+    #[test]
+    fn serializes_suggestions_separately_from_results() {
+        let suggestion = UserLookupDetails {
+            pubkey: "1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            email: Some("suggested@example.com".to_string()),
+            email_verified: Some(true),
+            username: None,
+            display_name: None,
+            vine_id: None,
+            has_personal_key: false,
+            status: "active".to_string(),
+            suspended_reason: None,
+            active_sessions: 0,
+            created_at: "2026-07-17T12:00:00+00:00".to_string(),
+            last_active: None,
+        };
+        let response = UserLookupResponse {
+            results: vec![],
+            suggestions: vec![suggestion],
+            total: 0,
+        };
+
+        let json = serde_json::to_value(response).expect("lookup response should serialize");
+        assert_eq!(json["results"], serde_json::json!([]));
+        assert_eq!(json["total"], 0);
+        assert_eq!(json["suggestions"][0]["email"], "suggested@example.com");
+    }
+}
+
+/// Look up users by email, username, vine ID, or pubkey.
+///
+/// Available to support admins and above. Empty result sets include fuzzy email suggestions.
 pub async fn get_user_lookup(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
@@ -946,39 +1014,30 @@ pub async fn get_user_lookup(
         }
     }
 
+    let suggested_users = if users.is_empty() {
+        user_repo.suggest_users_for_admin(q, tenant_id).await?
+    } else {
+        vec![]
+    };
+
     let oauth_repo = OAuthAuthorizationRepository::new(pool.clone());
     let total = users.len();
     let mut results = Vec::with_capacity(total);
 
     for details in users {
-        let sessions = oauth_repo
-            .list_active_sessions(&details.pubkey, tenant_id)
-            .await
-            .unwrap_or_default();
-
-        let last_active = sessions
-            .iter()
-            .filter_map(|s| s.5.as_deref())
-            .max()
-            .map(String::from);
-
-        results.push(UserLookupDetails {
-            pubkey: details.pubkey,
-            email: details.email,
-            email_verified: details.email_verified,
-            username: details.username,
-            display_name: details.display_name,
-            vine_id: details.vine_id,
-            has_personal_key: details.has_personal_key,
-            status: details.status.as_str().to_string(),
-            suspended_reason: details.suspended_reason,
-            active_sessions: sessions.len() as i64,
-            created_at: details.created_at.to_rfc3339(),
-            last_active,
-        });
+        results.push(enrich_user_lookup_details(details, &oauth_repo, tenant_id).await);
     }
 
-    Ok(Json(UserLookupResponse { results, total }))
+    let mut suggestions = Vec::with_capacity(suggested_users.len());
+    for details in suggested_users {
+        suggestions.push(enrich_user_lookup_details(details, &oauth_repo, tenant_id).await);
+    }
+
+    Ok(Json(UserLookupResponse {
+        results,
+        suggestions,
+        total,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
