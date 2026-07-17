@@ -20,7 +20,7 @@
 	// User lookup state
 	let searchQuery = $state('');
 	let isSearching = $state(false);
-	let searchResult = $state<null | { results: UserDetails[]; total: number }>(null);
+	let searchResult = $state<null | { results: UserDetails[]; suggestions: UserDetails[]; total: number }>(null);
 	let searchError = $state('');
 
 	// Expand/collapse state
@@ -66,6 +66,16 @@
 		last_active: string | null;
 	}
 
+	let displayedUsers: UserDetails[] = $derived.by(() => {
+		if (!searchResult) return [];
+		return searchResult.results.length > 0 ? searchResult.results : searchResult.suggestions;
+	});
+	let showingSuggestions = $derived(
+		searchResult !== null &&
+		searchResult.results.length === 0 &&
+		searchResult.suggestions.length > 0
+	);
+
 	onMount(async () => {
 		try {
 			const response = await api.get<{ is_admin: boolean; role: string | null }>('/admin/status');
@@ -104,13 +114,14 @@
 		expandedPubkey = null;
 
 		try {
-			const result = await api.get<{ results: UserDetails[]; total: number }>(
+			const result = await api.get<{ results: UserDetails[]; suggestions: UserDetails[]; total: number }>(
 				`/admin/user-lookup?q=${encodeURIComponent(q)}`
 			);
 			searchResult = result;
-			// Auto-expand if single result
-			if (result.results.length === 1) {
-				expandedPubkey = result.results[0].pubkey;
+			const returnedUsers = result.results.length > 0 ? result.results : result.suggestions;
+			// Auto-expand a single result or suggestion.
+			if (returnedUsers.length === 1) {
+				expandedPubkey = returnedUsers[0].pubkey;
 			}
 		} catch (err: any) {
 			if (redirectToLoginOnAuthError(err)) return;
@@ -228,8 +239,8 @@
 	}
 
 	$effect(() => {
-		if (expandedPubkey && searchResult) {
-			const user = searchResult.results.find(u => u.pubkey === expandedPubkey);
+		if (expandedPubkey) {
+			const user = displayedUsers.find(u => u.pubkey === expandedPubkey);
 			if (user?.vine_id && !user?.email) {
 				loadClaimToken(user.pubkey);
 			} else {
@@ -274,7 +285,7 @@
 					<input
 						type="text"
 						bind:value={searchQuery}
-						placeholder="Search for a user..."
+						placeholder="Email, username, Vine ID, or pubkey"
 						class="search-input"
 						disabled={isSearching}
 					/>
@@ -283,7 +294,7 @@
 					{isSearching ? 'Searching...' : 'Search'}
 				</button>
 			</form>
-			<p class="search-hint">Search by email, Vine username, vine_id, hex pubkey, or npub</p>
+			<p class="search-hint">Full or partial email, username, Vine ID, hex pubkey, or npub</p>
 
 			{#if searchError}
 				<div class="search-error">
@@ -293,12 +304,17 @@
 			{/if}
 
 			{#if searchResult}
-				{#if searchResult.results.length === 0}
+				{#if displayedUsers.length === 0}
 					<div class="no-result">
 						<p>No user found matching that query.</p>
 					</div>
 				{:else}
-					{#if searchResult.total >= 20}
+					{#if showingSuggestions}
+						<div class="suggestions-header">
+							<h3>Did you mean?</h3>
+							<p>No exact match was found. Try one of these similar email addresses.</p>
+						</div>
+					{:else if searchResult.total >= 20}
 						<div class="results-banner warning">
 							<Warning size={14} />
 							<span>Showing first 20 of many results — refine your search</span>
@@ -310,7 +326,7 @@
 					{/if}
 
 					<div class="user-list">
-						{#each searchResult.results as u (u.pubkey)}
+						{#each displayedUsers as u (u.pubkey)}
 							{@const isExpanded = expandedPubkey === u.pubkey}
 							<div class="user-list-item" class:expanded={isExpanded}>
 								<button class="user-list-row" onclick={() => toggleExpand(u.pubkey)}>
@@ -635,6 +651,23 @@
 		color: var(--color-divine-warning);
 		background: color-mix(in srgb, var(--color-divine-warning) 10%, var(--color-divine-bg));
 		border-color: color-mix(in srgb, var(--color-divine-warning) 30%, transparent);
+	}
+
+	.suggestions-header {
+		margin-bottom: 0.5rem;
+	}
+
+	.suggestions-header h3 {
+		margin: 0 0 0.25rem;
+		color: var(--color-divine-text);
+		font-size: 0.875rem;
+		font-weight: 600;
+	}
+
+	.suggestions-header p {
+		margin: 0;
+		color: var(--color-divine-text-secondary);
+		font-size: 0.775rem;
 	}
 
 	.btn-search {
