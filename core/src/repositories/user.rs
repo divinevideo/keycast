@@ -135,6 +135,14 @@ fn merge_admin_lookup_candidates(
     candidates
 }
 
+fn is_undefined_postgres_function(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::Database(database_error)
+            if database_error.code().as_deref() == Some("42883")
+    )
+}
+
 // Row structs backing the account-status / verified_minor safeguard queries below.
 // `FromRow` maps by column name, so callers read named fields and the six-column
 // shape can no longer be mis-ordered the way a positional tuple can. These are
@@ -2017,7 +2025,8 @@ impl UserRepository {
     ///
     /// # Errors
     ///
-    /// Returns [`RepositoryError`] when the database query fails.
+    /// Returns [`RepositoryError`] when the database query fails for reasons other than a missing
+    /// `pg_trgm` operator or function. Databases without `pg_trgm` return no suggestions.
     pub async fn suggest_users_for_admin(
         &self,
         query: &str,
@@ -2029,7 +2038,7 @@ impl UserRepository {
         }
 
         let normalized_query = query.to_lowercase();
-        let rows: Vec<AdminUserDetails> = sqlx::query_as(
+        let rows: Result<Vec<AdminUserDetails>, sqlx::Error> = sqlx::query_as(
             "SELECT
                 u.pubkey,
                 u.email,
@@ -2053,9 +2062,13 @@ impl UserRepository {
         .bind(normalized_query)
         .bind(tenant_id)
         .fetch_all(&self.pool)
-        .await?;
+        .await;
 
-        Ok(rows)
+        match rows {
+            Ok(rows) => Ok(rows),
+            Err(error) if is_undefined_postgres_function(&error) => Ok(vec![]),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Look up multiple users by email for enrichment (batch).
@@ -2198,6 +2211,7 @@ pub struct DeleteAccountResult {
 mod tests {
     use super::*;
     use nostr_sdk::{Keys, ToBech32};
+    use sqlx::postgres::PgPoolOptions;
     use sqlx::PgPool;
 
     async fn setup_pool() -> PgPool {
@@ -2783,6 +2797,70 @@ mod tests {
 
         cleanup_user(&pool, &closest_pubkey).await;
         cleanup_user(&pool, &farther_pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_suggest_users_for_admin_skips_when_pg_trgm_is_unavailable() {
+        let administrative_pool = setup_pool().await;
+        let schema = format!("no_trgm_{}", test_suffix());
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&administrative_pool)
+            .await
+            .unwrap();
+
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast".to_string());
+        let isolated_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        let mut connection = isolated_pool.acquire().await.unwrap();
+        sqlx::query(&format!("SET search_path TO {schema}, pg_catalog"))
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE users (
+                pubkey TEXT PRIMARY KEY,
+                email TEXT,
+                email_verified BOOLEAN,
+                username TEXT,
+                display_name TEXT,
+                vine_id TEXT,
+                tenant_id BIGINT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                suspended_reason TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+        )
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE personal_keys (
+                user_pubkey TEXT NOT NULL,
+                tenant_id BIGINT NOT NULL
+            )",
+        )
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+        drop(connection);
+
+        let repo = UserRepository::new(isolated_pool.clone());
+        let suggestions = repo
+            .suggest_users_for_admin("missing@example.com", 1)
+            .await
+            .expect("missing pg_trgm should disable suggestions");
+        assert!(suggestions.is_empty());
+
+        isolated_pool.close().await;
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&administrative_pool)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
