@@ -71,11 +71,68 @@ pub struct AdminUserDetails {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Ordered users and authority metadata returned by an admin lookup.
+#[derive(Debug)]
+pub struct AdminUserLookup {
+    pub users: Vec<AdminUserDetails>,
+    pub authoritative_match: bool,
+}
+
+/// Maximum number of primary users returned by one admin lookup.
+pub const ADMIN_USER_LOOKUP_LIMIT: usize = 20;
+
 fn escape_like_pattern(value: &str) -> String {
     value
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
+}
+
+fn merge_admin_lookup_candidates(
+    authoritative: Vec<String>,
+    primary_loose: Vec<String>,
+    email_loose: Vec<String>,
+) -> Vec<String> {
+    let mut candidates = Vec::with_capacity(ADMIN_USER_LOOKUP_LIMIT);
+    let mut seen = std::collections::HashSet::new();
+
+    for pubkey in authoritative {
+        if seen.insert(pubkey.clone()) {
+            candidates.push(pubkey);
+        }
+        if candidates.len() == ADMIN_USER_LOOKUP_LIMIT {
+            return candidates;
+        }
+    }
+
+    let mut primary_loose = primary_loose.into_iter();
+    let mut email_loose = email_loose.into_iter();
+    while candidates.len() < ADMIN_USER_LOOKUP_LIMIT {
+        let mut had_candidate = false;
+
+        if let Some(pubkey) = primary_loose.next() {
+            had_candidate = true;
+            if seen.insert(pubkey.clone()) {
+                candidates.push(pubkey);
+            }
+        }
+        if candidates.len() == ADMIN_USER_LOOKUP_LIMIT {
+            break;
+        }
+
+        if let Some(pubkey) = email_loose.next() {
+            had_candidate = true;
+            if seen.insert(pubkey.clone()) {
+                candidates.push(pubkey);
+            }
+        }
+
+        if !had_candidate {
+            break;
+        }
+    }
+
+    candidates
 }
 
 // Row structs backing the account-status / verified_minor safeguard queries below.
@@ -1769,29 +1826,54 @@ impl UserRepository {
         &self,
         query: &str,
         tenant_id: i64,
-    ) -> Result<Vec<AdminUserDetails>, RepositoryError> {
+    ) -> Result<AdminUserLookup, RepositoryError> {
         let normalized_query = query.to_lowercase();
-        let mut pubkeys: Vec<String> = if query.contains('@') {
+        let (authoritative_pubkeys, primary_loose_pubkeys, email_loose_pubkeys) = if query
+            .contains('@')
+        {
             if query.len() < 3 {
-                vec![]
+                (vec![], vec![], vec![])
             } else {
-                let email_pattern = format!("%{}%", escape_like_pattern(&normalized_query));
-                let by_email: Vec<(String,)> = sqlx::query_as(
+                let exact_email: Vec<(String,)> = sqlx::query_as(
                     "SELECT pubkey FROM users
-                     WHERE email ILIKE $1 ESCAPE '\\' AND tenant_id = $2
-                     LIMIT 20",
+                     WHERE LOWER(email) = $1 AND tenant_id = $2
+                     ORDER BY pubkey
+                     LIMIT 1",
                 )
-                .bind(email_pattern)
+                .bind(&normalized_query)
                 .bind(tenant_id)
                 .fetch_all(&self.pool)
                 .await?;
-                by_email.into_iter().map(|row| row.0).collect()
+                let email_pattern = format!("%{}%", escape_like_pattern(&normalized_query));
+                let substring_email: Vec<(String,)> = sqlx::query_as(
+                    "SELECT pubkey FROM users
+                     WHERE email ILIKE $1 ESCAPE '\\'
+                       AND LOWER(email) <> $2
+                       AND tenant_id = $3
+                     ORDER BY LOWER(email), pubkey
+                     LIMIT 20",
+                )
+                .bind(email_pattern)
+                .bind(&normalized_query)
+                .bind(tenant_id)
+                .fetch_all(&self.pool)
+                .await?;
+                (
+                    exact_email.into_iter().map(|row| row.0).collect(),
+                    vec![],
+                    substring_email.into_iter().map(|row| row.0).collect(),
+                )
             }
         } else if query.starts_with("npub") {
             // Decode npub to hex — at most one result
             match PublicKey::parse(query) {
-                Ok(pk) => vec![pk.to_hex()],
-                Err(_) => return Ok(vec![]),
+                Ok(pk) => (vec![pk.to_hex()], vec![], vec![]),
+                Err(_) => {
+                    return Ok(AdminUserLookup {
+                        users: vec![],
+                        authoritative_match: false,
+                    });
+                }
             }
         } else {
             let email_pattern =
@@ -1800,6 +1882,7 @@ impl UserRepository {
                 sqlx::query_as(
                     "SELECT pubkey FROM users
                      WHERE email ILIKE $1 ESCAPE '\\' AND tenant_id = $2
+                     ORDER BY LOWER(email), pubkey
                      LIMIT 20",
                 )
                 .bind(email_pattern)
@@ -1815,6 +1898,7 @@ impl UserRepository {
                 "SELECT pubkey FROM users
                  WHERE LOWER(REGEXP_REPLACE(username, '[._\\-]', '', 'g')) = LOWER(REGEXP_REPLACE($1, '[._\\-]', '', 'g'))
                    AND tenant_id = $2
+                 ORDER BY pubkey
                  LIMIT 20",
             )
             .bind(query)
@@ -1822,9 +1906,26 @@ impl UserRepository {
             .fetch_all(&self.pool)
             .await?;
 
-            let mut by_non_email = if !by_username.is_empty() {
-                by_username.into_iter().map(|r| r.0).collect()
-            } else if query.len() >= 3 {
+            let by_vine_id: Vec<(String,)> = sqlx::query_as(
+                "SELECT pubkey FROM users
+                 WHERE LOWER(vine_id) = LOWER($1) AND tenant_id = $2
+                 ORDER BY pubkey
+                 LIMIT 20",
+            )
+            .bind(query)
+            .bind(tenant_id)
+            .fetch_all(&self.pool)
+            .await?;
+
+            let by_hex_pubkey = if query.len() == 64
+                && query.chars().all(|character| character.is_ascii_hexdigit())
+            {
+                vec![query.to_lowercase()]
+            } else {
+                vec![]
+            };
+
+            let by_prefix = if by_username.is_empty() && query.len() >= 3 {
                 // Prefix search fallback (uses B-tree index on LOWER(username))
                 let normalized: String = query
                     .chars()
@@ -1836,6 +1937,7 @@ impl UserRepository {
                     "SELECT pubkey FROM users
                      WHERE LOWER(REGEXP_REPLACE(username, '[._\\-]', '', 'g')) LIKE $1
                        AND tenant_id = $2
+                     ORDER BY pubkey
                      LIMIT 20",
                 )
                 .bind(&pattern)
@@ -1843,53 +1945,37 @@ impl UserRepository {
                 .fetch_all(&self.pool)
                 .await?;
 
-                if !by_prefix.is_empty() {
-                    by_prefix.into_iter().map(|r| r.0).collect()
-                } else {
-                    // Vine ID fallback: case-insensitive
-                    let by_vine_id: Vec<(String,)> = sqlx::query_as(
-                        "SELECT pubkey FROM users WHERE LOWER(vine_id) = LOWER($1) AND tenant_id = $2 LIMIT 20",
-                    )
-                    .bind(query)
-                    .bind(tenant_id)
-                    .fetch_all(&self.pool)
-                    .await?;
-
-                    if !by_vine_id.is_empty() {
-                        by_vine_id.into_iter().map(|r| r.0).collect()
-                    } else {
-                        // Hex pubkey fallback
-                        vec![query.to_string()]
-                    }
-                }
+                by_prefix.into_iter().map(|row| row.0).collect()
             } else {
-                // Query too short for prefix search, try vine_id and hex pubkey
-                let by_vine_id: Vec<(String,)> = sqlx::query_as(
-                    "SELECT pubkey FROM users WHERE LOWER(vine_id) = LOWER($1) AND tenant_id = $2 LIMIT 20",
-                )
-                .bind(query)
-                .bind(tenant_id)
-                .fetch_all(&self.pool)
-                .await?;
-
-                if !by_vine_id.is_empty() {
-                    by_vine_id.into_iter().map(|r| r.0).collect()
-                } else {
-                    // Hex pubkey fallback
-                    vec![query.to_string()]
-                }
+                vec![]
             };
 
-            by_non_email.extend(by_email.into_iter().map(|row| row.0));
-            by_non_email
+            let authoritative = by_username
+                .into_iter()
+                .chain(by_vine_id)
+                .map(|row| row.0)
+                .chain(by_hex_pubkey)
+                .collect();
+            (
+                authoritative,
+                by_prefix,
+                by_email.into_iter().map(|row| row.0).collect(),
+            )
         };
 
-        let mut seen_pubkeys = std::collections::HashSet::new();
-        pubkeys.retain(|pubkey| seen_pubkeys.insert(pubkey.clone()));
-        pubkeys.truncate(20);
+        let authoritative_pubkey_set: std::collections::HashSet<String> =
+            authoritative_pubkeys.iter().cloned().collect();
+        let pubkeys = merge_admin_lookup_candidates(
+            authoritative_pubkeys,
+            primary_loose_pubkeys,
+            email_loose_pubkeys,
+        );
 
         if pubkeys.is_empty() {
-            return Ok(vec![]);
+            return Ok(AdminUserLookup {
+                users: vec![],
+                authoritative_match: false,
+            });
         }
 
         let rows: Vec<AdminUserDetails> = sqlx::query_as(
@@ -1907,14 +1993,22 @@ impl UserRepository {
                 u.updated_at
              FROM users u
              LEFT JOIN personal_keys pk ON pk.user_pubkey = u.pubkey AND pk.tenant_id = u.tenant_id
-             WHERE u.pubkey = ANY($1::text[]) AND u.tenant_id = $2",
+             WHERE u.pubkey = ANY($1::text[]) AND u.tenant_id = $2
+             ORDER BY array_position($1::text[], u.pubkey)",
         )
         .bind(&pubkeys)
         .bind(tenant_id)
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows)
+        let authoritative_match = rows
+            .iter()
+            .any(|row| authoritative_pubkey_set.contains(row.pubkey.as_str()));
+
+        Ok(AdminUserLookup {
+            users: rows,
+            authoritative_match,
+        })
     }
 
     /// Suggest users whose emails are trigram-similar to an admin query.
@@ -2011,6 +2105,7 @@ impl UserRepository {
         Ok(self
             .find_users_for_admin(query, tenant_id)
             .await?
+            .users
             .into_iter()
             .next())
     }
@@ -2485,10 +2580,11 @@ mod tests {
         create_user_with_username(&pool, &h2, &format!("lele_pons-{}", suffix)).await;
         create_user_with_username(&pool, &h3, &format!("LELE-PONS-{}", suffix)).await;
 
-        let results = repo
+        let lookup = repo
             .find_users_for_admin(&format!("lelepons-{}", suffix), 1)
             .await
             .unwrap();
+        let results = lookup.users;
         assert_eq!(results.len(), 3, "Should find all 3 normalized matches");
 
         let found_pubkeys: Vec<&str> = results.iter().map(|u| u.pubkey.as_str()).collect();
@@ -2518,7 +2614,7 @@ mod tests {
         )
         .await;
 
-        let results = repo.find_users_for_admin(&query, 1).await.unwrap();
+        let results = repo.find_users_for_admin(&query, 1).await.unwrap().users;
         let found_pubkeys: Vec<&str> = results.iter().map(|user| user.pubkey.as_str()).collect();
         assert!(found_pubkeys.contains(&username_pubkey.as_str()));
         assert!(found_pubkeys.contains(&email_pubkey.as_str()));
@@ -2539,7 +2635,7 @@ mod tests {
         create_user_with_email(&pool, &first_pubkey, &format!("first{domain}")).await;
         create_user_with_email(&pool, &second_pubkey, &format!("second{domain}")).await;
 
-        let results = repo.find_users_for_admin(&domain, 1).await.unwrap();
+        let results = repo.find_users_for_admin(&domain, 1).await.unwrap().users;
         let found_pubkeys: Vec<&str> = results.iter().map(|user| user.pubkey.as_str()).collect();
         assert_eq!(found_pubkeys.len(), 2);
         assert!(found_pubkeys.contains(&first_pubkey.as_str()));
@@ -2547,6 +2643,73 @@ mod tests {
 
         cleanup_user(&pool, &first_pubkey).await;
         cleanup_user(&pool, &second_pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_find_users_for_admin_places_exact_email_before_substrings() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let suffix = test_suffix();
+        let query = format!("exact-{suffix}@lookup.test");
+        let substring_pubkey = Keys::generate().public_key().to_hex();
+        let exact_pubkey = Keys::generate().public_key().to_hex();
+
+        create_user_with_email(&pool, &substring_pubkey, &format!("prefix-{query}")).await;
+        create_user_with_email(&pool, &exact_pubkey, &query).await;
+
+        let lookup = repo.find_users_for_admin(&query, 1).await.unwrap();
+        assert!(lookup.authoritative_match);
+        assert_eq!(lookup.users[0].pubkey, exact_pubkey);
+        assert_eq!(lookup.users[1].pubkey, substring_pubkey);
+
+        cleanup_user(&pool, &substring_pubkey).await;
+        cleanup_user(&pool, &exact_pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_find_users_for_admin_keeps_username_and_email_candidates_at_limit() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let suffix = test_suffix();
+        let query = format!("mixed{suffix}");
+        let mut username_pubkeys = Vec::new();
+        let mut email_pubkeys = Vec::new();
+
+        for index in 0..20 {
+            let username_pubkey = Keys::generate().public_key().to_hex();
+            create_user_with_username(
+                &pool,
+                &username_pubkey,
+                &format!("{query}-username-{index:02}"),
+            )
+            .await;
+            username_pubkeys.push(username_pubkey);
+
+            let email_pubkey = Keys::generate().public_key().to_hex();
+            create_user_with_email(
+                &pool,
+                &email_pubkey,
+                &format!("owner-{index:02}+{query}@lookup.test"),
+            )
+            .await;
+            email_pubkeys.push(email_pubkey);
+        }
+
+        let lookup = repo.find_users_for_admin(&query, 1).await.unwrap();
+        assert!(!lookup.authoritative_match);
+        assert_eq!(lookup.users.len(), 20);
+        assert!(lookup
+            .users
+            .iter()
+            .any(|user| username_pubkeys.contains(&user.pubkey)));
+        assert!(lookup
+            .users
+            .iter()
+            .any(|user| email_pubkeys.contains(&user.pubkey)));
+
+        for pubkey in username_pubkeys.iter().chain(&email_pubkeys) {
+            cleanup_user(&pool, pubkey).await;
+        }
     }
 
     #[tokio::test]
@@ -2571,7 +2734,7 @@ mod tests {
         )
         .await;
 
-        let results = repo.find_users_for_admin(&query, 1).await.unwrap();
+        let results = repo.find_users_for_admin(&query, 1).await.unwrap().users;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].pubkey, literal_pubkey);
 
@@ -2605,6 +2768,7 @@ mod tests {
             .find_users_for_admin(&query, 1)
             .await
             .unwrap()
+            .users
             .is_empty());
         let suggestions = repo.suggest_users_for_admin(&query, 1).await.unwrap();
         let closest_position = suggestions

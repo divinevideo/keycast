@@ -17,7 +17,7 @@ use keycast_core::repositories::{
     test_redirect_pattern, AdminAuditEventRecord, AdminAuditEventRepository, AdminUserDetails,
     AuthEventRepository, ClaimTokenRepository, FullAdminStatusRow, OAuthAuthorizationRepository,
     RegisteredClient, RegisteredClientRepository, RepositoryError, UserRepository,
-    VerifiedMinorRow,
+    VerifiedMinorRow, ADMIN_USER_LOOKUP_LIMIT,
 };
 use keycast_core::types::claim_token::generate_claim_token;
 use keycast_core::types::user::UserStatus;
@@ -943,9 +943,20 @@ async fn enrich_user_lookup_details(
     }
 }
 
+fn should_attempt_name_fallback(query: &str, authoritative_match: bool) -> bool {
+    !authoritative_match && !query.contains('@') && !query.starts_with("npub") && query.len() != 64
+}
+
+fn should_fetch_email_suggestions(authoritative_match: bool) -> bool {
+    !authoritative_match
+}
+
 #[cfg(test)]
 mod user_lookup_response_tests {
-    use super::{UserLookupDetails, UserLookupResponse};
+    use super::{
+        should_attempt_name_fallback, should_fetch_email_suggestions, UserLookupDetails,
+        UserLookupResponse,
+    };
 
     #[test]
     fn serializes_suggestions_separately_from_results() {
@@ -974,6 +985,14 @@ mod user_lookup_response_tests {
         assert_eq!(json["total"], 0);
         assert_eq!(json["suggestions"][0]["email"], "suggested@example.com");
     }
+
+    #[test]
+    fn loose_matches_still_allow_authoritative_fallbacks_and_suggestions() {
+        assert!(should_attempt_name_fallback("partial-name", false));
+        assert!(should_fetch_email_suggestions(false));
+        assert!(!should_attempt_name_fallback("partial-name", true));
+        assert!(!should_fetch_email_suggestions(true));
+    }
 }
 
 /// Look up users by email, username, vine ID, or pubkey.
@@ -998,33 +1017,45 @@ pub async fn get_user_lookup(
     }
 
     let user_repo = UserRepository::new(pool.clone());
-    let mut users = user_repo.find_users_for_admin(q, tenant_id).await?;
+    let mut lookup = user_repo.find_users_for_admin(q, tenant_id).await?;
 
-    // Divine name server fallback: if no results and query looks like a username
-    if users.is_empty()
-        && !q.contains('@')
-        && !q.starts_with("npub")
-        && q.len() != 64
+    // Divine name server fallback: if no authoritative result and query looks like a username
+    if should_attempt_name_fallback(q, lookup.authoritative_match)
         && crate::divine_names::is_enabled()
     {
         if let Ok(Some(hex_pubkey)) = crate::divine_names::lookup_by_name(q).await {
-            users = user_repo
+            let mut resolved_lookup = user_repo
                 .find_users_for_admin(&hex_pubkey, tenant_id)
                 .await?;
+            if resolved_lookup.authoritative_match {
+                let mut seen_pubkeys: std::collections::HashSet<String> = resolved_lookup
+                    .users
+                    .iter()
+                    .map(|user| user.pubkey.clone())
+                    .collect();
+                resolved_lookup.users.extend(
+                    lookup
+                        .users
+                        .into_iter()
+                        .filter(|user| seen_pubkeys.insert(user.pubkey.clone())),
+                );
+                resolved_lookup.users.truncate(ADMIN_USER_LOOKUP_LIMIT);
+                lookup = resolved_lookup;
+            }
         }
     }
 
-    let suggested_users = if users.is_empty() {
+    let suggested_users = if should_fetch_email_suggestions(lookup.authoritative_match) {
         user_repo.suggest_users_for_admin(q, tenant_id).await?
     } else {
         vec![]
     };
 
     let oauth_repo = OAuthAuthorizationRepository::new(pool.clone());
-    let total = users.len();
+    let total = lookup.users.len();
     let mut results = Vec::with_capacity(total);
 
-    for details in users {
+    for details in lookup.users {
         results.push(enrich_user_lookup_details(details, &oauth_repo, tenant_id).await);
     }
 
