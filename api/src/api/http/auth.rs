@@ -2190,43 +2190,51 @@ async fn perform_email_verification(
         .ok_or(AuthError::InvalidToken)?;
 
     let public_key = token_data.pubkey;
+    let verification_expired = token_data
+        .email_verification_expires_at
+        .as_ref()
+        .is_some_and(|expires| expires < &Utc::now());
 
-    // Already verified (e.g. user clicked the link again) - show success
+    // Keep an already-verified first-party token useful for the rest of its original verification
+    // window. A mail scanner may be the first caller that flips email_verified; the user's later
+    // click must still reach the session-cookie path instead of losing auto-login. Once the window
+    // expires, the retained token remains a harmless "already verified" acknowledgement and must
+    // no longer mint a session.
     if token_data.email_verified {
-        return Ok(VerifyOutcome::AlreadyVerified);
-    }
-
-    // Check if token is expired
-    if let Some(expires) = token_data.email_verification_expires_at {
-        if expires < Utc::now() {
+        if verification_expired {
+            return Ok(VerifyOutcome::AlreadyVerified);
+        }
+    } else {
+        // An unverified account cannot complete after the verification window expires.
+        if verification_expired {
             return Ok(VerifyOutcome::Expired);
         }
-    }
 
-    // Check async bcrypt state: password_hash IS NULL means still processing
-    if token_data.password_hash.is_none() {
-        let age = Utc::now().signed_duration_since(token_data.created_at);
-        if age.num_seconds() > 120 {
-            // Hash should complete in <1s normally. After 2min, assume instance died.
-            // User needs to re-register (cleanup job will delete this row)
-            tracing::warn!(
-                "Password hash not completed after {}s for token {}..., likely instance died",
+        // Check async bcrypt state: password_hash IS NULL means still processing
+        if token_data.password_hash.is_none() {
+            let age = Utc::now().signed_duration_since(token_data.created_at);
+            if age.num_seconds() > 120 {
+                // Hash should complete in <1s normally. After 2min, assume instance died.
+                // User needs to re-register (cleanup job will delete this row)
+                tracing::warn!(
+                    "Password hash not completed after {}s for token {}..., likely instance died",
+                    age.num_seconds(),
+                    &token[..std::cmp::min(8, token.len())]
+                );
+                return Err(AuthError::RegistrationExpired);
+            }
+            // Still processing - tell caller to retry
+            tracing::debug!(
+                "Password hash still processing (age: {}s) for token {}...",
                 age.num_seconds(),
                 &token[..std::cmp::min(8, token.len())]
             );
-            return Err(AuthError::RegistrationExpired);
+            return Ok(VerifyOutcome::Processing);
         }
-        // Still processing - tell caller to retry
-        tracing::debug!(
-            "Password hash still processing (age: {}s) for token {}...",
-            age.num_seconds(),
-            &token[..std::cmp::min(8, token.len())]
-        );
-        return Ok(VerifyOutcome::Processing);
-    }
 
-    // Mark email as verified (token kept for idempotent re-verification)
-    user_repo.verify_email(&public_key, tenant_id).await?;
+        // Mark email as verified (token kept for idempotent re-verification).
+        user_repo.verify_email(&public_key, tenant_id).await?;
+    }
 
     // Get user's email and account status for UCAN
     let email = user_repo.get_email(&public_key, tenant_id).await?;
@@ -5617,7 +5625,7 @@ mod tests {
     use crate::state::KeycastState;
     #[cfg(feature = "integration-tests")]
     use axum::{
-        extract::State,
+        extract::{Query, State},
         http::{
             header::{AUTHORIZATION, ORIGIN},
             HeaderMap, HeaderValue, StatusCode,
@@ -6133,6 +6141,9 @@ mod tests {
     async fn test_verify_email_prefetch_does_not_strand_user() {
         let pool = create_test_db().await;
         let auth_state = create_test_auth_state(pool.clone());
+
+        // OAuth registrations retain their pending row so a scanner hit cannot consume the
+        // redirect/code that the user's later visit needs.
         let email = format!("verify-prefetch-{}@example.com", Uuid::new_v4());
         let (pubkey, token) = insert_oauth_pending_registration(&pool, &email).await;
 
@@ -6177,6 +6188,97 @@ mod tests {
         );
 
         cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
+
+        // First-party registrations retain their users-table token. A scanner GET may perform
+        // the verification first, but the user's later GET must still receive a session cookie
+        // while the original verification window is live.
+        let first_party_keys = Keys::generate();
+        let first_party_pubkey = first_party_keys.public_key().to_hex();
+        let first_party_token = format!("verify_first_party_{}", Uuid::new_v4());
+        let first_party_email = format!("verify-first-party-{}@example.com", Uuid::new_v4());
+        let first_party_password_hash =
+            bcrypt::hash("testpassword123", bcrypt::DEFAULT_COST).unwrap();
+        let first_party_expires_at = Utc::now() + Duration::hours(24);
+        let first_party_secret = first_party_keys.secret_key().to_secret_bytes();
+        let user_repo = keycast_core::repositories::UserRepository::new(pool.clone());
+
+        cleanup_verify_email_test_data(&pool, &first_party_pubkey, &first_party_token).await;
+        user_repo
+            .register_with_personal_key(
+                &first_party_pubkey,
+                1,
+                &first_party_email,
+                Some(&first_party_password_hash),
+                &first_party_token,
+                first_party_expires_at,
+                &first_party_secret,
+            )
+            .await
+            .unwrap();
+
+        let scanner_get = verify_email_get(
+            create_test_tenant(),
+            State(auth_state.clone()),
+            HeaderMap::new(),
+            Query(VerifyEmailQuery {
+                token: Some(first_party_token.clone()),
+            }),
+        )
+        .await;
+        assert!(scanner_get.status().is_redirection());
+        assert!(
+            scanner_get
+                .headers()
+                .contains_key(axum::http::header::SET_COOKIE),
+            "the first GET should verify and issue a session cookie"
+        );
+
+        let user_get = verify_email_get(
+            create_test_tenant(),
+            State(auth_state),
+            HeaderMap::new(),
+            Query(VerifyEmailQuery {
+                token: Some(first_party_token.clone()),
+            }),
+        )
+        .await;
+        assert!(
+            user_get.status().is_redirection(),
+            "the user's GET after scanner prefetch should still redirect into the app"
+        );
+        assert!(
+            user_get
+                .headers()
+                .contains_key(axum::http::header::SET_COOKIE),
+            "the user's GET after scanner prefetch must re-arm the first-party session cookie"
+        );
+
+        sqlx::query(
+            "UPDATE users SET email_verification_expires_at = NOW() - INTERVAL '1 second' \
+             WHERE pubkey = $1 AND tenant_id = 1",
+        )
+        .bind(&first_party_pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let expired_reclick = verify_email_get(
+            create_test_tenant(),
+            State(create_test_auth_state(pool.clone())),
+            HeaderMap::new(),
+            Query(VerifyEmailQuery {
+                token: Some(first_party_token.clone()),
+            }),
+        )
+        .await;
+        assert_eq!(expired_reclick.status(), StatusCode::OK);
+        assert!(
+            !expired_reclick
+                .headers()
+                .contains_key(axum::http::header::SET_COOKIE),
+            "an expired retained token must acknowledge verification without minting a session"
+        );
+
+        cleanup_verify_email_test_data(&pool, &first_party_pubkey, &first_party_token).await;
     }
 
     /// Build a Redis-backed AuthState for headless GET tests (the link path requires Redis).
