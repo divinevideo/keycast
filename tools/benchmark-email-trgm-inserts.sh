@@ -62,8 +62,20 @@ if [[ -z "$benchmark_database_url" ]]; then
     exit 2
 fi
 
-case "$benchmark_database_url" in
-    *localhost*|*127.0.0.1*) ;;
+database_authority="${benchmark_database_url#*://}"
+if [[ "$database_authority" == "$benchmark_database_url" ]]; then
+    echo "Refusing to benchmark a non-local database" >&2
+    exit 2
+fi
+database_authority="${database_authority%%/*}"
+database_authority="${database_authority%%\?*}"
+database_authority="${database_authority%%\#*}"
+database_host_and_port="${database_authority##*@}"
+database_host="${database_host_and_port%%:*}"
+database_host="${database_host,,}"
+
+case "$database_host" in
+    localhost|127.0.0.1) ;;
     *)
         echo "Refusing to benchmark a non-local database" >&2
         exit 2

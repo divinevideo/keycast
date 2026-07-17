@@ -11,3 +11,21 @@ grep -q -- "--clients" <<<"$help_output"
 grep -q -- "--transactions" <<<"$help_output"
 grep -q -- "--explain-rows" <<<"$help_output"
 grep -q -- "isolated benchmark schema" <<<"$help_output"
+
+assert_remote_database_rejected() {
+    local database_url="$1"
+    local output
+
+    if output="$($benchmark_script --database-url "$database_url" 2>&1)"; then
+        echo "Expected remote database URL to be rejected: $database_url" >&2
+        exit 1
+    fi
+
+    grep -q -- "Refusing to benchmark a non-local database" <<<"$output"
+}
+
+assert_remote_database_rejected "postgres://localhost:password@remote.invalid/keycast"
+assert_remote_database_rejected "postgres://user:password@remote.invalid/localhost"
+assert_remote_database_rejected \
+    "postgres://user:password@remote.invalid/keycast?application_name=localhost"
+assert_remote_database_rejected "postgres://user:password@localhost.invalid/keycast"
