@@ -71,6 +71,13 @@ pub struct AdminUserDetails {
     pub updated_at: DateTime<Utc>,
 }
 
+fn escape_like_pattern(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 // Row structs backing the account-status / verified_minor safeguard queries below.
 // `FromRow` maps by column name, so callers read named fields and the six-column
 // shape can no longer be mis-ordered the way a positional tuple can. These are
@@ -1750,23 +1757,36 @@ impl UserRepository {
         Ok(result.is_some())
     }
 
-    /// Look up a user for admin support tools.
-    /// Searches by email (if query contains @), npub, username, vine_id, or hex pubkey.
-    /// Search for users matching a query. Returns multiple results for username searches.
+    /// Search for users matching an admin-support query.
+    ///
+    /// Email queries use case-insensitive substring matching. Queries without an `@`
+    /// merge email substring matches with the existing username, vine ID, and pubkey paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError`] when a database query fails.
     pub async fn find_users_for_admin(
         &self,
         query: &str,
         tenant_id: i64,
     ) -> Result<Vec<AdminUserDetails>, RepositoryError> {
-        let pubkeys: Vec<String> = if query.contains('@') {
-            // Search by email — at most one result
-            let result: Option<(String,)> =
-                sqlx::query_as("SELECT pubkey FROM users WHERE email = $1 AND tenant_id = $2")
-                    .bind(query.to_lowercase())
-                    .bind(tenant_id)
-                    .fetch_optional(&self.pool)
-                    .await?;
-            result.into_iter().map(|r| r.0).collect()
+        let normalized_query = query.to_lowercase();
+        let mut pubkeys: Vec<String> = if query.contains('@') {
+            if query.len() < 3 {
+                vec![]
+            } else {
+                let email_pattern = format!("%{}%", escape_like_pattern(&normalized_query));
+                let by_email: Vec<(String,)> = sqlx::query_as(
+                    "SELECT pubkey FROM users
+                     WHERE email ILIKE $1 ESCAPE '\\' AND tenant_id = $2
+                     LIMIT 20",
+                )
+                .bind(email_pattern)
+                .bind(tenant_id)
+                .fetch_all(&self.pool)
+                .await?;
+                by_email.into_iter().map(|row| row.0).collect()
+            }
         } else if query.starts_with("npub") {
             // Decode npub to hex — at most one result
             match PublicKey::parse(query) {
@@ -1774,7 +1794,23 @@ impl UserRepository {
                 Err(_) => return Ok(vec![]),
             }
         } else {
-            // Username: case-insensitive, strip dots, hyphens, and underscores
+            let email_pattern =
+                (query.len() >= 3).then(|| format!("%{}%", escape_like_pattern(&normalized_query)));
+            let by_email: Vec<(String,)> = if let Some(email_pattern) = email_pattern {
+                sqlx::query_as(
+                    "SELECT pubkey FROM users
+                     WHERE email ILIKE $1 ESCAPE '\\' AND tenant_id = $2
+                     LIMIT 20",
+                )
+                .bind(email_pattern)
+                .bind(tenant_id)
+                .fetch_all(&self.pool)
+                .await?
+            } else {
+                vec![]
+            };
+
+            // Username: case-insensitive, strip dots, hyphens, and underscores.
             let by_username: Vec<(String,)> = sqlx::query_as(
                 "SELECT pubkey FROM users
                  WHERE LOWER(REGEXP_REPLACE(username, '[._\\-]', '', 'g')) = LOWER(REGEXP_REPLACE($1, '[._\\-]', '', 'g'))
@@ -1786,7 +1822,7 @@ impl UserRepository {
             .fetch_all(&self.pool)
             .await?;
 
-            if !by_username.is_empty() {
+            let mut by_non_email = if !by_username.is_empty() {
                 by_username.into_iter().map(|r| r.0).collect()
             } else if query.len() >= 3 {
                 // Prefix search fallback (uses B-tree index on LOWER(username))
@@ -1842,8 +1878,15 @@ impl UserRepository {
                     // Hex pubkey fallback
                     vec![query.to_string()]
                 }
-            }
+            };
+
+            by_non_email.extend(by_email.into_iter().map(|row| row.0));
+            by_non_email
         };
+
+        let mut seen_pubkeys = std::collections::HashSet::new();
+        pubkeys.retain(|pubkey| seen_pubkeys.insert(pubkey.clone()));
+        pubkeys.truncate(20);
 
         if pubkeys.is_empty() {
             return Ok(vec![]);
@@ -1867,6 +1910,53 @@ impl UserRepository {
              WHERE u.pubkey = ANY($1::text[]) AND u.tenant_id = $2",
         )
         .bind(&pubkeys)
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Suggest users whose emails are trigram-similar to an admin query.
+    ///
+    /// Short queries, npubs, and 64-character hex pubkeys return no suggestions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError`] when the database query fails.
+    pub async fn suggest_users_for_admin(
+        &self,
+        query: &str,
+        tenant_id: i64,
+    ) -> Result<Vec<AdminUserDetails>, RepositoryError> {
+        let is_hex_pubkey = query.len() == 64 && query.chars().all(|char| char.is_ascii_hexdigit());
+        if query.len() < 3 || query.starts_with("npub") || is_hex_pubkey {
+            return Ok(vec![]);
+        }
+
+        let normalized_query = query.to_lowercase();
+        let rows: Vec<AdminUserDetails> = sqlx::query_as(
+            "SELECT
+                u.pubkey,
+                u.email,
+                u.email_verified,
+                u.username,
+                u.display_name,
+                u.vine_id,
+                (pk.user_pubkey IS NOT NULL) as \"has_personal_key\",
+                u.status,
+                u.suspended_reason,
+                u.created_at,
+                u.updated_at
+             FROM users u
+             LEFT JOIN personal_keys pk ON pk.user_pubkey = u.pubkey AND pk.tenant_id = u.tenant_id
+             WHERE u.email IS NOT NULL
+               AND u.email % $1
+               AND u.tenant_id = $2
+             ORDER BY similarity(u.email, $1) DESC, u.pubkey
+             LIMIT 5",
+        )
+        .bind(normalized_query)
         .bind(tenant_id)
         .fetch_all(&self.pool)
         .await?;
@@ -2409,6 +2499,126 @@ mod tests {
         cleanup_user(&pool, &h1).await;
         cleanup_user(&pool, &h2).await;
         cleanup_user(&pool, &h3).await;
+    }
+
+    #[tokio::test]
+    async fn test_find_users_for_admin_merges_email_contains_with_username_matches() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let suffix = test_suffix();
+        let query = format!("socialp{suffix}");
+        let username_pubkey = Keys::generate().public_key().to_hex();
+        let email_pubkey = Keys::generate().public_key().to_hex();
+
+        create_user_with_username(&pool, &username_pubkey, &query).await;
+        create_user_with_email(
+            &pool,
+            &email_pubkey,
+            &format!("creator+{query}@example.com"),
+        )
+        .await;
+
+        let results = repo.find_users_for_admin(&query, 1).await.unwrap();
+        let found_pubkeys: Vec<&str> = results.iter().map(|user| user.pubkey.as_str()).collect();
+        assert!(found_pubkeys.contains(&username_pubkey.as_str()));
+        assert!(found_pubkeys.contains(&email_pubkey.as_str()));
+
+        cleanup_user(&pool, &username_pubkey).await;
+        cleanup_user(&pool, &email_pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_find_users_for_admin_by_email_domain_suffix() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let suffix = test_suffix();
+        let domain = format!("@lookup-{suffix}.test");
+        let first_pubkey = Keys::generate().public_key().to_hex();
+        let second_pubkey = Keys::generate().public_key().to_hex();
+
+        create_user_with_email(&pool, &first_pubkey, &format!("first{domain}")).await;
+        create_user_with_email(&pool, &second_pubkey, &format!("second{domain}")).await;
+
+        let results = repo.find_users_for_admin(&domain, 1).await.unwrap();
+        let found_pubkeys: Vec<&str> = results.iter().map(|user| user.pubkey.as_str()).collect();
+        assert_eq!(found_pubkeys.len(), 2);
+        assert!(found_pubkeys.contains(&first_pubkey.as_str()));
+        assert!(found_pubkeys.contains(&second_pubkey.as_str()));
+
+        cleanup_user(&pool, &first_pubkey).await;
+        cleanup_user(&pool, &second_pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_find_users_for_admin_escapes_email_contains_wildcards() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let suffix = test_suffix();
+        let query = format!("literal%_{suffix}");
+        let literal_pubkey = Keys::generate().public_key().to_hex();
+        let wildcard_pubkey = Keys::generate().public_key().to_hex();
+
+        create_user_with_email(
+            &pool,
+            &literal_pubkey,
+            &format!("owner+{query}@example.com"),
+        )
+        .await;
+        create_user_with_email(
+            &pool,
+            &wildcard_pubkey,
+            &format!("owner+literalXX{suffix}@example.com"),
+        )
+        .await;
+
+        let results = repo.find_users_for_admin(&query, 1).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].pubkey, literal_pubkey);
+
+        cleanup_user(&pool, &literal_pubkey).await;
+        cleanup_user(&pool, &wildcard_pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_suggest_users_for_admin_ranks_closest_email_first() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let suffix = test_suffix();
+        let query = format!("socialpublishllc-{suffix}@lookup.test");
+        let closest_pubkey = Keys::generate().public_key().to_hex();
+        let farther_pubkey = Keys::generate().public_key().to_hex();
+
+        create_user_with_email(
+            &pool,
+            &closest_pubkey,
+            &format!("socialpulishllc-{suffix}@lookup.test"),
+        )
+        .await;
+        create_user_with_email(
+            &pool,
+            &farther_pubkey,
+            &format!("socialllc-{suffix}@lookup.test"),
+        )
+        .await;
+
+        assert!(repo
+            .find_users_for_admin(&query, 1)
+            .await
+            .unwrap()
+            .is_empty());
+        let suggestions = repo.suggest_users_for_admin(&query, 1).await.unwrap();
+        let closest_position = suggestions
+            .iter()
+            .position(|user| user.pubkey == closest_pubkey)
+            .expect("closest email should be suggested");
+        let farther_position = suggestions
+            .iter()
+            .position(|user| user.pubkey == farther_pubkey)
+            .expect("farther email should be suggested");
+        assert!(closest_position < farther_position);
+
+        cleanup_user(&pool, &closest_pubkey).await;
+        cleanup_user(&pool, &farther_pubkey).await;
     }
 
     #[tokio::test]
