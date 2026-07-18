@@ -1845,8 +1845,7 @@ impl UserRepository {
                 let exact_email: Vec<(String,)> = sqlx::query_as(
                     "SELECT pubkey FROM users
                      WHERE LOWER(email) = $1 AND tenant_id = $2
-                     ORDER BY pubkey
-                     LIMIT 1",
+                     ORDER BY pubkey",
                 )
                 .bind(&normalized_query)
                 .bind(tenant_id)
@@ -2678,6 +2677,33 @@ mod tests {
 
         cleanup_user(&pool, &substring_pubkey).await;
         cleanup_user(&pool, &exact_pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_find_users_for_admin_keeps_case_variant_exact_emails() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let suffix = test_suffix();
+        let query = format!("duplicate-{suffix}@lookup.test");
+        let lowercase_pubkey = Keys::generate().public_key().to_hex();
+        let uppercase_pubkey = Keys::generate().public_key().to_hex();
+
+        create_user_with_email(&pool, &lowercase_pubkey, &query).await;
+        create_user_with_email(&pool, &uppercase_pubkey, &query.to_uppercase()).await;
+
+        let lookup = repo.find_users_for_admin(&query, 1).await.unwrap();
+        let found_pubkeys: Vec<&str> = lookup
+            .users
+            .iter()
+            .map(|user| user.pubkey.as_str())
+            .collect();
+        assert!(lookup.authoritative_match);
+        assert_eq!(found_pubkeys.len(), 2);
+        assert!(found_pubkeys.contains(&lowercase_pubkey.as_str()));
+        assert!(found_pubkeys.contains(&uppercase_pubkey.as_str()));
+
+        cleanup_user(&pool, &lowercase_pubkey).await;
+        cleanup_user(&pool, &uppercase_pubkey).await;
     }
 
     #[tokio::test]
