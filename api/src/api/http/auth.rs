@@ -6320,6 +6320,21 @@ mod tests {
         state
     }
 
+    /// Build an AuthState whose Redis wrapper deterministically rejects SETEX operations.
+    #[cfg(feature = "integration-tests")]
+    async fn create_test_auth_state_with_failing_redis(pool: PgPool) -> AuthState {
+        let mut state = create_test_auth_state(pool);
+        let redis_url =
+            std::env::var("TEST_REDIS_URL").unwrap_or_else(|_| "redis://localhost:16379".into());
+        let client = redis::Client::open(redis_url.as_str()).unwrap();
+        let conn = redis::aio::ConnectionManager::new(client).await.unwrap();
+        let redis =
+            crate::redis::PrefixedRedis::new_failing(conn, Some("test_verify_fail".to_string()));
+        let inner = Arc::get_mut(&mut state.state).expect("unique Arc");
+        inner.redis = Some(redis);
+        state
+    }
+
     /// Insert a headless pending registration (device_code set) and return (pubkey, token, device_code).
     #[cfg(feature = "integration-tests")]
     async fn insert_headless_pending_registration(
@@ -6590,6 +6605,120 @@ mod tests {
         assert!(
             body.contains("temporary problem verifying your link"),
             "retry page should explain the temporary verification problem neutrally: {body}"
+        );
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
+    }
+
+    /// A failed strict Redis delivery removes only the exchange code minted by this finalize,
+    /// while preserving the materialized user and pending row so the link can be retried.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_finalize_pending_registration_fresh_code_redis_failure_cleans_orphan() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state_with_failing_redis(pool.clone()).await;
+        let redis = auth_state.state.redis.as_ref().expect("failing Redis");
+        let repo = keycast_core::repositories::OAuthCodeRepository::new(pool.clone());
+        let email = format!("verify-fresh-redis-fail-{}@example.com", Uuid::new_v4());
+        let (pubkey, token, _device_code) =
+            insert_headless_pending_registration(&pool, &email).await;
+        let pending = repo
+            .find_by_verification_token(&token, 1)
+            .await
+            .unwrap()
+            .expect("pending registration");
+
+        let result = super::finalize_pending_registration(
+            &pool,
+            Some(redis),
+            1,
+            &pending,
+            super::HeadlessDelivery::RedisRequired,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(super::AuthError::ServiceUnavailable { .. })
+        ));
+        assert!(
+            repo.find_by_verification_token(&token, 1)
+                .await
+                .unwrap()
+                .is_some(),
+            "Redis failure must preserve the pending registration for retry"
+        );
+        let (email_verified,): (bool,) =
+            sqlx::query_as("SELECT email_verified FROM users WHERE pubkey = $1 AND tenant_id = 1")
+                .bind(&pubkey)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            email_verified,
+            "the user must remain materialized and verified"
+        );
+        assert!(
+            repo.find_live_exchange_code_with_expiry_for_pending(1, &pending)
+                .await
+                .unwrap()
+                .is_none(),
+            "the freshly minted undeliverable exchange code must be deleted"
+        );
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
+    }
+
+    /// A failed strict Redis redelivery must not delete a still-live code owned by a prior
+    /// successful finalize, because the polling app may already hold that code.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_finalize_pending_registration_reused_code_redis_failure_preserves_code() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state_with_failing_redis(pool.clone()).await;
+        let redis = auth_state.state.redis.as_ref().expect("failing Redis");
+        let repo = keycast_core::repositories::OAuthCodeRepository::new(pool.clone());
+        let email = format!("verify-reused-redis-fail-{}@example.com", Uuid::new_v4());
+        let (pubkey, token, _device_code) =
+            insert_headless_pending_registration(&pool, &email).await;
+        let pending = repo
+            .find_by_verification_token(&token, 1)
+            .await
+            .unwrap()
+            .expect("pending registration");
+
+        let first = super::finalize_pending_registration(
+            &pool,
+            None,
+            1,
+            &pending,
+            super::HeadlessDelivery::RedisBestEffort,
+        )
+        .await
+        .expect("first finalize mints a reusable live code");
+
+        let result = super::finalize_pending_registration(
+            &pool,
+            Some(redis),
+            1,
+            &pending,
+            super::HeadlessDelivery::RedisRequired,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(super::AuthError::ServiceUnavailable { .. })
+        ));
+        let live_code = repo
+            .find_live_exchange_code_with_expiry_for_pending(1, &pending)
+            .await
+            .unwrap()
+            .map(|(code, _expires_at)| code);
+        assert_eq!(
+            live_code.as_deref(),
+            Some(first.new_code.as_str()),
+            "Redis redelivery failure must leave the reused code intact"
         );
 
         cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
