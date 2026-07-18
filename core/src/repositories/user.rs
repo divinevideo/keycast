@@ -1844,7 +1844,9 @@ impl UserRepository {
             } else {
                 let exact_email: Vec<(String,)> = sqlx::query_as(
                     "SELECT pubkey FROM users
-                     WHERE LOWER(email) = $1 AND tenant_id = $2
+                     WHERE LOWER(email) = $1
+                       AND tenant_id = $2
+                       AND email IS NOT NULL
                      ORDER BY pubkey",
                 )
                 .bind(&normalized_query)
@@ -2704,6 +2706,26 @@ mod tests {
 
         cleanup_user(&pool, &lowercase_pubkey).await;
         cleanup_user(&pool, &uppercase_pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_exact_email_lookup_has_matching_functional_index() {
+        let pool = setup_pool().await;
+        let index_definition: Option<String> = sqlx::query_scalar(
+            "SELECT indexdef
+             FROM pg_indexes
+             WHERE schemaname = 'public'
+               AND tablename = 'users'
+               AND indexname = 'idx_users_tenant_lower_email'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+
+        let index_definition =
+            index_definition.expect("exact email lookup should have a matching functional index");
+        assert!(index_definition.contains("(tenant_id, lower(email))"));
+        assert!(index_definition.contains("WHERE (email IS NOT NULL)"));
     }
 
     #[tokio::test]

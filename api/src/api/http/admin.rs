@@ -947,8 +947,8 @@ fn should_attempt_name_fallback(query: &str, authoritative_match: bool) -> bool 
     !authoritative_match && !query.contains('@') && !query.starts_with("npub") && query.len() != 64
 }
 
-fn should_fetch_email_suggestions(authoritative_match: bool) -> bool {
-    !authoritative_match
+fn should_fetch_email_suggestions(authoritative_match: bool, result_count: usize) -> bool {
+    !authoritative_match && result_count == 0
 }
 
 #[cfg(test)]
@@ -987,11 +987,12 @@ mod user_lookup_response_tests {
     }
 
     #[test]
-    fn loose_matches_still_allow_authoritative_fallbacks_and_suggestions() {
+    fn loose_matches_still_allow_authoritative_fallbacks_but_skip_suggestions() {
         assert!(should_attempt_name_fallback("partial-name", false));
-        assert!(should_fetch_email_suggestions(false));
+        assert!(!should_fetch_email_suggestions(false, 1));
+        assert!(should_fetch_email_suggestions(false, 0));
         assert!(!should_attempt_name_fallback("partial-name", true));
-        assert!(!should_fetch_email_suggestions(true));
+        assert!(!should_fetch_email_suggestions(true, 0));
     }
 }
 
@@ -1045,11 +1046,12 @@ pub async fn get_user_lookup(
         }
     }
 
-    let suggested_users = if should_fetch_email_suggestions(lookup.authoritative_match) {
-        user_repo.suggest_users_for_admin(q, tenant_id).await?
-    } else {
-        vec![]
-    };
+    let suggested_users =
+        if should_fetch_email_suggestions(lookup.authoritative_match, lookup.users.len()) {
+            user_repo.suggest_users_for_admin(q, tenant_id).await?
+        } else {
+            vec![]
+        };
 
     let oauth_repo = OAuthAuthorizationRepository::new(pool.clone());
     let total = lookup.users.len();
