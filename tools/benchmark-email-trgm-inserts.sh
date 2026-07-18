@@ -72,7 +72,7 @@ database_authority="${database_authority%%\?*}"
 database_authority="${database_authority%%\#*}"
 database_host_and_port="${database_authority##*@}"
 database_host="${database_host_and_port%%:*}"
-database_host="${database_host,,}"
+database_host="$(printf '%s' "$database_host" | tr '[:upper:]' '[:lower:]')"
 
 case "$database_host" in
     localhost|127.0.0.1) ;;
