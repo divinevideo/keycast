@@ -943,7 +943,7 @@ async fn enrich_user_lookup_details(
     }
 }
 
-fn should_attempt_name_fallback(query: &str, authoritative_match: bool) -> bool {
+fn should_attempt_authoritative_name_promotion(query: &str, authoritative_match: bool) -> bool {
     !authoritative_match && !query.contains('@') && !query.starts_with("npub") && query.len() != 64
 }
 
@@ -954,8 +954,8 @@ fn should_fetch_email_suggestions(authoritative_match: bool, result_count: usize
 #[cfg(test)]
 mod user_lookup_response_tests {
     use super::{
-        should_attempt_name_fallback, should_fetch_email_suggestions, UserLookupDetails,
-        UserLookupResponse,
+        should_attempt_authoritative_name_promotion, should_fetch_email_suggestions,
+        UserLookupDetails, UserLookupResponse,
     };
 
     #[test]
@@ -987,11 +987,17 @@ mod user_lookup_response_tests {
     }
 
     #[test]
-    fn loose_matches_still_allow_authoritative_fallbacks_but_skip_suggestions() {
-        assert!(should_attempt_name_fallback("partial-name", false));
+    fn loose_matches_allow_authoritative_name_promotion_but_skip_suggestions() {
+        assert!(should_attempt_authoritative_name_promotion(
+            "partial-name",
+            false
+        ));
         assert!(!should_fetch_email_suggestions(false, 1));
         assert!(should_fetch_email_suggestions(false, 0));
-        assert!(!should_attempt_name_fallback("partial-name", true));
+        assert!(!should_attempt_authoritative_name_promotion(
+            "partial-name",
+            true
+        ));
         assert!(!should_fetch_email_suggestions(true, 0));
     }
 }
@@ -1020,8 +1026,10 @@ pub async fn get_user_lookup(
     let user_repo = UserRepository::new(pool.clone());
     let mut lookup = user_repo.find_users_for_admin(q, tenant_id).await?;
 
-    // Divine name server fallback: if no authoritative result and query looks like a username
-    if should_attempt_name_fallback(q, lookup.authoritative_match)
+    // Loose repository matches are candidates, not authoritative identity matches. Keep them in
+    // the response, but still resolve username-shaped queries so an exact external name match can
+    // be promoted ahead of those candidates.
+    if should_attempt_authoritative_name_promotion(q, lookup.authoritative_match)
         && crate::divine_names::is_enabled()
     {
         if let Ok(Some(hex_pubkey)) = crate::divine_names::lookup_by_name(q).await {
