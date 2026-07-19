@@ -31,6 +31,12 @@ const PRELOAD_TOKEN_EXPIRY_DAYS: i64 = 30;
 /// Redis key for the support admins set
 const SUPPORT_ADMINS_KEY: &str = "support_admins";
 
+/// Maximum delay for optional external-name promotion during an admin lookup.
+///
+/// Local candidates are already available, so external enrichment must not add the name
+/// service's three-second request timeout to the support workflow.
+const ADMIN_NAME_PROMOTION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Full admin: has admin_role == "full" in UCAN, or pubkey in ALLOWED_PUBKEYS whitelist.
 /// Full admins can access all admin endpoints including token generation and user preloading.
 pub fn is_full_admin(auth: &UcanAuth) -> bool {
@@ -951,12 +957,41 @@ fn should_fetch_email_suggestions(authoritative_match: bool, result_count: usize
     !authoritative_match && result_count == 0
 }
 
+async fn await_name_promotion_within<T>(
+    future: impl std::future::Future<Output = T>,
+    timeout: std::time::Duration,
+) -> Option<T> {
+    tokio::time::timeout(timeout, future).await.ok()
+}
+
 #[cfg(test)]
 mod user_lookup_response_tests {
     use super::{
-        should_attempt_authoritative_name_promotion, should_fetch_email_suggestions,
-        UserLookupDetails, UserLookupResponse,
+        await_name_promotion_within, should_attempt_authoritative_name_promotion,
+        should_fetch_email_suggestions, UserLookupDetails, UserLookupResponse,
+        ADMIN_NAME_PROMOTION_TIMEOUT,
     };
+
+    #[tokio::test]
+    async fn authoritative_name_promotion_stops_at_the_admin_lookup_budget() {
+        let completed = await_name_promotion_within(
+            std::future::ready("authoritative"),
+            std::time::Duration::from_millis(5),
+        )
+        .await;
+        let result = await_name_promotion_within(
+            std::future::pending::<()>(),
+            std::time::Duration::from_millis(5),
+        )
+        .await;
+
+        assert_eq!(completed, Some("authoritative"));
+        assert_eq!(result, None);
+        assert_eq!(
+            ADMIN_NAME_PROMOTION_TIMEOUT,
+            std::time::Duration::from_millis(250)
+        );
+    }
 
     #[test]
     fn serializes_suggestions_separately_from_results() {
@@ -1032,7 +1067,12 @@ pub async fn get_user_lookup(
     if should_attempt_authoritative_name_promotion(q, lookup.authoritative_match)
         && crate::divine_names::is_enabled()
     {
-        if let Ok(Some(hex_pubkey)) = crate::divine_names::lookup_by_name(q).await {
+        if let Some(Ok(Some(hex_pubkey))) = await_name_promotion_within(
+            crate::divine_names::lookup_by_name(q),
+            ADMIN_NAME_PROMOTION_TIMEOUT,
+        )
+        .await
+        {
             let mut resolved_lookup = user_repo
                 .find_users_for_admin(&hex_pubkey, tenant_id)
                 .await?;
