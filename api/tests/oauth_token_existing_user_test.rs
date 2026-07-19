@@ -18,8 +18,11 @@ use keycast_api::{
 };
 use keycast_core::{
     encryption::{KeyManager, KeyManagerError},
-    repositories::{OAuthCodeRepository, StoreOAuthCodeParams},
-    secret_pool::SecretPool,
+    repositories::{
+        OAuthCodeRepository, PersonalKeysRepository, StoreOAuthCodeParams,
+        StoreOAuthCodeWithRegistrationParams,
+    },
+    secret_pool::{SecretPool, SecretPoolReceiver},
 };
 use moka::future::Cache;
 use nostr_sdk::{Keys, ToBech32};
@@ -56,9 +59,18 @@ async fn setup_pool() -> PgPool {
 }
 
 fn create_auth_state(pool: PgPool) -> AuthState {
-    let bcrypt_queue = BcryptQueue::new();
     let secret_pool = Box::leak(Box::new(SecretPool::new(1)));
     let _secret_pool_producer = secret_pool.spawn_producer();
+    build_auth_state(pool, secret_pool.receiver())
+}
+
+fn create_exhausted_auth_state(pool: PgPool) -> AuthState {
+    let receiver = SecretPool::new(1).receiver();
+    build_auth_state(pool, receiver)
+}
+
+fn build_auth_state(pool: PgPool, secret_pool: SecretPoolReceiver) -> AuthState {
+    let bcrypt_queue = BcryptQueue::new();
     let tenant_cache = Cache::builder().max_capacity(10).build();
     let key_manager: Arc<Box<dyn KeyManager>> = Arc::new(Box::new(TestKeyManager));
 
@@ -72,7 +84,7 @@ fn create_auth_state(pool: PgPool) -> AuthState {
             tenant_cache,
             bcrypt_sender: bcrypt_queue.sender(),
             redis: None,
-            secret_pool: secret_pool.receiver(),
+            secret_pool,
             activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),
         }),
         auth_tx: None,
@@ -193,4 +205,136 @@ async fn oauth_token_exchanges_plain_existing_user_code() {
     assert_eq!(status, StatusCode::OK, "unexpected token response: {body}");
     assert!(body["access_token"].is_string(), "token response: {body}");
     assert!(body["bunker_url"].is_string(), "token response: {body}");
+}
+
+#[tokio::test]
+async fn oauth_token_issuance_failure_leaves_pending_registration_rearmable() {
+    let pool = setup_pool().await;
+    let auth_state = create_exhausted_auth_state(pool.clone());
+    let keys = Keys::generate();
+    let user_pubkey = keys.public_key().to_hex();
+    let email = format!("oauth-token-recovery-{}@example.com", Uuid::new_v4());
+    let pending_code = format!("oauth_pending_{}", Uuid::new_v4());
+    let exchange_code = format!("oauth_exchange_{}", Uuid::new_v4());
+    let replacement_code = format!("oauth_replacement_{}", Uuid::new_v4());
+    let device_code = format!("device_{}", Uuid::new_v4());
+    let verification_token = format!("verification_{}", Uuid::new_v4());
+    let client_id = format!("client_{}", Uuid::new_v4());
+    let redirect_uri = "http://localhost:3000/callback";
+    let repo = OAuthCodeRepository::new(pool.clone());
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, email, email_verified, created_at, updated_at)
+         VALUES ($1, 1, $2, TRUE, NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(&email)
+    .execute(&pool)
+    .await
+    .unwrap();
+    PersonalKeysRepository::new(pool.clone())
+        .create(&user_pubkey, &keys.secret_key().to_secret_bytes(), 1)
+        .await
+        .unwrap();
+
+    repo.store_with_pending_registration(StoreOAuthCodeWithRegistrationParams {
+        tenant_id: 1,
+        code: &pending_code,
+        user_pubkey: &user_pubkey,
+        client_id: &client_id,
+        redirect_uri,
+        scope: "policy:social",
+        code_challenge: None,
+        code_challenge_method: None,
+        expires_at: Utc::now() + Duration::hours(24),
+        pending_email: &email,
+        pending_password_hash: "already-finalized",
+        pending_email_verification_token: &verification_token,
+        pending_encrypted_secret: Some(&keys.secret_key().to_secret_bytes()),
+        state: None,
+        device_code: Some(&device_code),
+        is_headless: true,
+        pin_hash: Some("pin-hash"),
+    })
+    .await
+    .unwrap();
+    let pending = repo
+        .find_by_device_code(&device_code, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(repo
+        .store_for_pending_registration(
+            StoreOAuthCodeParams {
+                tenant_id: 1,
+                code: &exchange_code,
+                user_pubkey: &user_pubkey,
+                client_id: &client_id,
+                redirect_uri,
+                scope: "policy:social",
+                code_challenge: None,
+                code_challenge_method: None,
+                expires_at: Utc::now() + Duration::minutes(10),
+                previous_auth_id: None,
+                state: None,
+                is_headless: true,
+            },
+            &pending,
+        )
+        .await
+        .unwrap());
+
+    let response = match token(
+        create_test_tenant(),
+        State(auth_state),
+        TokenRequestBody(TokenRequest {
+            grant_type: Some("authorization_code".to_string()),
+            code: Some(exchange_code.clone()),
+            client_id: client_id.clone(),
+            redirect_uri: Some(redirect_uri.to_string()),
+            code_verifier: None,
+            refresh_token: None,
+        }),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    };
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(repo.find_valid(1, &exchange_code).await.unwrap().is_none());
+    let pending_after_failure = repo
+        .find_by_device_code(&device_code, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        pending_after_failure.consumed_at.is_none(),
+        "failed issuance must not make the pending registration terminal"
+    );
+    assert!(
+        repo.store_for_pending_registration(
+            StoreOAuthCodeParams {
+                tenant_id: 1,
+                code: &replacement_code,
+                user_pubkey: &user_pubkey,
+                client_id: &client_id,
+                redirect_uri,
+                scope: "policy:social",
+                code_challenge: None,
+                code_challenge_method: None,
+                expires_at: Utc::now() + Duration::minutes(10),
+                previous_auth_id: None,
+                state: None,
+                is_headless: true,
+            },
+            &pending_after_failure,
+        )
+        .await
+        .unwrap(),
+        "the verification flow must be able to mint a replacement exchange code"
+    );
+
+    cleanup_user(&pool, &user_pubkey, &replacement_code).await;
 }

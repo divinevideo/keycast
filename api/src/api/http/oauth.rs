@@ -3097,10 +3097,11 @@ async fn handle_authorization_code_grant(
 
         pending_email_val.clone()
     } else {
-        // Normal token exchange (existing user, not registration)
-        // One-time exchange and pending-row completion must be one authoritative DB transition.
+        // Normal token exchange (existing user, not registration). Redeem the exchange code now,
+        // but leave the pending registration active until every issuance step succeeds. If a
+        // downstream dependency fails, the verification link/PIN can mint a replacement code.
         if !oauth_code_repo
-            .redeem_code_and_mark_pending_consumed(tenant_id, code, &auth_code_for_redeem)
+            .redeem_code(tenant_id, code, &auth_code_for_redeem)
             .await?
         {
             return Err(OAuthError::Unauthorized);
@@ -3119,7 +3120,7 @@ async fn handle_authorization_code_grant(
     );
 
     // Create OAuth authorization and generate token response
-    create_oauth_authorization_and_token(
+    let response = create_oauth_authorization_and_token(
         CreateAuthorizationParams {
             tenant_id,
             user_pubkey: &user_pubkey,
@@ -3133,7 +3134,27 @@ async fn handle_authorization_code_grant(
         },
         auth_state,
     )
-    .await
+    .await?;
+
+    // `consumed_at` is the terminal registration marker. Set it only after the authorization,
+    // refresh token, and response have all been created successfully; otherwise recovery remains
+    // possible through the still-active pending row.
+    if pending_email.is_none()
+        && !oauth_code_repo
+            .mark_pending_consumed(tenant_id, &auth_code_for_redeem)
+            .await?
+    {
+        tracing::error!(
+            tenant_id,
+            user_pubkey,
+            "OAuth token issuance succeeded but pending registration completion failed"
+        );
+        return Err(OAuthError::ServerError(
+            "Failed to complete pending registration".to_string(),
+        ));
+    }
+
+    Ok(response)
 }
 
 // handle_password_grant() removed - ROPC grant type deprecated and removed

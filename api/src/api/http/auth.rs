@@ -514,7 +514,7 @@ pub enum AuthError {
     Forbidden(String),   // User has no authorization for this origin
     KeyEgressDenied,     // Policy refuses raw-key egress for this account
     RegistrationExpired, // Async bcrypt timed out (instance died)
-    /// The pending registration's exchange code was already redeemed; re-mint is refused
+    /// The pending registration already completed token issuance; re-mint is refused
     /// (keycast#262 bounded lifecycle).
     RegistrationAlreadyCompleted,
     ServiceUnavailable {
@@ -1735,7 +1735,7 @@ pub async fn finalize_pending_registration(
     oauth_data: &OAuthCodeData,
     delivery: HeadlessDelivery,
 ) -> Result<FinalizedRegistration, AuthError> {
-    // Terminal: once the registration's exchange code has been redeemed, the row is consumed and
+    // Terminal: once the registration's exchange code has issued tokens, the row is consumed and
     // must not re-mint again (keycast#262). Re-clicks before redemption still re-arm a fresh code
     // (the intended harmless idempotency); re-clicks after completion are refused here.
     if oauth_data.consumed_at.is_some() {
@@ -2139,7 +2139,7 @@ async fn perform_email_verification(
         // Complete via the shared finalize path. This intentionally does NOT delete the pending
         // row: re-verifying within the 24h window re-arms a fresh 10-minute code, which makes
         // link prefetch/preview harmless (keycast#262 Part A). Once the registration has been
-        // completed (exchange code redeemed), finalize refuses to re-mint; a re-clicked link then
+        // completed token issuance, finalize refuses to re-mint; a re-clicked link then
         // shows the friendly "already verified" page rather than an error.
         let finalized = match finalize_pending_registration(
             pool,
@@ -2460,6 +2460,8 @@ pub async fn verify_email_get(
                 "This email is already registered. Please log in instead.",
             )
         }
+        // Rate limited: the link is still good, so retry rather than declaring it dead.
+        Err(AuthError::TooManyRequests { retry_after, .. }) => verify_html_retry_page(retry_after),
         Err(AuthError::Database(_))
         | Err(AuthError::PasswordHash(_))
         | Err(AuthError::Encryption(_))
@@ -2477,6 +2479,8 @@ pub async fn verify_email_get(
         | Err(AuthError::Forbidden(_))
         | Err(AuthError::RegistrationExpired)
         | Err(AuthError::RegistrationAlreadyCompleted)
+        | Err(AuthError::KeyEgressDenied)
+        | Err(AuthError::OAuthProtocol { .. })
         | Err(AuthError::Conflict(_)) => verify_html_page(
             StatusCode::OK,
             "Verification failed",

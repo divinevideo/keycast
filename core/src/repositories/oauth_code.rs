@@ -33,8 +33,8 @@ pub struct OAuthCodeData {
     pub pin_attempts: i32,
     /// Timestamp of the last PIN issuance; backs the PIN-resend cooldown
     pub pin_sent_at: Option<DateTime<Utc>>,
-    /// Terminal marker (keycast#262): set when the registration's exchange code is redeemed. Once
-    /// non-NULL, finalize refuses to re-mint and the row is eligible for cleanup.
+    /// Terminal marker (keycast#262): set after the registration's exchange code successfully
+    /// issues tokens. Once non-NULL, finalize refuses to re-mint and the row is eligible for cleanup.
     pub consumed_at: Option<DateTime<Utc>>,
 }
 
@@ -275,7 +275,7 @@ impl OAuthCodeRepository {
     /// Atomically reserve one PIN-verification attempt slot for a pending registration, returning
     /// the new attempt count. Returns `None` when no slot could be reserved — the row is already
     /// at `max_attempts` (locked), no live pending row matches the `device_code`, or the
-    /// registration was already consumed (exchange code redeemed).
+    /// registration already completed token issuance.
     ///
     /// Scoped to the pending registration row itself (`pending_email IS NOT NULL AND consumed_at
     /// IS NULL`): minted exchange-code rows copy `device_code` from the pending row, and a
@@ -320,7 +320,7 @@ impl OAuthCodeRepository {
     /// Deliberately NOT scoped to the pending row (unlike [`Self::reserve_pin_attempt`] /
     /// [`Self::reset_pin_attempts`]): this rewrites `pending_email_verification_token`, which
     /// minted sibling exchange-code rows copy and which redemption correlates on (see
-    /// `redeem_code_and_mark_pending_consumed`). Restricting the UPDATE to the pending row would
+    /// [`Self::mark_pending_consumed`]). Restricting the UPDATE to the pending row would
     /// desynchronize the token between a pre-resend minted code and the pending row, so redeeming
     /// that code would no longer mark the registration consumed. If you need to narrow this,
     /// change the redemption correlation key first.
@@ -483,8 +483,13 @@ impl OAuthCodeRepository {
         Ok(row)
     }
 
-    /// Delete an exchange code and atomically mark the matching pending registration consumed.
-    pub async fn redeem_code_and_mark_pending_consumed(
+    /// Redeem an exchange code while its matching pending registration is still active.
+    ///
+    /// This deliberately does not mark the pending row consumed. Token issuance performs several
+    /// fallible operations after code redemption, so the caller must mark the pending row only
+    /// after issuance succeeds. If issuance fails, the one-shot exchange code stays redeemed, but
+    /// the pending registration remains active and can mint a replacement code.
+    pub async fn redeem_code(
         &self,
         tenant_id: i64,
         code: &str,
@@ -503,23 +508,22 @@ impl OAuthCodeRepository {
         }
 
         if auth_code.pending_email_verification_token.is_some() {
-            let updated = sqlx::query(
-                "UPDATE oauth_codes SET consumed_at = $1
-                 WHERE tenant_id = $2
-                   AND user_pubkey = $3
-                   AND client_id = $4
-                   AND redirect_uri = $5
-                   AND scope = $6
-                   AND code_challenge IS NOT DISTINCT FROM $7
-                   AND code_challenge_method IS NOT DISTINCT FROM $8
-                   AND state IS NOT DISTINCT FROM $9
-                   AND is_headless = $10
+            let pending_exists: Option<(i32,)> = sqlx::query_as(
+                "SELECT 1 FROM oauth_codes
+                 WHERE tenant_id = $1
+                   AND user_pubkey = $2
+                   AND client_id = $3
+                   AND redirect_uri = $4
+                   AND scope = $5
+                   AND code_challenge IS NOT DISTINCT FROM $6
+                   AND code_challenge_method IS NOT DISTINCT FROM $7
+                   AND state IS NOT DISTINCT FROM $8
+                   AND is_headless = $9
                    AND pending_email IS NOT NULL
-                   AND pending_email_verification_token IS NOT DISTINCT FROM $11
-                   AND device_code IS NOT DISTINCT FROM $12
+                   AND pending_email_verification_token IS NOT DISTINCT FROM $10
+                   AND device_code IS NOT DISTINCT FROM $11
                    AND consumed_at IS NULL",
             )
-            .bind(Utc::now())
             .bind(tenant_id)
             .bind(&auth_code.user_pubkey)
             .bind(&auth_code.client_id)
@@ -531,10 +535,10 @@ impl OAuthCodeRepository {
             .bind(auth_code.is_headless)
             .bind(auth_code.pending_email_verification_token.as_deref())
             .bind(auth_code.device_code.as_deref())
-            .execute(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await?;
 
-            if updated.rows_affected() != 1 {
+            if pending_exists.is_none() {
                 tx.rollback().await?;
                 return Ok(false);
             }
@@ -544,8 +548,53 @@ impl OAuthCodeRepository {
         Ok(true)
     }
 
+    /// Mark the pending registration associated with a successfully issued exchange code as
+    /// terminal. Returns `false` if the pending row is missing or already consumed.
+    pub async fn mark_pending_consumed(
+        &self,
+        tenant_id: i64,
+        auth_code: &OAuthCodeData,
+    ) -> Result<bool, RepositoryError> {
+        if auth_code.pending_email_verification_token.is_none() {
+            return Ok(true);
+        }
+
+        let updated = sqlx::query(
+            "UPDATE oauth_codes SET consumed_at = $1
+             WHERE tenant_id = $2
+               AND user_pubkey = $3
+               AND client_id = $4
+               AND redirect_uri = $5
+               AND scope = $6
+               AND code_challenge IS NOT DISTINCT FROM $7
+               AND code_challenge_method IS NOT DISTINCT FROM $8
+               AND state IS NOT DISTINCT FROM $9
+               AND is_headless = $10
+               AND pending_email IS NOT NULL
+               AND pending_email_verification_token IS NOT DISTINCT FROM $11
+               AND device_code IS NOT DISTINCT FROM $12
+               AND consumed_at IS NULL",
+        )
+        .bind(Utc::now())
+        .bind(tenant_id)
+        .bind(&auth_code.user_pubkey)
+        .bind(&auth_code.client_id)
+        .bind(&auth_code.redirect_uri)
+        .bind(&auth_code.scope)
+        .bind(auth_code.code_challenge.as_deref())
+        .bind(auth_code.code_challenge_method.as_deref())
+        .bind(auth_code.state.as_deref())
+        .bind(auth_code.is_headless)
+        .bind(auth_code.pending_email_verification_token.as_deref())
+        .bind(auth_code.device_code.as_deref())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(updated.rows_affected() == 1)
+    }
+
     /// Delete dead rows: anything past its expiry, plus consumed pending registrations (terminal
-    /// once their exchange code was redeemed). Bounds table growth and enforces the pending row's
+    /// once their exchange code successfully issued tokens). Bounds table growth and enforces the pending row's
     /// finite lifecycle (keycast#262). Returns the number of rows removed.
     pub async fn delete_expired_and_consumed(&self) -> Result<u64, RepositoryError> {
         let result =
@@ -913,7 +962,7 @@ mod tests {
             "reset_pin_attempts must not touch the minted sibling row"
         );
 
-        // Once the registration is consumed (exchange code redeemed), no attempt slot may be
+        // Once the registration is consumed (token issuance succeeded), no attempt slot may be
         // reserved: the terminal marker must end the PIN lifecycle too.
         sqlx::query("UPDATE oauth_codes SET consumed_at = NOW() WHERE device_code = $1 AND pending_email IS NOT NULL")
             .bind(&device_code)
@@ -1316,17 +1365,28 @@ mod tests {
             .unwrap());
         let auth_code = repo.find_valid(1, &exchange_code).await.unwrap().unwrap();
 
-        repo.redeem_code_and_mark_pending_consumed(1, &exchange_code, &auth_code)
+        repo.redeem_code(1, &exchange_code, &auth_code)
             .await
             .unwrap();
 
-        let after = repo
+        let after_redeem = repo
             .find_by_device_code(&device_code, 1)
             .await
             .unwrap()
             .unwrap();
         assert!(
-            after.consumed_at.is_some(),
+            after_redeem.consumed_at.is_none(),
+            "redeeming the exchange code must leave recovery possible until issuance succeeds"
+        );
+
+        assert!(repo.mark_pending_consumed(1, &auth_code).await.unwrap());
+        let after_issuance = repo
+            .find_by_device_code(&device_code, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            after_issuance.consumed_at.is_some(),
             "pending row should be marked consumed"
         );
 
@@ -1378,11 +1438,12 @@ mod tests {
 
         let auth_code_a = repo.find_valid(1, &exchange_a).await.unwrap().unwrap();
         assert!(
-            repo.redeem_code_and_mark_pending_consumed(1, &exchange_a, &auth_code_a)
+            repo.redeem_code(1, &exchange_a, &auth_code_a)
                 .await
                 .unwrap(),
             "first exchange code should redeem the pending registration"
         );
+        assert!(repo.mark_pending_consumed(1, &auth_code_a).await.unwrap());
 
         let after_first = repo
             .find_by_device_code(&device_code, 1)
@@ -1397,7 +1458,7 @@ mod tests {
         let auth_code_b = repo.find_valid(1, &exchange_b).await.unwrap().unwrap();
         assert!(
             !repo
-                .redeem_code_and_mark_pending_consumed(1, &exchange_b, &auth_code_b)
+                .redeem_code(1, &exchange_b, &auth_code_b)
                 .await
                 .unwrap(),
             "second sibling exchange code must not redeem after pending row is consumed"
@@ -1504,9 +1565,8 @@ mod tests {
             .unwrap());
         let auth_code = repo.find_valid(1, &exchange_a).await.unwrap().unwrap();
 
-        repo.redeem_code_and_mark_pending_consumed(1, &exchange_a, &auth_code)
-            .await
-            .unwrap();
+        repo.redeem_code(1, &exchange_a, &auth_code).await.unwrap();
+        assert!(repo.mark_pending_consumed(1, &auth_code).await.unwrap());
 
         let pending_a = repo
             .find_by_device_code(&device_a, 1)
