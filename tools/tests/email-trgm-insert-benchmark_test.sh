@@ -9,7 +9,7 @@ help_output="$($benchmark_script --help)"
 grep -q -- "--database-url" <<<"$help_output"
 grep -q -- "--clients" <<<"$help_output"
 grep -q -- "--transactions" <<<"$help_output"
-grep -q -- "--explain-rows" <<<"$help_output"
+grep -q -- "--baseline-rows" <<<"$help_output"
 grep -q -- "isolated benchmark schema" <<<"$help_output"
 
 assert_remote_database_rejected() {

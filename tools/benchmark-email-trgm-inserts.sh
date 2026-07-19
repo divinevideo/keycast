@@ -15,7 +15,7 @@ Options:
   --database-url URL    Local PostgreSQL URL (or set DATABASE_URL)
   --clients N           Concurrent pgbench clients (default: 4)
   --transactions N      Transactions per client and per configuration (default: 10000)
-  --explain-rows N      Indexed rows used for EXPLAIN verification (default: 400000)
+  --baseline-rows N     Preloaded rows per configuration and for EXPLAIN (default: 400000)
   --help                Show this help
 EOF
 }
@@ -23,7 +23,7 @@ EOF
 benchmark_database_url="${DATABASE_URL:-}"
 benchmark_clients=4
 benchmark_transactions=10000
-benchmark_explain_rows=400000
+benchmark_baseline_rows=400000
 benchmark_schema="email_trgm_benchmark"
 benchmark_workload="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/email-trgm-insert-workload.sql"
 
@@ -41,8 +41,8 @@ while (($# > 0)); do
             benchmark_transactions="${2:-}"
             shift 2
             ;;
-        --explain-rows)
-            benchmark_explain_rows="${2:-}"
+        --baseline-rows)
+            benchmark_baseline_rows="${2:-}"
             shift 2
             ;;
         --help|-h)
@@ -90,8 +90,8 @@ if [[ ! "$benchmark_transactions" =~ ^[1-9][0-9]*$ ]]; then
     echo "--transactions must be a positive integer" >&2
     exit 2
 fi
-if [[ ! "$benchmark_explain_rows" =~ ^[1-9][0-9]*$ ]]; then
-    echo "--explain-rows must be a positive integer" >&2
+if [[ ! "$benchmark_baseline_rows" =~ ^[1-9][0-9]*$ ]]; then
+    echo "--baseline-rows must be a positive integer" >&2
     exit 2
 fi
 
@@ -157,46 +157,14 @@ run_benchmark() {
     printf '%s_tps=%s\n' "$configuration" "$tps"
 }
 
-total_inserts=$((benchmark_clients * benchmark_transactions))
-if ((benchmark_explain_rows < total_inserts)); then
-    echo "--explain-rows must be at least clients × transactions" >&2
-    exit 2
-fi
-echo "postgres_version=$(psql "$benchmark_database_url" --tuples-only --no-align --command='SHOW server_version')"
-echo "clients=$benchmark_clients"
-echo "transactions_per_client=$benchmark_transactions"
-echo "inserts_per_configuration=$total_inserts"
-echo "explain_rows=$benchmark_explain_rows"
-
-without_gin_results="$(run_benchmark without_gin)"
-echo "$without_gin_results"
-without_gin_tps="$(awk -F= '$1 == "without_gin_tps" { print $2 }' <<<"$without_gin_results")"
-
-psql "$benchmark_database_url" \
-    --set=ON_ERROR_STOP=1 \
-    --set=benchmark_schema="$benchmark_schema" <<'SQL' >/dev/null
+populate_baseline() {
+    psql "$benchmark_database_url" \
+        --set=ON_ERROR_STOP=1 \
+        --set=benchmark_schema="$benchmark_schema" \
+        --set=baseline_rows="$benchmark_baseline_rows" <<'SQL' >/dev/null
 TRUNCATE TABLE :"benchmark_schema".users;
 ALTER SEQUENCE :"benchmark_schema".user_sequence RESTART WITH 1;
-CREATE INDEX idx_users_email_trgm
-    ON :"benchmark_schema".users USING gin (email gin_trgm_ops)
-    WHERE email IS NOT NULL;
-SQL
 
-with_gin_results="$(run_benchmark with_gin)"
-echo "$with_gin_results"
-with_gin_tps="$(awk -F= '$1 == "with_gin_tps" { print $2 }' <<<"$with_gin_results")"
-
-throughput_change_percent="$(awk \
-    -v without_gin="$without_gin_tps" \
-    -v with_gin="$with_gin_tps" \
-    'BEGIN { printf "%.2f", ((with_gin - without_gin) / without_gin) * 100 }')"
-echo "throughput_change_percent=$throughput_change_percent"
-
-psql "$benchmark_database_url" \
-    --set=ON_ERROR_STOP=1 \
-    --set=benchmark_schema="$benchmark_schema" \
-    --set=current_rows="$total_inserts" \
-    --set=explain_rows="$benchmark_explain_rows" <<'SQL'
 INSERT INTO :"benchmark_schema".users (
     pubkey,
     tenant_id,
@@ -215,8 +183,52 @@ SELECT
     true,
     clock_timestamp(),
     clock_timestamp()
-FROM generate_series(:current_rows + 1, :explain_rows) AS value;
+FROM generate_series(1, :baseline_rows) AS value;
 
+SELECT setval(
+    format('%I.user_sequence', :'benchmark_schema')::regclass,
+    :baseline_rows,
+    true
+);
+SQL
+}
+
+total_inserts=$((benchmark_clients * benchmark_transactions))
+rows_after_timed_inserts=$((benchmark_baseline_rows + total_inserts))
+echo "postgres_version=$(psql "$benchmark_database_url" --tuples-only --no-align --command='SHOW server_version')"
+echo "clients=$benchmark_clients"
+echo "transactions_per_client=$benchmark_transactions"
+echo "inserts_per_configuration=$total_inserts"
+echo "baseline_rows_per_configuration=$benchmark_baseline_rows"
+echo "rows_after_timed_inserts=$rows_after_timed_inserts"
+
+populate_baseline
+without_gin_results="$(run_benchmark without_gin)"
+echo "$without_gin_results"
+without_gin_tps="$(awk -F= '$1 == "without_gin_tps" { print $2 }' <<<"$without_gin_results")"
+
+populate_baseline
+psql "$benchmark_database_url" \
+    --set=ON_ERROR_STOP=1 \
+    --set=benchmark_schema="$benchmark_schema" <<'SQL' >/dev/null
+CREATE INDEX idx_users_email_trgm
+    ON :"benchmark_schema".users USING gin (email gin_trgm_ops)
+    WHERE email IS NOT NULL;
+SQL
+
+with_gin_results="$(run_benchmark with_gin)"
+echo "$with_gin_results"
+with_gin_tps="$(awk -F= '$1 == "with_gin_tps" { print $2 }' <<<"$with_gin_results")"
+
+throughput_change_percent="$(awk \
+    -v without_gin="$without_gin_tps" \
+    -v with_gin="$with_gin_tps" \
+    'BEGIN { printf "%.2f", ((with_gin - without_gin) / without_gin) * 100 }')"
+echo "throughput_change_percent=$throughput_change_percent"
+
+psql "$benchmark_database_url" \
+    --set=ON_ERROR_STOP=1 \
+    --set=benchmark_schema="$benchmark_schema" <<'SQL'
 ANALYZE :"benchmark_schema".users;
 
 SELECT 'gin_index_size_bytes=' || pg_relation_size(format('%I.idx_users_email_trgm', :'benchmark_schema')::regclass);
