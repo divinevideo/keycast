@@ -760,11 +760,10 @@ async fn record_pin_verify_failure(
 /// Verify-pin rejects several states before ever reaching the bcrypt compare (unknown
 /// `device_code`, no PIN issued, already locked). Burning a dummy hash on those paths keeps their
 /// latency comparable to a wrong-PIN attempt so the rejected state is not distinguishable by timing.
-async fn burn_dummy_bcrypt() {
-    let _ = tokio::task::spawn_blocking(|| {
-        let _ = bcrypt::hash("dummy", bcrypt::DEFAULT_COST);
-    })
-    .await;
+async fn burn_dummy_bcrypt(
+    bcrypt_sender: &crate::bcrypt_queue::BcryptSender,
+) -> Result<(), HeadlessError> {
+    bcrypt_sender.burn_dummy().await.map_err(Into::into)
 }
 
 /// POST /api/headless/verify-pin
@@ -790,7 +789,7 @@ pub async fn headless_verify_pin(
 
     let Some(pending) = pending else {
         // Burn comparable time so an unknown/expired device_code isn't distinguishable by latency.
-        burn_dummy_bcrypt().await;
+        burn_dummy_bcrypt(&auth_state.state.bcrypt_sender).await?;
         record_pin_verify_failure(
             pool,
             &headers,
@@ -815,7 +814,7 @@ pub async fn headless_verify_pin(
     let Some(pin_hash) = pending.pin_hash.clone() else {
         // No PIN was issued for this registration. Burn comparable bcrypt work so this is
         // indistinguishable by latency from a wrong-PIN attempt before rejecting uniformly.
-        burn_dummy_bcrypt().await;
+        burn_dummy_bcrypt(&auth_state.state.bcrypt_sender).await?;
         record_pin_verify_failure(
             pool,
             &headers,
@@ -836,7 +835,7 @@ pub async fn headless_verify_pin(
         .reserve_pin_attempt(&req.device_code, tenant_id, MAX_PIN_ATTEMPTS)
         .await?
     else {
-        burn_dummy_bcrypt().await;
+        burn_dummy_bcrypt(&auth_state.state.bcrypt_sender).await?;
         record_pin_verify_failure(
             pool,
             &headers,
@@ -849,13 +848,13 @@ pub async fn headless_verify_pin(
         return Err(HeadlessError::PinVerificationFailed);
     };
 
-    // Constant-time PIN comparison (bcrypt's own compare; work factor dominates).
-    let candidate = req.pin.clone();
-    let stored = pin_hash;
-    let valid = tokio::task::spawn_blocking(move || verify(&candidate, &stored))
-        .await
-        .map_err(|e| HeadlessError::Internal(format!("Task join error: {}", e)))?
-        .unwrap_or(false);
+    // Constant-time PIN comparison (bcrypt's own compare; work factor dominates). Both this real
+    // comparison and the dummy rejection paths share the same bounded worker pool.
+    let valid = auth_state
+        .state
+        .bcrypt_sender
+        .verify(secrecy::SecretString::from(req.pin.clone()), pin_hash)
+        .await?;
 
     if !valid {
         // The slot was already consumed by the atomic reserve above; just classify and record.
@@ -1173,6 +1172,15 @@ impl From<keycast_core::repositories::RepositoryError> for HeadlessError {
     }
 }
 
+impl From<crate::bcrypt_queue::BcryptQueueError> for HeadlessError {
+    fn from(_error: crate::bcrypt_queue::BcryptQueueError) -> Self {
+        HeadlessError::ServiceUnavailable {
+            message: "Verification service is busy. Please try again shortly.".to_string(),
+            retry_after: Some(1),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nostr_sdk::Keys;
@@ -1206,6 +1214,7 @@ mod tests {
             .connect_lazy(&database_url)
             .expect("lazy pool should be created");
         let bcrypt_queue = crate::bcrypt_queue::BcryptQueue::new();
+        let _bcrypt_workers = bcrypt_queue.spawn_workers(pool.clone());
         let secret_pool = keycast_core::secret_pool::SecretPool::new(1);
         let tenant_cache = moka::future::Cache::builder().max_capacity(10).build();
         let key_manager: std::sync::Arc<Box<dyn keycast_core::encryption::KeyManager>> =

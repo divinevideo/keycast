@@ -1,10 +1,11 @@
 // ABOUTME: Async bcrypt queue for high-scale signup handling
 // ABOUTME: Defers password hashing to background workers, using email verification latency as natural buffer
 
-use bcrypt::{hash, DEFAULT_COST};
+use bcrypt::{hash, verify, DEFAULT_COST};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::PgPool;
+use tokio::sync::oneshot;
 
 /// Queue capacity for surge buffering
 /// At cost 12 (~300ms/hash), 4 cores can process ~13 hashes/sec
@@ -19,10 +20,22 @@ pub struct BcryptJob {
     pub password: SecretString,
 }
 
+enum BcryptWork {
+    HashPassword(BcryptJob),
+    Verify {
+        candidate: SecretString,
+        stored_hash: String,
+        result_tx: oneshot::Sender<bool>,
+    },
+    Dummy {
+        result_tx: oneshot::Sender<()>,
+    },
+}
+
 /// Async bcrypt queue for deferring password hashing to background workers
 pub struct BcryptQueue {
-    tx: Sender<BcryptJob>,
-    rx: Receiver<BcryptJob>,
+    tx: Sender<BcryptWork>,
+    rx: Receiver<BcryptWork>,
 }
 
 impl BcryptQueue {
@@ -73,14 +86,40 @@ impl Default for BcryptQueue {
 /// Sender handle for the bcrypt queue
 #[derive(Clone)]
 pub struct BcryptSender {
-    tx: Sender<BcryptJob>,
+    tx: Sender<BcryptWork>,
 }
 
 impl BcryptSender {
     /// Try to queue a bcrypt job
     /// Returns error if queue is full (backpressure) or disconnected
     pub fn try_send(&self, job: BcryptJob) -> Result<(), BcryptQueueError> {
-        self.tx.try_send(job).map_err(|e| match e {
+        self.try_send_work(BcryptWork::HashPassword(job))
+    }
+
+    /// Run a bcrypt comparison through the bounded worker pool.
+    pub async fn verify(
+        &self,
+        candidate: SecretString,
+        stored_hash: String,
+    ) -> Result<bool, BcryptQueueError> {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.try_send_work(BcryptWork::Verify {
+            candidate,
+            stored_hash,
+            result_tx,
+        })?;
+        result_rx.await.map_err(|_| BcryptQueueError::ShuttingDown)
+    }
+
+    /// Spend bcrypt work equivalent to a verification through the bounded worker pool.
+    pub async fn burn_dummy(&self) -> Result<(), BcryptQueueError> {
+        let (result_tx, result_rx) = oneshot::channel();
+        self.try_send_work(BcryptWork::Dummy { result_tx })?;
+        result_rx.await.map_err(|_| BcryptQueueError::ShuttingDown)
+    }
+
+    fn try_send_work(&self, work: BcryptWork) -> Result<(), BcryptQueueError> {
+        self.tx.try_send(work).map_err(|e| match e {
             TrySendError::Full(_) => BcryptQueueError::AtCapacity,
             TrySendError::Disconnected(_) => BcryptQueueError::ShuttingDown,
         })
@@ -107,7 +146,7 @@ pub enum BcryptQueueError {
 }
 
 /// Worker loop that processes bcrypt jobs from the queue
-async fn bcrypt_worker_loop(worker_id: usize, rx: Receiver<BcryptJob>, pool: PgPool) {
+async fn bcrypt_worker_loop(worker_id: usize, rx: Receiver<BcryptWork>, pool: PgPool) {
     tracing::debug!("Bcrypt worker {} started", worker_id);
 
     loop {
@@ -128,81 +167,122 @@ async fn bcrypt_worker_loop(worker_id: usize, rx: Receiver<BcryptJob>, pool: PgP
             }
         };
 
-        let token = job.token.clone();
-
-        // Hash password (CPU-bound operation)
-        // SecretString auto-zeroizes when dropped after closure completes
-        let hash_result = tokio::task::spawn_blocking({
-            let password = job.password;
-            move || {
-                let result = hash(password.expose_secret(), DEFAULT_COST);
-                // password (SecretString) dropped here, auto-zeroized
-                result
+        match job {
+            BcryptWork::HashPassword(job) => {
+                process_password_hash(worker_id, job, &pool).await;
             }
-        })
-        .await;
-
-        let password_hash = match hash_result {
-            Ok(Ok(h)) => h,
-            Ok(Err(e)) => {
-                tracing::error!(
-                    "Bcrypt worker {}: hash error for token {}: {}",
-                    worker_id,
-                    &token[..8],
-                    e
-                );
-                continue;
+            BcryptWork::Verify {
+                candidate,
+                stored_hash,
+                result_tx,
+            } => {
+                let result = tokio::task::spawn_blocking(move || {
+                    verify(candidate.expose_secret(), &stored_hash).unwrap_or(false)
+                })
+                .await;
+                let verified = match result {
+                    Ok(verified) => verified,
+                    Err(error) => {
+                        tracing::error!(
+                            "Bcrypt worker {}: verify task panicked: {}",
+                            worker_id,
+                            error
+                        );
+                        false
+                    }
+                };
+                let _ = result_tx.send(verified);
             }
-            Err(e) => {
-                tracing::error!(
-                    "Bcrypt worker {}: spawn_blocking panicked for token {}: {}",
-                    worker_id,
-                    &token[..8],
-                    e
-                );
-                continue;
-            }
-        };
-
-        // Update user row with the hash
-        let update_result = sqlx::query(
-            "UPDATE users SET password_hash = $1, updated_at = NOW()
-             WHERE email_verification_token = $2",
-        )
-        .bind(&password_hash)
-        .bind(&token)
-        .execute(&pool)
-        .await;
-
-        match update_result {
-            Ok(result) => {
-                if result.rows_affected() == 0 {
-                    // Row was deleted (TTL cleanup) before we could update it
-                    tracing::warn!(
-                        "Bcrypt worker {}: no row found for token {} (likely expired)",
+            BcryptWork::Dummy { result_tx } => {
+                let result = tokio::task::spawn_blocking(|| hash("dummy", DEFAULT_COST)).await;
+                if let Err(error) = result {
+                    tracing::error!(
+                        "Bcrypt worker {}: dummy task panicked: {}",
                         worker_id,
-                        &token[..8]
-                    );
-                } else {
-                    tracing::debug!(
-                        "Bcrypt worker {}: updated password hash for token {}",
-                        worker_id,
-                        &token[..8]
+                        error
                     );
                 }
-            }
-            Err(e) => {
-                tracing::error!(
-                    "Bcrypt worker {}: DB update failed for token {}: {}",
-                    worker_id,
-                    &token[..8],
-                    e
-                );
+                let _ = result_tx.send(());
             }
         }
     }
 
     tracing::debug!("Bcrypt worker {} exited", worker_id);
+}
+
+async fn process_password_hash(worker_id: usize, job: BcryptJob, pool: &PgPool) {
+    let token = job.token.clone();
+
+    // Hash password (CPU-bound operation)
+    // SecretString auto-zeroizes when dropped after closure completes
+    let hash_result = tokio::task::spawn_blocking({
+        let password = job.password;
+        move || {
+            let result = hash(password.expose_secret(), DEFAULT_COST);
+            // password (SecretString) dropped here, auto-zeroized
+            result
+        }
+    })
+    .await;
+
+    let password_hash = match hash_result {
+        Ok(Ok(h)) => h,
+        Ok(Err(e)) => {
+            tracing::error!(
+                "Bcrypt worker {}: hash error for token {}: {}",
+                worker_id,
+                &token[..8],
+                e
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::error!(
+                "Bcrypt worker {}: spawn_blocking panicked for token {}: {}",
+                worker_id,
+                &token[..8],
+                e
+            );
+            return;
+        }
+    };
+
+    // Update user row with the hash
+    let update_result = sqlx::query(
+        "UPDATE users SET password_hash = $1, updated_at = NOW()
+             WHERE email_verification_token = $2",
+    )
+    .bind(&password_hash)
+    .bind(&token)
+    .execute(pool)
+    .await;
+
+    match update_result {
+        Ok(result) => {
+            if result.rows_affected() == 0 {
+                // Row was deleted (TTL cleanup) before we could update it
+                tracing::warn!(
+                    "Bcrypt worker {}: no row found for token {} (likely expired)",
+                    worker_id,
+                    &token[..8]
+                );
+            } else {
+                tracing::debug!(
+                    "Bcrypt worker {}: updated password hash for token {}",
+                    worker_id,
+                    &token[..8]
+                );
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                "Bcrypt worker {}: DB update failed for token {}: {}",
+                worker_id,
+                &token[..8],
+                e
+            );
+        }
+    }
 }
 
 /// Spawn a cleanup task that periodically removes stale email signup rows
@@ -240,7 +320,7 @@ pub fn spawn_cleanup_task(pool: PgPool) -> tokio::task::JoinHandle<()> {
             }
 
             // Bound the oauth_codes pending/exchange rows: drop anything expired plus consumed
-            // pending registrations (terminal once their exchange code was redeemed) (keycast#262).
+            // pending registrations (terminal once token issuance succeeds) (keycast#262).
             let oauth_code_repo =
                 keycast_core::repositories::OAuthCodeRepository::new(pool.clone());
             match oauth_code_repo.delete_expired_and_consumed().await {
@@ -284,7 +364,7 @@ mod tests {
 
     #[test]
     fn test_queue_backpressure() {
-        let (tx, _rx) = bounded::<BcryptJob>(2);
+        let (tx, _rx) = bounded::<BcryptWork>(2);
         let sender = BcryptSender { tx };
 
         // Fill the queue
@@ -307,5 +387,29 @@ mod tests {
             password: SecretString::from("pass3".to_string()),
         });
         assert!(matches!(result, Err(BcryptQueueError::AtCapacity)));
+    }
+
+    #[tokio::test]
+    async fn test_verify_bcrypt_obeys_queue_backpressure() {
+        let (tx, _rx) = bounded::<BcryptWork>(1);
+        let sender = BcryptSender { tx };
+        sender
+            .try_send(BcryptJob {
+                token: "signup-token".to_string(),
+                password: SecretString::from("signup-password".to_string()),
+            })
+            .unwrap();
+
+        let result = sender
+            .verify(
+                SecretString::from("123456".to_string()),
+                bcrypt::hash("123456", bcrypt::DEFAULT_COST).unwrap(),
+            )
+            .await;
+
+        assert!(matches!(result, Err(BcryptQueueError::AtCapacity)));
+
+        let dummy_result = sender.burn_dummy().await;
+        assert!(matches!(dummy_result, Err(BcryptQueueError::AtCapacity)));
     }
 }
