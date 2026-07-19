@@ -4,6 +4,12 @@
 	import { KeycastApi } from '$lib/keycast_api.svelte';
 	import { redirectToLoginOnAuthError } from '$lib/utils/auth';
 	import { deeplinkQuery } from '$lib/utils/deeplink';
+	import {
+		isShowingSuggestions,
+		selectAutoExpandedPubkey,
+		selectDisplayedUsers,
+		type LookupResult
+	} from './lookup-view';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
 	import Loader from '$lib/components/Loader.svelte';
@@ -20,7 +26,7 @@
 	// User lookup state
 	let searchQuery = $state('');
 	let isSearching = $state(false);
-	let searchResult = $state<null | { results: UserDetails[]; suggestions: UserDetails[]; total: number }>(null);
+	let searchResult = $state<LookupResult<UserDetails> | null>(null);
 	let searchError = $state('');
 
 	// Expand/collapse state
@@ -66,15 +72,8 @@
 		last_active: string | null;
 	}
 
-	let displayedUsers: UserDetails[] = $derived.by(() => {
-		if (!searchResult) return [];
-		return searchResult.results.length > 0 ? searchResult.results : searchResult.suggestions;
-	});
-	let showingSuggestions = $derived(
-		searchResult !== null &&
-		searchResult.results.length === 0 &&
-		searchResult.suggestions.length > 0
-	);
+	let displayedUsers: UserDetails[] = $derived(selectDisplayedUsers(searchResult));
+	let showingSuggestions = $derived(isShowingSuggestions(searchResult));
 
 	onMount(async () => {
 		try {
@@ -114,15 +113,12 @@
 		expandedPubkey = null;
 
 		try {
-			const result = await api.get<{ results: UserDetails[]; suggestions: UserDetails[]; total: number }>(
+			const result = await api.get<LookupResult<UserDetails>>(
 				`/admin/user-lookup?q=${encodeURIComponent(q)}`
 			);
 			searchResult = result;
-			const returnedUsers = result.results.length > 0 ? result.results : result.suggestions;
-			// Auto-expand a single result or suggestion.
-			if (returnedUsers.length === 1) {
-				expandedPubkey = returnedUsers[0].pubkey;
-			}
+			// Suggestions require an explicit click so they are not mistaken for confirmed matches.
+			expandedPubkey = selectAutoExpandedPubkey(result);
 		} catch (err: any) {
 			if (redirectToLoginOnAuthError(err)) return;
 			searchError = err.message || 'Search failed';
@@ -341,6 +337,9 @@
 									<span class="list-name">{u.display_name || u.username || u.email || truncateFormatted(u.pubkey)}</span>
 									{#if u.username}
 										<span class="list-username">@{u.username}</span>
+									{/if}
+									{#if showingSuggestions}
+										<span class="suggested-badge">Suggested</span>
 									{/if}
 									<span class="list-sessions">{u.active_sessions} {u.active_sessions === 1 ? 'session' : 'sessions'}</span>
 								</button>
@@ -779,6 +778,19 @@
 	.list-username {
 		color: var(--color-divine-text-tertiary);
 		font-size: 0.775rem;
+		flex-shrink: 0;
+	}
+
+	.suggested-badge {
+		padding: 0.125rem 0.375rem;
+		border-radius: 9999px;
+		background: color-mix(in srgb, var(--color-divine-purple, #8b5cf6) 20%, transparent);
+		color: var(--color-divine-purple, #8b5cf6);
+		font-size: 0.65rem;
+		font-weight: 600;
+		line-height: 1.2;
+		text-transform: uppercase;
+		letter-spacing: 0.025em;
 		flex-shrink: 0;
 	}
 

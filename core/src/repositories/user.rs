@@ -2895,6 +2895,17 @@ mod tests {
         .execute(&mut *connection)
         .await
         .unwrap();
+        // A matching row makes this test fail if the isolated connection ever regains access to
+        // pg_trgm. The intended path still fails at query planning and returns no suggestions.
+        let matching_pubkey = Keys::generate().public_key().to_hex();
+        sqlx::query(
+            "INSERT INTO users (pubkey, email, tenant_id, status)
+             VALUES ($1, 'missing@example.com', 1, 'active')",
+        )
+        .bind(&matching_pubkey)
+        .execute(&mut *connection)
+        .await
+        .unwrap();
         drop(connection);
 
         let repo = UserRepository::new(isolated_pool.clone());

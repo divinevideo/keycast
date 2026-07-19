@@ -1,19 +1,62 @@
 import { describe, expect, test } from "bun:test";
+import {
+    isShowingSuggestions,
+    selectAutoExpandedPubkey,
+    selectDisplayedUsers,
+} from "./lookup-view";
 
-const pageSource = await Bun.file(
-    new URL("./+page.svelte", import.meta.url),
-).text();
+interface Row {
+    pubkey: string;
+}
 
-describe("support admin user lookup", () => {
-    test("renders fuzzy email suggestions with specific search guidance", () => {
-        expect(pageSource).toContain("suggestions: UserDetails[]");
-        expect(pageSource).toContain("searchResult.suggestions");
-        expect(pageSource).toContain("Did you mean?");
-        expect(pageSource).toContain(
-            'placeholder="Email, username, Vine ID, or pubkey"',
-        );
-        expect(pageSource).toContain(
-            "Full or partial email, username, Vine ID, hex pubkey, or npub",
-        );
+const row = (pubkey: string): Row => ({ pubkey });
+
+describe("support admin user lookup view", () => {
+    test("shows authoritative results and hides suggestions when results exist", () => {
+        const result = {
+            results: [row("a"), row("b")],
+            suggestions: [row("c")],
+            total: 2,
+        };
+
+        expect(selectDisplayedUsers(result)).toEqual([row("a"), row("b")]);
+        expect(isShowingSuggestions(result)).toBe(false);
+        expect(selectAutoExpandedPubkey(result)).toBeNull();
+    });
+
+    test("auto-expands a lone authoritative result", () => {
+        const result = {
+            results: [row("a")],
+            suggestions: [],
+            total: 1,
+        };
+
+        expect(selectAutoExpandedPubkey(result)).toBe("a");
+    });
+
+    test("falls back to fuzzy suggestions without auto-expanding them", () => {
+        const result = {
+            results: [],
+            suggestions: [row("c")],
+            total: 0,
+        };
+
+        expect(selectDisplayedUsers(result)).toEqual([row("c")]);
+        expect(isShowingSuggestions(result)).toBe(true);
+        expect(selectAutoExpandedPubkey(result)).toBeNull();
+    });
+
+    test("shows nothing and no suggestion banner when both are empty", () => {
+        const result = { results: [], suggestions: [], total: 0 };
+
+        expect(selectDisplayedUsers(result)).toEqual([]);
+        expect(isShowingSuggestions(result)).toBe(false);
+        expect(selectAutoExpandedPubkey(result)).toBeNull();
+    });
+
+    test("treats a null pre-search result as empty", () => {
+        expect(selectDisplayedUsers(null)).toEqual([]);
+        expect(isShowingSuggestions(null)).toBe(false);
+        expect(selectAutoExpandedPubkey(null)).toBeNull();
     });
 });
