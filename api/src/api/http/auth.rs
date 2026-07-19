@@ -2094,8 +2094,7 @@ pub async fn finalize_pending_registration(
     })
 }
 
-/// Result of running the shared email-verification logic, rendered as JSON by the POST handler
-/// and as HTML/redirect by the GET handler so both transports stay behaviorally identical.
+/// Result of running the interactive POST email-verification logic.
 enum VerifyOutcome {
     /// Non-headless OAuth: send the browser to the client callback carrying a fresh code.
     OAuthRedirect { redirect_url: String },
@@ -2111,78 +2110,99 @@ enum VerifyOutcome {
     Expired,
 }
 
-/// Core email-verification logic shared by the POST (JSON) and GET (browser) handlers.
-///
-/// Verification runs entirely server-side here, so it does not depend on any client JavaScript —
-/// the key fix for sandboxed in-app browsers that never run the SPA's `onMount` fetch (keycast#262).
+/// Outcomes that a server-side GET may produce. This deliberately excludes first-party user
+/// verification and session issuance, which require the interactive POST flow.
+enum PendingVerifyOutcome {
+    OAuthRedirect { redirect_url: String },
+    Headless,
+    AlreadyVerified,
+}
+
+/// Finalize only an OAuth/headless pending registration, if the token belongs to one.
+async fn perform_pending_email_verification(
+    auth_state: &super::routes::AuthState,
+    tenant_id: i64,
+    token: &str,
+) -> Result<Option<PendingVerifyOutcome>, AuthError> {
+    let pool = &auth_state.state.db;
+    let oauth_code_repo = OAuthCodeRepository::new(pool.clone());
+    let Some(oauth_data) = oauth_code_repo
+        .find_by_verification_token(token, tenant_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+
+    tracing::info!(
+        "Email verification for OAuth registration: pubkey {}, email {:?}",
+        oauth_data.user_pubkey,
+        oauth_data.pending_email
+    );
+
+    // Complete via the shared finalize path. This intentionally does NOT delete the pending row:
+    // re-verifying within the 24h window re-arms a fresh 10-minute code, which makes link
+    // prefetch/preview harmless. Once token issuance completes, finalize refuses to re-mint.
+    let finalized = match finalize_pending_registration(
+        pool,
+        auth_state.state.redis.as_ref(),
+        tenant_id,
+        &oauth_data,
+        HeadlessDelivery::RedisRequired,
+    )
+    .await
+    {
+        Ok(finalized) => finalized,
+        Err(AuthError::RegistrationAlreadyCompleted) => {
+            return Ok(Some(PendingVerifyOutcome::AlreadyVerified))
+        }
+        Err(e) => return Err(e),
+    };
+
+    if finalized.is_headless {
+        tracing::info!(
+            event = "email_verification",
+            tenant_id = tenant_id,
+            flow = "oauth_headless",
+            success = true,
+            "Email verified (headless), app will pick up code via polling"
+        );
+        return Ok(Some(PendingVerifyOutcome::Headless));
+    }
+
+    let mut redirect_url = format!("{}?code={}", finalized.redirect_uri, finalized.new_code);
+    if let Some(ref state) = finalized.state {
+        redirect_url = format!("{}&state={}", redirect_url, state);
+    }
+    tracing::info!(
+        event = "email_verification",
+        tenant_id = tenant_id,
+        flow = "oauth",
+        success = true,
+        "Email verified, redirecting to OAuth client"
+    );
+    Ok(Some(PendingVerifyOutcome::OAuthRedirect { redirect_url }))
+}
+
+/// Core POST email-verification logic. OAuth/headless pending rows finalize server-side; normal
+/// first-party registrations are verified and receive a session only through this interactive POST.
 async fn perform_email_verification(
     auth_state: &super::routes::AuthState,
     headers: &HeaderMap,
     tenant_id: i64,
     token: &str,
 ) -> Result<VerifyOutcome, AuthError> {
-    let pool = &auth_state.state.db;
-    let key_manager = auth_state.state.key_manager.as_ref();
-
-    // First: Check oauth_codes for pending OAuth registration
-    let oauth_code_repo = OAuthCodeRepository::new(pool.clone());
-    if let Some(oauth_data) = oauth_code_repo
-        .find_by_verification_token(token, tenant_id)
-        .await?
-    {
-        tracing::info!(
-            "Email verification for OAuth registration: pubkey {}, email {:?}",
-            oauth_data.user_pubkey,
-            oauth_data.pending_email
-        );
-
-        // Complete via the shared finalize path. This intentionally does NOT delete the pending
-        // row: re-verifying within the 24h window re-arms a fresh 10-minute code, which makes
-        // link prefetch/preview harmless (keycast#262 Part A). Once the registration has been
-        // completed token issuance, finalize refuses to re-mint; a re-clicked link then
-        // shows the friendly "already verified" page rather than an error.
-        let finalized = match finalize_pending_registration(
-            pool,
-            auth_state.state.redis.as_ref(),
-            tenant_id,
-            &oauth_data,
-            HeadlessDelivery::RedisRequired,
-        )
-        .await
-        {
-            Ok(finalized) => finalized,
-            Err(AuthError::RegistrationAlreadyCompleted) => {
-                return Ok(VerifyOutcome::AlreadyVerified)
+    if let Some(outcome) = perform_pending_email_verification(auth_state, tenant_id, token).await? {
+        return Ok(match outcome {
+            PendingVerifyOutcome::OAuthRedirect { redirect_url } => {
+                VerifyOutcome::OAuthRedirect { redirect_url }
             }
-            Err(e) => return Err(e),
-        };
-
-        if finalized.is_headless {
-            tracing::info!(
-                event = "email_verification",
-                tenant_id = tenant_id,
-                flow = "oauth_headless",
-                success = true,
-                "Email verified (headless), app will pick up code via polling"
-            );
-            return Ok(VerifyOutcome::Headless);
-        }
-
-        let mut redirect_url = format!("{}?code={}", finalized.redirect_uri, finalized.new_code);
-        if let Some(ref state) = finalized.state {
-            redirect_url = format!("{}&state={}", redirect_url, state);
-        }
-        tracing::info!(
-            event = "email_verification",
-            tenant_id = tenant_id,
-            flow = "oauth",
-            success = true,
-            "Email verified, redirecting to OAuth client"
-        );
-        return Ok(VerifyOutcome::OAuthRedirect { redirect_url });
+            PendingVerifyOutcome::Headless => VerifyOutcome::Headless,
+            PendingVerifyOutcome::AlreadyVerified => VerifyOutcome::AlreadyVerified,
+        });
     }
 
-    // Second: Check users table for normal registration
+    let pool = &auth_state.state.db;
+    let key_manager = auth_state.state.key_manager.as_ref();
     let user_repo = UserRepository::new(pool.clone());
     let token_data = user_repo
         .find_by_verification_token(token, tenant_id)
@@ -2195,11 +2215,10 @@ async fn perform_email_verification(
         .as_ref()
         .is_none_or(|expires| expires < &Utc::now());
 
-    // Keep an already-verified first-party token useful for the rest of its original verification
-    // window. A mail scanner may be the first caller that flips email_verified; the user's later
-    // click must still reach the session-cookie path instead of losing auto-login. Once the window
-    // expires, the retained token remains a harmless "already verified" acknowledgement and must
-    // no longer mint a session.
+    // Keep an already-verified first-party token useful for retrying the interactive POST during
+    // its original verification window (for example, if the first response was lost). Once the
+    // window expires, the retained token remains a harmless acknowledgement and must not mint a
+    // new session.
     if token_data.email_verified {
         if verification_expired {
             return Ok(VerifyOutcome::AlreadyVerified);
@@ -2393,13 +2412,13 @@ pub struct VerifyEmailQuery {
 
 /// Verify email address by GET (the link target in verification emails).
 ///
-/// Verification happens on this server-side GET, so it works even in sandboxed in-app browsers
-/// that never run the SPA's client JavaScript (keycast#262 Part A). Renders a minimal HTML page
-/// for headless / error states and 3xx-redirects for OAuth / first-party flows.
+/// OAuth/headless pending registrations finalize on this server-side GET so sandboxed in-app
+/// browsers do not need JavaScript. First-party tokens are handed to the interactive page without
+/// mutating user state or issuing a session; only that page's POST may do so.
 pub async fn verify_email_get(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Query(query): Query<VerifyEmailQuery>,
 ) -> Response {
     let tenant_id = tenant.0.id;
@@ -2412,34 +2431,25 @@ pub async fn verify_email_get(
         );
     };
 
-    match perform_email_verification(&auth_state, &headers, tenant_id, &token).await {
-        Ok(VerifyOutcome::OAuthRedirect { redirect_url }) => {
+    match perform_pending_email_verification(&auth_state, tenant_id, &token).await {
+        Ok(Some(PendingVerifyOutcome::OAuthRedirect { redirect_url })) => {
             Redirect::to(&redirect_url).into_response()
         }
-        Ok(VerifyOutcome::LoggedIn { cookie }) => {
-            // Set the session cookie, then send the browser to the app home.
-            ([(axum::http::header::SET_COOKIE, cookie)], Redirect::to("/")).into_response()
-        }
-        Ok(VerifyOutcome::Headless) => verify_html_page(
+        Ok(Some(PendingVerifyOutcome::Headless)) => verify_html_page(
             StatusCode::OK,
             "Email verified!",
             "Your email is verified. You can return to the app to continue.",
         ),
-        Ok(VerifyOutcome::AlreadyVerified) => verify_html_page(
+        Ok(Some(PendingVerifyOutcome::AlreadyVerified)) => verify_html_page(
             StatusCode::OK,
             "Already verified",
             "Your email is already verified. You can return to the app or log in.",
         ),
-        Ok(VerifyOutcome::Processing) => verify_html_page(
-            StatusCode::OK,
-            "Almost there…",
-            "We're finishing your registration. Please refresh this page in a few seconds.",
-        ),
-        Ok(VerifyOutcome::Expired) => verify_html_page(
-            StatusCode::OK,
-            "Link expired",
-            "This verification link has expired. Please request a new one from the app.",
-        ),
+        Ok(None) => {
+            let interactive_url =
+                format!("/verify-email?token={}", urlencoding::encode(&token));
+            Redirect::to(&interactive_url).into_response()
+        }
         // Retryable: the link may still be good, so render a non-terminal page that retries
         // itself instead of a success-looking 2xx or terminal invalid-link page.
         Err(AuthError::ServiceUnavailable { retry_after, .. }) => {
@@ -6193,9 +6203,8 @@ mod tests {
 
         cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
 
-        // First-party registrations retain their users-table token. A scanner GET may perform
-        // the verification first, but the user's later GET must still receive a session cookie
-        // while the original verification window is live.
+        // First-party registration links hand off to the interactive page. A scanner GET must not
+        // verify the user or mint a first-party session; the page's POST performs that transition.
         let first_party_keys = Keys::generate();
         let first_party_pubkey = first_party_keys.public_key().to_hex();
         let first_party_token = format!("verify_first_party_{}", Uuid::new_v4());
@@ -6231,80 +6240,49 @@ mod tests {
         .await;
         assert!(scanner_get.status().is_redirection());
         assert!(
-            scanner_get
+            !scanner_get
                 .headers()
                 .contains_key(axum::http::header::SET_COOKIE),
-            "the first GET should verify and issue a session cookie"
+            "a first-party GET must never issue a session cookie"
+        );
+        let (verified_after_get,): (bool,) =
+            sqlx::query_as("SELECT email_verified FROM users WHERE pubkey = $1 AND tenant_id = 1")
+                .bind(&first_party_pubkey)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            !verified_after_get,
+            "a first-party GET must not mutate verification state"
         );
 
-        let user_get = verify_email_get(
+        let interactive_post = verify_email(
             create_test_tenant(),
             State(auth_state.clone()),
             HeaderMap::new(),
-            Query(VerifyEmailQuery {
-                token: Some(first_party_token.clone()),
+            Json(VerifyEmailRequest {
+                token: first_party_token.clone(),
             }),
         )
-        .await;
-        assert!(
-            user_get.status().is_redirection(),
-            "the user's GET after scanner prefetch should still redirect into the app"
-        );
-        assert!(
-            user_get
-                .headers()
-                .contains_key(axum::http::header::SET_COOKIE),
-            "the user's GET after scanner prefetch must re-arm the first-party session cookie"
-        );
-
-        sqlx::query(
-            "UPDATE users SET email_verification_expires_at = NULL \
-             WHERE pubkey = $1 AND tenant_id = 1",
-        )
-        .bind(&first_party_pubkey)
-        .execute(&pool)
         .await
-        .unwrap();
-        let missing_expiry_reclick = verify_email_get(
-            create_test_tenant(),
-            State(auth_state.clone()),
-            HeaderMap::new(),
-            Query(VerifyEmailQuery {
-                token: Some(first_party_token.clone()),
-            }),
-        )
-        .await;
-        assert_eq!(missing_expiry_reclick.status(), StatusCode::OK);
+        .map(|r| r.into_response())
+        .unwrap_or_else(|e| e.into_response());
+        assert_eq!(interactive_post.status(), StatusCode::OK);
         assert!(
-            !missing_expiry_reclick
+            interactive_post
                 .headers()
                 .contains_key(axum::http::header::SET_COOKIE),
-            "an already-verified row without a concrete expiry must not mint a session"
+            "the interactive POST must still issue the first-party session cookie"
         );
-
-        sqlx::query(
-            "UPDATE users SET email_verification_expires_at = NOW() - INTERVAL '1 second' \
-             WHERE pubkey = $1 AND tenant_id = 1",
-        )
-        .bind(&first_party_pubkey)
-        .execute(&pool)
-        .await
-        .unwrap();
-        let expired_reclick = verify_email_get(
-            create_test_tenant(),
-            State(auth_state),
-            HeaderMap::new(),
-            Query(VerifyEmailQuery {
-                token: Some(first_party_token.clone()),
-            }),
-        )
-        .await;
-        assert_eq!(expired_reclick.status(), StatusCode::OK);
+        let (verified_after_post,): (bool,) =
+            sqlx::query_as("SELECT email_verified FROM users WHERE pubkey = $1 AND tenant_id = 1")
+                .bind(&first_party_pubkey)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert!(
-            !expired_reclick
-                .headers()
-                .contains_key(axum::http::header::SET_COOKIE),
-            "an expired retained token must acknowledge verification without minting a session"
+            verified_after_post,
+            "the interactive POST must complete first-party verification"
         );
 
         cleanup_verify_email_test_data(&pool, &first_party_pubkey, &first_party_token).await;
@@ -6467,11 +6445,11 @@ mod tests {
         cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
     }
 
-    /// GET verify with a bogus token must render an HTML error page for the browser, not a 500
-    /// or a raw JSON body.
+    /// A token not belonging to a pending OAuth/headless row is handed to the interactive page.
+    /// GET does not inspect the first-party users table, so valid and bogus tokens behave alike.
     #[cfg(feature = "integration-tests")]
     #[tokio::test]
-    async fn test_verify_email_get_invalid_token_renders_html_not_500() {
+    async fn test_verify_email_get_non_pending_token_redirects_to_interactive_page() {
         let pool = create_test_db().await;
         let auth_state = create_test_auth_state(pool.clone());
 
@@ -6486,19 +6464,21 @@ mod tests {
         .await
         .into_response();
 
-        assert_ne!(
-            response.status(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "invalid token must not 500"
-        );
-        let content_type = response
-            .headers()
-            .get(axum::http::header::CONTENT_TYPE)
-            .map(|v| v.to_str().unwrap().to_string())
-            .unwrap_or_default();
+        assert!(response.status().is_redirection());
         assert!(
-            content_type.contains("text/html"),
-            "invalid-token GET verify should render HTML, got {content_type}"
+            !response
+                .headers()
+                .contains_key(axum::http::header::SET_COOKIE),
+            "GET must not issue a first-party session"
+        );
+        let location = response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert!(
+            location.starts_with("/verify-email?token="),
+            "non-pending tokens must be handed to the interactive page, got {location}"
         );
     }
 
