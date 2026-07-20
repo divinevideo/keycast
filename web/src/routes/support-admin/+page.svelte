@@ -6,6 +6,8 @@
 	import { deeplinkQuery } from '$lib/utils/deeplink';
 	import {
 		emailMatchParts,
+		emailSuggestionDiff,
+		isShowingDidYouMean,
 		isShowingSuggestions,
 		selectAutoExpandedPubkey,
 		selectDisplayedUsers,
@@ -75,6 +77,7 @@
 
 	let displayedUsers: UserDetails[] = $derived(selectDisplayedUsers(searchResult));
 	let showingSuggestions = $derived(isShowingSuggestions(searchResult));
+	let showingDidYouMean = $derived(isShowingDidYouMean(searchResult));
 
 	onMount(async () => {
 		try {
@@ -306,10 +309,14 @@
 						<p>No user found matching that query.</p>
 					</div>
 				{:else}
-					{#if showingSuggestions}
+					{#if showingDidYouMean}
 						<div class="suggestions-header">
 							<h3>Did you mean?</h3>
 							<p>No exact match was found. Try one of these similar email addresses.</p>
+							<div class="suggestion-safety" role="note">
+								<Warning size={14} weight="fill" />
+								<span>These are different addresses — confirm identity before acting.</span>
+							</div>
 						</div>
 					{:else if searchResult.total >= 20}
 						<div class="results-banner warning">
@@ -326,6 +333,7 @@
 						{#each displayedUsers as u (u.pubkey)}
 							{@const isExpanded = expandedPubkey === u.pubkey}
 							{@const emailParts = u.email ? emailMatchParts(u.email, searchQuery) : []}
+							{@const suggestionDiff = showingDidYouMean && u.email ? emailSuggestionDiff(searchQuery.trim(), u.email) : null}
 							<div class="user-list-item" class:expanded={isExpanded}>
 								<button class="user-list-row" onclick={() => toggleExpand(u.pubkey)}>
 									<span class="expand-icon">
@@ -362,6 +370,32 @@
 									{/if}
 									<span class="list-sessions">{u.active_sessions} {u.active_sessions === 1 ? 'session' : 'sessions'}</span>
 								</button>
+
+								{#if suggestionDiff}
+									<div class="suggestion-diff">
+										<span class="suggestion-distance">{suggestionDiff.chip}</span>
+										<div class="diff-line">
+											<span class="diff-label">you typed</span>
+											<span class="diff-value" role="img" aria-label={searchQuery.trim()}>
+												{#each suggestionDiff.typed as part}
+													{#if part.changed}
+														<mark class="diff-character" class:gap={part.gap}>{part.gap ? '∅' : part.text}</mark>
+													{:else}{part.text}{/if}
+												{/each}
+											</span>
+										</div>
+										<div class="diff-line">
+											<span class="diff-label">account</span>
+											<span class="diff-value" role="img" aria-label={u.email}>
+												{#each suggestionDiff.account as part}
+													{#if part.changed}
+														<mark class="diff-character" class:gap={part.gap}>{part.gap ? '∅' : part.text}</mark>
+													{:else}{part.text}{/if}
+												{/each}
+											</span>
+										</div>
+									</div>
+								{/if}
 
 								{#if isExpanded}
 									<div class="user-card">
@@ -692,6 +726,20 @@
 		font-size: 0.775rem;
 	}
 
+	.suggestion-safety {
+		display: flex;
+		align-items: center;
+		gap: 0.375rem;
+		margin-top: 0.5rem;
+		padding: 0.5rem 0.625rem;
+		border: 1px solid color-mix(in srgb, var(--color-divine-warning) 30%, transparent);
+		border-radius: 8px;
+		background: color-mix(in srgb, var(--color-divine-warning) 10%, var(--color-divine-bg));
+		color: var(--color-divine-warning);
+		font-size: 0.75rem;
+		font-weight: 500;
+	}
+
 	.btn-search {
 		padding: 0.625rem 1.25rem;
 		background: var(--color-divine-green);
@@ -821,6 +869,56 @@
 		background: color-mix(in srgb, var(--color-divine-green) 20%, transparent);
 		color: var(--color-divine-green);
 		font-weight: 600;
+	}
+
+	.suggestion-diff {
+		display: grid;
+		grid-template-columns: max-content minmax(0, 1fr);
+		gap: 0.25rem 0.625rem;
+		padding: 0.625rem 1rem 0.75rem 3rem;
+		border-top: 1px solid var(--color-divine-border);
+		background: color-mix(in srgb, var(--color-divine-purple, #8b5cf6) 5%, transparent);
+	}
+
+	.suggestion-distance {
+		grid-column: 1 / -1;
+		justify-self: start;
+		padding: 0.125rem 0.5rem;
+		border-radius: 9999px;
+		background: color-mix(in srgb, var(--color-divine-purple, #8b5cf6) 20%, transparent);
+		color: var(--color-divine-purple, #8b5cf6);
+		font-size: 0.7rem;
+		font-weight: 600;
+	}
+
+	.diff-line {
+		display: contents;
+	}
+
+	.diff-label {
+		color: var(--color-divine-text-tertiary);
+		font-size: 0.7rem;
+		text-transform: uppercase;
+		letter-spacing: 0.025em;
+	}
+
+	.diff-value {
+		overflow-x: auto;
+		color: var(--color-divine-text-secondary);
+		font-family: var(--font-mono);
+		font-size: 0.75rem;
+		white-space: nowrap;
+	}
+
+	.diff-character {
+		padding: 0 0.0625rem;
+		background: color-mix(in srgb, var(--color-divine-purple, #8b5cf6) 25%, transparent);
+		color: var(--color-divine-purple, #8b5cf6);
+		font-weight: 700;
+	}
+
+	.diff-character.gap {
+		border-bottom: 1px dashed currentColor;
 	}
 
 	.list-sessions {

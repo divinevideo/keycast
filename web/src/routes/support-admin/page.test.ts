@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
     emailMatchParts,
+    emailSuggestionDiff,
+    isShowingDidYouMean,
     isShowingSuggestions,
     selectAutoExpandedPubkey,
     selectDisplayedUsers,
@@ -13,6 +15,34 @@ interface Row {
 const row = (pubkey: string): Row => ({ pubkey });
 
 describe("support admin user lookup view", () => {
+    test("aligns a missing account character and describes the edit", () => {
+        const diff = emailSuggestionDiff(
+            "socialpublishllc@gmail.com",
+            "socialpulishllc@gmail.com",
+        );
+        const gapIndex = diff.account.findIndex((part) => part.gap);
+
+        expect(diff.distance).toBe(1);
+        expect(diff.chip).toBe("1 letter off · missing 'b'");
+        expect(gapIndex).toBeGreaterThan(-1);
+        expect(diff.typed[gapIndex]).toEqual({ text: "b", changed: true, gap: false });
+        expect(diff.account[gapIndex]).toEqual({ text: "", changed: true, gap: true });
+    });
+
+    test("describes a substituted account character", () => {
+        const diff = emailSuggestionDiff("namea@example.com", "nameb@example.com");
+
+        expect(diff.distance).toBe(1);
+        expect(diff.chip).toBe("1 letter off · 'a'→'b'");
+    });
+
+    test("describes two edits and ignores email casing", () => {
+        const diff = emailSuggestionDiff("Nameab@example.com", "namexy@example.com");
+
+        expect(diff.distance).toBe(2);
+        expect(diff.chip).toBe("2 letters off · 'a'→'x', 'b'→'y'");
+    });
+
     test("marks a case-insensitive contains fragment inside an email", () => {
         expect(emailMatchParts("CreatorSocialPublishLLC@example.com", "socialp")).toEqual([
             { text: "Creator", matched: false },
@@ -64,6 +94,7 @@ describe("support admin user lookup view", () => {
 
         expect(selectDisplayedUsers(result)).toEqual([row("a")]);
         expect(isShowingSuggestions(result)).toBe(true);
+        expect(isShowingDidYouMean(result)).toBe(false);
         expect(selectAutoExpandedPubkey(result)).toBeNull();
     });
 
@@ -77,6 +108,7 @@ describe("support admin user lookup view", () => {
 
         expect(selectDisplayedUsers(result)).toEqual([row("c")]);
         expect(isShowingSuggestions(result)).toBe(true);
+        expect(isShowingDidYouMean(result)).toBe(true);
         expect(selectAutoExpandedPubkey(result)).toBeNull();
     });
 
