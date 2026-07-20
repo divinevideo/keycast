@@ -87,6 +87,9 @@ const ADMIN_EMAIL_SUGGESTION_MIN_SIMILARITY: f32 = 0.5;
 /// Maximum edit distance allowed between an admin query and a suggested email.
 const ADMIN_EMAIL_SUGGESTION_MAX_EDIT_DISTANCE: usize = 2;
 
+/// Maximum number of close email suggestions returned to an admin.
+const ADMIN_EMAIL_SUGGESTION_LIMIT: usize = 5;
+
 fn escape_like_pattern(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -2088,8 +2091,7 @@ impl UserRepository {
                AND u.email % $1
                AND similarity(u.email, $1) >= $3
                AND u.tenant_id = $2
-             ORDER BY similarity(u.email, $1) DESC, u.pubkey
-             LIMIT 5",
+             ORDER BY similarity(u.email, $1) DESC, u.pubkey",
         )
         .bind(&normalized_query)
         .bind(tenant_id)
@@ -2109,6 +2111,7 @@ impl UserRepository {
                         )
                     })
                 })
+                .take(ADMIN_EMAIL_SUGGESTION_LIMIT)
                 .collect()),
             Err(error) if is_undefined_postgres_function(&error) => Ok(vec![]),
             Err(error) => Err(error.into()),
@@ -2897,6 +2900,44 @@ mod tests {
         cleanup_user(&pool, &closest_pubkey).await;
         cleanup_user(&pool, &two_edits_pubkey).await;
         cleanup_user(&pool, &farther_pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_suggest_users_for_admin_filters_edit_distance_before_result_limit() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let suffix = test_suffix();
+        let query = format!("socialpublishllc-{suffix}@lookup.test");
+        let close_pubkey = Keys::generate().public_key().to_hex();
+        let distant_infixes = ["123", "xyz", "uvw", "456", "789"];
+        let mut distant_pubkeys = Vec::with_capacity(distant_infixes.len());
+
+        create_user_with_email(
+            &pool,
+            &close_pubkey,
+            &format!("socialpulishllx-{suffix}@lookup.test"),
+        )
+        .await;
+
+        for infix in distant_infixes {
+            let pubkey = Keys::generate().public_key().to_hex();
+            create_user_with_email(
+                &pool,
+                &pubkey,
+                &format!("socialpublishllc{infix}-{suffix}@lookup.test"),
+            )
+            .await;
+            distant_pubkeys.push(pubkey);
+        }
+
+        let suggestions = repo.suggest_users_for_admin(&query, 1).await.unwrap();
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].pubkey, close_pubkey);
+
+        cleanup_user(&pool, &close_pubkey).await;
+        for pubkey in distant_pubkeys {
+            cleanup_user(&pool, &pubkey).await;
+        }
     }
 
     #[tokio::test]
