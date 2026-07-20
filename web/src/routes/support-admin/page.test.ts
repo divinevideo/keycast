@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+    emailMatchParts,
     isShowingSuggestions,
     selectAutoExpandedPubkey,
     selectDisplayedUsers,
@@ -12,6 +13,23 @@ interface Row {
 const row = (pubkey: string): Row => ({ pubkey });
 
 describe("support admin user lookup view", () => {
+    test("marks a case-insensitive contains fragment inside an email", () => {
+        expect(emailMatchParts("CreatorSocialPublishLLC@example.com", "socialp")).toEqual([
+            { text: "Creator", matched: false },
+            { text: "SocialP", matched: true },
+            { text: "ublishLLC@example.com", matched: false },
+        ]);
+    });
+
+    test("does not highlight exact emails or unrelated queries", () => {
+        expect(emailMatchParts("account@example.com", "account@example.com")).toEqual([
+            { text: "account@example.com", matched: false },
+        ]);
+        expect(emailMatchParts("account@example.com", "different")).toEqual([
+            { text: "account@example.com", matched: false },
+        ]);
+    });
+
     test("shows authoritative results and hides suggestions when results exist", () => {
         const result = {
             results: [row("a"), row("b")],

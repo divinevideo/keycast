@@ -5,6 +5,7 @@
 	import { redirectToLoginOnAuthError } from '$lib/utils/auth';
 	import { deeplinkQuery } from '$lib/utils/deeplink';
 	import {
+		emailMatchParts,
 		isShowingSuggestions,
 		selectAutoExpandedPubkey,
 		selectDisplayedUsers,
@@ -324,6 +325,7 @@
 					<div class="user-list">
 						{#each displayedUsers as u (u.pubkey)}
 							{@const isExpanded = expandedPubkey === u.pubkey}
+							{@const emailParts = u.email ? emailMatchParts(u.email, searchQuery) : []}
 							<div class="user-list-item" class:expanded={isExpanded}>
 								<button class="user-list-row" onclick={() => toggleExpand(u.pubkey)}>
 									<span class="expand-icon">
@@ -334,9 +336,26 @@
 										{/if}
 									</span>
 									<User size={16} weight="fill" />
-									<span class="list-name">{u.display_name || u.username || u.email || truncateFormatted(u.pubkey)}</span>
+									<span class="list-name">
+										{#if u.display_name || u.username}
+											{u.display_name || u.username}
+										{:else if u.email}
+											{#each emailParts as part}
+												{#if part.matched}<mark class="email-match">{part.text}</mark>{:else}{part.text}{/if}
+											{/each}
+										{:else}
+											{truncateFormatted(u.pubkey)}
+										{/if}
+									</span>
 									{#if u.username}
 										<span class="list-username">@{u.username}</span>
+									{/if}
+									{#if u.email && (u.display_name || u.username) && emailParts.some((part) => part.matched)}
+										<span class="list-username">
+											{#each emailParts as part}
+												{#if part.matched}<mark class="email-match">{part.text}</mark>{:else}{part.text}{/if}
+											{/each}
+										</span>
 									{/if}
 									{#if showingSuggestions}
 										<span class="suggested-badge">Suggested</span>
@@ -388,7 +407,11 @@
 											{#if u.email}
 												<div class="field">
 													<span class="field-label">Email</span>
-													<span class="field-value">{u.email}</span>
+													<span class="field-value">
+														{#each emailParts as part}
+															{#if part.matched}<mark class="email-match">{part.text}</mark>{:else}{part.text}{/if}
+														{/each}
+													</span>
 												</div>
 											{/if}
 
@@ -792,6 +815,12 @@
 		text-transform: uppercase;
 		letter-spacing: 0.025em;
 		flex-shrink: 0;
+	}
+
+	.email-match {
+		background: color-mix(in srgb, var(--color-divine-green) 20%, transparent);
+		color: var(--color-divine-green);
+		font-weight: 600;
 	}
 
 	.list-sessions {
