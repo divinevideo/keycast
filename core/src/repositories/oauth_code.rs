@@ -307,6 +307,31 @@ impl OAuthCodeRepository {
         Ok(row.map(|r| r.0))
     }
 
+    /// Refund a reserved PIN attempt when no bcrypt comparison ran.
+    ///
+    /// The decrement is atomic so a concurrent failed comparison remains counted. The lower bound
+    /// protects the counter if a successful verification reset it before this refund completed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError`] when the database update fails.
+    pub async fn refund_pin_attempt(
+        &self,
+        device_code: &str,
+        tenant_id: i64,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "UPDATE oauth_codes SET pin_attempts = GREATEST(pin_attempts - 1, 0) \
+             WHERE device_code = $1 AND tenant_id = $2 \
+               AND pending_email IS NOT NULL AND consumed_at IS NULL",
+        )
+        .bind(device_code)
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Re-arm a pending registration for PIN resend: install a fresh verification token + PIN hash,
     /// reset the attempt counter to zero, and refresh `pin_sent_at`.
     ///

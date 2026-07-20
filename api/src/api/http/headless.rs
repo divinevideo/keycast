@@ -850,11 +850,22 @@ pub async fn headless_verify_pin(
 
     // Constant-time PIN comparison (bcrypt's own compare; work factor dominates). Both this real
     // comparison and the dummy rejection paths share the same bounded worker pool.
-    let valid = auth_state
+    let valid = match auth_state
         .state
         .bcrypt_sender
         .verify(secrecy::SecretString::from(req.pin.clone()), pin_hash)
-        .await?;
+        .await
+    {
+        Ok(valid) => valid,
+        Err(error) => {
+            // The queue rejected or abandoned the job before bcrypt produced a comparison result,
+            // so this request must not consume the attempt slot reserved above.
+            oauth_code_repo
+                .refund_pin_attempt(&req.device_code, tenant_id)
+                .await?;
+            return Err(error.into());
+        }
+    };
 
     if !valid {
         // The slot was already consumed by the atomic reserve above; just classify and record.
@@ -1615,6 +1626,49 @@ mod tests {
         assert!(
             !locked.status().is_success(),
             "correct PIN after lockout must not finalize"
+        );
+
+        let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(&pubkey)
+            .execute(&pool)
+            .await;
+    }
+
+    /// A rejected bcrypt job returns 503 without consuming a PIN-attempt slot.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_pin_bcrypt_503_refunds_reserved_attempt() {
+        let mut auth_state = create_lazy_auth_state();
+        let pool = auth_state.state.db.clone();
+        let email = format!("verify-pin-busy-{}@example.com", uuid::Uuid::new_v4());
+        let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
+
+        let disconnected_queue = crate::bcrypt_queue::BcryptQueue::new();
+        let disconnected_sender = disconnected_queue.sender();
+        drop(disconnected_queue);
+        std::sync::Arc::get_mut(&mut auth_state.state)
+            .expect("test auth state should have one owner")
+            .bcrypt_sender = disconnected_sender;
+
+        let response = call_verify_pin(auth_state, &device_code, "000000").await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let (attempts,): (i32,) =
+            sqlx::query_as("SELECT pin_attempts FROM oauth_codes WHERE device_code = $1")
+                .bind(&device_code)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            attempts, 0,
+            "bcrypt backpressure must not advance the lockout counter"
         );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
