@@ -2589,10 +2589,13 @@ async fn handle_authorization_code_grant(
     }
 
     // Extract optional nsec from code_verifier (for BYOK flow)
-    let nsec_from_verifier = req
-        .code_verifier
-        .as_ref()
-        .and_then(|v| extract_nsec_from_verifier_public(v));
+    let nsec_from_verifier = if pending_encrypted_secret.is_none() {
+        req.code_verifier
+            .as_ref()
+            .and_then(|v| extract_nsec_from_verifier_public(v))
+    } else {
+        None
+    };
 
     // Check if this is a registration flow (has pending_email)
     let email = if let Some(ref pending_email_val) = pending_email {
