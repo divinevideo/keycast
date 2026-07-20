@@ -1,538 +1,461 @@
 # Keycast Deployment & Operations Guide
 
-## Architecture Overview
+Keycast is mid-migration from the current production Cloud Run service to the shared GKE/ArgoCD platform.
 
-**Current Status:** Production runs on GKE via `divine-iac-coreconfig`; the legacy Cloud Run notes below are historical context only.
-**Region:** `us-central1` (Primary)
+| Environment | Current runtime | Deploy path |
+|-------------|-----------------|-------------|
+| production (`login.divine.video`) | Cloud Run service `keycast` in `openvine-co`, `us-central1` | `bun run deploy` -> Cloud Build -> Cloud Run |
+| staging (`login.staging.divine.video`) | GKE | GitHub Actions -> `divine-iac-coreconfig` dispatch/PR -> ArgoCD |
+| poc (`login.poc.dvines.org`) | GKE | GitHub Actions -> `divine-iac-coreconfig` dispatch/PR -> ArgoCD |
 
-Keycast is a Nostr key custody service. Users store their cryptographic keys here; apps request signing operations.
+The `divine-iac-coreconfig` repo has a staged production overlay for Keycast, but Cloud Run remains authoritative for production traffic until the migration is explicitly completed. Do not use the production overlay's pinned image tag as proof of what is serving `login.divine.video` today.
 
-**System Components:**
-
-| Component | What it does | Why it exists |
-|-----------|--------------|---------------|
-| **PostgreSQL** | Stores encrypted user keys | Keys encrypted at rest (AES-256-GCM) |
-| **KMS provider (`KMS_PROVIDER`)** | Holds the master encryption key | Hardware-backed when using cloud KMS backends |
-| **Redis** | Cluster coordination only | Hashring for distributing NIP-46 relay requests across instances |
-| **Instance Cache** | Per-instance memory cache for decrypted keys | Avoids repeated KMS decryption; why session affinity matters |
-
-**Two request paths:**
-1. **HTTP RPC** - REST API calls. Session affinity routes repeat users to same instance for cache hits.
-2. **NIP-46 Relays** - WebSocket connections to Nostr relays. All instances subscribe to same relays; Redis hashring determines which instance processes which request (others ignore).
-
-**Key security point:** Decrypted keys exist only in instance memory. Redis is NOT used for secrets - only for cluster coordination. This is intentional.
+The former test environment has been decommissioned in the current GKE workflow. Older docs that mention `dv-platform-test` or a `test` overlay are historical unless the IaC repo reintroduces that environment.
 
 ---
 
-## Current GCP Resources
+## System shape
 
-The system currently relies on these specific GCP managed services.
+| Component | Purpose | Notes |
+|-----------|---------|-------|
+| PostgreSQL | Stores encrypted user keys and auth state | Cloud Run production uses Cloud SQL; GKE envs use the platform database setup from IaC. |
+| KMS provider | Holds the master encryption key | Production uses GCP KMS through `USE_GCP_KMS=true`; the binary also supports explicit `KMS_PROVIDER=file`, `gcp`, or `aws`. |
+| Redis | Cluster coordination | Used for hashring membership, heartbeats, and Pub/Sub. Redis is not used for plaintext secrets. |
+| In-memory handler cache | Caches decrypted handlers per instance/pod | Session affinity materially improves cache hit rate and KMS latency/cost. |
 
-| Resource | Name | Region/Location |
-|----------|------|-----------------|
-| GKE / ArgoCD | `keycast` | us-central1 |
-| Cloud SQL | `keycast-db-plus` | us-central1 |
-| Cloud KMS | `keycast-keys/master-key` | global |
-| Memorystore | `keycast-redis` | us-central1 |
-| Artifact Registry | `docker` | us-central1 |
+Two request paths matter operationally:
 
-### GKE Service
-*The application runtime environment.*
-```
-Service: keycast
-Image: us-central1-docker.pkg.dev/dv-platform-prod/containers-production/keycast:<pinned-tag>
+1. HTTP API/RPC requests land on the web/API server and use the per-instance handler cache.
+2. NIP-46 signer traffic arrives through relay connections; all instances subscribe to the relay set, and the Redis-backed hashring decides which instance processes each request.
 
-Current settings:
-  CPU: 4 vCPU
-  Memory: 4 GiB
-  Min instances: 3
-  Max instances: 200
-  Concurrency: 50
-  Session affinity: enabled (CRITICAL)
-  Execution: Gen2 + CPU boost
-  VPC egress: private-ranges-only
-```
-
-### Cloud SQL
-*Managed PostgreSQL.*
-```
-Instance: keycast-db-plus
-Connection: openvine-co:us-central1:keycast-db-plus
-Version: PostgreSQL 15
-Tier: db-perf-optimized-N-4
-max_connections: 250
-Data cache: enabled
-Connection pooling: Managed PgBouncer (max_pool_size: 200, max_client_connections: 2000, transaction mode)
-```
-
-### Cloud KMS
-*Master Key Encryption Key (KEK).*
-```
-Key ring: global/keycast-keys
-Key: master-key
-Purpose: ENCRYPT_DECRYPT
-Note: Production currently uses `KMS_PROVIDER=gcp`. The runtime also supports `KMS_PROVIDER=aws` (build with `--features aws`) and `KMS_PROVIDER=file`.
-```
-
-### Redis (Memorystore)
-*Cluster Coordination.*
-```
-Instance: keycast-redis
-Memory: 1 GB (BASIC tier)
-Purpose: Cluster coordination (hashring, heartbeats)
-```
+Plaintext key material must stay inside the `core` key-manager abstractions and live process memory only.
 
 ---
 
-## Connection Pool Math
+## Production: Cloud Run
 
-```
-PostgreSQL max_connections: 250
-Cloud Run concurrency: 50 per instance
-SQLX_POOL_SIZE: 50 per instance
+Production is deployed with:
 
-Why pool_size = concurrency:
-  - Worst case: all 50 concurrent requests need DB simultaneously
-  - In practice, fewer connections needed because:
-    - CPU-bound crypto runs off-pool (spawn_blocking)
-    - Connections released between queries (except in transactions)
-    - Registration now I/O-bound (async bcrypt queue)
-  - PgBouncer multiplexes: 200 instances × 50 = 10000 client connections → 200 backend
-
-Rule: Start with pool_size = concurrency. Lower only if measured.
-
-Note on concurrency=50: Registration uses async bcrypt queue (password hashing
-in background workers), so HTTP requests complete in ~10ms instead of ~350ms.
-This allows 5x higher concurrency without blocking request threads on bcrypt.
+```bash
+bun run deploy
 ```
 
----
+That script submits `cloudbuild.yaml` to project `openvine-co`.
 
-## Environment Variables
+### Cloud Build sequence
 
-### Secrets (Secret Manager → env vars)
+Current `cloudbuild.yaml` does the following:
 
-| Secret | Variable | Purpose |
-|--------|----------|---------|
-| `keycast-database-url` | `DATABASE_URL` | PostgreSQL connection with pooler |
-| `keycast-ucan-secret` | `SERVER_NSEC` | Server nsec for token signing |
-| `keycast-sendgrid-api-key` | `SENDGRID_API_KEY` | Email (disabled: `DISABLE_EMAILS=true`) |
-| `keycast-redis-url` | `REDIS_URL` | Redis connection |
+1. Builds the Docker image with `BUILD_VERSION=${BUILD_ID}` and tags it as `us-central1-docker.pkg.dev/${PROJECT_ID}/docker/keycast:latest`.
+2. Pushes the `:latest` image.
+3. Runs database migrations by executing the Cloud Run Job `keycast-migrate` with `gcloud run jobs execute keycast-migrate --wait`.
+4. Deploys the Cloud Run service `keycast`.
+5. Runs smoke checks:
+   - `GET /healthz/ready`
+   - CORS preflight for `/api/auth/register`
+   - CORS preflight for `/api/headless/login`
 
-### Plain Variables (cloudbuild.yaml)
+Cloud Build only publishes `:latest` for the Cloud Run path. It does not push a separate `:$BUILD_ID` tag in this pipeline.
+
+### Cloud Run service settings
+
+| Setting | Value |
+|---------|-------|
+| Service | `keycast` |
+| Image | `us-central1-docker.pkg.dev/openvine-co/docker/keycast:latest` |
+| Region | `us-central1` |
+| Port | `3000` |
+| CPU / memory | `4` vCPU / `4Gi` |
+| Timeout | `300s` request timeout |
+| Min / max instances | `3` / `200` |
+| Concurrency | `50` |
+| Execution environment | Gen2, CPU boost, no CPU throttling |
+| Session affinity | enabled |
+| HTTP/2 | enabled |
+| Startup probe | `GET /healthz/startup` on port 3000 |
+| Liveness probe | `GET /livez` on port 3000 |
+| Cloud SQL | `openvine-co:us-central1:keycast-db-plus` |
+| VPC egress | private ranges only |
+
+Cloud Run does not have readiness-probe-driven endpoint removal during shutdown. The production Cloud Run env vars set the shutdown budget to fit Cloud Run's shorter SIGTERM-to-SIGKILL window.
+
+### Production secrets
+
+| Secret Manager secret | Env var |
+|-----------------------|---------|
+| `keycast-database-url` | `DATABASE_URL` |
+| `keycast-ucan-secret` | `SERVER_NSEC` |
+| `keycast-sendgrid-api-key` | `SENDGRID_API_KEY` |
+| `keycast-redis-url` | `REDIS_URL` |
+| `keycast-service-token` | `KEYCAST_SERVICE_TOKEN` |
+
+There is no Cloud Run Sentry secret or `sentry-cli` release step in the current Cloud Build file.
+
+### Production plain env
+
+These are set by `cloudbuild.yaml --set-env-vars`:
 
 | Variable | Value |
 |----------|-------|
-| `KMS_PROVIDER` | `gcp` |
-| `USE_GCP_KMS` | `true` (legacy compatibility) |
-| `GCP_PROJECT_ID` | `openvine-co` |
-| `AWS_KMS_KEY_ID` | unset (only for `KMS_PROVIDER=aws`) |
-| `AWS_REGION` | `us-east-1` (only for `KMS_PROVIDER=aws`) |
+| `NODE_ENV` | `production` |
+| `USE_GCP_KMS` | `true` |
+| `GCP_PROJECT_ID` | `${PROJECT_ID}` (`openvine-co` when deployed by `bun run deploy`) |
 | `ALLOWED_ORIGINS` | `https://login.divine.video,https://divine.video,https://*.openvine-app.pages.dev` |
+| `ALLOWED_TENANT_DOMAINS` | `login.divine.video` |
+| `REQUIRE_REGISTERED_OAUTH_CLIENTS` | `false` |
+| `APP_URL` | `https://login.divine.video` |
+| `FROM_EMAIL` | `noreply@divine.video` |
 | `RUST_LOG` | `info` |
+| `ENABLE_EXAMPLES` | `true` |
+| `SQLX_STATEMENT_CACHE` | `100` |
+| `SQLX_POOL_SIZE` | `50` |
+| `ALLOWED_PUBKEYS` | configured in `cloudbuild.yaml` |
+| `BUNKER_RELAYS` | `wss://relay.divine.video,wss://relay.primal.net,wss://relay.nsec.app,wss://nos.lol` |
+| `ENABLE_DIVINE_NAMES` | `true` |
+| `SHOW_TEAMS_FUNCTIONALITY` | `true` |
+| `SHUTDOWN_GRACE_PERIOD_CEILING_SECS` | `10` |
+| `SHUTDOWN_PRE_DRAIN_SECS` | `0` |
+| `SHUTDOWN_HTTP_DRAIN_SECS` | `3` |
+| `SHUTDOWN_SIGNER_DRAIN_SECS` | `3` |
+| `SHUTDOWN_TEARDOWN_MARGIN_SECS` | `4` |
+
+### Production GCP resources
+
+| Resource | Name |
+|----------|------|
+| Cloud Run service | `keycast` |
+| Cloud SQL | `keycast-db-plus`, Postgres 15 |
+| Cloud KMS | key ring `keycast-keys`, key `master-key`, location `global` |
+| Memorystore Redis | `keycast-redis` |
+| Artifact Registry | `us-central1-docker.pkg.dev/openvine-co/docker` |
+| Runtime service account | `972941478875-compute@developer.gserviceaccount.com` |
+
+The service account needs Secret Manager access for runtime secrets, Cloud KMS encrypt/decrypt, and Cloud SQL client access. Redis access is through the VPC path.
+
+### Production rollback
+
+Cloud Run keeps revision history:
+
+```bash
+gcloud run revisions list \
+  --service=keycast \
+  --region=us-central1 \
+  --project=openvine-co
+
+gcloud run services update-traffic keycast \
+  --to-revisions=<revision-name>=100 \
+  --region=us-central1 \
+  --project=openvine-co
+```
+
+### Production logs
+
+```bash
+bun run logs
+bun run logs:watch
+
+gcloud logging read \
+  'resource.type="cloud_run_revision" AND resource.labels.service_name="keycast"' \
+  --limit=50 \
+  --project=openvine-co
+```
+
+---
+
+## Non-production: GKE and ArgoCD
+
+POC and staging currently run on GKE through `divine-iac-coreconfig`. The production GKE overlay exists, but it is staged until production traffic moves off Cloud Run.
+
+### Build and dispatch flow
+
+`.github/workflows/build-test-push.yaml` handles the shared GKE image flow:
+
+1. On PRs, run Rust tests, clippy, and format checks.
+2. On pushes to `main` and release tags, build one local Docker image with Buildx.
+3. Push to Artifact Registry:
+   - POC registry on `main`
+   - staging registry on `main`
+   - production registry only on `v*` tags or `workflow_dispatch` with `include_production=true`
+4. Dispatch `image-deploy` to `divine-iac-coreconfig` with the short source SHA.
+5. IaC automation updates the matching overlays and ArgoCD applies the merged IaC change.
+
+The former test push is intentionally removed from this workflow because that GCP project/environment is decommissioned.
+
+### Current GKE manifests
+
+Keycast manifests live under `divine-iac-coreconfig/k8s/applications/keycast/`.
+
+| Path | Purpose |
+|------|---------|
+| `base/deployment.yaml` | `Deployment` in namespace `identity`, sync wave 2 |
+| `base/service.yaml` | `ClusterIP` Service on port 3000 |
+| `base/httproute.yaml` | HTTP-to-HTTPS redirects and HTTPS routes for login and entryway hosts |
+| `base/db-migrate.yaml` | ArgoCD Sync hook, sync wave 1, for DB bootstrap and `./keycast --migrate` |
+| `base/external-secret.yaml` | ExternalSecret for `KEYCAST_ATPROTO_TOKEN` |
+| `overlays/poc/kustomization.yaml` | POC project, hostnames, KMS key ring, image tag, relays, Redis |
+| `overlays/staging/kustomization.yaml` | staging project, hostnames, KMS key ring, image tag, relays, Redis, resources |
+| `overlays/production/kustomization.yaml` | staged production GKE config; not live for prod traffic |
+
+### GKE probes
+
+Current IaC config:
+
+| Probe | Path | Notes |
+|-------|------|-------|
+| startup | `/healthz/startup` | Fast startup endpoint. |
+| liveness | `/health` | Current IaC still uses `/health` with an inline note to move to `/livez` after all overlays are on images that contain `/livez`. |
+| readiness | `/healthz/ready` | Checks DB readiness and returns 503 during shutdown pre-drain. |
+
+The runtime also exposes `/livez`; Cloud Run already uses it for liveness. Do not use `/health` as readiness. `/health` returns a general 200 OK and does not participate in readiness-based draining.
+
+### GKE shutdown requirement
+
+The binary's built-in GKE-sized shutdown defaults are:
+
+```text
+pre_drain 15s + http_drain 40s + signer_drain 10s + teardown_margin 10s = 75s
+```
+
+That default is intended to fit a Kubernetes `terminationGracePeriodSeconds: 75`. The current base `Deployment` does not set `terminationGracePeriodSeconds`, so Kubernetes defaults it to 30s. Before moving production traffic to GKE, the IaC overlay must either:
+
+- set `terminationGracePeriodSeconds: 75`, or
+- set explicit `SHUTDOWN_*` env vars whose total budget fits the actual pod grace period.
+
+Leaving the current pod default at 30s while using the binary's 75s default risks SIGKILL during a rollout drain.
+
+### GKE session affinity gap
+
+The current GKE `Service` is `ClusterIP` and does not set `spec.sessionAffinity`. Cloud Run has session affinity enabled. Before moving production traffic to GKE, choose and configure the GKE equivalent, such as `Service.spec.sessionAffinity: ClientIP` or a Gateway/backend policy appropriate for the platform.
+
+Without stickiness, Keycast still works, but the in-memory decrypted-handler cache has a lower hit rate. That increases KMS decrypts and can add latency on cache misses.
+
+### GKE overlay summary
+
+Verified from the current IaC repo:
+
+| Env | GCP project | Hosts | Replicas | KMS key ring | Image registry |
+|-----|-------------|-------|----------|--------------|----------------|
+| poc | `rich-compiler-479518-d2` | `login.poc.dvines.org`, `entryway.poc.dvines.org` | 1 | `app-keys-poc` | `containers-poc` |
+| staging | `dv-platform-staging` | `login.staging.divine.video`, `entryway.staging.divine.video` | 2 | `app-keys-staging` | `containers-staging` |
+| production (staged) | `dv-platform-prod` | `login.divine.video`, `entryway.divine.video` | 3, HPA 3-20 | `app-keys-production` | `containers-production` |
+
+Base resources are `128Mi`/`100m` requests and `512Mi`/`500m` limits. Staging patches to `256Mi`/`200m` requests and `1Gi`/`1000m` limits. Staged production patches to `2Gi`/`2000m` requests and `4Gi`/`4000m` limits and adds an HPA with min 3, max 20.
+
+### GKE environment variables and secrets
+
+The base deployment reads these secrets:
+
+| Kubernetes Secret | Env var |
+|-------------------|---------|
+| `keycast-db-credentials` | `DATABASE_URL` |
+| `keycast-server-nsec` | `SERVER_NSEC` |
+| `keycast-sendgrid-api-key` | `SENDGRID_API_KEY` |
+| `keycast-atproto-runtime` | `KEYCAST_ATPROTO_TOKEN` |
+
+The migration job also reads:
+
+| Kubernetes Secret | Env var | Scope |
+|-------------------|---------|-------|
+| `postgres-superuser-credentials` | `SUPERUSER_URL` | bootstrap init container only |
+| `keycast-db-credentials` | `DATABASE_URL_DIRECT` | migration container |
+
+The Deployment sets or patches these runtime env vars:
+
+| Variable | Notes |
+|----------|-------|
+| `USE_GCP_KMS` | `true` |
+| `GCP_PROJECT_ID` | patched per environment |
+| `GCP_KMS_LOCATION` | `us-central1` |
+| `GCP_KMS_KEY_RING` | patched per environment |
+| `GCP_KMS_KEY_NAME` | `keycast-master-key` |
+| `ALLOWED_ORIGINS` | patched per environment |
+| `BUNKER_RELAYS` | patched per environment |
+| `FROM_EMAIL`, `FROM_NAME`, `BASE_URL`, `APP_URL` | patched per environment |
+| `VITE_DOMAIN`, `VITE_NDK_EXPLICIT_RELAYS`, `VITE_NDK_BUNKER_RELAYS` | frontend runtime injection |
+| `ALLOWED_PUBKEYS` | patched per environment |
+| `ALLOWED_TENANT_DOMAINS` | base value is `login.divine.video`; POC and staging patch it |
+| `RUST_LOG` | `info` |
+| `NODE_ENV` | `production` |
 | `SQLX_POOL_SIZE` | `50` |
 | `SQLX_STATEMENT_CACHE` | `100` |
+| `DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL` | in-cluster control plane URL |
+| `DIVINE_HANDLE_DOMAIN` | `divine.video` |
+| `ATPROTO_ENTRYWAY_ENABLED` | `true` in current IaC |
+| `ATPROTO_ENTRYWAY_ORIGIN`, `ATPROTO_ENTRYWAY_HOSTS` | patched per environment |
+| `REDIS_URL` | added by overlays, points at in-cluster Redis DB 1 |
+| `ENABLE_DIVINE_NAMES` | staged production overlay only |
 
-### KMS Migration (`USE_GCP_KMS` -> `KMS_PROVIDER`)
+Current GKE manifests do not set Sentry env vars.
 
-- Legacy behavior: when `KMS_PROVIDER` is unset, `USE_GCP_KMS=true` selects `gcp`, otherwise `file`.
-- Recommended: set `KMS_PROVIDER` explicitly (`file`, `gcp`, `aws`) in all environments.
-- Precedence: if both are set and disagree, `KMS_PROVIDER` is source of truth.
-- Rollout order:
-  1. Set `KMS_PROVIDER` to the provider your environment is currently using.
-  2. Deploy and verify startup/config validation logs.
-  3. Remove `USE_GCP_KMS` after verification.
+### GKE migrations
 
-### Security Variables (added 2026-04-04)
+The GKE path runs migrations as an ArgoCD Sync hook before the Deployment rolls:
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `SENDGRID_API_KEY` | Production | — | Email delivery. Production fails to start without this unless `DISABLE_EMAILS=true`. |
-| `DISABLE_EMAILS` | No | — | Set to `true` to explicitly disable email delivery in production. |
-| `ALLOWED_TENANT_DOMAINS` | Production | — | Comma-separated list of allowed tenant domains. |
-| `ENABLE_TENANT_AUTO_PROVISIONING` | No | `false` | Set to `true` to allow automatic tenant creation for unknown domains (dev only). |
+- `keycast-db-migrate` Job, sync wave 1
+- `keycast` Deployment, sync wave 2
+- bootstrap init container uses `postgres:16-alpine` and `SUPERUSER_URL`
+- migration container runs `./keycast --migrate`
 
----
+If the migration job fails, ArgoCD should not roll the wave-2 Deployment.
 
-## DNS
+### GKE rollback
 
-Production login traffic is routed through the GKE Gateway and external DNS entries managed in `divine-iac-coreconfig`.
+Rollback is a GitOps operation:
 
----
+1. Revert or edit the image tag in the relevant `divine-iac-coreconfig/k8s/applications/keycast/overlays/<env>/kustomization.yaml`.
+2. Merge the IaC change.
+3. Let ArgoCD sync the overlay.
 
-## Deployment Workflow
-
-**Current state:** Production deploys are GitOps-managed through `divine-iac-coreconfig` and ArgoCD. The legacy Cloud Run workflow below no longer describes the live path.
-
-**What happens:**
-1. Cloud Build runs on E2_HIGHCPU_8 (~20 min)
-2. Multi-stage Docker build (Rust + Bun frontend)
-3. Push to Artifact Registry
-4. Update the `divine-iac-coreconfig` overlay to the new image tag
-5. Let ArgoCD reconcile to GKE
-6. Smoke tests (health check, CORS preflight, ATProto entryway surfaces if enabled)
-
----
-
-## Database Migrations
-
-Migrations do NOT run automatically. Manual process:
+For a manual pod recycle after config/secret changes:
 
 ```bash
-# Requires: cloud-sql-proxy, sqlx-cli
-./tools/run-migrations.sh
+kubectl rollout restart deployment/keycast -n identity
 ```
-
-Migration files: `database/migrations/NNNN_*.sql`
 
 ---
 
-## Service Account
+## Database backups
 
-`972941478875-compute@developer.gserviceaccount.com`
-
-Required roles:
-- `roles/secretmanager.secretAccessor`
-- `roles/cloudkms.cryptoKeyEncrypterDecrypter`
-- `roles/cloudsql.client`
-
-Redis access via VPC (no IAM needed for Memorystore BASIC).
-
-### AWS KMS IAM Minimum Policy (when `KMS_PROVIDER=aws`)
-
-Grant the runtime IAM principal access to the configured KMS key with:
-- `kms:Encrypt`
-- `kms:Decrypt`
-- `kms:DescribeKey`
-
----
-
-## Backup & Recovery
-
-### Database Backups
-Cloud SQL automated backups are configured:
-```
-Automated backups: Enabled (daily)
-Retention: 15 backups
-Point-in-time recovery (PITR): Enabled
-Transaction log retention: 14 days
-```
-
-**Restore options:**
-1. **Point-in-time:** Restore to any timestamp within the last 14 days
-2. **Backup snapshot:** Restore from any of the last 15 daily backups
+Production Cloud SQL has automated backups and PITR configured outside this repo. Useful commands:
 
 ```bash
-# List available backups
-gcloud sql backups list --instance=keycast-db-plus --project=openvine-co
+gcloud sql backups list \
+  --instance=keycast-db-plus \
+  --project=openvine-co
 
-# Restore to point in time (creates new instance)
 gcloud sql instances clone keycast-db-plus keycast-db-restored \
-  --point-in-time="2024-01-15T10:00:00Z" --project=openvine-co
-```
-
-### Application Rollback
-GKE/ArgoCD deploys roll back by reverting the pinned image tag in `divine-iac-coreconfig` and resyncing:
-
-```bash
-# Roll back by restoring the previous pinned image tag in the overlay
-# and allowing ArgoCD to sync the manifest again.
+  --point-in-time="2024-01-15T10:00:00Z" \
+  --project=openvine-co
 ```
 
 ---
 
-## Monitoring & Alerting
+## Config and secret rotation
 
-**Current state:** No custom alert policies or dashboards configured. Uses default Cloud Run metrics only.
+Configuration is read at startup. There is no hot reload.
 
-**TODO:** Set up alerts for:
-- Error rate spikes (5xx responses)
-- Latency P95 thresholds
-- Instance count approaching max (200)
-- Database connection exhaustion
-- KMS decryption failures
+- Cloud Run: update Secret Manager or env config, then run `bun run deploy` so a new revision starts with the new values.
+- GKE: update the source secret/config in the platform, wait for External Secrets where applicable, then roll the Deployment if the pods do not restart automatically.
 
----
+Live updates that do not require a process restart:
 
-## Application Behavior Under Failure
-
-| Dependency | At Startup | During Runtime |
-|------------|------------|----------------|
-| **Redis unreachable** | Hard failure, app exits | Exponential backoff retry (heartbeat), 1s reconnect loop (Pub/Sub). Hashring uses stale data until reconnected. App continues but may misroute NIP-46 requests. |
-| **KMS unavailable** | Hard failure if `KMS_PROVIDER` is `gcp` or `aws` | Cached keys still work. New decryptions retry 3x with exponential backoff (100ms, 200ms, 400ms), then fail. |
-| **PostgreSQL down** | 5 retries with exponential backoff (1s, 2s, 4s, 8s), then exits | Immediate 500 error per request. No circuit breaker. Pool auto-reconnects when DB returns. |
-| **ATProto control plane unreachable** | Missing or invalid `DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL` logs a warning; Keycast still starts. | ATProto enable/reenable/disable requests fail closed with HTTP 503 and an ATProto-specific temporary-unavailable message. Other Keycast routes remain available. |
-
-**Key insight:** The app degrades gracefully for Redis/KMS partial failures but has no circuit breaker for database issues.
-
-## ATProto Entryway Groundwork
-
-ATProto provisioning uses a separate control-plane service when users enable Bluesky publishing.
-
-Optional scoped dependency:
-
-- `DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL=https://...`
-
-Optional:
-
-- `DIVINE_HANDLE_DOMAIN=divine.video`
-- `KEYCAST_ATPROTO_TOKEN=...` when the control plane requires bearer service auth
-
-If the control plane is not configured, malformed, or cannot be reached at runtime, Keycast logs the configuration/runtime problem and the ATProto enablement endpoints fail closed with HTTP 503 and a user-safe temporary-unavailable message. The rest of Keycast remains available.
-
-The ATProto entryway surface is intentionally gated off by default.
-
-Required env vars to enable it:
-
-- `ATPROTO_ENTRYWAY_ENABLED=true`
-- `ATPROTO_ENTRYWAY_ORIGIN=https://entryway.divine.video`
-
-`entryway.divine.video` is the only public ATProto Authorization Server host in this setup. `login.divine.video` remains the human-facing Divine and Nostr login surface.
-
-Optional:
-
-- `ATPROTO_ENTRYWAY_HOSTS=entryway.divine.video`
-
-Current safety boundary:
-
-- host matching uses the incoming `Host` or `:authority` value only
-- the metadata origin is normalized from `ATPROTO_ENTRYWAY_ORIGIN` as scheme + host + optional port only, and invalid values fail closed with no metadata response
-- PAR request state is process-local in memory
-- the discovery document only advertises the token capabilities this slice actually supports
-
-Operational constraint for this groundwork slice:
-
-- only enable this on a single instance while the PAR store remains in-process
-- do not treat it as horizontally safe until PAR state is moved to shared persistence
+- OAuth authorization create/revoke through the API/signer channel
+- cluster membership changes through Redis Pub/Sub
 
 ---
 
-## Secrets and Config Reload
+## Failure modes
 
-**No hot reload.** All configuration is read at startup from environment variables.
+| Dependency | Startup behavior | Runtime behavior |
+|------------|------------------|------------------|
+| Redis unavailable | Hard failure, app exits | Heartbeat and Pub/Sub reconnect loops retry; stale hashring data can misroute NIP-46 requests while HTTP may continue. |
+| KMS unavailable | Hard failure when using `gcp` or `aws` provider | Cached keys still work; cache misses retry and then fail. |
+| Postgres unavailable | startup retries then exits | Requests needing DB return errors; pool reconnects when the database recovers. |
+| ATProto control plane unavailable | invalid/missing URL logs a warning and Keycast still starts | ATProto enablement endpoints fail closed with 503; other routes continue. |
 
-- Changing any secret or env var requires a **new Cloud Run revision** (redeploy)
-- Secret rotation procedure: Update Secret Manager → trigger deploy → new instances pick up new values
-- Live updates that DON'T require redeploy:
-  - OAuth authorization creation/revocation (API→Signer channel)
-  - Cluster membership changes (Redis Pub/Sub)
+---
+
+## ATProto entryway
+
+ATProto entryway support is controlled by:
+
+- `ATPROTO_ENTRYWAY_ENABLED`
+- `ATPROTO_ENTRYWAY_ORIGIN`
+- `ATPROTO_ENTRYWAY_HOSTS`
+
+The runtime safety boundary is process-local PAR state. Do not assume horizontal safety for entryway flows until PAR state moves to shared persistence or the platform has a documented single-replica constraint for that surface.
+
+The current IaC manifests set `ATPROTO_ENTRYWAY_ENABLED=true` and run multiple replicas in staging and staged production, so the production GKE cutover must explicitly verify this behavior before traffic moves.
 
 ---
 
 ## Logging
 
-**Format:**
-- Production (`NODE_ENV=production`): Structured JSON (GCP Cloud Logging native)
-- Development: Plain text
+Production (`NODE_ENV=production`) emits structured JSON logs. Development emits plain text logs.
 
-**Request Tracing:**
-Each HTTP request gets a `trace_id` (8-char UUID) automatically attached to all logs within that request.
-- Clients can pass `x-trace-id` header for correlation across services
-- If not provided, server generates one automatically
+Every HTTP request gets a request/trace id, either from the client `x-trace-id` header or generated server-side.
 
-**TODO:** Integrate trace_id from mobile (keycast_flutter) and web (keycast-login) clients:
-- Clients should generate trace_id on request initiation
-- Pass via `x-trace-id` header for full request correlation
-- Enables tracing from UI action → API → signer daemon
+Useful Cloud Logging queries:
 
-**Key fields in structured logs:**
-```json
-{"level":"INFO","span":{"name":"request","trace_id":"a1b2c3d4","method":"GET","uri":"/api/user"},"message":"Processing request"}
-```
+```text
+# Cloud Run production
+resource.type="cloud_run_revision"
+resource.labels.service_name="keycast"
+severity>=ERROR
 
-**What's logged:**
-- Instance lifecycle events (startup, shutdown)
-- Error details with stack context
-- NIP-46 request flow (received, rejected, processed)
-- Cache hit/miss events (at debug level)
-- Request trace_id for correlation
+# GKE
+resource.type="k8s_container"
+resource.labels.namespace_name="identity"
+resource.labels.container_name="keycast"
+severity>=ERROR
 
-**What's NOT logged:**
-- User identifiers in HTTP request logs
-- Secrets are never logged
-
-**Log queries (Cloud Logging):**
-```bash
-# Errors only
-resource.type="cloud_run_revision" severity>=ERROR
-
-# Specific instance
-resource.labels.revision_name="keycast-00151-abc"
-
-# NIP-46 activity
-jsonPayload.message=~"NIP-46"
-
-# Trace a specific request (use trace_id from x-trace-id header or log output)
+# Request trace
 jsonPayload.span.trace_id="a1b2c3d4"
 ```
 
+Never log secrets, plaintext key material, or plaintext Nostr private keys.
+
 ---
 
-## Metrics & Observability
+## Metrics
 
-**Prometheus endpoint:** `GET /api/metrics`
+Prometheus metrics are exposed at:
 
-Returns Prometheus text format, no auth required. Safe to scrape frequently (in-memory counters, no DB queries).
+```text
+GET /api/metrics
+```
 
-**Available metrics:**
+The endpoint is unauthenticated and returns in-memory counters/gauges only.
 
 | Metric | Type | Description |
 |--------|------|-------------|
 | `keycast_cache_hits_total` | counter | Handler found in memory cache |
 | `keycast_cache_misses_total` | counter | Handler loaded from DB |
 | `keycast_cache_size` | gauge | Current handlers in cache |
-| `keycast_nip46_requests_total` | counter | Total NIP-46 requests received |
-| `keycast_nip46_rejected_hashring_total` | counter | Requests assigned to different instance |
-| `keycast_nip46_processed_total` | counter | Successfully processed |
-| `keycast_nip46_queue_dropped_total` | counter | Dropped due to backpressure |
+| `keycast_nip46_requests_total` | counter | NIP-46 requests received |
+| `keycast_nip46_rejected_hashring_total` | counter | Requests assigned to another instance |
+| `keycast_nip46_processed_total` | counter | Requests processed successfully |
+| `keycast_nip46_queue_dropped_total` | counter | Requests dropped under backpressure |
 | `keycast_http_rpc_requests_total` | counter | HTTP RPC requests to `/api/nostr` |
-| `keycast_http_rpc_auth_errors_total` | counter | Auth failures |
+| `keycast_http_rpc_auth_errors_total` | counter | HTTP RPC auth failures |
 | `keycast_registrations_total` | counter | User registrations |
 | `keycast_logins_total` | counter | Successful logins |
-| `keycast_login_failures_total` | counter | Failed login attempts |
+| `keycast_login_failures_total` | counter | Failed logins |
 
-**Alert recommendations:**
-- `keycast_nip46_queue_dropped_total` increasing → system overloaded, scale up
-- `keycast_cache_misses_total` high relative to hits → session affinity may be broken
-- `keycast_http_rpc_auth_errors_total` spike → possible attack or client misconfiguration
-
-**Metrics aggregation:**
-
-Cloud Run provides **built-in aggregated metrics** automatically (request count, latency, CPU, memory, instance count). These are sufficient for scaling decisions and basic alerting—no setup required.
-
-The custom Prometheus metrics at `/metrics` (cache hits, NIP-46 stats, auth errors) are **per-instance only**. Options for aggregating these:
-
-1. **Log-based metrics** (simplest) - Create custom metrics from structured logs in Cloud Logging. No code changes, works now.
-2. **Managed Prometheus** - Google Cloud Managed Service for Prometheus can scrape all instances. More infrastructure.
-3. **Push to Cloud Monitoring** - Add OTLP/Cloud Monitoring client to push metrics. Requires code changes.
-
-For a test environment, Cloud Run's built-in metrics + log queries for custom data is probably sufficient.
+High `keycast_cache_misses_total` relative to hits usually points at session affinity or cold-cache behavior. Increasing `keycast_nip46_queue_dropped_total` means the signer path is overloaded.
 
 ---
 
-## Performance Characteristics
+## Performance characteristics
 
-**Mixed workload.** Crypto operations are CPU-bound, but significant I/O exists throughout the request paths.
+CPU-bound work:
 
-```
-CPU-bound (request path):
-  - secp256k1 signing, NIP-44/NIP-04 encrypt/decrypt
-  - Login bcrypt verification (~300ms)
-  - Uses spawn_blocking to avoid blocking async runtime
+- secp256k1 signing
+- NIP-44/NIP-04 encrypt/decrypt
+- login bcrypt verification through `spawn_blocking`
+- registration bcrypt hashing in the background queue
 
-CPU-bound (background):
-  - Registration bcrypt hashing (async queue, 4 workers)
-  - ~13 hashes/sec per instance capacity
+I/O-bound work:
 
-I/O-bound (Network):
-  - NIP-46 relay WebSocket traffic (receive requests, send responses)
-  - Redis Pub/Sub for hashring coordination + heartbeats
-  - KMS API calls on cache miss
+- relay WebSocket traffic
+- Redis Pub/Sub and heartbeats
+- KMS API calls on cache miss
+- database queries for auth/session/OAuth/user flows
 
-I/O-bound (Database):
-  - Registration (~10ms, bcrypt decoupled)
-  - OAuth flow queries, authorization lookups on cache miss
-  - Cold start loads all authorizations
-
-Workers: 2× CPU cores (min 8), Queue: 4096 items with backpressure
-Bcrypt workers: num_cpus (4 on 4 vCPU), Queue: 350 items with backpressure
-```
-
-**Async bcrypt architecture:** Registration uses a background worker queue for password
-hashing. HTTP requests return in ~10ms (vs ~350ms with sync bcrypt). This decouples
-signup surge handling from HTTP latency—other endpoints remain responsive during
-registration spikes. The bcrypt queue (350 items) provides ~27s burst buffer per instance.
-
-**Scaling recommendation:** Cloud Run autoscales based on per-instance CPU utilization and request concurrency. Requests are routed away from high-CPU instances even if concurrency limit isn't reached. Session affinity is broken when an instance hits max CPU—requests go to other instances.
-
-Scaling triggers (now decoupled):
-- HTTP concurrency limit → scale out (configurable, currently 50)
-- CPU from signing workloads → scale out
-- CPU from bcrypt workers → scale out (independent of HTTP handling)
-
-Monitor **P95 latency** and **cache miss rate** alongside CPU. High latency with low CPU suggests I/O saturation—check Redis, relays, or session affinity (cache misses).
-
-- Current concurrency: 50 requests/instance
-- If `keycast_nip46_queue_dropped_total` increases, add instances
-- Memory is not typically the bottleneck (4 GiB); primary consumer is the handler cache
-
-**Signup surge capacity:**
-```
-Per instance:  ~13 registrations/sec (bcrypt limited)
-3 instances:   ~39/sec
-50 instances:  ~650/sec
-200 instances: ~2,600/sec (max)
-
-For anticipated surges: increase min-instances to pre-warm capacity
-```
-
-**Latency expectations:**
-- Registration: ~10ms (bcrypt in background)
-- Login: ~300ms (bcrypt verify, sync)
-- HTTP RPC signing: Fast (cache hit) to slower (cache miss requires KMS decrypt)
-- NIP-46 relay signing: Above + network RTT to relays (varies by relay latency)
-
-Actual latencies depend on network conditions, KMS region, and relay performance.
-Cache hits are typically an order of magnitude faster than cache misses.
+Cloud Run currently targets 50 concurrent requests per instance and `SQLX_POOL_SIZE=50`. Use cache hit rate, p95 latency, CPU, and queue drops together when evaluating scaling.
 
 ---
 
-## Operational Requirements (Platform Agnostic)
+## Quick reference
 
-The current GCP Cloud Run deployment satisfies these requirements through native configuration. If migrating to another provider or orchestrator, these architectural constraints must be manually replicated.
-
-### Health Checks & Probes
-The application exposes standard endpoints suitable for Liveness and Readiness probes:
-
-- **Startup/Liveness:** `/health` or `/healthz/startup` (Returns 200 OK)
-- **Readiness:** `/healthz/ready` (Returns 200 OK)
-
-### Graceful Shutdown
-The application handles `SIGTERM` and `SIGINT` signals to ensure zero-downtime deployments:
-- **Stop Signal:** Listens for `SIGTERM`.
-- **Drain Logic:**
-  - Stops accepting new connections.
-  - Waits up to **15 seconds** for API requests to drain.
-  - Waits up to **10 seconds** for background tasks (Signer relay connections) to finish.
-  - Closes DB connections.
-- **Requirement:** Ensure the platform's termination grace period is at least **30s** to accommodate this 25s max drain sequence.
-
-### Session Affinity (Sticky Sessions)
-**CRITICAL:** The application uses an in-memory cache for decrypted keys to reduce KMS costs and latency.
-- **Requirement:** You **MUST** enable Session Affinity (Sticky Sessions) at the Load Balancer / Ingress level.
-- **Why:** Without it, requests for the same user might land on different instances, causing frequent cache misses and expensive re-decryption calls to Cloud KMS.
-- *Current GCP Implementation:* Enabled in Cloud Run service settings.
-
-### Resources
-Minimum resource requirements per instance:
-- **CPU:** 1-4 vCPU (current: 4 vCPU for testing)
-- **Memory:** 2-4 GiB (current: 4 GiB for testing)
-
-### Encryption Dependency
-The runtime supports these key manager backends:
-1. `KMS_PROVIDER=file` (local master key file via `MASTER_KEY_PATH`)
-2. `KMS_PROVIDER=gcp` (Google Cloud KMS via `GCP_PROJECT_ID`)
-3. `KMS_PROVIDER=aws` (AWS KMS via `AWS_KMS_KEY_ID` and optional `AWS_REGION`, build with `--features aws`)
-
-Backward compatibility:
-- If `KMS_PROVIDER` is unset, `USE_GCP_KMS=true` selects `gcp`; otherwise `file`.
-- If both are set and disagree, `KMS_PROVIDER` wins.
-
----
-
-## Quick Reference
-
-| Situation | What to check |
-|-----------|---------------|
-| High latency, low CPU | Redis, relay connectivity, or cache misses (session affinity) |
-| High CPU | Expected under signing load; scale horizontally |
-| `queue_dropped` increasing | System overloaded, add instances |
-| `cache_misses` high vs hits | Session affinity broken at LB |
-| Auth errors spiking | Possible attack or client misconfiguration |
-| Config change needed | Requires redeploy (no hot reload) |
-| DB failures cascading | No circuit breaker; expect immediate 500s |
-
-**Critical settings:**
-- Session affinity: **mandatory** (cache efficiency)
-- Termination grace period: **≥30s** (25s drain sequence)
-- All config via env vars at startup (no hot reload)
+| Situation | Check |
+|-----------|-------|
+| Which platform serves production | Cloud Run service `keycast` in `openvine-co` |
+| Current Cloud Run revision | `gcloud run services describe keycast --region=us-central1 --project=openvine-co --format='value(status.latestReadyRevisionName)'` |
+| Current GKE image | `kubectl -n identity get deployment keycast -o jsonpath='{.spec.template.spec.containers[0].image}'` |
+| ArgoCD sync state | ArgoCD app for the relevant keycast overlay in `divine-iac-coreconfig` |
+| High latency, low CPU | cache misses, Redis, relay health, KMS latency |
+| `keycast_nip46_queue_dropped_total` increasing | signer path overloaded; scale or reduce load |
+| Cache misses high vs hits | session affinity or cold-cache problem |
+| Config or secret changed | roll Cloud Run revision or GKE pods |
+| Before production GKE cutover | fix/verify 75s shutdown budget, session affinity, probe paths, ATProto entryway multi-replica behavior, production overlay tag |
