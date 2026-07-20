@@ -17,6 +17,7 @@ describe("support admin user lookup view", () => {
             results: [row("a"), row("b")],
             suggestions: [row("c")],
             total: 2,
+            authoritative_match: true,
         };
 
         expect(selectDisplayedUsers(result)).toEqual([row("a"), row("b")]);
@@ -29,9 +30,23 @@ describe("support admin user lookup view", () => {
             results: [row("a")],
             suggestions: [],
             total: 1,
+            authoritative_match: true,
         };
 
         expect(selectAutoExpandedPubkey(result)).toBe("a");
+    });
+
+    test("marks a lone non-authoritative result as suggested without auto-expanding it", () => {
+        const result = {
+            results: [row("a")],
+            suggestions: [],
+            total: 1,
+            authoritative_match: false,
+        };
+
+        expect(selectDisplayedUsers(result)).toEqual([row("a")]);
+        expect(isShowingSuggestions(result)).toBe(true);
+        expect(selectAutoExpandedPubkey(result)).toBeNull();
     });
 
     test("falls back to fuzzy suggestions without auto-expanding them", () => {
@@ -39,6 +54,7 @@ describe("support admin user lookup view", () => {
             results: [],
             suggestions: [row("c")],
             total: 0,
+            authoritative_match: false,
         };
 
         expect(selectDisplayedUsers(result)).toEqual([row("c")]);
@@ -47,7 +63,7 @@ describe("support admin user lookup view", () => {
     });
 
     test("shows nothing and no suggestion banner when both are empty", () => {
-        const result = { results: [], suggestions: [], total: 0 };
+        const result = { results: [], suggestions: [], total: 0, authoritative_match: false };
 
         expect(selectDisplayedUsers(result)).toEqual([]);
         expect(isShowingSuggestions(result)).toBe(false);

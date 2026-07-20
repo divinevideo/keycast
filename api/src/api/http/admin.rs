@@ -898,6 +898,7 @@ pub struct UserLookupResponse {
     pub results: Vec<UserLookupDetails>,
     pub suggestions: Vec<UserLookupDetails>,
     pub total: usize,
+    pub authoritative_match: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1013,9 +1014,11 @@ mod user_lookup_response_tests {
             results: vec![],
             suggestions: vec![suggestion],
             total: 0,
+            authoritative_match: true,
         };
 
         let json = serde_json::to_value(response).expect("lookup response should serialize");
+        assert_eq!(json["authoritative_match"], true);
         assert_eq!(json["results"], serde_json::json!([]));
         assert_eq!(json["total"], 0);
         assert_eq!(json["suggestions"][0]["email"], "suggested@example.com");
@@ -1103,6 +1106,7 @@ pub async fn get_user_lookup(
 
     let oauth_repo = OAuthAuthorizationRepository::new(pool.clone());
     let total = lookup.users.len();
+    let authoritative_match = lookup.authoritative_match;
     let mut results = Vec::with_capacity(total);
 
     for details in lookup.users {
@@ -1118,6 +1122,7 @@ pub async fn get_user_lookup(
         results,
         suggestions,
         total,
+        authoritative_match,
     }))
 }
 
