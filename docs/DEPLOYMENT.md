@@ -102,7 +102,7 @@ These are set by `cloudbuild.yaml --set-env-vars`:
 | `GCP_PROJECT_ID` | `${PROJECT_ID}` (`openvine-co` when deployed by `bun run deploy`) |
 | `ALLOWED_ORIGINS` | `https://login.divine.video,https://divine.video,https://*.openvine-app.pages.dev` |
 | `ALLOWED_TENANT_DOMAINS` | `login.divine.video` |
-| `REQUIRE_REGISTERED_OAUTH_CLIENTS` | `false` |
+| `REQUIRE_REGISTERED_OAUTH_CLIENTS` | `false` in Cloud Build; not currently consumed by the server |
 | `APP_URL` | `https://login.divine.video` |
 | `FROM_EMAIL` | `noreply@divine.video` |
 | `RUST_LOG` | `info` |
@@ -124,9 +124,9 @@ These are set by `cloudbuild.yaml --set-env-vars`:
 | Resource | Name |
 |----------|------|
 | Cloud Run service | `keycast` |
-| Cloud SQL | `keycast-db-plus`, Postgres 15 |
+| Cloud SQL | `keycast-db-plus`; connection configured by Cloud Build, engine details managed outside this repo |
 | Cloud KMS | key ring `keycast-keys`, key `master-key`, location `global` |
-| Memorystore Redis | `keycast-redis` |
+| Redis | URL injected from the `keycast-redis-url` Secret Manager secret; instance details managed outside this repo |
 | Artifact Registry | `us-central1-docker.pkg.dev/openvine-co/docker` |
 | Runtime service account | `972941478875-compute@developer.gserviceaccount.com` |
 
@@ -192,6 +192,7 @@ Keycast manifests live under `divine-iac-coreconfig/k8s/applications/keycast/`.
 | `base/httproute.yaml` | HTTP-to-HTTPS redirects and HTTPS routes for login and entryway hosts |
 | `base/db-migrate.yaml` | ArgoCD Sync hook, sync wave 1, for DB bootstrap and `./keycast --migrate` |
 | `base/external-secret.yaml` | ExternalSecret for `KEYCAST_ATPROTO_TOKEN` |
+| `base/auth-events-retention-cronjob.yaml` | Daily 03:17 CronJob that prunes `auth_events` older than 30 days |
 | `overlays/poc/kustomization.yaml` | POC project, hostnames, KMS key ring, image tag, relays, Redis |
 | `overlays/staging/kustomization.yaml` | staging project, hostnames, KMS key ring, image tag, relays, Redis, resources |
 | `overlays/production/kustomization.yaml` | staged production GKE config; not live for prod traffic |
@@ -280,8 +281,9 @@ The Deployment sets or patches these runtime env vars:
 | `SQLX_STATEMENT_CACHE` | `100` |
 | `DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL` | in-cluster control plane URL |
 | `DIVINE_HANDLE_DOMAIN` | `divine.video` |
-| `ATPROTO_ENTRYWAY_ENABLED` | `true` in current IaC |
-| `ATPROTO_ENTRYWAY_ORIGIN`, `ATPROTO_ENTRYWAY_HOSTS` | patched per environment |
+| `ATPROTO_ENTRYWAY_ENABLED` | `true` in current IaC; not currently consumed by the server |
+| `ATPROTO_ENTRYWAY_ORIGIN` | patched per environment; used by server metadata |
+| `ATPROTO_ENTRYWAY_HOSTS` | patched per environment; not currently consumed by the server |
 | `REDIS_URL` | added by overlays, points at in-cluster Redis DB 1 |
 | `ENABLE_DIVINE_NAMES` | staged production overlay only |
 
@@ -357,15 +359,13 @@ Live updates that do not require a process restart:
 
 ## ATProto entryway
 
-ATProto entryway support is controlled by:
+ATProto OAuth entryway routes are registered unconditionally by the server. The only entryway env var the server currently reads is `ATPROTO_ENTRYWAY_ORIGIN`, which is used when generating OAuth authorization-server metadata. If unset, metadata generation falls back to `APP_URL` or `VITE_DOMAIN`.
 
-- `ATPROTO_ENTRYWAY_ENABLED`
-- `ATPROTO_ENTRYWAY_ORIGIN`
-- `ATPROTO_ENTRYWAY_HOSTS`
+Current IaC also sets `ATPROTO_ENTRYWAY_ENABLED` and `ATPROTO_ENTRYWAY_HOSTS`, but those values are not consumed by the server today. Changing them does not gate the routes or host matching in Keycast.
 
-The runtime safety boundary is process-local PAR state. Do not assume horizontal safety for entryway flows until PAR state moves to shared persistence or the platform has a documented single-replica constraint for that surface.
+PAR state is stored in shared Postgres in `atproto_oauth_sessions` with a unique `request_uri`, so PAR lookup is replica-safe.
 
-The current IaC manifests set `ATPROTO_ENTRYWAY_ENABLED=true` and run multiple replicas in staging and staged production, so the production GKE cutover must explicitly verify this behavior before traffic moves.
+The current per-replica safety gap is replay protection: DPoP and client assertion replay caches are in-memory `DashMap`s. A replay that reaches a different pod inside the replay window may not be caught. Before production GKE cutover, decide whether that risk is acceptable or move those replay caches to shared storage.
 
 ---
 
@@ -405,7 +405,7 @@ Prometheus metrics are exposed at:
 GET /api/metrics
 ```
 
-The endpoint is unauthenticated and returns in-memory counters/gauges only.
+The endpoint is unauthenticated and returns in-memory counters/gauges only. The table below lists the common operational subset; the endpoint emits additional series as code paths are exercised.
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -416,11 +416,18 @@ The endpoint is unauthenticated and returns in-memory counters/gauges only.
 | `keycast_nip46_rejected_hashring_total` | counter | Requests assigned to another instance |
 | `keycast_nip46_processed_total` | counter | Requests processed successfully |
 | `keycast_nip46_queue_dropped_total` | counter | Requests dropped under backpressure |
+| `keycast_nip46_queue_closed_total` | counter | Requests rejected because the queue is closed during graceful shutdown |
 | `keycast_http_rpc_requests_total` | counter | HTTP RPC requests to `/api/nostr` |
 | `keycast_http_rpc_auth_errors_total` | counter | HTTP RPC auth failures |
+| `keycast_http_rpc_cache_hits_total` | counter | HTTP RPC handler found in memory cache |
+| `keycast_http_rpc_cache_misses_total` | counter | HTTP RPC handler loaded from DB |
+| `keycast_http_rpc_cache_size` | gauge | Current HTTP RPC handlers in cache |
 | `keycast_registrations_total` | counter | User registrations |
 | `keycast_logins_total` | counter | Successful logins |
 | `keycast_login_failures_total` | counter | Failed logins |
+| `keycast_oauth_authorizations_created_total` | counter | OAuth authorizations created |
+| `keycast_oauth_authorizations_revoked_total` | counter | OAuth authorizations revoked |
+| `keycast_auth_requests_total` | counter | Auth request outcomes by endpoint and reason |
 
 High `keycast_cache_misses_total` relative to hits usually points at session affinity or cold-cache behavior. Increasing `keycast_nip46_queue_dropped_total` means the signer path is overloaded.
 
