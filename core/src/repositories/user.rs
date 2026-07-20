@@ -81,11 +81,41 @@ pub struct AdminUserLookup {
 /// Maximum number of primary users returned by one admin lookup.
 pub const ADMIN_USER_LOOKUP_LIMIT: usize = 20;
 
+/// Minimum trigram similarity used to select plausible email suggestions.
+const ADMIN_EMAIL_SUGGESTION_MIN_SIMILARITY: f32 = 0.5;
+
+/// Maximum edit distance allowed between an admin query and a suggested email.
+const ADMIN_EMAIL_SUGGESTION_MAX_EDIT_DISTANCE: usize = 2;
+
 fn escape_like_pattern(value: &str) -> String {
     value
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
+}
+
+fn is_within_edit_distance(left: &str, right: &str, maximum: usize) -> bool {
+    let left = left.chars().collect::<Vec<_>>();
+    let right = right.chars().collect::<Vec<_>>();
+    if left.len().abs_diff(right.len()) > maximum {
+        return false;
+    }
+
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right.len() + 1];
+
+    for (left_index, left_character) in left.iter().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_character) in right.iter().enumerate() {
+            let substitution_cost = usize::from(left_character != right_character);
+            current[right_index + 1] = (current[right_index] + 1)
+                .min(previous[right_index + 1] + 1)
+                .min(previous[right_index] + substitution_cost);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    previous[right.len()] <= maximum
 }
 
 fn merge_admin_lookup_candidates(
@@ -2056,17 +2086,30 @@ impl UserRepository {
              LEFT JOIN personal_keys pk ON pk.user_pubkey = u.pubkey AND pk.tenant_id = u.tenant_id
              WHERE u.email IS NOT NULL
                AND u.email % $1
+               AND similarity(u.email, $1) >= $3
                AND u.tenant_id = $2
              ORDER BY similarity(u.email, $1) DESC, u.pubkey
              LIMIT 5",
         )
-        .bind(normalized_query)
+        .bind(&normalized_query)
         .bind(tenant_id)
+        .bind(ADMIN_EMAIL_SUGGESTION_MIN_SIMILARITY)
         .fetch_all(&self.pool)
         .await;
 
         match rows {
-            Ok(rows) => Ok(rows),
+            Ok(rows) => Ok(rows
+                .into_iter()
+                .filter(|user| {
+                    user.email.as_ref().is_some_and(|email| {
+                        is_within_edit_distance(
+                            &normalized_query,
+                            &email.to_lowercase(),
+                            ADMIN_EMAIL_SUGGESTION_MAX_EDIT_DISTANCE,
+                        )
+                    })
+                })
+                .collect()),
             Err(error) if is_undefined_postgres_function(&error) => Ok(vec![]),
             Err(error) => Err(error.into()),
         }
@@ -2805,18 +2848,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_suggest_users_for_admin_ranks_closest_email_first() {
+    async fn test_suggest_users_for_admin_ranks_close_emails_and_excludes_distant_ones() {
         let pool = setup_pool().await;
         let repo = UserRepository::new(pool.clone());
         let suffix = test_suffix();
         let query = format!("socialpublishllc-{suffix}@lookup.test");
         let closest_pubkey = Keys::generate().public_key().to_hex();
+        let two_edits_pubkey = Keys::generate().public_key().to_hex();
         let farther_pubkey = Keys::generate().public_key().to_hex();
 
         create_user_with_email(
             &pool,
             &closest_pubkey,
             &format!("socialpulishllc-{suffix}@lookup.test"),
+        )
+        .await;
+        create_user_with_email(
+            &pool,
+            &two_edits_pubkey,
+            &format!("socialpulishllx-{suffix}@lookup.test"),
         )
         .await;
         create_user_with_email(
@@ -2836,14 +2886,16 @@ mod tests {
         let closest_position = suggestions
             .iter()
             .position(|user| user.pubkey == closest_pubkey)
-            .expect("closest email should be suggested");
-        let farther_position = suggestions
+            .expect("one-edit email should be suggested");
+        let two_edits_position = suggestions
             .iter()
-            .position(|user| user.pubkey == farther_pubkey)
-            .expect("farther email should be suggested");
-        assert!(closest_position < farther_position);
+            .position(|user| user.pubkey == two_edits_pubkey)
+            .expect("two-edit email should be suggested");
+        assert!(closest_position < two_edits_position);
+        assert!(!suggestions.iter().any(|user| user.pubkey == farther_pubkey));
 
         cleanup_user(&pool, &closest_pubkey).await;
+        cleanup_user(&pool, &two_edits_pubkey).await;
         cleanup_user(&pool, &farther_pubkey).await;
     }
 
