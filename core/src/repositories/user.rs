@@ -34,6 +34,10 @@ pub struct VerificationTokenData {
 pub struct OAuthRegistrationState {
     /// Email currently on the row, if any.
     pub email: Option<String>,
+    /// Whether the row has completed email verification.
+    pub email_verified: bool,
+    /// Whether the row has a password hash ready for password login.
+    pub has_password_hash: bool,
     /// Whether a personal_keys row exists for this pubkey.
     pub has_personal_key: bool,
 }
@@ -1372,6 +1376,8 @@ impl UserRepository {
     ) -> Result<Option<OAuthRegistrationState>, RepositoryError> {
         sqlx::query_as(
             "SELECT u.email,
+                    u.email_verified,
+                    u.password_hash IS NOT NULL AS has_password_hash,
                     EXISTS(SELECT 1 FROM personal_keys pk WHERE pk.user_pubkey = u.pubkey) AS has_personal_key
              FROM users u WHERE u.pubkey = $1 AND u.tenant_id = $2",
         )
@@ -1397,8 +1403,8 @@ impl UserRepository {
 
         sqlx::query(
             "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
-             SELECT $1, $2, $3, $4, $4
-             WHERE NOT EXISTS (SELECT 1 FROM personal_keys WHERE user_pubkey = $1)",
+             VALUES ($1, $2, $3, $4, $4)
+             ON CONFLICT (user_pubkey) DO NOTHING",
         )
         .bind(pubkey)
         .bind(encrypted_secret)
@@ -1437,9 +1443,14 @@ impl UserRepository {
 
         let updated = sqlx::query(
             "UPDATE users
-             SET email = $1, password_hash = $2, email_verified = true,
+             SET email = $1, password_hash = COALESCE(password_hash, $2), email_verified = true,
                  email_verification_token = $3, updated_at = $4
-             WHERE pubkey = $5 AND tenant_id = $6 AND email IS NULL",
+             WHERE pubkey = $5
+               AND tenant_id = $6
+               AND (
+                   email IS NULL
+                   OR (email = $1 AND (email_verified = false OR password_hash IS NULL))
+               )",
         )
         .bind(email)
         .bind(password_hash)
@@ -1452,18 +1463,19 @@ impl UserRepository {
         .rows_affected();
 
         if updated == 0 {
-            let existing_email = sqlx::query_scalar::<_, Option<String>>(
-                "SELECT email FROM users WHERE pubkey = $1 AND tenant_id = $2",
+            let existing_state = sqlx::query_as::<_, (Option<String>, bool, bool)>(
+                "SELECT email, email_verified, password_hash IS NOT NULL AS has_password_hash
+                 FROM users WHERE pubkey = $1 AND tenant_id = $2",
             )
             .bind(pubkey)
             .bind(tenant_id)
             .fetch_optional(&mut *tx)
             .await?;
 
-            match existing_email {
+            match existing_state {
                 // A concurrent request already applied this exact registration;
                 // fall through so a missing personal key can still be backfilled.
-                Some(Some(existing)) if existing == email => {}
+                Some((Some(existing), true, true)) if existing == email => {}
                 Some(_) => return Err(RepositoryError::Duplicate),
                 None => {
                     return Err(RepositoryError::NotFound(format!(
@@ -1477,8 +1489,8 @@ impl UserRepository {
         if let Some(secret) = encrypted_secret {
             sqlx::query(
                 "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
-                 SELECT $1, $2, $3, $4, $4
-                 WHERE NOT EXISTS (SELECT 1 FROM personal_keys WHERE user_pubkey = $1)",
+                 VALUES ($1, $2, $3, $4, $4)
+                 ON CONFLICT (user_pubkey) DO NOTHING",
             )
             .bind(pubkey)
             .bind(secret)
@@ -2778,6 +2790,8 @@ mod tests {
             .unwrap()
             .expect("bare row should have state");
         assert_eq!(bare_state.email, None);
+        assert!(!bare_state.email_verified);
+        assert!(!bare_state.has_password_hash);
         assert!(!bare_state.has_personal_key);
 
         let full_state = repo
@@ -2786,6 +2800,8 @@ mod tests {
             .unwrap()
             .expect("full row should have state");
         assert_eq!(full_state.email.as_deref(), Some(email.as_str()));
+        assert!(full_state.email_verified);
+        assert!(full_state.has_password_hash);
         assert!(full_state.has_personal_key);
 
         cleanup_user(&pool, &bare_pubkey).await;
@@ -2871,6 +2887,33 @@ mod tests {
                 .unwrap();
         assert_eq!(keys.len(), 1, "existing key must not be duplicated");
         assert_eq!(keys[0].0, existing_secret, "existing key must be preserved");
+
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_backfill_personal_key_is_idempotent() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let pubkey = Keys::generate().public_key().to_hex();
+
+        create_bare_user(&pool, &pubkey).await;
+
+        repo.backfill_personal_key(&pubkey, 1, &[1_u8; 32])
+            .await
+            .unwrap();
+        repo.backfill_personal_key(&pubkey, 1, &[2_u8; 32])
+            .await
+            .unwrap();
+
+        let keys: Vec<(Vec<u8>,)> =
+            sqlx::query_as("SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1")
+                .bind(&pubkey)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(keys.len(), 1, "backfill must not duplicate personal keys");
+        assert_eq!(keys[0].0, vec![1_u8; 32], "first key must be preserved");
 
         cleanup_user(&pool, &pubkey).await;
     }
@@ -3028,6 +3071,61 @@ mod tests {
             keys[0].0, secret,
             "backfilled key must hold the pending secret"
         );
+
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_complete_pending_oauth_registration_completes_same_email_incomplete_row() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let suffix = test_suffix();
+        let pubkey = Keys::generate().public_key().to_hex();
+        let email = format!("oauth-incomplete-{}@example.com", suffix);
+        let secret = vec![6_u8; 32];
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
+             VALUES ($1, 1, $2, NULL, false, NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .bind(&email)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        repo.complete_pending_oauth_registration(
+            &pubkey,
+            1,
+            &email,
+            "pending-hash",
+            "token",
+            Some(&secret),
+        )
+        .await
+        .expect("same-email incomplete row should be completed");
+
+        let row: (Option<String>, Option<String>, bool, Option<String>) = sqlx::query_as(
+            "SELECT email, password_hash, email_verified, email_verification_token
+             FROM users WHERE pubkey = $1 AND tenant_id = 1",
+        )
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0.as_deref(), Some(email.as_str()));
+        assert_eq!(row.1.as_deref(), Some("pending-hash"));
+        assert!(row.2, "same-email row must be marked verified");
+        assert_eq!(row.3.as_deref(), Some("token"));
+
+        let keys: Vec<(Vec<u8>,)> =
+            sqlx::query_as("SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1")
+                .bind(&pubkey)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(keys.len(), 1, "missing personal key must be backfilled");
+        assert_eq!(keys[0].0, secret);
 
         cleanup_user(&pool, &pubkey).await;
     }

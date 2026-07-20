@@ -1588,26 +1588,56 @@ pub async fn verify_email(
         if let Some(existing) = existing_user {
             match existing.email.as_deref() {
                 Some(existing_email) if existing_email == email => {
-                    // Genuine retry: a prior attempt already applied the pending
-                    // credentials. Backfill the personal key if that attempt (or
-                    // another creation path) left it missing.
-                    tracing::info!(
-                        "Retrying OAuth email verification for existing user: {}",
-                        oauth_data.user_pubkey
-                    );
-                    if let (Some(encrypted_secret), false) = (
-                        oauth_data.pending_encrypted_secret.as_deref(),
-                        existing.has_personal_key,
-                    ) {
-                        user_repo
-                            .backfill_personal_key(
+                    if existing.email_verified && existing.has_password_hash {
+                        // Genuine retry: a prior attempt already applied the pending
+                        // credentials. Backfill the personal key if that attempt (or
+                        // another creation path) left it missing.
+                        tracing::info!(
+                            "Retrying OAuth email verification for existing user: {}",
+                            oauth_data.user_pubkey
+                        );
+                        if let (Some(encrypted_secret), false) = (
+                            oauth_data.pending_encrypted_secret.as_deref(),
+                            existing.has_personal_key,
+                        ) {
+                            user_repo
+                                .backfill_personal_key(
+                                    &oauth_data.user_pubkey,
+                                    tenant_id,
+                                    encrypted_secret,
+                                )
+                                .await?;
+                            tracing::info!(
+                                "Backfilled missing personal key during OAuth verification retry: {}",
+                                oauth_data.user_pubkey
+                            );
+                        }
+                    } else {
+                        // A same-email row can come from standard registration before
+                        // verification or before bcrypt finishes. Complete it before
+                        // minting an OAuth code.
+                        if let Err(err) = user_repo
+                            .complete_pending_oauth_registration(
                                 &oauth_data.user_pubkey,
                                 tenant_id,
-                                encrypted_secret,
+                                email,
+                                password_hash,
+                                &req.token,
+                                oauth_data.pending_encrypted_secret.as_deref(),
                             )
-                            .await?;
+                            .await
+                        {
+                            if matches!(err, keycast_core::repositories::RepositoryError::Duplicate)
+                            {
+                                oauth_code_repo
+                                    .delete_by_verification_token(&req.token, tenant_id)
+                                    .await?;
+                                return Err(AuthError::EmailAlreadyExists);
+                            }
+                            return Err(err.into());
+                        }
                         tracing::info!(
-                            "Backfilled missing personal key during OAuth verification retry: {}",
+                            "Completed incomplete same-email OAuth registration row: {}",
                             oauth_data.user_pubkey
                         );
                     }
@@ -5079,6 +5109,94 @@ mod tests {
             stored_password_hash.0, changed_password_hash,
             "retry key backfill must not rewrite existing credentials"
         );
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &verification_token).await;
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_email_completes_same_email_unverified_row_before_minting() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+        let pending_keys = Keys::generate();
+        let pubkey = pending_keys.public_key().to_hex();
+        let email = format!("verify-incomplete-{}@example.com", Uuid::new_v4());
+        let verification_token = format!("verify_{}", Uuid::new_v4());
+        let password_hash = bcrypt::hash("testpassword123", bcrypt::DEFAULT_COST).unwrap();
+        let encrypted_secret = pending_keys.secret_key().to_secret_bytes().to_vec();
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &verification_token).await;
+
+        // Standard registration can leave the same pubkey/email row incomplete
+        // until this verification link is clicked.
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
+             VALUES ($1, 1, $2, NULL, false, NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .bind(&email)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        insert_pending_oauth_registration(
+            &pool,
+            &pubkey,
+            &email,
+            &verification_token,
+            &password_hash,
+            Some(&encrypted_secret),
+        )
+        .await;
+
+        let response = match verify_email(
+            create_test_tenant(),
+            State(auth_state),
+            HeaderMap::new(),
+            Json(VerifyEmailRequest {
+                token: verification_token.clone(),
+            }),
+        )
+        .await
+        {
+            Ok(response) => response.into_response(),
+            Err(err) => err.into_response(),
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let row: (Option<String>, Option<String>, bool) = sqlx::query_as(
+            "SELECT email, password_hash, email_verified FROM users
+             WHERE pubkey = $1 AND tenant_id = 1",
+        )
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0.as_deref(), Some(email.as_str()));
+        assert_eq!(
+            row.1.as_deref(),
+            Some(password_hash.as_str()),
+            "pending password must complete the incomplete same-email row"
+        );
+        assert!(row.2, "OAuth verification must mark the row verified");
+
+        let usable_code_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM oauth_codes
+             WHERE tenant_id = 1 AND user_pubkey = $1 AND pending_email IS NULL",
+        )
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(usable_code_count.0, 1, "OAuth code should be minted");
+
+        let key_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM personal_keys WHERE user_pubkey = $1")
+                .bind(&pubkey)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(key_count.0, 1, "personal key must be created once");
 
         cleanup_verify_email_test_data(&pool, &pubkey, &verification_token).await;
     }
