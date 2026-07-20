@@ -9,11 +9,13 @@ use axum::{
     Json,
 };
 use keycast_core::ap_signing::{self, AP_KEY_TYPE};
-use keycast_core::repositories::{ApActorKeysRepository, RepositoryError, UserRepository};
+use keycast_core::repositories::{
+    ApActorKeysRepository, OAuthAuthorizationRepository, RepositoryError, UserRepository,
+};
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 
-use crate::api::http::auth::extract_user_from_token;
+use crate::api::http::auth::extract_user_and_origin_from_token;
 use crate::api::http::routes::AuthState;
 use crate::api::tenant::TenantExtractor;
 
@@ -76,28 +78,99 @@ fn validate_hex_pubkey(pubkey: &str) -> Result<String, ApError> {
         .map_err(|_| ApError::BadRequest("Invalid hex pubkey".to_string()))
 }
 
-/// Resolve the acting user_pubkey for a request.
-/// - Service token: `body_pubkey` is REQUIRED (gateway acts for any actor in the tenant).
-/// - UCAN: pubkey comes from the token; if `body_pubkey` is present it must match.
-async fn resolve_principal(
-    headers: &HeaderMap,
+fn actor_username(actor: &str) -> Result<String, ApError> {
+    let actor = actor.trim();
+    let without_scheme = actor
+        .strip_prefix("https://")
+        .or_else(|| actor.strip_prefix("http://"))
+        .ok_or_else(|| ApError::BadRequest("Invalid actor URL".to_string()))?;
+    let (_host, path) = without_scheme
+        .split_once('/')
+        .ok_or_else(|| ApError::BadRequest("Invalid actor URL".to_string()))?;
+    let username = path
+        .strip_prefix("ap/users/")
+        .ok_or_else(|| ApError::BadRequest("Invalid actor URL".to_string()))?;
+    if username.is_empty() || username.contains('/') {
+        return Err(ApError::BadRequest("Invalid actor URL".to_string()));
+    }
+    Ok(username.to_string())
+}
+
+async fn resolve_actor_pubkey(
+    pool: &sqlx::PgPool,
+    tenant_id: i64,
+    actor: &str,
+) -> Result<String, ApError> {
+    let username = actor_username(actor)?;
+    UserRepository::new(pool.clone())
+        .find_pubkey_by_username(&username, tenant_id)
+        .await
+        .map_err(|e| ApError::Internal(e.to_string()))?
+        .ok_or_else(|| ApError::NotFound("No user for this actor".to_string()))
+}
+
+async fn resolve_requested_pubkey(
+    pool: &sqlx::PgPool,
     tenant_id: i64,
     body_pubkey: Option<&str>,
+    actor: Option<&str>,
+) -> Result<Option<String>, ApError> {
+    match (body_pubkey, actor) {
+        (Some(pk), None) => Ok(Some(validate_hex_pubkey(pk)?)),
+        (None, Some(actor)) => Ok(Some(resolve_actor_pubkey(pool, tenant_id, actor).await?)),
+        (Some(pk), Some(actor)) => {
+            let pk = validate_hex_pubkey(pk)?;
+            let actor_pk = resolve_actor_pubkey(pool, tenant_id, actor).await?;
+            if pk != actor_pk {
+                return Err(ApError::Forbidden(
+                    "pubkey does not match actor".to_string(),
+                ));
+            }
+            Ok(Some(pk))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+/// Resolve the acting user_pubkey for a request.
+/// - Service token: `pubkey` or `actor` is REQUIRED (gateway acts for an existing actor in the tenant).
+/// - UCAN: requires a live OAuth authorization bunker and cannot act for a different actor/pubkey.
+async fn resolve_principal(
+    headers: &HeaderMap,
+    pool: &sqlx::PgPool,
+    tenant_id: i64,
+    body_pubkey: Option<&str>,
+    actor: Option<&str>,
 ) -> Result<String, ApError> {
+    let requested = resolve_requested_pubkey(pool, tenant_id, body_pubkey, actor).await?;
+
     if is_service_token(headers) {
-        let pk = body_pubkey.ok_or_else(|| {
-            ApError::BadRequest("pubkey is required for service-token calls".into())
-        })?;
-        return validate_hex_pubkey(pk);
+        return requested.ok_or_else(|| {
+            ApError::BadRequest("pubkey or actor is required for service-token calls".into())
+        });
     }
 
     // UCAN path
-    let token_pubkey = extract_user_from_token(headers, tenant_id)
-        .await
-        .map_err(|_| ApError::Unauthorized("Authentication required".to_string()))?;
+    let (token_pubkey, _redirect_origin, bunker_pubkey) =
+        extract_user_and_origin_from_token(headers, tenant_id)
+            .await
+            .map_err(|_| ApError::Unauthorized("Authentication required".to_string()))?;
 
-    if let Some(pk) = body_pubkey {
-        let pk = validate_hex_pubkey(pk)?;
+    let bunker_pubkey = bunker_pubkey.ok_or_else(|| {
+        ApError::Unauthorized("OAuth authorization required for AP signing".to_string())
+    })?;
+    let oauth_repo = OAuthAuthorizationRepository::new(pool.clone());
+    if !oauth_repo
+        .exists_active_for_bunker(&bunker_pubkey, &token_pubkey, tenant_id)
+        .await
+        .map_err(|e| ApError::Internal(e.to_string()))?
+    {
+        return Err(ApError::Unauthorized(
+            "OAuth authorization is revoked or expired".to_string(),
+        ));
+    }
+
+    if let Some(pk) = requested {
         if pk != token_pubkey {
             return Err(ApError::Forbidden(
                 "Cannot act on behalf of another user".to_string(),
@@ -114,14 +187,15 @@ async fn ensure_active(
     user_pubkey: &str,
 ) -> Result<(), ApError> {
     let user_repo = UserRepository::new(pool.clone());
-    if let Some((status, _, _)) = user_repo
+    let Some((status, _, _)) = user_repo
         .get_user_status(user_pubkey, tenant_id)
         .await
         .map_err(|e| ApError::Internal(e.to_string()))?
-    {
-        if !status.is_active() {
-            return Err(ApError::Forbidden("Account restricted".to_string()));
-        }
+    else {
+        return Err(ApError::NotFound("No user for this actor".to_string()));
+    };
+    if !status.is_active() {
+        return Err(ApError::Forbidden("Account restricted".to_string()));
     }
     Ok(())
 }
@@ -132,6 +206,8 @@ async fn ensure_active(
 pub struct CreateKeyRequest {
     /// Hex Nostr pubkey of the actor. Required for service-token callers.
     pub pubkey: Option<String>,
+    /// ActivityPub actor URL, e.g. https://divine.video/ap/users/alice.
+    pub actor: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -153,6 +229,8 @@ pub struct PublicKeyResponse {
 pub struct SignRequest {
     /// Hex Nostr pubkey of the actor. Required for service-token callers.
     pub pubkey: Option<String>,
+    /// ActivityPub actor URL, e.g. https://divine.video/ap/users/alice.
+    pub actor: Option<String>,
     /// Exact draft-cavage signing string. Signed as its UTF-8 bytes.
     pub signing_string: String,
 }
@@ -164,34 +242,12 @@ pub struct SignResponse {
     pub algorithm: &'static str,
 }
 
-// ---- handlers ----
-
-/// POST /api/ap/keys — create-or-return the actor's RSA key. Idempotent: never regenerates.
-pub async fn create_key(
-    tenant: TenantExtractor,
-    State(auth_state): State<AuthState>,
-    headers: HeaderMap,
-    Json(req): Json<CreateKeyRequest>,
-) -> Result<Json<KeyResponse>, ApError> {
-    let tenant_id = tenant.0.id;
-    let user_pubkey = resolve_principal(&headers, tenant_id, req.pubkey.as_deref()).await?;
-    let pool = &auth_state.state.db;
-    let repo = ApActorKeysRepository::new(pool.clone());
-
-    // Idempotent: if a key exists, return it unchanged.
-    if let Some((pem, key_type)) = repo
-        .find_public_pem(tenant_id, &user_pubkey)
-        .await
-        .map_err(|e| ApError::Internal(e.to_string()))?
-    {
-        return Ok(Json(KeyResponse {
-            pubkey: user_pubkey,
-            public_key_pem: pem,
-            key_type,
-            created: false,
-        }));
-    }
-
+async fn create_actor_key(
+    repo: &ApActorKeysRepository,
+    auth_state: &AuthState,
+    tenant_id: i64,
+    user_pubkey: &str,
+) -> Result<(String, String, bool), ApError> {
     // Generate (CPU-bound) off the async runtime.
     let material = tokio::task::spawn_blocking(ap_signing::generate_rsa_2048)
         .await
@@ -209,38 +265,75 @@ pub async fn create_key(
     match repo
         .create(
             tenant_id,
-            &user_pubkey,
+            user_pubkey,
             &encrypted,
             &material.public_pem,
             AP_KEY_TYPE,
         )
         .await
     {
-        Ok(()) => Ok(Json(KeyResponse {
-            pubkey: user_pubkey,
-            public_key_pem: material.public_pem,
-            key_type: AP_KEY_TYPE.to_string(),
-            created: true,
-        })),
+        Ok(()) => Ok((material.public_pem, AP_KEY_TYPE.to_string(), true)),
         Err(RepositoryError::Duplicate) => {
-            // Lost a race: another request created it. Return the winner's key.
             let (pem, key_type) = repo
-                .find_public_pem(tenant_id, &user_pubkey)
+                .find_public_pem(tenant_id, user_pubkey)
                 .await
                 .map_err(|e| ApError::Internal(e.to_string()))?
                 .ok_or_else(|| ApError::Internal("key insert conflict but no row".into()))?;
-            Ok(Json(KeyResponse {
-                pubkey: user_pubkey,
-                public_key_pem: pem,
-                key_type,
-                created: false,
-            }))
+            Ok((pem, key_type, false))
         }
         Err(e) => Err(ApError::Internal(e.to_string())),
     }
 }
 
-/// GET /api/ap/keys/{pubkey} — return the actor's public PEM. Never decrypts.
+async fn find_or_create_actor_key(
+    repo: &ApActorKeysRepository,
+    auth_state: &AuthState,
+    tenant_id: i64,
+    user_pubkey: &str,
+) -> Result<(String, String, bool), ApError> {
+    if let Some((pem, key_type)) = repo
+        .find_public_pem(tenant_id, user_pubkey)
+        .await
+        .map_err(|e| ApError::Internal(e.to_string()))?
+    {
+        return Ok((pem, key_type, false));
+    }
+    create_actor_key(repo, auth_state, tenant_id, user_pubkey).await
+}
+
+// ---- handlers ----
+
+/// POST /api/ap/keys — create-or-return the actor's RSA key. Idempotent: never regenerates.
+pub async fn create_key(
+    tenant: TenantExtractor,
+    State(auth_state): State<AuthState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateKeyRequest>,
+) -> Result<Json<KeyResponse>, ApError> {
+    let tenant_id = tenant.0.id;
+    let pool = &auth_state.state.db;
+    let user_pubkey = resolve_principal(
+        &headers,
+        pool,
+        tenant_id,
+        req.pubkey.as_deref(),
+        req.actor.as_deref(),
+    )
+    .await?;
+    ensure_active(pool, tenant_id, &user_pubkey).await?;
+    let repo = ApActorKeysRepository::new(pool.clone());
+
+    let (pem, key_type, created) =
+        find_or_create_actor_key(&repo, &auth_state, tenant_id, &user_pubkey).await?;
+    Ok(Json(KeyResponse {
+        pubkey: user_pubkey,
+        public_key_pem: pem,
+        key_type,
+        created,
+    }))
+}
+
+/// GET /api/ap/keys/{pubkey-or-actor} — return the actor's public PEM. Never decrypts.
 pub async fn get_key(
     tenant: TenantExtractor,
     State(auth_state): State<AuthState>,
@@ -248,14 +341,17 @@ pub async fn get_key(
     Path(pubkey): Path<String>,
 ) -> Result<Json<PublicKeyResponse>, ApError> {
     let tenant_id = tenant.0.id;
-    let user_pubkey = resolve_principal(&headers, tenant_id, Some(&pubkey)).await?;
+    let pool = &auth_state.state.db;
+    let user_pubkey = if PublicKey::from_hex(&pubkey).is_ok() {
+        resolve_principal(&headers, pool, tenant_id, Some(&pubkey), None).await?
+    } else {
+        resolve_principal(&headers, pool, tenant_id, None, Some(&pubkey)).await?
+    };
+    ensure_active(pool, tenant_id, &user_pubkey).await?;
     let repo = ApActorKeysRepository::new(auth_state.state.db.clone());
 
-    let (pem, key_type) = repo
-        .find_public_pem(tenant_id, &user_pubkey)
-        .await
-        .map_err(|e| ApError::Internal(e.to_string()))?
-        .ok_or_else(|| ApError::NotFound("No AP key for this actor".to_string()))?;
+    let (pem, key_type, _) =
+        find_or_create_actor_key(&repo, &auth_state, tenant_id, &user_pubkey).await?;
 
     Ok(Json(PublicKeyResponse {
         pubkey: user_pubkey,
@@ -272,17 +368,39 @@ pub async fn sign(
     Json(req): Json<SignRequest>,
 ) -> Result<Json<SignResponse>, ApError> {
     let tenant_id = tenant.0.id;
-    let user_pubkey = resolve_principal(&headers, tenant_id, req.pubkey.as_deref()).await?;
     let pool = &auth_state.state.db;
+    let user_pubkey = resolve_principal(
+        &headers,
+        pool,
+        tenant_id,
+        req.pubkey.as_deref(),
+        req.actor.as_deref(),
+    )
+    .await?;
 
     ensure_active(pool, tenant_id, &user_pubkey).await?;
 
     let repo = ApActorKeysRepository::new(pool.clone());
-    let row = repo
+    let row = match repo
         .find_for_tenant(tenant_id, &user_pubkey)
         .await
         .map_err(|e| ApError::Internal(e.to_string()))?
-        .ok_or_else(|| ApError::NotFound("No AP key for this actor".to_string()))?;
+    {
+        Some(row) => row,
+        None => {
+            create_actor_key(&repo, &auth_state, tenant_id, &user_pubkey).await?;
+            repo.find_for_tenant(tenant_id, &user_pubkey)
+                .await
+                .map_err(|e| ApError::Internal(e.to_string()))?
+                .ok_or_else(|| ApError::Internal("key created but no row found".into()))?
+        }
+    };
+    if row.key_type != AP_KEY_TYPE {
+        return Err(ApError::Internal(format!(
+            "Unsupported AP key type: {}",
+            row.key_type
+        )));
+    }
 
     let der = auth_state
         .state

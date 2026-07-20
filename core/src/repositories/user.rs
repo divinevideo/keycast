@@ -1569,6 +1569,20 @@ impl UserRepository {
         .execute(&mut *tx)
         .await?;
 
+        // Preserve the actor's published ActivityPub RSA public key across
+        // Nostr key rotation; remote servers cache publicKeyPem.
+        sqlx::query(
+            "UPDATE ap_actor_keys
+             SET user_pubkey = $1, updated_at = $2
+             WHERE user_pubkey = $3 AND tenant_id = $4",
+        )
+        .bind(new_pubkey)
+        .bind(now)
+        .bind(old_pubkey)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+
         // Create personal_keys for new identity
         sqlx::query(
             "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
@@ -2237,7 +2251,16 @@ impl UserRepository {
             .execute(&mut *tx)
             .await?;
 
-        // 3. Delete user (cascades to personal_keys, oauth_authorizations -> refresh_tokens,
+        // 3. Delete AP RSA key material. The FK cascade also handles this, but
+        // keeping it explicit preserves account deletion semantics if an older
+        // database has not applied the FK-hardening migration yet.
+        sqlx::query("DELETE FROM ap_actor_keys WHERE user_pubkey = $1 AND tenant_id = $2")
+            .bind(pubkey)
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // 4. Delete user (cascades to personal_keys, oauth_authorizations -> refresh_tokens,
         //    email_verification_tokens, password_reset_tokens, user_profiles,
         //    account_claim_tokens)
         let result = sqlx::query("DELETE FROM users WHERE pubkey = $1 AND tenant_id = $2")

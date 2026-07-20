@@ -21,7 +21,9 @@ use keycast_api::{
 };
 use keycast_core::{
     encryption::{KeyManager, KeyManagerError},
+    repositories::{ApActorKeysRepository, UserRepository},
     secret_pool::SecretPool,
+    types::user::UserStatus,
 };
 use moka::future::Cache;
 use nostr_sdk::Keys;
@@ -33,6 +35,7 @@ use sha2::Sha256;
 use sqlx::PgPool;
 use std::sync::Arc;
 use tower::ServiceExt;
+use ucan::builder::UcanBuilder;
 use zeroize::Zeroizing;
 
 const TENANT_ID: i64 = 1;
@@ -141,6 +144,21 @@ async fn create_test_user(pool: &PgPool, pubkey: &str) {
     .expect("Failed to create test user");
 }
 
+async fn create_test_user_with_username(pool: &PgPool, pubkey: &str, username: &str) {
+    let email = format!("ap-{}@example.com", uuid::Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO users (pubkey, email, email_verified, username, tenant_id, created_at, updated_at) \
+         VALUES ($1, $2, true, $3, $4, NOW(), NOW())",
+    )
+    .bind(pubkey)
+    .bind(&email)
+    .bind(username)
+    .bind(TENANT_ID)
+    .execute(pool)
+    .await
+    .expect("Failed to create test user");
+}
+
 async fn cleanup(pool: &PgPool, pubkey: &str) {
     sqlx::query("DELETE FROM ap_actor_keys WHERE user_pubkey = $1")
         .bind(pubkey)
@@ -152,6 +170,58 @@ async fn cleanup(pool: &PgPool, pubkey: &str) {
         .execute(pool)
         .await
         .ok();
+}
+
+async fn create_test_oauth_authorization(
+    pool: &PgPool,
+    user_pubkey: &str,
+    bunker_pubkey: &str,
+    revoked: bool,
+) {
+    let auth_handle = hex::encode(rand::random::<[u8; 32]>());
+    let revoked_at = if revoked { Some(Utc::now()) } else { None };
+    sqlx::query(
+        "INSERT INTO oauth_authorizations
+         (user_pubkey, redirect_origin, bunker_public_key, secret_hash, relays, tenant_id, revoked_at, authorization_handle, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, $3, 'test_hash', $4, $5, $6, $7, NOW() + INTERVAL '30 days', NOW(), NOW())",
+    )
+    .bind(user_pubkey)
+    .bind("https://ap-test.example.com")
+    .bind(bunker_pubkey)
+    .bind(serde_json::json!(["wss://relay.example.com"]).to_string())
+    .bind(TENANT_ID)
+    .bind(revoked_at)
+    .bind(&auth_handle)
+    .execute(pool)
+    .await
+    .expect("Failed to create oauth authorization");
+}
+
+async fn build_self_signed_ucan(user_keys: &Keys, bunker_pubkey: Option<&str>) -> String {
+    use keycast_api::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
+
+    let user_did = nostr_pubkey_to_did(&user_keys.public_key());
+    let key_material = NostrKeyMaterial::from_keys(user_keys.clone());
+    let mut facts = serde_json::json!({
+        "tenant_id": TENANT_ID,
+        "redirect_origin": "https://ap-test.example.com",
+    });
+    if let Some(bunker_pubkey) = bunker_pubkey {
+        facts["bunker_pubkey"] = serde_json::json!(bunker_pubkey);
+    }
+
+    let ucan = UcanBuilder::default()
+        .issued_by(&key_material)
+        .for_audience(&user_did)
+        .with_lifetime(3600)
+        .with_fact(facts)
+        .build()
+        .expect("Failed to build UCAN")
+        .sign()
+        .await
+        .expect("Failed to sign UCAN");
+
+    ucan.encode().expect("Failed to encode UCAN")
 }
 
 fn bearer_json(uri: &str, body: serde_json::Value, token: Option<&str>) -> Request<Body> {
@@ -278,10 +348,10 @@ async fn create_get_sign_roundtrip_service_token() {
     cleanup(&pool, &pubkey).await;
 }
 
-// --- Test B: sign without a key returns 404 ---
+// --- Test B: sign without a key lazily creates the actor key ---
 
 #[tokio::test]
-async fn sign_without_key_returns_404() {
+async fn sign_without_key_lazily_creates_key() {
     common::assert_test_database_url();
     unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
     let pool = common::setup_test_db().await;
@@ -298,7 +368,15 @@ async fn sign_without_key_returns_404() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let key_exists: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM ap_actor_keys WHERE user_pubkey = $1")
+            .bind(&pubkey)
+            .fetch_optional(&pool)
+            .await
+            .expect("query AP key");
+    assert!(key_exists.is_some(), "sign should lazily create AP key");
 
     cleanup(&pool, &pubkey).await;
 }
@@ -330,9 +408,261 @@ async fn unauthenticated_request_rejected() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
-// NOTE: Test D (UCAN-for-A requesting pubkey B -> 403) is intentionally NOT
-// implemented. Minting a valid UCAN that survives extract_user_from_token's
-// validation (DPoP binding / facts) is disproportionately complex for a single
-// 403 assertion. The Forbidden branch is exercised by code review of
-// resolve_principal: when is_service_token() == false and the token resolves to
-// a pubkey != body_pubkey, it returns ApError::Forbidden -> 403.
+#[tokio::test]
+async fn gateway_actor_shape_lazily_creates_key_and_signs() {
+    common::assert_test_database_url();
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+    let pool = common::setup_test_db().await;
+
+    let pubkey = Keys::generate().public_key().to_hex();
+    let username = format!("ap-actor-{}", &pubkey[..8]);
+    let actor = format!("https://divine.video/ap/users/{username}");
+    create_test_user_with_username(&pool, &pubkey, &username).await;
+
+    let app = build_app(create_test_auth_state(pool.clone()));
+    let resp = app
+        .oneshot(
+            Request::get(format!("/ap/keys/{}", urlencoding::encode(&actor)))
+                .header("authorization", format!("Bearer {}", SERVICE_TOKEN))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let key_body = parse_body(resp).await;
+    let pem = key_body["public_key_pem"].as_str().unwrap().to_string();
+
+    let signing_string =
+        "(request-target): post /inbox\nhost: divine.video\ndate: Mon, 01 Jan 2026 00:00:00 GMT";
+    let app = build_app(create_test_auth_state(pool.clone()));
+    let resp = app
+        .oneshot(bearer_json(
+            "/ap/sign",
+            serde_json::json!({ "actor": actor, "signing_string": signing_string }),
+            Some(SERVICE_TOKEN),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sign_resp = parse_body(resp).await;
+    assert_eq!(sign_resp["pubkey"].as_str().unwrap(), pubkey);
+
+    let public = RsaPublicKey::from_public_key_pem(&pem).expect("pem");
+    let vk = VerifyingKey::<Sha256>::new(public);
+    let raw = BASE64
+        .decode(sign_resp["signature"].as_str().unwrap())
+        .expect("b64");
+    let sig = Signature::try_from(raw.as_slice()).expect("sig");
+    vk.verify(signing_string.as_bytes(), &sig)
+        .expect("signature must verify against actor PEM");
+
+    cleanup(&pool, &pubkey).await;
+}
+
+#[tokio::test]
+async fn deleted_user_removes_key_and_later_sign_returns_404() {
+    common::assert_test_database_url();
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+    let pool = common::setup_test_db().await;
+
+    let pubkey = Keys::generate().public_key().to_hex();
+    create_test_user(&pool, &pubkey).await;
+
+    let app = build_app(create_test_auth_state(pool.clone()));
+    let resp = app
+        .oneshot(bearer_json(
+            "/ap/keys",
+            serde_json::json!({ "pubkey": pubkey }),
+            Some(SERVICE_TOKEN),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let user_repo = UserRepository::new(pool.clone());
+    user_repo
+        .delete_account(&pubkey, TENANT_ID)
+        .await
+        .expect("delete account");
+
+    let key_exists: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM ap_actor_keys WHERE user_pubkey = $1")
+            .bind(&pubkey)
+            .fetch_optional(&pool)
+            .await
+            .expect("query AP key");
+    assert!(key_exists.is_none(), "AP key must be deleted with account");
+
+    let app = build_app(create_test_auth_state(pool.clone()));
+    let resp = app
+        .oneshot(bearer_json(
+            "/ap/sign",
+            serde_json::json!({ "pubkey": pubkey, "signing_string": "x" }),
+            Some(SERVICE_TOKEN),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn suspended_user_cannot_create_get_or_sign() {
+    common::assert_test_database_url();
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+    let pool = common::setup_test_db().await;
+
+    let pubkey = Keys::generate().public_key().to_hex();
+    create_test_user(&pool, &pubkey).await;
+    UserRepository::new(pool.clone())
+        .set_user_status(&pubkey, TENANT_ID, &UserStatus::Suspended, Some("ap test"))
+        .await
+        .expect("suspend user");
+
+    let app = build_app(create_test_auth_state(pool.clone()));
+    let resp = app
+        .oneshot(bearer_json(
+            "/ap/keys",
+            serde_json::json!({ "pubkey": pubkey }),
+            Some(SERVICE_TOKEN),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let app = build_app(create_test_auth_state(pool.clone()));
+    let resp = app
+        .oneshot(
+            Request::get(format!("/ap/keys/{}", pubkey))
+                .header("authorization", format!("Bearer {}", SERVICE_TOKEN))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let app = build_app(create_test_auth_state(pool.clone()));
+    let resp = app
+        .oneshot(bearer_json(
+            "/ap/sign",
+            serde_json::json!({ "pubkey": pubkey, "signing_string": "x" }),
+            Some(SERVICE_TOKEN),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    cleanup(&pool, &pubkey).await;
+}
+
+#[tokio::test]
+async fn ucan_pubkey_mismatch_returns_403() {
+    common::assert_test_database_url();
+    let pool = common::setup_test_db().await;
+
+    let user_keys = Keys::generate();
+    let user_pubkey = user_keys.public_key().to_hex();
+    let other_pubkey = Keys::generate().public_key().to_hex();
+    let bunker_pubkey = Keys::generate().public_key().to_hex();
+    create_test_user(&pool, &user_pubkey).await;
+    create_test_user(&pool, &other_pubkey).await;
+    create_test_oauth_authorization(&pool, &user_pubkey, &bunker_pubkey, false).await;
+
+    let token = build_self_signed_ucan(&user_keys, Some(&bunker_pubkey)).await;
+    let app = build_app(create_test_auth_state(pool.clone()));
+    let resp = app
+        .oneshot(bearer_json(
+            "/ap/sign",
+            serde_json::json!({ "pubkey": other_pubkey, "signing_string": "x" }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    cleanup(&pool, &user_pubkey).await;
+    cleanup(&pool, &other_pubkey).await;
+}
+
+#[tokio::test]
+async fn revoked_oauth_ucan_cannot_sign() {
+    common::assert_test_database_url();
+    let pool = common::setup_test_db().await;
+
+    let user_keys = Keys::generate();
+    let user_pubkey = user_keys.public_key().to_hex();
+    let bunker_pubkey = Keys::generate().public_key().to_hex();
+    create_test_user(&pool, &user_pubkey).await;
+    create_test_oauth_authorization(&pool, &user_pubkey, &bunker_pubkey, true).await;
+
+    let token = build_self_signed_ucan(&user_keys, Some(&bunker_pubkey)).await;
+    let app = build_app(create_test_auth_state(pool.clone()));
+    let resp = app
+        .oneshot(bearer_json(
+            "/ap/sign",
+            serde_json::json!({ "pubkey": user_pubkey, "signing_string": "x" }),
+            Some(&token),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    cleanup(&pool, &user_pubkey).await;
+}
+
+#[tokio::test]
+async fn key_rotation_preserves_ap_public_pem_on_new_pubkey() {
+    common::assert_test_database_url();
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+    let pool = common::setup_test_db().await;
+
+    let old_keys = Keys::generate();
+    let old_pubkey = old_keys.public_key().to_hex();
+    let new_keys = Keys::generate();
+    let new_pubkey = new_keys.public_key().to_hex();
+    create_test_user(&pool, &old_pubkey).await;
+
+    let app = build_app(create_test_auth_state(pool.clone()));
+    let resp = app
+        .oneshot(bearer_json(
+            "/ap/keys",
+            serde_json::json!({ "pubkey": old_pubkey }),
+            Some(SERVICE_TOKEN),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let created = parse_body(resp).await;
+    let original_pem = created["public_key_pem"].as_str().unwrap().to_string();
+
+    let user_repo = UserRepository::new(pool.clone());
+    user_repo
+        .change_key_transaction(
+            &old_pubkey,
+            &new_pubkey,
+            TENANT_ID,
+            "rotated-ap@example.com",
+            "password-hash",
+            &[1, 2, 3, 4],
+        )
+        .await
+        .expect("change key");
+
+    let repo = ApActorKeysRepository::new(pool.clone());
+    assert!(
+        repo.find_public_pem(TENANT_ID, &old_pubkey)
+            .await
+            .expect("old AP key lookup")
+            .is_none(),
+        "old pubkey should no longer own the AP key"
+    );
+    let (rotated_pem, _) = repo
+        .find_public_pem(TENANT_ID, &new_pubkey)
+        .await
+        .expect("new AP key lookup")
+        .expect("new pubkey should own the existing AP key");
+    assert_eq!(rotated_pem, original_pem);
+
+    cleanup(&pool, &new_pubkey).await;
+}

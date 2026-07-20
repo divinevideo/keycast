@@ -123,6 +123,17 @@ mod tests {
         let pool = setup_pool().await;
         let repo = ApActorKeysRepository::new(pool.clone());
         let pubkey = Keys::generate().public_key().to_hex();
+        let email = format!("ap-keys-{}@example.com", &pubkey[..8]);
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, email, email_verified, tenant_id, created_at, updated_at)
+             VALUES ($1, $2, true, 1, NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .bind(&email)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         assert!(!repo.exists(1, &pubkey).await.unwrap());
         assert!(repo.find_for_tenant(1, &pubkey).await.unwrap().is_none());
@@ -150,6 +161,11 @@ mod tests {
 
         // Cleanup
         sqlx::query("DELETE FROM ap_actor_keys WHERE user_pubkey = $1")
+            .bind(&pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM users WHERE pubkey = $1")
             .bind(&pubkey)
             .execute(&pool)
             .await

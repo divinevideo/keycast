@@ -72,8 +72,12 @@ components:
       properties:
         pubkey:
           type: string
-          description: Hex Nostr pubkey of the actor. Required for service-token callers; for UCAN callers it defaults to the token's pubkey and, if present, must match it.
+          description: Hex Nostr pubkey of the actor. For service-token callers, either pubkey or actor is required; for UCAN callers it defaults to the token's pubkey and, if present, must match it.
           example: "e1ff3bfdd4e40315959b08b4fcc8245eaa514637e1d4ec2ae166b743341be1af"
+        actor:
+          type: string
+          description: ActivityPub actor URL. Alternative to pubkey for the gateway; resolves /ap/users/{username} against the tenant selected by the Keycast request Host.
+          example: "https://divine.video/ap/users/alice"
     ApKeyResponse:
       type: object
       properties:
@@ -113,7 +117,10 @@ components:
       properties:
         pubkey:
           type: string
-          description: Hex Nostr pubkey of the actor (required for service-token callers).
+          description: Hex Nostr pubkey of the actor. For service-token callers, either pubkey or actor is required.
+        actor:
+          type: string
+          description: ActivityPub actor URL. Alternative to pubkey for the gateway; resolves /ap/users/{username} against the tenant selected by the Keycast request Host.
         signing_string:
           type: string
           description: The exact draft-cavage HTTP-Signature signing string. Signed as UTF-8 bytes.
@@ -542,14 +549,15 @@ paths:
         SPKI public PEM for embedding in `publicKey.publicKeyPem`. The private key is stored
         encrypted-at-rest and is never returned. Calling again returns the existing key
         with `created: false` — the key is never regenerated (federated keys are cached by
-        remote servers). Auth: ServiceToken (with `pubkey`) or UCAN (BearerAuth).
+        remote servers). Auth: ServiceToken (with `pubkey` or `actor`) or an OAuth UCAN
+        for the same actor.
       tags:
         - ActivityPub
       security:
         - ServiceToken: []
         - BearerAuth: []
       requestBody:
-        required: false
+        required: true
         content:
           application/json:
             schema:
@@ -579,9 +587,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-  /ap/keys/{pubkey}:
+  /ap/keys/{actor_or_pubkey}:
     get:
       summary: Get an actor's ActivityPub public key PEM
+      description: |
+        Returns the actor's public PEM, lazily minting the RSA key if needed. The path
+        accepts either a hex Nostr pubkey or a URL-encoded ActivityPub actor URL.
       tags:
         - ActivityPub
       security:
@@ -589,11 +600,11 @@ paths:
         - BearerAuth: []
       parameters:
         - in: path
-          name: pubkey
+          name: actor_or_pubkey
           required: true
           schema:
             type: string
-          description: Hex Nostr pubkey of the actor
+          description: Hex Nostr pubkey or URL-encoded ActivityPub actor URL
       responses:
         '200':
           description: Public key PEM
@@ -614,7 +625,9 @@ paths:
         Signs the exact caller-supplied signing string with RSASSA-PKCS1-v1_5 + SHA-256 and
         returns the base64 signature. The caller builds the draft-cavage signing string and
         assembles the final `Signature:` header. The private key never leaves Keycast.
-        Suspended/banned accounts are rejected.
+        Suspended/banned accounts are rejected. Service-token callers identify the actor
+        with `pubkey` or `actor`; UCAN callers need a live OAuth authorization for the
+        same actor.
       tags:
         - ActivityPub
       security:

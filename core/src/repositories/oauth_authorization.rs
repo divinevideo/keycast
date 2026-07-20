@@ -214,6 +214,7 @@ impl OAuthAuthorizationRepository {
             "SELECT 1 FROM oauth_authorizations
              WHERE bunker_public_key = $1 AND user_pubkey = $2
                AND revoked_at IS NULL
+               AND (expires_at IS NULL OR expires_at > NOW())
                AND user_pubkey IN (SELECT pubkey FROM users WHERE tenant_id = $3)",
         )
         .bind(bunker_pubkey)
