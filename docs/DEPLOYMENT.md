@@ -183,10 +183,12 @@ The former test push is intentionally removed from this workflow because that GC
 
 ### Current GKE manifests
 
-Keycast manifests live under `divine-iac-coreconfig/k8s/applications/keycast/`.
+Keycast manifests live under `divine-iac-coreconfig/k8s/applications/keycast/`. The table below is the full set: the eight resources listed in `base/kustomization.yaml`, plus each overlay and the extra manifests its `resources:` list pulls in.
 
 | Path | Purpose |
 |------|---------|
+| `base/namespace.yaml` | `Namespace` `identity`, ArgoCD-managed, annotated `linkerd.io/inject: enabled` |
+| `base/serviceaccount.yaml` | `ServiceAccount` `keycast`, annotated `iam.gke.io/gcp-service-account` for Workload Identity; the GCP service account is patched per overlay |
 | `base/deployment.yaml` | `Deployment` in namespace `identity`, sync wave 2 |
 | `base/service.yaml` | `ClusterIP` Service on port 3000 |
 | `base/httproute.yaml` | HTTP-to-HTTPS redirects and HTTPS routes for login and entryway hosts |
@@ -195,7 +197,10 @@ Keycast manifests live under `divine-iac-coreconfig/k8s/applications/keycast/`.
 | `base/auth-events-retention-cronjob.yaml` | Daily 03:17 CronJob that prunes `auth_events` older than 30 days |
 | `overlays/poc/kustomization.yaml` | POC project, hostnames, KMS key ring, image tag, relays, Redis |
 | `overlays/staging/kustomization.yaml` | staging project, hostnames, KMS key ring, image tag, relays, Redis, resources |
+| `overlays/staging/legacy-hostname-redirects.yaml` | Additive HTTPRoutes claiming `login.staging.dvines.org` and `entryway.staging.dvines.org`, 301 to the matching `.staging.divine.video` hosts |
 | `overlays/production/kustomization.yaml` | staged production GKE config; not live for prod traffic |
+| `overlays/production/hpa.yaml` | `HorizontalPodAutoscaler` for `keycast`, 3-20 replicas at 70% CPU / 75% memory |
+| `overlays/production/pdb.yaml` | `PodDisruptionBudget` for `keycast` with `minAvailable: 2` |
 
 ### GKE probes
 
@@ -405,7 +410,7 @@ Prometheus metrics are exposed at:
 GET /api/metrics
 ```
 
-The endpoint is unauthenticated and returns in-memory counters/gauges only. The table below lists the common operational subset; the endpoint emits additional series as code paths are exercised.
+The endpoint is unauthenticated and reads only in-process state, so a scrape does no database or Redis work. It emits counters, gauges, and one histogram. The table below is the full set of families. Every family's `# HELP`/`# TYPE` lines are written on every scrape; the four label-keyed families at the end of the table carry no samples until the matching code path has run.
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -414,20 +419,27 @@ The endpoint is unauthenticated and returns in-memory counters/gauges only. The 
 | `keycast_cache_size` | gauge | Current handlers in cache |
 | `keycast_nip46_requests_total` | counter | NIP-46 requests received |
 | `keycast_nip46_rejected_hashring_total` | counter | Requests assigned to another instance |
+| `keycast_nip46_handler_not_found_total` | counter | Requests whose authorization was not found |
 | `keycast_nip46_processed_total` | counter | Requests processed successfully |
 | `keycast_nip46_queue_dropped_total` | counter | Requests dropped under backpressure |
 | `keycast_nip46_queue_closed_total` | counter | Requests rejected because the queue is closed during graceful shutdown |
+| `keycast_nip46_tombstone_responses_total` | counter | Error responses sent for revoked or expired authorizations |
 | `keycast_http_rpc_requests_total` | counter | HTTP RPC requests to `/api/nostr` |
 | `keycast_http_rpc_auth_errors_total` | counter | HTTP RPC auth failures |
 | `keycast_http_rpc_cache_hits_total` | counter | HTTP RPC handler found in memory cache |
 | `keycast_http_rpc_cache_misses_total` | counter | HTTP RPC handler loaded from DB |
 | `keycast_http_rpc_cache_size` | gauge | Current HTTP RPC handlers in cache |
+| `keycast_http_rpc_success_total` | counter | HTTP RPC requests processed successfully |
 | `keycast_registrations_total` | counter | User registrations |
 | `keycast_logins_total` | counter | Successful logins |
 | `keycast_login_failures_total` | counter | Failed logins |
+| `keycast_account_deletions_total` | counter | Account deletions |
 | `keycast_oauth_authorizations_created_total` | counter | OAuth authorizations created |
 | `keycast_oauth_authorizations_revoked_total` | counter | OAuth authorizations revoked |
-| `keycast_auth_requests_total` | counter | Auth request outcomes by endpoint and reason |
+| `keycast_auth_requests_total` | counter | Auth request outcomes, labelled `endpoint`, `outcome`, `reason_code` |
+| `keycast_auth_request_duration_seconds` | histogram | Auth request latency, labelled `endpoint` and `outcome`; exposed as `_bucket`/`_sum`/`_count` series |
+| `keycast_auth_audit_write_failures_total` | counter | Auth audit writes that failed without failing the user request, labelled `endpoint` |
+| `keycast_auth_email_send_failures_total` | counter | Auth email send failures, labelled `template` |
 
 High `keycast_cache_misses_total` relative to hits usually points at session affinity or cold-cache behavior. Increasing `keycast_nip46_queue_dropped_total` means the signer path is overloaded.
 
