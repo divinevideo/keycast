@@ -6,7 +6,8 @@ usage() {
 Benchmark users-table INSERT throughput with and without the email trigram GIN index.
 
 The benchmark clones public.users into an isolated benchmark schema, preserving its
-baseline indexes without writing to application rows. The schema is removed on exit.
+baseline indexes without writing to application rows. It also reports the combined
+migration index build duration. The schema is removed on exit.
 
 Usage:
   tools/benchmark-email-trgm-inserts.sh --database-url URL [options]
@@ -127,8 +128,15 @@ SELECT format('DROP INDEX %I.%I', schemaname, indexname)
 FROM pg_indexes
 WHERE schemaname = :'benchmark_schema'
   AND tablename = 'users'
-  AND indexdef LIKE '%gin_trgm_ops%'
+  AND (
+      indexdef LIKE '%gin_trgm_ops%'
+      OR indexdef LIKE '%(tenant_id, lower(email))%'
+  )
 \gexec
+
+CREATE INDEX idx_users_tenant_lower_email
+    ON :"benchmark_schema".users (tenant_id, LOWER(email))
+    WHERE email IS NOT NULL;
 SQL
 
 run_benchmark() {
@@ -211,10 +219,23 @@ populate_baseline
 psql "$benchmark_database_url" \
     --set=ON_ERROR_STOP=1 \
     --set=benchmark_schema="$benchmark_schema" <<'SQL' >/dev/null
+DROP INDEX IF EXISTS :"benchmark_schema".idx_users_tenant_lower_email;
+SQL
+
+migration_index_build_started_ms="$(date +%s%3N)"
+psql "$benchmark_database_url" \
+    --set=ON_ERROR_STOP=1 \
+    --set=benchmark_schema="$benchmark_schema" <<'SQL' >/dev/null
 CREATE INDEX idx_users_email_trgm
     ON :"benchmark_schema".users USING gin (email gin_trgm_ops)
     WHERE email IS NOT NULL;
+
+CREATE INDEX idx_users_tenant_lower_email
+    ON :"benchmark_schema".users (tenant_id, LOWER(email))
+    WHERE email IS NOT NULL;
 SQL
+migration_index_build_finished_ms="$(date +%s%3N)"
+echo "migration_index_build_ms=$((migration_index_build_finished_ms - migration_index_build_started_ms))"
 
 with_gin_results="$(run_benchmark with_gin)"
 echo "$with_gin_results"
