@@ -6,6 +6,8 @@ The partial `gin_trgm_ops` index reduced median paired INSERT throughput by 1.96
 
 Both timed configurations started with 400,000 rows, approximating a mature production-sized index, and inserted another 40,000 rows. The earlier -3.11% result is superseded because it measured the timed GIN workload against an empty index. On the resulting 440,000-row dataset, PostgreSQL selected `idx_users_email_trgm` for both `ILIKE '%fragment%'` and the trigram similarity (`%`) operator. The median index size was 24,805,376 bytes (23.7 MiB).
 
+The shipped suggestion query bounds the similarity-ranked database candidate set at 100 rows. Rust then applies the stricter edit-distance check to those candidates and returns at most five suggestions, avoiding an unbounded `fetch_all` while leaving headroom for higher-similarity rows that the edit-distance check rejects.
+
 The exact two-index migration sequence took 1,903 ms on a fresh 400,000-row clone in a July 20 follow-up run. Ordinary `CREATE INDEX` takes a lock that blocks writes for the build, and SQLx runs each migration transactionally, so this local duration is a lower bound for the production write-blocking window rather than a production latency prediction.
 
 ## Method
@@ -87,17 +89,18 @@ Bitmap Heap Scan on users (actual time=1.425..1.530 rows=44 loops=1)
 Execution Time: 1.561 ms
 ```
 
-Representative ranked-similarity plan (trial 1):
+Representative bounded candidate plan from a July 20 recapture on the same 440,000-row shape:
 
 ```text
-Limit (actual time=4.137..4.138 rows=5 loops=1)
+Limit (actual time=3.852..3.855 rows=44 loops=1)
   -> Sort
        Sort Key: similarity(email, 'needle-fragment@rare.test'::text) DESC
        -> Bitmap Heap Scan on users
             Recheck Cond: (email % 'needle-fragment@rare.test'::text)
+            Filter: ((tenant_id = 1) AND (similarity(email, 'needle-fragment@rare.test'::text) >= 0.5))
             -> Bitmap Index Scan on idx_users_email_trgm
                  Index Cond: (email % 'needle-fragment@rare.test'::text)
-Execution Time: 4.151 ms
+Execution Time: 3.869 ms
 ```
 
 Both are cost-based plans; the benchmark does not disable sequential scans. Production hardware, cache state, row width, and write concurrency will change absolute values, so the script should be rerun after material schema or workload changes.

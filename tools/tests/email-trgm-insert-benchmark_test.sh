@@ -13,6 +13,7 @@ grep -q -- "--baseline-rows" <<<"$help_output"
 grep -q -- "isolated benchmark schema" <<<"$help_output"
 grep -q -- "migration index build duration" <<<"$help_output"
 grep -q -- "migration_index_build_ms=" "$benchmark_script"
+grep -q -- "LIMIT 100;" "$benchmark_script"
 
 assert_remote_database_rejected() {
     local database_url="$1"

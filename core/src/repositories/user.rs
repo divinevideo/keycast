@@ -91,6 +91,30 @@ const ADMIN_EMAIL_SUGGESTION_MAX_EDIT_DISTANCE: usize = 2;
 /// Maximum number of close email suggestions returned to an admin.
 const ADMIN_EMAIL_SUGGESTION_LIMIT: usize = 5;
 
+/// Maximum number of trigram-ranked rows checked for close email suggestions.
+const ADMIN_EMAIL_SUGGESTION_CANDIDATE_LIMIT: i64 = 100;
+
+const ADMIN_EMAIL_SUGGESTION_QUERY: &str = "SELECT
+        u.pubkey,
+        u.email,
+        u.email_verified,
+        u.username,
+        u.display_name,
+        u.vine_id,
+        (pk.user_pubkey IS NOT NULL) as \"has_personal_key\",
+        u.status,
+        u.suspended_reason,
+        u.created_at,
+        u.updated_at
+     FROM users u
+     LEFT JOIN personal_keys pk ON pk.user_pubkey = u.pubkey AND pk.tenant_id = u.tenant_id
+     WHERE u.email IS NOT NULL
+       AND u.email % $1
+       AND similarity(u.email, $1) >= $3
+       AND u.tenant_id = $2
+     ORDER BY similarity(u.email, $1) DESC, u.pubkey
+     LIMIT $4";
+
 fn escape_like_pattern(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -2077,32 +2101,14 @@ impl UserRepository {
         }
 
         let normalized_query = query.to_lowercase();
-        let rows: Result<Vec<AdminUserDetails>, sqlx::Error> = sqlx::query_as(
-            "SELECT
-                u.pubkey,
-                u.email,
-                u.email_verified,
-                u.username,
-                u.display_name,
-                u.vine_id,
-                (pk.user_pubkey IS NOT NULL) as \"has_personal_key\",
-                u.status,
-                u.suspended_reason,
-                u.created_at,
-                u.updated_at
-             FROM users u
-             LEFT JOIN personal_keys pk ON pk.user_pubkey = u.pubkey AND pk.tenant_id = u.tenant_id
-             WHERE u.email IS NOT NULL
-               AND u.email % $1
-               AND similarity(u.email, $1) >= $3
-               AND u.tenant_id = $2
-             ORDER BY similarity(u.email, $1) DESC, u.pubkey",
-        )
-        .bind(&normalized_query)
-        .bind(tenant_id)
-        .bind(ADMIN_EMAIL_SUGGESTION_MIN_SIMILARITY)
-        .fetch_all(&self.pool)
-        .await;
+        let rows: Result<Vec<AdminUserDetails>, sqlx::Error> =
+            sqlx::query_as(ADMIN_EMAIL_SUGGESTION_QUERY)
+                .bind(&normalized_query)
+                .bind(tenant_id)
+                .bind(ADMIN_EMAIL_SUGGESTION_MIN_SIMILARITY)
+                .bind(ADMIN_EMAIL_SUGGESTION_CANDIDATE_LIMIT)
+                .fetch_all(&self.pool)
+                .await;
 
         match rows {
             Ok(rows) => Ok(rows
@@ -2856,6 +2862,22 @@ mod tests {
 
         cleanup_user(&pool, &literal_pubkey).await;
         cleanup_user(&pool, &wildcard_pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_suggest_users_for_admin_bounds_database_candidates() {
+        let pool = setup_pool().await;
+        let explain_sql = format!("EXPLAIN (FORMAT JSON) {ADMIN_EMAIL_SUGGESTION_QUERY}");
+        let plan: serde_json::Value = sqlx::query_scalar(&explain_sql)
+            .bind("missing@example.com")
+            .bind(1_i64)
+            .bind(ADMIN_EMAIL_SUGGESTION_MIN_SIMILARITY)
+            .bind(ADMIN_EMAIL_SUGGESTION_CANDIDATE_LIMIT)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(plan[0]["Plan"]["Node Type"], "Limit");
     }
 
     #[tokio::test]

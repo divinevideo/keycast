@@ -267,6 +267,8 @@ SELECT pubkey
 FROM :"benchmark_schema".users
 WHERE email IS NOT NULL
   AND email % 'needle-fragment@rare.test'
+  AND similarity(email, 'needle-fragment@rare.test') >= 0.5
+  AND tenant_id = 1
 ORDER BY similarity(email, 'needle-fragment@rare.test') DESC
-LIMIT 5;
+LIMIT 100;
 SQL
