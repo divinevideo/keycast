@@ -76,6 +76,7 @@ pub struct AdminUserDetails {
 pub struct AdminUserLookup {
     pub users: Vec<AdminUserDetails>,
     pub authoritative_match: bool,
+    pub authoritative_count: usize,
 }
 
 /// Maximum number of primary users returned by one admin lookup.
@@ -1914,6 +1915,7 @@ impl UserRepository {
                     return Ok(AdminUserLookup {
                         users: vec![],
                         authoritative_match: false,
+                        authoritative_count: 0,
                     });
                 }
             }
@@ -2017,6 +2019,7 @@ impl UserRepository {
             return Ok(AdminUserLookup {
                 users: vec![],
                 authoritative_match: false,
+                authoritative_count: 0,
             });
         }
 
@@ -2043,13 +2046,15 @@ impl UserRepository {
         .fetch_all(&self.pool)
         .await?;
 
-        let authoritative_match = rows
+        let authoritative_count = rows
             .iter()
-            .any(|row| authoritative_pubkey_set.contains(row.pubkey.as_str()));
+            .filter(|row| authoritative_pubkey_set.contains(row.pubkey.as_str()))
+            .count();
 
         Ok(AdminUserLookup {
             users: rows,
-            authoritative_match,
+            authoritative_match: authoritative_count > 0,
+            authoritative_count,
         })
     }
 
@@ -2720,6 +2725,7 @@ mod tests {
 
         let lookup = repo.find_users_for_admin(&query, 1).await.unwrap();
         assert!(lookup.authoritative_match);
+        assert_eq!(lookup.authoritative_count, 1);
         assert_eq!(lookup.users[0].pubkey, exact_pubkey);
         assert_eq!(lookup.users[1].pubkey, substring_pubkey);
 
@@ -2746,6 +2752,7 @@ mod tests {
             .map(|user| user.pubkey.as_str())
             .collect();
         assert!(lookup.authoritative_match);
+        assert_eq!(lookup.authoritative_count, 2);
         assert_eq!(found_pubkeys.len(), 2);
         assert!(found_pubkeys.contains(&lowercase_pubkey.as_str()));
         assert!(found_pubkeys.contains(&uppercase_pubkey.as_str()));
@@ -2805,6 +2812,7 @@ mod tests {
 
         let lookup = repo.find_users_for_admin(&query, 1).await.unwrap();
         assert!(!lookup.authoritative_match);
+        assert_eq!(lookup.authoritative_count, 0);
         assert_eq!(lookup.users.len(), 20);
         assert!(lookup
             .users

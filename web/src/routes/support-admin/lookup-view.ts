@@ -5,6 +5,7 @@ export interface LookupResult<User> {
 	suggestions: User[];
 	total: number;
 	authoritative_match: boolean;
+	authoritative_count: number;
 }
 
 export interface EmailMatchPart {
@@ -176,6 +177,6 @@ export function isShowingDidYouMean<User>(result: LookupResult<User> | null): bo
 export function selectAutoExpandedPubkey<User extends { pubkey: string }>(
 	result: LookupResult<User> | null
 ): string | null {
-	if (!result?.authoritative_match || result.results.length !== 1) return null;
+	if (!result?.authoritative_match || result.authoritative_count !== 1) return null;
 	return result.results[0]?.pubkey ?? null;
 }

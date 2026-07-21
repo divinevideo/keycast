@@ -66,6 +66,7 @@ describe("support admin user lookup view", () => {
             suggestions: [row("c")],
             total: 2,
             authoritative_match: true,
+            authoritative_count: 2,
         };
 
         expect(selectDisplayedUsers(result)).toEqual([row("a"), row("b")]);
@@ -79,9 +80,22 @@ describe("support admin user lookup view", () => {
             suggestions: [],
             total: 1,
             authoritative_match: true,
+            authoritative_count: 1,
         };
 
         expect(selectAutoExpandedPubkey(result)).toBe("a");
+    });
+
+    test("auto-expands one authoritative result ahead of loose candidates", () => {
+        const result = {
+            results: [row("authoritative"), row("loose")],
+            suggestions: [],
+            total: 2,
+            authoritative_match: true,
+            authoritative_count: 1,
+        };
+
+        expect(selectAutoExpandedPubkey(result)).toBe("authoritative");
     });
 
     test("marks a lone non-authoritative result as suggested without auto-expanding it", () => {
@@ -90,6 +104,7 @@ describe("support admin user lookup view", () => {
             suggestions: [],
             total: 1,
             authoritative_match: false,
+            authoritative_count: 0,
         };
 
         expect(selectDisplayedUsers(result)).toEqual([row("a")]);
@@ -104,6 +119,7 @@ describe("support admin user lookup view", () => {
             suggestions: [row("c")],
             total: 0,
             authoritative_match: false,
+            authoritative_count: 0,
         };
 
         expect(selectDisplayedUsers(result)).toEqual([row("c")]);
@@ -113,7 +129,13 @@ describe("support admin user lookup view", () => {
     });
 
     test("shows nothing and no suggestion banner when both are empty", () => {
-        const result = { results: [], suggestions: [], total: 0, authoritative_match: false };
+        const result = {
+            results: [],
+            suggestions: [],
+            total: 0,
+            authoritative_match: false,
+            authoritative_count: 0,
+        };
 
         expect(selectDisplayedUsers(result)).toEqual([]);
         expect(isShowingSuggestions(result)).toBe(false);
