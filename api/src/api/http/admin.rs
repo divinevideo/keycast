@@ -15,9 +15,9 @@ use crate::api::error::{ApiError, ApiResult};
 use crate::api::extractors::UcanAuth;
 use keycast_core::repositories::{
     test_redirect_pattern, AdminAuditEventRecord, AdminAuditEventRepository, AdminUserDetails,
-    AdminUserLookup, AuthEventRepository, ClaimTokenRepository, FullAdminStatusRow,
-    OAuthAuthorizationRepository, RegisteredClient, RegisteredClientRepository, RepositoryError,
-    UserRepository, VerifiedMinorRow, ADMIN_USER_LOOKUP_LIMIT,
+    AuthEventRepository, ClaimTokenRepository, FullAdminStatusRow, OAuthAuthorizationRepository,
+    RegisteredClient, RegisteredClientRepository, RepositoryError, UserRepository,
+    VerifiedMinorRow,
 };
 use keycast_core::types::claim_token::generate_claim_token;
 use keycast_core::types::user::UserStatus;
@@ -961,25 +961,6 @@ fn should_fetch_email_suggestions(authoritative_match: bool, result_count: usize
     !authoritative_match && result_count == 0
 }
 
-fn merge_promoted_admin_lookup(
-    mut promoted: AdminUserLookup,
-    local: AdminUserLookup,
-) -> AdminUserLookup {
-    let mut seen_pubkeys: std::collections::HashSet<String> = promoted
-        .users
-        .iter()
-        .map(|user| user.pubkey.clone())
-        .collect();
-    promoted.users.extend(
-        local
-            .users
-            .into_iter()
-            .filter(|user| seen_pubkeys.insert(user.pubkey.clone())),
-    );
-    promoted.users.truncate(ADMIN_USER_LOOKUP_LIMIT);
-    promoted
-}
-
 fn authoritative_name_promotion_timeout(local_result_count: usize) -> Option<std::time::Duration> {
     (local_result_count > 0).then_some(ADMIN_NAME_PROMOTION_TIMEOUT)
 }
@@ -995,11 +976,12 @@ async fn await_name_promotion_within<T>(
 mod user_lookup_response_tests {
     use super::{
         authoritative_name_promotion_timeout, await_name_promotion_within,
-        merge_promoted_admin_lookup, should_attempt_authoritative_name_promotion,
-        should_fetch_email_suggestions, AdminUserDetails, AdminUserLookup, UserLookupDetails,
-        UserLookupResponse, UserStatus, ADMIN_NAME_PROMOTION_TIMEOUT,
+        should_attempt_authoritative_name_promotion, should_fetch_email_suggestions,
+        AdminUserDetails, UserLookupDetails, UserLookupResponse, UserStatus,
+        ADMIN_NAME_PROMOTION_TIMEOUT,
     };
     use chrono::Utc;
+    use keycast_core::repositories::AdminUserLookup;
 
     fn lookup_details(pubkey: &str, authoritative: bool) -> AdminUserDetails {
         let now = Utc::now();
@@ -1096,7 +1078,7 @@ mod user_lookup_response_tests {
             authoritative_count: 0,
         };
 
-        let merged = merge_promoted_admin_lookup(promoted, local);
+        let merged = promoted.append_loose_results(local);
 
         assert!(merged.users[0].authoritative);
         assert!(!merged.users[1].authoritative);
@@ -1162,7 +1144,7 @@ pub async fn get_user_lookup(
                 .find_users_for_admin(&hex_pubkey, tenant_id)
                 .await?;
             if resolved_lookup.authoritative_match {
-                lookup = merge_promoted_admin_lookup(resolved_lookup, lookup);
+                lookup = resolved_lookup.append_loose_results(lookup);
             }
         }
     }

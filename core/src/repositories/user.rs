@@ -148,17 +148,21 @@ fn is_within_edit_distance(left: &str, right: &str, maximum: usize) -> bool {
     previous[right.len()] <= maximum
 }
 
-fn merge_admin_lookup_candidates(
-    authoritative: Vec<String>,
-    primary_loose: Vec<String>,
-    email_loose: Vec<String>,
-) -> Vec<String> {
+fn merge_admin_lookup_candidates<T, K>(
+    authoritative: Vec<T>,
+    primary_loose: Vec<T>,
+    email_loose: Vec<T>,
+    key: impl Fn(&T) -> K,
+) -> Vec<T>
+where
+    K: Eq + std::hash::Hash,
+{
     let mut candidates = Vec::with_capacity(ADMIN_USER_LOOKUP_LIMIT);
     let mut seen = std::collections::HashSet::new();
 
-    for pubkey in authoritative {
-        if seen.insert(pubkey.clone()) {
-            candidates.push(pubkey);
+    for candidate in authoritative {
+        if seen.insert(key(&candidate)) {
+            candidates.push(candidate);
         }
         if candidates.len() == ADMIN_USER_LOOKUP_LIMIT {
             return candidates;
@@ -170,20 +174,20 @@ fn merge_admin_lookup_candidates(
     while candidates.len() < ADMIN_USER_LOOKUP_LIMIT {
         let mut had_candidate = false;
 
-        if let Some(pubkey) = primary_loose.next() {
+        if let Some(candidate) = primary_loose.next() {
             had_candidate = true;
-            if seen.insert(pubkey.clone()) {
-                candidates.push(pubkey);
+            if seen.insert(key(&candidate)) {
+                candidates.push(candidate);
             }
         }
         if candidates.len() == ADMIN_USER_LOOKUP_LIMIT {
             break;
         }
 
-        if let Some(pubkey) = email_loose.next() {
+        if let Some(candidate) = email_loose.next() {
             had_candidate = true;
-            if seen.insert(pubkey.clone()) {
-                candidates.push(pubkey);
+            if seen.insert(key(&candidate)) {
+                candidates.push(candidate);
             }
         }
 
@@ -193,6 +197,16 @@ fn merge_admin_lookup_candidates(
     }
 
     candidates
+}
+
+impl AdminUserLookup {
+    /// Append de-duplicated loose results while preserving authoritative metadata.
+    pub fn append_loose_results(mut self, loose: Self) -> Self {
+        self.users = merge_admin_lookup_candidates(self.users, loose.users, vec![], |user| {
+            user.pubkey.clone()
+        });
+        self
+    }
 }
 
 fn is_undefined_postgres_function(error: &sqlx::Error) -> bool {
@@ -1884,8 +1898,8 @@ impl UserRepository {
 
     /// Search for users matching an admin-support query.
     ///
-    /// Email queries use case-insensitive substring matching. Queries without an `@`
-    /// merge email substring matches with the existing username, vine ID, and pubkey paths.
+    /// Email queries use case-insensitive substring matching. Non-`npub` queries without an
+    /// `@` merge email substring matches with the username, vine ID, and hex-pubkey paths.
     ///
     /// # Errors
     ///
@@ -2039,6 +2053,7 @@ impl UserRepository {
             authoritative_pubkeys,
             primary_loose_pubkeys,
             email_loose_pubkeys,
+            Clone::clone,
         );
 
         if pubkeys.is_empty() {
