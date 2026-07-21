@@ -959,6 +959,10 @@ fn should_fetch_email_suggestions(authoritative_match: bool, result_count: usize
     !authoritative_match && result_count == 0
 }
 
+fn authoritative_name_promotion_timeout(local_result_count: usize) -> Option<std::time::Duration> {
+    (local_result_count > 0).then_some(ADMIN_NAME_PROMOTION_TIMEOUT)
+}
+
 async fn await_name_promotion_within<T>(
     future: impl std::future::Future<Output = T>,
     timeout: std::time::Duration,
@@ -969,10 +973,19 @@ async fn await_name_promotion_within<T>(
 #[cfg(test)]
 mod user_lookup_response_tests {
     use super::{
-        await_name_promotion_within, should_attempt_authoritative_name_promotion,
-        should_fetch_email_suggestions, UserLookupDetails, UserLookupResponse,
-        ADMIN_NAME_PROMOTION_TIMEOUT,
+        authoritative_name_promotion_timeout, await_name_promotion_within,
+        should_attempt_authoritative_name_promotion, should_fetch_email_suggestions,
+        UserLookupDetails, UserLookupResponse, ADMIN_NAME_PROMOTION_TIMEOUT,
     };
+
+    #[test]
+    fn empty_local_lookup_preserves_upstream_name_timeout() {
+        assert_eq!(authoritative_name_promotion_timeout(0), None);
+        assert_eq!(
+            authoritative_name_promotion_timeout(1),
+            Some(ADMIN_NAME_PROMOTION_TIMEOUT)
+        );
+    }
 
     #[tokio::test]
     async fn authoritative_name_promotion_stops_at_the_admin_lookup_budget() {
@@ -1073,12 +1086,15 @@ pub async fn get_user_lookup(
     if should_attempt_authoritative_name_promotion(q, lookup.authoritative_match)
         && crate::divine_names::is_enabled()
     {
-        if let Some(Ok(Some(hex_pubkey))) = await_name_promotion_within(
-            crate::divine_names::lookup_by_name(q),
-            ADMIN_NAME_PROMOTION_TIMEOUT,
-        )
-        .await
-        {
+        let name_lookup = crate::divine_names::lookup_by_name(q);
+        let promoted_name =
+            if let Some(timeout) = authoritative_name_promotion_timeout(lookup.users.len()) {
+                await_name_promotion_within(name_lookup, timeout).await
+            } else {
+                Some(name_lookup.await)
+            };
+
+        if let Some(Ok(Some(hex_pubkey))) = promoted_name {
             let mut resolved_lookup = user_repo
                 .find_users_for_admin(&hex_pubkey, tenant_id)
                 .await?;
