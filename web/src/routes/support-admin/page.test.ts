@@ -3,16 +3,17 @@ import {
     emailMatchParts,
     emailSuggestionDiff,
     isShowingDidYouMean,
-    isShowingSuggestions,
+    isSuggestedUser,
     selectAutoExpandedPubkey,
     selectDisplayedUsers,
 } from "./lookup-view";
 
 interface Row {
     pubkey: string;
+    authoritative: boolean;
 }
 
-const row = (pubkey: string): Row => ({ pubkey });
+const row = (pubkey: string, authoritative = false): Row => ({ pubkey, authoritative });
 
 describe("support admin user lookup view", () => {
     test("aligns a missing account character and describes the edit", () => {
@@ -62,21 +63,21 @@ describe("support admin user lookup view", () => {
 
     test("shows authoritative results and hides suggestions when results exist", () => {
         const result = {
-            results: [row("a"), row("b")],
+            results: [row("a", true), row("b", true)],
             suggestions: [row("c")],
             total: 2,
             authoritative_match: true,
             authoritative_count: 2,
         };
 
-        expect(selectDisplayedUsers(result)).toEqual([row("a"), row("b")]);
-        expect(isShowingSuggestions(result)).toBe(false);
+        expect(selectDisplayedUsers(result)).toEqual([row("a", true), row("b", true)]);
+        expect(isSuggestedUser(result.results[0])).toBe(false);
         expect(selectAutoExpandedPubkey(result)).toBeNull();
     });
 
     test("auto-expands a lone authoritative result", () => {
         const result = {
-            results: [row("a")],
+            results: [row("a", true)],
             suggestions: [],
             total: 1,
             authoritative_match: true,
@@ -88,7 +89,7 @@ describe("support admin user lookup view", () => {
 
     test("auto-expands one authoritative result ahead of loose candidates", () => {
         const result = {
-            results: [row("authoritative"), row("loose")],
+            results: [row("authoritative", true), row("loose")],
             suggestions: [],
             total: 2,
             authoritative_match: true,
@@ -96,6 +97,8 @@ describe("support admin user lookup view", () => {
         };
 
         expect(selectAutoExpandedPubkey(result)).toBe("authoritative");
+        expect(isSuggestedUser(result.results[0])).toBe(false);
+        expect(isSuggestedUser(result.results[1])).toBe(true);
     });
 
     test("marks a lone non-authoritative result as suggested without auto-expanding it", () => {
@@ -108,7 +111,7 @@ describe("support admin user lookup view", () => {
         };
 
         expect(selectDisplayedUsers(result)).toEqual([row("a")]);
-        expect(isShowingSuggestions(result)).toBe(true);
+        expect(isSuggestedUser(result.results[0])).toBe(true);
         expect(isShowingDidYouMean(result)).toBe(false);
         expect(selectAutoExpandedPubkey(result)).toBeNull();
     });
@@ -123,7 +126,7 @@ describe("support admin user lookup view", () => {
         };
 
         expect(selectDisplayedUsers(result)).toEqual([row("c")]);
-        expect(isShowingSuggestions(result)).toBe(true);
+        expect(isSuggestedUser(result.suggestions[0])).toBe(true);
         expect(isShowingDidYouMean(result)).toBe(true);
         expect(selectAutoExpandedPubkey(result)).toBeNull();
     });
@@ -138,13 +141,11 @@ describe("support admin user lookup view", () => {
         };
 
         expect(selectDisplayedUsers(result)).toEqual([]);
-        expect(isShowingSuggestions(result)).toBe(false);
         expect(selectAutoExpandedPubkey(result)).toBeNull();
     });
 
     test("treats a null pre-search result as empty", () => {
         expect(selectDisplayedUsers(null)).toEqual([]);
-        expect(isShowingSuggestions(null)).toBe(false);
         expect(selectAutoExpandedPubkey(null)).toBeNull();
     });
 });

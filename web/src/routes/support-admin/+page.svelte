@@ -8,7 +8,7 @@
 		emailMatchParts,
 		emailSuggestionDiff,
 		isShowingDidYouMean,
-		isShowingSuggestions,
+		isSuggestedUser,
 		selectAutoExpandedPubkey,
 		selectDisplayedUsers,
 		type LookupResult
@@ -64,6 +64,7 @@
 
 	interface UserDetails {
 		pubkey: string;
+		authoritative: boolean;
 		email: string | null;
 		email_verified: boolean | null;
 		username: string | null;
@@ -76,7 +77,6 @@
 	}
 
 	let displayedUsers: UserDetails[] = $derived(selectDisplayedUsers(searchResult));
-	let showingSuggestions = $derived(isShowingSuggestions(searchResult));
 	let showingDidYouMean = $derived(isShowingDidYouMean(searchResult));
 
 	onMount(async () => {
@@ -365,7 +365,7 @@
 											{/each}
 										</span>
 									{/if}
-									{#if showingSuggestions}
+									{#if isSuggestedUser(u)}
 										<span class="suggested-badge">Suggested</span>
 									{/if}
 									<span class="list-sessions">{u.active_sessions} {u.active_sessions === 1 ? 'session' : 'sessions'}</span>

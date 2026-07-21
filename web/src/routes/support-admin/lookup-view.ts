@@ -158,9 +158,9 @@ export function selectDisplayedUsers<User>(result: LookupResult<User> | null): U
 	return result.results.length > 0 ? result.results : result.suggestions;
 }
 
-/** Report whether the displayed rows are unconfirmed suggestions. */
-export function isShowingSuggestions<User>(result: LookupResult<User> | null): boolean {
-	return result !== null && !result.authoritative_match && selectDisplayedUsers(result).length > 0;
+/** Report whether one lookup row is a loose or fuzzy suggestion. */
+export function isSuggestedUser(user: { authoritative: boolean }): boolean {
+	return !user.authoritative;
 }
 
 /** Report whether the displayed rows came from the fuzzy suggestion fallback. */

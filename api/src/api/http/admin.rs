@@ -15,9 +15,9 @@ use crate::api::error::{ApiError, ApiResult};
 use crate::api::extractors::UcanAuth;
 use keycast_core::repositories::{
     test_redirect_pattern, AdminAuditEventRecord, AdminAuditEventRepository, AdminUserDetails,
-    AuthEventRepository, ClaimTokenRepository, FullAdminStatusRow, OAuthAuthorizationRepository,
-    RegisteredClient, RegisteredClientRepository, RepositoryError, UserRepository,
-    VerifiedMinorRow, ADMIN_USER_LOOKUP_LIMIT,
+    AdminUserLookup, AuthEventRepository, ClaimTokenRepository, FullAdminStatusRow,
+    OAuthAuthorizationRepository, RegisteredClient, RegisteredClientRepository, RepositoryError,
+    UserRepository, VerifiedMinorRow, ADMIN_USER_LOOKUP_LIMIT,
 };
 use keycast_core::types::claim_token::generate_claim_token;
 use keycast_core::types::user::UserStatus;
@@ -905,6 +905,7 @@ pub struct UserLookupResponse {
 #[derive(Debug, Serialize)]
 pub struct UserLookupDetails {
     pub pubkey: String,
+    pub authoritative: bool,
     pub email: Option<String>,
     pub email_verified: Option<bool>,
     pub username: Option<String>,
@@ -937,6 +938,7 @@ async fn enrich_user_lookup_details(
 
     UserLookupDetails {
         pubkey: details.pubkey,
+        authoritative: details.authoritative,
         email: details.email,
         email_verified: details.email_verified,
         username: details.username,
@@ -959,6 +961,25 @@ fn should_fetch_email_suggestions(authoritative_match: bool, result_count: usize
     !authoritative_match && result_count == 0
 }
 
+fn merge_promoted_admin_lookup(
+    mut promoted: AdminUserLookup,
+    local: AdminUserLookup,
+) -> AdminUserLookup {
+    let mut seen_pubkeys: std::collections::HashSet<String> = promoted
+        .users
+        .iter()
+        .map(|user| user.pubkey.clone())
+        .collect();
+    promoted.users.extend(
+        local
+            .users
+            .into_iter()
+            .filter(|user| seen_pubkeys.insert(user.pubkey.clone())),
+    );
+    promoted.users.truncate(ADMIN_USER_LOOKUP_LIMIT);
+    promoted
+}
+
 fn authoritative_name_promotion_timeout(local_result_count: usize) -> Option<std::time::Duration> {
     (local_result_count > 0).then_some(ADMIN_NAME_PROMOTION_TIMEOUT)
 }
@@ -974,9 +995,29 @@ async fn await_name_promotion_within<T>(
 mod user_lookup_response_tests {
     use super::{
         authoritative_name_promotion_timeout, await_name_promotion_within,
-        should_attempt_authoritative_name_promotion, should_fetch_email_suggestions,
-        UserLookupDetails, UserLookupResponse, ADMIN_NAME_PROMOTION_TIMEOUT,
+        merge_promoted_admin_lookup, should_attempt_authoritative_name_promotion,
+        should_fetch_email_suggestions, AdminUserDetails, AdminUserLookup, UserLookupDetails,
+        UserLookupResponse, UserStatus, ADMIN_NAME_PROMOTION_TIMEOUT,
     };
+    use chrono::Utc;
+
+    fn lookup_details(pubkey: &str, authoritative: bool) -> AdminUserDetails {
+        let now = Utc::now();
+        AdminUserDetails {
+            pubkey: pubkey.to_string(),
+            authoritative,
+            email: None,
+            email_verified: None,
+            username: None,
+            display_name: None,
+            vine_id: None,
+            has_personal_key: false,
+            status: UserStatus::Active,
+            suspended_reason: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
 
     #[test]
     fn empty_local_lookup_preserves_upstream_name_timeout() {
@@ -1012,6 +1053,7 @@ mod user_lookup_response_tests {
     fn serializes_suggestions_separately_from_results() {
         let suggestion = UserLookupDetails {
             pubkey: "1111111111111111111111111111111111111111111111111111111111111111".to_string(),
+            authoritative: false,
             email: Some("suggested@example.com".to_string()),
             email_verified: Some(true),
             username: None,
@@ -1038,6 +1080,27 @@ mod user_lookup_response_tests {
         assert_eq!(json["results"], serde_json::json!([]));
         assert_eq!(json["total"], 0);
         assert_eq!(json["suggestions"][0]["email"], "suggested@example.com");
+        assert_eq!(json["suggestions"][0]["authoritative"], false);
+    }
+
+    #[test]
+    fn name_promotion_merge_preserves_each_row_tier() {
+        let promoted = AdminUserLookup {
+            users: vec![lookup_details("authoritative", true)],
+            authoritative_match: true,
+            authoritative_count: 1,
+        };
+        let local = AdminUserLookup {
+            users: vec![lookup_details("loose", false)],
+            authoritative_match: false,
+            authoritative_count: 0,
+        };
+
+        let merged = merge_promoted_admin_lookup(promoted, local);
+
+        assert!(merged.users[0].authoritative);
+        assert!(!merged.users[1].authoritative);
+        assert_eq!(merged.authoritative_count, 1);
     }
 
     #[test]
@@ -1095,23 +1158,11 @@ pub async fn get_user_lookup(
             };
 
         if let Some(Ok(Some(hex_pubkey))) = promoted_name {
-            let mut resolved_lookup = user_repo
+            let resolved_lookup = user_repo
                 .find_users_for_admin(&hex_pubkey, tenant_id)
                 .await?;
             if resolved_lookup.authoritative_match {
-                let mut seen_pubkeys: std::collections::HashSet<String> = resolved_lookup
-                    .users
-                    .iter()
-                    .map(|user| user.pubkey.clone())
-                    .collect();
-                resolved_lookup.users.extend(
-                    lookup
-                        .users
-                        .into_iter()
-                        .filter(|user| seen_pubkeys.insert(user.pubkey.clone())),
-                );
-                resolved_lookup.users.truncate(ADMIN_USER_LOOKUP_LIMIT);
-                lookup = resolved_lookup;
+                lookup = merge_promoted_admin_lookup(resolved_lookup, lookup);
             }
         }
     }

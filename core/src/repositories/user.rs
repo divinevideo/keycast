@@ -59,6 +59,8 @@ pub struct PendingEmailChange {
 #[derive(Debug, FromRow)]
 pub struct AdminUserDetails {
     pub pubkey: String,
+    #[sqlx(default)]
+    pub authoritative: bool,
     pub email: Option<String>,
     pub email_verified: Option<bool>,
     pub username: Option<String>,
@@ -2047,7 +2049,7 @@ impl UserRepository {
             });
         }
 
-        let rows: Vec<AdminUserDetails> = sqlx::query_as(
+        let mut rows: Vec<AdminUserDetails> = sqlx::query_as(
             "SELECT
                 u.pubkey,
                 u.email,
@@ -2070,10 +2072,10 @@ impl UserRepository {
         .fetch_all(&self.pool)
         .await?;
 
-        let authoritative_count = rows
-            .iter()
-            .filter(|row| authoritative_pubkey_set.contains(row.pubkey.as_str()))
-            .count();
+        for row in &mut rows {
+            row.authoritative = authoritative_pubkey_set.contains(row.pubkey.as_str());
+        }
+        let authoritative_count = rows.iter().filter(|row| row.authoritative).count();
 
         Ok(AdminUserLookup {
             users: rows,
@@ -2733,7 +2735,9 @@ mod tests {
         assert!(lookup.authoritative_match);
         assert_eq!(lookup.authoritative_count, 1);
         assert_eq!(lookup.users[0].pubkey, exact_pubkey);
+        assert!(lookup.users[0].authoritative);
         assert_eq!(lookup.users[1].pubkey, substring_pubkey);
+        assert!(!lookup.users[1].authoritative);
 
         cleanup_user(&pool, &substring_pubkey).await;
         cleanup_user(&pool, &exact_pubkey).await;
