@@ -1,4 +1,3 @@
-import { resolve } from "node:path";
 import { type Page, type TestInfo, expect, test } from "@playwright/test";
 import { parseCookieValue, registerAndVerify } from "../helpers/auth";
 import { withDb } from "../helpers/db";
@@ -24,13 +23,6 @@ async function captureLookupState(
 ): Promise<void> {
   const screenshot = await page.screenshot({ fullPage: true });
   await testInfo.attach(name, { body: screenshot, contentType: "image/png" });
-
-  if (process.env.UPDATE_SUPPORT_ADMIN_SCREENSHOTS === "1") {
-    await page.screenshot({
-      path: resolve(__dirname, `../../docs/images/${name}.png`),
-      fullPage: true,
-    });
-  }
 }
 
 async function search(page: Page, query: string): Promise<void> {
