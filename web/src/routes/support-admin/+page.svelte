@@ -28,6 +28,7 @@
 
 	// User lookup state
 	let searchQuery = $state('');
+	let executedSearchQuery = $state('');
 	let isSearching = $state(false);
 	let searchResult = $state<LookupResult<UserDetails> | null>(null);
 	let searchError = $state('');
@@ -120,6 +121,7 @@
 			const result = await api.get<LookupResult<UserDetails>>(
 				`/admin/user-lookup?q=${encodeURIComponent(q)}`
 			);
+			executedSearchQuery = q;
 			searchResult = result;
 			// Suggestions require an explicit click so they are not mistaken for confirmed matches.
 			expandedPubkey = selectAutoExpandedPubkey(result);
@@ -332,8 +334,8 @@
 					<div class="user-list">
 						{#each displayedUsers as u (u.pubkey)}
 							{@const isExpanded = expandedPubkey === u.pubkey}
-							{@const emailParts = u.email ? emailMatchParts(u.email, searchQuery) : []}
-							{@const suggestionDiff = showingDidYouMean && u.email ? emailSuggestionDiff(searchQuery.trim(), u.email) : null}
+							{@const emailParts = u.email ? emailMatchParts(u.email, executedSearchQuery) : []}
+							{@const suggestionDiff = showingDidYouMean && u.email ? emailSuggestionDiff(executedSearchQuery, u.email) : null}
 							<div class="user-list-item" class:expanded={isExpanded}>
 								<button class="user-list-row" onclick={() => toggleExpand(u.pubkey)}>
 									<span class="expand-icon">
@@ -376,7 +378,7 @@
 										<span class="suggestion-distance">{suggestionDiff.chip}</span>
 										<div class="diff-line">
 											<span class="diff-label">you typed</span>
-											<span class="diff-value" role="img" aria-label={searchQuery.trim()}>
+											<span class="diff-value" role="img" aria-label={executedSearchQuery}>
 												{#each suggestionDiff.typed as part}
 													{#if part.changed}
 														<mark class="diff-character" class:gap={part.gap}>{part.gap ? '∅' : part.text}</mark>

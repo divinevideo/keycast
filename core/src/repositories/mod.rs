@@ -42,5 +42,4 @@ pub use user::{
     AccountStatusRow, AccountStatusWithMinorRow, AdminUserDetails, AdminUserLookup,
     ClaimConsumeOutcome, DeleteAccountResult, FinalizeEmailOutcome, FullAdminStatusRow,
     PendingEmailChange, PendingEmailSide, UserRepository, VerificationTokenData, VerifiedMinorRow,
-    ADMIN_USER_LOOKUP_LIMIT,
 };

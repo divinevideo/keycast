@@ -205,6 +205,8 @@ impl AdminUserLookup {
         self.users = merge_admin_lookup_candidates(self.users, loose.users, vec![], |user| {
             user.pubkey.clone()
         });
+        self.authoritative_count = self.users.iter().filter(|user| user.authoritative).count();
+        self.authoritative_match = self.authoritative_count > 0;
         self
     }
 }
@@ -2174,7 +2176,9 @@ impl UserRepository {
                 u.updated_at
              FROM users u
              LEFT JOIN personal_keys pk ON pk.user_pubkey = u.pubkey AND pk.tenant_id = u.tenant_id
-             WHERE u.email = ANY($1::text[]) AND u.tenant_id = $2",
+             WHERE LOWER(u.email) = ANY($1::text[])
+               AND u.tenant_id = $2
+               AND u.email IS NOT NULL",
         )
         .bind(&lowered)
         .bind(tenant_id)
@@ -2183,21 +2187,6 @@ impl UserRepository {
 
         Ok(rows)
     }
-
-    /// Look up a single user for admin. Thin wrapper over `find_users_for_admin`.
-    pub async fn find_user_for_admin(
-        &self,
-        query: &str,
-        tenant_id: i64,
-    ) -> Result<Option<AdminUserDetails>, RepositoryError> {
-        Ok(self
-            .find_users_for_admin(query, tenant_id)
-            .await?
-            .users
-            .into_iter()
-            .next())
-    }
-
     /// Delete a user account and all associated data.
     ///
     /// This performs a complete account deletion:
@@ -2285,7 +2274,7 @@ pub struct DeleteAccountResult {
 #[cfg(all(test, feature = "integration-tests"))]
 mod tests {
     use super::*;
-    use nostr_sdk::{Keys, ToBech32};
+    use nostr_sdk::Keys;
     use sqlx::postgres::PgPoolOptions;
     use sqlx::PgPool;
 
@@ -2523,18 +2512,6 @@ mod tests {
         .unwrap();
     }
 
-    async fn add_personal_key(pool: &PgPool, pubkey: &str) {
-        sqlx::query(
-            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
-             VALUES ($1, $2, 1, NOW(), NOW())",
-        )
-        .bind(pubkey)
-        .bind(b"test-encrypted-key" as &[u8])
-        .execute(pool)
-        .await
-        .unwrap();
-    }
-
     async fn create_user_with_username(pool: &PgPool, pubkey: &str, username: &str) {
         sqlx::query(
             "INSERT INTO users (pubkey, tenant_id, username, created_at, updated_at)
@@ -2558,96 +2535,6 @@ mod tests {
             .execute(pool)
             .await
             .ok();
-    }
-
-    #[tokio::test]
-    async fn test_find_user_for_admin_by_email() {
-        let pool = setup_pool().await;
-        let repo = UserRepository::new(pool.clone());
-        let keys = Keys::generate();
-        let hex = keys.public_key().to_hex();
-        let suffix = test_suffix();
-        let email = format!("admin-lookup-{}@test.local", suffix);
-
-        create_user_with_email(&pool, &hex, &email).await;
-
-        let result = repo.find_user_for_admin(&email, 1).await.unwrap();
-        assert!(result.is_some(), "Should find user by email");
-        let user = result.unwrap();
-        assert_eq!(user.pubkey, hex);
-        assert_eq!(user.email.as_deref(), Some(email.as_str()));
-        assert!(!user.has_personal_key);
-
-        cleanup_user(&pool, &hex).await;
-    }
-
-    #[tokio::test]
-    async fn test_find_user_for_admin_by_hex_pubkey() {
-        let pool = setup_pool().await;
-        let repo = UserRepository::new(pool.clone());
-        let keys = Keys::generate();
-        let hex = keys.public_key().to_hex();
-        let suffix = test_suffix();
-        let email = format!("admin-hex-{}@test.local", suffix);
-
-        create_user_with_email(&pool, &hex, &email).await;
-
-        let result = repo.find_user_for_admin(&hex, 1).await.unwrap();
-        assert!(result.is_some(), "Should find user by hex pubkey");
-        assert_eq!(result.unwrap().pubkey, hex);
-
-        cleanup_user(&pool, &hex).await;
-    }
-
-    #[tokio::test]
-    async fn test_find_user_for_admin_by_npub() {
-        let pool = setup_pool().await;
-        let repo = UserRepository::new(pool.clone());
-        let keys = Keys::generate();
-        let pk = keys.public_key();
-        let hex = pk.to_hex();
-        let npub = pk.to_bech32().unwrap();
-        let suffix = test_suffix();
-        let email = format!("admin-npub-{}@test.local", suffix);
-
-        create_user_with_email(&pool, &hex, &email).await;
-
-        let result = repo.find_user_for_admin(&npub, 1).await.unwrap();
-        assert!(result.is_some(), "Should find user by npub");
-        assert_eq!(result.unwrap().pubkey, hex);
-
-        cleanup_user(&pool, &hex).await;
-    }
-
-    #[tokio::test]
-    async fn test_find_user_for_admin_has_personal_key() {
-        let pool = setup_pool().await;
-        let repo = UserRepository::new(pool.clone());
-        let keys = Keys::generate();
-        let hex = keys.public_key().to_hex();
-        let suffix = test_suffix();
-        let email = format!("admin-pk-{}@test.local", suffix);
-
-        create_user_with_email(&pool, &hex, &email).await;
-        add_personal_key(&pool, &hex).await;
-
-        let result = repo.find_user_for_admin(&email, 1).await.unwrap();
-        assert!(result.is_some());
-        assert!(result.unwrap().has_personal_key, "Should have personal key");
-
-        cleanup_user(&pool, &hex).await;
-    }
-
-    #[tokio::test]
-    async fn test_find_user_for_admin_nonexistent() {
-        let pool = setup_pool().await;
-        let repo = UserRepository::new(pool);
-
-        let result = repo
-            .find_user_for_admin("nonexistent@example.com", 1)
-            .await
-            .unwrap();
-        assert!(result.is_none(), "Should return None for nonexistent user");
     }
 
     #[tokio::test]

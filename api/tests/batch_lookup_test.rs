@@ -207,6 +207,31 @@ async fn test_batch_lookup_returns_matching_user() {
     assert!(!user.created_at.is_empty());
 }
 
+#[tokio::test]
+async fn test_batch_lookup_returns_mixed_case_stored_email() {
+    common::assert_test_database_url();
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+    let pool = common::setup_test_db().await;
+    let app = build_app(create_test_auth_state(pool.clone()));
+
+    let email = format!("mixed-case-{}@example.com", uuid::Uuid::new_v4());
+    let stored_email = email.to_uppercase();
+    let pubkey = create_test_user_with_email(&pool, &stored_email).await;
+
+    let resp = app
+        .oneshot(post_batch_lookup(&[&email], SERVICE_TOKEN))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let result = parse_response(resp).await;
+
+    assert!(result.not_found.is_empty());
+    let user = result.results.get(&email).unwrap();
+    assert_eq!(user.pubkey, pubkey);
+    assert_eq!(user.email, stored_email);
+}
+
 // --- Test 2: Mixed batch — some found, some not_found ---
 
 #[tokio::test]
