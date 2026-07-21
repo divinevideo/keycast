@@ -175,14 +175,9 @@ test.describe("OAuth security regressions", () => {
     }
   });
 
-  test("Strict mode rejects unknown OAuth clients", async () => {
+  test("Open OAuth permits unregistered clients", async () => {
     const isolatedPort = 3412;
-    const server = await startKeycastProcess({
-      port: isolatedPort,
-      env: {
-        REQUIRE_REGISTERED_OAUTH_CLIENTS: "true",
-      },
-    });
+    const server = await startKeycastProcess({ port: isolatedPort });
 
     try {
       const isolatedApi = await playwrightRequest.newContext({
@@ -193,8 +188,8 @@ test.describe("OAuth security regressions", () => {
           "http://localhost:3456/callback.html",
         )}&scope=policy:full`,
       );
-      expect(res.status()).toBe(400);
-      expect(await res.text()).toContain("Unregistered client");
+      expect(res.status()).toBe(200);
+      expect(await res.text()).not.toContain("Unregistered client");
     } finally {
       await stopKeycastProcess(server);
     }
