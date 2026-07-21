@@ -50,44 +50,17 @@ docker run --rm --network host \
 
 The script refuses non-local database URLs.
 
-## Deployment Gate
+## Deployment Behavior
 
-The migration must run in a low-traffic maintenance window. Do not deploy it through a normal unattended rollout: both index statements are non-concurrent and block writes while their transaction remains open. `CREATE INDEX CONCURRENTLY` is not a drop-in replacement because PostgreSQL forbids it inside the transaction SQLx uses for a migration.
+Production uses the normal unattended Cloud Build path. After pushing the new image, `cloudbuild.yaml` executes the `keycast-migrate` Cloud Run Job with `--wait`; that job runs the image's `./keycast --migrate` entrypoint before the service deploy step. A migration error fails the build and prevents the new service revision from deploying. The job does not set custom `PGOPTIONS`, so the accepted rollout behavior is the default transactional SQLx migration rather than a separate manually timed migration command.
 
-Run this read-only preflight through the same connection and role the migration job will use:
+Read-only production inspection on July 20, 2026 confirmed PostgreSQL 16, `pg_trgm` 1.6 available and trusted but not yet installed, and 216,549 users, including 41,122 with email. The migration role used by `keycast-migrate` inherits `cloudsqlsuperuser` and has `CREATE` on both the database and `public` schema, so it can run `CREATE EXTENSION IF NOT EXISTS pg_trgm` as part of the automated job. The email-bearing row count is well below the 400,000-row benchmark.
 
-```sql
-SELECT current_database(), current_user, current_setting('server_version');
+Non-production GKE deployments use the same binary migration path through the `keycast-db-migrate` ArgoCD sync-hook Job before the application Deployment. Database bootstrap assigns ownership and `public` schema privileges to the migration role, and a failed migration prevents the later Deployment sync wave. No separate live staging query is a release gate for this migration.
 
-SELECT name, version, installed, trusted
-FROM pg_available_extension_versions
-WHERE name = 'pg_trgm'
-ORDER BY version;
+Both index statements are non-concurrent and block writes while their transaction remains open. `CREATE INDEX CONCURRENTLY` is not a drop-in replacement because PostgreSQL forbids it inside the transaction SQLx uses for a migration. The measured 1,903 ms local build is therefore a lower bound, not a production latency guarantee; monitor the migration job, write latency/errors, database CPU and I/O, and `pg_stat_activity` during rollout. Cancelling a migration that exceeds the acceptable window rolls back the transaction so it can be retried.
 
-SELECT
-    has_database_privilege(current_user, current_database(), 'CREATE') AS can_create_in_database,
-    has_schema_privilege(current_user, 'public', 'CREATE') AS can_create_in_public;
-
-SELECT
-    COUNT(*) AS users_total,
-    COUNT(email) AS users_with_email
-FROM users;
-```
-
-Proceed only when `pg_trgm` is available and trusted and both privilege checks are true. Re-run the 400,000-row benchmark if `users_with_email` exceeds 400,000 or the table/index layout has materially changed.
-
-For the migration session, set a short `lock_timeout` so existing write traffic makes the deploy fail fast instead of waiting indefinitely, and set a bounded `statement_timeout` comfortably above a staging rehearsal. For example, the current local measurement leaves ample margin with:
-
-```bash
-PGOPTIONS='-c lock_timeout=5s -c statement_timeout=10min' \
-  sqlx migrate run --database-url "$DATABASE_URL" --source database/migrations
-```
-
-Monitor application write latency/errors, database CPU and I/O, and `pg_stat_activity` throughout the migration. Cancel the migration if it exceeds the rehearsed window or degrades the write SLO; cancellation rolls back the transactional migration, after which it can be retried in a quieter window.
-
-Read-only production preflight on July 20, 2026 confirmed PostgreSQL 16, `pg_trgm` 1.6 available and trusted but not yet installed, and database plus `public` schema `CREATE` privileges for the non-superuser migration connection. It also measured 216,549 users, including 41,122 with email, below the benchmark's 400,000 email-bearing rows.
-
-Live staging preflight was blocked during review by expired interactive GKE authentication and remains a hard requirement before rollout. The staging infrastructure contract confirms that the non-superuser application role owns the database, and the pinned CloudNativePG PostgreSQL 17.5 image contains trusted `pg_trgm` 1.6; those facts support the expected outcome but do not replace the live privilege query above.
+Re-run the 400,000-row benchmark if the target grows beyond 400,000 email-bearing users or the table/index layout changes materially.
 
 ## INSERT Results
 
