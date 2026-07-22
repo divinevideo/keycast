@@ -621,13 +621,15 @@ async fn key_rotation_preserves_ap_public_pem_on_new_pubkey() {
     let old_pubkey = old_keys.public_key().to_hex();
     let new_keys = Keys::generate();
     let new_pubkey = new_keys.public_key().to_hex();
-    create_test_user(&pool, &old_pubkey).await;
+    let username = format!("ap-rotate-{}", &old_pubkey[..8]);
+    let actor = format!("https://divine.video/ap/users/{username}");
+    create_test_user_with_username(&pool, &old_pubkey, &username).await;
 
     let app = build_app(create_test_auth_state(pool.clone()));
     let resp = app
         .oneshot(bearer_json(
             "/ap/keys",
-            serde_json::json!({ "pubkey": old_pubkey }),
+            serde_json::json!({ "actor": actor.clone() }),
             Some(SERVICE_TOKEN),
         ))
         .await
@@ -635,6 +637,7 @@ async fn key_rotation_preserves_ap_public_pem_on_new_pubkey() {
     assert_eq!(resp.status(), StatusCode::OK);
     let created = parse_body(resp).await;
     let original_pem = created["public_key_pem"].as_str().unwrap().to_string();
+    assert_eq!(created["pubkey"].as_str().unwrap(), old_pubkey);
 
     let user_repo = UserRepository::new(pool.clone());
     user_repo
@@ -648,6 +651,13 @@ async fn key_rotation_preserves_ap_public_pem_on_new_pubkey() {
         )
         .await
         .expect("change key");
+
+    let resolved_pubkey = user_repo
+        .find_pubkey_by_username(&username, TENANT_ID)
+        .await
+        .expect("username lookup")
+        .expect("username should still resolve after key rotation");
+    assert_eq!(resolved_pubkey, new_pubkey);
 
     let repo = ApActorKeysRepository::new(pool.clone());
     assert!(
@@ -664,5 +674,45 @@ async fn key_rotation_preserves_ap_public_pem_on_new_pubkey() {
         .expect("new pubkey should own the existing AP key");
     assert_eq!(rotated_pem, original_pem);
 
+    let app = build_app(create_test_auth_state(pool.clone()));
+    let resp = app
+        .oneshot(
+            Request::get(format!("/ap/keys/{}", urlencoding::encode(&actor)))
+                .header("authorization", format!("Bearer {}", SERVICE_TOKEN))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let key_body = parse_body(resp).await;
+    assert_eq!(key_body["pubkey"].as_str().unwrap(), new_pubkey);
+    assert_eq!(key_body["public_key_pem"].as_str().unwrap(), original_pem);
+
+    let signing_string =
+        "(request-target): post /inbox\nhost: divine.video\ndate: Mon, 01 Jan 2026 00:00:00 GMT";
+    let app = build_app(create_test_auth_state(pool.clone()));
+    let resp = app
+        .oneshot(bearer_json(
+            "/ap/sign",
+            serde_json::json!({ "actor": actor.clone(), "signing_string": signing_string }),
+            Some(SERVICE_TOKEN),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let sign_resp = parse_body(resp).await;
+    assert_eq!(sign_resp["pubkey"].as_str().unwrap(), new_pubkey);
+
+    let public = RsaPublicKey::from_public_key_pem(&original_pem).expect("pem");
+    let vk = VerifyingKey::<Sha256>::new(public);
+    let raw = BASE64
+        .decode(sign_resp["signature"].as_str().unwrap())
+        .expect("b64");
+    let sig = Signature::try_from(raw.as_slice()).expect("sig");
+    vk.verify(signing_string.as_bytes(), &sig)
+        .expect("signature must verify against pre-rotation actor PEM");
+
+    cleanup(&pool, &old_pubkey).await;
     cleanup(&pool, &new_pubkey).await;
 }

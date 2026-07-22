@@ -1502,8 +1502,8 @@ impl UserRepository {
     /// Performs a complete key rotation:
     /// 1. Counts and deletes OAuth authorizations for the old pubkey
     /// 2. Deletes personal_keys for the old pubkey
-    /// 3. Orphans the old user identity (clears email/password)
-    /// 4. Creates new user identity with email/password
+    /// 3. Orphans the old user identity (clears email/password/username)
+    /// 4. Creates new user identity with email/password/username
     /// 5. Creates personal_keys for the new identity
     ///
     /// Returns the count of OAuth authorizations that were deleted.
@@ -1543,9 +1543,16 @@ impl UserRepository {
             .execute(&mut *tx)
             .await?;
 
-        // Orphan old identity (transfer email/password to NULL)
+        let old_username: Option<String> =
+            sqlx::query_scalar("SELECT username FROM users WHERE pubkey = $1 AND tenant_id = $2")
+                .bind(old_pubkey)
+                .bind(tenant_id)
+                .fetch_one(&mut *tx)
+                .await?;
+
+        // Orphan old identity (transfer email/password/username to NULL)
         sqlx::query(
-            "UPDATE users SET email = NULL, password_hash = NULL, updated_at = $1
+            "UPDATE users SET email = NULL, password_hash = NULL, username = NULL, updated_at = $1
              WHERE pubkey = $2 AND tenant_id = $3",
         )
         .bind(now)
@@ -1554,16 +1561,18 @@ impl UserRepository {
         .execute(&mut *tx)
         .await?;
 
-        // Create new user identity with email/password
+        // Create new user identity with email/password/username. The AP gateway
+        // resolves actor URLs by username, so it must move with the AP key row.
         sqlx::query(
-            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, username, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(new_pubkey)
         .bind(tenant_id)
         .bind(email)
         .bind(password_hash)
         .bind(true) // Keep email verified status
+        .bind(old_username)
         .bind(now)
         .bind(now)
         .execute(&mut *tx)

@@ -396,7 +396,7 @@ pub async fn sign(
         }
     };
     if row.key_type != AP_KEY_TYPE {
-        return Err(ApError::Internal(format!(
+        return Err(ApError::BadRequest(format!(
             "Unsupported AP key type: {}",
             row.key_type
         )));
