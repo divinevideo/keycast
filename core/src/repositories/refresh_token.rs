@@ -73,6 +73,29 @@ impl RefreshTokenRepository {
         Ok(result)
     }
 
+    /// Look up a refresh-token record by its SHA-256 hash without changing it.
+    ///
+    /// This is intended for rejection diagnostics after [`Self::consume`] returns `None`.
+    /// It deliberately includes expired and consumed records.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RepositoryError` if the database query fails.
+    pub async fn find_by_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<RefreshToken>, RepositoryError> {
+        sqlx::query_as::<_, RefreshToken>(
+            "SELECT id, token_hash, authorization_id, tenant_id, created_at, expires_at, consumed_at
+             FROM oauth_refresh_tokens
+             WHERE token_hash = $1",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Revoke all refresh tokens for an authorization.
     ///
     /// # Errors
@@ -126,5 +149,102 @@ mod tests {
         let hash1 = hash_refresh_token(token);
         let hash2 = hash_refresh_token(token);
         assert_eq!(hash1, hash2);
+    }
+}
+
+#[cfg(all(test, feature = "integration-tests"))]
+mod integration_tests {
+    use super::*;
+    use crate::types::refresh_token::{generate_refresh_token, hash_refresh_token};
+    use nostr_sdk::Keys;
+    use uuid::Uuid;
+
+    fn assert_localhost_db() {
+        let url = std::env::var("DATABASE_URL").unwrap_or_default();
+        assert!(
+            url.contains("localhost") || url.contains("127.0.0.1") || url.is_empty(),
+            "Tests must run against localhost"
+        );
+    }
+
+    async fn setup_pool() -> PgPool {
+        assert_localhost_db();
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string());
+        let pool = PgPool::connect(&database_url)
+            .await
+            .expect("failed to connect to test database");
+        pool
+    }
+
+    #[tokio::test]
+    async fn lookup_by_hash_returns_existing_state_without_mutating_it() {
+        let pool = setup_pool().await;
+        let repo = RefreshTokenRepository::new(pool.clone());
+        let user_pubkey = Keys::generate().public_key().to_hex();
+        let origin = format!("https://refresh-test-{}.example", Uuid::new_v4());
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
+             VALUES ($1, 1, NOW(), NOW())",
+        )
+        .bind(&user_pubkey)
+        .execute(&pool)
+        .await
+        .expect("create test user");
+        let authorization_id: i32 = sqlx::query_scalar(
+            "INSERT INTO oauth_authorizations
+             (user_pubkey, redirect_origin, client_id, bunker_public_key, secret_hash, relays,
+              tenant_id, handle_expires_at, created_at, updated_at)
+             VALUES ($1, $2, 'stored-client', $3, 'secret-hash', '[]', 1,
+                     NOW() + INTERVAL '30 days', NOW(), NOW())
+             RETURNING id",
+        )
+        .bind(&user_pubkey)
+        .bind(&origin)
+        .bind(Keys::generate().public_key().to_hex())
+        .fetch_one(&pool)
+        .await
+        .expect("create test authorization");
+
+        let raw_token = generate_refresh_token();
+        let token_hash = hash_refresh_token(&raw_token);
+        repo.create(&raw_token, authorization_id, 1)
+            .await
+            .expect("create refresh token");
+
+        let active = repo
+            .find_by_token_hash(&token_hash)
+            .await
+            .expect("lookup active refresh token")
+            .expect("active refresh token should exist");
+        assert!(active.consumed_at.is_none());
+        assert!(repo
+            .find_by_token_hash(&raw_token)
+            .await
+            .expect("raw-token lookup should execute")
+            .is_none());
+
+        repo.consume(&raw_token)
+            .await
+            .expect("consume refresh token")
+            .expect("refresh token should be consumable");
+        let consumed = repo
+            .find_by_token_hash(&token_hash)
+            .await
+            .expect("lookup consumed refresh token")
+            .expect("consumed refresh token should remain diagnosable");
+        assert!(consumed.consumed_at.is_some());
+        assert!(repo
+            .find_by_token_hash(&"0".repeat(64))
+            .await
+            .expect("unknown-token lookup should execute")
+            .is_none());
+
+        sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(&user_pubkey)
+            .execute(&pool)
+            .await
+            .expect("clean up test user");
     }
 }
