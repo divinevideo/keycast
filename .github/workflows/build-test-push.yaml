@@ -30,7 +30,7 @@ env:
 
 jobs:
   test:
-    runs-on: ubuntu-24.04-16core
+    runs-on: ubuntu-24.04
     services:
       postgres:
         image: postgres:16
@@ -97,7 +97,7 @@ jobs:
   docker:
     name: Build & Push
     needs: test
-    runs-on: ubuntu-24.04-16core
+    runs-on: ubuntu-24.04
     if: github.event_name != 'pull_request'
     permissions:
       id-token: write
@@ -203,7 +203,7 @@ jobs:
   deploy:
     name: Trigger Deploy
     needs: docker
-    runs-on: ubuntu-24.04-16core
+    runs-on: ubuntu-24.04
     if: github.event_name != 'pull_request'
     environment: staging
 
