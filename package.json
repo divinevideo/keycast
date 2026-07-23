@@ -14,8 +14,9 @@
 		"dev:web": "cd web && VITE_ALLOWED_PUBKEYS=89ef92b9ebe6dc1e4ea398f6477f227e95429627b0a33dc89b640e137b256be5 bun run dev",
 		"build": "cargo build --release --bin keycast",
 		"build:web": "cd web && bun run build",
-		"deploy:gcp": "gcloud builds submit --config=cloudbuild.yaml --project=openvine-co",
-		"deploy": "gcloud builds submit --config=cloudbuild.yaml --project=openvine-co",
+		"deploy:preflight": "./scripts/check-cloudbuild-context.sh",
+		"deploy:gcp": "bun run deploy:preflight && gcloud builds submit --config=cloudbuild.yaml --project=openvine-co",
+		"deploy": "bun run deploy:preflight && gcloud builds submit --config=cloudbuild.yaml --project=openvine-co",
 		"logs": "./scripts/view-logs.sh",
 		"logs:watch": "./scripts/logs-watch.sh",
 		"db:reset": "bun run deps:up && sqlx database reset -y --database-url postgres://postgres:password@localhost/keycast --source ./database/migrations",
@@ -28,7 +29,8 @@
 		"setup:hooks": "cp scripts/hooks/pre-push .git/hooks/ && chmod +x .git/hooks/pre-push",
 		"test": "(test -f master.key || ./scripts/generate_key.sh) && bun run deps:up && (docker exec keycast-postgres psql -U postgres -tc \"SELECT 1 FROM pg_database WHERE datname = 'keycast_test'\" | grep -q 1 || docker exec keycast-postgres createdb -U postgres keycast_test) && DATABASE_URL=${DATABASE_URL:-postgres://postgres:password@localhost:5432/keycast_test} cargo run --bin keycast -- --migrate && DATABASE_URL=${DATABASE_URL:-postgres://postgres:password@localhost:5432/keycast_test} REDIS_URL=${REDIS_URL:-redis://localhost:16379} TEST_REDIS_URL=${TEST_REDIS_URL:-redis://localhost:16379} cargo nextest run --workspace && DATABASE_URL=${DATABASE_URL:-postgres://postgres:password@localhost:5432/keycast_test} REDIS_URL=${REDIS_URL:-redis://localhost:16379} TEST_REDIS_URL=${TEST_REDIS_URL:-redis://localhost:16379} cargo test -p keycast_core --features integration-tests --lib && DATABASE_URL=${DATABASE_URL:-postgres://postgres:password@localhost:5432/keycast_test} REDIS_URL=${REDIS_URL:-redis://localhost:16379} TEST_REDIS_URL=${TEST_REDIS_URL:-redis://localhost:16379} cargo test -p keycast_api --features integration-tests --lib --tests && DATABASE_URL=${DATABASE_URL:-postgres://postgres:password@localhost:5432/keycast_test} REDIS_URL=${REDIS_URL:-redis://localhost:16379} TEST_REDIS_URL=${TEST_REDIS_URL:-redis://localhost:16379} cargo test -p keycast_signer --features integration-tests --lib --tests && TEST_REDIS_URL=${TEST_REDIS_URL:-redis://localhost:16379} cargo test -p cluster-hashring --lib -- --ignored",
 		"test:ci": "DATABASE_URL=${DATABASE_URL:-postgres://postgres:password@localhost:5432/keycast_test} REDIS_URL=${REDIS_URL:-redis://localhost:16379} TEST_REDIS_URL=${TEST_REDIS_URL:-redis://localhost:16379} cargo nextest run --workspace && DATABASE_URL=${DATABASE_URL:-postgres://postgres:password@localhost:5432/keycast_test} REDIS_URL=${REDIS_URL:-redis://localhost:16379} TEST_REDIS_URL=${TEST_REDIS_URL:-redis://localhost:16379} cargo test -p keycast_core --features integration-tests --lib && DATABASE_URL=${DATABASE_URL:-postgres://postgres:password@localhost:5432/keycast_test} REDIS_URL=${REDIS_URL:-redis://localhost:16379} TEST_REDIS_URL=${TEST_REDIS_URL:-redis://localhost:16379} cargo test -p keycast_api --features integration-tests --lib --tests && DATABASE_URL=${DATABASE_URL:-postgres://postgres:password@localhost:5432/keycast_test} REDIS_URL=${REDIS_URL:-redis://localhost:16379} TEST_REDIS_URL=${TEST_REDIS_URL:-redis://localhost:16379} cargo test -p keycast_signer --features integration-tests --lib --tests && TEST_REDIS_URL=${TEST_REDIS_URL:-redis://localhost:16379} cargo test -p cluster-hashring --lib -- --ignored",
-		"check": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets --all-features -- -D warnings -A deprecated && cargo test --workspace"
+		"test:deploy-preflight": "bash tests/scripts/check-cloudbuild-context-test.sh",
+		"check": "bun run test:deploy-preflight && cargo fmt --all -- --check && cargo clippy --workspace --all-targets --all-features -- -D warnings -A deprecated && cargo test --workspace"
 	},
 	"devDependencies": {
 		"concurrently": "^9.1.2",

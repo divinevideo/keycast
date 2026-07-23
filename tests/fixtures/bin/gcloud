@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$*" != "meta list-files-for-upload ." ]]; then
+	printf 'unexpected gcloud arguments: %s\n' "$*" >&2
+	exit 64
+fi
+
+printf '%s' "${FAKE_GCLOUD_OUTPUT:-}"
+exit "${FAKE_GCLOUD_STATUS:-0}"
