@@ -21,7 +21,7 @@ import { npubFromPubkey } from "$lib/utils/nostr";
 import { CaretRight } from "phosphor-svelte";
 import { toast } from "svelte-hot-french-toast";
 
-const { id, pubkey } = $page.params;
+const { id, pubkey } = $page.params as { id: string; pubkey: string };
 
 const api = new KeycastApi();
 const user = $derived(getCurrentUser());
