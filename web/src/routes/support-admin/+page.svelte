@@ -72,6 +72,10 @@
 		display_name: string | null;
 		vine_id: string | null;
 		has_personal_key: boolean;
+		status: string;
+		suspended_reason?: string | null;
+		verified_minor: boolean;
+		verified_minor_at?: string | null;
 		active_sessions: number;
 		created_at: string;
 		last_active: string | null;
@@ -131,6 +135,11 @@
 		} finally {
 			isSearching = false;
 		}
+	}
+
+	function accountStatusLabel(u: UserDetails): string {
+		const base = u.status.charAt(0).toUpperCase() + u.status.slice(1);
+		return u.suspended_reason ? `${base} (${u.suspended_reason})` : base;
 	}
 
 	function formatDate(iso: string): string {
@@ -370,6 +379,12 @@
 									{#if isSuggestedUser(u)}
 										<span class="suggested-badge">Suggested</span>
 									{/if}
+									{#if u.verified_minor}
+										<span class="flag-badge flag-minor">Minor</span>
+									{/if}
+									{#if u.status !== 'active'}
+										<span class="flag-badge" class:flag-suspended={u.status === 'suspended'} class:flag-banned={u.status === 'banned'}>{u.status}</span>
+									{/if}
 									<span class="list-sessions">{u.active_sessions} {u.active_sessions === 1 ? 'session' : 'sessions'}</span>
 								</button>
 
@@ -416,6 +431,14 @@
 											<div class="status-item" class:status-ok={u.active_sessions > 0} class:status-none={u.active_sessions === 0}>
 												<span>{u.active_sessions} active {u.active_sessions === 1 ? 'session' : 'sessions'}</span>
 											</div>
+											<div class="status-item" class:status-ok={u.status === 'active'} class:status-warn={u.status === 'suspended'} class:status-error={u.status === 'banned'}>
+												<span>{accountStatusLabel(u)}</span>
+											</div>
+											{#if u.verified_minor}
+												<div class="status-item status-warn">
+													<span>Protected minor{u.verified_minor_at ? ` (since ${formatDate(u.verified_minor_at)})` : ''}</span>
+												</div>
+											{/if}
 										</div>
 
 										<div class="user-fields">
@@ -867,6 +890,28 @@
 		flex-shrink: 0;
 	}
 
+	.flag-badge {
+		padding: 0.125rem 0.375rem;
+		border-radius: 9999px;
+		font-size: 0.65rem;
+		font-weight: 600;
+		line-height: 1.2;
+		text-transform: uppercase;
+		letter-spacing: 0.025em;
+		flex-shrink: 0;
+	}
+
+	.flag-minor,
+	.flag-suspended {
+		background: color-mix(in srgb, var(--color-divine-warning) 20%, transparent);
+		color: var(--color-divine-warning);
+	}
+
+	.flag-banned {
+		background: color-mix(in srgb, var(--color-divine-error) 20%, transparent);
+		color: var(--color-divine-error);
+	}
+
 	.email-match {
 		background: color-mix(in srgb, var(--color-divine-green) 20%, transparent);
 		color: var(--color-divine-green);
@@ -968,6 +1013,10 @@
 
 	.status-item.status-none {
 		color: var(--color-divine-text-tertiary);
+	}
+
+	.status-item.status-error {
+		color: var(--color-divine-error);
 	}
 
 	.status-neutral {
