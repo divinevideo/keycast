@@ -15,9 +15,9 @@ use crate::api::error::{ApiError, ApiResult};
 use crate::api::extractors::UcanAuth;
 use keycast_core::repositories::{
     test_redirect_pattern, AdminAuditEventRecord, AdminAuditEventRepository, AdminUserDetails,
-    AuthEventRepository, ClaimTokenRepository, FullAdminStatusRow, OAuthAuthorizationRepository,
-    RegisteredClient, RegisteredClientRepository, RepositoryError, UserRepository,
-    VerifiedMinorRow,
+    AdminUserLookup, AuthEventRepository, ClaimTokenRepository, FullAdminStatusRow,
+    OAuthAuthorizationRepository, RegisteredClient, RegisteredClientRepository, RepositoryError,
+    UserRepository, VerifiedMinorRow,
 };
 use keycast_core::types::claim_token::generate_claim_token;
 use keycast_core::types::user::UserStatus;
@@ -968,6 +968,33 @@ async fn await_name_promotion_within<T>(
     tokio::time::timeout(timeout, future).await.ok()
 }
 
+/// Combine a local admin lookup with the name server's resolution of the same handle.
+///
+/// The name server is authoritative for handles, so a local match is authoritative only when the
+/// name server confirms it. `resolved` is `Some` iff the name server returned a keycast account:
+/// - confirmed → that account is the sole authoritative match; every local row is demoted to a
+///   candidate below it.
+/// - not confirmed (`None`: timeout, transport error, unregistered handle, or a pubkey with no
+///   keycast account) → any local authoritative match is demoted too, so an unconfirmed stale
+///   `username` or a slow/unavailable name server cannot select the wrong account.
+///
+/// Demoted rows stay visible as candidates; nothing is hidden.
+fn apply_name_promotion(
+    local: AdminUserLookup,
+    resolved: Option<AdminUserLookup>,
+) -> AdminUserLookup {
+    if let Some(resolved) = resolved {
+        if resolved.authoritative_match {
+            return resolved.append_loose_results(local.demote_to_candidates());
+        }
+    }
+    if local.authoritative_match {
+        local.demote_to_candidates()
+    } else {
+        local
+    }
+}
+
 /// A support-lookup query reduced to its effective search string, plus whether it is a
 /// Divine-handle-shaped query eligible for authoritative name-server promotion.
 ///
@@ -1054,7 +1081,7 @@ fn canonicalize_lookup_query(raw: &str, nip05_domain: &str) -> CanonicalLookup {
 #[cfg(test)]
 mod user_lookup_response_tests {
     use super::{
-        authoritative_name_promotion_timeout, await_name_promotion_within,
+        apply_name_promotion, authoritative_name_promotion_timeout, await_name_promotion_within,
         canonicalize_lookup_query, should_fetch_email_suggestions, AdminUserDetails,
         CanonicalLookup, UserLookupDetails, UserLookupResponse, UserStatus,
         ADMIN_NAME_PROMOTION_TIMEOUT,
@@ -1177,23 +1204,19 @@ mod user_lookup_response_tests {
         assert!(!demoted.authoritative_match);
     }
 
-    #[test]
-    fn name_promotion_demotes_a_disagreeing_authoritative_local_match() {
-        // The name server resolved the handle to `canonical`; a local exact-username match
-        // `stale` disagrees. After demotion + merge only the name-server row is authoritative,
-        // so the stale local row can no longer shadow the real account.
-        let promoted = AdminUserLookup {
-            users: vec![lookup_details("canonical", true)],
+    fn authoritative(pubkey: &str) -> AdminUserLookup {
+        AdminUserLookup {
+            users: vec![lookup_details(pubkey, true)],
             authoritative_match: true,
             authoritative_count: 1,
-        };
-        let local = AdminUserLookup {
-            users: vec![lookup_details("stale", true)],
-            authoritative_match: true,
-            authoritative_count: 1,
-        };
+        }
+    }
 
-        let merged = promoted.append_loose_results(local.demote_to_candidates());
+    #[test]
+    fn apply_name_promotion_confirmed_demotes_a_disagreeing_local_match() {
+        // Name server resolved the handle to `canonical`; a local exact-username match `stale`
+        // disagrees. Only the name-server row stays authoritative; the stale local row is demoted.
+        let merged = apply_name_promotion(authoritative("stale"), Some(authoritative("canonical")));
 
         assert_eq!(merged.users[0].pubkey, "canonical");
         assert!(merged.users[0].authoritative);
@@ -1203,23 +1226,57 @@ mod user_lookup_response_tests {
     }
 
     #[test]
-    fn name_promotion_dedupes_when_name_server_agrees_with_local() {
-        let promoted = AdminUserLookup {
-            users: vec![lookup_details("same", true)],
-            authoritative_match: true,
-            authoritative_count: 1,
-        };
-        let local = AdminUserLookup {
-            users: vec![lookup_details("same", true)],
-            authoritative_match: true,
-            authoritative_count: 1,
-        };
-
-        let merged = promoted.append_loose_results(local.demote_to_candidates());
+    fn apply_name_promotion_confirmed_dedupes_when_it_agrees_with_local() {
+        let merged = apply_name_promotion(authoritative("same"), Some(authoritative("same")));
 
         assert_eq!(merged.users.len(), 1, "same pubkey should dedupe");
         assert!(merged.users[0].authoritative);
         assert_eq!(merged.authoritative_count, 1);
+    }
+
+    #[test]
+    fn apply_name_promotion_unconfirmed_demotes_a_local_authoritative_match() {
+        // `resolved == None` models a timeout / transport error / unregistered handle. A stale
+        // exact `username` must NOT stay authoritative just because the name server was too slow.
+        let result = apply_name_promotion(authoritative("stale"), None);
+
+        assert_eq!(result.users[0].pubkey, "stale");
+        assert!(
+            !result.users[0].authoritative,
+            "an unconfirmed local match must not claim authority"
+        );
+        assert!(!result.authoritative_match);
+        assert_eq!(result.authoritative_count, 0);
+    }
+
+    #[test]
+    fn apply_name_promotion_unconfirmed_leaves_non_authoritative_local_untouched() {
+        let loose = AdminUserLookup {
+            users: vec![lookup_details("loose", false)],
+            authoritative_match: false,
+            authoritative_count: 0,
+        };
+        let result = apply_name_promotion(loose, None);
+
+        assert_eq!(result.users.len(), 1);
+        assert!(!result.users[0].authoritative);
+        assert!(!result.authoritative_match);
+    }
+
+    #[test]
+    fn apply_name_promotion_non_keycast_resolution_demotes_local_authority() {
+        // Name server resolved the handle to a pubkey with no keycast account (empty, non-
+        // authoritative resolution) — still not a confirmation of the local match, so demote it.
+        let empty_resolution = AdminUserLookup {
+            users: vec![],
+            authoritative_match: false,
+            authoritative_count: 0,
+        };
+        let result = apply_name_promotion(authoritative("stale"), Some(empty_resolution));
+
+        assert_eq!(result.users[0].pubkey, "stale");
+        assert!(!result.users[0].authoritative);
+        assert!(!result.authoritative_match);
     }
 
     #[test]
@@ -1319,9 +1376,11 @@ pub async fn get_user_lookup(
     }
 
     // Reduce the several ways a Divine handle is written (@mjb, mjb.<domain>, mjb@<domain>) to the
-    // bare handle, and mark whether this is a handle-shaped query at all.
-    let nip05_domain = crate::api::http::auth::resolve_nip05_domain(&tenant.0.domain);
-    let canonical = canonicalize_lookup_query(q, &nip05_domain);
+    // bare handle, and mark whether this is a handle-shaped query. Canonicalize against the public
+    // handle domain (e.g. divine.video), NOT the tenant/login host (e.g. login.divine.video), or a
+    // qualified handle like `mjb@divine.video` would never reduce to `mjb`.
+    let handle_domain = crate::api::http::auth::public_handle_domain();
+    let canonical = canonicalize_lookup_query(q, &handle_domain);
 
     let user_repo = UserRepository::new(pool.clone());
     let mut lookup = user_repo
@@ -1330,11 +1389,11 @@ pub async fn get_user_lookup(
 
     // The Divine name server is authoritative for handles, so consult it for any handle-shaped
     // query even when a local row already matches: a stale local `username` must not shadow the
-    // real account. When the name server resolves to a keycast account, that account becomes the
-    // sole authoritative match and every local row is demoted to a candidate. Note `is_handle` is
-    // syntactic, so a local match on some other column (e.g. a coincidental `vine_id`) is demoted
-    // too; that is intentional — the name server owns a registered handle regardless — and the
-    // demoted row stays visible as a candidate rather than being hidden.
+    // real account. A local match is authoritative only when the name server CONFIRMS it (see
+    // `apply_name_promotion`); a timeout / error / unregistered handle demotes an unconfirmed local
+    // match rather than let it claim identity. Note `is_handle` is syntactic, so a local match on
+    // some other column (e.g. a coincidental `vine_id`) is subject to the same rule — intentional,
+    // the name server owns a registered handle regardless, and demoted rows stay visible.
     if canonical.is_handle && crate::divine_names::is_enabled() {
         let name_lookup = crate::divine_names::lookup_by_name(&canonical.query);
         let promoted_name =
@@ -1344,14 +1403,17 @@ pub async fn get_user_lookup(
                 Some(name_lookup.await)
             };
 
-        if let Some(Ok(Some(hex_pubkey))) = promoted_name {
-            let resolved_lookup = user_repo
-                .find_users_for_admin(&hex_pubkey, tenant_id)
-                .await?;
-            if resolved_lookup.authoritative_match {
-                lookup = resolved_lookup.append_loose_results(lookup.demote_to_candidates());
-            }
-        }
+        // Only a name-server response resolving to a keycast account confirms an identity; a
+        // timeout, transport error, or unregistered handle leaves us unconfirmed.
+        let resolved = match promoted_name {
+            Some(Ok(Some(hex_pubkey))) => Some(
+                user_repo
+                    .find_users_for_admin(&hex_pubkey, tenant_id)
+                    .await?,
+            ),
+            _ => None,
+        };
+        lookup = apply_name_promotion(lookup, resolved);
     }
 
     let suggested_users =

@@ -70,7 +70,7 @@ pub fn generate_secure_token() -> String {
 /// or `DOMAIN` override a real tenant would make verification fail (profile claims one host while
 /// discovery lives on another). Those env vars apply only when the tenant host is `localhost` or
 /// `127.0.0.1` (local dev), with `DEFAULT_NIP05_DOMAIN` as the final fallback.
-pub(crate) fn resolve_nip05_domain(tenant_domain: &str) -> String {
+fn resolve_nip05_domain(tenant_domain: &str) -> String {
     if tenant_domain == "localhost" || tenant_domain == "127.0.0.1" {
         return std::env::var("NIP05_DOMAIN")
             .ok()
@@ -79,6 +79,18 @@ pub(crate) fn resolve_nip05_domain(tenant_domain: &str) -> String {
             .unwrap_or_else(|| DEFAULT_NIP05_DOMAIN.to_string());
     }
     tenant_domain.to_string()
+}
+
+/// The public Divine handle domain — what NIP-05 handles and profile URLs use
+/// (`<handle>@divine.video`, `<handle>.divine.video`), independent of the per-request tenant/login
+/// host. The support lookup resolves *public* handles, so it must canonicalize against this domain,
+/// not `resolve_nip05_domain`'s tenant host (which is e.g. `login.divine.video` in production, so a
+/// query like `mjb@divine.video` would never be reduced to the handle `mjb`).
+pub(crate) fn public_handle_domain() -> String {
+    std::env::var("NIP05_DOMAIN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_NIP05_DOMAIN.to_string())
 }
 
 fn normalize_nip05_username(raw_username: &str) -> Result<String, AuthError> {

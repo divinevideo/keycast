@@ -1,11 +1,15 @@
-// ABOUTME: Integration coverage that the support lookup resolves the several Divine-handle forms
-// ABOUTME: (@mjb, mjb.<domain>, mjb@<domain>) through get_user_lookup's canonicalization (#49)
+// ABOUTME: A slow name-server response must not let a stale local username stay authoritative (#49)
+// ABOUTME: Own binary so it can enable the name server via env vars without racing other tests
 
 #![cfg(feature = "integration-tests")]
 
 mod common;
 
-use axum::extract::{Query, State};
+use axum::{
+    extract::{Query, State},
+    routing::get,
+    Json, Router,
+};
 use chrono::Utc;
 use keycast_api::{
     api::{
@@ -26,12 +30,57 @@ use keycast_core::{
 };
 use moka::future::Cache;
 use nostr_sdk::Keys;
+use serde_json::json;
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::TcpListener;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 const TENANT_ID: i64 = 1;
+
+// A nostr.json handler that responds only after well over the 250ms promotion budget, so the
+// support lookup times out waiting for it. It "resolves" the handle to a disagreeing owner.
+async fn slow_nostr_json(Query(params): Query<HashMap<String, String>>) -> Json<serde_json::Value> {
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let name = params.get("name").cloned().unwrap_or_default();
+    let disagreeing_owner = "1".repeat(64);
+    Json(json!({ "names": { name: disagreeing_owner } }))
+}
+
+async fn start_slow_name_server() -> String {
+    let app = Router::new().route("/.well-known/nostr.json", get(slow_nostr_json));
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    format!("http://{}", address)
+}
+
+struct EnvGuard {
+    key: &'static str,
+    previous: Option<String>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
 
 #[derive(Clone)]
 struct AuthConfig {
@@ -55,10 +104,6 @@ impl AuthConfig {
     }
 }
 
-// Production-shaped: the login/tenant host is `login.divine.video`, but public handles live at
-// `divine.video`. Canonicalization must use the public handle domain, NOT the tenant host, or
-// `mjb@divine.video` / `mjb.divine.video` would never reduce to `mjb`. This test fails if the
-// lookup canonicalizes against the tenant host.
 fn create_test_tenant() -> TenantExtractor {
     TenantExtractor(Arc::new(Tenant {
         id: TENANT_ID,
@@ -108,19 +153,6 @@ fn create_test_auth_state(pool: PgPool) -> AuthState {
     }
 }
 
-async fn lookup_pubkeys(pool: &PgPool, q: &str) -> Vec<String> {
-    let resp = get_user_lookup(
-        create_test_tenant(),
-        State(create_test_auth_state(pool.clone())),
-        AuthConfig::full_admin().into_auth(),
-        Query(UserLookupQuery { q: q.to_string() }),
-    )
-    .await
-    .expect("full admin lookup should succeed")
-    .0;
-    resp.results.into_iter().map(|u| u.pubkey).collect()
-}
-
 async fn cleanup_user(pool: &PgPool, pubkey: &str) {
     sqlx::query("DELETE FROM users WHERE pubkey = $1")
         .bind(pubkey)
@@ -130,12 +162,16 @@ async fn cleanup_user(pool: &PgPool, pubkey: &str) {
 }
 
 #[tokio::test]
-async fn lookup_resolves_divine_handle_forms_to_the_same_account() {
+async fn slow_name_server_demotes_a_stale_local_username() {
+    let base_url = start_slow_name_server().await;
+    let _server = EnvGuard::set("DIVINE_NAME_SERVER_URL", &base_url);
+    let _enable = EnvGuard::set("ENABLE_DIVINE_NAMES", "1");
+
     let pool = common::setup_test_db().await;
     let pubkey = Keys::generate().public_key().to_hex();
-    // Simple (hyphen-free) suffix keeps the handle unambiguous under the query's normalization.
     let handle = format!("mjb{}", Uuid::new_v4().simple());
 
+    // A local account whose username exactly matches the handle — an authoritative local match.
     sqlx::query(
         "INSERT INTO users (pubkey, tenant_id, username, created_at, updated_at) \
          VALUES ($1, $2, $3, NOW(), NOW())",
@@ -147,28 +183,28 @@ async fn lookup_resolves_divine_handle_forms_to_the_same_account() {
     .await
     .unwrap();
 
-    // Every way support/users write the handle must resolve to the same account. The name server
-    // is disabled in the test env, so these exercise the canonicalization -> local-username path.
-    for form in [
-        handle.clone(),                    // bare
-        format!("@{handle}"),              // @handle
-        format!("{handle}.divine.video"),  // profile-URL / subdomain
-        format!("@{handle}.divine.video"), // @handle.domain
-        format!("{handle}@divine.video"),  // NIP-05 email form
-    ] {
-        let pubkeys = lookup_pubkeys(&pool, &form).await;
-        assert!(
-            pubkeys.contains(&pubkey),
-            "handle form `{form}` should resolve to the seeded account"
-        );
-    }
+    let resp = get_user_lookup(
+        create_test_tenant(),
+        State(create_test_auth_state(pool.clone())),
+        AuthConfig::full_admin().into_auth(),
+        Query(UserLookupQuery { q: handle.clone() }),
+    )
+    .await
+    .expect("full admin lookup should succeed")
+    .0;
 
-    // An unrelated email at another domain must stay on the email path, not resolve to the handle.
-    let unrelated = lookup_pubkeys(&pool, "someone-else@example.com").await;
+    // The name server was too slow to confirm the handle, so the stale local row stays visible but
+    // must NOT be presented as the authoritative identity match.
+    let row = resp
+        .results
+        .iter()
+        .find(|u| u.pubkey == pubkey)
+        .expect("stale local row should still be visible as a candidate");
     assert!(
-        !unrelated.contains(&pubkey),
-        "an unrelated email must not resolve to the seeded handle account"
+        !row.authoritative,
+        "a slow name server must not leave a stale local username authoritative"
     );
+    assert!(!resp.authoritative_match);
 
     cleanup_user(&pool, &pubkey).await;
 }
