@@ -915,6 +915,11 @@ pub struct UserLookupDetails {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suspended_reason: Option<String>,
+    /// Approved protected-minor (13-15) flag. Terminal age-review signal; the in-review
+    /// state lives in relay-manager, not keycast.
+    pub verified_minor: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified_minor_at: Option<String>,
     pub active_sessions: i64,
     pub created_at: String,
     pub last_active: Option<String>,
@@ -947,6 +952,8 @@ async fn enrich_user_lookup_details(
         has_personal_key: details.has_personal_key,
         status: details.status.as_str().to_string(),
         suspended_reason: details.suspended_reason,
+        verified_minor: details.verified_minor,
+        verified_minor_at: details.verified_minor_at.map(|at| at.to_rfc3339()),
         active_sessions: sessions.len() as i64,
         created_at: details.created_at.to_rfc3339(),
         last_active,
@@ -996,6 +1003,8 @@ mod user_lookup_response_tests {
             has_personal_key: false,
             status: UserStatus::Active,
             suspended_reason: None,
+            verified_minor: false,
+            verified_minor_at: None,
             created_at: now,
             updated_at: now,
         }
@@ -1044,6 +1053,8 @@ mod user_lookup_response_tests {
             has_personal_key: false,
             status: "active".to_string(),
             suspended_reason: None,
+            verified_minor: false,
+            verified_minor_at: None,
             active_sessions: 0,
             created_at: "2026-07-17T12:00:00+00:00".to_string(),
             last_active: None,

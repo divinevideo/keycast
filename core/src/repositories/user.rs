@@ -86,6 +86,11 @@ pub struct AdminUserDetails {
     pub has_personal_key: bool,
     pub status: UserStatus,
     pub suspended_reason: Option<String>,
+    // Selected by every admin-lookup query (deliberately no `#[sqlx(default)]`, unlike
+    // `authoritative` which is computed post-fetch): a query that forgets these columns
+    // must fail loudly rather than silently report a minor as non-minor.
+    pub verified_minor: bool,
+    pub verified_minor_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -123,6 +128,8 @@ const ADMIN_EMAIL_SUGGESTION_QUERY: &str = "SELECT
         (pk.user_pubkey IS NOT NULL) as \"has_personal_key\",
         u.status,
         u.suspended_reason,
+        u.verified_minor,
+        u.verified_minor_at,
         u.created_at,
         u.updated_at
      FROM users u
@@ -2232,6 +2239,8 @@ impl UserRepository {
                 (pk.user_pubkey IS NOT NULL) as \"has_personal_key\",
                 u.status,
                 u.suspended_reason,
+                u.verified_minor,
+                u.verified_minor_at,
                 u.created_at,
                 u.updated_at
              FROM users u
@@ -2327,6 +2336,8 @@ impl UserRepository {
                 (pk.user_pubkey IS NOT NULL) as \"has_personal_key\",
                 u.status,
                 u.suspended_reason,
+                u.verified_minor,
+                u.verified_minor_at,
                 u.created_at,
                 u.updated_at
              FROM users u
@@ -2729,6 +2740,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_find_users_for_admin_surfaces_verified_minor() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let suffix = test_suffix();
+
+        let pubkey = Keys::generate().public_key().to_hex();
+        let username = format!("minoruser-{}", suffix);
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, username, verified_minor, verified_minor_at, created_at, updated_at) \
+             VALUES ($1, 1, $2, TRUE, NOW(), NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .bind(&username)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let results = repo.find_users_for_admin(&username, 1).await.unwrap().users;
+        assert_eq!(results.len(), 1, "should find the verified-minor user");
+        assert!(
+            results[0].verified_minor,
+            "admin lookup must surface verified_minor so support sees the terminal age-review state"
+        );
+        assert!(
+            results[0].verified_minor_at.is_some(),
+            "verified_minor_at should accompany a set flag"
+        );
+
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
     async fn test_find_users_for_admin_merges_email_contains_with_username_matches() {
         let pool = setup_pool().await;
         let repo = UserRepository::new(pool.clone());
@@ -3063,6 +3106,8 @@ mod tests {
                 tenant_id BIGINT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'active',
                 suspended_reason TEXT,
+                verified_minor BOOLEAN NOT NULL DEFAULT FALSE,
+                verified_minor_at TIMESTAMPTZ,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )",
