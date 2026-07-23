@@ -334,9 +334,9 @@
 							</div>
 						</div>
 					{:else if resultsBanner}
-						<div class="results-banner" class:warning={searchResult.total >= 20}>
-							{#if searchResult.total >= 20}<Warning size={14} />{/if}
-							<span>{resultsBanner}</span>
+						<div class="results-banner" class:warning={resultsBanner.warning}>
+							{#if resultsBanner.warning}<Warning size={14} />{/if}
+							<span>{resultsBanner.text}</span>
 						</div>
 					{/if}
 

@@ -21,7 +21,13 @@ import { npubFromPubkey } from "$lib/utils/nostr";
 import { CaretRight } from "phosphor-svelte";
 import { toast } from "svelte-hot-french-toast";
 
-const { id, pubkey } = $page.params as { id: string; pubkey: string };
+function requiredRouteParam(value: string | undefined, name: string): string {
+    if (!value) throw new Error(`Missing route param: ${name}`);
+    return value;
+}
+
+const id = requiredRouteParam($page.params.id, "id");
+const pubkey = requiredRouteParam($page.params.pubkey, "pubkey");
 
 const api = new KeycastApi();
 const user = $derived(getCurrentUser());

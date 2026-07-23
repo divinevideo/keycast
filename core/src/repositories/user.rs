@@ -194,20 +194,22 @@ fn closest_email_edit_distance(query: &str, email: &str, maximum: usize) -> Opti
         return (distance <= maximum).then_some(distance);
     }
 
-    let shortest_window = query.len().saturating_sub(maximum).max(1);
-    let longest_window = (query.len() + maximum).min(email.len());
-    let mut closest = None;
+    let mut previous = vec![0; email.len() + 1];
+    let mut current = vec![0; email.len() + 1];
 
-    for window_length in shortest_window..=longest_window {
-        for window in email.windows(window_length) {
-            let distance = edit_distance(&query, window);
-            if distance <= maximum && closest.is_none_or(|current| distance < current) {
-                closest = Some(distance);
-            }
+    for (query_index, query_character) in query.iter().enumerate() {
+        current[0] = query_index + 1;
+        for (email_index, email_character) in email.iter().enumerate() {
+            let substitution_cost = usize::from(query_character != email_character);
+            current[email_index + 1] = (current[email_index] + 1)
+                .min(previous[email_index + 1] + 1)
+                .min(previous[email_index] + substitution_cost);
         }
+        std::mem::swap(&mut previous, &mut current);
     }
 
-    closest
+    let distance = previous.iter().copied().min().unwrap_or(query.len());
+    (distance <= maximum).then_some(distance)
 }
 
 #[cfg(test)]
@@ -2603,6 +2605,19 @@ mod tests {
         uuid::Uuid::new_v4().to_string()[..8].to_string()
     }
 
+    fn plan_mentions_index(plan: &serde_json::Value, index_name: &str) -> bool {
+        match plan {
+            serde_json::Value::Array(values) => values
+                .iter()
+                .any(|value| plan_mentions_index(value, index_name)),
+            serde_json::Value::Object(values) => values.iter().any(|(key, value)| {
+                (key == "Index Name" && value.as_str() == Some(index_name))
+                    || plan_mentions_index(value, index_name)
+            }),
+            _ => false,
+        }
+    }
+
     async fn create_test_team(pool: &PgPool, name: &str) -> i32 {
         let result: (i32,) = sqlx::query_as(
             "INSERT INTO teams (name, tenant_id, created_at, updated_at)
@@ -3151,24 +3166,40 @@ mod tests {
     async fn test_suggest_users_for_admin_uses_the_email_trigram_index() {
         let pool = setup_pool().await;
         let mut transaction = pool.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, created_at, updated_at)
+             SELECT
+                md5('admin-email-trgm-noise-' || value)::text || md5('admin-email-trgm-suffix-' || value)::text,
+                1,
+                'noise-' || value || '@example.com',
+                NOW(),
+                NOW()
+             FROM generate_series(1, 20000) value",
+        )
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, created_at, updated_at)
+             VALUES (
+                md5('admin-email-trgm-match')::text || md5('admin-email-trgm-match-suffix')::text,
+                1,
+                'socialpublishcommunity@example.com',
+                NOW(),
+                NOW()
+             )",
+        )
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        sqlx::query("ANALYZE users")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
         sqlx::query("SET LOCAL enable_seqscan = off")
             .execute(&mut *transaction)
             .await
             .unwrap();
-        sqlx::query(
-            "CREATE TEMP TABLE admin_email_index_probe (email TEXT)
-             ON COMMIT DROP",
-        )
-        .execute(&mut *transaction)
-        .await
-        .unwrap();
-        sqlx::query(
-            "CREATE INDEX admin_email_index_probe_trgm
-             ON admin_email_index_probe USING gin (email gin_trgm_ops)",
-        )
-        .execute(&mut *transaction)
-        .await
-        .unwrap();
         sqlx::query_scalar::<_, String>(
             "SELECT set_config('pg_trgm.word_similarity_threshold', $1, true)",
         )
@@ -3177,19 +3208,19 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(ADMIN_EMAIL_SUGGESTION_QUERY.contains("u.email %> $1"));
-        let plan: serde_json::Value = sqlx::query_scalar(
-            "EXPLAIN (FORMAT JSON)
-             SELECT email FROM admin_email_index_probe WHERE email %> $1",
-        )
-        .bind("publish")
-        .fetch_one(&mut *transaction)
-        .await
-        .unwrap();
+        let explain_sql = format!("EXPLAIN (FORMAT JSON) {ADMIN_EMAIL_SUGGESTION_QUERY}");
+        let plan: serde_json::Value = sqlx::query_scalar(&explain_sql)
+            .bind("publish")
+            .bind(1_i64)
+            .bind(ADMIN_EMAIL_SUGGESTION_MIN_WORD_SIMILARITY)
+            .bind(ADMIN_EMAIL_SUGGESTION_CANDIDATE_LIMIT)
+            .fetch_one(&mut *transaction)
+            .await
+            .unwrap();
 
         assert!(
-            plan.to_string().contains("admin_email_index_probe_trgm"),
-            "the production word-similarity operator should use gin_trgm_ops: {plan}"
+            plan_mentions_index(&plan, "idx_users_email_trgm"),
+            "the production suggestion query should use idx_users_email_trgm: {plan}"
         );
     }
 

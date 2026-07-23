@@ -10,6 +10,11 @@ export interface LookupResult<User> {
 
 export type LookupMatchKind = "authoritative" | "partial" | "fuzzy";
 
+export interface LookupResultsBanner {
+	text: string;
+	warning: boolean;
+}
+
 export interface EmailMatchPart {
 	text: string;
 	matched: boolean;
@@ -184,11 +189,6 @@ export function matchKindLabel(user: { match_kind: LookupMatchKind }): string | 
 	return null;
 }
 
-/** Report whether one lookup row is a loose or fuzzy suggestion. */
-export function isSuggestedUser(user: { match_kind: LookupMatchKind }): boolean {
-	return user.match_kind !== "authoritative";
-}
-
 /** Report whether the displayed rows came from the fuzzy suggestion fallback. */
 export function isShowingDidYouMean<User extends { match_kind: LookupMatchKind }>(
 	result: LookupResult<User> | null,
@@ -207,17 +207,24 @@ export function isShowingDidYouMean<User extends { match_kind: LookupMatchKind }
 /** Select banner copy using the combined, de-duplicated row count. */
 export function lookupResultsBanner<
 	User extends { pubkey: string; match_kind: LookupMatchKind },
->(result: LookupResult<User> | null): string | null {
+>(result: LookupResult<User> | null): LookupResultsBanner | null {
 	if (!result) return null;
-	if (result.total >= 20) return "Showing first 20 of many results — refine your search";
 	const displayedCount = selectDisplayedUsers(result).length;
-	return displayedCount > 1 ? `${displayedCount} users found` : null;
+	if (result.total >= 20) {
+		return {
+			text: `Showing first ${displayedCount} of many results — refine your search`,
+			warning: true
+		};
+	}
+	return displayedCount > 1 ? { text: `${displayedCount} users found`, warning: false } : null;
 }
 
 /** Select a lone authoritative result for automatic expansion. */
-export function selectAutoExpandedPubkey<User extends { pubkey: string }>(
+export function selectAutoExpandedPubkey<
+	User extends { pubkey: string; match_kind: LookupMatchKind },
+>(
 	result: LookupResult<User> | null
 ): string | null {
 	if (!result?.authoritative_match || result.authoritative_count !== 1) return null;
-	return result.results[0]?.pubkey ?? null;
+	return result.results.find((user) => user.match_kind === "authoritative")?.pubkey ?? null;
 }

@@ -3,7 +3,6 @@ import {
     emailMatchParts,
     emailSuggestionDiff,
     isShowingDidYouMean,
-    isSuggestedUser,
     lookupResultsBanner,
     matchKindLabel,
     selectAutoExpandedPubkey,
@@ -85,6 +84,19 @@ describe("support admin user lookup view", () => {
             row("partial"),
             row("fuzzy", "fuzzy"),
         ]);
+        expect(selectAutoExpandedPubkey(result)).toBe("authoritative");
+    });
+
+    test("does not auto-expand when multiple authoritative users match", () => {
+        const result = {
+            results: [row("a", "authoritative"), row("b", "authoritative")],
+            suggestions: [row("c", "fuzzy")],
+            total: 2,
+            authoritative_match: true,
+            authoritative_count: 2,
+        };
+
+        expect(selectAutoExpandedPubkey(result)).toBeNull();
     });
 
     test("auto-expands a lone authoritative result", () => {
@@ -114,7 +126,22 @@ describe("support admin user lookup view", () => {
             authoritative_count: 0,
         };
 
-        expect(lookupResultsBanner(result)).toBe("2 users found");
+        expect(lookupResultsBanner(result)).toEqual({ text: "2 users found", warning: false });
+    });
+
+    test("reports the actual displayed row count when capped results include suggestions", () => {
+        const result = {
+            results: Array.from({ length: 20 }, (_, index) => row(`partial-${index}`)),
+            suggestions: [row("fuzzy", "fuzzy")],
+            total: 20,
+            authoritative_match: false,
+            authoritative_count: 0,
+        };
+
+        expect(lookupResultsBanner(result)).toEqual({
+            text: "Showing first 21 of many results — refine your search",
+            warning: true,
+        });
     });
 
     test("auto-expands one authoritative result ahead of loose candidates", () => {
@@ -127,8 +154,8 @@ describe("support admin user lookup view", () => {
         };
 
         expect(selectAutoExpandedPubkey(result)).toBe("authoritative");
-        expect(isSuggestedUser(result.results[0])).toBe(false);
-        expect(isSuggestedUser(result.results[1])).toBe(true);
+        expect(matchKindLabel(result.results[0])).toBeNull();
+        expect(matchKindLabel(result.results[1])).toBe("Partial match");
     });
 
     test("marks a lone non-authoritative result as suggested without auto-expanding it", () => {
@@ -141,7 +168,7 @@ describe("support admin user lookup view", () => {
         };
 
         expect(selectDisplayedUsers(result)).toEqual([row("a")]);
-        expect(isSuggestedUser(result.results[0])).toBe(true);
+        expect(matchKindLabel(result.results[0])).toBe("Partial match");
         expect(isShowingDidYouMean(result, "partial")).toBe(false);
         expect(selectAutoExpandedPubkey(result)).toBeNull();
     });
@@ -156,7 +183,7 @@ describe("support admin user lookup view", () => {
         };
 
         expect(selectDisplayedUsers(result)).toEqual([row("c", "fuzzy")]);
-        expect(isSuggestedUser(result.suggestions[0])).toBe(true);
+        expect(matchKindLabel(result.suggestions[0])).toBe("Possible typo");
         expect(isShowingDidYouMean(result, "typo@example.com")).toBe(true);
         expect(isShowingDidYouMean(result, "typo-fragment")).toBe(false);
         expect(selectAutoExpandedPubkey(result)).toBeNull();
