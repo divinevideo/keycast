@@ -161,6 +161,20 @@ pub fn validate_minor_encrypt(
     }
 }
 
+/// Gate the recipient tags of an already-parsed NIP-17 rumor.
+///
+/// This is used when Keycast composes the kind-13 seal itself: the normal
+/// verified-minor sign gate learns the rumor recipients by decrypting the
+/// client-composed seal, while the server-composed path already has the raw
+/// rumor and can validate its tags directly. Zero `p` tags remains valid
+/// because the actual encryption recipient is checked separately.
+pub fn validate_minor_rumor_recipients(
+    user_pubkey: &PublicKey,
+    rumor: &UnsignedEvent,
+) -> Result<(), MinorDmDenied> {
+    validate_p_tags_approved(user_pubkey, rumor.tags.as_slice())
+}
+
 /// Gate for `sign_event`: refuse DM-shaped events whose recipients fall
 /// outside the approved set. Non-DM kinds pass through untouched.
 ///
@@ -383,6 +397,56 @@ mod tests {
         assert_eq!(
             validate_minor_encrypt(&user.public_key(), &mallory.public_key()),
             Err(MinorDmDenied::RecipientNotApproved)
+        );
+    }
+
+    // -- already-parsed NIP-17 rumor gate -------------------------------------
+
+    #[test]
+    fn raw_rumor_to_pinned_official_and_self_is_allowed() {
+        let user = Keys::generate();
+        let rumor = dm_shaped_event(14, &user, &[hq_pubkey(), user.public_key()]);
+
+        assert_eq!(
+            validate_minor_rumor_recipients(&user.public_key(), &rumor),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn raw_rumor_with_unapproved_recipient_is_refused() {
+        let user = Keys::generate();
+        let mallory = Keys::generate();
+        let rumor = dm_shaped_event(14, &user, &[hq_pubkey(), mallory.public_key()]);
+
+        assert_eq!(
+            validate_minor_rumor_recipients(&user.public_key(), &rumor),
+            Err(MinorDmDenied::RecipientNotApproved)
+        );
+    }
+
+    #[test]
+    fn raw_rumor_with_malformed_recipient_is_refused_fail_closed() {
+        let user = Keys::generate();
+        let malformed = Tag::custom(TagKind::custom("p"), ["not-a-valid-pubkey"]);
+        let rumor = EventBuilder::new(Kind::PrivateDirectMessage, "hello")
+            .tags([malformed])
+            .build(user.public_key());
+
+        assert_eq!(
+            validate_minor_rumor_recipients(&user.public_key(), &rumor),
+            Err(MinorDmDenied::RecipientUnresolvable)
+        );
+    }
+
+    #[test]
+    fn raw_rumor_without_p_tags_is_allowed() {
+        let user = Keys::generate();
+        let rumor = dm_shaped_event(14, &user, &[]);
+
+        assert_eq!(
+            validate_minor_rumor_recipients(&user.public_key(), &rumor),
+            Ok(())
         );
     }
 
