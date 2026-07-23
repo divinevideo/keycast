@@ -1005,13 +1005,18 @@ mod user_lookup_response_tests {
         UserStatus, ADMIN_NAME_PROMOTION_TIMEOUT,
     };
     use chrono::Utc;
-    use keycast_core::repositories::AdminUserLookup;
+    use keycast_core::repositories::{AdminUserLookup, AdminUserMatchKind};
 
     fn lookup_details(pubkey: &str, authoritative: bool) -> AdminUserDetails {
         let now = Utc::now();
         AdminUserDetails {
             pubkey: pubkey.to_string(),
             authoritative,
+            match_kind: if authoritative {
+                AdminUserMatchKind::Authoritative
+            } else {
+                AdminUserMatchKind::Partial
+            },
             email: None,
             email_verified: None,
             username: None,

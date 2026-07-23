@@ -72,12 +72,28 @@ pub struct PendingEmailChange {
     pub pending_email_new_confirmed_at: Option<DateTime<Utc>>,
 }
 
+/// Provenance of an admin lookup row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminUserMatchKind {
+    /// Exact email, username, Vine ID, npub, or hex-pubkey match.
+    Authoritative,
+    /// Literal email substring or username-prefix match.
+    #[default]
+    Partial,
+    /// Typo-near email match retained by the bounded fuzzy filter.
+    Fuzzy,
+}
+
 /// User details returned by admin lookup.
 #[derive(Debug, FromRow)]
 pub struct AdminUserDetails {
     pub pubkey: String,
     #[sqlx(default)]
     pub authoritative: bool,
+    /// How this row matched the admin's query.
+    #[sqlx(skip)]
+    pub match_kind: AdminUserMatchKind,
     pub email: Option<String>,
     pub email_verified: Option<bool>,
     pub username: Option<String>,
@@ -106,8 +122,8 @@ pub struct AdminUserLookup {
 /// Maximum number of primary users returned by one admin lookup.
 pub const ADMIN_USER_LOOKUP_LIMIT: usize = 20;
 
-/// Minimum trigram similarity used to select plausible email suggestions.
-const ADMIN_EMAIL_SUGGESTION_MIN_SIMILARITY: f32 = 0.5;
+/// Minimum word similarity used to select plausible email suggestions.
+const ADMIN_EMAIL_SUGGESTION_MIN_WORD_SIMILARITY: f32 = 0.2;
 
 /// Maximum edit distance allowed between an admin query and a suggested email.
 const ADMIN_EMAIL_SUGGESTION_MAX_EDIT_DISTANCE: usize = 2;
@@ -135,10 +151,10 @@ const ADMIN_EMAIL_SUGGESTION_QUERY: &str = "SELECT
      FROM users u
      LEFT JOIN personal_keys pk ON pk.user_pubkey = u.pubkey AND pk.tenant_id = u.tenant_id
      WHERE u.email IS NOT NULL
-       AND u.email % $1
-       AND similarity(u.email, $1) >= $3
+       AND u.email %> $1
+       AND word_similarity($1, u.email) >= $3
        AND u.tenant_id = $2
-     ORDER BY similarity(u.email, $1) DESC, u.pubkey
+     ORDER BY word_similarity($1, u.email) DESC, LOWER(u.email), u.pubkey
      LIMIT $4";
 
 fn escape_like_pattern(value: &str) -> String {
@@ -148,13 +164,7 @@ fn escape_like_pattern(value: &str) -> String {
         .replace('_', "\\_")
 }
 
-fn is_within_edit_distance(left: &str, right: &str, maximum: usize) -> bool {
-    let left = left.chars().collect::<Vec<_>>();
-    let right = right.chars().collect::<Vec<_>>();
-    if left.len().abs_diff(right.len()) > maximum {
-        return false;
-    }
-
+fn edit_distance(left: &[char], right: &[char]) -> usize {
     let mut previous = (0..=right.len()).collect::<Vec<_>>();
     let mut current = vec![0; right.len() + 1];
 
@@ -169,13 +179,97 @@ fn is_within_edit_distance(left: &str, right: &str, maximum: usize) -> bool {
         std::mem::swap(&mut previous, &mut current);
     }
 
-    previous[right.len()] <= maximum
+    previous[right.len()]
+}
+
+fn closest_email_edit_distance(query: &str, email: &str, maximum: usize) -> Option<usize> {
+    let query = query.chars().collect::<Vec<_>>();
+    let email = email.chars().collect::<Vec<_>>();
+
+    if query.contains(&'@') {
+        if query.len().abs_diff(email.len()) > maximum {
+            return None;
+        }
+        let distance = edit_distance(&query, &email);
+        return (distance <= maximum).then_some(distance);
+    }
+
+    let shortest_window = query.len().saturating_sub(maximum).max(1);
+    let longest_window = (query.len() + maximum).min(email.len());
+    let mut closest = None;
+
+    for window_length in shortest_window..=longest_window {
+        for window in email.windows(window_length) {
+            let distance = edit_distance(&query, window);
+            if distance <= maximum && closest.is_none_or(|current| distance < current) {
+                closest = Some(distance);
+            }
+        }
+    }
+
+    closest
+}
+
+#[cfg(test)]
+mod admin_email_match_unit_tests {
+    use super::{
+        closest_email_edit_distance, merge_admin_lookup_candidates, ADMIN_USER_LOOKUP_LIMIT,
+    };
+
+    #[test]
+    fn partial_query_uses_the_closest_email_substring() {
+        assert_eq!(
+            closest_email_edit_distance("publish", "socialpulishllc@gmail.com", 2),
+            Some(1)
+        );
+        assert_eq!(
+            closest_email_edit_distance("publish", "unrelated@gmail.com", 2),
+            None
+        );
+        assert_eq!(
+            closest_email_edit_distance("mañana", "hola-mañna@example.com", 2),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn lookup_merge_ranks_tiers_and_deduplicates_pubkeys() {
+        let merged = merge_admin_lookup_candidates(
+            vec!["authoritative"],
+            vec!["partial-primary", "duplicate"],
+            vec!["partial-email", "duplicate"],
+            vec!["fuzzy", "authoritative"],
+            |pubkey| *pubkey,
+        );
+
+        assert_eq!(
+            merged,
+            vec![
+                "authoritative",
+                "partial-primary",
+                "partial-email",
+                "duplicate",
+                "fuzzy"
+            ]
+        );
+    }
+
+    #[test]
+    fn lookup_merge_does_not_let_fuzzy_rows_exceed_the_overall_cap() {
+        let partial = (0..ADMIN_USER_LOOKUP_LIMIT).collect::<Vec<_>>();
+        let merged =
+            merge_admin_lookup_candidates(vec![], partial, vec![], vec![usize::MAX], |key| *key);
+
+        assert_eq!(merged.len(), ADMIN_USER_LOOKUP_LIMIT);
+        assert!(!merged.contains(&usize::MAX));
+    }
 }
 
 fn merge_admin_lookup_candidates<T, K>(
     authoritative: Vec<T>,
     primary_loose: Vec<T>,
     email_loose: Vec<T>,
+    fuzzy: Vec<T>,
     key: impl Fn(&T) -> K,
 ) -> Vec<T>
 where
@@ -220,13 +314,32 @@ where
         }
     }
 
+    for candidate in fuzzy {
+        if candidates.len() == ADMIN_USER_LOOKUP_LIMIT {
+            break;
+        }
+        if seen.insert(key(&candidate)) {
+            candidates.push(candidate);
+        }
+    }
+
     candidates
 }
 
 impl AdminUserLookup {
     /// Append de-duplicated loose results while preserving authoritative metadata.
     pub fn append_loose_results(mut self, loose: Self) -> Self {
-        self.users = merge_admin_lookup_candidates(self.users, loose.users, vec![], |user| {
+        let mut authoritative = Vec::new();
+        let mut partial = Vec::new();
+        let mut fuzzy = Vec::new();
+        for user in self.users.into_iter().chain(loose.users) {
+            match user.match_kind {
+                AdminUserMatchKind::Authoritative => authoritative.push(user),
+                AdminUserMatchKind::Partial => partial.push(user),
+                AdminUserMatchKind::Fuzzy => fuzzy.push(user),
+            }
+        }
+        self.users = merge_admin_lookup_candidates(authoritative, partial, vec![], fuzzy, |user| {
             user.pubkey.clone()
         });
         self.authoritative_count = self.users.iter().filter(|user| user.authoritative).count();
@@ -2217,6 +2330,7 @@ impl UserRepository {
             authoritative_pubkeys,
             primary_loose_pubkeys,
             email_loose_pubkeys,
+            vec![],
             Clone::clone,
         );
 
@@ -2255,6 +2369,11 @@ impl UserRepository {
 
         for row in &mut rows {
             row.authoritative = authoritative_pubkey_set.contains(row.pubkey.as_str());
+            row.match_kind = if row.authoritative {
+                AdminUserMatchKind::Authoritative
+            } else {
+                AdminUserMatchKind::Partial
+            };
         }
         let authoritative_count = rows.iter().filter(|row| row.authoritative).count();
 
@@ -2265,7 +2384,10 @@ impl UserRepository {
         })
     }
 
-    /// Suggest users whose emails are trigram-similar to an admin query.
+    /// Suggest users whose emails contain a typo-near match for an admin query.
+    ///
+    /// PostgreSQL word similarity supplies a bounded candidate set, then an edit-distance filter
+    /// retains only full-address or closest-substring matches within two edits.
     ///
     /// Short queries, npubs, and 64-character hex pubkeys return no suggestions.
     ///
@@ -2284,29 +2406,47 @@ impl UserRepository {
         }
 
         let normalized_query = query.to_lowercase();
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query_scalar::<_, String>(
+            "SELECT set_config('pg_trgm.word_similarity_threshold', $1, true)",
+        )
+        .bind(ADMIN_EMAIL_SUGGESTION_MIN_WORD_SIMILARITY.to_string())
+        .fetch_one(&mut *transaction)
+        .await?;
         let rows: Result<Vec<AdminUserDetails>, sqlx::Error> =
             sqlx::query_as(ADMIN_EMAIL_SUGGESTION_QUERY)
                 .bind(&normalized_query)
                 .bind(tenant_id)
-                .bind(ADMIN_EMAIL_SUGGESTION_MIN_SIMILARITY)
+                .bind(ADMIN_EMAIL_SUGGESTION_MIN_WORD_SIMILARITY)
                 .bind(ADMIN_EMAIL_SUGGESTION_CANDIDATE_LIMIT)
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *transaction)
                 .await;
 
         match rows {
-            Ok(rows) => Ok(rows
-                .into_iter()
-                .filter(|user| {
-                    user.email.as_ref().is_some_and(|email| {
-                        is_within_edit_distance(
+            Ok(rows) => {
+                let mut close_rows = rows
+                    .into_iter()
+                    .filter_map(|mut user| {
+                        let distance = closest_email_edit_distance(
                             &normalized_query,
-                            &email.to_lowercase(),
+                            &user.email.as_ref()?.to_lowercase(),
                             ADMIN_EMAIL_SUGGESTION_MAX_EDIT_DISTANCE,
-                        )
+                        )?;
+                        (distance > 0).then(|| {
+                            user.authoritative = false;
+                            user.match_kind = AdminUserMatchKind::Fuzzy;
+                            (distance, user)
+                        })
                     })
-                })
-                .take(ADMIN_EMAIL_SUGGESTION_LIMIT)
-                .collect()),
+                    .collect::<Vec<_>>();
+                close_rows.sort_by_key(|(distance, _)| *distance);
+                transaction.commit().await?;
+                Ok(close_rows
+                    .into_iter()
+                    .map(|(_, user)| user)
+                    .take(ADMIN_EMAIL_SUGGESTION_LIMIT)
+                    .collect())
+            }
             Err(error) if is_undefined_postgres_function(&error) => Ok(vec![]),
             Err(error) => Err(error.into()),
         }
@@ -2844,6 +2984,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_find_users_for_admin_reports_authoritative_and_partial_match_kinds() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let suffix = test_suffix();
+        let query = format!("kind-{suffix}@lookup.test");
+        let exact_pubkey = Keys::generate().public_key().to_hex();
+        let partial_pubkey = Keys::generate().public_key().to_hex();
+
+        create_user_with_email(&pool, &exact_pubkey, &query).await;
+        create_user_with_email(&pool, &partial_pubkey, &format!("prefix-{query}")).await;
+
+        let lookup = repo.find_users_for_admin(&query, 1).await.unwrap();
+        assert_eq!(
+            lookup.users[0].match_kind,
+            AdminUserMatchKind::Authoritative
+        );
+        assert_eq!(lookup.users[1].match_kind, AdminUserMatchKind::Partial);
+
+        cleanup_user(&pool, &exact_pubkey).await;
+        cleanup_user(&pool, &partial_pubkey).await;
+    }
+
+    #[tokio::test]
     async fn test_find_users_for_admin_keeps_case_variant_exact_emails() {
         let pool = setup_pool().await;
         let repo = UserRepository::new(pool.clone());
@@ -2975,13 +3138,59 @@ mod tests {
         let plan: serde_json::Value = sqlx::query_scalar(&explain_sql)
             .bind("missing@example.com")
             .bind(1_i64)
-            .bind(ADMIN_EMAIL_SUGGESTION_MIN_SIMILARITY)
+            .bind(ADMIN_EMAIL_SUGGESTION_MIN_WORD_SIMILARITY)
             .bind(ADMIN_EMAIL_SUGGESTION_CANDIDATE_LIMIT)
             .fetch_one(&pool)
             .await
             .unwrap();
 
         assert_eq!(plan[0]["Plan"]["Node Type"], "Limit");
+    }
+
+    #[tokio::test]
+    async fn test_suggest_users_for_admin_uses_the_email_trigram_index() {
+        let pool = setup_pool().await;
+        let mut transaction = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TEMP TABLE admin_email_index_probe (email TEXT)
+             ON COMMIT DROP",
+        )
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE INDEX admin_email_index_probe_trgm
+             ON admin_email_index_probe USING gin (email gin_trgm_ops)",
+        )
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        sqlx::query_scalar::<_, String>(
+            "SELECT set_config('pg_trgm.word_similarity_threshold', $1, true)",
+        )
+        .bind(ADMIN_EMAIL_SUGGESTION_MIN_WORD_SIMILARITY.to_string())
+        .fetch_one(&mut *transaction)
+        .await
+        .unwrap();
+
+        assert!(ADMIN_EMAIL_SUGGESTION_QUERY.contains("u.email %> $1"));
+        let plan: serde_json::Value = sqlx::query_scalar(
+            "EXPLAIN (FORMAT JSON)
+             SELECT email FROM admin_email_index_probe WHERE email %> $1",
+        )
+        .bind("publish")
+        .fetch_one(&mut *transaction)
+        .await
+        .unwrap();
+
+        assert!(
+            plan.to_string().contains("admin_email_index_probe_trgm"),
+            "the production word-similarity operator should use gin_trgm_ops: {plan}"
+        );
     }
 
     #[tokio::test]
@@ -3037,6 +3246,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_suggest_users_for_admin_finds_a_typo_near_partial_email_fragment() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let suffix = test_suffix();
+        let query = format!("publish{suffix}");
+        let partial_pubkey = Keys::generate().public_key().to_hex();
+        let fuzzy_pubkey = Keys::generate().public_key().to_hex();
+
+        create_user_with_email(
+            &pool,
+            &partial_pubkey,
+            &format!("social{query}llc@gmail.com"),
+        )
+        .await;
+        create_user_with_email(
+            &pool,
+            &fuzzy_pubkey,
+            &format!("socialpulish{suffix}llc@gmail.com"),
+        )
+        .await;
+
+        let primary = repo.find_users_for_admin(&query, 1).await.unwrap().users;
+        assert_eq!(primary.len(), 1);
+        assert_eq!(primary[0].pubkey, partial_pubkey);
+        assert_eq!(primary[0].match_kind, AdminUserMatchKind::Partial);
+
+        let suggestions = repo.suggest_users_for_admin(&query, 1).await.unwrap();
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].pubkey, fuzzy_pubkey);
+        assert_eq!(suggestions[0].match_kind, AdminUserMatchKind::Fuzzy);
+
+        cleanup_user(&pool, &partial_pubkey).await;
+        cleanup_user(&pool, &fuzzy_pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_suggest_users_for_admin_keeps_fuzzy_fragments_tenant_scoped() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let suffix = test_suffix();
+        let query = format!("publish{suffix}");
+        let local_pubkey = Keys::generate().public_key().to_hex();
+        let foreign_pubkey = Keys::generate().public_key().to_hex();
+        let foreign_tenant_id: i64 = sqlx::query_scalar(
+            "INSERT INTO tenants (domain, name, created_at, updated_at)
+             VALUES ($1, $2, NOW(), NOW())
+             RETURNING id",
+        )
+        .bind(format!("fuzzy-{suffix}.lookup.test"))
+        .bind(format!("Fuzzy tenant {suffix}"))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        create_user_with_email(
+            &pool,
+            &local_pubkey,
+            &format!("socialpulish{suffix}local@gmail.com"),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO users
+                (pubkey, tenant_id, email, email_verified, created_at, updated_at)
+             VALUES ($1, $2, $3, true, NOW(), NOW())",
+        )
+        .bind(&foreign_pubkey)
+        .bind(foreign_tenant_id)
+        .bind(format!("socialpulish{suffix}foreign@gmail.com"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let suggestions = repo.suggest_users_for_admin(&query, 1).await.unwrap();
+        assert!(suggestions.iter().any(|user| user.pubkey == local_pubkey));
+        assert!(!suggestions.iter().any(|user| user.pubkey == foreign_pubkey));
+
+        cleanup_user(&pool, &local_pubkey).await;
+        cleanup_user(&pool, &foreign_pubkey).await;
+        sqlx::query("DELETE FROM tenants WHERE id = $1")
+            .bind(foreign_tenant_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn test_suggest_users_for_admin_filters_edit_distance_before_result_limit() {
         let pool = setup_pool().await;
         let repo = UserRepository::new(pool.clone());
@@ -3070,6 +3365,34 @@ mod tests {
 
         cleanup_user(&pool, &close_pubkey).await;
         for pubkey in distant_pubkeys {
+            cleanup_user(&pool, &pubkey).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_suggest_users_for_admin_caps_filtered_fuzzy_results() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let suffix = test_suffix();
+        let query = format!("fuzzycap{suffix}");
+        let mut pubkeys = Vec::new();
+
+        for index in 0..6 {
+            let mut variant = query.chars().collect::<Vec<_>>();
+            variant[index] = 'q';
+            let variant = variant.into_iter().collect::<String>();
+            let pubkey = Keys::generate().public_key().to_hex();
+            create_user_with_email(&pool, &pubkey, &format!("social{variant}llc@gmail.com")).await;
+            pubkeys.push(pubkey);
+        }
+
+        let suggestions = repo.suggest_users_for_admin(&query, 1).await.unwrap();
+        assert_eq!(suggestions.len(), ADMIN_EMAIL_SUGGESTION_LIMIT);
+        assert!(suggestions
+            .iter()
+            .all(|user| user.match_kind == AdminUserMatchKind::Fuzzy));
+
+        for pubkey in pubkeys {
             cleanup_user(&pool, &pubkey).await;
         }
     }
