@@ -1,6 +1,8 @@
 # Version control
+.gcloudignore
 .git
 .gitignore
+#!include:.gitignore
 
 # Rust build artifacts
 target/
@@ -37,6 +39,19 @@ docs/
 test-results/
 .private-journal/
 coverage/
+.playwright-mcp/
+e2e/playwright-report/
+web/test-results/
+
+# Local development tooling
+.claude/
+.cursor/
+.kamal/
+.repo-cache/
+.specify/
+.superpowers/
+.worktrees/
+k8s_local_tests/
 
 # IDE and editor files
 .vscode/
@@ -48,7 +63,18 @@ coverage/
 
 # Build outputs not needed in final image
 web/build/
+web/.netlify/
+web/.output/
+web/.svelte-kit/
+web/.vercel/
+web/.wrangler/
 api/oauth-ui/dist/
+
+# Load testing artifacts
+tools/loadtest/*.json
+tools/loadtest/**/*.json
+tools/loadtest/*.cfg
+tools/loadtest/pgbouncer/
 
 # Temporary files
 *.log
