@@ -2951,6 +2951,8 @@ mod tests {
                 tenant_id BIGINT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'active',
                 suspended_reason TEXT,
+                verified_minor BOOLEAN NOT NULL DEFAULT FALSE,
+                verified_minor_at TIMESTAMPTZ,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )",
