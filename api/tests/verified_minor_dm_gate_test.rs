@@ -537,6 +537,107 @@ async fn minor_rpc_nip44_encrypt_to_official_and_self_allowed() {
     assert!(to_self.result.is_some());
 }
 
+// ============================================================================
+// HTTP RPC (/api/nostr) — nip17_wrap_batch
+// ============================================================================
+
+#[tokio::test]
+#[serial]
+async fn minor_rpc_nip17_wrap_batch_to_official_and_self_allowed() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let key_manager = FileKeyManager::new().expect("key manager");
+    let minor = setup_account(&pool, tenant_id, &key_manager, true).await;
+    let auth_state = create_test_auth_state(
+        pool.clone(),
+        Arc::new(Box::new(key_manager) as Box<dyn KeyManager>),
+    );
+    let rumor = unsigned_dm_json(14, &minor.keys, &[hq_pubkey()]);
+
+    let response = invoke_rpc(
+        tenant_id,
+        auth_state,
+        &minor.token,
+        "nip17_wrap_batch",
+        vec![
+            rumor,
+            json!([hq_pubkey().to_hex(), minor.keys.public_key().to_hex()]),
+        ],
+    )
+    .await
+    .expect("minor may wrap the same approved rumor to official and self");
+
+    let slots = response
+        .result
+        .as_ref()
+        .and_then(Value::as_array)
+        .expect("ordered result slots");
+    assert_eq!(slots.len(), 2);
+    assert_eq!(slots[0]["gift_wrap"]["kind"].as_u64(), Some(1059));
+
+    let self_wrap: Event = serde_json::from_value(slots[1]["gift_wrap"].clone())
+        .expect("self slot contains gift wrap");
+    let unwrapped = UnwrappedGift::from_gift_wrap(&minor.keys, &self_wrap)
+        .await
+        .expect("minor can unwrap own history copy");
+    assert_eq!(unwrapped.sender, minor.keys.public_key());
+    assert_eq!(unwrapped.rumor.content, "gate test message");
+}
+
+#[tokio::test]
+#[serial]
+async fn minor_rpc_nip17_wrap_batch_to_arbitrary_slot_refused() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let key_manager = FileKeyManager::new().expect("key manager");
+    let minor = setup_account(&pool, tenant_id, &key_manager, true).await;
+    let auth_state = create_test_auth_state(
+        pool.clone(),
+        Arc::new(Box::new(key_manager) as Box<dyn KeyManager>),
+    );
+    let mallory = Keys::generate();
+    let rumor = unsigned_dm_json(14, &minor.keys, &[hq_pubkey()]);
+
+    let err = invoke_rpc(
+        tenant_id,
+        auth_state,
+        &minor.token,
+        "nip17_wrap_batch",
+        vec![rumor, json!([mallory.public_key().to_hex()])],
+    )
+    .await
+    .expect_err("minor may not add an arbitrary encryption recipient slot");
+
+    assert_rpc_denied(err);
+}
+
+#[tokio::test]
+#[serial]
+async fn minor_rpc_nip17_wrap_batch_embedded_arbitrary_recipient_refused() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let key_manager = FileKeyManager::new().expect("key manager");
+    let minor = setup_account(&pool, tenant_id, &key_manager, true).await;
+    let auth_state = create_test_auth_state(
+        pool.clone(),
+        Arc::new(Box::new(key_manager) as Box<dyn KeyManager>),
+    );
+    let mallory = Keys::generate();
+    let rumor = unsigned_dm_json(14, &minor.keys, &[hq_pubkey(), mallory.public_key()]);
+
+    let err = invoke_rpc(
+        tenant_id,
+        auth_state,
+        &minor.token,
+        "nip17_wrap_batch",
+        vec![rumor, json!([minor.keys.public_key().to_hex()])],
+    )
+    .await
+    .expect_err("approved self slot cannot smuggle an arbitrary rumor p-tag");
+
+    assert_rpc_denied(err);
+}
+
 #[tokio::test]
 #[serial]
 async fn minor_rpc_nip04_encrypt_to_arbitrary_recipient_refused() {
