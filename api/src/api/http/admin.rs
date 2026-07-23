@@ -15,9 +15,9 @@ use crate::api::error::{ApiError, ApiResult};
 use crate::api::extractors::UcanAuth;
 use keycast_core::repositories::{
     test_redirect_pattern, AdminAuditEventRecord, AdminAuditEventRepository, AdminUserDetails,
-    AuthEventRepository, ClaimTokenRepository, FullAdminStatusRow, OAuthAuthorizationRepository,
-    RegisteredClient, RegisteredClientRepository, RepositoryError, UserRepository,
-    VerifiedMinorRow,
+    AdminUserMatchKind, AuthEventRepository, ClaimTokenRepository, FullAdminStatusRow,
+    OAuthAuthorizationRepository, RegisteredClient, RegisteredClientRepository, RepositoryError,
+    UserRepository, VerifiedMinorRow,
 };
 use keycast_core::types::claim_token::generate_claim_token;
 use keycast_core::types::user::UserStatus;
@@ -906,6 +906,7 @@ pub struct UserLookupResponse {
 pub struct UserLookupDetails {
     pub pubkey: String,
     pub authoritative: bool,
+    pub match_kind: AdminUserMatchKind,
     pub email: Option<String>,
     pub email_verified: Option<bool>,
     pub username: Option<String>,
@@ -944,6 +945,7 @@ async fn enrich_user_lookup_details(
     UserLookupDetails {
         pubkey: details.pubkey,
         authoritative: details.authoritative,
+        match_kind: details.match_kind,
         email: details.email,
         email_verified: details.email_verified,
         username: details.username,
@@ -964,8 +966,23 @@ fn should_attempt_authoritative_name_promotion(query: &str, authoritative_match:
     !authoritative_match && !query.contains('@') && !query.starts_with("npub") && query.len() != 64
 }
 
-fn should_fetch_email_suggestions(authoritative_match: bool, result_count: usize) -> bool {
-    !authoritative_match && result_count == 0
+fn should_fetch_email_suggestions(authoritative_match: bool) -> bool {
+    !authoritative_match
+}
+
+fn deduplicate_suggested_users(
+    primary: &[AdminUserDetails],
+    suggestions: Vec<AdminUserDetails>,
+) -> Vec<AdminUserDetails> {
+    let mut seen = primary
+        .iter()
+        .map(|user| user.pubkey.clone())
+        .collect::<std::collections::HashSet<_>>();
+
+    suggestions
+        .into_iter()
+        .filter(|user| seen.insert(user.pubkey.clone()))
+        .collect()
 }
 
 fn authoritative_name_promotion_timeout(local_result_count: usize) -> Option<std::time::Duration> {
@@ -983,18 +1000,23 @@ async fn await_name_promotion_within<T>(
 mod user_lookup_response_tests {
     use super::{
         authoritative_name_promotion_timeout, await_name_promotion_within,
-        should_attempt_authoritative_name_promotion, should_fetch_email_suggestions,
-        AdminUserDetails, UserLookupDetails, UserLookupResponse, UserStatus,
-        ADMIN_NAME_PROMOTION_TIMEOUT,
+        deduplicate_suggested_users, should_attempt_authoritative_name_promotion,
+        should_fetch_email_suggestions, AdminUserDetails, UserLookupDetails, UserLookupResponse,
+        UserStatus, ADMIN_NAME_PROMOTION_TIMEOUT,
     };
     use chrono::Utc;
-    use keycast_core::repositories::AdminUserLookup;
+    use keycast_core::repositories::{AdminUserLookup, AdminUserMatchKind};
 
     fn lookup_details(pubkey: &str, authoritative: bool) -> AdminUserDetails {
         let now = Utc::now();
         AdminUserDetails {
             pubkey: pubkey.to_string(),
             authoritative,
+            match_kind: if authoritative {
+                AdminUserMatchKind::Authoritative
+            } else {
+                AdminUserMatchKind::Partial
+            },
             email: None,
             email_verified: None,
             username: None,
@@ -1042,9 +1064,28 @@ mod user_lookup_response_tests {
 
     #[test]
     fn serializes_suggestions_separately_from_results() {
+        let result = UserLookupDetails {
+            pubkey: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            authoritative: true,
+            match_kind: AdminUserMatchKind::Authoritative,
+            email: Some("exact@example.com".to_string()),
+            email_verified: Some(true),
+            username: None,
+            display_name: None,
+            vine_id: None,
+            has_personal_key: false,
+            status: "active".to_string(),
+            suspended_reason: None,
+            verified_minor: false,
+            verified_minor_at: None,
+            active_sessions: 0,
+            created_at: "2026-07-17T12:00:00+00:00".to_string(),
+            last_active: None,
+        };
         let suggestion = UserLookupDetails {
             pubkey: "1111111111111111111111111111111111111111111111111111111111111111".to_string(),
             authoritative: false,
+            match_kind: AdminUserMatchKind::Fuzzy,
             email: Some("suggested@example.com".to_string()),
             email_verified: Some(true),
             username: None,
@@ -1060,9 +1101,9 @@ mod user_lookup_response_tests {
             last_active: None,
         };
         let response = UserLookupResponse {
-            results: vec![],
+            results: vec![result],
             suggestions: vec![suggestion],
-            total: 0,
+            total: 1,
             authoritative_match: true,
             authoritative_count: 1,
         };
@@ -1070,10 +1111,12 @@ mod user_lookup_response_tests {
         let json = serde_json::to_value(response).expect("lookup response should serialize");
         assert_eq!(json["authoritative_match"], true);
         assert_eq!(json["authoritative_count"], 1);
-        assert_eq!(json["results"], serde_json::json!([]));
-        assert_eq!(json["total"], 0);
+        assert_eq!(json["results"][0]["email"], "exact@example.com");
+        assert_eq!(json["results"][0]["match_kind"], "authoritative");
+        assert_eq!(json["total"], 1);
         assert_eq!(json["suggestions"][0]["email"], "suggested@example.com");
         assert_eq!(json["suggestions"][0]["authoritative"], false);
+        assert_eq!(json["suggestions"][0]["match_kind"], "fuzzy");
     }
 
     #[test]
@@ -1091,30 +1134,55 @@ mod user_lookup_response_tests {
 
         let merged = promoted.append_loose_results(local);
 
+        assert_eq!(merged.users[0].pubkey, "authoritative");
         assert!(merged.users[0].authoritative);
+        assert_eq!(
+            merged.users[0].match_kind,
+            AdminUserMatchKind::Authoritative
+        );
+        assert_eq!(merged.users[1].pubkey, "loose");
         assert!(!merged.users[1].authoritative);
+        assert_eq!(merged.users[1].match_kind, AdminUserMatchKind::Partial);
         assert_eq!(merged.authoritative_count, 1);
     }
 
     #[test]
-    fn loose_matches_allow_authoritative_name_promotion_but_skip_suggestions() {
+    fn suggestions_exclude_primary_and_repeated_pubkeys() {
+        let primary = vec![lookup_details("already-selected", false)];
+        let mut selected_again = lookup_details("already-selected", false);
+        selected_again.match_kind = AdminUserMatchKind::Fuzzy;
+        let mut fuzzy = lookup_details("fuzzy", false);
+        fuzzy.match_kind = AdminUserMatchKind::Fuzzy;
+        let mut fuzzy_again = lookup_details("fuzzy", false);
+        fuzzy_again.match_kind = AdminUserMatchKind::Fuzzy;
+
+        let suggestions =
+            deduplicate_suggested_users(&primary, vec![selected_again, fuzzy, fuzzy_again]);
+
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].pubkey, "fuzzy");
+        assert_eq!(suggestions[0].match_kind, AdminUserMatchKind::Fuzzy);
+    }
+
+    #[test]
+    fn loose_matches_allow_authoritative_name_promotion_and_suggestions() {
         assert!(should_attempt_authoritative_name_promotion(
             "partial-name",
             false
         ));
-        assert!(!should_fetch_email_suggestions(false, 1));
-        assert!(should_fetch_email_suggestions(false, 0));
+        assert!(should_fetch_email_suggestions(false));
         assert!(!should_attempt_authoritative_name_promotion(
             "partial-name",
             true
         ));
-        assert!(!should_fetch_email_suggestions(true, 0));
+        assert!(!should_fetch_email_suggestions(true));
     }
 }
 
 /// Look up users by email, username, vine ID, or pubkey.
 ///
-/// Available to support admins and above. Empty result sets include fuzzy email suggestions.
+/// Available to support admins and above. Non-authoritative lookups include de-duplicated fuzzy
+/// email suggestions alongside any literal primary results.
 pub async fn get_user_lookup(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
@@ -1160,12 +1228,12 @@ pub async fn get_user_lookup(
         }
     }
 
-    let suggested_users =
-        if should_fetch_email_suggestions(lookup.authoritative_match, lookup.users.len()) {
-            user_repo.suggest_users_for_admin(q, tenant_id).await?
-        } else {
-            vec![]
-        };
+    let suggested_users = if should_fetch_email_suggestions(lookup.authoritative_match) {
+        user_repo.suggest_users_for_admin(q, tenant_id).await?
+    } else {
+        vec![]
+    };
+    let suggested_users = deduplicate_suggested_users(&lookup.users, suggested_users);
 
     let oauth_repo = OAuthAuthorizationRepository::new(pool.clone());
     let total = lookup.users.len();

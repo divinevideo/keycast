@@ -3,7 +3,8 @@ import {
     emailMatchParts,
     emailSuggestionDiff,
     isShowingDidYouMean,
-    isSuggestedUser,
+    lookupResultsBanner,
+    matchKindLabel,
     selectAutoExpandedPubkey,
     selectDisplayedUsers,
 } from "./lookup-view";
@@ -11,9 +12,17 @@ import {
 interface Row {
     pubkey: string;
     authoritative: boolean;
+    match_kind: "authoritative" | "partial" | "fuzzy";
 }
 
-const row = (pubkey: string, authoritative = false): Row => ({ pubkey, authoritative });
+const row = (
+    pubkey: string,
+    match_kind: Row["match_kind"] = "partial",
+): Row => ({
+    pubkey,
+    authoritative: match_kind === "authoritative",
+    match_kind,
+});
 
 describe("support admin user lookup view", () => {
     test("aligns a missing account character and describes the edit", () => {
@@ -61,23 +70,38 @@ describe("support admin user lookup view", () => {
         ]);
     });
 
-    test("shows authoritative results and hides suggestions when results exist", () => {
+    test("combines result tiers, ranks them, and defensively deduplicates pubkeys", () => {
         const result = {
-            results: [row("a", true), row("b", true)],
-            suggestions: [row("c")],
+            results: [row("partial"), row("authoritative", "authoritative")],
+            suggestions: [row("fuzzy", "fuzzy"), row("partial", "fuzzy")],
+            total: 2,
+            authoritative_match: true,
+            authoritative_count: 1,
+        };
+
+        expect(selectDisplayedUsers(result)).toEqual([
+            row("authoritative", "authoritative"),
+            row("partial"),
+            row("fuzzy", "fuzzy"),
+        ]);
+        expect(selectAutoExpandedPubkey(result)).toBe("authoritative");
+    });
+
+    test("does not auto-expand when multiple authoritative users match", () => {
+        const result = {
+            results: [row("a", "authoritative"), row("b", "authoritative")],
+            suggestions: [row("c", "fuzzy")],
             total: 2,
             authoritative_match: true,
             authoritative_count: 2,
         };
 
-        expect(selectDisplayedUsers(result)).toEqual([row("a", true), row("b", true)]);
-        expect(isSuggestedUser(result.results[0])).toBe(false);
         expect(selectAutoExpandedPubkey(result)).toBeNull();
     });
 
     test("auto-expands a lone authoritative result", () => {
         const result = {
-            results: [row("a", true)],
+            results: [row("a", "authoritative")],
             suggestions: [],
             total: 1,
             authoritative_match: true,
@@ -87,9 +111,42 @@ describe("support admin user lookup view", () => {
         expect(selectAutoExpandedPubkey(result)).toBe("a");
     });
 
+    test("classifies partial and fuzzy rows with non-conflicting labels", () => {
+        expect(matchKindLabel(row("authoritative", "authoritative"))).toBeNull();
+        expect(matchKindLabel(row("partial"))).toBe("Partial match");
+        expect(matchKindLabel(row("fuzzy", "fuzzy"))).toBe("Possible typo");
+    });
+
+    test("counts combined mixed rows in the results banner", () => {
+        const result = {
+            results: [row("partial")],
+            suggestions: [row("fuzzy", "fuzzy")],
+            total: 1,
+            authoritative_match: false,
+            authoritative_count: 0,
+        };
+
+        expect(lookupResultsBanner(result)).toEqual({ text: "2 users found", warning: false });
+    });
+
+    test("reports the actual displayed row count when capped results include suggestions", () => {
+        const result = {
+            results: Array.from({ length: 20 }, (_, index) => row(`partial-${index}`)),
+            suggestions: [row("fuzzy", "fuzzy")],
+            total: 20,
+            authoritative_match: false,
+            authoritative_count: 0,
+        };
+
+        expect(lookupResultsBanner(result)).toEqual({
+            text: "Showing first 21 of many results — refine your search",
+            warning: true,
+        });
+    });
+
     test("auto-expands one authoritative result ahead of loose candidates", () => {
         const result = {
-            results: [row("authoritative", true), row("loose")],
+            results: [row("authoritative", "authoritative"), row("loose")],
             suggestions: [],
             total: 2,
             authoritative_match: true,
@@ -97,8 +154,8 @@ describe("support admin user lookup view", () => {
         };
 
         expect(selectAutoExpandedPubkey(result)).toBe("authoritative");
-        expect(isSuggestedUser(result.results[0])).toBe(false);
-        expect(isSuggestedUser(result.results[1])).toBe(true);
+        expect(matchKindLabel(result.results[0])).toBeNull();
+        expect(matchKindLabel(result.results[1])).toBe("Partial match");
     });
 
     test("marks a lone non-authoritative result as suggested without auto-expanding it", () => {
@@ -111,23 +168,24 @@ describe("support admin user lookup view", () => {
         };
 
         expect(selectDisplayedUsers(result)).toEqual([row("a")]);
-        expect(isSuggestedUser(result.results[0])).toBe(true);
-        expect(isShowingDidYouMean(result)).toBe(false);
+        expect(matchKindLabel(result.results[0])).toBe("Partial match");
+        expect(isShowingDidYouMean(result, "partial")).toBe(false);
         expect(selectAutoExpandedPubkey(result)).toBeNull();
     });
 
     test("falls back to fuzzy suggestions without auto-expanding them", () => {
         const result = {
             results: [],
-            suggestions: [row("c")],
+            suggestions: [row("c", "fuzzy")],
             total: 0,
             authoritative_match: false,
             authoritative_count: 0,
         };
 
-        expect(selectDisplayedUsers(result)).toEqual([row("c")]);
-        expect(isSuggestedUser(result.suggestions[0])).toBe(true);
-        expect(isShowingDidYouMean(result)).toBe(true);
+        expect(selectDisplayedUsers(result)).toEqual([row("c", "fuzzy")]);
+        expect(matchKindLabel(result.suggestions[0])).toBe("Possible typo");
+        expect(isShowingDidYouMean(result, "typo@example.com")).toBe(true);
+        expect(isShowingDidYouMean(result, "typo-fragment")).toBe(false);
         expect(selectAutoExpandedPubkey(result)).toBeNull();
     });
 
