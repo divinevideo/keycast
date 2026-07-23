@@ -25,6 +25,23 @@ pub struct VerificationTokenData {
     pub email_verified: bool,
 }
 
+/// Snapshot of an existing users row used to gate OAuth registration finalization.
+///
+/// Distinguishes a genuine registration retry (row already carries the pending
+/// email) from a bare row created by another path (team membership, authorization
+/// pre-creation) that still needs the pending credentials applied.
+#[derive(Debug, FromRow)]
+pub struct OAuthRegistrationState {
+    /// Email currently on the row, if any.
+    pub email: Option<String>,
+    /// Whether the row has completed email verification.
+    pub email_verified: bool,
+    /// Whether the row has a password hash ready for password login.
+    pub has_password_hash: bool,
+    /// Whether a personal_keys row exists for this pubkey.
+    pub has_personal_key: bool,
+}
+
 /// Which side of a pending email change a token belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingEmailSide {
@@ -1492,6 +1509,144 @@ impl UserRepository {
             .bind(oauth_code)
             .execute(&mut *tx)
             .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Fetch the registration-relevant state of an existing users row.
+    ///
+    /// Returns `None` when no row exists for this pubkey in the tenant.
+    pub async fn oauth_registration_state(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<Option<OAuthRegistrationState>, RepositoryError> {
+        sqlx::query_as(
+            "SELECT u.email,
+                    u.email_verified,
+                    u.password_hash IS NOT NULL AS has_password_hash,
+                    EXISTS(SELECT 1 FROM personal_keys pk WHERE pk.user_pubkey = u.pubkey) AS has_personal_key
+             FROM users u WHERE u.pubkey = $1 AND u.tenant_id = $2",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Insert a missing personal key for an existing OAuth user.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Database`] if the insert query fails.
+    pub async fn backfill_personal_key(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+        encrypted_secret: &[u8],
+    ) -> Result<(), RepositoryError> {
+        let now = Utc::now();
+
+        sqlx::query(
+            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $4)
+             ON CONFLICT (user_pubkey) DO NOTHING",
+        )
+        .bind(pubkey)
+        .bind(encrypted_secret)
+        .bind(tenant_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Apply a pending OAuth registration to an existing users row.
+    ///
+    /// Sets email/password/verified state on the row and inserts the personal
+    /// key if one is pending and none exists yet, all in one transaction.
+    /// If the row already carries the pending email (a concurrent request won
+    /// the completion race), this is success: existing credentials are never
+    /// rewritten and only a missing personal key is backfilled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::NotFound`] if no row exists for this pubkey.
+    /// Returns [`RepositoryError::Duplicate`] if the email is owned by another
+    /// user or the row is already bound to a different email.
+    pub async fn complete_pending_oauth_registration(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+        email: &str,
+        password_hash: &str,
+        verification_token: &str,
+        encrypted_secret: Option<&[u8]>,
+    ) -> Result<(), RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let now = Utc::now();
+
+        let updated = sqlx::query(
+            "UPDATE users
+             SET email = $1, password_hash = COALESCE(password_hash, $2), email_verified = true,
+                 email_verification_token = $3, updated_at = $4
+             WHERE pubkey = $5
+               AND tenant_id = $6
+               AND (
+                   email IS NULL
+                   OR (email = $1 AND (email_verified = false OR password_hash IS NULL))
+               )",
+        )
+        .bind(email)
+        .bind(password_hash)
+        .bind(verification_token)
+        .bind(now)
+        .bind(pubkey)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        if updated == 0 {
+            let existing_state = sqlx::query_as::<_, (Option<String>, bool, bool)>(
+                "SELECT email, email_verified, password_hash IS NOT NULL AS has_password_hash
+                 FROM users WHERE pubkey = $1 AND tenant_id = $2",
+            )
+            .bind(pubkey)
+            .bind(tenant_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            match existing_state {
+                // A concurrent request already applied this exact registration;
+                // fall through so a missing personal key can still be backfilled.
+                Some((Some(existing), true, true)) if existing == email => {}
+                Some(_) => return Err(RepositoryError::Duplicate),
+                None => {
+                    return Err(RepositoryError::NotFound(format!(
+                        "no users row for pubkey {} in tenant {}",
+                        pubkey, tenant_id
+                    )));
+                }
+            }
+        }
+
+        if let Some(secret) = encrypted_secret {
+            sqlx::query(
+                "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $4)
+                 ON CONFLICT (user_pubkey) DO NOTHING",
+            )
+            .bind(pubkey)
+            .bind(secret)
+            .bind(tenant_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         tx.commit().await?;
         Ok(())
@@ -3116,5 +3271,424 @@ mod tests {
         assert!(!verified_minor);
 
         cleanup_user(&pool, &pubkey).await;
+    }
+
+    async fn create_bare_user(pool: &PgPool, pubkey: &str) {
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
+             VALUES ($1, 1, NOW(), NOW())",
+        )
+        .bind(pubkey)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_oauth_registration_state_none_for_unknown_user() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool);
+        let pubkey = Keys::generate().public_key().to_hex();
+
+        let state = repo.oauth_registration_state(&pubkey, 1).await.unwrap();
+        assert!(state.is_none(), "Unknown pubkey should have no state");
+    }
+
+    #[tokio::test]
+    async fn test_oauth_registration_state_reports_email_and_key_presence() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let suffix = test_suffix();
+
+        let bare_pubkey = Keys::generate().public_key().to_hex();
+        create_bare_user(&pool, &bare_pubkey).await;
+
+        let full_pubkey = Keys::generate().public_key().to_hex();
+        let email = format!("oauth-state-{}@example.com", suffix);
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
+             VALUES ($1, 1, $2, 'hash', true, NOW(), NOW())",
+        )
+        .bind(&full_pubkey)
+        .bind(&email)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
+             VALUES ($1, $2, 1, NOW(), NOW())",
+        )
+        .bind(&full_pubkey)
+        .bind(vec![1_u8, 2, 3])
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let bare_state = repo
+            .oauth_registration_state(&bare_pubkey, 1)
+            .await
+            .unwrap()
+            .expect("bare row should have state");
+        assert_eq!(bare_state.email, None);
+        assert!(!bare_state.email_verified);
+        assert!(!bare_state.has_password_hash);
+        assert!(!bare_state.has_personal_key);
+
+        let full_state = repo
+            .oauth_registration_state(&full_pubkey, 1)
+            .await
+            .unwrap()
+            .expect("full row should have state");
+        assert_eq!(full_state.email.as_deref(), Some(email.as_str()));
+        assert!(full_state.email_verified);
+        assert!(full_state.has_password_hash);
+        assert!(full_state.has_personal_key);
+
+        cleanup_user(&pool, &bare_pubkey).await;
+        cleanup_user(&pool, &full_pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_complete_pending_oauth_registration_applies_pending_to_bare_row() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let suffix = test_suffix();
+        let pubkey = Keys::generate().public_key().to_hex();
+        let email = format!("oauth-complete-{}@example.com", suffix);
+        let token = format!("token-{}", suffix);
+        let secret = vec![7_u8; 32];
+
+        create_bare_user(&pool, &pubkey).await;
+
+        repo.complete_pending_oauth_registration(&pubkey, 1, &email, "hash", &token, Some(&secret))
+            .await
+            .unwrap();
+
+        let row: (Option<String>, Option<String>, bool, Option<String>) = sqlx::query_as(
+            "SELECT email, password_hash, email_verified, email_verification_token
+             FROM users WHERE pubkey = $1 AND tenant_id = 1",
+        )
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0.as_deref(), Some(email.as_str()));
+        assert_eq!(row.1.as_deref(), Some("hash"));
+        assert!(row.2, "email_verified should be set");
+        assert_eq!(row.3.as_deref(), Some(token.as_str()));
+
+        let stored_secret: (Vec<u8>,) =
+            sqlx::query_as("SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1")
+                .bind(&pubkey)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored_secret.0, secret);
+
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_complete_pending_oauth_registration_keeps_existing_personal_key() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let suffix = test_suffix();
+        let pubkey = Keys::generate().public_key().to_hex();
+        let email = format!("oauth-keep-key-{}@example.com", suffix);
+        let existing_secret = vec![9_u8; 32];
+
+        create_bare_user(&pool, &pubkey).await;
+        sqlx::query(
+            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
+             VALUES ($1, $2, 1, NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .bind(&existing_secret)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        repo.complete_pending_oauth_registration(
+            &pubkey,
+            1,
+            &email,
+            "hash",
+            "token",
+            Some(&[1_u8; 32]),
+        )
+        .await
+        .unwrap();
+
+        let keys: Vec<(Vec<u8>,)> =
+            sqlx::query_as("SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1")
+                .bind(&pubkey)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(keys.len(), 1, "existing key must not be duplicated");
+        assert_eq!(keys[0].0, existing_secret, "existing key must be preserved");
+
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_backfill_personal_key_is_idempotent() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let pubkey = Keys::generate().public_key().to_hex();
+
+        create_bare_user(&pool, &pubkey).await;
+
+        repo.backfill_personal_key(&pubkey, 1, &[1_u8; 32])
+            .await
+            .unwrap();
+        repo.backfill_personal_key(&pubkey, 1, &[2_u8; 32])
+            .await
+            .unwrap();
+
+        let keys: Vec<(Vec<u8>,)> =
+            sqlx::query_as("SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1")
+                .bind(&pubkey)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(keys.len(), 1, "backfill must not duplicate personal keys");
+        assert_eq!(keys[0].0, vec![1_u8; 32], "first key must be preserved");
+
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_complete_pending_oauth_registration_duplicate_email_rolls_back() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let suffix = test_suffix();
+        let email = format!("oauth-dup-{}@example.com", suffix);
+
+        let owner_pubkey = Keys::generate().public_key().to_hex();
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, created_at, updated_at)
+             VALUES ($1, 1, $2, NOW(), NOW())",
+        )
+        .bind(&owner_pubkey)
+        .bind(&email)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let pubkey = Keys::generate().public_key().to_hex();
+        create_bare_user(&pool, &pubkey).await;
+
+        let result = repo
+            .complete_pending_oauth_registration(&pubkey, 1, &email, "hash", "token", None)
+            .await;
+        assert!(
+            matches!(result, Err(RepositoryError::Duplicate)),
+            "claiming an owned email must fail with Duplicate, got: {result:?}"
+        );
+
+        let row: (Option<String>, bool) = sqlx::query_as(
+            "SELECT email, email_verified FROM users WHERE pubkey = $1 AND tenant_id = 1",
+        )
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, None, "failed completion must roll back the email");
+        assert!(!row.1, "failed completion must roll back email_verified");
+
+        cleanup_user(&pool, &owner_pubkey).await;
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_complete_pending_oauth_registration_bound_row_returns_duplicate() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let suffix = test_suffix();
+        let pubkey = Keys::generate().public_key().to_hex();
+        let existing_email = format!("oauth-bound-existing-{}@example.com", suffix);
+        let pending_email = format!("oauth-bound-pending-{}@example.com", suffix);
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
+             VALUES ($1, 1, $2, 'existing-hash', true, NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .bind(&existing_email)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = repo
+            .complete_pending_oauth_registration(
+                &pubkey,
+                1,
+                &pending_email,
+                "pending-hash",
+                "token",
+                Some(&[1_u8; 32]),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(RepositoryError::Duplicate)),
+            "completing a row already bound to an email must fail with Duplicate, got: {result:?}"
+        );
+
+        let row: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT email, password_hash FROM users WHERE pubkey = $1 AND tenant_id = 1",
+        )
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0.as_deref(), Some(existing_email.as_str()));
+        assert_eq!(row.1.as_deref(), Some("existing-hash"));
+
+        let key_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM personal_keys WHERE user_pubkey = $1")
+                .bind(&pubkey)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(key_count.0, 0, "failed completion must not insert a key");
+
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_complete_pending_oauth_registration_already_applied_email_is_idempotent() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let suffix = test_suffix();
+        let pubkey = Keys::generate().public_key().to_hex();
+        let email = format!("oauth-applied-{}@example.com", suffix);
+        let secret = vec![5_u8; 32];
+
+        // Simulate losing the completion race: a concurrent request already
+        // bound the row to the pending email, but the personal key is missing.
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
+             VALUES ($1, 1, $2, 'existing-hash', true, NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .bind(&email)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        repo.complete_pending_oauth_registration(
+            &pubkey,
+            1,
+            &email,
+            "pending-hash",
+            "token",
+            Some(&secret),
+        )
+        .await
+        .expect("row already bound to the pending email must be treated as success");
+
+        let row: (Option<String>,) =
+            sqlx::query_as("SELECT password_hash FROM users WHERE pubkey = $1 AND tenant_id = 1")
+                .bind(&pubkey)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            row.0.as_deref(),
+            Some("existing-hash"),
+            "idempotent completion must not rewrite existing credentials"
+        );
+
+        let keys: Vec<(Vec<u8>,)> =
+            sqlx::query_as("SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1")
+                .bind(&pubkey)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(keys.len(), 1, "missing personal key must be backfilled");
+        assert_eq!(
+            keys[0].0, secret,
+            "backfilled key must hold the pending secret"
+        );
+
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_complete_pending_oauth_registration_completes_same_email_incomplete_row() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let suffix = test_suffix();
+        let pubkey = Keys::generate().public_key().to_hex();
+        let email = format!("oauth-incomplete-{}@example.com", suffix);
+        let secret = vec![6_u8; 32];
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
+             VALUES ($1, 1, $2, NULL, false, NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .bind(&email)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        repo.complete_pending_oauth_registration(
+            &pubkey,
+            1,
+            &email,
+            "pending-hash",
+            "token",
+            Some(&secret),
+        )
+        .await
+        .expect("same-email incomplete row should be completed");
+
+        let row: (Option<String>, Option<String>, bool, Option<String>) = sqlx::query_as(
+            "SELECT email, password_hash, email_verified, email_verification_token
+             FROM users WHERE pubkey = $1 AND tenant_id = 1",
+        )
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0.as_deref(), Some(email.as_str()));
+        assert_eq!(row.1.as_deref(), Some("pending-hash"));
+        assert!(row.2, "same-email row must be marked verified");
+        assert_eq!(row.3.as_deref(), Some("token"));
+
+        let keys: Vec<(Vec<u8>,)> =
+            sqlx::query_as("SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1")
+                .bind(&pubkey)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(keys.len(), 1, "missing personal key must be backfilled");
+        assert_eq!(keys[0].0, secret);
+
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_complete_pending_oauth_registration_unknown_user_not_found() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool);
+        let pubkey = Keys::generate().public_key().to_hex();
+
+        let result = repo
+            .complete_pending_oauth_registration(
+                &pubkey,
+                1,
+                "oauth-missing@example.com",
+                "hash",
+                "token",
+                None,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(RepositoryError::NotFound(_))),
+            "completing a missing row must fail with NotFound, got: {result:?}"
+        );
     }
 }
