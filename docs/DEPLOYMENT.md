@@ -102,7 +102,6 @@ These are set by `cloudbuild.yaml --set-env-vars`:
 | `GCP_PROJECT_ID` | `${PROJECT_ID}` (`openvine-co` when deployed by `bun run deploy`) |
 | `ALLOWED_ORIGINS` | `https://login.divine.video,https://divine.video,https://*.openvine-app.pages.dev` |
 | `ALLOWED_TENANT_DOMAINS` | `login.divine.video` |
-| `REQUIRE_REGISTERED_OAUTH_CLIENTS` | `false` in Cloud Build; not currently consumed by the server |
 | `APP_URL` | `https://login.divine.video` |
 | `FROM_EMAIL` | `noreply@divine.video` |
 | `RUST_LOG` | `info` |

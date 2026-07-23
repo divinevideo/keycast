@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 import { registerAndVerify, parseCookieValue } from "../helpers/auth";
-import { ADMIN_PUBKEY, registerAdmin } from "../helpers/admin";
+import { getAdminTenantId, registerAdmin } from "../helpers/admin";
 import {
   addSupportAdmin,
   removeSupportAdmin,
@@ -268,13 +268,7 @@ test.describe("Support admin management", () => {
     const { cookie } = await registerAdmin(request);
     const sessionCookie = `keycast_session=${parseCookieValue(cookie)}`;
     const ts = Date.now();
-    const tenantId = await withDb(async (db) => {
-      const result = await db.query(
-        "SELECT tenant_id FROM users WHERE pubkey = $1",
-        [ADMIN_PUBKEY],
-      );
-      return result.rows[0].tenant_id;
-    });
+    const tenantId = await getAdminTenantId();
 
     // Seed 3 users with similar usernames via direct DB insert
     const usernames = [
@@ -331,13 +325,7 @@ test.describe("Support admin management", () => {
     const { cookie } = await registerAdmin(request);
     const sessionValue = parseCookieValue(cookie);
     const ts = Date.now();
-    const tenantId = await withDb(async (db) => {
-      const result = await db.query(
-        "SELECT tenant_id FROM users WHERE pubkey = $1",
-        [ADMIN_PUBKEY],
-      );
-      return result.rows[0].tenant_id;
-    });
+    const tenantId = await getAdminTenantId();
 
     // Seed 2 users with similar usernames
     const usernames = [`Test.User-${ts}`, `test_user-${ts}`];

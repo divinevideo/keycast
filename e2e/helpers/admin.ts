@@ -1,5 +1,5 @@
 import { APIRequestContext } from "@playwright/test";
-import { getVerificationToken } from "./db";
+import { getVerificationToken, withDb } from "./db";
 
 export const ADMIN_SECRET_KEY =
   "6d84196f84e681d76f75c149c79e0375ecefae480a355130d0642a1e7c7bab44";
@@ -76,4 +76,18 @@ export async function registerAdmin(
   }
 
   return verifyAdminEmail(request);
+}
+
+export async function getAdminTenantId(): Promise<number> {
+  return withDb(async (db) => {
+    const result = await db.query(
+      "SELECT tenant_id FROM users WHERE pubkey = $1",
+      [ADMIN_PUBKEY],
+    );
+    const tenantId = result.rows[0]?.tenant_id;
+    if (tenantId === undefined) {
+      throw new Error(`Admin user ${ADMIN_PUBKEY} was not found`);
+    }
+    return tenantId;
+  });
 }
