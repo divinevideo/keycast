@@ -264,6 +264,19 @@ pub struct FullAdminStatusRow {
     pub verified_minor_at: Option<DateTime<Utc>>,
 }
 
+/// Identity state read off the old pubkey in `change_key_transaction` and
+/// re-applied to the replacement row, so a Nostr key rotation moves the account
+/// wholesale — including the restrictions that gate Nostr and ActivityPub signing.
+#[derive(Debug, FromRow)]
+struct RotatedIdentityRow {
+    username: Option<String>,
+    status: UserStatus,
+    suspended_reason: Option<String>,
+    suspended_at: Option<DateTime<Utc>>,
+    verified_minor: bool,
+    verified_minor_at: Option<DateTime<Utc>>,
+}
+
 /// Outcome of atomically consuming a claim token and claiming the account.
 /// Only `Claimed` mutates anything; the other outcomes guarantee both the
 /// token and the user row are untouched (see
@@ -1543,12 +1556,20 @@ impl UserRepository {
             .execute(&mut *tx)
             .await?;
 
-        let old_username: Option<String> =
-            sqlx::query_scalar("SELECT username FROM users WHERE pubkey = $1 AND tenant_id = $2")
-                .bind(old_pubkey)
-                .bind(tenant_id)
-                .fetch_one(&mut *tx)
-                .await?;
+        // Everything that must move with the identity, read before the old row is
+        // orphaned. Account restrictions (status/suspension, verified-minor) travel
+        // with the username and the AP key: a suspended or banned actor that rotates
+        // its Nostr key must stay restricted on the new pubkey, otherwise the
+        // replacement row would default to `active` and hand the actor back both
+        // Nostr and ActivityPub signing.
+        let old_identity: RotatedIdentityRow = sqlx::query_as(
+            "SELECT username, status, suspended_reason, suspended_at, verified_minor, verified_minor_at \
+             FROM users WHERE pubkey = $1 AND tenant_id = $2",
+        )
+        .bind(old_pubkey)
+        .bind(tenant_id)
+        .fetch_one(&mut *tx)
+        .await?;
 
         // Orphan old identity (transfer email/password/username to NULL)
         sqlx::query(
@@ -1564,15 +1585,22 @@ impl UserRepository {
         // Create new user identity with email/password/username. The AP gateway
         // resolves actor URLs by username, so it must move with the AP key row.
         sqlx::query(
-            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, username, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, username, \
+                                status, suspended_reason, suspended_at, verified_minor, verified_minor_at, \
+                                created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(new_pubkey)
         .bind(tenant_id)
         .bind(email)
         .bind(password_hash)
         .bind(true) // Keep email verified status
-        .bind(old_username)
+        .bind(old_identity.username)
+        .bind(old_identity.status.as_str())
+        .bind(old_identity.suspended_reason)
+        .bind(old_identity.suspended_at)
+        .bind(old_identity.verified_minor)
+        .bind(old_identity.verified_minor_at)
         .bind(now)
         .bind(now)
         .execute(&mut *tx)

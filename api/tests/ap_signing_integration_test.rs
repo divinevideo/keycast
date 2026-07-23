@@ -716,3 +716,98 @@ async fn key_rotation_preserves_ap_public_pem_on_new_pubkey() {
     cleanup(&pool, &old_pubkey).await;
     cleanup(&pool, &new_pubkey).await;
 }
+
+/// Rotation transfers the identity — username and AP key — to the new pubkey, so
+/// it must transfer the account restrictions too. Otherwise a suspended actor
+/// rotates its Nostr key onto a row that defaults to `active` and gets its
+/// ActivityPub signing oracle back.
+#[tokio::test]
+async fn key_rotation_preserves_suspension_for_ap_actor() {
+    common::assert_test_database_url();
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+    let pool = common::setup_test_db().await;
+
+    let old_pubkey = Keys::generate().public_key().to_hex();
+    let new_pubkey = Keys::generate().public_key().to_hex();
+    let username = format!("ap-susp-{}", uuid::Uuid::new_v4());
+    let actor = format!("https://divine.video/ap/users/{username}");
+    create_test_user_with_username(&pool, &old_pubkey, &username).await;
+
+    // Mint the AP key while the account is still active, then suspend it.
+    let app = build_app(create_test_auth_state(pool.clone()));
+    let resp = app
+        .oneshot(bearer_json(
+            "/ap/keys",
+            serde_json::json!({ "actor": actor.clone() }),
+            Some(SERVICE_TOKEN),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let user_repo = UserRepository::new(pool.clone());
+    user_repo
+        .set_user_status(
+            &old_pubkey,
+            TENANT_ID,
+            &UserStatus::Suspended,
+            Some("ap rotation test"),
+        )
+        .await
+        .expect("suspend user");
+
+    user_repo
+        .change_key_transaction(
+            &old_pubkey,
+            &new_pubkey,
+            TENANT_ID,
+            &format!("suspended-ap-{}@example.com", uuid::Uuid::new_v4()),
+            "password-hash",
+            &[1, 2, 3, 4],
+        )
+        .await
+        .expect("change key");
+
+    let (status, reason, suspended_at) = user_repo
+        .get_user_status(&new_pubkey, TENANT_ID)
+        .await
+        .expect("status lookup")
+        .expect("replacement user should exist");
+    assert_eq!(
+        status,
+        UserStatus::Suspended,
+        "rotation must not reset the account to active"
+    );
+    assert_eq!(reason.as_deref(), Some("ap rotation test"));
+    assert!(
+        suspended_at.is_some(),
+        "suspended_at should carry to the new pubkey"
+    );
+
+    // The actor URL now resolves to the new pubkey; both AP paths must stay closed.
+    let app = build_app(create_test_auth_state(pool.clone()));
+    let resp = app
+        .oneshot(
+            Request::get(format!("/ap/keys/{}", urlencoding::encode(&actor)))
+                .header("authorization", format!("Bearer {}", SERVICE_TOKEN))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let app = build_app(create_test_auth_state(pool.clone()));
+    let resp = app
+        .oneshot(bearer_json(
+            "/ap/sign",
+            serde_json::json!({ "actor": actor.clone(), "signing_string": "(request-target): post /inbox" }),
+            Some(SERVICE_TOKEN),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    cleanup(&pool, &old_pubkey).await;
+    cleanup(&pool, &new_pubkey).await;
+}

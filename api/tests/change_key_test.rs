@@ -387,3 +387,102 @@ async fn test_change_key_transaction_no_oauth_authorizations() {
         .await
         .ok();
 }
+
+// ============================================================================
+// Test: rotation carries account restrictions to the replacement identity
+// ============================================================================
+
+/// Account-restriction columns as stored, for comparing the old row to the
+/// replacement row after rotation.
+#[derive(sqlx::FromRow)]
+struct RestrictionsRow {
+    status: String,
+    suspended_reason: Option<String>,
+    suspended_at: Option<chrono::DateTime<Utc>>,
+    verified_minor: bool,
+    verified_minor_at: Option<chrono::DateTime<Utc>>,
+}
+
+#[tokio::test]
+async fn test_change_key_transaction_preserves_account_restrictions() {
+    let pool = setup_pool().await;
+
+    let old_pubkey = Keys::generate().public_key().to_hex();
+    let email = format!("restricted-{}@example.com", Uuid::new_v4());
+    let password_hash = "$2b$12$K4Iczl3gkZmIq7WxVbJbNepLNnDOXhF2wZvLZOKCqwCmHPHkKZedi";
+
+    create_test_user(&pool, &old_pubkey, &email, password_hash, &[0u8; 48]).await;
+
+    sqlx::query(
+        "UPDATE users SET status = 'banned', suspended_reason = $1, suspended_at = NOW(), \
+                          verified_minor = TRUE, verified_minor_at = NOW() \
+         WHERE pubkey = $2",
+    )
+    .bind("policy violation")
+    .bind(&old_pubkey)
+    .execute(&pool)
+    .await
+    .expect("Should restrict test user");
+
+    // Read the stored timestamps back so the comparison below is against what
+    // Postgres actually holds, not a client-side value it rounds on write.
+    let (suspended_at, verified_minor_at): (
+        Option<chrono::DateTime<Utc>>,
+        Option<chrono::DateTime<Utc>>,
+    ) = sqlx::query_as("SELECT suspended_at, verified_minor_at FROM users WHERE pubkey = $1")
+        .bind(&old_pubkey)
+        .fetch_one(&pool)
+        .await
+        .expect("Query should succeed");
+
+    let new_pubkey = Keys::generate().public_key().to_hex();
+    keycast_core::repositories::UserRepository::new(pool.clone())
+        .change_key_transaction(
+            &old_pubkey,
+            &new_pubkey,
+            1,
+            &email,
+            password_hash,
+            &[1u8; 48],
+        )
+        .await
+        .expect("change_key_transaction should succeed");
+
+    let carried: RestrictionsRow = sqlx::query_as(
+        "SELECT status, suspended_reason, suspended_at, verified_minor, verified_minor_at \
+         FROM users WHERE pubkey = $1",
+    )
+    .bind(&new_pubkey)
+    .fetch_one(&pool)
+    .await
+    .expect("Query should succeed");
+
+    assert_eq!(
+        carried.status, "banned",
+        "Replacement identity must stay banned, not default to active"
+    );
+    assert_eq!(
+        carried.suspended_reason.as_deref(),
+        Some("policy violation")
+    );
+    assert_eq!(carried.suspended_at, suspended_at);
+    assert!(
+        carried.verified_minor,
+        "verified_minor designation must follow the identity"
+    );
+    assert_eq!(carried.verified_minor_at, verified_minor_at);
+
+    // Cleanup
+    sqlx::query("DELETE FROM personal_keys WHERE user_pubkey IN ($1, $2)")
+        .bind(&old_pubkey)
+        .bind(&new_pubkey)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM users WHERE pubkey IN ($1, $2)")
+        .bind(&old_pubkey)
+        .bind(&new_pubkey)
+        .execute(&pool)
+        .await
+        .ok();
+}
