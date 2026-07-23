@@ -953,10 +953,6 @@ async fn enrich_user_lookup_details(
     }
 }
 
-fn should_attempt_authoritative_name_promotion(query: &str, authoritative_match: bool) -> bool {
-    !authoritative_match && !query.contains('@') && !query.starts_with("npub") && query.len() != 64
-}
-
 fn should_fetch_email_suggestions(authoritative_match: bool, result_count: usize) -> bool {
     !authoritative_match && result_count == 0
 }
@@ -972,12 +968,95 @@ async fn await_name_promotion_within<T>(
     tokio::time::timeout(timeout, future).await.ok()
 }
 
+/// A support-lookup query reduced to its effective search string, plus whether it is a
+/// Divine-handle-shaped query eligible for authoritative name-server promotion.
+///
+/// Support and users write a handle several ways: `mjb`, `@mjb`, `mjb.<domain>` (the profile
+/// URL), `@mjb.<domain>`, and `mjb@<domain>` (the NIP-05 form). All reduce to the bare handle
+/// `mjb`. Emails at other domains, `npub…`, and 64-char hex are not handles.
+#[derive(Debug, PartialEq, Eq)]
+struct CanonicalLookup {
+    query: String,
+    is_handle: bool,
+}
+
+/// Strip an ASCII `suffix` (matched case-insensitively via `lower`) from `s`, returning the
+/// prefix. `lower` must be `s.to_lowercase()`; `suffix` must be lowercase ASCII. The suffix
+/// region is ASCII, so `s.len() - suffix.len()` is a valid char boundary even if the prefix
+/// is non-ASCII.
+fn strip_ascii_suffix<'a>(s: &'a str, lower: &str, suffix: &str) -> Option<&'a str> {
+    lower
+        .ends_with(suffix)
+        .then(|| &s[..s.len() - suffix.len()])
+}
+
+fn canonicalize_lookup_query(raw: &str, nip05_domain: &str) -> CanonicalLookup {
+    let q = raw.trim();
+
+    // Direct pubkey forms are searched as-is and never promoted by name.
+    if q.starts_with("npub") || (q.len() == 64 && q.chars().all(|c| c.is_ascii_hexdigit())) {
+        return CanonicalLookup {
+            query: q.to_string(),
+            is_handle: false,
+        };
+    }
+
+    // A leading '@' is a common way to write a handle.
+    let s = q.strip_prefix('@').unwrap_or(q);
+    let domain = nip05_domain.trim().to_lowercase();
+    let lower = s.to_lowercase();
+
+    if !domain.is_empty() {
+        // NIP-05 email form `handle@domain` reduces to the bare handle.
+        if let Some(handle) = strip_ascii_suffix(s, &lower, &format!("@{domain}")) {
+            if !handle.is_empty() {
+                return CanonicalLookup {
+                    query: handle.to_string(),
+                    is_handle: true,
+                };
+            }
+        }
+        // Profile-URL / subdomain form `handle.domain` reduces to the bare handle too (it would
+        // otherwise be mangled by the username query's dot-stripping normalization), but only for
+        // a bare host: an email at a subdomain (e.g. `agent@qa.divine.video`) still contains `@`
+        // and must fall through to the email branch, not be mis-read as the handle `agent@qa`.
+        if !s.contains('@') {
+            if let Some(handle) = strip_ascii_suffix(s, &lower, &format!(".{domain}")) {
+                if !handle.is_empty() {
+                    return CanonicalLookup {
+                        query: handle.to_string(),
+                        is_handle: true,
+                    };
+                }
+            }
+        }
+    }
+
+    // An email at some other domain: search as email, not a handle.
+    if s.contains('@') || s.is_empty() {
+        return CanonicalLookup {
+            query: if s.is_empty() {
+                q.to_string()
+            } else {
+                s.to_string()
+            },
+            is_handle: false,
+        };
+    }
+
+    // A bare token is a Divine-handle candidate (the local ladder still tries username/vine_id/hex).
+    CanonicalLookup {
+        query: s.to_string(),
+        is_handle: true,
+    }
+}
+
 #[cfg(test)]
 mod user_lookup_response_tests {
     use super::{
         authoritative_name_promotion_timeout, await_name_promotion_within,
-        should_attempt_authoritative_name_promotion, should_fetch_email_suggestions,
-        AdminUserDetails, UserLookupDetails, UserLookupResponse, UserStatus,
+        canonicalize_lookup_query, should_fetch_email_suggestions, AdminUserDetails,
+        CanonicalLookup, UserLookupDetails, UserLookupResponse, UserStatus,
         ADMIN_NAME_PROMOTION_TIMEOUT,
     };
     use chrono::Utc;
@@ -1086,18 +1165,135 @@ mod user_lookup_response_tests {
     }
 
     #[test]
-    fn loose_matches_allow_authoritative_name_promotion_but_skip_suggestions() {
-        assert!(should_attempt_authoritative_name_promotion(
-            "partial-name",
-            false
-        ));
+    fn demote_to_candidates_clears_authority() {
+        let lookup = AdminUserLookup {
+            users: vec![lookup_details("a", true), lookup_details("b", true)],
+            authoritative_match: true,
+            authoritative_count: 2,
+        };
+        let demoted = lookup.demote_to_candidates();
+        assert!(demoted.users.iter().all(|user| !user.authoritative));
+        assert_eq!(demoted.authoritative_count, 0);
+        assert!(!demoted.authoritative_match);
+    }
+
+    #[test]
+    fn name_promotion_demotes_a_disagreeing_authoritative_local_match() {
+        // The name server resolved the handle to `canonical`; a local exact-username match
+        // `stale` disagrees. After demotion + merge only the name-server row is authoritative,
+        // so the stale local row can no longer shadow the real account.
+        let promoted = AdminUserLookup {
+            users: vec![lookup_details("canonical", true)],
+            authoritative_match: true,
+            authoritative_count: 1,
+        };
+        let local = AdminUserLookup {
+            users: vec![lookup_details("stale", true)],
+            authoritative_match: true,
+            authoritative_count: 1,
+        };
+
+        let merged = promoted.append_loose_results(local.demote_to_candidates());
+
+        assert_eq!(merged.users[0].pubkey, "canonical");
+        assert!(merged.users[0].authoritative);
+        assert_eq!(merged.users[1].pubkey, "stale");
+        assert!(!merged.users[1].authoritative);
+        assert_eq!(merged.authoritative_count, 1);
+    }
+
+    #[test]
+    fn name_promotion_dedupes_when_name_server_agrees_with_local() {
+        let promoted = AdminUserLookup {
+            users: vec![lookup_details("same", true)],
+            authoritative_match: true,
+            authoritative_count: 1,
+        };
+        let local = AdminUserLookup {
+            users: vec![lookup_details("same", true)],
+            authoritative_match: true,
+            authoritative_count: 1,
+        };
+
+        let merged = promoted.append_loose_results(local.demote_to_candidates());
+
+        assert_eq!(merged.users.len(), 1, "same pubkey should dedupe");
+        assert!(merged.users[0].authoritative);
+        assert_eq!(merged.authoritative_count, 1);
+    }
+
+    #[test]
+    fn email_suggestions_only_when_no_authoritative_match_and_zero_results() {
         assert!(!should_fetch_email_suggestions(false, 1));
         assert!(should_fetch_email_suggestions(false, 0));
-        assert!(!should_attempt_authoritative_name_promotion(
-            "partial-name",
-            true
-        ));
         assert!(!should_fetch_email_suggestions(true, 0));
+    }
+
+    fn handle(query: &str) -> CanonicalLookup {
+        CanonicalLookup {
+            query: query.to_string(),
+            is_handle: true,
+        }
+    }
+
+    fn non_handle(query: &str) -> CanonicalLookup {
+        CanonicalLookup {
+            query: query.to_string(),
+            is_handle: false,
+        }
+    }
+
+    #[test]
+    fn canonicalize_reduces_handle_forms_to_bare_handle() {
+        let d = "divine.video";
+        assert_eq!(canonicalize_lookup_query("mjb", d), handle("mjb"));
+        assert_eq!(canonicalize_lookup_query("@mjb", d), handle("mjb"));
+        assert_eq!(
+            canonicalize_lookup_query("mjb.divine.video", d),
+            handle("mjb")
+        );
+        assert_eq!(
+            canonicalize_lookup_query("@mjb.divine.video", d),
+            handle("mjb")
+        );
+        assert_eq!(
+            canonicalize_lookup_query("mjb@divine.video", d),
+            handle("mjb")
+        );
+        // Case is preserved (DB match is case-insensitive; the name server resolves case-insensitively).
+        assert_eq!(
+            canonicalize_lookup_query("  MJB@Divine.Video  ", d),
+            handle("MJB")
+        );
+    }
+
+    #[test]
+    fn canonicalize_marks_non_handles() {
+        let d = "divine.video";
+        assert_eq!(
+            canonicalize_lookup_query("alice@gmail.com", d),
+            non_handle("alice@gmail.com")
+        );
+        // An email at a subdomain of the Divine domain is still an email, not the handle `agent@qa`.
+        assert_eq!(
+            canonicalize_lookup_query("agent@qa.divine.video", d),
+            non_handle("agent@qa.divine.video")
+        );
+        assert_eq!(
+            canonicalize_lookup_query("npub1qqqqexample", d),
+            non_handle("npub1qqqqexample")
+        );
+        let hex = "a".repeat(64);
+        assert_eq!(canonicalize_lookup_query(&hex, d), non_handle(&hex));
+    }
+
+    #[test]
+    fn canonicalize_dotted_handle_that_is_not_the_domain_stays_a_handle() {
+        // The ladder normalizes dots, so a dotted handle is still a handle candidate.
+        assert_eq!(
+            canonicalize_lookup_query("lele.pons", "divine.video"),
+            handle("lele.pons")
+        );
     }
 }
 
@@ -1122,16 +1318,25 @@ pub async fn get_user_lookup(
         return Err(ApiError::bad_request("Query parameter 'q' is required"));
     }
 
-    let user_repo = UserRepository::new(pool.clone());
-    let mut lookup = user_repo.find_users_for_admin(q, tenant_id).await?;
+    // Reduce the several ways a Divine handle is written (@mjb, mjb.<domain>, mjb@<domain>) to the
+    // bare handle, and mark whether this is a handle-shaped query at all.
+    let nip05_domain = crate::api::http::auth::resolve_nip05_domain(&tenant.0.domain);
+    let canonical = canonicalize_lookup_query(q, &nip05_domain);
 
-    // Loose repository matches are candidates, not authoritative identity matches. Keep them in
-    // the response, but still resolve username-shaped queries so an exact external name match can
-    // be promoted ahead of those candidates.
-    if should_attempt_authoritative_name_promotion(q, lookup.authoritative_match)
-        && crate::divine_names::is_enabled()
-    {
-        let name_lookup = crate::divine_names::lookup_by_name(q);
+    let user_repo = UserRepository::new(pool.clone());
+    let mut lookup = user_repo
+        .find_users_for_admin(&canonical.query, tenant_id)
+        .await?;
+
+    // The Divine name server is authoritative for handles, so consult it for any handle-shaped
+    // query even when a local row already matches: a stale local `username` must not shadow the
+    // real account. When the name server resolves to a keycast account, that account becomes the
+    // sole authoritative match and every local row is demoted to a candidate. Note `is_handle` is
+    // syntactic, so a local match on some other column (e.g. a coincidental `vine_id`) is demoted
+    // too; that is intentional — the name server owns a registered handle regardless — and the
+    // demoted row stays visible as a candidate rather than being hidden.
+    if canonical.is_handle && crate::divine_names::is_enabled() {
+        let name_lookup = crate::divine_names::lookup_by_name(&canonical.query);
         let promoted_name =
             if let Some(timeout) = authoritative_name_promotion_timeout(lookup.users.len()) {
                 await_name_promotion_within(name_lookup, timeout).await
@@ -1144,14 +1349,16 @@ pub async fn get_user_lookup(
                 .find_users_for_admin(&hex_pubkey, tenant_id)
                 .await?;
             if resolved_lookup.authoritative_match {
-                lookup = resolved_lookup.append_loose_results(lookup);
+                lookup = resolved_lookup.append_loose_results(lookup.demote_to_candidates());
             }
         }
     }
 
     let suggested_users =
         if should_fetch_email_suggestions(lookup.authoritative_match, lookup.users.len()) {
-            user_repo.suggest_users_for_admin(q, tenant_id).await?
+            user_repo
+                .suggest_users_for_admin(&canonical.query, tenant_id)
+                .await?
         } else {
             vec![]
         };

@@ -287,7 +287,7 @@
 					<input
 						type="text"
 						bind:value={searchQuery}
-						placeholder="Email, username, Vine ID, or pubkey"
+						placeholder="Email, Divine username, Vine ID, or pubkey"
 						class="search-input"
 						disabled={isSearching}
 					/>
@@ -296,7 +296,7 @@
 					{isSearching ? 'Searching...' : 'Search'}
 				</button>
 			</form>
-			<p class="search-hint">Full or partial email, username, Vine ID, hex pubkey, or npub</p>
+			<p class="search-hint">Full or partial email, Divine username, Vine ID, hex pubkey, or npub</p>
 
 			{#if searchError}
 				<div class="search-error">

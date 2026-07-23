@@ -70,7 +70,7 @@ pub fn generate_secure_token() -> String {
 /// or `DOMAIN` override a real tenant would make verification fail (profile claims one host while
 /// discovery lives on another). Those env vars apply only when the tenant host is `localhost` or
 /// `127.0.0.1` (local dev), with `DEFAULT_NIP05_DOMAIN` as the final fallback.
-fn resolve_nip05_domain(tenant_domain: &str) -> String {
+pub(crate) fn resolve_nip05_domain(tenant_domain: &str) -> String {
     if tenant_domain == "localhost" || tenant_domain == "127.0.0.1" {
         return std::env::var("NIP05_DOMAIN")
             .ok()

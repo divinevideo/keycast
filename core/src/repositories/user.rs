@@ -226,6 +226,18 @@ impl AdminUserLookup {
         self.authoritative_match = self.authoritative_count > 0;
         self
     }
+
+    /// Demote every row to a non-authoritative candidate. Used when an authoritative
+    /// name-server match supersedes local matches for a handle query, so a stale local row
+    /// (e.g. an outdated `username`) can no longer present itself as the identity match.
+    pub fn demote_to_candidates(mut self) -> Self {
+        for user in &mut self.users {
+            user.authoritative = false;
+        }
+        self.authoritative_count = 0;
+        self.authoritative_match = false;
+        self
+    }
 }
 
 fn is_undefined_postgres_function(error: &sqlx::Error) -> bool {
