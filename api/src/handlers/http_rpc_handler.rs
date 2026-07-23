@@ -70,9 +70,12 @@ impl UnwrapError {
 
 /// Per-recipient failure reason for NIP-17 gift-wrap creation.
 ///
-/// The HTTP batch response exposes these as stable `{"error": "<code>"}`
-/// slots, allowing one recipient failure to remain isolated without weakening
-/// authorization or permission checks for the rest of the batch.
+/// The HTTP batch response exposes recipient-scoped failures as stable
+/// `{"error": "<code>"}` slots, allowing one recipient failure to remain
+/// isolated without weakening authorization or permission checks for the rest of
+/// the batch. Common rumor failures such as [`Self::InvalidRumorAuthor`] and
+/// [`Self::InvalidRumorId`] are rejected by the RPC layer as request-level
+/// invalid params before any per-recipient slots are built.
 #[derive(Debug, Error)]
 pub enum WrapError {
     #[error("authorization expired or revoked")]
@@ -416,14 +419,34 @@ impl HttpRpcHandler {
         rumor.ensure_id();
 
         let plaintext = rumor.as_json();
-        let ciphertext = self
-            .nip44_encrypt(recipient, &plaintext)
+        self.nip17_wrap_prevalidated_plaintext(&plaintext, recipient)
             .await
-            .map_err(|error| match error {
-                HandlerError::AuthorizationInvalid => WrapError::AuthorizationInvalid,
-                HandlerError::PermissionDenied => WrapError::PermissionDenied,
-                HandlerError::Encryption(_) | HandlerError::Signing(_) => WrapError::EncryptFailed,
-            })?;
+    }
+
+    /// Build one NIP-59 gift wrap from a prevalidated, serialized rumor.
+    ///
+    /// The caller must verify the rumor author and id before passing plaintext.
+    /// This keeps batch wrapping from rehashing and reserializing the same rumor
+    /// for every recipient while preserving the encrypt and sign policy gates.
+    pub(crate) async fn nip17_wrap_prevalidated_plaintext(
+        &self,
+        plaintext: &str,
+        recipient: &PublicKey,
+    ) -> Result<Event, WrapError> {
+        if !self.is_valid() {
+            return Err(WrapError::AuthorizationInvalid);
+        }
+
+        let ciphertext =
+            self.nip44_encrypt(recipient, plaintext)
+                .await
+                .map_err(|error| match error {
+                    HandlerError::AuthorizationInvalid => WrapError::AuthorizationInvalid,
+                    HandlerError::PermissionDenied => WrapError::PermissionDenied,
+                    HandlerError::Encryption(_) | HandlerError::Signing(_) => {
+                        WrapError::EncryptFailed
+                    }
+                })?;
 
         let seal = EventBuilder::new(Kind::Seal, ciphertext)
             .custom_created_at(Timestamp::tweaked(nip59::RANGE_RANDOM_TIMESTAMP_TWEAK))

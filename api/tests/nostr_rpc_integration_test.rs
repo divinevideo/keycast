@@ -1418,6 +1418,23 @@ fn wrap_rumor_param(sender: &Keys, receiver: &PublicKey, text: &str) -> Value {
     serde_json::to_value(rumor).expect("serialize rumor")
 }
 
+fn assert_gift_wrap_has_recipient_p_tag(slot: &Value, recipient: &PublicKey) {
+    let recipient_hex = recipient.to_hex();
+    let tags = slot["gift_wrap"]["tags"]
+        .as_array()
+        .expect("gift wrap has tags");
+    assert!(
+        tags.iter().any(|tag| {
+            let Some(parts) = tag.as_array() else {
+                return false;
+            };
+            parts.first().and_then(Value::as_str) == Some("p")
+                && parts.get(1).and_then(Value::as_str) == Some(recipient_hex.as_str())
+        }),
+        "gift wrap must include recipient p tag"
+    );
+}
+
 struct WrapRpcAccount {
     user_keys: Keys,
     pubkey: String,
@@ -1734,6 +1751,7 @@ async fn test_nip17_wrap_batch_happy_path_order_duplicates_partial_failure_and_a
         (2usize, &account.user_keys),
         (3usize, &recipient),
     ] {
+        assert_gift_wrap_has_recipient_p_tag(&results[idx], &receiver.public_key());
         let gift_wrap: Event = serde_json::from_value(results[idx]["gift_wrap"].clone())
             .expect("successful slot contains gift wrap");
         let unwrapped = UnwrappedGift::from_gift_wrap(receiver, &gift_wrap)

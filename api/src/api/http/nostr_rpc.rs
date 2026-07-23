@@ -15,7 +15,7 @@ use keycast_core::repositories::{
 };
 use keycast_core::signing_session::{parse_cache_key, CacheKey, SigningSession};
 use keycast_core::traits::CustomPermission;
-use nostr_sdk::{Event, Keys, PublicKey, UnsignedEvent};
+use nostr_sdk::{Event, JsonUtil, Keys, PublicKey, UnsignedEvent};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -950,40 +950,42 @@ fn parse_nip17_wrap_batch_params(params: &[JsonValue]) -> Result<Nip17WrapBatchP
     Ok(Nip17WrapBatchParams { rumor, recipients })
 }
 
-fn wrap_error_slot(code: &str) -> JsonValue {
+fn error_slot(code: &str) -> JsonValue {
     serde_json::json!({ "error": code })
 }
 
 /// Build ordered, index-aligned gift wraps for one shared rumor.
 ///
 /// Construction is deliberately sequential: a request can contain at most
-/// [`MAX_WRAP_BATCH`] recipients, and one in-flight recipient at a time avoids
-/// crowding Tokio's shared blocking pool while preserving duplicate slots.
+/// [`MAX_WRAP_BATCH`] recipients, and one in-flight recipient at a time keeps
+/// per-request work bounded while preserving duplicate slots.
 async fn wrap_gift_wrap_batch(
     handler: &Arc<HttpRpcHandler>,
     rumor: &UnsignedEvent,
     recipients: &[Result<PublicKey, ()>],
 ) -> Vec<JsonValue> {
+    let mut rumor = rumor.clone();
+    rumor.ensure_id();
+    let plaintext = rumor.as_json();
+
     let mut results = Vec::with_capacity(recipients.len());
     for recipient in recipients {
         let slot = match recipient {
-            Err(()) => wrap_error_slot("invalid_recipient"),
-            Ok(recipient) => match handler.nip17_wrap(rumor.clone(), recipient).await {
+            Err(()) => error_slot("invalid_recipient"),
+            Ok(recipient) => match handler
+                .nip17_wrap_prevalidated_plaintext(&plaintext, recipient)
+                .await
+            {
                 Ok(gift_wrap) => match serde_json::to_value(gift_wrap) {
                     Ok(event) => serde_json::json!({ "gift_wrap": event }),
-                    Err(_) => wrap_error_slot("internal"),
+                    Err(_) => error_slot("internal"),
                 },
-                Err(error) => wrap_error_slot(error.code()),
+                Err(error) => error_slot(error.code()),
             },
         };
         results.push(slot);
     }
     results
-}
-
-/// Build the per-item error slot for the unwrap batch response.
-fn unwrap_error_slot(code: &str) -> JsonValue {
-    serde_json::json!({ "error": code })
 }
 
 /// Unwrap a batch of NIP-59 gift wraps into ordered, index-aligned result slots.
@@ -1014,7 +1016,7 @@ async fn unwrap_gift_wrap_batch(
         set.spawn(async move {
             let event: Event = match serde_json::from_value(item) {
                 Ok(e) => e,
-                Err(_) => return (idx, unwrap_error_slot("invalid_event")),
+                Err(_) => return (idx, error_slot("invalid_event")),
             };
             let slot = match handler.nip17_unwrap(event).await {
                 Ok(unwrapped) => match serde_json::to_value(&unwrapped.rumor) {
@@ -1022,9 +1024,9 @@ async fn unwrap_gift_wrap_batch(
                         "rumor": rumor,
                         "sender": unwrapped.sender.to_hex(),
                     }),
-                    Err(_) => unwrap_error_slot("internal"),
+                    Err(_) => error_slot("internal"),
                 },
-                Err(e) => unwrap_error_slot(e.code()),
+                Err(e) => error_slot(e.code()),
             };
             (idx, slot)
         });
@@ -1033,7 +1035,7 @@ async fn unwrap_gift_wrap_batch(
     // Pre-fill with internal-error slots so a task that fails to report a result
     // (e.g. a JoinError from a panicked task) still yields a valid, index-aligned
     // slot rather than a hole in the ordered response.
-    let mut results = vec![unwrap_error_slot("internal"); items.len()];
+    let mut results = vec![error_slot("internal"); items.len()];
     while let Some(joined) = set.join_next().await {
         if let Ok((idx, slot)) = joined {
             results[idx] = slot;
@@ -1206,6 +1208,23 @@ mod tests {
         let rumor =
             nostr_sdk::EventBuilder::private_msg_rumor(recipient, "batch send").build(author);
         serde_json::to_value(rumor).expect("serialize rumor")
+    }
+
+    fn assert_gift_wrap_has_recipient_p_tag(slot: &JsonValue, recipient: &PublicKey) {
+        let recipient_hex = recipient.to_hex();
+        let tags = slot["gift_wrap"]["tags"]
+            .as_array()
+            .expect("gift wrap has tags");
+        assert!(
+            tags.iter().any(|tag| {
+                let Some(parts) = tag.as_array() else {
+                    return false;
+                };
+                parts.first().and_then(JsonValue::as_str) == Some("p")
+                    && parts.get(1).and_then(JsonValue::as_str) == Some(recipient_hex.as_str())
+            }),
+            "gift wrap must include recipient p tag"
+        );
     }
 
     #[test]
@@ -1424,6 +1443,7 @@ mod tests {
             (2usize, &receiver_b),
             (3usize, &receiver_a),
         ] {
+            assert_gift_wrap_has_recipient_p_tag(&results[idx], &receiver.public_key());
             let wrap: Event = serde_json::from_value(results[idx]["gift_wrap"].clone())
                 .expect("successful slot contains an event");
             let unwrapped = nostr_sdk::nips::nip59::UnwrappedGift::from_gift_wrap(receiver, &wrap)
