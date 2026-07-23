@@ -6,7 +6,7 @@
 	"scripts": {
 		"predev": "cd web && bun install",
 		"dev": "bun run deps:up && npx concurrently -n api,web -c blue,green \"bun run dev:api\" \"bun run dev:web\"",
-		"dev:e2e": "docker compose -f docker-compose.deps.yml --profile e2e up -d --wait && cargo build --bin keycast && DATABASE_URL=postgres://postgres:password@localhost/keycast REDIS_URL=redis://localhost:16379 RUST_LOG=debug,hyper=info,h2=info,rustls=info,sqlx=info,nostr_relay_pool=info,tower_http=info MASTER_KEY_PATH=./master.key ENABLE_EXAMPLES=true ALLOWED_ORIGINS=http://localhost:5173,http://localhost:5174,http://localhost:3000 SERVER_NSEC=0000000000000000000000000000000000000000000000000000000000000001 WEB_BUILD_DIR=./web/build BUNKER_RELAYS=ws://localhost:8080 ALLOWED_PUBKEYS=25fa07621969c92191feb4433fca94fdb500f2b445fd4f017c0a332ceecbf813 ./target/debug/keycast",
+		"dev:e2e": "docker compose -f docker-compose.deps.yml --profile e2e up -d --wait && cargo build --bin keycast && DATABASE_URL=postgres://postgres:password@localhost/keycast REDIS_URL=redis://localhost:16379 RUST_LOG=debug,hyper=info,h2=info,rustls=info,sqlx=info,nostr_relay_pool=info,tower_http=info MASTER_KEY_PATH=./master.key ENABLE_EXAMPLES=true ALLOWED_ORIGINS=http://localhost:5173,http://localhost:5174,http://localhost:3000 ALLOWED_TENANT_DOMAINS=localhost SERVER_NSEC=0000000000000000000000000000000000000000000000000000000000000001 WEB_BUILD_DIR=./web/build BUNKER_RELAYS=ws://localhost:8080 ALLOWED_PUBKEYS=25fa07621969c92191feb4433fca94fdb500f2b445fd4f017c0a332ceecbf813 ./target/debug/keycast",
 		"deps:up": "docker compose -f docker-compose.deps.yml up -d --wait",
 		"deps:down": "docker compose -f docker-compose.deps.yml down",
 		"deps:logs": "docker compose -f docker-compose.deps.yml logs -f",

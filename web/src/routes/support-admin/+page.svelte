@@ -4,6 +4,15 @@
 	import { KeycastApi } from '$lib/keycast_api.svelte';
 	import { redirectToLoginOnAuthError } from '$lib/utils/auth';
 	import { deeplinkQuery } from '$lib/utils/deeplink';
+	import {
+		emailMatchParts,
+		emailSuggestionDiff,
+		isShowingDidYouMean,
+		isSuggestedUser,
+		selectAutoExpandedPubkey,
+		selectDisplayedUsers,
+		type LookupResult
+	} from './lookup-view';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
 	import Loader from '$lib/components/Loader.svelte';
@@ -19,8 +28,9 @@
 
 	// User lookup state
 	let searchQuery = $state('');
+	let executedSearchQuery = $state('');
 	let isSearching = $state(false);
-	let searchResult = $state<null | { results: UserDetails[]; total: number }>(null);
+	let searchResult = $state<LookupResult<UserDetails> | null>(null);
 	let searchError = $state('');
 
 	// Expand/collapse state
@@ -55,6 +65,7 @@
 
 	interface UserDetails {
 		pubkey: string;
+		authoritative: boolean;
 		email: string | null;
 		email_verified: boolean | null;
 		username: string | null;
@@ -65,6 +76,9 @@
 		created_at: string;
 		last_active: string | null;
 	}
+
+	let displayedUsers: UserDetails[] = $derived(selectDisplayedUsers(searchResult));
+	let showingDidYouMean = $derived(isShowingDidYouMean(searchResult));
 
 	onMount(async () => {
 		try {
@@ -104,14 +118,13 @@
 		expandedPubkey = null;
 
 		try {
-			const result = await api.get<{ results: UserDetails[]; total: number }>(
+			const result = await api.get<LookupResult<UserDetails>>(
 				`/admin/user-lookup?q=${encodeURIComponent(q)}`
 			);
+			executedSearchQuery = q;
 			searchResult = result;
-			// Auto-expand if single result
-			if (result.results.length === 1) {
-				expandedPubkey = result.results[0].pubkey;
-			}
+			// Suggestions require an explicit click so they are not mistaken for confirmed matches.
+			expandedPubkey = selectAutoExpandedPubkey(result);
 		} catch (err: any) {
 			if (redirectToLoginOnAuthError(err)) return;
 			searchError = err.message || 'Search failed';
@@ -228,8 +241,8 @@
 	}
 
 	$effect(() => {
-		if (expandedPubkey && searchResult) {
-			const user = searchResult.results.find(u => u.pubkey === expandedPubkey);
+		if (expandedPubkey) {
+			const user = displayedUsers.find(u => u.pubkey === expandedPubkey);
 			if (user?.vine_id && !user?.email) {
 				loadClaimToken(user.pubkey);
 			} else {
@@ -274,7 +287,7 @@
 					<input
 						type="text"
 						bind:value={searchQuery}
-						placeholder="Search for a user..."
+						placeholder="Email, username, Vine ID, or pubkey"
 						class="search-input"
 						disabled={isSearching}
 					/>
@@ -283,7 +296,7 @@
 					{isSearching ? 'Searching...' : 'Search'}
 				</button>
 			</form>
-			<p class="search-hint">Search by email, Vine username, vine_id, hex pubkey, or npub</p>
+			<p class="search-hint">Full or partial email, username, Vine ID, hex pubkey, or npub</p>
 
 			{#if searchError}
 				<div class="search-error">
@@ -293,12 +306,21 @@
 			{/if}
 
 			{#if searchResult}
-				{#if searchResult.results.length === 0}
+				{#if displayedUsers.length === 0}
 					<div class="no-result">
 						<p>No user found matching that query.</p>
 					</div>
 				{:else}
-					{#if searchResult.total >= 20}
+					{#if showingDidYouMean}
+						<div class="suggestions-header">
+							<h3>Did you mean?</h3>
+							<p>No exact match was found. Try one of these similar email addresses.</p>
+							<div class="suggestion-safety" role="note">
+								<Warning size={14} weight="fill" />
+								<span>These are different addresses — confirm identity before acting.</span>
+							</div>
+						</div>
+					{:else if searchResult.total >= 20}
 						<div class="results-banner warning">
 							<Warning size={14} />
 							<span>Showing first 20 of many results — refine your search</span>
@@ -310,8 +332,10 @@
 					{/if}
 
 					<div class="user-list">
-						{#each searchResult.results as u (u.pubkey)}
+						{#each displayedUsers as u (u.pubkey)}
 							{@const isExpanded = expandedPubkey === u.pubkey}
+							{@const emailParts = u.email ? emailMatchParts(u.email, executedSearchQuery) : []}
+							{@const suggestionDiff = showingDidYouMean && u.email ? emailSuggestionDiff(executedSearchQuery, u.email) : null}
 							<div class="user-list-item" class:expanded={isExpanded}>
 								<button class="user-list-row" onclick={() => toggleExpand(u.pubkey)}>
 									<span class="expand-icon">
@@ -322,12 +346,58 @@
 										{/if}
 									</span>
 									<User size={16} weight="fill" />
-									<span class="list-name">{u.display_name || u.username || u.email || truncateFormatted(u.pubkey)}</span>
+									<span class="list-name">
+										{#if u.display_name || u.username}
+											{u.display_name || u.username}
+										{:else if u.email}
+											{#each emailParts as part}
+												{#if part.matched}<mark class="email-match">{part.text}</mark>{:else}{part.text}{/if}
+											{/each}
+										{:else}
+											{truncateFormatted(u.pubkey)}
+										{/if}
+									</span>
 									{#if u.username}
 										<span class="list-username">@{u.username}</span>
 									{/if}
+									{#if u.email && (u.display_name || u.username) && emailParts.some((part) => part.matched)}
+										<span class="list-username">
+											{#each emailParts as part}
+												{#if part.matched}<mark class="email-match">{part.text}</mark>{:else}{part.text}{/if}
+											{/each}
+										</span>
+									{/if}
+									{#if isSuggestedUser(u)}
+										<span class="suggested-badge">Suggested</span>
+									{/if}
 									<span class="list-sessions">{u.active_sessions} {u.active_sessions === 1 ? 'session' : 'sessions'}</span>
 								</button>
+
+								{#if suggestionDiff}
+									<div class="suggestion-diff">
+										<span class="suggestion-distance">{suggestionDiff.chip}</span>
+										<div class="diff-line">
+											<span class="diff-label">you typed</span>
+											<span class="diff-value" role="img" aria-label={executedSearchQuery}>
+												{#each suggestionDiff.typed as part}
+													{#if part.changed}
+														<mark class="diff-character" class:gap={part.gap}>{part.gap ? '∅' : part.text}</mark>
+													{:else}{part.text}{/if}
+												{/each}
+											</span>
+										</div>
+										<div class="diff-line">
+											<span class="diff-label">account</span>
+											<span class="diff-value" role="img" aria-label={u.email}>
+												{#each suggestionDiff.account as part}
+													{#if part.changed}
+														<mark class="diff-character" class:gap={part.gap}>{part.gap ? '∅' : part.text}</mark>
+													{:else}{part.text}{/if}
+												{/each}
+											</span>
+										</div>
+									</div>
+								{/if}
 
 								{#if isExpanded}
 									<div class="user-card">
@@ -373,7 +443,11 @@
 											{#if u.email}
 												<div class="field">
 													<span class="field-label">Email</span>
-													<span class="field-value">{u.email}</span>
+													<span class="field-value">
+														{#each emailParts as part}
+															{#if part.matched}<mark class="email-match">{part.text}</mark>{:else}{part.text}{/if}
+														{/each}
+													</span>
 												</div>
 											{/if}
 
@@ -637,6 +711,37 @@
 		border-color: color-mix(in srgb, var(--color-divine-warning) 30%, transparent);
 	}
 
+	.suggestions-header {
+		margin-bottom: 0.5rem;
+	}
+
+	.suggestions-header h3 {
+		margin: 0 0 0.25rem;
+		color: var(--color-divine-text);
+		font-size: 0.875rem;
+		font-weight: 600;
+	}
+
+	.suggestions-header p {
+		margin: 0;
+		color: var(--color-divine-text-secondary);
+		font-size: 0.775rem;
+	}
+
+	.suggestion-safety {
+		display: flex;
+		align-items: center;
+		gap: 0.375rem;
+		margin-top: 0.5rem;
+		padding: 0.5rem 0.625rem;
+		border: 1px solid color-mix(in srgb, var(--color-divine-warning) 30%, transparent);
+		border-radius: 8px;
+		background: color-mix(in srgb, var(--color-divine-warning) 10%, var(--color-divine-bg));
+		color: var(--color-divine-warning);
+		font-size: 0.75rem;
+		font-weight: 500;
+	}
+
 	.btn-search {
 		padding: 0.625rem 1.25rem;
 		background: var(--color-divine-green);
@@ -747,6 +852,75 @@
 		color: var(--color-divine-text-tertiary);
 		font-size: 0.775rem;
 		flex-shrink: 0;
+	}
+
+	.suggested-badge {
+		padding: 0.125rem 0.375rem;
+		border-radius: 9999px;
+		background: color-mix(in srgb, var(--color-divine-purple, #8b5cf6) 20%, transparent);
+		color: var(--color-divine-purple, #8b5cf6);
+		font-size: 0.65rem;
+		font-weight: 600;
+		line-height: 1.2;
+		text-transform: uppercase;
+		letter-spacing: 0.025em;
+		flex-shrink: 0;
+	}
+
+	.email-match {
+		background: color-mix(in srgb, var(--color-divine-green) 20%, transparent);
+		color: var(--color-divine-green);
+		font-weight: 600;
+	}
+
+	.suggestion-diff {
+		display: grid;
+		grid-template-columns: max-content minmax(0, 1fr);
+		gap: 0.25rem 0.625rem;
+		padding: 0.625rem 1rem 0.75rem 3rem;
+		border-top: 1px solid var(--color-divine-border);
+		background: color-mix(in srgb, var(--color-divine-purple, #8b5cf6) 5%, transparent);
+	}
+
+	.suggestion-distance {
+		grid-column: 1 / -1;
+		justify-self: start;
+		padding: 0.125rem 0.5rem;
+		border-radius: 9999px;
+		background: color-mix(in srgb, var(--color-divine-purple, #8b5cf6) 20%, transparent);
+		color: var(--color-divine-purple, #8b5cf6);
+		font-size: 0.7rem;
+		font-weight: 600;
+	}
+
+	.diff-line {
+		display: contents;
+	}
+
+	.diff-label {
+		color: var(--color-divine-text-tertiary);
+		font-size: 0.7rem;
+		text-transform: uppercase;
+		letter-spacing: 0.025em;
+	}
+
+	.diff-value {
+		overflow-x: auto;
+		color: var(--color-divine-text-secondary);
+		font-family: var(--font-mono);
+		font-size: 0.75rem;
+		white-space: nowrap;
+	}
+
+	.diff-character {
+		padding: 0 0.0625rem;
+		background: color-mix(in srgb, var(--color-divine-purple, #8b5cf6) 25%, transparent);
+		color: var(--color-divine-purple, #8b5cf6);
+		font-weight: 700;
+	}
+
+	.diff-character.gap {
+		border-bottom: 1px dashed currentColor;
 	}
 
 	.list-sessions {
