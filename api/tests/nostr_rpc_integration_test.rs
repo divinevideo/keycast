@@ -1413,6 +1413,62 @@ async fn gift_wrap_param(sender: &Keys, receiver: &PublicKey, text: &str) -> Val
     serde_json::to_value(&wrap).expect("serialize gift wrap")
 }
 
+fn wrap_rumor_param(sender: &Keys, receiver: &PublicKey, text: &str) -> Value {
+    let rumor = EventBuilder::private_msg_rumor(*receiver, text).build(sender.public_key());
+    serde_json::to_value(rumor).expect("serialize rumor")
+}
+
+struct WrapRpcAccount {
+    user_keys: Keys,
+    pubkey: String,
+    auth_id: i32,
+    token: String,
+    auth_state: AuthState,
+}
+
+async fn setup_wrap_rpc_account(
+    pool: &PgPool,
+    tenant_id: i64,
+    expires_at: Option<chrono::DateTime<Utc>>,
+    revoked_at: Option<chrono::DateTime<Utc>>,
+) -> WrapRpcAccount {
+    let (user_keys, pubkey) = create_test_user();
+    let key_manager = FileKeyManager::new().expect("Failed to create key manager");
+    insert_user(pool, tenant_id, &pubkey).await;
+    create_personal_key(pool, tenant_id, &pubkey, &user_keys, &key_manager).await;
+
+    let redirect_origin = format!("https://wrap-{}.example.com", Uuid::new_v4());
+    let (auth_id, bunker_pubkey) = create_test_oauth_authorization(
+        pool,
+        tenant_id,
+        &pubkey,
+        &redirect_origin,
+        None,
+        expires_at,
+        revoked_at,
+    )
+    .await;
+    let token = build_self_signed_ucan(
+        &user_keys,
+        tenant_id,
+        &redirect_origin,
+        Some(&bunker_pubkey),
+    )
+    .await;
+    let auth_state = create_test_auth_state(
+        pool.clone(),
+        Arc::new(Box::new(key_manager) as Box<dyn KeyManager>),
+    );
+
+    WrapRpcAccount {
+        user_keys,
+        pubkey,
+        auth_id,
+        token,
+        auth_state,
+    }
+}
+
 /// Happy path + partial failure: a batch with one decryptable wrap, one
 /// non-gift-wrap event, one wrap for a different recipient, and one unparseable
 /// item returns four ordered, index-aligned slots (success / per-item errors).
@@ -1624,4 +1680,231 @@ async fn test_suspended_user_denied_nip17_unwrap_batch() {
         RpcError::AccountSuspended(msg) => assert_eq!(msg, "Account restricted"),
         other => panic!("expected AccountSuspended, got: {:?}", other),
     }
+}
+
+// ============================================================================
+// nip17_wrap_batch (NIP-59 gift-wrap creation)
+// ============================================================================
+
+#[tokio::test]
+#[serial]
+async fn test_nip17_wrap_batch_happy_path_order_duplicates_partial_failure_and_activity() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let account = setup_wrap_rpc_account(&pool, tenant_id, None, None).await;
+    let recipient = Keys::generate();
+    let rumor = wrap_rumor_param(
+        &account.user_keys,
+        &recipient.public_key(),
+        "one shared rumor",
+    );
+
+    let response = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        account.auth_state,
+        &format!("Bearer {}", account.token),
+        None,
+        NostrRpcRequest {
+            method: "nip17_wrap_batch".to_string(),
+            params: vec![
+                rumor,
+                json!([
+                    recipient.public_key().to_hex(),
+                    "not-a-recipient",
+                    account.pubkey,
+                    recipient.public_key().to_hex()
+                ]),
+            ],
+        },
+    )
+    .await
+    .expect("batch wrap should return ordered slots");
+
+    let results = response
+        .result
+        .as_ref()
+        .and_then(Value::as_array)
+        .expect("result array");
+    assert_eq!(results.len(), 4);
+    assert_eq!(results[1]["error"].as_str(), Some("invalid_recipient"));
+
+    let mut rumor_ids = Vec::new();
+    for (idx, receiver) in [
+        (0usize, &recipient),
+        (2usize, &account.user_keys),
+        (3usize, &recipient),
+    ] {
+        let gift_wrap: Event = serde_json::from_value(results[idx]["gift_wrap"].clone())
+            .expect("successful slot contains gift wrap");
+        let unwrapped = UnwrappedGift::from_gift_wrap(receiver, &gift_wrap)
+            .await
+            .expect("intended recipient unwraps");
+        assert_eq!(unwrapped.sender, account.user_keys.public_key());
+        assert_eq!(unwrapped.rumor.content, "one shared rumor");
+        rumor_ids.push(unwrapped.rumor.id.expect("server ensures rumor id"));
+    }
+    assert!(
+        rumor_ids.windows(2).all(|pair| pair[0] == pair[1]),
+        "every slot must carry the same durable rumor id"
+    );
+    assert_ne!(
+        results[0]["gift_wrap"]["id"], results[3]["gift_wrap"]["id"],
+        "duplicate recipients retain separate ephemeral gift wraps"
+    );
+
+    let mut activity_count = 0;
+    for _ in 0..100 {
+        activity_count = sqlx::query_scalar::<_, i32>(
+            "SELECT activity_count FROM oauth_authorizations WHERE id = $1",
+        )
+        .bind(account.auth_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read activity count");
+        if activity_count == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        activity_count, 1,
+        "the whole batch records exactly one coalesced activity update"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_nip17_wrap_batch_rejects_malformed_common_shape_empty_and_cap() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let account = setup_wrap_rpc_account(&pool, tenant_id, None, None).await;
+    let recipient = Keys::generate();
+    let valid_rumor = wrap_rumor_param(&account.user_keys, &recipient.public_key(), "valid shape");
+
+    let malformed = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        account.auth_state.clone(),
+        &format!("Bearer {}", account.token),
+        None,
+        NostrRpcRequest {
+            method: "nip17_wrap_batch".to_string(),
+            params: vec![
+                json!({ "kind": 14 }),
+                json!([recipient.public_key().to_hex()]),
+            ],
+        },
+    )
+    .await
+    .expect_err("malformed shared rumor is request-level invalid params");
+    assert!(matches!(malformed, RpcError::InvalidParams(_)));
+
+    let wrong_author = Keys::generate();
+    let wrong_author_rumor =
+        wrap_rumor_param(&wrong_author, &recipient.public_key(), "wrong author");
+    let wrong_author_err = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        account.auth_state.clone(),
+        &format!("Bearer {}", account.token),
+        None,
+        NostrRpcRequest {
+            method: "nip17_wrap_batch".to_string(),
+            params: vec![wrong_author_rumor, json!([recipient.public_key().to_hex()])],
+        },
+    )
+    .await
+    .expect_err("shared rumor author mismatch is request-level invalid params");
+    assert!(matches!(wrong_author_err, RpcError::InvalidParams(_)));
+
+    let empty = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        account.auth_state.clone(),
+        &format!("Bearer {}", account.token),
+        None,
+        NostrRpcRequest {
+            method: "nip17_wrap_batch".to_string(),
+            params: vec![valid_rumor.clone(), json!([])],
+        },
+    )
+    .await
+    .expect_err("empty recipient list is rejected");
+    assert!(matches!(empty, RpcError::InvalidParams(_)));
+
+    let recipients = vec![recipient.public_key().to_hex(); 101];
+    let over_cap = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        account.auth_state,
+        &format!("Bearer {}", account.token),
+        None,
+        NostrRpcRequest {
+            method: "nip17_wrap_batch".to_string(),
+            params: vec![valid_rumor, serde_json::to_value(recipients).unwrap()],
+        },
+    )
+    .await
+    .expect_err("over-cap recipient list is rejected");
+    assert!(matches!(over_cap, RpcError::InvalidParams(_)));
+}
+
+#[tokio::test]
+#[serial]
+async fn test_suspended_user_denied_nip17_wrap_batch() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let account = setup_wrap_rpc_account(&pool, tenant_id, None, None).await;
+    suspend_user(&pool, &account.pubkey, tenant_id).await;
+    let recipient = Keys::generate();
+
+    let err = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        account.auth_state,
+        &format!("Bearer {}", account.token),
+        None,
+        NostrRpcRequest {
+            method: "nip17_wrap_batch".to_string(),
+            params: vec![
+                wrap_rumor_param(&account.user_keys, &recipient.public_key(), "restricted"),
+                json!([recipient.public_key().to_hex()]),
+            ],
+        },
+    )
+    .await
+    .expect_err("suspended user cannot wrap a batch");
+
+    match err {
+        RpcError::AccountSuspended(msg) => assert_eq!(msg, "Account restricted"),
+        other => panic!("expected AccountSuspended, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_revoked_authorization_denied_nip17_wrap_batch() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let account = setup_wrap_rpc_account(
+        &pool,
+        tenant_id,
+        None,
+        Some(Utc::now() - Duration::minutes(1)),
+    )
+    .await;
+    let recipient = Keys::generate();
+
+    let err = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        account.auth_state,
+        &format!("Bearer {}", account.token),
+        None,
+        NostrRpcRequest {
+            method: "nip17_wrap_batch".to_string(),
+            params: vec![
+                wrap_rumor_param(&account.user_keys, &recipient.public_key(), "revoked"),
+                json!([recipient.public_key().to_hex()]),
+            ],
+        },
+    )
+    .await
+    .expect_err("revoked authorization cannot wrap a batch");
+
+    assert!(matches!(err, RpcError::Auth(AuthError::InvalidToken)));
 }

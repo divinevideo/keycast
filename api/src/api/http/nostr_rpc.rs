@@ -30,6 +30,11 @@ use super::routes::AuthState;
 /// limit (gift wraps are ~1-2 KB each). Mirrors the `batch_lookup_users` cap.
 const MAX_UNWRAP_BATCH: usize = 100;
 
+/// Maximum recipients accepted in one `nip17_wrap_batch` request.
+/// The shared rumor is processed sequentially so this is also a hard bound on
+/// per-request seal and gift-wrap crypto.
+const MAX_WRAP_BATCH: usize = 100;
+
 /// RPC request format (mirrors NIP-46)
 #[derive(Debug, Deserialize)]
 pub struct NostrRpcRequest {
@@ -126,6 +131,9 @@ impl From<HandlerError> for RpcError {
 /// - nip17_unwrap_batch: Unwraps a batch of NIP-59 gift wraps (1059→seal→rumor),
 ///   returning ordered per-item `{rumor, sender}` / `{error}` slots. Amortizes the
 ///   per-request auth/status overhead and collapses the client's 2 RPCs-per-DM.
+/// - nip17_wrap_batch: Wraps one shared NIP-17 rumor for an ordered recipient
+///   list, returning per-recipient `{gift_wrap}` / `{error}` slots. Preserves
+///   the existing NIP-44 encryption and kind-13 signing policy checks.
 ///
 /// Uses BLAKE3 token cache - on cache hit, skips UCAN verification entirely.
 /// All operations use cached handler with in-memory permission validation (no DB hits).
@@ -260,6 +268,51 @@ pub async fn nostr_rpc(
             JsonValue::Array(results)
         }
 
+        "nip17_wrap_batch" => {
+            let batch = parse_nip17_wrap_batch_params(&req.params)?;
+
+            // Common rumor failures invalidate every possible recipient slot,
+            // so reject them once at request level before any crypto.
+            if batch.rumor.pubkey != handler.public_key() {
+                return Err(RpcError::InvalidParams(
+                    "Rumor author must match signer".into(),
+                ));
+            }
+            batch
+                .rumor
+                .verify_id()
+                .map_err(|_| RpcError::InvalidParams("Invalid rumor id".into()))?;
+
+            // Whole-batch validity gate, matching nip17_unwrap_batch. The
+            // handler primitives still recheck validity at each operation.
+            if !handler.is_valid() {
+                return Err(RpcError::Auth(AuthError::InvalidToken));
+            }
+
+            if verified_minor {
+                enforce_minor_dm_rumor(&handler, &batch.rumor)?;
+                // Validate every parseable encryption target before building
+                // any slot. Malformed targets cannot receive a wrap and remain
+                // isolated as `invalid_recipient` slots.
+                for recipient in batch
+                    .recipients
+                    .iter()
+                    .filter_map(|recipient| recipient.as_ref().ok())
+                {
+                    enforce_minor_dm_encrypt(&handler, recipient)?;
+                }
+            }
+
+            // Sequential construction bounds blocking crypto and naturally
+            // preserves duplicate and positional recipient semantics.
+            let results = wrap_gift_wrap_batch(&handler, &batch.rumor, &batch.recipients).await;
+
+            // One coalesced activity update for the whole RPC request.
+            spawn_log_activity(pool.clone(), handler.is_oauth(), handler.authorization_id());
+
+            JsonValue::Array(results)
+        }
+
         "nip04_encrypt" => {
             let (recipient_pubkey, plaintext) = parse_encrypt_params(&req.params)?;
 
@@ -365,6 +418,25 @@ fn enforce_minor_dm_encrypt(
                 recipient = %recipient.to_hex(),
                 reason = %denied,
                 "verified_minor DM encrypt refused"
+            );
+            RpcError::Auth(AuthError::Forbidden(MINOR_DM_DENIED_MSG.into()))
+        })
+}
+
+/// Apply the verified_minor containment gate to an already-parsed raw rumor
+/// before Keycast composes any per-recipient seals.
+fn enforce_minor_dm_rumor(
+    handler: &Arc<HttpRpcHandler>,
+    rumor: &UnsignedEvent,
+) -> Result<(), RpcError> {
+    keycast_core::verified_minor_dm::validate_minor_rumor_recipients(&handler.public_key(), rumor)
+        .map_err(|denied| {
+            tracing::warn!(
+                event = "minor_dm_gate.rumor_denied",
+                user_pubkey = %handler.user_pubkey_hex(),
+                kind = rumor.kind.as_u16(),
+                reason = %denied,
+                "verified_minor NIP-17 rumor refused"
             );
             RpcError::Auth(AuthError::Forbidden(MINOR_DM_DENIED_MSG.into()))
         })
@@ -822,6 +894,93 @@ fn parse_decrypt_params(params: &[JsonValue]) -> Result<(PublicKey, String), Rpc
     Ok((pubkey, ciphertext.to_string()))
 }
 
+struct Nip17WrapBatchParams {
+    rumor: UnsignedEvent,
+    recipients: Vec<Result<PublicKey, ()>>,
+}
+
+/// Parse `[rumor_object, [recipient_pubkey_hex...]]`.
+///
+/// The shared rumor and recipient-list shape are request-level concerns.
+/// Individual malformed recipient entries remain positional per-item errors so
+/// valid siblings can still be wrapped without reindexing the response.
+fn parse_nip17_wrap_batch_params(params: &[JsonValue]) -> Result<Nip17WrapBatchParams, RpcError> {
+    if params.len() != 2 {
+        return Err(RpcError::InvalidParams(
+            "Expected rumor and recipient list parameters".into(),
+        ));
+    }
+
+    let rumor_value = params
+        .first()
+        .filter(|value| value.is_object())
+        .ok_or_else(|| RpcError::InvalidParams("Missing rumor object".into()))?;
+    let rumor: UnsignedEvent = serde_json::from_value(rumor_value.clone())
+        .map_err(|e| RpcError::InvalidParams(format!("Invalid rumor format: {}", e)))?;
+    if !matches!(rumor.kind.as_u16(), 14 | 15) {
+        return Err(RpcError::InvalidParams(
+            "Rumor kind must be 14 or 15".into(),
+        ));
+    }
+
+    let recipient_values = params
+        .get(1)
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| RpcError::InvalidParams("Missing recipient list".into()))?;
+    if recipient_values.is_empty() {
+        return Err(RpcError::InvalidParams("Empty recipient list".into()));
+    }
+    if recipient_values.len() > MAX_WRAP_BATCH {
+        return Err(RpcError::InvalidParams(format!(
+            "Maximum {} recipients per batch",
+            MAX_WRAP_BATCH
+        )));
+    }
+
+    let recipients = recipient_values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or(())
+                .and_then(|hex| PublicKey::from_hex(hex).map_err(|_| ()))
+        })
+        .collect();
+
+    Ok(Nip17WrapBatchParams { rumor, recipients })
+}
+
+fn wrap_error_slot(code: &str) -> JsonValue {
+    serde_json::json!({ "error": code })
+}
+
+/// Build ordered, index-aligned gift wraps for one shared rumor.
+///
+/// Construction is deliberately sequential: a request can contain at most
+/// [`MAX_WRAP_BATCH`] recipients, and one in-flight recipient at a time avoids
+/// crowding Tokio's shared blocking pool while preserving duplicate slots.
+async fn wrap_gift_wrap_batch(
+    handler: &Arc<HttpRpcHandler>,
+    rumor: &UnsignedEvent,
+    recipients: &[Result<PublicKey, ()>],
+) -> Vec<JsonValue> {
+    let mut results = Vec::with_capacity(recipients.len());
+    for recipient in recipients {
+        let slot = match recipient {
+            Err(()) => wrap_error_slot("invalid_recipient"),
+            Ok(recipient) => match handler.nip17_wrap(rumor.clone(), recipient).await {
+                Ok(gift_wrap) => match serde_json::to_value(gift_wrap) {
+                    Ok(event) => serde_json::json!({ "gift_wrap": event }),
+                    Err(_) => wrap_error_slot("internal"),
+                },
+                Err(error) => wrap_error_slot(error.code()),
+            },
+        };
+        results.push(slot);
+    }
+    results
+}
+
 /// Build the per-item error slot for the unwrap batch response.
 fn unwrap_error_slot(code: &str) -> JsonValue {
     serde_json::json!({ "error": code })
@@ -1043,6 +1202,70 @@ mod tests {
         assert!(result.is_err());
     }
 
+    fn wrap_rumor_value(author: PublicKey, recipient: PublicKey) -> JsonValue {
+        let rumor =
+            nostr_sdk::EventBuilder::private_msg_rumor(recipient, "batch send").build(author);
+        serde_json::to_value(rumor).expect("serialize rumor")
+    }
+
+    #[test]
+    fn parse_wrap_batch_accepts_shared_rumor_and_preserves_recipient_slots() {
+        let sender = Keys::generate();
+        let receiver = Keys::generate();
+        let receiver_hex = receiver.public_key().to_hex();
+        let params = vec![
+            wrap_rumor_value(sender.public_key(), receiver.public_key()),
+            serde_json::json!([receiver_hex, "not-a-pubkey", receiver.public_key().to_hex()]),
+        ];
+
+        let parsed = parse_nip17_wrap_batch_params(&params).expect("valid batch shape");
+
+        assert_eq!(parsed.rumor.pubkey, sender.public_key());
+        assert_eq!(parsed.recipients.len(), 3);
+        assert_eq!(
+            parsed.recipients[0].as_ref().expect("valid recipient"),
+            &receiver.public_key()
+        );
+        assert!(parsed.recipients[1].is_err());
+        assert_eq!(
+            parsed.recipients[2].as_ref().expect("duplicate recipient"),
+            &receiver.public_key()
+        );
+    }
+
+    #[test]
+    fn parse_wrap_batch_rejects_empty_and_over_cap_recipient_lists() {
+        let sender = Keys::generate();
+        let receiver = Keys::generate();
+        let rumor = wrap_rumor_value(sender.public_key(), receiver.public_key());
+
+        let empty = parse_nip17_wrap_batch_params(&[rumor.clone(), serde_json::json!([])]);
+        assert!(matches!(empty, Err(RpcError::InvalidParams(_))));
+
+        let recipients = vec![receiver.public_key().to_hex(); MAX_WRAP_BATCH + 1];
+        let over_cap =
+            parse_nip17_wrap_batch_params(&[rumor, serde_json::to_value(recipients).unwrap()]);
+        assert!(matches!(over_cap, Err(RpcError::InvalidParams(_))));
+    }
+
+    #[test]
+    fn parse_wrap_batch_rejects_malformed_or_non_nip17_rumor() {
+        let malformed = parse_nip17_wrap_batch_params(&[
+            serde_json::json!({ "kind": 14 }),
+            serde_json::json!(["not-a-pubkey"]),
+        ]);
+        assert!(matches!(malformed, Err(RpcError::InvalidParams(_))));
+
+        let sender = Keys::generate();
+        let receiver = Keys::generate();
+        let note = nostr_sdk::EventBuilder::text_note("not a rumor").build(sender.public_key());
+        let wrong_kind = parse_nip17_wrap_batch_params(&[
+            serde_json::to_value(note).unwrap(),
+            serde_json::json!([receiver.public_key().to_hex()]),
+        ]);
+        assert!(matches!(wrong_kind, Err(RpcError::InvalidParams(_))));
+    }
+
     #[test]
     fn test_rpc_response_success() {
         let response = NostrRpcResponse::success(JsonValue::String("test".to_string()));
@@ -1173,5 +1396,45 @@ mod tests {
                 "authenticated sender out of order at slot {i}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn wrap_gift_wrap_batch_preserves_order_duplicates_and_partial_errors() {
+        let handler = Arc::new(create_test_handler_with_dpop(None));
+        let receiver_a = Keys::generate();
+        let receiver_b = Keys::generate();
+        let rumor = nostr_sdk::EventBuilder::private_msg_rumor(
+            receiver_a.public_key(),
+            "ordered batch send",
+        )
+        .build(handler.public_key());
+        let recipients = vec![
+            Ok(receiver_a.public_key()),
+            Err(()),
+            Ok(receiver_b.public_key()),
+            Ok(receiver_a.public_key()),
+        ];
+
+        let results = wrap_gift_wrap_batch(&handler, &rumor, &recipients).await;
+
+        assert_eq!(results.len(), recipients.len());
+        assert_eq!(results[1]["error"].as_str(), Some("invalid_recipient"));
+        for (idx, receiver) in [
+            (0usize, &receiver_a),
+            (2usize, &receiver_b),
+            (3usize, &receiver_a),
+        ] {
+            let wrap: Event = serde_json::from_value(results[idx]["gift_wrap"].clone())
+                .expect("successful slot contains an event");
+            let unwrapped = nostr_sdk::nips::nip59::UnwrappedGift::from_gift_wrap(receiver, &wrap)
+                .await
+                .expect("intended recipient unwraps");
+            assert_eq!(unwrapped.sender, handler.public_key());
+            assert_eq!(unwrapped.rumor.content, "ordered batch send");
+        }
+        assert_ne!(
+            results[0]["gift_wrap"]["id"], results[3]["gift_wrap"]["id"],
+            "duplicate recipients get distinct ephemeral outer wraps"
+        );
     }
 }
