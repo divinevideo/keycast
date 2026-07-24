@@ -84,6 +84,8 @@ else
     # Now build web app
     cd web
     bun install
+    echo "  → Running web unit tests..."
+    bun run test
     bun run build
     cd ..
 fi

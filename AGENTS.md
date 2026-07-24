@@ -91,6 +91,9 @@ Run the smallest relevant verification first, then broaden if the change is cros
   - `cargo test --workspace --verbose` for a quick pass.
   - `bun run test` to spin up Postgres + Redis via `docker-compose.deps.yml`, set up the test database, and run the full workspace + integration-feature test suite (matches what CI runs via `bun run test:ci`).
   - Targeted test commands (e.g. `cd api && cargo test --test oauth_integration_test`) when a change is scoped to a single crate or path. Record that scope in the PR.
+- Web checks:
+  - `cd web && bun run check` for Svelte/TypeScript validation.
+  - `cd web && bun run test` for frontend unit tests.
 - Combined gate: `bun run check` runs fmt, clippy, and `cargo test --workspace` together.
 - Optional pre-push parity with CI: `bun run setup:hooks` installs `scripts/hooks/pre-push`.
 - For `web/` changes, manually verify the affected path in the browser and document the manual checks in the PR.
