@@ -66,12 +66,15 @@ jobs:
       SERVER_NSEC: "0000000000000000000000000000000000000000000000000000000000000001"
       ALLOWED_ORIGINS: "http://localhost:3000,http://localhost:5173,http://localhost:5174"
       ALLOWED_TENANT_DOMAINS: "localhost,tenant-a.localhost,tenant-b.localhost"
+      ALLOWED_PUBKEYS: "25fa07621969c92191feb4433fca94fdb500f2b445fd4f017c0a332ceecbf813"
       BUNKER_RELAYS: ws://localhost:8080
       ATPROTO_OAUTH_JWT_PRIVATE_KEY_HEX: "8f2a55949068468ad5d670dfd0c0a33d5b9e7e1a2c0d2059f0f8f8779d4d078d"
       ATPROTO_OAUTH_PDS_DID: "did:web:pds.divine.test"
+      ENABLE_EXAMPLES: "true"
       ENABLE_TENANT_AUTO_PROVISIONING: "true"
       API_URL: http://localhost:3000
       KEYCAST_BINARY: ${{ github.workspace }}/target/debug/keycast
+      WEB_BUILD_DIR: ${{ github.workspace }}/web/build
 
     steps:
       - uses: actions/checkout@v6
@@ -87,6 +90,12 @@ jobs:
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
+
+      - name: Build web app
+        working-directory: web
+        run: |
+          bun install
+          bun run build
 
       - name: Build keycast (debug)
         run: cargo build --bin keycast

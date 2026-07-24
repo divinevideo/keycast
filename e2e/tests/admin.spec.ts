@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 import { registerAndVerify, parseCookieValue } from "../helpers/auth";
-import { registerAdmin } from "../helpers/admin";
+import { getAdminTenantId, registerAdmin } from "../helpers/admin";
 import {
   addSupportAdmin,
   removeSupportAdmin,
@@ -268,12 +268,13 @@ test.describe("Support admin management", () => {
     const { cookie } = await registerAdmin(request);
     const sessionCookie = `keycast_session=${parseCookieValue(cookie)}`;
     const ts = Date.now();
+    const tenantId = await getAdminTenantId();
 
     // Seed 3 users with similar usernames via direct DB insert
     const usernames = [
       `Lele.Pons-${ts}`,
-      `lelepons-${ts}`,
-      `LELEPONS-${ts}`,
+      `lele_pons-${ts}`,
+      `LELE-PONS-${ts}`,
     ];
     const pubkeys: string[] = [];
 
@@ -288,8 +289,8 @@ test.describe("Support admin management", () => {
 
       await withDb(async (db) => {
         await db.query(
-          "INSERT INTO users (pubkey, tenant_id, username, created_at, updated_at) VALUES ($1, 1, $2, NOW(), NOW()) ON CONFLICT (pubkey) DO NOTHING",
-          [pk, username],
+          "INSERT INTO users (pubkey, tenant_id, username, created_at, updated_at) VALUES ($1, $2, $3, NOW(), NOW()) ON CONFLICT (pubkey) DO NOTHING",
+          [pk, tenantId, username],
         );
       });
     }
@@ -324,9 +325,10 @@ test.describe("Support admin management", () => {
     const { cookie } = await registerAdmin(request);
     const sessionValue = parseCookieValue(cookie);
     const ts = Date.now();
+    const tenantId = await getAdminTenantId();
 
     // Seed 2 users with similar usernames
-    const usernames = [`TestUser-${ts}`, `testuser-${ts}`];
+    const usernames = [`Test.User-${ts}`, `test_user-${ts}`];
     const pubkeys: string[] = [];
 
     for (const username of usernames) {
@@ -339,8 +341,8 @@ test.describe("Support admin management", () => {
 
       await withDb(async (db) => {
         await db.query(
-          "INSERT INTO users (pubkey, tenant_id, username, created_at, updated_at) VALUES ($1, 1, $2, NOW(), NOW()) ON CONFLICT (pubkey) DO NOTHING",
-          [pk, username],
+          "INSERT INTO users (pubkey, tenant_id, username, created_at, updated_at) VALUES ($1, $2, $3, NOW(), NOW()) ON CONFLICT (pubkey) DO NOTHING",
+          [pk, tenantId, username],
         );
       });
     }
