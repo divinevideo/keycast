@@ -410,6 +410,26 @@ impl Nip46Handler {
         self.status
     }
 
+    /// The time from which the 24-hour tombstone retention window is measured.
+    ///
+    /// Clock-derived expiry does not mutate a cached handler, so an authorization
+    /// that expires while cached has no stamped `tombstone_at`. In that case its
+    /// actual `expires_at` is the start of the retention window.
+    fn effective_tombstone_at(&self) -> Option<DateTime<Utc>> {
+        if self.tombstone_at.is_some() {
+            return self.tombstone_at;
+        }
+
+        (self.effective_status() == HandlerStatus::Expired)
+            .then_some(self.expires_at)
+            .flatten()
+    }
+
+    fn tombstone_is_older_than(&self, cutoff: DateTime<Utc>) -> bool {
+        self.effective_tombstone_at()
+            .is_some_and(|tombstone_at| tombstone_at < cutoff)
+    }
+
     /// Check if this handler is a tombstone (revoked or expired)
     pub fn is_tombstone(&self) -> bool {
         self.effective_status() != HandlerStatus::Active
@@ -1184,10 +1204,8 @@ impl UnifiedSigner {
                 // Collect tombstone keys older than 24 hours
                 // Note: iter() yields (Arc<K>, V) pairs, so key is Arc<String>
                 for (key, handler) in handlers_cleanup.iter() {
-                    if let Some(tombstone_at) = handler.tombstone_at {
-                        if tombstone_at < cutoff {
-                            to_remove.push(key.as_ref().clone());
-                        }
+                    if handler.tombstone_is_older_than(cutoff) {
+                        to_remove.push(key.as_ref().clone());
                     }
                 }
 
@@ -2060,6 +2078,41 @@ impl UnifiedSigner {
         } else {
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tombstone_cleanup_tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    fn cached_handler_expiring_at(expires_at: DateTime<Utc>) -> Nip46Handler {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .expect("lazy pool construction should not require a live database");
+
+        Nip46Handler::new_for_test(
+            Keys::generate(),
+            Keys::generate(),
+            "test_hash".to_string(),
+            1,
+            1,
+            false,
+            pool,
+        )
+        .with_expires_at(Some(expires_at))
+    }
+
+    #[tokio::test]
+    async fn cleanup_selects_clock_expired_handler_only_after_twenty_four_hours() {
+        let now = Utc::now();
+        let cutoff = now - chrono::Duration::hours(24);
+        let old_expiry = cached_handler_expiring_at(now - chrono::Duration::hours(25));
+        let recent_expiry = cached_handler_expiring_at(now - chrono::Duration::hours(23));
+
+        assert_eq!(old_expiry.tombstone_at, None);
+        assert!(old_expiry.tombstone_is_older_than(cutoff));
+        assert!(!recent_expiry.tombstone_is_older_than(cutoff));
     }
 }
 
