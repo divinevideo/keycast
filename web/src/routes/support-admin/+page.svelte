@@ -8,9 +8,11 @@
 		emailMatchParts,
 		emailSuggestionDiff,
 		isShowingDidYouMean,
-		isSuggestedUser,
+		lookupResultsBanner,
+		matchKindLabel,
 		selectAutoExpandedPubkey,
 		selectDisplayedUsers,
+		type LookupMatchKind,
 		type LookupResult
 	} from './lookup-view';
 	import { goto } from '$app/navigation';
@@ -66,19 +68,25 @@
 	interface UserDetails {
 		pubkey: string;
 		authoritative: boolean;
+		match_kind: LookupMatchKind;
 		email: string | null;
 		email_verified: boolean | null;
 		username: string | null;
 		display_name: string | null;
 		vine_id: string | null;
 		has_personal_key: boolean;
+		status: string;
+		suspended_reason?: string | null;
+		verified_minor: boolean;
+		verified_minor_at?: string | null;
 		active_sessions: number;
 		created_at: string;
 		last_active: string | null;
 	}
 
-	let displayedUsers: UserDetails[] = $derived(selectDisplayedUsers(searchResult));
-	let showingDidYouMean = $derived(isShowingDidYouMean(searchResult));
+	const displayedUsers: UserDetails[] = $derived(selectDisplayedUsers(searchResult));
+	const showingDidYouMean = $derived(isShowingDidYouMean(searchResult, executedSearchQuery));
+	const resultsBanner = $derived(lookupResultsBanner(searchResult));
 
 	onMount(async () => {
 		try {
@@ -131,6 +139,11 @@
 		} finally {
 			isSearching = false;
 		}
+	}
+
+	function accountStatusLabel(u: UserDetails): string {
+		const base = u.status.charAt(0).toUpperCase() + u.status.slice(1);
+		return u.suspended_reason ? `${base} (${u.suspended_reason})` : base;
 	}
 
 	function formatDate(iso: string): string {
@@ -320,20 +333,17 @@
 								<span>These are different addresses — confirm identity before acting.</span>
 							</div>
 						</div>
-					{:else if searchResult.total >= 20}
-						<div class="results-banner warning">
-							<Warning size={14} />
-							<span>Showing first 20 of many results — refine your search</span>
-						</div>
-					{:else if searchResult.total > 1}
-						<div class="results-banner">
-							<span>{searchResult.total} users found</span>
+					{:else if resultsBanner}
+						<div class="results-banner" class:warning={resultsBanner.warning}>
+							{#if resultsBanner.warning}<Warning size={14} />{/if}
+							<span>{resultsBanner.text}</span>
 						</div>
 					{/if}
 
 					<div class="user-list">
 						{#each displayedUsers as u (u.pubkey)}
 							{@const isExpanded = expandedPubkey === u.pubkey}
+							{@const matchLabel = matchKindLabel(u)}
 							{@const emailParts = u.email ? emailMatchParts(u.email, executedSearchQuery) : []}
 							{@const suggestionDiff = showingDidYouMean && u.email ? emailSuggestionDiff(executedSearchQuery, u.email) : null}
 							<div class="user-list-item" class:expanded={isExpanded}>
@@ -367,11 +377,31 @@
 											{/each}
 										</span>
 									{/if}
-									{#if isSuggestedUser(u)}
-										<span class="suggested-badge">Suggested</span>
+									{#if matchLabel}
+										<span
+											class="match-kind-badge"
+											class:partial-match={u.match_kind === 'partial'}
+											class:fuzzy-match={u.match_kind === 'fuzzy'}
+										>
+											{#if u.match_kind === 'fuzzy'}<Warning size={11} weight="fill" />{/if}
+											{matchLabel}
+										</span>
+									{/if}
+									{#if u.verified_minor}
+										<span class="flag-badge flag-minor">Minor</span>
+									{/if}
+									{#if u.status !== 'active'}
+										<span class="flag-badge" class:flag-suspended={u.status === 'suspended'} class:flag-banned={u.status === 'banned'}>{u.status}</span>
 									{/if}
 									<span class="list-sessions">{u.active_sessions} {u.active_sessions === 1 ? 'session' : 'sessions'}</span>
 								</button>
+
+								{#if u.match_kind === 'fuzzy' && !showingDidYouMean}
+									<div class="fuzzy-match-warning" role="note">
+										<Warning size={14} weight="fill" />
+										<span>This email is close to your search, not a literal match. Confirm identity before acting.</span>
+									</div>
+								{/if}
 
 								{#if suggestionDiff}
 									<div class="suggestion-diff">
@@ -416,6 +446,14 @@
 											<div class="status-item" class:status-ok={u.active_sessions > 0} class:status-none={u.active_sessions === 0}>
 												<span>{u.active_sessions} active {u.active_sessions === 1 ? 'session' : 'sessions'}</span>
 											</div>
+											<div class="status-item" class:status-ok={u.status === 'active'} class:status-warn={u.status === 'suspended'} class:status-error={u.status === 'banned'}>
+												<span>{accountStatusLabel(u)}</span>
+											</div>
+											{#if u.verified_minor}
+												<div class="status-item status-warn">
+													<span>Protected minor{u.verified_minor_at ? ` (since ${formatDate(u.verified_minor_at)})` : ''}</span>
+												</div>
+											{/if}
 										</div>
 
 										<div class="user-fields">
@@ -854,17 +892,62 @@
 		flex-shrink: 0;
 	}
 
-	.suggested-badge {
+	.match-kind-badge {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.2rem;
 		padding: 0.125rem 0.375rem;
 		border-radius: 9999px;
-		background: color-mix(in srgb, var(--color-divine-purple, #8b5cf6) 20%, transparent);
-		color: var(--color-divine-purple, #8b5cf6);
 		font-size: 0.65rem;
 		font-weight: 600;
 		line-height: 1.2;
 		text-transform: uppercase;
 		letter-spacing: 0.025em;
 		flex-shrink: 0;
+	}
+
+	.match-kind-badge.partial-match {
+		background: color-mix(in srgb, var(--color-divine-purple, #8b5cf6) 20%, transparent);
+		color: var(--color-divine-purple, #8b5cf6);
+	}
+
+	.match-kind-badge.fuzzy-match {
+		background: color-mix(in srgb, var(--color-divine-warning) 20%, transparent);
+		color: var(--color-divine-warning);
+	}
+
+	.fuzzy-match-warning {
+		display: flex;
+		align-items: center;
+		gap: 0.375rem;
+		padding: 0.5rem 1rem 0.625rem 3rem;
+		border-top: 1px solid color-mix(in srgb, var(--color-divine-warning) 25%, transparent);
+		background: color-mix(in srgb, var(--color-divine-warning) 8%, transparent);
+		color: var(--color-divine-warning);
+		font-size: 0.725rem;
+		font-weight: 500;
+	}
+
+	.flag-badge {
+		padding: 0.125rem 0.375rem;
+		border-radius: 9999px;
+		font-size: 0.65rem;
+		font-weight: 600;
+		line-height: 1.2;
+		text-transform: uppercase;
+		letter-spacing: 0.025em;
+		flex-shrink: 0;
+	}
+
+	.flag-minor,
+	.flag-suspended {
+		background: color-mix(in srgb, var(--color-divine-warning) 20%, transparent);
+		color: var(--color-divine-warning);
+	}
+
+	.flag-banned {
+		background: color-mix(in srgb, var(--color-divine-error) 20%, transparent);
+		color: var(--color-divine-error);
 	}
 
 	.email-match {
@@ -968,6 +1051,10 @@
 
 	.status-item.status-none {
 		color: var(--color-divine-text-tertiary);
+	}
+
+	.status-item.status-error {
+		color: var(--color-divine-error);
 	}
 
 	.status-neutral {

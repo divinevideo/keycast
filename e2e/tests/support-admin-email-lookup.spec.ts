@@ -4,8 +4,11 @@ import { withDb } from "../helpers/db";
 import { addSupportAdmin, clearSupportAdmins } from "../helpers/redis";
 
 const PASSWORD = "TestPass123!";
+const LITERAL_PUBLISH_EMAIL = "socialpublishcommunity@gmail.com";
+const TYPO_NEAR_EMAIL = "socialpulishllc@gmail.com";
 const ACCOUNT_EMAILS = [
-  "socialpulishllc@gmail.com",
+  LITERAL_PUBLISH_EMAIL,
+  TYPO_NEAR_EMAIL,
   "socialpanda@gmail.com",
   "socialpirate@gmail.com",
 ];
@@ -72,14 +75,42 @@ test.describe("Support admin email lookup UI", () => {
     await expect(page.getByText("Support Admin", { exact: true })).toBeVisible();
 
     await search(page, "socialp");
-    await expect(page.locator(".user-list-item")).toHaveCount(3);
-    await expect(page.locator(".user-list-item .email-match")).toHaveCount(3);
+    await expect(page.locator(".user-list-item")).toHaveCount(4);
+    await expect(page.locator(".user-list-item .email-match")).toHaveCount(4);
     await expect(page.locator(".user-list-item .email-match")).toHaveText([
+      "socialp",
       "socialp",
       "socialp",
       "socialp",
     ]);
     await captureLookupState(page, testInfo, "support-admin-email-contains");
+
+    await search(page, "publish");
+    const mixedRows = page.locator(".user-list-item");
+    await expect(mixedRows).toHaveCount(2);
+    await expect(mixedRows.locator(".list-name")).toHaveText([
+      LITERAL_PUBLISH_EMAIL,
+      TYPO_NEAR_EMAIL,
+    ]);
+    await expect(mixedRows.locator(".match-kind-badge")).toHaveText([
+      "Partial match",
+      "Possible typo",
+    ]);
+    await expect(mixedRows.nth(0).locator(".email-match")).toHaveText("publish");
+    await expect(mixedRows.nth(1).getByRole("note")).toContainText(
+      "This email is close to your search, not a literal match.",
+    );
+    await expect(page.getByRole("heading", { name: "Did you mean?" })).toHaveCount(0);
+    await captureLookupState(page, testInfo, "support-admin-email-mixed-match-tiers");
+
+    await search(page, LITERAL_PUBLISH_EMAIL);
+    await expect(page.locator(".user-list-item")).toHaveCount(1);
+    await expect(page.locator(".user-list-item .list-name")).toHaveText(
+      LITERAL_PUBLISH_EMAIL,
+    );
+    await expect(page.locator(".user-card")).toBeVisible();
+    await expect(page.locator(".match-kind-badge")).toHaveCount(0);
+    await expect(page.getByRole("heading", { name: "Did you mean?" })).toHaveCount(0);
 
     await search(page, "socialpublishllc@gmail.com");
     await expect(page.getByRole("heading", { name: "Did you mean?" })).toBeVisible();
@@ -88,7 +119,7 @@ test.describe("Support admin email lookup UI", () => {
     );
     await expect(page.locator(".user-list-item")).toHaveCount(1);
     await expect(page.locator(".user-list-item .list-name")).toHaveText(
-      "socialpulishllc@gmail.com",
+      TYPO_NEAR_EMAIL,
     );
     await expect(page.locator(".suggestion-distance")).toHaveText(
       "1 letter off · missing 'b'",
@@ -97,7 +128,7 @@ test.describe("Support admin email lookup UI", () => {
       page.getByRole("img", { name: "socialpublishllc@gmail.com" }),
     ).toBeVisible();
     await expect(
-      page.getByRole("img", { name: "socialpulishllc@gmail.com" }),
+      page.getByRole("img", { name: TYPO_NEAR_EMAIL }),
     ).toBeVisible();
     await expect(page.locator(".diff-line").nth(0).locator(".diff-character")).toHaveText(
       "b",
@@ -107,7 +138,7 @@ test.describe("Support admin email lookup UI", () => {
     );
     await captureLookupState(page, testInfo, "support-admin-email-suggestion");
 
-    await search(page, "socialpulishllc@gmail.com");
+    await search(page, TYPO_NEAR_EMAIL);
     await expect(page.locator(".user-list-item")).toHaveCount(1);
     await expect(page.locator(".user-card")).toBeVisible();
     await expect(page.getByRole("heading", { name: "Did you mean?" })).toHaveCount(0);

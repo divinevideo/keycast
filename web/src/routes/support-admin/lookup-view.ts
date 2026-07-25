@@ -8,6 +8,13 @@ export interface LookupResult<User> {
 	authoritative_count: number;
 }
 
+export type LookupMatchKind = "authoritative" | "partial" | "fuzzy";
+
+export interface LookupResultsBanner {
+	text: string;
+	warning: boolean;
+}
+
 export interface EmailMatchPart {
 	text: string;
 	matched: boolean;
@@ -152,31 +159,72 @@ export function emailSuggestionDiff(typedEmail: string, accountEmail: string): E
 	return { distance, chip: `${label}${detail}`, typed, account };
 }
 
-/** Select primary lookup rows, falling back to fuzzy suggestions only when needed. */
-export function selectDisplayedUsers<User>(result: LookupResult<User> | null): User[] {
+/** Combine lookup tiers in rank order and defensively de-duplicate by pubkey. */
+export function selectDisplayedUsers<
+	User extends { pubkey: string; match_kind: LookupMatchKind },
+>(result: LookupResult<User> | null): User[] {
 	if (!result) return [];
-	return result.results.length > 0 ? result.results : result.suggestions;
+	const rank: Record<LookupMatchKind, number> = {
+		authoritative: 0,
+		partial: 1,
+		fuzzy: 2
+	};
+	const seen = new Set<string>();
+
+	return [...result.results, ...result.suggestions]
+		.map((user, index) => ({ user, index }))
+		.sort((left, right) => rank[left.user.match_kind] - rank[right.user.match_kind] || left.index - right.index)
+		.map(({ user }) => user)
+		.filter((user) => {
+			if (seen.has(user.pubkey)) return false;
+			seen.add(user.pubkey);
+			return true;
+		});
 }
 
-/** Report whether one lookup row is a loose or fuzzy suggestion. */
-export function isSuggestedUser(user: { authoritative: boolean }): boolean {
-	return !user.authoritative;
+/** Select the user-facing provenance label for one lookup row. */
+export function matchKindLabel(user: { match_kind: LookupMatchKind }): string | null {
+	if (user.match_kind === "partial") return "Partial match";
+	if (user.match_kind === "fuzzy") return "Possible typo";
+	return null;
 }
 
 /** Report whether the displayed rows came from the fuzzy suggestion fallback. */
-export function isShowingDidYouMean<User>(result: LookupResult<User> | null): boolean {
+export function isShowingDidYouMean<User extends { match_kind: LookupMatchKind }>(
+	result: LookupResult<User> | null,
+	query: string
+): boolean {
 	return (
 		result !== null &&
+		query.trim().includes("@") &&
 		!result.authoritative_match &&
 		result.results.length === 0 &&
-		result.suggestions.length > 0
+		result.suggestions.length > 0 &&
+		result.suggestions.every((user) => user.match_kind === "fuzzy")
 	);
 }
 
+/** Select banner copy using the combined, de-duplicated row count. */
+export function lookupResultsBanner<
+	User extends { pubkey: string; match_kind: LookupMatchKind },
+>(result: LookupResult<User> | null): LookupResultsBanner | null {
+	if (!result) return null;
+	const displayedCount = selectDisplayedUsers(result).length;
+	if (result.total >= 20) {
+		return {
+			text: `Showing first ${displayedCount} of many results — refine your search`,
+			warning: true
+		};
+	}
+	return displayedCount > 1 ? { text: `${displayedCount} users found`, warning: false } : null;
+}
+
 /** Select a lone authoritative result for automatic expansion. */
-export function selectAutoExpandedPubkey<User extends { pubkey: string }>(
+export function selectAutoExpandedPubkey<
+	User extends { pubkey: string; match_kind: LookupMatchKind },
+>(
 	result: LookupResult<User> | null
 ): string | null {
 	if (!result?.authoritative_match || result.authoritative_count !== 1) return null;
-	return result.results[0]?.pubkey ?? null;
+	return result.results.find((user) => user.match_kind === "authoritative")?.pubkey ?? null;
 }

@@ -60,8 +60,10 @@ test.describe("Account claim flow", () => {
     await page.fill('input[name="password_confirmation"]', claimPassword);
     await page.click('button[type="submit"]');
 
-    // 7. Verify redirect to dashboard with session cookie set
-    await page.waitForURL("http://localhost:3000/", { timeout: 15000 });
+    // 7. Verify the success page renders with the session cookie set
+    await expect(page.locator("h1")).toContainText("Account Claimed!", {
+      timeout: 15000,
+    });
 
     const cookies = await page.context().cookies();
     const kcCookie = cookies.find((c) => c.name === "keycast_session");
@@ -79,10 +81,9 @@ test.describe("Account claim flow", () => {
 
   test("invalid claim token shows error page", async ({ page }) => {
     await page.goto("http://localhost:3000/api/claim?token=invalid-token-abc");
-    await expect(page.locator("h1")).toContainText(
-      "Invalid or Expired Link",
-      { timeout: 10000 },
-    );
+    await expect(page.locator("h1")).toContainText("Link not recognized", {
+      timeout: 10000,
+    });
   });
 
   test("claim password visibility toggles preserve typed values", async ({

@@ -16,7 +16,7 @@ use keycast_core::repositories::{
     PersonalKeysRepository, PolicyRepository, RefreshTokenRepository, RepositoryError,
     StoreOAuthCodeParams, StoreOAuthCodeWithRegistrationParams, UserRepository,
 };
-use keycast_core::types::refresh_token::generate_refresh_token;
+use keycast_core::types::refresh_token::{generate_refresh_token, hash_refresh_token};
 use nostr_sdk::{Keys, ToBech32};
 use rand::Rng;
 use secrecy::ExposeSecret;
@@ -345,6 +345,19 @@ pub enum OAuthError {
     Database(sqlx::Error),
     Encryption(String),
     ServerError(String),
+}
+
+impl OAuthError {
+    fn status_code(&self) -> StatusCode {
+        match self {
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::InvalidEmail | Self::InvalidRequest(_) | Self::InvalidGrant(_) => {
+                StatusCode::BAD_REQUEST
+            }
+            Self::Database(_) | Self::Encryption(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::ServerError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
 }
 
 impl IntoResponse for OAuthError {
@@ -2381,23 +2394,178 @@ async fn handle_refresh_token_grant(
     auth_state: super::routes::AuthState,
     req: TokenRequest,
 ) -> Result<Response, OAuthError> {
+    finish_refresh_token_grant(handle_refresh_token_grant_inner(tenant_id, auth_state, req).await)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RefreshTokenRejectionReason {
+    MissingRefreshToken,
+    ConsumeFailed,
+    DiagnosticLookupFailed,
+    TokenNotFound,
+    TokenExpired,
+    TokenAlreadyConsumed,
+    TokenTenantMismatch,
+    TokenStateUnexpected,
+    AuthorizationLookupFailed,
+    AuthorizationNotFound,
+    AuthorizationRevoked,
+    StoredKeyLookupFailed,
+    StoredKeyNotFound,
+    StoredKeyDecryptFailed,
+    StoredKeyParseFailed,
+    StoredPubkeyParseFailed,
+    UcanGenerationFailed,
+    RotatedTokenInsertFailed,
+}
+
+impl RefreshTokenRejectionReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingRefreshToken => "missing_refresh_token",
+            Self::ConsumeFailed => "refresh_token_consume_failed",
+            Self::DiagnosticLookupFailed => "refresh_token_diagnostic_lookup_failed",
+            Self::TokenNotFound => "refresh_token_not_found",
+            Self::TokenExpired => "refresh_token_expired",
+            Self::TokenAlreadyConsumed => "refresh_token_already_consumed",
+            Self::TokenTenantMismatch => "refresh_token_tenant_mismatch",
+            Self::TokenStateUnexpected => "refresh_token_state_unexpected",
+            Self::AuthorizationLookupFailed => "authorization_lookup_failed",
+            Self::AuthorizationNotFound => "authorization_not_found",
+            Self::AuthorizationRevoked => "authorization_revoked",
+            Self::StoredKeyLookupFailed => "stored_key_lookup_failed",
+            Self::StoredKeyNotFound => "stored_key_not_found",
+            Self::StoredKeyDecryptFailed => "stored_key_decrypt_failed",
+            Self::StoredKeyParseFailed => "stored_key_parse_failed",
+            Self::StoredPubkeyParseFailed => "stored_pubkey_parse_failed",
+            Self::UcanGenerationFailed => "ucan_generation_failed",
+            Self::RotatedTokenInsertFailed => "rotated_refresh_token_insert_failed",
+        }
+    }
+}
+
+fn classify_failed_refresh_token(
+    token: Option<&keycast_core::types::refresh_token::RefreshToken>,
+    tenant_id: i64,
+    now: chrono::DateTime<Utc>,
+) -> RefreshTokenRejectionReason {
+    let Some(token) = token else {
+        return RefreshTokenRejectionReason::TokenNotFound;
+    };
+
+    if token.tenant_id != tenant_id {
+        RefreshTokenRejectionReason::TokenTenantMismatch
+    } else if token.expires_at <= now {
+        RefreshTokenRejectionReason::TokenExpired
+    } else if token.consumed_at.is_some() {
+        RefreshTokenRejectionReason::TokenAlreadyConsumed
+    } else {
+        RefreshTokenRejectionReason::TokenStateUnexpected
+    }
+}
+
+#[derive(Debug)]
+struct RefreshGrantRejection {
+    error: OAuthError,
+    reason: RefreshTokenRejectionReason,
+    client_id: Option<String>,
+}
+
+fn refresh_grant_rejection(
+    error: OAuthError,
+    reason: RefreshTokenRejectionReason,
+    client_id: Option<&str>,
+) -> RefreshGrantRejection {
+    RefreshGrantRejection {
+        error,
+        reason,
+        client_id: client_id.map(str::to_owned),
+    }
+}
+
+fn finish_refresh_token_grant(
+    result: Result<Response, RefreshGrantRejection>,
+) -> Result<Response, OAuthError> {
+    result.map_err(|rejection| {
+        tracing::warn!(
+            event = "oauth_refresh_token_rejection",
+            grant_flow = "refresh_token",
+            outcome = "rejected",
+            reason_code = rejection.reason.as_str(),
+            http_status = rejection.error.status_code().as_u16(),
+            client_id = rejection.client_id.as_deref().unwrap_or("unavailable"),
+            "OAuth refresh token grant rejected"
+        );
+        rejection.error
+    })
+}
+
+async fn handle_refresh_token_grant_inner(
+    tenant_id: i64,
+    auth_state: super::routes::AuthState,
+    req: TokenRequest,
+) -> Result<Response, RefreshGrantRejection> {
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
 
     // Extract required refresh_token parameter
     let refresh_token = req.refresh_token.as_ref().ok_or_else(|| {
-        OAuthError::InvalidRequest(
-            "Missing 'refresh_token' parameter for refresh_token grant".into(),
+        refresh_grant_rejection(
+            OAuthError::InvalidRequest(
+                "Missing 'refresh_token' parameter for refresh_token grant".into(),
+            ),
+            RefreshTokenRejectionReason::MissingRefreshToken,
+            None,
         )
     })?;
 
     // Consume refresh token atomically (validates + marks as consumed)
     // This implements one-time use per RFC 9700 token rotation
     let refresh_token_repo = RefreshTokenRepository::new(pool.clone());
-    let token_record = refresh_token_repo
-        .consume(refresh_token)
-        .await?
-        .ok_or_else(|| OAuthError::InvalidGrant("Invalid or expired refresh token".into()))?;
+    let token_record = match refresh_token_repo.consume(refresh_token).await {
+        Ok(Some(token_record)) => token_record,
+        Err(error) => {
+            return Err(refresh_grant_rejection(
+                OAuthError::from(error),
+                RefreshTokenRejectionReason::ConsumeFailed,
+                None,
+            ));
+        }
+        Ok(None) => {
+            let token_hash = hash_refresh_token(refresh_token);
+            let diagnostic_record = refresh_token_repo
+                .find_by_token_hash(&token_hash)
+                .await
+                .map_err(|_| {
+                    refresh_grant_rejection(
+                        OAuthError::InvalidGrant("Invalid or expired refresh token".into()),
+                        RefreshTokenRejectionReason::DiagnosticLookupFailed,
+                        None,
+                    )
+                })?;
+            let reason =
+                classify_failed_refresh_token(diagnostic_record.as_ref(), tenant_id, Utc::now());
+            let client_id = match diagnostic_record.as_ref() {
+                Some(record) if record.tenant_id == tenant_id => {
+                    keycast_core::types::oauth_authorization::OAuthAuthorization::find(
+                        pool,
+                        tenant_id,
+                        record.authorization_id,
+                    )
+                    .await
+                    .ok()
+                    .and_then(|authorization| authorization.client_id)
+                }
+                _ => None,
+            };
+
+            return Err(refresh_grant_rejection(
+                OAuthError::InvalidGrant("Invalid or expired refresh token".into()),
+                reason,
+                client_id.as_deref(),
+            ));
+        }
+    };
 
     // Get the OAuth authorization (verify not revoked)
     let oauth_auth = keycast_core::types::oauth_authorization::OAuthAuthorization::find(
@@ -2406,11 +2574,32 @@ async fn handle_refresh_token_grant(
         token_record.authorization_id,
     )
     .await
-    .map_err(|e| OAuthError::InvalidGrant(format!("Authorization not found: {}", e)))?;
+    .map_err(|error| {
+        let reason = if token_record.tenant_id != tenant_id {
+            RefreshTokenRejectionReason::TokenTenantMismatch
+        } else if matches!(
+            &error,
+            keycast_core::types::authorization::AuthorizationError::Database(
+                sqlx::Error::RowNotFound
+            )
+        ) {
+            RefreshTokenRejectionReason::AuthorizationNotFound
+        } else {
+            RefreshTokenRejectionReason::AuthorizationLookupFailed
+        };
+        refresh_grant_rejection(
+            OAuthError::InvalidGrant(format!("Authorization not found: {}", error)),
+            reason,
+            None,
+        )
+    })?;
+    let stored_client_id = oauth_auth.client_id.clone();
 
     if oauth_auth.revoked_at.is_some() {
-        return Err(OAuthError::InvalidGrant(
-            "Authorization has been revoked".into(),
+        return Err(refresh_grant_rejection(
+            OAuthError::InvalidGrant("Authorization has been revoked".into()),
+            RefreshTokenRejectionReason::AuthorizationRevoked,
+            stored_client_id.as_deref(),
         ));
     }
 
@@ -2431,16 +2620,42 @@ async fn handle_refresh_token_grant(
     let personal_keys_repo = PersonalKeysRepository::new(pool.clone());
     let encrypted_user_key = personal_keys_repo
         .find_encrypted_key_for_tenant(&oauth_auth.user_pubkey, tenant_id)
-        .await?
-        .ok_or_else(|| OAuthError::InvalidGrant("User keys not found".into()))?;
+        .await
+        .map_err(|error| {
+            refresh_grant_rejection(
+                OAuthError::from(error),
+                RefreshTokenRejectionReason::StoredKeyLookupFailed,
+                stored_client_id.as_deref(),
+            )
+        })?
+        .ok_or_else(|| {
+            refresh_grant_rejection(
+                OAuthError::InvalidGrant("User keys not found".into()),
+                RefreshTokenRejectionReason::StoredKeyNotFound,
+                stored_client_id.as_deref(),
+            )
+        })?;
 
     // Decrypt user key for bunker derivation
-    let decrypted_user_secret = key_manager
-        .decrypt(&encrypted_user_key)
-        .await
-        .map_err(|e| OAuthError::Encryption(format!("Failed to decrypt user key: {}", e)))?;
-    let user_secret_key = nostr_sdk::SecretKey::from_slice(&decrypted_user_secret)
-        .map_err(|e| OAuthError::InvalidRequest(format!("Invalid secret key: {}", e)))?;
+    let decrypted_user_secret =
+        key_manager
+            .decrypt(&encrypted_user_key)
+            .await
+            .map_err(|error| {
+                refresh_grant_rejection(
+                    OAuthError::Encryption(format!("Failed to decrypt user key: {}", error)),
+                    RefreshTokenRejectionReason::StoredKeyDecryptFailed,
+                    stored_client_id.as_deref(),
+                )
+            })?;
+    let user_secret_key =
+        nostr_sdk::SecretKey::from_slice(&decrypted_user_secret).map_err(|error| {
+            refresh_grant_rejection(
+                OAuthError::InvalidRequest(format!("Invalid secret key: {}", error)),
+                RefreshTokenRejectionReason::StoredKeyParseFailed,
+                stored_client_id.as_deref(),
+            )
+        })?;
 
     // Re-derive bunker keys using the stored secret_hash (deterministic)
     let bunker_keys =
@@ -2449,9 +2664,16 @@ async fn handle_refresh_token_grant(
 
     // Generate new UCAN access token (server-signed)
     // Note: refresh tokens don't preserve first_party status - users need fresh headless login
+    let stored_pubkey =
+        nostr_sdk::PublicKey::from_hex(&oauth_auth.user_pubkey).map_err(|error| {
+            refresh_grant_rejection(
+                OAuthError::InvalidRequest(format!("Invalid public key: {}", error)),
+                RefreshTokenRejectionReason::StoredPubkeyParseFailed,
+                stored_client_id.as_deref(),
+            )
+        })?;
     let access_token = super::auth::generate_server_signed_ucan(
-        &nostr_sdk::PublicKey::from_hex(&oauth_auth.user_pubkey)
-            .map_err(|e| OAuthError::InvalidRequest(format!("Invalid public key: {}", e)))?,
+        &stored_pubkey,
         tenant_id,
         &email,
         &oauth_auth.redirect_origin,
@@ -2462,13 +2684,26 @@ async fn handle_refresh_token_grant(
         user_status.as_ref(),
     )
     .await
-    .map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?;
+    .map_err(|error| {
+        refresh_grant_rejection(
+            OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", error)),
+            RefreshTokenRejectionReason::UcanGenerationFailed,
+            stored_client_id.as_deref(),
+        )
+    })?;
 
     // Generate new refresh token (rotation per RFC 9700)
     let new_refresh_token = generate_refresh_token();
     refresh_token_repo
         .create(&new_refresh_token, oauth_auth.id, tenant_id)
-        .await?;
+        .await
+        .map_err(|error| {
+            refresh_grant_rejection(
+                OAuthError::from(error),
+                RefreshTokenRejectionReason::RotatedTokenInsertFailed,
+                stored_client_id.as_deref(),
+            )
+        })?;
 
     tracing::info!(
         "Refreshed token for user {} authorization {}",
@@ -4239,6 +4474,46 @@ pub async fn poll(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct SharedLogWriterGuard(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedLogWriterGuard {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogWriter {
+        type Writer = SharedLogWriterGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedLogWriterGuard(Arc::clone(&self.0))
+        }
+    }
+
+    impl SharedLogWriter {
+        fn json_events(&self) -> Vec<serde_json::Value> {
+            let bytes = self.0.lock().expect("log buffer lock").clone();
+            String::from_utf8(bytes)
+                .expect("tracing output should be utf-8")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("tracing output should be JSON"))
+                .collect()
+        }
+    }
 
     struct LazyTestKeyManager;
 
@@ -4260,9 +4535,12 @@ mod tests {
         }
     }
 
-    fn create_lazy_auth_state() -> crate::api::http::routes::AuthState {
+    fn create_lazy_auth_state_with_database_url(
+        database_url: &str,
+    ) -> crate::api::http::routes::AuthState {
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://postgres:password@localhost/keycast_test")
+            .acquire_timeout(std::time::Duration::from_millis(100))
+            .connect_lazy(database_url)
             .expect("lazy pool should be created");
         let bcrypt_queue = crate::bcrypt_queue::BcryptQueue::new();
         let secret_pool = keycast_core::secret_pool::SecretPool::new(1);
@@ -4286,6 +4564,12 @@ mod tests {
         }
     }
 
+    fn create_lazy_auth_state() -> crate::api::http::routes::AuthState {
+        create_lazy_auth_state_with_database_url(
+            "postgres://postgres:password@localhost/keycast_test",
+        )
+    }
+
     fn create_unit_test_tenant() -> crate::api::tenant::TenantExtractor {
         crate::api::tenant::TenantExtractor(std::sync::Arc::new(crate::api::tenant::Tenant {
             id: 1,
@@ -4302,6 +4586,359 @@ mod tests {
             .await
             .expect("response body should be readable");
         serde_json::from_slice(&body).expect("response body should be JSON")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_grant_missing_token_logs_one_sanitized_rejection_and_preserves_response() {
+        let logs = SharedLogWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(logs.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let result = handle_refresh_token_grant(
+            1,
+            create_lazy_auth_state(),
+            TokenRequest {
+                grant_type: Some("refresh_token".to_string()),
+                code: Some("authorization-code-sentinel".to_string()),
+                client_id: "spoofed-request-client-id".to_string(),
+                redirect_uri: None,
+                code_verifier: None,
+                refresh_token: None,
+            },
+        )
+        .await;
+
+        let response = match result {
+            Ok(_) => panic!("missing refresh token should be rejected"),
+            Err(error) => error.into_response(),
+        };
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await,
+            serde_json::json!({
+                "error": "Invalid request: Missing 'refresh_token' parameter for refresh_token grant"
+            })
+        );
+
+        let events = logs.json_events();
+        let rejection_events: Vec<_> = events
+            .iter()
+            .filter(|event| event["fields"]["event"] == "oauth_refresh_token_rejection")
+            .collect();
+        assert_eq!(rejection_events.len(), 1);
+
+        let fields = &rejection_events[0]["fields"];
+        assert_eq!(fields["grant_flow"], "refresh_token");
+        assert_eq!(fields["outcome"], "rejected");
+        assert_eq!(fields["reason_code"], "missing_refresh_token");
+        assert_eq!(fields["http_status"], 400);
+        assert_eq!(fields["client_id"], "unavailable");
+
+        let rejection_json = rejection_events[0].to_string();
+        for forbidden in [
+            "authorization-code-sentinel",
+            "spoofed-request-client-id",
+            "token_hash",
+            "request_body",
+        ] {
+            assert!(
+                !rejection_json.contains(forbidden),
+                "rejection event leaked forbidden value {forbidden}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_grant_consume_failure_logs_once_without_credentials() {
+        let logs = SharedLogWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(logs.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let result = handle_refresh_token_grant(
+            1,
+            create_lazy_auth_state_with_database_url(
+                "postgres://postgres:password@127.0.0.1:1/keycast_test",
+            ),
+            TokenRequest {
+                grant_type: Some("refresh_token".to_string()),
+                code: Some("authorization-code-sentinel".to_string()),
+                client_id: "spoofed-request-client-id".to_string(),
+                redirect_uri: None,
+                code_verifier: None,
+                refresh_token: Some("raw-refresh-token-sentinel".to_string()),
+            },
+        )
+        .await;
+
+        let error = match result {
+            Ok(_) => panic!("unavailable database should reject the refresh grant"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
+
+        let rejection_events: Vec<_> = logs
+            .json_events()
+            .into_iter()
+            .filter(|event| event["fields"]["event"] == "oauth_refresh_token_rejection")
+            .collect();
+        assert_eq!(rejection_events.len(), 1);
+        let fields = &rejection_events[0]["fields"];
+        assert_eq!(fields["reason_code"], "refresh_token_consume_failed");
+        assert_eq!(fields["http_status"], 400);
+        assert_eq!(fields["client_id"], "unavailable");
+
+        let event_json = rejection_events[0].to_string();
+        for forbidden in [
+            "raw-refresh-token-sentinel",
+            "authorization-code-sentinel",
+            "spoofed-request-client-id",
+        ] {
+            assert!(!event_json.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn every_refresh_rejection_reason_emits_one_sanitized_structured_event() {
+        let cases = [
+            (
+                RefreshTokenRejectionReason::MissingRefreshToken,
+                "missing_refresh_token",
+            ),
+            (
+                RefreshTokenRejectionReason::ConsumeFailed,
+                "refresh_token_consume_failed",
+            ),
+            (
+                RefreshTokenRejectionReason::DiagnosticLookupFailed,
+                "refresh_token_diagnostic_lookup_failed",
+            ),
+            (
+                RefreshTokenRejectionReason::TokenNotFound,
+                "refresh_token_not_found",
+            ),
+            (
+                RefreshTokenRejectionReason::TokenExpired,
+                "refresh_token_expired",
+            ),
+            (
+                RefreshTokenRejectionReason::TokenAlreadyConsumed,
+                "refresh_token_already_consumed",
+            ),
+            (
+                RefreshTokenRejectionReason::TokenTenantMismatch,
+                "refresh_token_tenant_mismatch",
+            ),
+            (
+                RefreshTokenRejectionReason::TokenStateUnexpected,
+                "refresh_token_state_unexpected",
+            ),
+            (
+                RefreshTokenRejectionReason::AuthorizationLookupFailed,
+                "authorization_lookup_failed",
+            ),
+            (
+                RefreshTokenRejectionReason::AuthorizationNotFound,
+                "authorization_not_found",
+            ),
+            (
+                RefreshTokenRejectionReason::AuthorizationRevoked,
+                "authorization_revoked",
+            ),
+            (
+                RefreshTokenRejectionReason::StoredKeyLookupFailed,
+                "stored_key_lookup_failed",
+            ),
+            (
+                RefreshTokenRejectionReason::StoredKeyNotFound,
+                "stored_key_not_found",
+            ),
+            (
+                RefreshTokenRejectionReason::StoredKeyDecryptFailed,
+                "stored_key_decrypt_failed",
+            ),
+            (
+                RefreshTokenRejectionReason::StoredKeyParseFailed,
+                "stored_key_parse_failed",
+            ),
+            (
+                RefreshTokenRejectionReason::StoredPubkeyParseFailed,
+                "stored_pubkey_parse_failed",
+            ),
+            (
+                RefreshTokenRejectionReason::UcanGenerationFailed,
+                "ucan_generation_failed",
+            ),
+            (
+                RefreshTokenRejectionReason::RotatedTokenInsertFailed,
+                "rotated_refresh_token_insert_failed",
+            ),
+        ];
+
+        for (reason, expected_code) in cases {
+            let logs = SharedLogWriter::default();
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .with_writer(logs.clone())
+                .finish();
+            let returned_error = tracing::subscriber::with_default(subscriber, || {
+                let result = finish_refresh_token_grant(Err(RefreshGrantRejection {
+                    error: OAuthError::InvalidRequest(
+                        "raw-refresh-token-sentinel token-hash-sentinel authorization-code-sentinel request-body-sentinel spoofed-request-client-id".to_string(),
+                    ),
+                    reason,
+                    client_id: Some("stored-client-id".to_string()),
+                }));
+                match result {
+                    Ok(_) => panic!("rejection should remain an error"),
+                    Err(error) => error,
+                }
+            });
+            assert_eq!(returned_error.status_code(), StatusCode::BAD_REQUEST);
+
+            let events = logs.json_events();
+            let rejection_events: Vec<_> = events
+                .iter()
+                .filter(|event| event["fields"]["event"] == "oauth_refresh_token_rejection")
+                .collect();
+            assert_eq!(
+                rejection_events.len(),
+                1,
+                "expected one rejection event for {expected_code}"
+            );
+
+            let fields = &rejection_events[0]["fields"];
+            assert_eq!(fields["grant_flow"], "refresh_token");
+            assert_eq!(fields["outcome"], "rejected");
+            assert_eq!(fields["reason_code"], expected_code);
+            assert_eq!(fields["http_status"], 400);
+            assert_eq!(fields["client_id"], "stored-client-id");
+
+            let event_json = rejection_events[0].to_string();
+            for forbidden in [
+                "raw-refresh-token-sentinel",
+                "token-hash-sentinel",
+                "authorization-code-sentinel",
+                "request-body-sentinel",
+                "spoofed-request-client-id",
+                "token_hash",
+                "authorization_code",
+                "request_body",
+            ] {
+                assert!(
+                    !event_json.contains(forbidden),
+                    "{expected_code} event leaked forbidden value or field {forbidden}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failed_refresh_token_state_has_stable_classification() {
+        let now = chrono::Utc::now();
+        let record =
+            |tenant_id, expires_at, consumed_at| keycast_core::types::refresh_token::RefreshToken {
+                id: 1,
+                token_hash: "token-hash-sentinel".to_string(),
+                authorization_id: 2,
+                tenant_id,
+                created_at: now - chrono::Duration::days(1),
+                expires_at,
+                consumed_at,
+            };
+
+        assert_eq!(
+            classify_failed_refresh_token(None, 10, now).as_str(),
+            "refresh_token_not_found"
+        );
+        assert_eq!(
+            classify_failed_refresh_token(
+                Some(&record(11, now + chrono::Duration::days(1), None)),
+                10,
+                now,
+            )
+            .as_str(),
+            "refresh_token_tenant_mismatch"
+        );
+        assert_eq!(
+            classify_failed_refresh_token(
+                Some(&record(10, now - chrono::Duration::seconds(1), None)),
+                10,
+                now,
+            )
+            .as_str(),
+            "refresh_token_expired"
+        );
+        assert_eq!(
+            classify_failed_refresh_token(
+                Some(&record(
+                    10,
+                    now + chrono::Duration::days(1),
+                    Some(now - chrono::Duration::seconds(1)),
+                )),
+                10,
+                now,
+            )
+            .as_str(),
+            "refresh_token_already_consumed"
+        );
+        assert_eq!(
+            classify_failed_refresh_token(
+                Some(&record(10, now + chrono::Duration::days(1), None)),
+                10,
+                now,
+            )
+            .as_str(),
+            "refresh_token_state_unexpected"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_rejection_boundary_preserves_oauth_error_responses() {
+        let cases = [
+            (
+                OAuthError::InvalidRequest("missing field".to_string()),
+                RefreshTokenRejectionReason::ConsumeFailed,
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({"error": "Invalid request: missing field"}),
+            ),
+            (
+                OAuthError::InvalidGrant("invalid token".to_string()),
+                RefreshTokenRejectionReason::TokenNotFound,
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "error": "invalid_grant",
+                    "error_description": "invalid token"
+                }),
+            ),
+            (
+                OAuthError::Encryption("decrypt failed".to_string()),
+                RefreshTokenRejectionReason::StoredKeyDecryptFailed,
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({
+                    "error": "Service temporarily unavailable. Please try again in a few minutes."
+                }),
+            ),
+        ];
+
+        for (error, reason, expected_status, expected_body) in cases {
+            let result = finish_refresh_token_grant(Err(RefreshGrantRejection {
+                error,
+                reason,
+                client_id: None,
+            }));
+            let response = match result {
+                Ok(_) => panic!("rejection should remain an error"),
+                Err(error) => error.into_response(),
+            };
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(response_json(response).await, expected_body);
+        }
     }
 
     #[tokio::test]

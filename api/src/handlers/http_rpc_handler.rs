@@ -8,7 +8,9 @@ use keycast_core::traits::CustomPermission;
 use moka::future::Cache;
 use nostr_sdk::nips::nip04;
 use nostr_sdk::nips::nip59::{self, UnwrappedGift};
-use nostr_sdk::{Event, Keys, Kind, PublicKey, UnsignedEvent};
+use nostr_sdk::{
+    Event, EventBuilder, JsonUtil, Keys, Kind, PublicKey, Tag, Timestamp, UnsignedEvent,
+};
 use once_cell::sync::Lazy;
 use secrecy::SecretString;
 use std::sync::Arc;
@@ -62,6 +64,47 @@ impl UnwrapError {
             UnwrapError::SenderMismatch => "sender_mismatch",
             UnwrapError::PermissionDenied => "permission_denied",
             UnwrapError::Internal => "internal",
+        }
+    }
+}
+
+/// Per-recipient failure reason for NIP-17 gift-wrap creation.
+///
+/// The HTTP batch response exposes recipient-scoped failures as stable
+/// `{"error": "<code>"}` slots, allowing one recipient failure to remain
+/// isolated without weakening authorization or permission checks for the rest of
+/// the batch. Common rumor failures such as [`Self::InvalidRumorAuthor`] and
+/// [`Self::InvalidRumorId`] are rejected by the RPC layer as request-level
+/// invalid params before any per-recipient slots are built.
+#[derive(Debug, Error)]
+pub enum WrapError {
+    #[error("authorization expired or revoked")]
+    AuthorizationInvalid,
+    #[error("rumor author does not match signer")]
+    InvalidRumorAuthor,
+    #[error("rumor id does not match its contents")]
+    InvalidRumorId,
+    #[error("permission denied")]
+    PermissionDenied,
+    #[error("rumor encryption failed")]
+    EncryptFailed,
+    #[error("seal signing failed")]
+    SignFailed,
+    #[error("gift wrap construction failed")]
+    WrapFailed,
+}
+
+impl WrapError {
+    /// Stable wire code for a per-recipient wrap result slot.
+    pub fn code(&self) -> &'static str {
+        match self {
+            WrapError::AuthorizationInvalid => "authorization_invalid",
+            WrapError::InvalidRumorAuthor => "invalid_rumor_author",
+            WrapError::InvalidRumorId => "invalid_rumor_id",
+            WrapError::PermissionDenied => "permission_denied",
+            WrapError::EncryptFailed => "encrypt_failed",
+            WrapError::SignFailed => "sign_failed",
+            WrapError::WrapFailed => "wrap_failed",
         }
     }
 }
@@ -354,6 +397,75 @@ impl HttpRpcHandler {
             .map_err(|e| HandlerError::Encryption(e.to_string()))
     }
 
+    /// Build one NIP-59 gift wrap while preserving the cached HTTP
+    /// authorization and custom-permission checks.
+    ///
+    /// The rumor is encrypted through [`Self::nip44_encrypt`] and the kind-13
+    /// seal is signed through [`Self::sign_event`]. Only the ephemeral outer
+    /// kind-1059 wrap is delegated directly to nostr-sdk, so the user's secret
+    /// key never bypasses the existing encrypt/sign policy surfaces.
+    pub async fn nip17_wrap(
+        &self,
+        mut rumor: UnsignedEvent,
+        recipient: &PublicKey,
+    ) -> Result<Event, WrapError> {
+        if !self.is_valid() {
+            return Err(WrapError::AuthorizationInvalid);
+        }
+        if rumor.pubkey != self.user_pubkey {
+            return Err(WrapError::InvalidRumorAuthor);
+        }
+        rumor.verify_id().map_err(|_| WrapError::InvalidRumorId)?;
+        rumor.ensure_id();
+
+        let plaintext = rumor.as_json();
+        self.nip17_wrap_prevalidated_plaintext(&plaintext, recipient)
+            .await
+    }
+
+    /// Build one NIP-59 gift wrap from a prevalidated, serialized rumor.
+    ///
+    /// The caller must verify the rumor author and id before passing plaintext.
+    /// This keeps batch wrapping from rehashing and reserializing the same rumor
+    /// for every recipient while preserving the encrypt and sign policy gates.
+    pub(crate) async fn nip17_wrap_prevalidated_plaintext(
+        &self,
+        plaintext: &str,
+        recipient: &PublicKey,
+    ) -> Result<Event, WrapError> {
+        if !self.is_valid() {
+            return Err(WrapError::AuthorizationInvalid);
+        }
+
+        let ciphertext =
+            self.nip44_encrypt(recipient, plaintext)
+                .await
+                .map_err(|error| match error {
+                    HandlerError::AuthorizationInvalid => WrapError::AuthorizationInvalid,
+                    HandlerError::PermissionDenied => WrapError::PermissionDenied,
+                    HandlerError::Encryption(_) | HandlerError::Signing(_) => {
+                        WrapError::EncryptFailed
+                    }
+                })?;
+
+        let seal = EventBuilder::new(Kind::Seal, ciphertext)
+            .custom_created_at(Timestamp::tweaked(nip59::RANGE_RANDOM_TIMESTAMP_TWEAK))
+            .build(self.user_pubkey);
+        let signed_seal = self.sign_event(seal).await.map_err(|error| match error {
+            HandlerError::AuthorizationInvalid => WrapError::AuthorizationInvalid,
+            HandlerError::PermissionDenied => WrapError::PermissionDenied,
+            HandlerError::Signing(_) | HandlerError::Encryption(_) => WrapError::SignFailed,
+        })?;
+
+        let recipient = *recipient;
+        tokio::task::spawn_blocking(move || {
+            EventBuilder::gift_wrap_from_seal(&recipient, &signed_seal, Vec::<Tag>::new())
+        })
+        .await
+        .map_err(|_| WrapError::WrapFailed)?
+        .map_err(|_| WrapError::WrapFailed)
+    }
+
     /// Unwrap a single NIP-59 gift wrap (kind 1059) → seal (kind 13) → rumor.
     ///
     /// This is the per-item primitive behind the `nip17_unwrap_batch` RPC. It
@@ -562,6 +674,21 @@ mod tests {
         )
     }
 
+    fn allowed_kinds_permission(kinds: &[u16]) -> Box<dyn CustomPermission> {
+        use keycast_core::types::permission::{JsonConfig, Permission};
+
+        let now = Utc::now();
+        Permission {
+            id: 1,
+            identifier: "allowed_kinds".to_string(),
+            config: JsonConfig(serde_json::json!({ "allowed_kinds": kinds })),
+            created_at: now,
+            updated_at: now,
+        }
+        .to_custom_permission()
+        .expect("allowed_kinds test permission")
+    }
+
     #[test]
     fn test_is_valid_no_expiration() {
         let handler = create_test_handler(None, None);
@@ -669,6 +796,134 @@ mod tests {
         );
 
         assert_eq!(handler.expected_dpop_jkt(), Some("thumbprint-123"));
+    }
+
+    // -- nip17_wrap (NIP-59 gift-wrap creation) ------------------------------
+
+    fn build_rumor(author: PublicKey, receiver: PublicKey, text: &str) -> UnsignedEvent {
+        nostr_sdk::EventBuilder::private_msg_rumor(receiver, text).build(author)
+    }
+
+    #[tokio::test]
+    async fn nip17_wrap_round_trips_for_recipient() {
+        let handler = create_test_handler(None, None);
+        let receiver = Keys::generate();
+        let rumor = build_rumor(
+            handler.public_key(),
+            receiver.public_key(),
+            "hello from keycast",
+        );
+
+        let gift_wrap = handler
+            .nip17_wrap(rumor.clone(), &receiver.public_key())
+            .await
+            .expect("wrap should succeed");
+
+        gift_wrap.verify().expect("outer wrap must verify");
+        assert_eq!(gift_wrap.kind, Kind::GiftWrap);
+
+        let unwrapped = UnwrappedGift::from_gift_wrap(&receiver, &gift_wrap)
+            .await
+            .expect("recipient should unwrap");
+        assert_eq!(unwrapped.sender, handler.public_key());
+        assert_eq!(unwrapped.rumor.content, rumor.content);
+        assert_eq!(unwrapped.rumor.pubkey, handler.public_key());
+        assert!(unwrapped.rumor.id.is_some());
+    }
+
+    #[tokio::test]
+    async fn nip17_wrap_denied_when_authorization_expired() {
+        let expires = Utc::now() - chrono::Duration::hours(1);
+        let handler = create_test_handler(Some(expires), None);
+        let receiver = Keys::generate();
+        let rumor = build_rumor(handler.public_key(), receiver.public_key(), "expired");
+
+        let err = handler
+            .nip17_wrap(rumor, &receiver.public_key())
+            .await
+            .expect_err("expired authorization must be denied");
+
+        assert_eq!(err.code(), "authorization_invalid");
+    }
+
+    #[tokio::test]
+    async fn nip17_wrap_rejects_mismatched_rumor_author() {
+        let handler = create_test_handler(None, None);
+        let receiver = Keys::generate();
+        let impersonated = Keys::generate();
+        let rumor = build_rumor(impersonated.public_key(), receiver.public_key(), "spoofed");
+
+        let err = handler
+            .nip17_wrap(rumor, &receiver.public_key())
+            .await
+            .expect_err("rumor author must equal the signer");
+
+        assert_eq!(err.code(), "invalid_rumor_author");
+    }
+
+    #[tokio::test]
+    async fn nip17_wrap_rejects_inconsistent_supplied_rumor_id() {
+        let handler = create_test_handler(None, None);
+        let receiver = Keys::generate();
+        let mut rumor = build_rumor(handler.public_key(), receiver.public_key(), "bad id");
+        rumor.id = Some(nostr_sdk::EventId::all_zeros());
+
+        let err = handler
+            .nip17_wrap(rumor, &receiver.public_key())
+            .await
+            .expect_err("inconsistent supplied rumor id must be rejected");
+
+        assert_eq!(err.code(), "invalid_rumor_id");
+    }
+
+    #[tokio::test]
+    async fn nip17_wrap_preserves_encrypt_permission() {
+        use keycast_core::custom_permissions::encrypt_to_self::EncryptToSelf;
+
+        let handler =
+            create_test_handler_with_permissions(None, None, vec![Box::new(EncryptToSelf {})]);
+        let receiver = Keys::generate();
+        let rumor = build_rumor(handler.public_key(), receiver.public_key(), "not to self");
+
+        let err = handler
+            .nip17_wrap(rumor, &receiver.public_key())
+            .await
+            .expect_err("encrypt_to_self must deny wrapping to another recipient");
+
+        assert_eq!(err.code(), "permission_denied");
+    }
+
+    #[tokio::test]
+    async fn nip17_wrap_preserves_kind_13_sign_permission() {
+        let handler =
+            create_test_handler_with_permissions(None, None, vec![allowed_kinds_permission(&[1])]);
+        let receiver = Keys::generate();
+        let rumor = build_rumor(
+            handler.public_key(),
+            receiver.public_key(),
+            "seal sign denied",
+        );
+
+        let err = handler
+            .nip17_wrap(rumor, &receiver.public_key())
+            .await
+            .expect_err("kind policy must deny signing the seal");
+
+        assert_eq!(err.code(), "permission_denied");
+    }
+
+    #[test]
+    fn wrap_error_codes_are_stable() {
+        assert_eq!(
+            WrapError::AuthorizationInvalid.code(),
+            "authorization_invalid"
+        );
+        assert_eq!(WrapError::InvalidRumorAuthor.code(), "invalid_rumor_author");
+        assert_eq!(WrapError::InvalidRumorId.code(), "invalid_rumor_id");
+        assert_eq!(WrapError::PermissionDenied.code(), "permission_denied");
+        assert_eq!(WrapError::EncryptFailed.code(), "encrypt_failed");
+        assert_eq!(WrapError::SignFailed.code(), "sign_failed");
+        assert_eq!(WrapError::WrapFailed.code(), "wrap_failed");
     }
 
     // -- nip17_unwrap (NIP-59 gift-wrap unwrap) ------------------------------
