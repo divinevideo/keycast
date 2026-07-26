@@ -1,3 +1,4 @@
+use crate::divine_names::{self, DivineNameError, PubkeyLookupResponse};
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -83,6 +84,127 @@ fn validate_atproto_state(state: Option<&str>) -> Result<(), AuthError> {
     }
 }
 
+pub async fn resolve_username_with_fallback<F, Fut>(
+    repo: &UserRepository,
+    tenant_id: i64,
+    user_pubkey: &str,
+    lookup: F,
+) -> Result<Option<String>, AtprotoControlError>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Result<Option<PubkeyLookupResponse>, DivineNameError>>,
+{
+    resolve_username_with_fallback_enabled(
+        repo,
+        tenant_id,
+        user_pubkey,
+        divine_names::is_enabled(),
+        lookup,
+    )
+    .await
+}
+
+pub async fn resolve_username_with_fallback_enabled<F, Fut>(
+    repo: &UserRepository,
+    tenant_id: i64,
+    user_pubkey: &str,
+    divine_names_enabled: bool,
+    lookup: F,
+) -> Result<Option<String>, AtprotoControlError>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Result<Option<PubkeyLookupResponse>, DivineNameError>>,
+{
+    let local_username = repo
+        .get_username(user_pubkey, tenant_id)
+        .await?
+        .ok_or(AtprotoControlError::UserNotFound)?;
+
+    if local_username.is_some() || !divine_names_enabled {
+        return Ok(local_username);
+    }
+
+    let lookup_response = match lookup(user_pubkey.to_string()).await {
+        Ok(Some(response)) => response,
+        Ok(None) => return Ok(None),
+        Err(error) => {
+            tracing::warn!(
+                "Failed to look up Divine username for ATProto fallback by pubkey {}: {}",
+                user_pubkey,
+                error
+            );
+            return Ok(None);
+        }
+    };
+
+    if let Some(ref lookup_pubkey) = lookup_response.pubkey {
+        if !lookup_pubkey.eq_ignore_ascii_case(user_pubkey) {
+            tracing::warn!(
+                "Divine username lookup by pubkey returned mismatched owner: requested_pubkey={}, returned_pubkey={}",
+                user_pubkey,
+                lookup_pubkey
+            );
+            return Ok(None);
+        }
+    }
+
+    let Some(resolved_username) = lookup_response.canonical.or(lookup_response.name) else {
+        tracing::warn!(
+            "Divine username lookup by pubkey returned no username for pubkey {}",
+            user_pubkey
+        );
+        return Ok(None);
+    };
+
+    let normalized_username = match super::auth::normalize_nip05_username(&resolved_username) {
+        Ok(username) => username,
+        Err(error) => {
+            tracing::warn!(
+                "Divine username lookup returned invalid username '{}' for pubkey {}: {:?}",
+                resolved_username,
+                user_pubkey,
+                error
+            );
+            return Ok(None);
+        }
+    };
+
+    if !repo
+        .check_username_available(&normalized_username, user_pubkey, tenant_id)
+        .await?
+    {
+        let conflicting_pubkey = repo
+            .find_pubkey_by_username(&normalized_username, tenant_id)
+            .await?
+            .unwrap_or_else(|| "<unknown>".to_string());
+        tracing::warn!(
+            "Refusing to reconcile Divine username '{}' for pubkey {} because tenant {} already assigns it to pubkey {}",
+            normalized_username,
+            user_pubkey,
+            tenant_id,
+            conflicting_pubkey
+        );
+        return Ok(None);
+    }
+
+    match repo
+        .update_username(user_pubkey, &normalized_username, tenant_id)
+        .await
+    {
+        Ok(()) => Ok(Some(normalized_username)),
+        Err(RepositoryError::Duplicate) => {
+            tracing::warn!(
+                "Refusing to reconcile Divine username '{}' for pubkey {} because a duplicate local username appeared in tenant {}",
+                normalized_username,
+                user_pubkey,
+                tenant_id
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn authorize_internal_sync(headers: &HeaderMap) -> Result<(), AuthError> {
     let expected = std::env::var("KEYCAST_ATPROTO_TOKEN")
         .ok()
@@ -110,10 +232,11 @@ pub async fn enable_user_atproto(
     user_pubkey: &str,
     requested_username: &str,
 ) -> Result<AtprotoStatusResponse, AtprotoControlError> {
-    let claimed_username = repo
-        .get_username(user_pubkey, tenant_id)
+    let claimed_username =
+        resolve_username_with_fallback(repo, tenant_id, user_pubkey, |pubkey| async move {
+            divine_names::lookup_by_pubkey(&pubkey).await
+        })
         .await?
-        .ok_or(AtprotoControlError::UserNotFound)?
         .ok_or(AtprotoControlError::UsernameNotClaimed)?;
 
     if claimed_username != requested_username {
@@ -170,10 +293,11 @@ pub async fn reenable_user_atproto(
     tenant_id: i64,
     user_pubkey: &str,
 ) -> Result<AtprotoStatusResponse, AtprotoControlError> {
-    let claimed_username = repo
-        .get_username(user_pubkey, tenant_id)
+    let claimed_username =
+        resolve_username_with_fallback(repo, tenant_id, user_pubkey, |pubkey| async move {
+            divine_names::lookup_by_pubkey(&pubkey).await
+        })
         .await?
-        .ok_or(AtprotoControlError::UserNotFound)?
         .ok_or(AtprotoControlError::UsernameNotClaimed)?;
 
     repo.set_atproto_state(user_pubkey, tenant_id, true, Some("pending"), None, None)
@@ -221,10 +345,11 @@ pub async fn get_user_atproto_status(
     tenant_id: i64,
     user_pubkey: &str,
 ) -> Result<AtprotoStatusResponse, AtprotoControlError> {
-    let username = repo
-        .get_username(user_pubkey, tenant_id)
-        .await?
-        .ok_or(AtprotoControlError::UserNotFound)?;
+    let username =
+        resolve_username_with_fallback(repo, tenant_id, user_pubkey, |pubkey| async move {
+            divine_names::lookup_by_pubkey(&pubkey).await
+        })
+        .await?;
 
     let state = repo
         .get_atproto_state(user_pubkey, tenant_id)

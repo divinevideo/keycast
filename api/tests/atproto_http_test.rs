@@ -1,13 +1,19 @@
 mod common;
 
+use axum::{
+    extract::{Path, State},
+    routing::get,
+    Json, Router,
+};
 use chrono::{Duration, Utc};
 use keycast_api::api::http::atproto::{
     disable_user_atproto, disable_user_atproto_and_revoke_sessions,
     disable_user_atproto_with_trigger, enable_user_atproto, enable_user_atproto_with_trigger,
-    get_user_atproto_status, set_user_atproto_crosspost, sync_user_atproto_state_by_pubkey,
-    SetCrosspostContext,
+    get_user_atproto_status, resolve_username_with_fallback_enabled, set_user_atproto_crosspost,
+    sync_user_atproto_state_by_pubkey, SetCrosspostContext,
 };
 use keycast_api::api::http::auth::AuthError;
+use keycast_api::divine_names::{DivineNameError, PubkeyLookupResponse};
 use keycast_core::repositories::{
     AtprotoOAuthSessionRepository, CreateAtprotoOAuthSessionParams, IssueAtprotoTokensParams,
     UserRepository,
@@ -15,11 +21,96 @@ use keycast_core::repositories::{
 use keycast_core::types::refresh_token::hash_refresh_token;
 use nostr_sdk::Keys;
 use reqwest::StatusCode;
+use serial_test::serial;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
 use uuid::Uuid;
+
+#[derive(Clone)]
+struct NameLookupMock {
+    pubkey: String,
+    username: String,
+}
+
+struct EnvGuard {
+    key: &'static str,
+    previous: Option<String>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        if let Some(ref value) = self.previous {
+            std::env::set_var(self.key, value);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
+
+async fn mock_name_lookup(
+    State(mock): State<NameLookupMock>,
+    Path(pubkey): Path<String>,
+) -> Json<serde_json::Value> {
+    if pubkey == mock.pubkey {
+        Json(serde_json::json!({
+            "ok": true,
+            "found": true,
+            "name": mock.username,
+            "canonical": mock.username,
+            "pubkey": mock.pubkey,
+        }))
+    } else {
+        Json(serde_json::json!({
+            "ok": true,
+            "found": false,
+        }))
+    }
+}
+
+async fn start_name_lookup_server(
+    pubkey: String,
+    username: String,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let app = Router::new()
+        .route("/api/username/by-pubkey/:pubkey", get(mock_name_lookup))
+        .with_state(NameLookupMock { pubkey, username });
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test listener");
+    let address = listener.local_addr().expect("listener address");
+
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve divine name lookup app");
+    });
+
+    (format!("http://{}", address), handle)
+}
+
+fn lookup_response(pubkey: &str, username: &str) -> PubkeyLookupResponse {
+    PubkeyLookupResponse {
+        ok: true,
+        found: true,
+        name: Some(username.to_string()),
+        canonical: Some(username.to_string()),
+        pubkey: Some(pubkey.to_string()),
+        profile_url: None,
+        nip05: None,
+        error: None,
+    }
+}
 
 #[tokio::test]
 async fn enable_sets_pending_and_returns_accepted() {
@@ -115,6 +206,222 @@ async fn status_returns_username_and_lifecycle_fields() {
     assert_eq!(response.state.as_deref(), Some("failed"));
     assert_eq!(response.did, None);
     assert_eq!(response.error.as_deref(), Some("provisioning failed"));
+}
+
+#[tokio::test]
+async fn username_resolver_keeps_local_username_without_lookup() {
+    let pool = common::setup_test_db().await;
+    let repo = UserRepository::new(pool.clone());
+    let tenant_id = 1_i64;
+
+    let keys = Keys::generate();
+    let user_pubkey = keys.public_key().to_hex();
+    let username = format!("alice-local-{}", &user_pubkey[..8]);
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, username, created_at, updated_at)
+         VALUES ($1, $2, $3, NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .bind(&username)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    let lookup_calls = Arc::new(AtomicUsize::new(0));
+    let seen = lookup_calls.clone();
+
+    let resolved =
+        resolve_username_with_fallback_enabled(&repo, tenant_id, &user_pubkey, true, move |_| {
+            let seen = seen.clone();
+            async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok::<Option<PubkeyLookupResponse>, DivineNameError>(None)
+            }
+        })
+        .await
+        .expect("resolver should succeed");
+
+    assert_eq!(resolved.as_deref(), Some(username.as_str()));
+    assert_eq!(lookup_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn username_resolver_persists_app_claimed_name() {
+    let pool = common::setup_test_db().await;
+    let repo = UserRepository::new(pool.clone());
+    let tenant_id = 1_i64;
+
+    let keys = Keys::generate();
+    let user_pubkey = keys.public_key().to_hex();
+    let username = format!("alice-resolved-{}", &user_pubkey[..8]);
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
+         VALUES ($1, $2, NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    let lookup_username = username.clone();
+    let resolved = resolve_username_with_fallback_enabled(
+        &repo,
+        tenant_id,
+        &user_pubkey,
+        true,
+        |pubkey| async move { Ok(Some(lookup_response(&pubkey, &lookup_username))) },
+    )
+    .await
+    .expect("resolver should succeed");
+
+    assert_eq!(resolved.as_deref(), Some(username.as_str()));
+    let persisted = repo
+        .get_username(&user_pubkey, tenant_id)
+        .await
+        .expect("username query should succeed")
+        .expect("user should exist");
+    assert_eq!(persisted.as_deref(), Some(username.as_str()));
+}
+
+#[tokio::test]
+async fn username_resolver_refuses_local_conflict() {
+    let pool = common::setup_test_db().await;
+    let repo = UserRepository::new(pool.clone());
+    let tenant_id = 1_i64;
+
+    let owner_pubkey = Keys::generate().public_key().to_hex();
+    let conflicting_pubkey = Keys::generate().public_key().to_hex();
+    let username = format!("alice-conflict-{}", &owner_pubkey[..8]);
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, username, created_at, updated_at)
+         VALUES ($1, $2, $3, NOW(), NOW()), ($4, $2, NULL, NOW(), NOW())",
+    )
+    .bind(&conflicting_pubkey)
+    .bind(tenant_id)
+    .bind(&username)
+    .bind(&owner_pubkey)
+    .execute(&pool)
+    .await
+    .expect("failed to insert users");
+
+    let lookup_username = username.clone();
+    let resolved = resolve_username_with_fallback_enabled(
+        &repo,
+        tenant_id,
+        &owner_pubkey,
+        true,
+        |pubkey| async move { Ok(Some(lookup_response(&pubkey, &lookup_username))) },
+    )
+    .await
+    .expect("resolver should not fail on conflicts");
+
+    assert_eq!(resolved, None);
+    let persisted = repo
+        .get_username(&owner_pubkey, tenant_id)
+        .await
+        .expect("username query should succeed")
+        .expect("user should exist");
+    assert_eq!(persisted, None);
+}
+
+#[tokio::test]
+async fn username_resolver_lookup_failure_returns_none() {
+    let pool = common::setup_test_db().await;
+    let repo = UserRepository::new(pool.clone());
+    let tenant_id = 1_i64;
+
+    let keys = Keys::generate();
+    let user_pubkey = keys.public_key().to_hex();
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
+         VALUES ($1, $2, NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    let resolved =
+        resolve_username_with_fallback_enabled(&repo, tenant_id, &user_pubkey, true, |_| async {
+            Err(DivineNameError::ResponseError("lookup failed".to_string()))
+        })
+        .await
+        .expect("resolver should swallow lookup errors");
+
+    assert_eq!(resolved, None);
+}
+
+#[tokio::test]
+#[serial]
+async fn crosspost_enable_reconciles_app_claimed_username() {
+    let pool = common::setup_test_db().await;
+    let repo = UserRepository::new(pool.clone());
+    let session_repo = AtprotoOAuthSessionRepository::new(pool.clone());
+    let tenant_id = 1_i64;
+
+    let keys = Keys::generate();
+    let user_pubkey = keys.public_key().to_hex();
+    let username = format!("alice-app-claimed-{}", &user_pubkey[..8]);
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, atproto_enabled, atproto_state, created_at, updated_at)
+         VALUES ($1, $2, false, NULL, NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    let (base_url, server_handle) =
+        start_name_lookup_server(user_pubkey.clone(), username.clone()).await;
+    let _divine_name_server = EnvGuard::set("DIVINE_NAME_SERVER_URL", &base_url);
+
+    let expected_pubkey = user_pubkey.clone();
+    let expected_username = username.clone();
+    let response = set_user_atproto_crosspost(
+        SetCrosspostContext {
+            user_repo: &repo,
+            session_repo: &session_repo,
+            tenant_id,
+            authenticated_user_pubkey: &user_pubkey,
+            requested_pubkey: &user_pubkey,
+            enabled: true,
+        },
+        move |pubkey, requested_username, crosspost_enabled| {
+            let expected_pubkey = expected_pubkey.clone();
+            let expected_username = expected_username.clone();
+            async move {
+                assert_eq!(pubkey, expected_pubkey);
+                assert_eq!(requested_username, expected_username);
+                assert!(crosspost_enabled);
+                Ok(())
+            }
+        },
+        |_pubkey| async { Ok(()) },
+        |_pubkey| async { Ok(()) },
+    )
+    .await
+    .expect("crosspost enable should succeed with app-claimed username");
+
+    assert!(response.enabled);
+    assert_eq!(response.state.as_deref(), Some("pending"));
+    assert_eq!(response.username.as_deref(), Some(username.as_str()));
+    let persisted = repo
+        .get_username(&user_pubkey, tenant_id)
+        .await
+        .expect("username query should succeed")
+        .expect("user should exist");
+    assert_eq!(persisted.as_deref(), Some(username.as_str()));
+
+    server_handle.abort();
 }
 
 #[tokio::test]

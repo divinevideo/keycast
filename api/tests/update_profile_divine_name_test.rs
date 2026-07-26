@@ -4,7 +4,7 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use http_body_util::BodyExt;
@@ -122,16 +122,44 @@ impl Drop for EnvGuard {
     }
 }
 
-async fn mock_name_check(Path(username): Path<String>) -> Json<serde_json::Value> {
+#[derive(Clone)]
+struct NameCheckMock {
+    owner_pubkey: Option<String>,
+}
+
+async fn mock_name_check(
+    State(mock): State<NameCheckMock>,
+    Path(username): Path<String>,
+) -> Json<serde_json::Value> {
+    if let Some(pubkey) = mock.owner_pubkey {
+        Json(json!({
+            "ok": true,
+            "available": false,
+            "reason": format!("{username} is already claimed"),
+            "status": "active",
+            "pubkey": pubkey,
+        }))
+    } else {
+        Json(json!({
+            "ok": true,
+            "available": false,
+            "reason": format!("{username} is reserved"),
+        }))
+    }
+}
+
+async fn mock_name_claim() -> Json<serde_json::Value> {
     Json(json!({
         "ok": true,
-        "available": false,
-        "reason": format!("{username} is reserved"),
+        "name": "claimed-name",
     }))
 }
 
-async fn start_name_check_server() -> (String, JoinHandle<()>) {
-    let app = Router::new().route("/api/username/check/:username", get(mock_name_check));
+async fn start_name_check_server(owner_pubkey: Option<String>) -> (String, JoinHandle<()>) {
+    let app = Router::new()
+        .route("/api/username/check/:username", get(mock_name_check))
+        .route("/api/username/claim", post(mock_name_claim))
+        .with_state(NameCheckMock { owner_pubkey });
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -327,7 +355,7 @@ async fn update_profile_divine_name_conflict_returns_conflict_status() {
             .expect("authorization header should parse"),
     );
 
-    let (base_url, server_handle) = start_name_check_server().await;
+    let (base_url, server_handle) = start_name_check_server(None).await;
     let _divine_name_server = EnvGuard::set("DIVINE_NAME_SERVER_URL", &base_url);
     let _enable_divine_names = EnvGuard::set("ENABLE_DIVINE_NAMES", "1");
 
@@ -357,6 +385,126 @@ async fn update_profile_divine_name_conflict_returns_conflict_status() {
         body["error"],
         "Username is not available. Please choose another username."
     );
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+#[serial]
+async fn update_profile_divine_name_same_owner_active_claim_succeeds() {
+    let pool = common::setup_test_db().await;
+    let repo = UserRepository::new(pool.clone());
+
+    let user_keys = Keys::generate();
+    let user_pubkey = user_keys.public_key().to_hex();
+    let tenant_id = 1_i64;
+    let username = format!("same-owner-{}", &user_pubkey[..8]);
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
+         VALUES ($1, $2, NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    let token = build_test_ucan(&user_keys, tenant_id).await;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {token}")
+            .parse()
+            .expect("authorization header should parse"),
+    );
+
+    let (base_url, server_handle) = start_name_check_server(Some(user_pubkey.clone())).await;
+    let _divine_name_server = EnvGuard::set("DIVINE_NAME_SERVER_URL", &base_url);
+    let _enable_divine_names = EnvGuard::set("ENABLE_DIVINE_NAMES", "1");
+
+    let response = auth::update_profile(
+        create_test_tenant(tenant_id),
+        State(create_test_auth_state(pool)),
+        headers,
+        Json(auth::ProfileData {
+            username: Some(username.clone()),
+            name: None,
+            about: None,
+            picture: None,
+            banner: None,
+            nip05: None,
+            website: None,
+            lud16: None,
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let persisted = repo
+        .get_username(&user_pubkey, tenant_id)
+        .await
+        .expect("username query should succeed")
+        .expect("user should exist");
+    assert_eq!(persisted.as_deref(), Some(username.as_str()));
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+#[serial]
+async fn update_profile_divine_name_different_owner_active_claim_conflicts() {
+    let pool = common::setup_test_db().await;
+
+    let user_keys = Keys::generate();
+    let user_pubkey = user_keys.public_key().to_hex();
+    let other_pubkey = Keys::generate().public_key().to_hex();
+    let tenant_id = 1_i64;
+    let username = format!("different-owner-{}", &user_pubkey[..8]);
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
+         VALUES ($1, $2, NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    let token = build_test_ucan(&user_keys, tenant_id).await;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        format!("Bearer {token}")
+            .parse()
+            .expect("authorization header should parse"),
+    );
+
+    let (base_url, server_handle) = start_name_check_server(Some(other_pubkey)).await;
+    let _divine_name_server = EnvGuard::set("DIVINE_NAME_SERVER_URL", &base_url);
+    let _enable_divine_names = EnvGuard::set("ENABLE_DIVINE_NAMES", "1");
+
+    let response = auth::update_profile(
+        create_test_tenant(tenant_id),
+        State(create_test_auth_state(pool)),
+        headers,
+        Json(auth::ProfileData {
+            username: Some(username),
+            name: None,
+            about: None,
+            picture: None,
+            banner: None,
+            nip05: None,
+            website: None,
+            lud16: None,
+        }),
+    )
+    .await
+    .into_response();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
 
     server_handle.abort();
 }
