@@ -48,12 +48,21 @@ pub struct AtprotoStatusResponse {
     pub username: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UsernameResolution {
+    Resolved(String),
+    NotClaimed,
+    Unavailable,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AtprotoControlError {
     #[error("user not found")]
     UserNotFound,
     #[error("username must be claimed before enabling atproto")]
     UsernameNotClaimed,
+    #[error("username resolution is temporarily unavailable")]
+    UsernameResolutionUnavailable,
     #[error("requested username does not match claimed username")]
     UsernameMismatch,
     #[error("{}", .0.public_message())]
@@ -89,7 +98,7 @@ pub async fn resolve_username_with_fallback<F, Fut>(
     tenant_id: i64,
     user_pubkey: &str,
     lookup: F,
-) -> Result<Option<String>, AtprotoControlError>
+) -> Result<UsernameResolution, AtprotoControlError>
 where
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = Result<Option<PubkeyLookupResponse>, DivineNameError>>,
@@ -110,7 +119,7 @@ pub async fn resolve_username_with_fallback_enabled<F, Fut>(
     user_pubkey: &str,
     divine_names_enabled: bool,
     lookup: F,
-) -> Result<Option<String>, AtprotoControlError>
+) -> Result<UsernameResolution, AtprotoControlError>
 where
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = Result<Option<PubkeyLookupResponse>, DivineNameError>>,
@@ -120,32 +129,42 @@ where
         .await?
         .ok_or(AtprotoControlError::UserNotFound)?;
 
-    if local_username.is_some() || !divine_names_enabled {
-        return Ok(local_username);
+    if let Some(username) = local_username {
+        return Ok(UsernameResolution::Resolved(username));
+    }
+
+    if !divine_names_enabled {
+        return Ok(UsernameResolution::NotClaimed);
     }
 
     let lookup_response = match lookup(user_pubkey.to_string()).await {
         Ok(Some(response)) => response,
-        Ok(None) => return Ok(None),
+        Ok(None) => return Ok(UsernameResolution::NotClaimed),
         Err(error) => {
             tracing::warn!(
                 "Failed to look up Divine username for ATProto fallback by pubkey {}: {}",
                 user_pubkey,
                 error
             );
-            return Ok(None);
+            return Ok(UsernameResolution::Unavailable);
         }
     };
 
-    if let Some(ref lookup_pubkey) = lookup_response.pubkey {
-        if !lookup_pubkey.eq_ignore_ascii_case(user_pubkey) {
-            tracing::warn!(
-                "Divine username lookup by pubkey returned mismatched owner: requested_pubkey={}, returned_pubkey={}",
-                user_pubkey,
-                lookup_pubkey
-            );
-            return Ok(None);
-        }
+    let Some(ref lookup_pubkey) = lookup_response.pubkey else {
+        tracing::warn!(
+            "Divine username lookup by pubkey returned no owner for requested_pubkey={}",
+            user_pubkey
+        );
+        return Ok(UsernameResolution::Unavailable);
+    };
+
+    if !lookup_pubkey.eq_ignore_ascii_case(user_pubkey) {
+        tracing::warn!(
+            "Divine username lookup by pubkey returned mismatched owner: requested_pubkey={}, returned_pubkey={}",
+            user_pubkey,
+            lookup_pubkey
+        );
+        return Ok(UsernameResolution::NotClaimed);
     }
 
     let Some(resolved_username) = lookup_response.canonical.or(lookup_response.name) else {
@@ -153,7 +172,7 @@ where
             "Divine username lookup by pubkey returned no username for pubkey {}",
             user_pubkey
         );
-        return Ok(None);
+        return Ok(UsernameResolution::NotClaimed);
     };
 
     let normalized_username = match super::auth::normalize_nip05_username(&resolved_username) {
@@ -165,7 +184,7 @@ where
                 user_pubkey,
                 error
             );
-            return Ok(None);
+            return Ok(UsernameResolution::NotClaimed);
         }
     };
 
@@ -184,14 +203,14 @@ where
             tenant_id,
             conflicting_pubkey
         );
-        return Ok(None);
+        return Ok(UsernameResolution::NotClaimed);
     }
 
     match repo
         .update_username(user_pubkey, &normalized_username, tenant_id)
         .await
     {
-        Ok(()) => Ok(Some(normalized_username)),
+        Ok(()) => Ok(UsernameResolution::Resolved(normalized_username)),
         Err(RepositoryError::Duplicate) => {
             tracing::warn!(
                 "Refusing to reconcile Divine username '{}' for pubkey {} because a duplicate local username appeared in tenant {}",
@@ -199,9 +218,19 @@ where
                 user_pubkey,
                 tenant_id
             );
-            Ok(None)
+            Ok(UsernameResolution::NotClaimed)
         }
         Err(error) => Err(error.into()),
+    }
+}
+
+fn require_resolved_username(
+    resolution: UsernameResolution,
+) -> Result<String, AtprotoControlError> {
+    match resolution {
+        UsernameResolution::Resolved(username) => Ok(username),
+        UsernameResolution::NotClaimed => Err(AtprotoControlError::UsernameNotClaimed),
+        UsernameResolution::Unavailable => Err(AtprotoControlError::UsernameResolutionUnavailable),
     }
 }
 
@@ -232,12 +261,12 @@ pub async fn enable_user_atproto(
     user_pubkey: &str,
     requested_username: &str,
 ) -> Result<AtprotoStatusResponse, AtprotoControlError> {
-    let claimed_username =
+    let claimed_username = require_resolved_username(
         resolve_username_with_fallback(repo, tenant_id, user_pubkey, |pubkey| async move {
             divine_names::lookup_by_pubkey(&pubkey).await
         })
-        .await?
-        .ok_or(AtprotoControlError::UsernameNotClaimed)?;
+        .await?,
+    )?;
 
     if claimed_username != requested_username {
         return Err(AtprotoControlError::UsernameMismatch);
@@ -293,12 +322,12 @@ pub async fn reenable_user_atproto(
     tenant_id: i64,
     user_pubkey: &str,
 ) -> Result<AtprotoStatusResponse, AtprotoControlError> {
-    let claimed_username =
+    let claimed_username = require_resolved_username(
         resolve_username_with_fallback(repo, tenant_id, user_pubkey, |pubkey| async move {
             divine_names::lookup_by_pubkey(&pubkey).await
         })
-        .await?
-        .ok_or(AtprotoControlError::UsernameNotClaimed)?;
+        .await?,
+    )?;
 
     repo.set_atproto_state(user_pubkey, tenant_id, true, Some("pending"), None, None)
         .await?;
@@ -345,18 +374,32 @@ pub async fn get_user_atproto_status(
     tenant_id: i64,
     user_pubkey: &str,
 ) -> Result<AtprotoStatusResponse, AtprotoControlError> {
-    let username =
+    let (response, _) =
+        get_user_atproto_status_with_resolution(repo, tenant_id, user_pubkey).await?;
+    Ok(response)
+}
+
+async fn get_user_atproto_status_with_resolution(
+    repo: &UserRepository,
+    tenant_id: i64,
+    user_pubkey: &str,
+) -> Result<(AtprotoStatusResponse, UsernameResolution), AtprotoControlError> {
+    let username_resolution =
         resolve_username_with_fallback(repo, tenant_id, user_pubkey, |pubkey| async move {
             divine_names::lookup_by_pubkey(&pubkey).await
         })
         .await?;
+    let username = match &username_resolution {
+        UsernameResolution::Resolved(username) => Some(username.clone()),
+        UsernameResolution::NotClaimed | UsernameResolution::Unavailable => None,
+    };
 
     let state = repo
         .get_atproto_state(user_pubkey, tenant_id)
         .await?
         .ok_or(AtprotoControlError::UserNotFound)?;
 
-    Ok(map_state_to_response(username, state))
+    Ok((map_state_to_response(username, state), username_resolution))
 }
 
 pub async fn sync_user_atproto_state_by_pubkey(
@@ -473,11 +516,18 @@ where
         ));
     }
 
-    let current = get_user_atproto_status(user_repo, tenant_id, authenticated_user_pubkey)
-        .await
-        .map_err(map_control_error)?;
+    let (current, username_resolution) =
+        get_user_atproto_status_with_resolution(user_repo, tenant_id, authenticated_user_pubkey)
+            .await
+            .map_err(map_control_error)?;
 
     if enabled {
+        if matches!(&username_resolution, UsernameResolution::Unavailable) {
+            return Err(map_control_error(
+                AtprotoControlError::UsernameResolutionUnavailable,
+            ));
+        }
+
         if current.enabled && matches!(current.state.as_deref(), Some("pending" | "ready")) {
             return Ok(current);
         }
@@ -493,11 +543,7 @@ where
             .map_err(map_control_error);
         }
 
-        let username = current
-            .username
-            .clone()
-            .ok_or(AtprotoControlError::UsernameNotClaimed)
-            .map_err(map_control_error)?;
+        let username = require_resolved_username(username_resolution).map_err(map_control_error)?;
 
         return enable_user_atproto_with_trigger(
             user_repo,
@@ -533,6 +579,12 @@ fn map_control_error(error: AtprotoControlError) -> AuthError {
         AtprotoControlError::UsernameNotClaimed => {
             AuthError::BadRequest("Username must be claimed before enabling ATProto".to_string())
         }
+        AtprotoControlError::UsernameResolutionUnavailable => AuthError::ServiceUnavailable {
+            message:
+                "ATProto username lookup is temporarily unavailable. Please try again shortly."
+                    .to_string(),
+            retry_after: Some(30),
+        },
         AtprotoControlError::UsernameMismatch => AuthError::BadRequest(
             "Requested username does not match the claimed username".to_string(),
         ),
