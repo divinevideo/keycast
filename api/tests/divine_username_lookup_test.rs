@@ -11,7 +11,7 @@ use keycast_api::{
     api::{
         extractors::UcanAuth,
         http::{
-            admin::{get_user_lookup, UserLookupQuery},
+            admin::{get_user_lookup, UserLookupQuery, UserLookupResponse},
             routes::AuthState,
         },
         tenant::{Tenant, TenantExtractor},
@@ -108,8 +108,8 @@ fn create_test_auth_state(pool: PgPool) -> AuthState {
     }
 }
 
-async fn lookup_pubkeys(pool: &PgPool, q: &str) -> Vec<String> {
-    let resp = get_user_lookup(
+async fn lookup(pool: &PgPool, q: &str) -> UserLookupResponse {
+    get_user_lookup(
         create_test_tenant(),
         State(create_test_auth_state(pool.clone())),
         AuthConfig::full_admin().into_auth(),
@@ -117,8 +117,39 @@ async fn lookup_pubkeys(pool: &PgPool, q: &str) -> Vec<String> {
     )
     .await
     .expect("full admin lookup should succeed")
-    .0;
-    resp.results.into_iter().map(|u| u.pubkey).collect()
+    .0
+}
+
+async fn lookup_pubkeys(pool: &PgPool, q: &str) -> Vec<String> {
+    lookup(pool, q)
+        .await
+        .results
+        .into_iter()
+        .map(|u| u.pubkey)
+        .collect()
+}
+
+/// Pubkeys the lookup reports as confirmed identities, in rank order.
+fn authoritative_pubkeys(resp: &UserLookupResponse) -> Vec<String> {
+    resp.results
+        .iter()
+        .filter(|u| u.authoritative)
+        .map(|u| u.pubkey.clone())
+        .collect()
+}
+
+async fn insert_user(pool: &PgPool, pubkey: &str, username: &str, email: Option<&str>) {
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, username, email, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, NOW(), NOW())",
+    )
+    .bind(pubkey)
+    .bind(TENANT_ID)
+    .bind(username)
+    .bind(email)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 async fn cleanup_user(pool: &PgPool, pubkey: &str) {
@@ -136,16 +167,7 @@ async fn lookup_resolves_divine_handle_forms_to_the_same_account() {
     // Simple (hyphen-free) suffix keeps the handle unambiguous under the query's normalization.
     let handle = format!("mjb{}", Uuid::new_v4().simple());
 
-    sqlx::query(
-        "INSERT INTO users (pubkey, tenant_id, username, created_at, updated_at) \
-         VALUES ($1, $2, $3, NOW(), NOW())",
-    )
-    .bind(&pubkey)
-    .bind(TENANT_ID)
-    .bind(&handle)
-    .execute(&pool)
-    .await
-    .unwrap();
+    insert_user(&pool, &pubkey, &handle, None).await;
 
     // Every way support/users write the handle must resolve to the same account. The name server
     // is disabled in the test env, so these exercise the canonicalization -> local-username path.
@@ -168,6 +190,99 @@ async fn lookup_resolves_divine_handle_forms_to_the_same_account() {
     assert!(
         !unrelated.contains(&pubkey),
         "an unrelated email must not resolve to the seeded handle account"
+    );
+
+    cleanup_user(&pool, &pubkey).await;
+}
+
+/// `<local>@divine.video` has two honest readings: a mailbox address, and the NIP-05 form of the
+/// handle `<local>`. When those belong to *different* accounts, reducing the query to the handle
+/// alone drops the exact-email path, so the handle owner becomes the sole confirmed match and the
+/// support UI auto-expands it in place of the person who actually owns the address. Both readings
+/// must survive, and two confirmed identities must suppress auto-expansion so support chooses.
+#[tokio::test]
+async fn qualified_email_keeps_mailbox_owner_confirmed_alongside_handle_owner() {
+    let pool = common::setup_test_db().await;
+    // Simple (hyphen-free) suffix keeps the handle unambiguous under the query's normalization.
+    let handle = format!("lele{}", Uuid::new_v4().simple());
+    let mailbox = format!("{handle}@divine.video");
+
+    let handle_owner = Keys::generate().public_key().to_hex();
+    insert_user(&pool, &handle_owner, &handle, None).await;
+
+    // A different account owns the mailbox. Its username deliberately does not match the handle,
+    // so the only thing tying it to the query is its exact email address.
+    let mailbox_owner = Keys::generate().public_key().to_hex();
+    let unrelated_username = format!("mailbox{}", Uuid::new_v4().simple());
+    insert_user(&pool, &mailbox_owner, &unrelated_username, Some(&mailbox)).await;
+
+    let resp = lookup(&pool, &mailbox).await;
+    let confirmed = authoritative_pubkeys(&resp);
+    assert!(
+        confirmed.contains(&mailbox_owner),
+        "the mailbox owner must stay confirmed for its own address; confirmed: {confirmed:?}"
+    );
+    assert!(
+        confirmed.contains(&handle_owner),
+        "the handle owner must stay confirmed for the NIP-05 reading; confirmed: {confirmed:?}"
+    );
+    // `selectAutoExpandedPubkey` (web/src/routes/support-admin/lookup-view.ts) only auto-expands
+    // when exactly one row is confirmed, so two confirmed identities is what stops the UI from
+    // silently picking the wrong person.
+    assert_eq!(
+        resp.authoritative_count, 2,
+        "an ambiguous address must report both identities, not auto-expand one"
+    );
+    // The literal reading of what support typed ranks first.
+    assert_eq!(confirmed.first(), Some(&mailbox_owner));
+
+    // The pure-handle forms are unchanged: the handle owner is the only confirmed identity and
+    // stays auto-expandable, even though the mailbox contains the handle as a substring.
+    for form in [
+        handle.clone(),
+        format!("@{handle}"),
+        format!("{handle}.divine.video"),
+        format!("@{handle}.divine.video"),
+    ] {
+        let resp = lookup(&pool, &form).await;
+        assert_eq!(
+            authoritative_pubkeys(&resp),
+            vec![handle_owner.clone()],
+            "`{form}` must confirm only the handle owner"
+        );
+        assert_eq!(
+            resp.authoritative_count, 1,
+            "`{form}` must stay auto-expandable"
+        );
+    }
+
+    cleanup_user(&pool, &handle_owner).await;
+    cleanup_user(&pool, &mailbox_owner).await;
+}
+
+/// The common case for a Divine mailbox: one account owns both the address and the handle. Both
+/// readings find the same account, so it must merge to a single confirmed row — searching the
+/// address twice must not split one person into two results and suppress auto-expansion.
+#[tokio::test]
+async fn qualified_email_owned_by_the_handle_owner_stays_a_single_confirmed_row() {
+    let pool = common::setup_test_db().await;
+    let handle = format!("lele{}", Uuid::new_v4().simple());
+    let mailbox = format!("{handle}@divine.video");
+
+    let pubkey = Keys::generate().public_key().to_hex();
+    insert_user(&pool, &pubkey, &handle, Some(&mailbox)).await;
+
+    let resp = lookup(&pool, &mailbox).await;
+
+    assert_eq!(authoritative_pubkeys(&resp), vec![pubkey.clone()]);
+    assert_eq!(
+        resp.authoritative_count, 1,
+        "one owner of both readings must stay auto-expandable"
+    );
+    assert_eq!(
+        resp.results.len(),
+        1,
+        "the two readings must merge, not duplicate the account"
     );
 
     cleanup_user(&pool, &pubkey).await;

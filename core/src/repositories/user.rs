@@ -329,12 +329,17 @@ where
 }
 
 impl AdminUserLookup {
-    /// Append de-duplicated loose results while preserving authoritative metadata.
-    pub fn append_loose_results(mut self, loose: Self) -> Self {
+    /// Merge another lookup into this one, de-duplicated by pubkey and re-ranked by tier.
+    ///
+    /// Each row keeps the tier it arrived with, so this merges two lookups of *any* authority:
+    /// rows confirmed by either side stay confirmed and rank first, and authority metadata is
+    /// recomputed from the merged set. Within a tier, `self`'s rows rank ahead of `other`'s, and
+    /// a pubkey present in both keeps its highest tier.
+    pub fn merge_ranked_results(mut self, other: Self) -> Self {
         let mut authoritative = Vec::new();
         let mut partial = Vec::new();
         let mut fuzzy = Vec::new();
-        for user in self.users.into_iter().chain(loose.users) {
+        for user in self.users.into_iter().chain(other.users) {
             match user.match_kind {
                 AdminUserMatchKind::Authoritative => authoritative.push(user),
                 AdminUserMatchKind::Partial => partial.push(user),

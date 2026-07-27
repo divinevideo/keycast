@@ -1009,7 +1009,7 @@ fn apply_name_promotion(
 ) -> AdminUserLookup {
     if let Some(resolved) = resolved {
         if resolved.authoritative_match {
-            return resolved.append_loose_results(local.demote_to_candidates());
+            return resolved.merge_ranked_results(local.demote_to_candidates());
         }
     }
     if local.authoritative_match {
@@ -1025,10 +1025,19 @@ fn apply_name_promotion(
 /// Support and users write a handle several ways: `mjb`, `@mjb`, `mjb.<domain>` (the profile
 /// URL), `@mjb.<domain>`, and `mjb@<domain>` (the NIP-05 form). All reduce to the bare handle
 /// `mjb`. Emails at other domains, `npub…`, and 64-char hex are not handles.
+///
+/// The NIP-05 form is the one query that is also a valid mailbox address, so it additionally
+/// carries `email_form` and is searched both ways.
 #[derive(Debug, PartialEq, Eq)]
 struct CanonicalLookup {
     query: String,
     is_handle: bool,
+    /// The address as typed, when the query is *also* a valid mailbox at the public handle domain
+    /// (`<local>@divine.video`). That form has two honest readings — a real mailbox, and the
+    /// NIP-05 spelling of the handle `<local>` — which can belong to different accounts, so the
+    /// lookup searches both. `None` for every other form (`mjb`, `@mjb`, `mjb.<domain>`), which
+    /// was never an address to begin with.
+    email_form: Option<String>,
 }
 
 /// Strip an ASCII `suffix` (matched case-insensitively via `lower`) from `s`, returning the
@@ -1049,6 +1058,7 @@ fn canonicalize_lookup_query(raw: &str, nip05_domain: &str) -> CanonicalLookup {
         return CanonicalLookup {
             query: q.to_string(),
             is_handle: false,
+            email_form: None,
         };
     }
 
@@ -1058,12 +1068,14 @@ fn canonicalize_lookup_query(raw: &str, nip05_domain: &str) -> CanonicalLookup {
     let lower = s.to_lowercase();
 
     if !domain.is_empty() {
-        // NIP-05 email form `handle@domain` reduces to the bare handle.
+        // NIP-05 email form `handle@domain` reduces to the bare handle, but it is also a
+        // syntactically valid mailbox, so keep the address for the exact-email path too.
         if let Some(handle) = strip_ascii_suffix(s, &lower, &format!("@{domain}")) {
             if !handle.is_empty() {
                 return CanonicalLookup {
                     query: handle.to_string(),
                     is_handle: true,
+                    email_form: Some(s.to_string()),
                 };
             }
         }
@@ -1077,6 +1089,7 @@ fn canonicalize_lookup_query(raw: &str, nip05_domain: &str) -> CanonicalLookup {
                     return CanonicalLookup {
                         query: handle.to_string(),
                         is_handle: true,
+                        email_form: None,
                     };
                 }
             }
@@ -1092,6 +1105,7 @@ fn canonicalize_lookup_query(raw: &str, nip05_domain: &str) -> CanonicalLookup {
                 s.to_string()
             },
             is_handle: false,
+            email_form: None,
         };
     }
 
@@ -1099,6 +1113,7 @@ fn canonicalize_lookup_query(raw: &str, nip05_domain: &str) -> CanonicalLookup {
     CanonicalLookup {
         query: s.to_string(),
         is_handle: true,
+        email_form: None,
     }
 }
 
@@ -1238,7 +1253,7 @@ mod user_lookup_response_tests {
             authoritative_count: 0,
         };
 
-        let merged = promoted.append_loose_results(local);
+        let merged = promoted.merge_ranked_results(local);
 
         assert_eq!(merged.users[0].pubkey, "authoritative");
         assert!(merged.users[0].authoritative);
@@ -1249,6 +1264,54 @@ mod user_lookup_response_tests {
         assert_eq!(merged.users[1].pubkey, "loose");
         assert!(!merged.users[1].authoritative);
         assert_eq!(merged.users[1].match_kind, AdminUserMatchKind::Partial);
+        assert_eq!(merged.authoritative_count, 1);
+    }
+
+    /// The mailbox and handle readings of `<local>@<domain>` can confirm two different accounts.
+    /// Merging must keep both confirmed — that is what makes `authoritative_count` exceed 1 and
+    /// stops the support UI auto-expanding either one.
+    #[test]
+    fn merge_keeps_both_sides_confirmed_when_readings_disagree() {
+        let by_email = AdminUserLookup {
+            users: vec![lookup_details("mailbox-owner", true)],
+            authoritative_match: true,
+            authoritative_count: 1,
+        };
+        let by_handle = AdminUserLookup {
+            users: vec![
+                lookup_details("handle-owner", true),
+                lookup_details("bystander", false),
+            ],
+            authoritative_match: true,
+            authoritative_count: 1,
+        };
+
+        let merged = by_email.merge_ranked_results(by_handle);
+
+        assert_eq!(merged.authoritative_count, 2);
+        assert!(merged.authoritative_match);
+        // Confirmed rows rank ahead of candidates, mailbox reading first.
+        let order: Vec<&str> = merged.users.iter().map(|u| u.pubkey.as_str()).collect();
+        assert_eq!(order, vec!["mailbox-owner", "handle-owner", "bystander"]);
+    }
+
+    /// One account owning both readings is one row, still confirmed — not a duplicate.
+    #[test]
+    fn merge_deduplicates_an_account_matching_both_readings() {
+        let by_email = AdminUserLookup {
+            users: vec![lookup_details("same-owner", true)],
+            authoritative_match: true,
+            authoritative_count: 1,
+        };
+        let by_handle = AdminUserLookup {
+            users: vec![lookup_details("same-owner", true)],
+            authoritative_match: true,
+            authoritative_count: 1,
+        };
+
+        let merged = by_email.merge_ranked_results(by_handle);
+
+        assert_eq!(merged.users.len(), 1);
         assert_eq!(merged.authoritative_count, 1);
     }
 
@@ -1374,6 +1437,16 @@ mod user_lookup_response_tests {
         CanonicalLookup {
             query: query.to_string(),
             is_handle: true,
+            email_form: None,
+        }
+    }
+
+    /// A handle written in NIP-05 form, which is also a valid mailbox and so keeps the address.
+    fn qualified_handle(query: &str, email_form: &str) -> CanonicalLookup {
+        CanonicalLookup {
+            query: query.to_string(),
+            is_handle: true,
+            email_form: Some(email_form.to_string()),
         }
     }
 
@@ -1381,6 +1454,7 @@ mod user_lookup_response_tests {
         CanonicalLookup {
             query: query.to_string(),
             is_handle: false,
+            email_form: None,
         }
     }
 
@@ -1397,14 +1471,20 @@ mod user_lookup_response_tests {
             canonicalize_lookup_query("@mjb.divine.video", d),
             handle("mjb")
         );
+        // The NIP-05 form is also a valid mailbox, so it keeps the address for the email path.
         assert_eq!(
             canonicalize_lookup_query("mjb@divine.video", d),
-            handle("mjb")
+            qualified_handle("mjb", "mjb@divine.video")
         );
         // Case is preserved (DB match is case-insensitive; the name server resolves case-insensitively).
         assert_eq!(
             canonicalize_lookup_query("  MJB@Divine.Video  ", d),
-            handle("MJB")
+            qualified_handle("MJB", "MJB@Divine.Video")
+        );
+        // A leading '@' is handle notation, not part of the address.
+        assert_eq!(
+            canonicalize_lookup_query("@mjb@divine.video", d),
+            qualified_handle("mjb", "mjb@divine.video")
         );
     }
 
@@ -1499,6 +1579,25 @@ pub async fn get_user_lookup(
             _ => None,
         };
         lookup = apply_name_promotion(lookup, resolved);
+    }
+
+    // `<local>@<public domain>` is both a real mailbox address and the NIP-05 spelling of the
+    // handle `<local>`, and those can belong to different accounts. Canonicalizing to the handle
+    // alone strips the `@` before `find_users_for_admin` can take its exact-email path, so the
+    // handle owner would become the sole confirmed match and the support UI would auto-expand it
+    // in place of the person who actually owns the address. Search the address as well and merge:
+    // when the readings disagree both owners stay confirmed, and `authoritative_count > 1` is what
+    // stops the UI silently picking one (see `selectAutoExpandedPubkey` in the support-admin view).
+    //
+    // Merged *after* name promotion on purpose: the name server is authoritative for handles, not
+    // for mailboxes, so an unconfirmed or slow handle lookup must not demote an exact email match.
+    // The mailbox reading leads because it is the query exactly as support typed it; the handle
+    // reading required stripping a suffix.
+    if let Some(email_form) = canonical.email_form.as_deref() {
+        let by_email = user_repo
+            .find_users_for_admin(email_form, tenant_id)
+            .await?;
+        lookup = by_email.merge_ranked_results(lookup);
     }
 
     let suggested_users = if should_fetch_email_suggestions(lookup.authoritative_match) {
