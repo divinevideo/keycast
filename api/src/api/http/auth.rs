@@ -81,6 +81,18 @@ fn resolve_nip05_domain(tenant_domain: &str) -> String {
     tenant_domain.to_string()
 }
 
+/// The public Divine handle domain — what NIP-05 handles and profile URLs use
+/// (`<handle>@divine.video`, `<handle>.divine.video`), independent of the per-request tenant/login
+/// host. The support lookup resolves *public* handles, so it must canonicalize against this domain,
+/// not `resolve_nip05_domain`'s tenant host (which is e.g. `login.divine.video` in production, so a
+/// query like `mjb@divine.video` would never be reduced to the handle `mjb`).
+pub(crate) fn public_handle_domain() -> String {
+    std::env::var("NIP05_DOMAIN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_NIP05_DOMAIN.to_string())
+}
+
 fn normalize_nip05_username(raw_username: &str) -> Result<String, AuthError> {
     let username = raw_username.trim().to_lowercase();
 

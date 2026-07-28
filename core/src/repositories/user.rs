@@ -329,12 +329,17 @@ where
 }
 
 impl AdminUserLookup {
-    /// Append de-duplicated loose results while preserving authoritative metadata.
-    pub fn append_loose_results(mut self, loose: Self) -> Self {
+    /// Merge another lookup into this one, de-duplicated by pubkey and re-ranked by tier.
+    ///
+    /// Each row keeps the tier it arrived with, so this merges two lookups of *any* authority:
+    /// rows confirmed by either side stay confirmed and rank first, and authority metadata is
+    /// recomputed from the merged set. Within a tier, `self`'s rows rank ahead of `other`'s, and
+    /// a pubkey present in both keeps its highest tier.
+    pub fn merge_ranked_results(mut self, other: Self) -> Self {
         let mut authoritative = Vec::new();
         let mut partial = Vec::new();
         let mut fuzzy = Vec::new();
-        for user in self.users.into_iter().chain(loose.users) {
+        for user in self.users.into_iter().chain(other.users) {
             match user.match_kind {
                 AdminUserMatchKind::Authoritative => authoritative.push(user),
                 AdminUserMatchKind::Partial => partial.push(user),
@@ -346,6 +351,22 @@ impl AdminUserLookup {
         });
         self.authoritative_count = self.users.iter().filter(|user| user.authoritative).count();
         self.authoritative_match = self.authoritative_count > 0;
+        self
+    }
+
+    /// Demote every row to a non-authoritative candidate. Used when an authoritative
+    /// name-server match supersedes local matches for a handle query, so a stale local row
+    /// (e.g. an outdated `username`) can no longer present itself as the identity match.
+    pub fn demote_to_candidates(mut self) -> Self {
+        for user in &mut self.users {
+            user.authoritative = false;
+            // Drop the tier too: rows are ranked and labeled by `match_kind`, so one left as
+            // `Authoritative` would still present as the top-tier identity match despite the
+            // cleared flag. Demote it to a candidate tier.
+            user.match_kind = AdminUserMatchKind::Partial;
+        }
+        self.authoritative_count = 0;
+        self.authoritative_match = false;
         self
     }
 }

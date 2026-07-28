@@ -232,13 +232,25 @@ pub async fn lookup_by_name(username: &str) -> Result<Option<String>, DivineName
         ))
     })?;
 
-    let pubkey = parsed
-        .get("names")
-        .and_then(|names| names.get(username))
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    Ok(extract_pubkey_from_names(&parsed, username))
+}
 
-    Ok(pubkey)
+/// Extract the hex pubkey for `name` from a parsed `nostr.json` value.
+///
+/// Tries an exact key match first, then a case-insensitive match: NIP-05 local-parts are
+/// conventionally lowercase and the name server may return a canonicalized key, but callers
+/// (e.g. the support lookup) can pass mixed-case handles.
+fn extract_pubkey_from_names(parsed: &serde_json::Value, name: &str) -> Option<String> {
+    let names = parsed.get("names")?.as_object()?;
+    if let Some(pubkey) = names.get(name).and_then(|v| v.as_str()) {
+        return Some(pubkey.to_string());
+    }
+    let lower = name.to_lowercase();
+    names
+        .iter()
+        .find(|(key, _)| key.to_lowercase() == lower)
+        .and_then(|(_, value)| value.as_str())
+        .map(String::from)
 }
 
 /// Response from the by-pubkey lookup endpoint
@@ -298,5 +310,50 @@ pub async fn lookup_by_pubkey(
         Ok(Some(lookup_response))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_pubkey_from_names;
+    use serde_json::json;
+
+    const PUBKEY: &str = "0000000000000000000000000000000000000000000000000000000000000001";
+
+    #[test]
+    fn exact_name_match() {
+        let value = json!({ "names": { "mjb": PUBKEY } });
+        assert_eq!(
+            extract_pubkey_from_names(&value, "mjb").as_deref(),
+            Some(PUBKEY)
+        );
+    }
+
+    #[test]
+    fn case_insensitive_match_when_exact_key_missing() {
+        // Caller passes mixed case; the name server returned a lowercased key.
+        let value = json!({ "names": { "mjb": PUBKEY } });
+        assert_eq!(
+            extract_pubkey_from_names(&value, "MJB").as_deref(),
+            Some(PUBKEY)
+        );
+    }
+
+    #[test]
+    fn no_matching_name_returns_none() {
+        let value = json!({ "names": { "someone": PUBKEY } });
+        assert!(extract_pubkey_from_names(&value, "mjb").is_none());
+    }
+
+    #[test]
+    fn missing_names_object_returns_none() {
+        let value = json!({ "relays": {} });
+        assert!(extract_pubkey_from_names(&value, "mjb").is_none());
+    }
+
+    #[test]
+    fn names_not_an_object_returns_none() {
+        let value = json!({ "names": "nope" });
+        assert!(extract_pubkey_from_names(&value, "mjb").is_none());
     }
 }
