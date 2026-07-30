@@ -5,9 +5,10 @@ use nostr_sdk::prelude::*;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_NAME_SERVER_URL: &str = "https://names.divine.video";
+const NAME_SERVER_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Serialize)]
 struct ClaimRequest {
@@ -48,6 +49,13 @@ pub enum DivineNameError {
     ClaimError(String),
     #[error("Invalid response: {0}")]
     ResponseError(String),
+}
+
+fn name_server_client() -> Result<Client, DivineNameError> {
+    Client::builder()
+        .timeout(NAME_SERVER_TIMEOUT)
+        .build()
+        .map_err(DivineNameError::RequestError)
 }
 
 /// Create a NIP-98 auth event for the claim endpoint
@@ -113,7 +121,7 @@ pub async fn claim_username(
     );
 
     // Make HTTP request
-    let client = Client::new();
+    let client = name_server_client()?;
     let response = client
         .post(&url)
         .header("Authorization", auth_header)
@@ -166,12 +174,15 @@ pub struct AvailabilityResponse {
     #[serde(default)]
     pub status: Option<String>,
     #[serde(default)]
+    pub pubkey: Option<String>,
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
     pub error: Option<String>,
 }
 
 /// Check if a username is available on divine-name-server (no auth required)
-/// Returns (available, reason) - reason is set when not available
-pub async fn check_availability(username: &str) -> Result<(bool, Option<String>), DivineNameError> {
+pub async fn check_availability(username: &str) -> Result<AvailabilityResponse, DivineNameError> {
     let base_url = std::env::var("DIVINE_NAME_SERVER_URL")
         .unwrap_or_else(|_| DEFAULT_NAME_SERVER_URL.to_string());
     let url = format!(
@@ -180,7 +191,7 @@ pub async fn check_availability(username: &str) -> Result<(bool, Option<String>)
         username
     );
 
-    let client = Client::new();
+    let client = name_server_client()?;
     let response = client.get(&url).send().await?;
 
     let status = response.status();
@@ -202,7 +213,7 @@ pub async fn check_availability(username: &str) -> Result<(bool, Option<String>)
         ));
     }
 
-    Ok((check_response.available, check_response.reason))
+    Ok(check_response)
 }
 
 /// Look up a username via NIP-05 nostr.json on divine-name-server.
@@ -217,9 +228,7 @@ pub async fn lookup_by_name(username: &str) -> Result<Option<String>, DivineName
         encoded_name
     );
 
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()?;
+    let client = name_server_client()?;
     let response = client.get(&url).send().await?;
 
     let status = response.status();
@@ -284,7 +293,7 @@ pub async fn lookup_by_pubkey(
         pubkey
     );
 
-    let client = Client::new();
+    let client = name_server_client()?;
     let response = client.get(&url).send().await?;
 
     let status = response.status();

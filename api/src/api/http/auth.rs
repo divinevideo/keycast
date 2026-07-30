@@ -93,7 +93,7 @@ pub(crate) fn public_handle_domain() -> String {
         .unwrap_or_else(|| DEFAULT_NIP05_DOMAIN.to_string())
 }
 
-fn normalize_nip05_username(raw_username: &str) -> Result<String, AuthError> {
+pub(crate) fn normalize_nip05_username(raw_username: &str) -> Result<String, AuthError> {
     let username = raw_username.trim().to_lowercase();
 
     if username.is_empty() {
@@ -2585,19 +2585,37 @@ pub async fn update_profile(
         // Check divine-name-server FIRST (if enabled) - this is the authoritative source
         if crate::divine_names::is_enabled() {
             match crate::divine_names::check_availability(&username).await {
-                Ok((available, reason)) => {
-                    if !available {
-                        let error_msg =
-                            reason.unwrap_or_else(|| "Username is not available".to_string());
+                Ok(response) => {
+                    if !response.available {
+                        let same_owner_active = response.status.as_deref() == Some("active")
+                            && response
+                                .pubkey
+                                .as_deref()
+                                .is_some_and(|pubkey| pubkey.eq_ignore_ascii_case(&user_pubkey));
+
+                        if !same_owner_active {
+                            let error_msg = response
+                                .reason
+                                .unwrap_or_else(|| "Username is not available".to_string());
+                            tracing::info!(
+                                "Username '{}' not available on divine-name-server: {}",
+                                username,
+                                error_msg
+                            );
+                            return Err(AuthError::Conflict(
+                                "Username is not available. Please choose another username."
+                                    .to_string(),
+                            ));
+                        }
+
+                        let error_msg = response
+                            .reason
+                            .unwrap_or_else(|| "already claimed".to_string());
                         tracing::info!(
-                            "Username '{}' not available on divine-name-server: {}",
+                            "Username '{}' is already active on divine-name-server for the authenticated user: {}",
                             username,
                             error_msg
                         );
-                        return Err(AuthError::Conflict(
-                            "Username is not available. Please choose another username."
-                                .to_string(),
-                        ));
                     }
                 }
                 Err(e) => {
