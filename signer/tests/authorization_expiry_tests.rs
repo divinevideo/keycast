@@ -2,6 +2,7 @@
 // ABOUTME: A handler cached while valid must stop working the moment its expires_at falls due
 
 use chrono::{Duration, Utc};
+use keycast_core::signing_handler::SigningHandler;
 use keycast_signer::{HandlerStatus, Nip46Handler};
 use nostr_sdk::prelude::*;
 use sqlx::postgres::PgPoolOptions;
@@ -89,5 +90,24 @@ async fn expiry_takes_effect_without_reloading_the_handler() {
     assert!(
         handler.is_tombstone(),
         "expiry must be evaluated against the clock per request, not at load time"
+    );
+}
+
+#[tokio::test]
+async fn expired_authorization_cannot_sign_directly() {
+    let handler =
+        handler_cached_as_active().with_expires_at(Some(Utc::now() - Duration::seconds(1)));
+    let pubkey =
+        PublicKey::from_hex(&handler.user_pubkey()).expect("test handler has a valid pubkey");
+    let unsigned = EventBuilder::text_note("must not be signed").build(pubkey);
+
+    let error = handler
+        .sign_event_direct(unsigned)
+        .await
+        .expect_err("an expired authorization must not reach the signing key");
+
+    assert_eq!(
+        error.to_string(),
+        "Permission denied: Authorization has expired"
     );
 }

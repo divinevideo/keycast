@@ -250,9 +250,12 @@ impl Nip46Handler {
                 let third_party_pubkey = PublicKey::from_hex(third_party_hex)
                     .map_err(|e| SignerError::invalid_key(e.to_string()))?;
 
+                self.ensure_authorization_active()?;
+
                 // Validate policy before encryption
                 self.validate_permissions_for_encrypt(plaintext, &third_party_pubkey)
                     .await?;
+                self.ensure_authorization_active()?;
 
                 // CPU-bound crypto wrapped in spawn_blocking
                 let ciphertext = {
@@ -286,9 +289,12 @@ impl Nip46Handler {
                 let third_party_pubkey = PublicKey::from_hex(third_party_hex)
                     .map_err(|e| SignerError::invalid_key(e.to_string()))?;
 
+                self.ensure_authorization_active()?;
+
                 // Validate policy before decryption
                 self.validate_permissions_for_decrypt(ciphertext, &third_party_pubkey)
                     .await?;
+                self.ensure_authorization_active()?;
 
                 // CPU-bound crypto wrapped in spawn_blocking
                 // Returns SecretString for automatic memory zeroization on drop
@@ -324,9 +330,12 @@ impl Nip46Handler {
                 let third_party_pubkey = PublicKey::from_hex(third_party_hex)
                     .map_err(|e| SignerError::invalid_key(e.to_string()))?;
 
+                self.ensure_authorization_active()?;
+
                 // Validate policy before encryption
                 self.validate_permissions_for_encrypt(plaintext, &third_party_pubkey)
                     .await?;
+                self.ensure_authorization_active()?;
 
                 // CPU-bound crypto wrapped in spawn_blocking
                 let ciphertext = {
@@ -360,9 +369,12 @@ impl Nip46Handler {
                 let third_party_pubkey = PublicKey::from_hex(third_party_hex)
                     .map_err(|e| SignerError::invalid_key(e.to_string()))?;
 
+                self.ensure_authorization_active()?;
+
                 // Validate policy before decryption
                 self.validate_permissions_for_decrypt(ciphertext, &third_party_pubkey)
                     .await?;
+                self.ensure_authorization_active()?;
 
                 // CPU-bound crypto wrapped in spawn_blocking
                 // Returns SecretString for automatic memory zeroization on drop
@@ -441,6 +453,13 @@ impl Nip46Handler {
             HandlerStatus::Active => None,
             HandlerStatus::Revoked => Some("Authorization has been revoked"),
             HandlerStatus::Expired => Some("Authorization has expired"),
+        }
+    }
+
+    fn ensure_authorization_active(&self) -> SignerResult<()> {
+        match self.tombstone_error_message() {
+            Some(message) => Err(SignerError::permission_denied(message)),
+            None => Ok(()),
         }
     }
 
@@ -1889,9 +1908,12 @@ impl SigningHandler for Nip46Handler {
             self.authorization_id
         );
 
+        self.ensure_authorization_active()?;
+
         // Check account status, minor DM gate, and policy permissions before signing
         self.check_user_sign_gates(&unsigned_event).await?;
         self.validate_permissions_for_sign(&unsigned_event).await?;
+        self.ensure_authorization_active()?;
 
         // Canonicalize the pubkey to match the signer keys, matching SigningSession::sign_event behavior.
         // This prevents producing an event where event.pubkey disagrees with the keypair that signed it.
@@ -1989,9 +2011,12 @@ impl Nip46Handler {
             content,
         );
 
+        self.ensure_authorization_active()?;
+
         // Check account status, minor DM gate, and policy permissions before signing
         self.check_user_sign_gates(&unsigned_event).await?;
         self.validate_permissions_for_sign(&unsigned_event).await?;
+        self.ensure_authorization_active()?;
 
         // Sign the event with user keys (CPU-bound, use spawn_blocking)
         let signed_event = {
