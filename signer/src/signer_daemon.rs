@@ -255,6 +255,7 @@ impl Nip46Handler {
                 // Validate policy before encryption
                 self.validate_permissions_for_encrypt(plaintext, &third_party_pubkey)
                     .await?;
+                // Recheck after the await: clock-derived expiry can fall due mid-request.
                 self.ensure_authorization_active()?;
 
                 // CPU-bound crypto wrapped in spawn_blocking
@@ -294,6 +295,7 @@ impl Nip46Handler {
                 // Validate policy before decryption
                 self.validate_permissions_for_decrypt(ciphertext, &third_party_pubkey)
                     .await?;
+                // Recheck after the await: clock-derived expiry can fall due mid-request.
                 self.ensure_authorization_active()?;
 
                 // CPU-bound crypto wrapped in spawn_blocking
@@ -335,6 +337,7 @@ impl Nip46Handler {
                 // Validate policy before encryption
                 self.validate_permissions_for_encrypt(plaintext, &third_party_pubkey)
                     .await?;
+                // Recheck after the await: clock-derived expiry can fall due mid-request.
                 self.ensure_authorization_active()?;
 
                 // CPU-bound crypto wrapped in spawn_blocking
@@ -374,6 +377,7 @@ impl Nip46Handler {
                 // Validate policy before decryption
                 self.validate_permissions_for_decrypt(ciphertext, &third_party_pubkey)
                     .await?;
+                // Recheck after the await: clock-derived expiry can fall due mid-request.
                 self.ensure_authorization_active()?;
 
                 // CPU-bound crypto wrapped in spawn_blocking
@@ -456,6 +460,13 @@ impl Nip46Handler {
         }
     }
 
+    /// Refuse the request if the authorization is a tombstone (revoked or expired).
+    ///
+    /// Call sites check twice: once up front, so an already-dead authorization
+    /// does not get policy validation done on its behalf, and again immediately
+    /// before the key is used. The second check is the one that protects the
+    /// key — expiry is clock-derived (see [`Self::effective_status`]), so it can
+    /// fall due while the validation await is in flight. Do not collapse the pair.
     fn ensure_authorization_active(&self) -> SignerResult<()> {
         match self.tombstone_error_message() {
             Some(message) => Err(SignerError::permission_denied(message)),
@@ -1913,6 +1924,7 @@ impl SigningHandler for Nip46Handler {
         // Check account status, minor DM gate, and policy permissions before signing
         self.check_user_sign_gates(&unsigned_event).await?;
         self.validate_permissions_for_sign(&unsigned_event).await?;
+        // Recheck after the awaits: clock-derived expiry can fall due mid-request.
         self.ensure_authorization_active()?;
 
         // Canonicalize the pubkey to match the signer keys, matching SigningSession::sign_event behavior.
@@ -2016,6 +2028,7 @@ impl Nip46Handler {
         // Check account status, minor DM gate, and policy permissions before signing
         self.check_user_sign_gates(&unsigned_event).await?;
         self.validate_permissions_for_sign(&unsigned_event).await?;
+        // Recheck after the awaits: clock-derived expiry can fall due mid-request.
         self.ensure_authorization_active()?;
 
         // Sign the event with user keys (CPU-bound, use spawn_blocking)
