@@ -390,6 +390,64 @@ async fn username_resolver_persists_app_claimed_name() {
 }
 
 #[tokio::test]
+async fn username_resolver_does_not_overwrite_concurrent_local_claim() {
+    let pool = common::setup_test_db().await;
+    let repo = UserRepository::new(pool.clone());
+    let tenant_id = 1_i64;
+
+    let user_pubkey = Keys::generate().public_key().to_hex();
+    let remote_username = format!("alice-stale-{}", &user_pubkey[..8]);
+    let concurrent_username = format!("alice-current-{}", &user_pubkey[..8]);
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
+         VALUES ($1, $2, NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    let update_pool = pool.clone();
+    let update_pubkey = user_pubkey.clone();
+    let expected_current = concurrent_username.clone();
+    let resolved = resolve_username_with_fallback_enabled(
+        &repo,
+        tenant_id,
+        &user_pubkey,
+        true,
+        move |lookup_pubkey| async move {
+            sqlx::query(
+                "UPDATE users SET username = $1, updated_at = NOW()
+                 WHERE pubkey = $2 AND tenant_id = $3",
+            )
+            .bind(&expected_current)
+            .bind(&update_pubkey)
+            .bind(tenant_id)
+            .execute(&update_pool)
+            .await
+            .expect("concurrent username claim should succeed");
+
+            Ok(Some(lookup_response(&lookup_pubkey, &remote_username)))
+        },
+    )
+    .await
+    .expect("resolver should preserve the concurrent claim");
+
+    assert_eq!(
+        resolved,
+        UsernameResolution::Resolved(concurrent_username.clone())
+    );
+    let persisted = repo
+        .get_username(&user_pubkey, tenant_id)
+        .await
+        .expect("username query should succeed")
+        .expect("user should exist");
+    assert_eq!(persisted.as_deref(), Some(concurrent_username.as_str()));
+}
+
+#[tokio::test]
 async fn username_resolver_refuses_local_conflict() {
     let pool = common::setup_test_db().await;
     let repo = UserRepository::new(pool.clone());

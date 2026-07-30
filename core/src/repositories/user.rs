@@ -1411,6 +1411,27 @@ impl UserRepository {
         Ok(())
     }
 
+    /// Set a username only while the local row still has no username.
+    pub async fn update_username_if_missing(
+        &self,
+        pubkey: &str,
+        username: &str,
+        tenant_id: i64,
+    ) -> Result<bool, RepositoryError> {
+        let result = sqlx::query(
+            "UPDATE users SET username = $1, updated_at = $2
+             WHERE pubkey = $3 AND tenant_id = $4 AND username IS NULL",
+        )
+        .bind(username)
+        .bind(Utc::now())
+        .bind(pubkey)
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Update a user's ATProto lifecycle state.
     pub async fn set_atproto_state(
         &self,

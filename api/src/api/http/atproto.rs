@@ -207,10 +207,21 @@ where
     }
 
     match repo
-        .update_username(user_pubkey, &normalized_username, tenant_id)
+        .update_username_if_missing(user_pubkey, &normalized_username, tenant_id)
         .await
     {
-        Ok(()) => Ok(UsernameResolution::Resolved(normalized_username)),
+        Ok(true) => Ok(UsernameResolution::Resolved(normalized_username)),
+        Ok(false) => {
+            let current_username = repo
+                .get_username(user_pubkey, tenant_id)
+                .await?
+                .ok_or(AtprotoControlError::UserNotFound)?;
+
+            Ok(current_username.map_or(
+                UsernameResolution::Unavailable,
+                UsernameResolution::Resolved,
+            ))
+        }
         Err(RepositoryError::Duplicate) => {
             tracing::warn!(
                 "Refusing to reconcile Divine username '{}' for pubkey {} because a duplicate local username appeared in tenant {}",
