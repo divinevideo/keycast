@@ -57,9 +57,17 @@ pub struct Nip46Handler {
     is_oauth: bool,
     pool: PgPool,
     /// Handler status for tombstone support (Active, Revoked, or Expired)
+    ///
+    /// This is a snapshot taken when the handler was loaded. Time-based expiry is
+    /// re-evaluated per request from `expires_at` — see [`Self::effective_status`].
     status: HandlerStatus,
     /// When this handler became a tombstone (for cleanup after 24h)
     tombstone_at: Option<DateTime<Utc>>,
+    /// The authorization's `expires_at`, carried so expiry can be re-evaluated
+    /// against the clock on every request rather than only at load time. The
+    /// handler cache has no TTL, so a handler cached while valid would otherwise
+    /// keep signing, encrypting, and decrypting forever past its expiry.
+    expires_at: Option<DateTime<Utc>>,
 }
 
 impl Nip46Handler {
@@ -84,7 +92,24 @@ impl Nip46Handler {
             pool,
             status: HandlerStatus::Active,
             tombstone_at: None,
+            expires_at: None,
         }
+    }
+
+    /// Set the authorization expiry on a test handler, so tests can cover a
+    /// handler that was cached while valid and has since fallen due.
+    #[doc(hidden)]
+    pub fn with_expires_at(mut self, expires_at: Option<DateTime<Utc>>) -> Self {
+        self.expires_at = expires_at;
+        self
+    }
+
+    /// Set the cached status on a test handler, so tests can cover the
+    /// revoked-beats-expired precedence.
+    #[doc(hidden)]
+    pub fn with_status(mut self, status: HandlerStatus) -> Self {
+        self.status = status;
+        self
     }
 
     /// The bunker (wire) public key for this handler. Test-only accessor so the
@@ -225,9 +250,13 @@ impl Nip46Handler {
                 let third_party_pubkey = PublicKey::from_hex(third_party_hex)
                     .map_err(|e| SignerError::invalid_key(e.to_string()))?;
 
+                self.ensure_authorization_active()?;
+
                 // Validate policy before encryption
                 self.validate_permissions_for_encrypt(plaintext, &third_party_pubkey)
                     .await?;
+                // Recheck after the await: clock-derived expiry can fall due mid-request.
+                self.ensure_authorization_active()?;
 
                 // CPU-bound crypto wrapped in spawn_blocking
                 let ciphertext = {
@@ -261,9 +290,13 @@ impl Nip46Handler {
                 let third_party_pubkey = PublicKey::from_hex(third_party_hex)
                     .map_err(|e| SignerError::invalid_key(e.to_string()))?;
 
+                self.ensure_authorization_active()?;
+
                 // Validate policy before decryption
                 self.validate_permissions_for_decrypt(ciphertext, &third_party_pubkey)
                     .await?;
+                // Recheck after the await: clock-derived expiry can fall due mid-request.
+                self.ensure_authorization_active()?;
 
                 // CPU-bound crypto wrapped in spawn_blocking
                 // Returns SecretString for automatic memory zeroization on drop
@@ -299,9 +332,13 @@ impl Nip46Handler {
                 let third_party_pubkey = PublicKey::from_hex(third_party_hex)
                     .map_err(|e| SignerError::invalid_key(e.to_string()))?;
 
+                self.ensure_authorization_active()?;
+
                 // Validate policy before encryption
                 self.validate_permissions_for_encrypt(plaintext, &third_party_pubkey)
                     .await?;
+                // Recheck after the await: clock-derived expiry can fall due mid-request.
+                self.ensure_authorization_active()?;
 
                 // CPU-bound crypto wrapped in spawn_blocking
                 let ciphertext = {
@@ -335,9 +372,13 @@ impl Nip46Handler {
                 let third_party_pubkey = PublicKey::from_hex(third_party_hex)
                     .map_err(|e| SignerError::invalid_key(e.to_string()))?;
 
+                self.ensure_authorization_active()?;
+
                 // Validate policy before decryption
                 self.validate_permissions_for_decrypt(ciphertext, &third_party_pubkey)
                     .await?;
+                // Recheck after the await: clock-derived expiry can fall due mid-request.
+                self.ensure_authorization_active()?;
 
                 // CPU-bound crypto wrapped in spawn_blocking
                 // Returns SecretString for automatic memory zeroization on drop
@@ -368,17 +409,68 @@ impl Nip46Handler {
         })
     }
 
+    /// The handler's status as of *now*, not as of when it was loaded.
+    ///
+    /// The handler cache has no TTL and `status` is only computed on a cache
+    /// miss, so a handler cached while still valid keeps a stale `Active` status
+    /// indefinitely. Re-checking `expires_at` here makes expiry take effect at
+    /// the moment it falls due, whether or not the handler is cached.
+    ///
+    /// Revocation still wins over expiry: a revoked handler stays revoked.
+    fn effective_status(&self) -> HandlerStatus {
+        if self.status == HandlerStatus::Active
+            && self.expires_at.is_some_and(|exp| exp <= Utc::now())
+        {
+            return HandlerStatus::Expired;
+        }
+        self.status
+    }
+
+    /// The time from which the 24-hour tombstone retention window is measured.
+    ///
+    /// Clock-derived expiry does not mutate a cached handler, so an authorization
+    /// that expires while cached has no stamped `tombstone_at`. In that case its
+    /// actual `expires_at` is the start of the retention window.
+    fn effective_tombstone_at(&self) -> Option<DateTime<Utc>> {
+        if self.tombstone_at.is_some() {
+            return self.tombstone_at;
+        }
+
+        (self.effective_status() == HandlerStatus::Expired)
+            .then_some(self.expires_at)
+            .flatten()
+    }
+
+    fn tombstone_is_older_than(&self, cutoff: DateTime<Utc>) -> bool {
+        self.effective_tombstone_at()
+            .is_some_and(|tombstone_at| tombstone_at < cutoff)
+    }
+
     /// Check if this handler is a tombstone (revoked or expired)
     pub fn is_tombstone(&self) -> bool {
-        self.status != HandlerStatus::Active
+        self.effective_status() != HandlerStatus::Active
     }
 
     /// Get the error message for this tombstone status
     pub fn tombstone_error_message(&self) -> Option<&'static str> {
-        match self.status {
+        match self.effective_status() {
             HandlerStatus::Active => None,
             HandlerStatus::Revoked => Some("Authorization has been revoked"),
             HandlerStatus::Expired => Some("Authorization has expired"),
+        }
+    }
+
+    /// Refuse the request if the authorization is a tombstone (revoked or expired).
+    ///
+    /// Call sites check twice: once up front, so an already-dead authorization
+    /// does not get policy validation done on its behalf, and again immediately
+    /// before the key is used. The second check is the one that protects the
+    /// key — expiry is clock-derived (see [`Self::effective_status`]), so it can
+    /// fall due while the validation await is in flight. Do not collapse the pair.
+    fn ensure_authorization_active(&self) -> SignerResult<()> {
+        match self.tombstone_error_message() {
+            Some(message) => Err(SignerError::permission_denied(message)),
+            None => Ok(()),
         }
     }
 
@@ -390,14 +482,21 @@ impl Nip46Handler {
     ) -> (HandlerStatus, Option<DateTime<Utc>>) {
         if auth.revoked_at.is_some() {
             (HandlerStatus::Revoked, auth.revoked_at)
-        } else if let Some(expires_at) = auth.expires_at {
-            if expires_at <= Utc::now() {
-                (HandlerStatus::Expired, Some(expires_at))
-            } else {
-                (HandlerStatus::Active, None)
-            }
         } else {
-            (HandlerStatus::Active, None)
+            Self::compute_status_from_expiry(auth.expires_at)
+        }
+    }
+
+    /// Compute handler status from an authorization's `expires_at` alone.
+    ///
+    /// Used for team authorizations, which are hard-deleted rather than revoked,
+    /// so expiry is their only tombstone signal.
+    fn compute_status_from_expiry(
+        expires_at: Option<DateTime<Utc>>,
+    ) -> (HandlerStatus, Option<DateTime<Utc>>) {
+        match expires_at {
+            Some(exp) if exp <= Utc::now() => (HandlerStatus::Expired, Some(exp)),
+            _ => (HandlerStatus::Active, None),
         }
     }
 
@@ -1135,10 +1234,8 @@ impl UnifiedSigner {
                 // Collect tombstone keys older than 24 hours
                 // Note: iter() yields (Arc<K>, V) pairs, so key is Arc<String>
                 for (key, handler) in handlers_cleanup.iter() {
-                    if let Some(tombstone_at) = handler.tombstone_at {
-                        if tombstone_at < cutoff {
-                            to_remove.push(key.as_ref().clone());
-                        }
+                    if handler.tombstone_is_older_than(cutoff) {
+                        to_remove.push(key.as_ref().clone());
                     }
                 }
 
@@ -1277,6 +1374,11 @@ impl UnifiedSigner {
                     &auth.secret_hash,
                 );
 
+                // The query above already filters out revoked/expired rows, but the
+                // status is still computed rather than assumed: the handler is cached
+                // without a TTL, so it must carry the expiry it was loaded with.
+                let (status, tombstone_at) = Nip46Handler::compute_status_from_oauth(&auth);
+
                 let handler = Nip46Handler {
                     bunker_keys,
                     user_keys,
@@ -1285,17 +1387,19 @@ impl UnifiedSigner {
                     tenant_id,
                     is_oauth: true,
                     pool: pool.clone(),
-                    status: HandlerStatus::Active,
-                    tombstone_at: None,
+                    status,
+                    tombstone_at,
+                    expires_at: auth.expires_at,
                 };
 
                 handlers.insert(bunker_pubkey.to_string(), handler).await;
                 tracing::debug!("Cached authorization: {}", bunker_pubkey);
             }
         } else {
-            // Load regular authorization
-            let auth_data: Option<(i32, String, i64)> = sqlx::query_as(
-                "SELECT id, secret_hash, stored_key_id FROM authorizations
+            // Load regular authorization. Team authorizations use hard-delete
+            // (no revoked_at), so expires_at is the only tombstone signal.
+            let auth_data: Option<(i32, String, i64, Option<DateTime<Utc>>)> = sqlx::query_as(
+                "SELECT id, secret_hash, stored_key_id, expires_at FROM authorizations
                  WHERE tenant_id = $1 AND bunker_public_key = $2",
             )
             .bind(tenant_id)
@@ -1303,7 +1407,7 @@ impl UnifiedSigner {
             .fetch_optional(pool)
             .await?;
 
-            if let Some((auth_id, secret_hash, stored_key_id)) = auth_data {
+            if let Some((auth_id, secret_hash, stored_key_id, expires_at)) = auth_data {
                 // Load stored_key (team's signing key) first - needed for HKDF derivation
                 let stored_key_secret: Vec<u8> = sqlx::query_scalar(
                     "SELECT secret_key FROM stored_keys WHERE id = $1 AND tenant_id = $2",
@@ -1328,6 +1432,11 @@ impl UnifiedSigner {
                 let bunker_keys =
                     keycast_core::bunker_key::derive_bunker_keys(&user_secret_key, &secret_hash);
 
+                // Unlike the OAuth branch, this query cannot filter expiry out in SQL
+                // without losing the row needed to answer with a tombstone error, so
+                // the status is computed here.
+                let (status, tombstone_at) = Nip46Handler::compute_status_from_expiry(expires_at);
+
                 let handler = Nip46Handler {
                     bunker_keys,
                     user_keys,
@@ -1336,8 +1445,9 @@ impl UnifiedSigner {
                     tenant_id,
                     is_oauth: false,
                     pool: pool.clone(),
-                    status: HandlerStatus::Active,
-                    tombstone_at: None,
+                    status,
+                    tombstone_at,
+                    expires_at,
                 };
 
                 handlers.insert(bunker_pubkey.to_string(), handler).await;
@@ -1462,6 +1572,7 @@ impl UnifiedSigner {
                             pool: pool.clone(),
                             status,
                             tombstone_at,
+                            expires_at: auth.expires_at,
                         };
 
                         // Cache it for future requests (LRU will evict old entries automatically)
@@ -1500,15 +1611,8 @@ impl UnifiedSigner {
                         match auth_data {
                             Some((auth_id, secret_hash, stored_key_id, tenant_id, expires_at)) => {
                                 // Compute status from expires_at (team auths don't have revoked_at)
-                                let (status, tombstone_at) = if let Some(exp) = expires_at {
-                                    if exp <= Utc::now() {
-                                        (HandlerStatus::Expired, Some(exp))
-                                    } else {
-                                        (HandlerStatus::Active, None)
-                                    }
-                                } else {
-                                    (HandlerStatus::Active, None)
-                                };
+                                let (status, tombstone_at) =
+                                    Nip46Handler::compute_status_from_expiry(expires_at);
 
                                 if status == HandlerStatus::Active {
                                     tracing::debug!(
@@ -1562,6 +1666,7 @@ impl UnifiedSigner {
                                     pool: pool.clone(),
                                     status,
                                     tombstone_at,
+                                    expires_at,
                                 };
 
                                 // Cache it for future requests
@@ -1814,9 +1919,13 @@ impl SigningHandler for Nip46Handler {
             self.authorization_id
         );
 
+        self.ensure_authorization_active()?;
+
         // Check account status, minor DM gate, and policy permissions before signing
         self.check_user_sign_gates(&unsigned_event).await?;
         self.validate_permissions_for_sign(&unsigned_event).await?;
+        // Recheck after the awaits: clock-derived expiry can fall due mid-request.
+        self.ensure_authorization_active()?;
 
         // Canonicalize the pubkey to match the signer keys, matching SigningSession::sign_event behavior.
         // This prevents producing an event where event.pubkey disagrees with the keypair that signed it.
@@ -1914,9 +2023,13 @@ impl Nip46Handler {
             content,
         );
 
+        self.ensure_authorization_active()?;
+
         // Check account status, minor DM gate, and policy permissions before signing
         self.check_user_sign_gates(&unsigned_event).await?;
         self.validate_permissions_for_sign(&unsigned_event).await?;
+        // Recheck after the awaits: clock-derived expiry can fall due mid-request.
+        self.ensure_authorization_active()?;
 
         // Sign the event with user keys (CPU-bound, use spawn_blocking)
         let signed_event = {
@@ -2006,6 +2119,41 @@ impl UnifiedSigner {
     }
 }
 
+#[cfg(test)]
+mod tombstone_cleanup_tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    fn cached_handler_expiring_at(expires_at: DateTime<Utc>) -> Nip46Handler {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .expect("lazy pool construction should not require a live database");
+
+        Nip46Handler::new_for_test(
+            Keys::generate(),
+            Keys::generate(),
+            "test_hash".to_string(),
+            1,
+            1,
+            false,
+            pool,
+        )
+        .with_expires_at(Some(expires_at))
+    }
+
+    #[tokio::test]
+    async fn cleanup_selects_clock_expired_handler_only_after_twenty_four_hours() {
+        let now = Utc::now();
+        let cutoff = now - chrono::Duration::hours(24);
+        let old_expiry = cached_handler_expiring_at(now - chrono::Duration::hours(25));
+        let recent_expiry = cached_handler_expiring_at(now - chrono::Duration::hours(23));
+
+        assert_eq!(old_expiry.tombstone_at, None);
+        assert!(old_expiry.tombstone_is_older_than(cutoff));
+        assert!(!recent_expiry.tombstone_is_older_than(cutoff));
+    }
+}
+
 #[cfg(all(test, feature = "integration-tests"))]
 mod tests {
     use super::*;
@@ -2088,6 +2236,7 @@ mod tests {
             pool,
             status: HandlerStatus::Active,
             tombstone_at: None,
+            expires_at: None,
         }
     }
 
@@ -2248,6 +2397,7 @@ mod tests {
             pool: pool.clone(),
             status: HandlerStatus::Active,
             tombstone_at: None,
+            expires_at: None,
         };
         handlers1.insert("test_key".to_string(), test_handler).await;
 
