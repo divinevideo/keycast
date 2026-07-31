@@ -4,7 +4,7 @@
 use crate::repositories::RepositoryError;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
 
 #[derive(Debug, Clone)]
 pub struct AuthEventRecord {
@@ -112,6 +112,69 @@ impl AuthEventRepository {
         .bind(record.user_agent)
         .bind(record.metadata_json)
         .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn record_in_transaction(
+        tx: &mut Transaction<'_, Postgres>,
+        record: AuthEventRecord,
+    ) -> Result<AuthEventRow, RepositoryError> {
+        sqlx::query_as::<_, AuthEventRow>(
+            "INSERT INTO auth_events (
+                request_id,
+                tenant_id,
+                endpoint,
+                event_type,
+                outcome,
+                reason_code,
+                http_status,
+                email,
+                email_hash,
+                pubkey,
+                pubkey_prefix,
+                client_id,
+                redirect_origin,
+                user_agent,
+                metadata_json
+             ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
+             )
+             RETURNING
+                id,
+                occurred_at,
+                request_id,
+                tenant_id,
+                endpoint,
+                event_type,
+                outcome,
+                reason_code,
+                http_status,
+                email,
+                email_hash,
+                pubkey,
+                pubkey_prefix,
+                client_id,
+                redirect_origin,
+                user_agent,
+                metadata_json",
+        )
+        .bind(record.request_id)
+        .bind(record.tenant_id)
+        .bind(record.endpoint)
+        .bind(record.event_type)
+        .bind(record.outcome)
+        .bind(record.reason_code)
+        .bind(record.http_status)
+        .bind(record.email)
+        .bind(record.email_hash)
+        .bind(record.pubkey)
+        .bind(record.pubkey_prefix)
+        .bind(record.client_id)
+        .bind(record.redirect_origin)
+        .bind(record.user_agent)
+        .bind(record.metadata_json)
+        .fetch_one(&mut **tx)
         .await
         .map_err(Into::into)
     }
@@ -231,12 +294,14 @@ impl AuthEventRepository {
     }
 
     /// Count this account's failures of one `event_type`/`reason_code` since `since`,
-    /// with the oldest one still inside the window.
+    /// with the oldest one in the active attempt budget.
     ///
     /// This is the read side of a failed-attempt lockout: the audit trail is the
     /// counter, so the budget is one per account across every replica and it
-    /// survives a restart. The oldest timestamp is what a caller needs to say when
-    /// the window reopens, since it is the next attempt to age out.
+    /// survives a restart. The returned timestamp is what a caller needs to say
+    /// when the window reopens: when the count is over budget, it is the oldest
+    /// failure in the newest `attempt_budget` failures, not the oldest matching
+    /// failure overall.
     ///
     /// Returns `(0, None)` when nothing matches. Uses the
     /// `(tenant_id, pubkey, occurred_at DESC)` index.
@@ -247,23 +312,78 @@ impl AuthEventRepository {
         event_type: &str,
         reason_code: &str,
         since: DateTime<Utc>,
+        attempt_budget: i64,
     ) -> Result<(i64, Option<DateTime<Utc>>), RepositoryError> {
         let row: (i64, Option<DateTime<Utc>>) = sqlx::query_as(
-            "SELECT COUNT(*), MIN(occurred_at)
-             FROM auth_events
-             WHERE tenant_id = $1
-               AND pubkey = $2
-               AND event_type = $3
-               AND outcome = 'failure'
-               AND reason_code = $4
-               AND occurred_at > $5",
+            "WITH matching AS (
+                SELECT id, occurred_at
+                FROM auth_events
+                WHERE tenant_id = $1
+                  AND pubkey = $2
+                  AND event_type = $3
+                  AND outcome = 'failure'
+                  AND reason_code = $4
+                  AND occurred_at > $5
+             ),
+             active_budget AS (
+                SELECT occurred_at
+                FROM matching
+                ORDER BY occurred_at DESC, id DESC
+                LIMIT $6
+             )
+             SELECT
+                (SELECT COUNT(*) FROM matching),
+                (SELECT MIN(occurred_at) FROM active_budget)",
         )
         .bind(tenant_id)
         .bind(pubkey)
         .bind(event_type)
         .bind(reason_code)
         .bind(since)
+        .bind(attempt_budget)
         .fetch_one(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
+    pub async fn count_recent_failures_in_transaction(
+        tx: &mut Transaction<'_, Postgres>,
+        tenant_id: i64,
+        pubkey: &str,
+        event_type: &str,
+        reason_code: &str,
+        since: DateTime<Utc>,
+        attempt_budget: i64,
+    ) -> Result<(i64, Option<DateTime<Utc>>), RepositoryError> {
+        let row: (i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "WITH matching AS (
+                SELECT id, occurred_at
+                FROM auth_events
+                WHERE tenant_id = $1
+                  AND pubkey = $2
+                  AND event_type = $3
+                  AND outcome = 'failure'
+                  AND reason_code = $4
+                  AND occurred_at > $5
+             ),
+             active_budget AS (
+                SELECT occurred_at
+                FROM matching
+                ORDER BY occurred_at DESC, id DESC
+                LIMIT $6
+             )
+             SELECT
+                (SELECT COUNT(*) FROM matching),
+                (SELECT MIN(occurred_at) FROM active_budget)",
+        )
+        .bind(tenant_id)
+        .bind(pubkey)
+        .bind(event_type)
+        .bind(reason_code)
+        .bind(since)
+        .bind(attempt_budget)
+        .fetch_one(&mut **tx)
         .await?;
 
         Ok(row)

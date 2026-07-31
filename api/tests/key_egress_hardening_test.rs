@@ -358,6 +358,67 @@ async fn export_locks_out_after_the_attempt_budget_is_spent() {
     assert_eq!(rate_limited, 1, "the lockout itself must be audited");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[serial]
+async fn concurrent_wrong_password_burst_spends_only_the_attempt_budget() {
+    let pool = setup_pool().await;
+    let km = FileKeyManager::new().expect("key manager");
+    let keys = Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    insert_user(&pool, &pubkey, &unique_email(), PASSWORD, true, false).await;
+    create_personal_key(&pool, &pubkey, &keys, &km).await;
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km));
+    let bearer = bearer_for(&keys).await;
+
+    let mut attempts = tokio::task::JoinSet::new();
+    for _ in 0..(MAX_ATTEMPTS + 5) {
+        let auth_state = auth_state.clone();
+        let bearer = bearer.clone();
+        attempts.spawn(async move {
+            export_key(
+                create_test_tenant(),
+                State(auth_state),
+                auth_headers(&bearer),
+                Json(json!({ "password": "wrong-password", "format": "nsec" })),
+            )
+            .await
+        });
+    }
+
+    let mut results = Vec::new();
+    while let Some(result) = attempts.join_next().await {
+        results.push(result.expect("attempt task should finish"));
+    }
+
+    let invalid_credentials = results
+        .iter()
+        .filter(|result| matches!(result, Err(AuthError::InvalidCredentials)))
+        .count();
+    let rate_limited = results
+        .iter()
+        .filter(|result| matches!(result, Err(AuthError::TooManyRequests { .. })))
+        .count();
+    assert_eq!(
+        invalid_credentials, MAX_ATTEMPTS,
+        "only the configured budget should reach password verification: {results:?}"
+    );
+    assert_eq!(
+        rate_limited,
+        results.len() - MAX_ATTEMPTS,
+        "the rest of the burst should be locked out: {results:?}"
+    );
+
+    let events = egress_events(&pool, &pubkey).await;
+    let counted_failures = events
+        .iter()
+        .filter(|event| event.reason_code.as_deref() == Some("invalid_password"))
+        .count();
+    assert_eq!(
+        counted_failures, MAX_ATTEMPTS,
+        "the audit-backed counter must not overspend under concurrency: {events:?}"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn lockout_refuses_the_correct_password_too() {
@@ -386,6 +447,106 @@ async fn lockout_refuses_the_correct_password_too() {
     assert!(
         matches!(err, AuthError::TooManyRequests { .. }),
         "expected TooManyRequests, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn export_bad_requests_after_authorization_are_audited() {
+    let pool = setup_pool().await;
+    let km = FileKeyManager::new().expect("key manager");
+    let keys = Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    insert_user(&pool, &pubkey, &unique_email(), PASSWORD, true, false).await;
+    create_personal_key(&pool, &pubkey, &keys, &km).await;
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km));
+    let bearer = bearer_for(&keys).await;
+
+    let missing_password = export_key(
+        create_test_tenant(),
+        State(auth_state.clone()),
+        auth_headers(&bearer),
+        Json(json!({ "format": "nsec" })),
+    )
+    .await
+    .expect_err("missing password must be refused");
+    assert!(matches!(missing_password, AuthError::BadRequest(_)));
+
+    let invalid_format = export_key(
+        create_test_tenant(),
+        State(auth_state),
+        auth_headers(&bearer),
+        Json(json!({ "password": PASSWORD, "format": "hex" })),
+    )
+    .await
+    .expect_err("invalid format must be refused");
+    assert!(matches!(invalid_format, AuthError::BadRequest(_)));
+
+    let events = egress_events(&pool, &pubkey).await;
+    let reasons = events
+        .iter()
+        .map(|event| event.reason_code.as_deref())
+        .collect::<Vec<_>>();
+    assert!(
+        reasons.contains(&Some("missing_password")),
+        "missing password must be audited: {events:?}"
+    );
+    assert!(
+        reasons.contains(&Some("invalid_format")),
+        "invalid format after a correct password must be audited: {events:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn change_key_duplicate_after_correct_password_is_audited() {
+    let pool = setup_pool().await;
+    let km = FileKeyManager::new().expect("key manager");
+    let keys = Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    insert_user(&pool, &pubkey, &unique_email(), PASSWORD, true, false).await;
+    create_personal_key(&pool, &pubkey, &keys, &km).await;
+
+    let duplicate_keys = Keys::generate();
+    let duplicate_pubkey = duplicate_keys.public_key().to_hex();
+    insert_user(
+        &pool,
+        &duplicate_pubkey,
+        &unique_email(),
+        PASSWORD,
+        true,
+        false,
+    )
+    .await;
+
+    let duplicate_nsec = duplicate_keys
+        .secret_key()
+        .to_bech32()
+        .expect("encode duplicate key");
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km));
+
+    let err = change_key(
+        create_test_tenant(),
+        State(auth_state),
+        auth_headers(&bearer_for(&keys).await),
+        Json(ChangeKeyRequest {
+            password: PASSWORD.to_string(),
+            nsec: Some(duplicate_nsec),
+        }),
+    )
+    .await
+    .expect_err("duplicate BYOK pubkey must be refused");
+    assert!(matches!(err, AuthError::DuplicateKey));
+
+    let events = egress_events(&pool, &pubkey).await;
+    let duplicate_event = events
+        .iter()
+        .find(|event| event.reason_code.as_deref() == Some("duplicate_key"))
+        .expect("duplicate-key refusal must be audited");
+    assert_eq!(duplicate_event.endpoint, "/api/user/change-key");
+    assert_eq!(
+        duplicate_event.metadata_json["new_pubkey"],
+        serde_json::json!(duplicate_pubkey)
     );
 }
 

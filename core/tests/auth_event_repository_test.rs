@@ -72,8 +72,9 @@ async fn records_and_queries_auth_events() {
 }
 
 /// `count_recent_failures` is the read side of the raw-key egress lockout, so it
-/// has to count only the matching failures and report the oldest one — that
-/// timestamp is what tells a locked-out caller when the window reopens.
+/// has to count only the matching failures and report the oldest one in the
+/// active budget — that timestamp is what tells a locked-out caller when the
+/// window reopens.
 #[tokio::test]
 async fn counts_only_matching_failures_and_reports_the_oldest() {
     let pool = setup_pool().await;
@@ -111,8 +112,9 @@ async fn counts_only_matching_failures_and_reports_the_oldest() {
     };
 
     // Two that count.
-    let first = write(pubkey.clone(), "key_egress", "failure", "invalid_password").await;
-    write(pubkey.clone(), "key_egress", "failure", "invalid_password").await;
+    let mut counted =
+        vec![write(pubkey.clone(), "key_egress", "failure", "invalid_password").await];
+    counted.push(write(pubkey.clone(), "key_egress", "failure", "invalid_password").await);
     // Three that must not: wrong outcome, wrong reason, wrong event_type.
     write(pubkey.clone(), "key_egress", "success", "invalid_password").await;
     write(pubkey.clone(), "key_egress", "failure", "rate_limited").await;
@@ -122,15 +124,45 @@ async fn counts_only_matching_failures_and_reports_the_oldest() {
 
     let window_start = Utc::now() - Duration::minutes(15);
     let (count, oldest) = repo
-        .count_recent_failures(1, &pubkey, "key_egress", "invalid_password", window_start)
+        .count_recent_failures(
+            1,
+            &pubkey,
+            "key_egress",
+            "invalid_password",
+            window_start,
+            5,
+        )
         .await
         .unwrap();
 
     assert_eq!(count, 2, "only matching failures count");
     assert_eq!(
         oldest.expect("oldest must be reported when the count is non-zero"),
-        first.occurred_at,
+        counted[0].occurred_at,
         "oldest must be the first failure, since that is the next one to age out"
+    );
+
+    for _ in 0..4 {
+        counted.push(write(pubkey.clone(), "key_egress", "failure", "invalid_password").await);
+    }
+
+    let (over_budget_count, active_budget_oldest) = repo
+        .count_recent_failures(
+            1,
+            &pubkey,
+            "key_egress",
+            "invalid_password",
+            window_start,
+            5,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(over_budget_count, 6);
+    assert_eq!(
+        active_budget_oldest.expect("oldest active-budget failure must be reported"),
+        counted[1].occurred_at,
+        "when over budget, Retry-After is based on the 5th newest failure aging out"
     );
 
     // A window that has already moved past every failure counts nothing.
@@ -141,6 +173,7 @@ async fn counts_only_matching_failures_and_reports_the_oldest() {
             "key_egress",
             "invalid_password",
             Utc::now() + Duration::seconds(1),
+            5,
         )
         .await
         .unwrap();

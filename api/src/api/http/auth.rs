@@ -26,7 +26,7 @@ use keycast_core::traits::CustomPermission;
 use nostr_sdk::{Keys, PublicKey, ToBech32, UnsignedEvent};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 
 // Registration and login return simple JSON (not OAuth TokenResponse)
 
@@ -4107,7 +4107,7 @@ async fn refuse_key_egress_for_verified_minor(
     Ok(())
 }
 
-/// Record an auth event for a raw-key egress attempt (best-effort).
+/// Record an auth event for a raw-key egress attempt.
 ///
 /// Every attempt on `/api/user/export-key` and `/api/user/change-key` writes one
 /// row, which is what makes a successful export reconstructable after a key
@@ -4116,7 +4116,7 @@ async fn refuse_key_egress_for_verified_minor(
 /// its `event_type` / `reason_code` values are load-bearing.
 #[allow(clippy::too_many_arguments)]
 async fn record_key_egress_event(
-    pool: &PgPool,
+    tx: &mut Transaction<'_, Postgres>,
     headers: &HeaderMap,
     tenant_id: i64,
     endpoint: &'static str,
@@ -4125,9 +4125,8 @@ async fn record_key_egress_event(
     http_status: i32,
     pubkey: &str,
     metadata_json: serde_json::Value,
-) {
-    super::auth_observability::record_auth_event_and_log(
-        pool,
+) -> Result<(), AuthError> {
+    let record = super::auth_observability::auth_event_record_and_log(
         headers,
         None,
         super::auth_observability::AuthEvent {
@@ -4143,8 +4142,23 @@ async fn record_key_egress_event(
             redirect_origin: None,
             metadata_json,
         },
-    )
-    .await;
+    );
+    AuthEventRepository::record_in_transaction(tx, record).await?;
+    Ok(())
+}
+
+async fn acquire_key_egress_attempt_lock<'a>(
+    pool: &'a PgPool,
+    tenant_id: i64,
+    user_pubkey: &str,
+) -> Result<Transaction<'a, Postgres>, AuthError> {
+    let mut tx = pool.begin().await?;
+    let lock_key = format!("key_egress_attempts:{tenant_id}:{user_pubkey}");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(lock_key)
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
 }
 
 /// Refuse a raw-key egress operation once the account has spent its wrong-password
@@ -4167,24 +4181,28 @@ async fn record_key_egress_event(
 ///
 /// A count is not read back from a replica-local cache, so the limit is one budget
 /// across every instance instead of one per instance.
-async fn enforce_key_egress_attempt_limit(
-    pool: &PgPool,
+async fn enforce_key_egress_attempt_limit<'a>(
+    pool: &'a PgPool,
+    headers: &HeaderMap,
     tenant_id: i64,
     user_pubkey: &str,
-) -> Result<(), AuthError> {
+    endpoint: &'static str,
+) -> Result<Transaction<'a, Postgres>, AuthError> {
+    let mut attempt_lock = acquire_key_egress_attempt_lock(pool, tenant_id, user_pubkey).await?;
     let window_start = Utc::now() - Duration::minutes(KEY_EGRESS_ATTEMPT_WINDOW_MINUTES);
-    let (failures, oldest) = AuthEventRepository::new(pool.clone())
-        .count_recent_failures(
-            tenant_id,
-            user_pubkey,
-            KEY_EGRESS_EVENT_TYPE,
-            KEY_EGRESS_INVALID_PASSWORD_REASON,
-            window_start,
-        )
-        .await?;
+    let (failures, oldest) = AuthEventRepository::count_recent_failures_in_transaction(
+        &mut attempt_lock,
+        tenant_id,
+        user_pubkey,
+        KEY_EGRESS_EVENT_TYPE,
+        KEY_EGRESS_INVALID_PASSWORD_REASON,
+        window_start,
+        KEY_EGRESS_MAX_PASSWORD_ATTEMPTS,
+    )
+    .await?;
 
     if failures < KEY_EGRESS_MAX_PASSWORD_ATTEMPTS {
-        return Ok(());
+        return Ok(attempt_lock);
     }
 
     // Seconds until the oldest counted failure leaves the window. `oldest` is
@@ -4206,6 +4224,20 @@ async fn enforce_key_egress_attempt_limit(
         "raw-key egress locked out after repeated wrong passwords"
     );
 
+    record_key_egress_event(
+        &mut attempt_lock,
+        headers,
+        tenant_id,
+        endpoint,
+        "failure",
+        Some("rate_limited"),
+        429,
+        user_pubkey,
+        serde_json::json!({}),
+    )
+    .await?;
+    attempt_lock.commit().await?;
+
     Err(AuthError::TooManyRequests {
         message: "Too many incorrect passwords. Please wait before trying again.".to_string(),
         retry_after,
@@ -4219,15 +4251,15 @@ async fn enforce_key_egress_attempt_limit(
 /// refusal whatever their lockout state — the policy answer must not vary with
 /// anything an attacker can drive. Both refusals land before the password is read,
 /// so no bcrypt work happens for a request that was never going to be served.
-async fn authorize_key_egress(
-    pool: &PgPool,
+async fn authorize_key_egress<'a>(
+    pool: &'a PgPool,
     headers: &HeaderMap,
     user_repo: &UserRepository,
     tenant_id: i64,
     user_pubkey: &str,
     endpoint: &'static str,
     operation: &str,
-) -> Result<(), AuthError> {
+) -> Result<Transaction<'a, Postgres>, AuthError> {
     // Each arm records only the refusal it actually made. A database failure
     // reaches these as `Internal` and is left unrecorded rather than logged as a
     // policy denial or a lockout — the audit trail is a control input now, so a
@@ -4235,8 +4267,10 @@ async fn authorize_key_egress(
     match refuse_key_egress_for_verified_minor(user_repo, tenant_id, user_pubkey, operation).await {
         Ok(()) => {}
         Err(AuthError::KeyEgressDenied) => {
+            let mut attempt_lock =
+                acquire_key_egress_attempt_lock(pool, tenant_id, user_pubkey).await?;
             record_key_egress_event(
-                pool,
+                &mut attempt_lock,
                 headers,
                 tenant_id,
                 endpoint,
@@ -4246,40 +4280,14 @@ async fn authorize_key_egress(
                 user_pubkey,
                 serde_json::json!({}),
             )
-            .await;
+            .await?;
+            attempt_lock.commit().await?;
             return Err(AuthError::KeyEgressDenied);
         }
         Err(error) => return Err(error),
     }
 
-    match enforce_key_egress_attempt_limit(pool, tenant_id, user_pubkey).await {
-        Ok(()) => {}
-        Err(AuthError::TooManyRequests {
-            message,
-            retry_after,
-        }) => {
-            record_key_egress_event(
-                pool,
-                headers,
-                tenant_id,
-                endpoint,
-                "failure",
-                Some("rate_limited"),
-                429,
-                user_pubkey,
-                serde_json::json!({}),
-            )
-            .await;
-            return Err(AuthError::TooManyRequests {
-                message,
-                retry_after,
-            });
-        }
-        // Fail closed: if the budget cannot be read, the key does not leave.
-        Err(error) => return Err(error),
-    }
-
-    Ok(())
+    enforce_key_egress_attempt_limit(pool, headers, tenant_id, user_pubkey, endpoint).await
 }
 
 /// Export user's private key (requires password and verified email)
@@ -4297,7 +4305,7 @@ pub async fn export_key(
 
     // verified_minor policy gate (support-trust-safety#188), then the
     // wrong-password lockout. Both refuse before any key material is touched.
-    authorize_key_egress(
+    let mut attempt_lock = authorize_key_egress(
         pool,
         &headers,
         &user_repo,
@@ -4309,10 +4317,25 @@ pub async fn export_key(
     .await?;
 
     // Extract password and format from request
-    let password = req
-        .get("password")
-        .and_then(|v| v.as_str())
-        .ok_or(AuthError::BadRequest("Missing password".to_string()))?;
+    let password = match req.get("password").and_then(|v| v.as_str()) {
+        Some(password) => password,
+        None => {
+            record_key_egress_event(
+                &mut attempt_lock,
+                &headers,
+                tenant_id,
+                EXPORT_KEY_ENDPOINT,
+                "failure",
+                Some("missing_password"),
+                400,
+                &user_pubkey,
+                serde_json::json!({}),
+            )
+            .await?;
+            attempt_lock.commit().await?;
+            return Err(AuthError::BadRequest("Missing password".to_string()));
+        }
+    };
 
     let format = req.get("format").and_then(|v| v.as_str()).unwrap_or("nsec");
 
@@ -4326,7 +4349,7 @@ pub async fn export_key(
     // Require email verification
     if !email_verified {
         record_key_egress_event(
-            pool,
+            &mut attempt_lock,
             &headers,
             tenant_id,
             EXPORT_KEY_ENDPOINT,
@@ -4336,7 +4359,8 @@ pub async fn export_key(
             &user_pubkey,
             serde_json::json!({}),
         )
-        .await;
+        .await?;
+        attempt_lock.commit().await?;
         return Err(AuthError::EmailNotVerified);
     }
 
@@ -4347,7 +4371,7 @@ pub async fn export_key(
         // Counted by the lockout above. Every wrong password must land here, or
         // the budget silently stops being spent.
         record_key_egress_event(
-            pool,
+            &mut attempt_lock,
             &headers,
             tenant_id,
             EXPORT_KEY_ENDPOINT,
@@ -4357,7 +4381,8 @@ pub async fn export_key(
             &user_pubkey,
             serde_json::json!({}),
         )
-        .await;
+        .await?;
+        attempt_lock.commit().await?;
         return Err(AuthError::InvalidCredentials);
     }
 
@@ -4373,7 +4398,7 @@ pub async fn export_key(
             // back. Recorded because it is a successful authentication against
             // the export surface, which is worth seeing.
             record_key_egress_event(
-                pool,
+                &mut attempt_lock,
                 &headers,
                 tenant_id,
                 EXPORT_KEY_ENDPOINT,
@@ -4383,7 +4408,8 @@ pub async fn export_key(
                 &user_pubkey,
                 serde_json::json!({}),
             )
-            .await;
+            .await?;
+            attempt_lock.commit().await?;
             return Err(AuthError::UserNotFound);
         }
     };
@@ -4405,9 +4431,22 @@ pub async fn export_key(
             .to_bech32()
             .map_err(|e| AuthError::Internal(format!("Failed to encode nsec: {}", e)))?,
         _ => {
+            record_key_egress_event(
+                &mut attempt_lock,
+                &headers,
+                tenant_id,
+                EXPORT_KEY_ENDPOINT,
+                "failure",
+                Some("invalid_format"),
+                400,
+                &user_pubkey,
+                serde_json::json!({ "format": format }),
+            )
+            .await?;
+            attempt_lock.commit().await?;
             return Err(AuthError::BadRequest(
                 "Invalid format. Must be 'nsec'".to_string(),
-            ))
+            ));
         }
     };
 
@@ -4416,7 +4455,7 @@ pub async fn export_key(
     // This is the row that answers "was this key ever exported, and when" after a
     // compromise, so it is worth the ordering.
     record_key_egress_event(
-        pool,
+        &mut attempt_lock,
         &headers,
         tenant_id,
         EXPORT_KEY_ENDPOINT,
@@ -4426,7 +4465,8 @@ pub async fn export_key(
         &user_pubkey,
         serde_json::json!({}),
     )
-    .await;
+    .await?;
+    attempt_lock.commit().await?;
 
     Ok(Json(ExportKeyResponse { key: key_string }))
 }
@@ -4447,7 +4487,7 @@ pub async fn change_key(
 
     // verified_minor policy gate (support-trust-safety#188), then the
     // wrong-password lockout, which shares one budget with export-key.
-    authorize_key_egress(
+    let mut attempt_lock = authorize_key_egress(
         pool,
         &headers,
         &user_repo,
@@ -4470,7 +4510,7 @@ pub async fn change_key(
 
     if !valid {
         record_key_egress_event(
-            pool,
+            &mut attempt_lock,
             &headers,
             tenant_id,
             CHANGE_KEY_ENDPOINT,
@@ -4480,15 +4520,36 @@ pub async fn change_key(
             &old_pubkey,
             serde_json::json!({}),
         )
-        .await;
+        .await?;
+        attempt_lock.commit().await?;
         return Err(AuthError::InvalidCredentials);
     }
 
     // Generate or parse new key
     let new_keys = if let Some(ref nsec_str) = req.nsec {
         tracing::info!("User provided new key (BYOK) for change");
-        Keys::parse(nsec_str)
-            .map_err(|e| AuthError::Internal(format!("Invalid nsec or secret key: {}", e)))?
+        match Keys::parse(nsec_str) {
+            Ok(keys) => keys,
+            Err(e) => {
+                record_key_egress_event(
+                    &mut attempt_lock,
+                    &headers,
+                    tenant_id,
+                    CHANGE_KEY_ENDPOINT,
+                    "failure",
+                    Some("invalid_nsec"),
+                    500,
+                    &old_pubkey,
+                    serde_json::json!({ "byok": true }),
+                )
+                .await?;
+                attempt_lock.commit().await?;
+                return Err(AuthError::Internal(format!(
+                    "Invalid nsec or secret key: {}",
+                    e
+                )));
+            }
+        }
     } else {
         tracing::info!("Auto-generating new key for change");
         Keys::generate()
@@ -4499,17 +4560,51 @@ pub async fn change_key(
 
     // Check if new pubkey already exists in this tenant
     if user_repo.exists(&new_pubkey, tenant_id).await? {
+        record_key_egress_event(
+            &mut attempt_lock,
+            &headers,
+            tenant_id,
+            CHANGE_KEY_ENDPOINT,
+            "failure",
+            Some("duplicate_key"),
+            409,
+            &old_pubkey,
+            serde_json::json!({
+                "new_pubkey": new_pubkey,
+                "byok": req.nsec.is_some(),
+            }),
+        )
+        .await?;
+        attempt_lock.commit().await?;
         return Err(AuthError::DuplicateKey);
     }
 
     // Encrypt new secret key (as raw 32 bytes, consistent with registration)
-    let encrypted_secret = key_manager
-        .encrypt(&new_secret_bytes)
-        .await
-        .map_err(|e| AuthError::Encryption(e.to_string()))?;
+    let encrypted_secret = match key_manager.encrypt(&new_secret_bytes).await {
+        Ok(encrypted_secret) => encrypted_secret,
+        Err(e) => {
+            record_key_egress_event(
+                &mut attempt_lock,
+                &headers,
+                tenant_id,
+                CHANGE_KEY_ENDPOINT,
+                "failure",
+                Some("encryption_failed"),
+                500,
+                &old_pubkey,
+                serde_json::json!({
+                    "new_pubkey": new_pubkey,
+                    "byok": req.nsec.is_some(),
+                }),
+            )
+            .await?;
+            attempt_lock.commit().await?;
+            return Err(AuthError::Encryption(e.to_string()));
+        }
+    };
 
     // Execute key change transaction
-    let oauth_count = user_repo
+    let oauth_count = match user_repo
         .change_key_transaction(
             &old_pubkey,
             &new_pubkey,
@@ -4518,13 +4613,35 @@ pub async fn change_key(
             &password_hash,
             &encrypted_secret,
         )
-        .await?;
+        .await
+    {
+        Ok(oauth_count) => oauth_count,
+        Err(error) => {
+            record_key_egress_event(
+                &mut attempt_lock,
+                &headers,
+                tenant_id,
+                CHANGE_KEY_ENDPOINT,
+                "failure",
+                Some("change_key_failed"),
+                500,
+                &old_pubkey,
+                serde_json::json!({
+                    "new_pubkey": new_pubkey,
+                    "byok": req.nsec.is_some(),
+                }),
+            )
+            .await?;
+            attempt_lock.commit().await?;
+            return Err(error.into());
+        }
+    };
 
     // The account's custody changed hands here, so the row carries the new
     // identity in full — the old pubkey is the event's subject, and without the
     // new one the trail stops at the swap.
     record_key_egress_event(
-        pool,
+        &mut attempt_lock,
         &headers,
         tenant_id,
         CHANGE_KEY_ENDPOINT,
@@ -4538,7 +4655,8 @@ pub async fn change_key(
             "oauth_authorizations_deleted": oauth_count,
         }),
     )
-    .await;
+    .await?;
+    attempt_lock.commit().await?;
 
     // Signal signer daemon to remove old authorizations
     if let Some(tx) = &auth_state.auth_tx {
