@@ -18,6 +18,7 @@ use keycast_api::bcrypt_queue::BcryptQueue;
 use keycast_api::handlers::http_rpc_handler::new_http_handler_cache;
 use keycast_api::state::KeycastState;
 use keycast_api::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
+use keycast_api::PrefixedRedis;
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::KeyManager;
 use keycast_core::secret_pool::SecretPool;
@@ -81,7 +82,14 @@ fn create_test_tenant() -> TenantExtractor {
     }))
 }
 
-fn create_test_auth_state(pool: PgPool, key_manager: Arc<Box<dyn KeyManager>>) -> AuthState {
+async fn create_test_auth_state(pool: PgPool, key_manager: Arc<Box<dyn KeyManager>>) -> AuthState {
+    let redis_url =
+        std::env::var("TEST_REDIS_URL").expect("TEST_REDIS_URL must name dedicated Redis");
+    let client = redis::Client::open(redis_url).expect("valid Redis URL");
+    let connection = redis::aio::ConnectionManager::new(client)
+        .await
+        .expect("connect to dedicated Redis");
+    let prefix = format!("keycast-pr326-independent-review:{}", Uuid::new_v4());
     let bcrypt_queue = BcryptQueue::new();
     let secret_pool = SecretPool::new(1);
     let tenant_cache = Cache::builder().max_capacity(10).build();
@@ -94,7 +102,7 @@ fn create_test_auth_state(pool: PgPool, key_manager: Arc<Box<dyn KeyManager>>) -
             server_keys: Keys::generate(),
             tenant_cache,
             bcrypt_sender: bcrypt_queue.sender(),
-            redis: None,
+            redis: Some(PrefixedRedis::new(connection, Some(prefix))),
             secret_pool: secret_pool.receiver(),
         }),
         auth_tx: None,
@@ -211,7 +219,7 @@ async fn minor_export_key_refused() {
     let pubkey = keys.public_key().to_hex();
     insert_user(&pool, &pubkey, &unique_email(), "correct-horse", true).await;
     create_personal_key(&pool, &pubkey, &keys, &km).await;
-    let auth_state = create_test_auth_state(pool.clone(), km_arc(km));
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
 
     let err = export_key(
         create_test_tenant(),
@@ -240,7 +248,7 @@ async fn minor_export_key_refused_before_password_check() {
     let pubkey = keys.public_key().to_hex();
     insert_user(&pool, &pubkey, &unique_email(), "correct-horse", true).await;
     create_personal_key(&pool, &pubkey, &keys, &km).await;
-    let auth_state = create_test_auth_state(pool.clone(), km_arc(km));
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
 
     let err = export_key(
         create_test_tenant(),
@@ -266,7 +274,7 @@ async fn non_minor_export_key_returns_nsec() {
     let pubkey = keys.public_key().to_hex();
     insert_user(&pool, &pubkey, &unique_email(), "correct-horse", false).await;
     create_personal_key(&pool, &pubkey, &keys, &km).await;
-    let auth_state = create_test_auth_state(pool.clone(), km_arc(km));
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
 
     let Json(resp) = export_key(
         create_test_tenant(),
@@ -292,7 +300,7 @@ async fn export_key_missing_user_row_fails_closed() {
     let pool = setup_pool().await;
     let km = FileKeyManager::new().expect("key manager");
     let keys = Keys::generate(); // no user row inserted
-    let auth_state = create_test_auth_state(pool.clone(), km_arc(km));
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
 
     let err = export_key(
         create_test_tenant(),
@@ -322,7 +330,7 @@ async fn minor_change_key_refused_and_key_unchanged() {
     let pubkey = keys.public_key().to_hex();
     insert_user(&pool, &pubkey, &unique_email(), "correct-horse", true).await;
     create_personal_key(&pool, &pubkey, &keys, &km).await;
-    let auth_state = create_test_auth_state(pool.clone(), km_arc(km));
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
 
     let new_keys = Keys::generate();
     let new_pubkey = new_keys.public_key().to_hex();
@@ -353,6 +361,45 @@ async fn minor_change_key_refused_and_key_unchanged() {
         !user_exists(&pool, &new_pubkey).await,
         "refused change-key must not create the new identity"
     );
+    let verified_minor: bool =
+        sqlx::query_scalar("SELECT verified_minor FROM users WHERE pubkey = $1 AND tenant_id = $2")
+            .bind(&pubkey)
+            .bind(TENANT_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("load original minor state");
+    assert!(
+        verified_minor,
+        "a refused rotation must preserve the policy state guarding the default-false insert"
+    );
+    let old_key_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM personal_keys WHERE user_pubkey = $1 AND tenant_id = $2",
+    )
+    .bind(&pubkey)
+    .bind(TENANT_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("count original personal key");
+    assert_eq!(
+        old_key_count, 1,
+        "a refused rotation must preserve the original custody row"
+    );
+    let success_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM auth_events
+         WHERE tenant_id = $1
+           AND pubkey = $2
+           AND endpoint = '/api/user/change-key'
+           AND outcome = 'success'",
+    )
+    .bind(TENANT_ID)
+    .bind(&pubkey)
+    .fetch_one(&pool)
+    .await
+    .expect("count change-key success audits");
+    assert_eq!(
+        success_count, 0,
+        "a policy refusal must not produce a success audit"
+    );
 }
 
 #[tokio::test]
@@ -364,7 +411,7 @@ async fn non_minor_change_key_succeeds() {
     let pubkey = keys.public_key().to_hex();
     insert_user(&pool, &pubkey, &unique_email(), "correct-horse", false).await;
     create_personal_key(&pool, &pubkey, &keys, &km).await;
-    let auth_state = create_test_auth_state(pool.clone(), km_arc(km));
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
 
     let new_keys = Keys::generate();
     let new_pubkey = new_keys.public_key().to_hex();
@@ -395,7 +442,7 @@ async fn change_key_missing_user_row_fails_closed() {
     let pool = setup_pool().await;
     let km = FileKeyManager::new().expect("key manager");
     let keys = Keys::generate(); // no user row inserted
-    let auth_state = create_test_auth_state(pool.clone(), km_arc(km));
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
 
     let new_keys = Keys::generate();
     let err = change_key(

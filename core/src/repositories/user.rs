@@ -5,7 +5,7 @@ use crate::repositories::RepositoryError;
 use crate::types::user::{User, UserAtprotoState, UserStatus};
 use chrono::{DateTime, Utc};
 use nostr_sdk::PublicKey;
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
 
 pub type StatusTransition = (
     UserStatus,
@@ -1841,25 +1841,58 @@ impl UserRepository {
         encrypted_secret: &[u8],
     ) -> Result<i64, RepositoryError> {
         let mut tx = self.pool.begin().await?;
+        let oauth_count = self
+            .change_key_in_transaction(
+                &mut tx,
+                old_pubkey,
+                new_pubkey,
+                tenant_id,
+                email,
+                password_hash,
+                encrypted_secret,
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(oauth_count)
+    }
+
+    /// Change a user's key inside the caller's transaction.
+    ///
+    /// Callers can include related audit writes in the same commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Database`] if any custody mutation fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn change_key_in_transaction(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        old_pubkey: &str,
+        new_pubkey: &str,
+        tenant_id: i64,
+        email: &str,
+        password_hash: &str,
+        encrypted_secret: &[u8],
+    ) -> Result<i64, RepositoryError> {
         let now = Utc::now();
 
         // Count OAuth authorizations that will be deleted (for logging)
         let oauth_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM oauth_authorizations WHERE user_pubkey = $1")
                 .bind(old_pubkey)
-                .fetch_one(&mut *tx)
+                .fetch_one(&mut **tx)
                 .await?;
 
         // Delete OAuth authorizations (we can't sign with old nsec anymore)
         sqlx::query("DELETE FROM oauth_authorizations WHERE user_pubkey = $1")
             .bind(old_pubkey)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
 
         // Delete old personal_keys (we no longer hold old nsec)
         sqlx::query("DELETE FROM personal_keys WHERE user_pubkey = $1")
             .bind(old_pubkey)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
 
         // Orphan old identity (transfer email/password to NULL)
@@ -1870,7 +1903,7 @@ impl UserRepository {
         .bind(now)
         .bind(old_pubkey)
         .bind(tenant_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
         // Create new user identity with email/password
@@ -1885,7 +1918,7 @@ impl UserRepository {
         .bind(true) // Keep email verified status
         .bind(now)
         .bind(now)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
         // Create personal_keys for new identity
@@ -1898,10 +1931,9 @@ impl UserRepository {
         .bind(tenant_id)
         .bind(now)
         .bind(now)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
-        tx.commit().await?;
         Ok(oauth_count)
     }
 

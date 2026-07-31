@@ -72,6 +72,15 @@ If a Divine Brain search or ask tool is available, you may use it for company me
 - The signer routes incoming NIP-46 requests by recipient pubkey; preserve that contract when adding handlers and avoid global state that conflates authorizations.
 - Keep frontend changes aligned with the existing SvelteKit/Bun setup. Reuse existing components and stores rather than adding parallel patterns.
 
+### Handler Resource Safety
+
+- Never hold a database transaction across password hashing or verification, a KMS call, or another network operation. Transaction-mode connection pooling pins backend capacity for the transaction's lifetime.
+- Never acquire from `PgPool` while already holding a connection or transaction from that pool. Pass the existing transaction into repository methods that must participate in the same atomic operation.
+- Use transaction-scoped advisory locks only. Session-scoped advisory locks are incompatible with transaction-mode connection pooling.
+- Run CPU-heavy request/response work on a bounded blocking path with explicit admission control. `spawn_blocking` alone prevents async-runtime starvation but does not bound CPU concurrency.
+- Test transaction-owning handler paths with `max_connections(1)` so nested acquisition fails deterministically rather than depending on load. A burst sized at the pool maximum does not prove this because pre-transaction work can stagger acquisition and hide the extra connection.
+- Put ephemeral, self-healing state such as rate-limit counters in Redis with a TTL. Put durable security state such as access-control lists and credentials in Postgres; Redis-only support-admin storage in issue #249 is the cautionary case.
+
 ## OAuth, Signing, And Identity Rules
 
 - Treat OAuth client configuration, session handling, UCAN issuance, relay configuration, and production identity settings as sensitive operational context. Call out changes that affect them explicitly in the PR body.

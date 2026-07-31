@@ -6,7 +6,12 @@
 
 mod common;
 
-use axum::{extract::State, http::HeaderMap, Json};
+use axum::{
+    extract::State,
+    http::{header::SET_COOKIE, HeaderMap},
+    Json,
+};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Utc};
 use keycast_api::api::{
     http::{
@@ -19,6 +24,7 @@ use keycast_api::bcrypt_queue::BcryptQueue;
 use keycast_api::handlers::http_rpc_handler::new_http_handler_cache;
 use keycast_api::state::KeycastState;
 use keycast_api::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
+use keycast_api::PrefixedRedis;
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::KeyManager;
 use keycast_core::secret_pool::SecretPool;
@@ -26,24 +32,31 @@ use moka::future::Cache;
 use nostr_sdk::prelude::*;
 use serde_json::json;
 use serial_test::serial;
-use sqlx::PgPool;
-use std::sync::Arc;
+use sqlx::{postgres::PgPoolOptions, PgPool};
+use std::{sync::Arc, time::Duration as StdDuration};
 use ucan::builder::UcanBuilder;
 use uuid::Uuid;
 
 const TENANT_ID: i64 = 1;
 const PASSWORD: &str = "correct-horse-battery-staple";
 
-/// Mirrors `KEY_EGRESS_MAX_PASSWORD_ATTEMPTS` in `api/src/api/http/auth.rs`.
+/// Mirrors `KEY_EGRESS_MAX_ATTEMPTS` in `api/src/key_egress_limiter.rs`.
 const MAX_ATTEMPTS: usize = 5;
 
 // ---------------------------------------------------------------- harness
 
 async fn setup_pool() -> PgPool {
+    setup_pool_with_options(10, StdDuration::from_secs(30)).await
+}
+
+async fn setup_pool_with_options(max_connections: u32, acquire_timeout: StdDuration) -> PgPool {
     common::assert_test_database_url();
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string());
-    let pool = PgPool::connect(&database_url)
+    let pool = PgPoolOptions::new()
+        .max_connections(max_connections)
+        .acquire_timeout(acquire_timeout)
+        .connect(&database_url)
         .await
         .expect("Failed to connect to database");
     sqlx::migrate!("../database/migrations")
@@ -64,7 +77,26 @@ fn create_test_tenant() -> TenantExtractor {
     }))
 }
 
-fn create_test_auth_state(pool: PgPool, key_manager: Arc<Box<dyn KeyManager>>) -> AuthState {
+async fn create_test_auth_state(pool: PgPool, key_manager: Arc<Box<dyn KeyManager>>) -> AuthState {
+    let redis_url =
+        std::env::var("TEST_REDIS_URL").expect("TEST_REDIS_URL must name dedicated Redis");
+    let client = redis::Client::open(redis_url).expect("valid Redis URL");
+    let connection = redis::aio::ConnectionManager::new(client)
+        .await
+        .expect("connect to dedicated Redis");
+    let prefix = format!("keycast-pr326-independent-review:{}", Uuid::new_v4());
+    create_test_auth_state_with_redis(
+        pool,
+        key_manager,
+        Some(PrefixedRedis::new(connection, Some(prefix))),
+    )
+}
+
+fn create_test_auth_state_with_redis(
+    pool: PgPool,
+    key_manager: Arc<Box<dyn KeyManager>>,
+    redis: Option<PrefixedRedis>,
+) -> AuthState {
     let bcrypt_queue = BcryptQueue::new();
     let secret_pool = SecretPool::new(1);
     let tenant_cache = Cache::builder().max_capacity(10).build();
@@ -77,7 +109,7 @@ fn create_test_auth_state(pool: PgPool, key_manager: Arc<Box<dyn KeyManager>>) -
             server_keys: Keys::generate(),
             tenant_cache,
             bcrypt_sender: bcrypt_queue.sender(),
-            redis: None,
+            redis,
             secret_pool: secret_pool.receiver(),
         }),
         auth_tx: None,
@@ -225,6 +257,162 @@ async fn raw_event_text(pool: &PgPool, pubkey: &str) -> String {
         .join("\n")
 }
 
+struct AuditFailureTrigger {
+    trigger_name: String,
+    function_name: String,
+}
+
+impl AuditFailureTrigger {
+    async fn install(pool: &PgPool, pubkey: &str, endpoint: &str) -> Self {
+        Self::install_for_outcome(pool, pubkey, endpoint, "success").await
+    }
+
+    async fn install_for_outcome(
+        pool: &PgPool,
+        pubkey: &str,
+        endpoint: &str,
+        outcome: &'static str,
+    ) -> Self {
+        let suffix = Uuid::new_v4().simple().to_string();
+        let trigger_name = format!("fail_key_egress_audit_{suffix}");
+        let function_name = format!("fail_key_egress_audit_fn_{suffix}");
+
+        // Both interpolated values are controlled test fixtures: a 64-character
+        // lowercase hex pubkey, a static endpoint, and a static outcome.
+        let function_sql = format!(
+            "CREATE FUNCTION {function_name}() RETURNS trigger AS $$
+             BEGIN
+                 IF NEW.pubkey = '{pubkey}'
+                    AND NEW.endpoint = '{endpoint}'
+                    AND NEW.outcome = '{outcome}'
+                 THEN
+                     RAISE EXCEPTION 'injected scoped key-egress audit failure';
+                 END IF;
+                 RETURN NEW;
+             END;
+             $$ LANGUAGE plpgsql"
+        );
+        sqlx::query(&function_sql)
+            .execute(pool)
+            .await
+            .expect("install scoped audit failure function");
+
+        let trigger_sql = format!(
+            "CREATE TRIGGER {trigger_name}
+             BEFORE INSERT ON auth_events
+             FOR EACH ROW EXECUTE FUNCTION {function_name}()"
+        );
+        sqlx::query(&trigger_sql)
+            .execute(pool)
+            .await
+            .expect("install scoped audit failure trigger");
+
+        Self {
+            trigger_name,
+            function_name,
+        }
+    }
+
+    async fn remove(self, pool: &PgPool) {
+        let drop_trigger = format!(
+            "DROP TRIGGER IF EXISTS {} ON auth_events",
+            self.trigger_name
+        );
+        sqlx::query(&drop_trigger)
+            .execute(pool)
+            .await
+            .expect("remove scoped audit failure trigger");
+
+        let drop_function = format!("DROP FUNCTION IF EXISTS {}()", self.function_name);
+        sqlx::query(&drop_function)
+            .execute(pool)
+            .await
+            .expect("remove scoped audit failure function");
+    }
+}
+
+async fn create_oauth_authorization(pool: &PgPool, user_pubkey: &str) -> i32 {
+    let bunker_pubkey = Keys::generate().public_key().to_hex();
+    sqlx::query_scalar(
+        "INSERT INTO oauth_authorizations
+            (user_pubkey, bunker_public_key, secret_hash, relays, redirect_origin,
+             tenant_id, handle_expires_at)
+         VALUES ($1, $2, 'test_hash', 'wss://relay.example.com',
+                 'https://app.example.com', $3, NOW() + INTERVAL '1 day')
+         RETURNING id",
+    )
+    .bind(user_pubkey)
+    .bind(bunker_pubkey)
+    .bind(TENANT_ID)
+    .fetch_one(pool)
+    .await
+    .expect("create OAuth authorization")
+}
+
+async fn assert_original_custody_unchanged(
+    pool: &PgPool,
+    old_pubkey: &str,
+    new_pubkey: &str,
+    expected_email: &str,
+    expected_oauth_id: i32,
+) {
+    let old_identity: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT email, password_hash FROM users WHERE pubkey = $1 AND tenant_id = $2",
+    )
+    .bind(old_pubkey)
+    .bind(TENANT_ID)
+    .fetch_optional(pool)
+    .await
+    .expect("read old identity");
+    let (email, password_hash) = old_identity.expect("old identity must remain");
+    assert_eq!(email.as_deref(), Some(expected_email));
+    assert!(
+        password_hash.is_some(),
+        "old identity must retain its password hash"
+    );
+
+    let old_key_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM personal_keys WHERE user_pubkey = $1 AND tenant_id = $2
+         )",
+    )
+    .bind(old_pubkey)
+    .bind(TENANT_ID)
+    .fetch_one(pool)
+    .await
+    .expect("read old personal key");
+    assert!(old_key_exists, "old custody key must remain");
+
+    let oauth_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM oauth_authorizations
+             WHERE id = $1 AND user_pubkey = $2 AND tenant_id = $3
+         )",
+    )
+    .bind(expected_oauth_id)
+    .bind(old_pubkey)
+    .bind(TENANT_ID)
+    .fetch_one(pool)
+    .await
+    .expect("read OAuth authorization");
+    assert!(oauth_exists, "OAuth authorization must remain");
+
+    let new_identity_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM users WHERE pubkey = $1 AND tenant_id = $2
+         )",
+    )
+    .bind(new_pubkey)
+    .bind(TENANT_ID)
+    .fetch_one(pool)
+    .await
+    .expect("read replacement identity");
+    assert!(
+        !new_identity_exists,
+        "failed change-key must not create the replacement identity"
+    );
+}
+
 /// Spend `count` wrong-password attempts against export-key.
 async fn burn_attempts(auth_state: &AuthState, keys: &Keys, bearer: &str, count: usize) {
     for attempt in 0..count {
@@ -255,7 +443,7 @@ async fn successful_export_is_recorded_without_the_key() {
     let pubkey = keys.public_key().to_hex();
     insert_user(&pool, &pubkey, &unique_email(), PASSWORD, true, false).await;
     create_personal_key(&pool, &pubkey, &keys, &km).await;
-    let auth_state = create_test_auth_state(pool.clone(), km_arc(km));
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
 
     let Json(resp) = export_key(
         create_test_tenant(),
@@ -296,6 +484,137 @@ async fn successful_export_is_recorded_without_the_key() {
 
 #[tokio::test]
 #[serial]
+async fn successful_export_needs_only_one_database_connection() {
+    let pool = setup_pool_with_options(1, StdDuration::from_millis(250)).await;
+    let km = FileKeyManager::new().expect("key manager");
+    let keys = Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    insert_user(&pool, &pubkey, &unique_email(), PASSWORD, true, false).await;
+    create_personal_key(&pool, &pubkey, &keys, &km).await;
+    let auth_state = create_test_auth_state(pool, km_arc(km)).await;
+
+    let Json(response) = export_key(
+        create_test_tenant(),
+        State(auth_state),
+        auth_headers(&bearer_for(&keys).await),
+        Json(json!({ "password": PASSWORD, "format": "nsec" })),
+    )
+    .await
+    .expect("one request must not need two simultaneous pool connections");
+
+    assert!(response.key.starts_with("nsec1"));
+}
+
+#[tokio::test]
+#[serial]
+async fn successful_change_key_needs_only_one_database_connection() {
+    let pool = setup_pool_with_options(1, StdDuration::from_millis(250)).await;
+    let km = FileKeyManager::new().expect("key manager");
+    let keys = Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    insert_user(&pool, &pubkey, &unique_email(), PASSWORD, true, false).await;
+    create_personal_key(&pool, &pubkey, &keys, &km).await;
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
+    let new_keys = Keys::generate();
+    let new_pubkey = new_keys.public_key().to_hex();
+
+    let response = change_key(
+        create_test_tenant(),
+        State(auth_state),
+        auth_headers(&bearer_for(&keys).await),
+        Json(ChangeKeyRequest {
+            password: PASSWORD.to_string(),
+            nsec: Some(new_keys.secret_key().to_bech32().expect("encode nsec")),
+        }),
+    )
+    .await
+    .expect("one change-key request must not need two simultaneous connections");
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let new_identity_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM users WHERE pubkey = $1 AND tenant_id = $2
+         )",
+    )
+    .bind(new_pubkey)
+    .bind(TENANT_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("read replacement identity");
+    assert!(new_identity_exists);
+}
+
+#[tokio::test]
+#[serial]
+async fn export_fails_closed_when_redis_is_not_configured() {
+    let pool = setup_pool().await;
+    let km = FileKeyManager::new().expect("key manager");
+    let keys = Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    insert_user(&pool, &pubkey, &unique_email(), PASSWORD, true, false).await;
+    create_personal_key(&pool, &pubkey, &keys, &km).await;
+    let auth_state = create_test_auth_state_with_redis(pool, km_arc(km), None);
+
+    let error = export_key(
+        create_test_tenant(),
+        State(auth_state),
+        auth_headers(&bearer_for(&keys).await),
+        Json(json!({ "password": PASSWORD, "format": "nsec" })),
+    )
+    .await
+    .expect_err("admission cannot be enforced without Redis");
+
+    assert!(
+        matches!(error, AuthError::ServiceUnavailable { .. }),
+        "missing Redis must load-shed with 503, got: {error:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn export_returns_no_key_when_its_success_audit_cannot_commit() {
+    let pool = setup_pool().await;
+    let km = FileKeyManager::new().expect("key manager");
+    let keys = Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    insert_user(&pool, &pubkey, &unique_email(), PASSWORD, true, false).await;
+    create_personal_key(&pool, &pubkey, &keys, &km).await;
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
+    let failure = AuditFailureTrigger::install(&pool, &pubkey, "/api/user/export-key").await;
+
+    let result = export_key(
+        create_test_tenant(),
+        State(auth_state),
+        auth_headers(&bearer_for(&keys).await),
+        Json(json!({ "password": PASSWORD, "format": "nsec" })),
+    )
+    .await;
+    failure.remove(&pool).await;
+
+    let error = result.expect_err("audit failure must prevent key delivery");
+    let response = axum::response::IntoResponse::into_response(error);
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read failure response");
+    let body = String::from_utf8(body.to_vec()).expect("UTF-8 failure response");
+    assert!(
+        !body.contains("nsec1"),
+        "failure response must not contain key material"
+    );
+
+    let events = egress_events(&pool, &pubkey).await;
+    assert!(
+        events.iter().all(|event| event.outcome != "success"),
+        "a rejected success audit must not appear committed: {events:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn wrong_password_is_recorded_as_a_countable_failure() {
     let pool = setup_pool().await;
     let km = FileKeyManager::new().expect("key manager");
@@ -303,7 +622,7 @@ async fn wrong_password_is_recorded_as_a_countable_failure() {
     let pubkey = keys.public_key().to_hex();
     insert_user(&pool, &pubkey, &unique_email(), PASSWORD, true, false).await;
     create_personal_key(&pool, &pubkey, &keys, &km).await;
-    let auth_state = create_test_auth_state(pool.clone(), km_arc(km));
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
     let bearer = bearer_for(&keys).await;
 
     burn_attempts(&auth_state, &keys, &bearer, 1).await;
@@ -318,6 +637,62 @@ async fn wrong_password_is_recorded_as_a_countable_failure() {
 
 #[tokio::test]
 #[serial]
+async fn failed_wrong_password_audit_does_not_refund_the_redis_budget() {
+    let pool = setup_pool().await;
+    let km = FileKeyManager::new().expect("key manager");
+    let keys = Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    insert_user(&pool, &pubkey, &unique_email(), PASSWORD, true, false).await;
+    create_personal_key(&pool, &pubkey, &keys, &km).await;
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
+    let bearer = bearer_for(&keys).await;
+    let failure =
+        AuditFailureTrigger::install_for_outcome(&pool, &pubkey, "/api/user/export-key", "failure")
+            .await;
+
+    let result = export_key(
+        create_test_tenant(),
+        State(auth_state.clone()),
+        auth_headers(&bearer),
+        Json(json!({ "password": "wrong-password", "format": "nsec" })),
+    )
+    .await;
+    failure.remove(&pool).await;
+    let error = result.expect_err("failed forensic audit must prevent a 401 response");
+    let response = axum::response::IntoResponse::into_response(error);
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "audit unavailability must surface as 503 after Redis spends the attempt"
+    );
+
+    burn_attempts(&auth_state, &keys, &bearer, MAX_ATTEMPTS - 1).await;
+    let locked = export_key(
+        create_test_tenant(),
+        State(auth_state),
+        auth_headers(&bearer),
+        Json(json!({ "password": PASSWORD, "format": "nsec" })),
+    )
+    .await
+    .expect_err("the failed audit must not have refunded its Redis attempt");
+    assert!(
+        matches!(locked, AuthError::TooManyRequests { .. }),
+        "one failed audit plus four recorded failures must exhaust the budget: {locked:?}"
+    );
+
+    let events = egress_events(&pool, &pubkey).await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.reason_code.as_deref() == Some("invalid_password"))
+            .count(),
+        MAX_ATTEMPTS - 1,
+        "the missing forensic row is expected, but Redis must retain the fifth budget entry"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn export_locks_out_after_the_attempt_budget_is_spent() {
     let pool = setup_pool().await;
     let km = FileKeyManager::new().expect("key manager");
@@ -325,7 +700,7 @@ async fn export_locks_out_after_the_attempt_budget_is_spent() {
     let pubkey = keys.public_key().to_hex();
     insert_user(&pool, &pubkey, &unique_email(), PASSWORD, true, false).await;
     create_personal_key(&pool, &pubkey, &keys, &km).await;
-    let auth_state = create_test_auth_state(pool.clone(), km_arc(km));
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
     let bearer = bearer_for(&keys).await;
 
     burn_attempts(&auth_state, &keys, &bearer, MAX_ATTEMPTS).await;
@@ -351,11 +726,12 @@ async fn export_locks_out_after_the_attempt_budget_is_spent() {
     }
 
     let events = egress_events(&pool, &pubkey).await;
-    let rate_limited = events
-        .iter()
-        .filter(|event| event.reason_code.as_deref() == Some("rate_limited"))
-        .count();
-    assert_eq!(rate_limited, 1, "the lockout itself must be audited");
+    assert!(
+        events
+            .iter()
+            .all(|event| event.reason_code.as_deref() != Some("rate_limited")),
+        "repeated locked requests must not amplify database writes: {events:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -367,7 +743,7 @@ async fn concurrent_wrong_password_burst_spends_only_the_attempt_budget() {
     let pubkey = keys.public_key().to_hex();
     insert_user(&pool, &pubkey, &unique_email(), PASSWORD, true, false).await;
     create_personal_key(&pool, &pubkey, &keys, &km).await;
-    let auth_state = create_test_auth_state(pool.clone(), km_arc(km));
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
     let bearer = bearer_for(&keys).await;
 
     let mut attempts = tokio::task::JoinSet::new();
@@ -428,7 +804,7 @@ async fn lockout_refuses_the_correct_password_too() {
     let pubkey = keys.public_key().to_hex();
     insert_user(&pool, &pubkey, &unique_email(), PASSWORD, true, false).await;
     create_personal_key(&pool, &pubkey, &keys, &km).await;
-    let auth_state = create_test_auth_state(pool.clone(), km_arc(km));
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
     let bearer = bearer_for(&keys).await;
 
     burn_attempts(&auth_state, &keys, &bearer, MAX_ATTEMPTS).await;
@@ -459,7 +835,7 @@ async fn export_bad_requests_after_authorization_are_audited() {
     let pubkey = keys.public_key().to_hex();
     insert_user(&pool, &pubkey, &unique_email(), PASSWORD, true, false).await;
     create_personal_key(&pool, &pubkey, &keys, &km).await;
-    let auth_state = create_test_auth_state(pool.clone(), km_arc(km));
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
     let bearer = bearer_for(&keys).await;
 
     let missing_password = export_key(
@@ -523,7 +899,7 @@ async fn change_key_duplicate_after_correct_password_is_audited() {
         .secret_key()
         .to_bech32()
         .expect("encode duplicate key");
-    let auth_state = create_test_auth_state(pool.clone(), km_arc(km));
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
 
     let err = change_key(
         create_test_tenant(),
@@ -559,7 +935,7 @@ async fn export_and_change_key_share_one_attempt_budget() {
     let pubkey = keys.public_key().to_hex();
     insert_user(&pool, &pubkey, &unique_email(), PASSWORD, true, false).await;
     create_personal_key(&pool, &pubkey, &keys, &km).await;
-    let auth_state = create_test_auth_state(pool.clone(), km_arc(km));
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
     let bearer = bearer_for(&keys).await;
 
     // Spend the whole budget on export-key…
@@ -587,37 +963,83 @@ async fn export_and_change_key_share_one_attempt_budget() {
 
 #[tokio::test]
 #[serial]
+async fn successful_rotation_starts_a_budget_for_the_new_pubkey() {
+    let pool = setup_pool().await;
+    let km = FileKeyManager::new().expect("key manager");
+    let old_keys = Keys::generate();
+    let old_pubkey = old_keys.public_key().to_hex();
+    insert_user(&pool, &old_pubkey, &unique_email(), PASSWORD, true, false).await;
+    create_personal_key(&pool, &old_pubkey, &old_keys, &km).await;
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
+    let old_bearer = bearer_for(&old_keys).await;
+
+    for _ in 0..(MAX_ATTEMPTS - 1) {
+        let error = export_key(
+            create_test_tenant(),
+            State(auth_state.clone()),
+            auth_headers(&old_bearer),
+            Json(json!({ "password": "wrong", "format": "nsec" })),
+        )
+        .await
+        .expect_err("wrong password");
+        assert!(matches!(error, AuthError::InvalidCredentials));
+    }
+
+    let new_keys = Keys::generate();
+    change_key(
+        create_test_tenant(),
+        State(auth_state.clone()),
+        auth_headers(&old_bearer),
+        Json(ChangeKeyRequest {
+            password: PASSWORD.to_string(),
+            nsec: Some(new_keys.secret_key().to_bech32().expect("nsec")),
+        }),
+    )
+    .await
+    .expect("correct password may use the fifth in-flight slot");
+
+    let new_bearer = bearer_for(&new_keys).await;
+    let error = export_key(
+        create_test_tenant(),
+        State(auth_state),
+        auth_headers(&new_bearer),
+        Json(json!({ "password": "wrong", "format": "nsec" })),
+    )
+    .await
+    .expect_err("wrong password on new identity");
+    assert!(
+        matches!(error, AuthError::InvalidCredentials),
+        "rotation intentionally starts a fresh budget for the new pubkey: {error:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn policy_denial_outranks_the_lockout() {
     let pool = setup_pool().await;
     let km = FileKeyManager::new().expect("key manager");
     let keys = Keys::generate();
     let pubkey = keys.public_key().to_hex();
-    // A verified_minor can never reach the password check, so it can never spend
-    // the budget — but seed failures directly to prove the ordering holds even
-    // when both refusals apply.
-    insert_user(&pool, &pubkey, &unique_email(), PASSWORD, true, true).await;
+    insert_user(&pool, &pubkey, &unique_email(), PASSWORD, true, false).await;
     create_personal_key(&pool, &pubkey, &keys, &km).await;
-    for _ in 0..MAX_ATTEMPTS {
-        sqlx::query(
-            "INSERT INTO auth_events
-                (request_id, tenant_id, endpoint, event_type, outcome, reason_code,
-                 http_status, email_hash, pubkey, metadata_json)
-             VALUES ($1, $2, '/api/user/export-key', 'key_egress', 'failure',
-                     'invalid_password', 401, 'none', $3, '{}'::jsonb)",
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(TENANT_ID)
-        .bind(&pubkey)
-        .execute(&pool)
-        .await
-        .expect("seed failure event");
-    }
-    let auth_state = create_test_auth_state(pool.clone(), km_arc(km));
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
+    let bearer = bearer_for(&keys).await;
+    burn_attempts(&auth_state, &keys, &bearer, MAX_ATTEMPTS).await;
+    sqlx::query(
+        "UPDATE users
+         SET verified_minor = true, verified_minor_at = NOW()
+         WHERE tenant_id = $1 AND pubkey = $2",
+    )
+    .bind(TENANT_ID)
+    .bind(&pubkey)
+    .execute(&pool)
+    .await
+    .expect("apply policy state after spending the Redis budget");
 
     let err = export_key(
         create_test_tenant(),
         State(auth_state),
-        auth_headers(&bearer_for(&keys).await),
+        auth_headers(&bearer),
         Json(json!({ "password": PASSWORD, "format": "nsec" })),
     )
     .await
@@ -649,7 +1071,7 @@ async fn gates_before_the_password_do_not_spend_the_budget() {
     // Unverified email: refused before bcrypt, so it never guesses at anything.
     insert_user(&pool, &pubkey, &unique_email(), PASSWORD, false, false).await;
     create_personal_key(&pool, &pubkey, &keys, &km).await;
-    let auth_state = create_test_auth_state(pool.clone(), km_arc(km));
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
     let bearer = bearer_for(&keys).await;
 
     for _ in 0..(MAX_ATTEMPTS + 2) {
@@ -678,6 +1100,52 @@ async fn gates_before_the_password_do_not_spend_the_budget() {
 
 #[tokio::test]
 #[serial]
+async fn email_verification_gate_is_intentionally_not_symmetric() {
+    let pool = setup_pool().await;
+    let km = FileKeyManager::new().expect("key manager");
+    let keys = Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    insert_user(&pool, &pubkey, &unique_email(), PASSWORD, false, false).await;
+    create_personal_key(&pool, &pubkey, &keys, &km).await;
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
+    let bearer = bearer_for(&keys).await;
+
+    let export_error = export_key(
+        create_test_tenant(),
+        State(auth_state.clone()),
+        auth_headers(&bearer),
+        Json(json!({ "password": PASSWORD, "format": "nsec" })),
+    )
+    .await
+    .expect_err("export must require a verified email");
+    assert!(matches!(export_error, AuthError::EmailNotVerified));
+
+    let new_keys = Keys::generate();
+    let new_pubkey = new_keys.public_key().to_hex();
+    change_key(
+        create_test_tenant(),
+        State(auth_state),
+        auth_headers(&bearer),
+        Json(ChangeKeyRequest {
+            password: PASSWORD.to_string(),
+            nsec: Some(new_keys.secret_key().to_bech32().expect("nsec")),
+        }),
+    )
+    .await
+    .expect("the pre-existing change-key contract does not check email_verified");
+    let migrated: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM users WHERE tenant_id = $1 AND pubkey = $2)",
+    )
+    .bind(TENANT_ID)
+    .bind(&new_pubkey)
+    .fetch_one(&pool)
+    .await
+    .expect("check migrated identity");
+    assert!(migrated);
+}
+
+#[tokio::test]
+#[serial]
 async fn change_key_success_records_the_new_identity_in_full() {
     let pool = setup_pool().await;
     let km = FileKeyManager::new().expect("key manager");
@@ -685,9 +1153,9 @@ async fn change_key_success_records_the_new_identity_in_full() {
     let pubkey = keys.public_key().to_hex();
     insert_user(&pool, &pubkey, &unique_email(), PASSWORD, true, false).await;
     create_personal_key(&pool, &pubkey, &keys, &km).await;
-    let auth_state = create_test_auth_state(pool.clone(), km_arc(km));
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
 
-    change_key(
+    let response = change_key(
         create_test_tenant(),
         State(auth_state),
         auth_headers(&bearer_for(&keys).await),
@@ -717,6 +1185,123 @@ async fn change_key_success_records_the_new_identity_in_full() {
     );
     assert_ne!(new_pubkey, pubkey);
     assert_eq!(success.metadata_json["byok"], serde_json::json!(false));
+
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM users WHERE tenant_id = $1 AND pubkey = $2")
+            .bind(TENANT_ID)
+            .bind(new_pubkey)
+            .fetch_one(&pool)
+            .await
+            .expect("load post-change account status");
+    assert_eq!(
+        status, "active",
+        "the new row must match the active status used to build the UCAN before mutation"
+    );
+
+    let cookie = response
+        .headers()
+        .get(SET_COOKIE)
+        .expect("change-key session cookie")
+        .to_str()
+        .expect("ASCII cookie");
+    let token = cookie
+        .strip_prefix("keycast_session=")
+        .and_then(|value| value.split(';').next())
+        .expect("session token in cookie");
+    let encoded_payload = token.split('.').nth(1).expect("UCAN payload segment");
+    let payload: serde_json::Value = serde_json::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(encoded_payload)
+            .expect("base64url UCAN payload"),
+    )
+    .expect("JSON UCAN payload");
+    assert!(
+        !payload.to_string().contains("account_status"),
+        "an active post-change account must not emit an account_status fact: {payload}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn change_key_rolls_back_custody_when_its_success_audit_fails() {
+    let pool = setup_pool().await;
+    let km = FileKeyManager::new().expect("key manager");
+    let keys = Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    let email = unique_email();
+    insert_user(&pool, &pubkey, &email, PASSWORD, true, false).await;
+    create_personal_key(&pool, &pubkey, &keys, &km).await;
+    let oauth_id = create_oauth_authorization(&pool, &pubkey).await;
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
+    let new_keys = Keys::generate();
+    let new_pubkey = new_keys.public_key().to_hex();
+    let failure = AuditFailureTrigger::install(&pool, &pubkey, "/api/user/change-key").await;
+
+    let result = change_key(
+        create_test_tenant(),
+        State(auth_state),
+        auth_headers(&bearer_for(&keys).await),
+        Json(ChangeKeyRequest {
+            password: PASSWORD.to_string(),
+            nsec: Some(new_keys.secret_key().to_bech32().expect("encode nsec")),
+        }),
+    )
+    .await;
+    failure.remove(&pool).await;
+
+    assert!(
+        result.is_err(),
+        "injected audit failure must fail the request"
+    );
+    assert_original_custody_unchanged(&pool, &pubkey, &new_pubkey, &email, oauth_id).await;
+    assert!(
+        egress_events(&pool, &pubkey)
+            .await
+            .iter()
+            .all(|event| event.outcome != "success"),
+        "failed transaction must not retain a success audit"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn change_key_missing_origin_fails_before_custody_changes() {
+    let pool = setup_pool().await;
+    let km = FileKeyManager::new().expect("key manager");
+    let keys = Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    let email = unique_email();
+    insert_user(&pool, &pubkey, &email, PASSWORD, true, false).await;
+    create_personal_key(&pool, &pubkey, &keys, &km).await;
+    let oauth_id = create_oauth_authorization(&pool, &pubkey).await;
+    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
+    let new_keys = Keys::generate();
+    let new_pubkey = new_keys.public_key().to_hex();
+    let bearer = bearer_for(&keys).await;
+    let mut headers = auth_headers(&bearer);
+    headers.remove("origin");
+
+    let error = change_key(
+        create_test_tenant(),
+        State(auth_state),
+        headers,
+        Json(ChangeKeyRequest {
+            password: PASSWORD.to_string(),
+            nsec: Some(new_keys.secret_key().to_bech32().expect("encode nsec")),
+        }),
+    )
+    .await
+    .expect_err("Origin is required");
+
+    assert!(matches!(error, AuthError::BadRequest(_)));
+    assert_original_custody_unchanged(&pool, &pubkey, &new_pubkey, &email, oauth_id).await;
+    assert!(
+        egress_events(&pool, &pubkey)
+            .await
+            .iter()
+            .all(|event| event.outcome != "success"),
+        "request that never completed must not retain a success audit"
+    );
 }
 
 // ------------------------------------------------------- wire-shape contract
