@@ -18,9 +18,9 @@ use crate::brand::BRAND_NAME;
 use crate::nip98;
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
-    AccountStatusWithMinorRow, CreateOAuthAuthorizationParams, OAuthAuthorizationRepository,
-    OAuthCodeRepository, PersonalKeysRepository, PolicyRepository, UserRepository,
-    VerifiedMinorRow,
+    AccountStatusWithMinorRow, AuthEventRepository, CreateOAuthAuthorizationParams,
+    OAuthAuthorizationRepository, OAuthCodeRepository, PersonalKeysRepository, PolicyRepository,
+    UserRepository, VerifiedMinorRow,
 };
 use keycast_core::traits::CustomPermission;
 use nostr_sdk::{Keys, PublicKey, ToBech32, UnsignedEvent};
@@ -44,6 +44,29 @@ pub(crate) const INVALID_EMAIL_MESSAGE: &str = "Please enter a valid email addre
 pub(crate) const EMAIL_ALREADY_EXISTS_CODE: &str = "EMAIL_ALREADY_EXISTS";
 const EMAIL_ALREADY_EXISTS_MESSAGE: &str =
     "This email is already registered. Please log in instead.";
+pub(crate) const EMAIL_NOT_VERIFIED_CODE: &str = "EMAIL_NOT_VERIFIED";
+pub(crate) const EMAIL_NOT_VERIFIED_MESSAGE: &str =
+    "Please verify your email address before continuing. Check your inbox for the verification link.";
+/// Uniform refusal for raw-key egress denied by policy. The message deliberately
+/// does not say *why*, and the code is deliberately the same for every reason, so
+/// neither discloses account state (see `refuse_key_egress_for_verified_minor`).
+pub(crate) const KEY_EGRESS_DENIED_CODE: &str = "KEY_EGRESS_DENIED";
+pub(crate) const KEY_EGRESS_DENIED_MESSAGE: &str = "Operation denied by policy";
+pub(crate) const TOO_MANY_ATTEMPTS_CODE: &str = "TOO_MANY_ATTEMPTS";
+/// `auth_events.endpoint` for the two raw-key egress routes.
+pub(crate) const EXPORT_KEY_ENDPOINT: &str = "/api/user/export-key";
+pub(crate) const CHANGE_KEY_ENDPOINT: &str = "/api/user/change-key";
+/// `auth_events.event_type` shared by both raw-key egress routes, so one wrong-password
+/// budget covers the whole surface rather than one per endpoint.
+pub(crate) const KEY_EGRESS_EVENT_TYPE: &str = "key_egress";
+/// `auth_events.reason_code` the lockout counts. Only a wrong password counts: the
+/// gates that run before it refuse an account that cannot succeed anyway, so counting
+/// them would lock out a user who never guessed at anything.
+pub(crate) const KEY_EGRESS_INVALID_PASSWORD_REASON: &str = "invalid_password";
+/// Wrong passwords allowed on the raw-key egress surface before it locks.
+const KEY_EGRESS_MAX_PASSWORD_ATTEMPTS: i64 = 5;
+/// Sliding window the wrong-password count is taken over.
+const KEY_EGRESS_ATTEMPT_WINDOW_MINUTES: i64 = 15;
 
 /// Get token expiry in seconds. Uses `TOKEN_EXPIRY_SECONDS` env var if set,
 /// otherwise defaults to 24 hours (86400 seconds).
@@ -473,11 +496,17 @@ pub enum AuthError {
     InvalidEmail,
     BadRequest(String),
     Forbidden(String),   // User has no authorization for this origin
+    KeyEgressDenied,     // Policy refuses raw-key egress for this account
     RegistrationExpired, // Async bcrypt timed out (instance died)
     ServiceUnavailable {
         // Server at capacity or shutting down
         message: String,
         retry_after: Option<u32>,
+    },
+    TooManyRequests {
+        // Caller is locked out after repeated failures
+        message: String,
+        retry_after: u32,
     },
     Conflict(String),
 }
@@ -543,10 +572,13 @@ impl IntoResponse for AuthError {
                     EMAIL_ALREADY_EXISTS_CODE,
                 );
             }
-            AuthError::EmailNotVerified => (
-                StatusCode::FORBIDDEN,
-                "Please verify your email address before continuing. Check your inbox for the verification link.".to_string(),
-            ),
+            AuthError::EmailNotVerified => {
+                return coded_error_response(
+                    StatusCode::FORBIDDEN,
+                    EMAIL_NOT_VERIFIED_MESSAGE,
+                    EMAIL_NOT_VERIFIED_CODE,
+                );
+            }
             AuthError::UserNotFound => (
                 StatusCode::NOT_FOUND,
                 "No account found with this email. Please register first.".to_string(),
@@ -610,6 +642,13 @@ impl IntoResponse for AuthError {
                 StatusCode::FORBIDDEN,
                 msg,
             ),
+            AuthError::KeyEgressDenied => {
+                return coded_error_response(
+                    StatusCode::FORBIDDEN,
+                    KEY_EGRESS_DENIED_MESSAGE,
+                    KEY_EGRESS_DENIED_CODE,
+                );
+            }
             AuthError::RegistrationExpired => (
                 StatusCode::GONE,
                 "Registration expired. Please register again.".to_string(),
@@ -628,6 +667,16 @@ impl IntoResponse for AuthError {
                     ).into_response();
                 }
                 return response.into_response();
+            }
+            AuthError::TooManyRequests { message, retry_after } => {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("Retry-After", retry_after.to_string())],
+                    Json(serde_json::json!({
+                        "error": message,
+                        "code": TOO_MANY_ATTEMPTS_CODE,
+                    })),
+                ).into_response();
             }
         };
 
@@ -4053,10 +4102,183 @@ async fn refuse_key_egress_for_verified_minor(
             operation = %operation,
             "verified_minor raw-key egress refused"
         );
-        return Err(AuthError::Forbidden(
-            "Operation denied by policy".to_string(),
-        ));
+        return Err(AuthError::KeyEgressDenied);
     }
+    Ok(())
+}
+
+/// Record an auth event for a raw-key egress attempt (best-effort).
+///
+/// Every attempt on `/api/user/export-key` and `/api/user/change-key` writes one
+/// row, which is what makes a successful export reconstructable after a key
+/// compromise. The `invalid_password` rows are also the lockout's counter — see
+/// [`enforce_key_egress_attempt_limit`] — so this is not observability alone and
+/// its `event_type` / `reason_code` values are load-bearing.
+#[allow(clippy::too_many_arguments)]
+async fn record_key_egress_event(
+    pool: &PgPool,
+    headers: &HeaderMap,
+    tenant_id: i64,
+    endpoint: &'static str,
+    outcome: &'static str,
+    reason_code: Option<&str>,
+    http_status: i32,
+    pubkey: &str,
+    metadata_json: serde_json::Value,
+) {
+    super::auth_observability::record_auth_event_and_log(
+        pool,
+        headers,
+        None,
+        super::auth_observability::AuthEvent {
+            tenant_id,
+            endpoint,
+            event_type: KEY_EGRESS_EVENT_TYPE,
+            outcome,
+            reason_code,
+            http_status,
+            email: None,
+            pubkey: Some(pubkey),
+            client_id: None,
+            redirect_origin: None,
+            metadata_json,
+        },
+    )
+    .await;
+}
+
+/// Refuse a raw-key egress operation once the account has spent its wrong-password
+/// budget, and report when the budget reopens.
+///
+/// The endpoints pay out the private key on a correct password, so an attacker
+/// holding a live bearer token — a borrowed unlocked phone, an exfiltrated session
+/// — could otherwise guess passwords against them without limit. The budget is
+/// per account rather than per IP because the account is the thing being guessed
+/// at; it is also the only key available, since nothing in this service extracts a
+/// client IP and the `X-Forwarded-For` a Cloud Run request arrives with is written
+/// by the client.
+///
+/// The window is a sliding count of `invalid_password` failures over
+/// `KEY_EGRESS_ATTEMPT_WINDOW_MINUTES`. It reopens when the oldest of those ages
+/// out — no unlock endpoint and no stored lock state, so a locked-out owner is
+/// never stranded. `export-key` and `change-key` share one budget: the same
+/// password opens both, so counting them apart would just move the guessing to
+/// whichever endpoint had budget left.
+///
+/// A count is not read back from a replica-local cache, so the limit is one budget
+/// across every instance instead of one per instance.
+async fn enforce_key_egress_attempt_limit(
+    pool: &PgPool,
+    tenant_id: i64,
+    user_pubkey: &str,
+) -> Result<(), AuthError> {
+    let window_start = Utc::now() - Duration::minutes(KEY_EGRESS_ATTEMPT_WINDOW_MINUTES);
+    let (failures, oldest) = AuthEventRepository::new(pool.clone())
+        .count_recent_failures(
+            tenant_id,
+            user_pubkey,
+            KEY_EGRESS_EVENT_TYPE,
+            KEY_EGRESS_INVALID_PASSWORD_REASON,
+            window_start,
+        )
+        .await?;
+
+    if failures < KEY_EGRESS_MAX_PASSWORD_ATTEMPTS {
+        return Ok(());
+    }
+
+    // Seconds until the oldest counted failure leaves the window. `oldest` is
+    // Some whenever the count is non-zero; fall back to the full window rather
+    // than reporting a retry that has already passed.
+    let retry_after = oldest
+        .map(|oldest| {
+            (oldest + Duration::minutes(KEY_EGRESS_ATTEMPT_WINDOW_MINUTES) - Utc::now())
+                .num_seconds()
+        })
+        .unwrap_or(KEY_EGRESS_ATTEMPT_WINDOW_MINUTES * 60)
+        .clamp(1, KEY_EGRESS_ATTEMPT_WINDOW_MINUTES * 60) as u32;
+
+    tracing::warn!(
+        event = "key_egress_rate_limited",
+        user_pubkey = %user_pubkey,
+        failures = failures,
+        retry_after_seconds = retry_after,
+        "raw-key egress locked out after repeated wrong passwords"
+    );
+
+    Err(AuthError::TooManyRequests {
+        message: "Too many incorrect passwords. Please wait before trying again.".to_string(),
+        retry_after,
+    })
+}
+
+/// Shared pre-flight for both raw-key egress endpoints, in refusal order:
+/// the `verified_minor` policy gate, then the wrong-password lockout.
+///
+/// The policy gate stays first so a protected minor gets the same uniform
+/// refusal whatever their lockout state — the policy answer must not vary with
+/// anything an attacker can drive. Both refusals land before the password is read,
+/// so no bcrypt work happens for a request that was never going to be served.
+async fn authorize_key_egress(
+    pool: &PgPool,
+    headers: &HeaderMap,
+    user_repo: &UserRepository,
+    tenant_id: i64,
+    user_pubkey: &str,
+    endpoint: &'static str,
+    operation: &str,
+) -> Result<(), AuthError> {
+    // Each arm records only the refusal it actually made. A database failure
+    // reaches these as `Internal` and is left unrecorded rather than logged as a
+    // policy denial or a lockout — the audit trail is a control input now, so a
+    // wrong reason in it is worse than a missing row.
+    match refuse_key_egress_for_verified_minor(user_repo, tenant_id, user_pubkey, operation).await {
+        Ok(()) => {}
+        Err(AuthError::KeyEgressDenied) => {
+            record_key_egress_event(
+                pool,
+                headers,
+                tenant_id,
+                endpoint,
+                "failure",
+                Some("policy_denied"),
+                403,
+                user_pubkey,
+                serde_json::json!({}),
+            )
+            .await;
+            return Err(AuthError::KeyEgressDenied);
+        }
+        Err(error) => return Err(error),
+    }
+
+    match enforce_key_egress_attempt_limit(pool, tenant_id, user_pubkey).await {
+        Ok(()) => {}
+        Err(AuthError::TooManyRequests {
+            message,
+            retry_after,
+        }) => {
+            record_key_egress_event(
+                pool,
+                headers,
+                tenant_id,
+                endpoint,
+                "failure",
+                Some("rate_limited"),
+                429,
+                user_pubkey,
+                serde_json::json!({}),
+            )
+            .await;
+            return Err(AuthError::TooManyRequests {
+                message,
+                retry_after,
+            });
+        }
+        // Fail closed: if the budget cannot be read, the key does not leave.
+        Err(error) => return Err(error),
+    }
+
     Ok(())
 }
 
@@ -4073,8 +4295,18 @@ pub async fn export_key(
     let key_manager = auth_state.state.key_manager.as_ref();
     let user_repo = UserRepository::new(pool.clone());
 
-    // verified_minor accounts cannot export their raw key (support-trust-safety#188).
-    refuse_key_egress_for_verified_minor(&user_repo, tenant_id, &user_pubkey, "export_key").await?;
+    // verified_minor policy gate (support-trust-safety#188), then the
+    // wrong-password lockout. Both refuse before any key material is touched.
+    authorize_key_egress(
+        pool,
+        &headers,
+        &user_repo,
+        tenant_id,
+        &user_pubkey,
+        EXPORT_KEY_ENDPOINT,
+        "export_key",
+    )
+    .await?;
 
     // Extract password and format from request
     let password = req
@@ -4093,6 +4325,18 @@ pub async fn export_key(
 
     // Require email verification
     if !email_verified {
+        record_key_egress_event(
+            pool,
+            &headers,
+            tenant_id,
+            EXPORT_KEY_ENDPOINT,
+            "failure",
+            Some("email_not_verified"),
+            403,
+            &user_pubkey,
+            serde_json::json!({}),
+        )
+        .await;
         return Err(AuthError::EmailNotVerified);
     }
 
@@ -4100,15 +4344,49 @@ pub async fn export_key(
         .map_err(|_| AuthError::Internal("Password verification failed".to_string()))?;
 
     if !valid {
+        // Counted by the lockout above. Every wrong password must land here, or
+        // the budget silently stops being spent.
+        record_key_egress_event(
+            pool,
+            &headers,
+            tenant_id,
+            EXPORT_KEY_ENDPOINT,
+            "failure",
+            Some(KEY_EGRESS_INVALID_PASSWORD_REASON),
+            401,
+            &user_pubkey,
+            serde_json::json!({}),
+        )
+        .await;
         return Err(AuthError::InvalidCredentials);
     }
 
     // Get user's encrypted secret key
     let personal_keys_repo = PersonalKeysRepository::new(pool.clone());
-    let encrypted_key = personal_keys_repo
+    let encrypted_key = match personal_keys_repo
         .find_encrypted_key_for_tenant(&user_pubkey, tenant_id)
         .await?
-        .ok_or(AuthError::UserNotFound)?;
+    {
+        Some(encrypted_key) => encrypted_key,
+        None => {
+            // Correct password, but this account has no server-held key to hand
+            // back. Recorded because it is a successful authentication against
+            // the export surface, which is worth seeing.
+            record_key_egress_event(
+                pool,
+                &headers,
+                tenant_id,
+                EXPORT_KEY_ENDPOINT,
+                "failure",
+                Some("missing_personal_key"),
+                404,
+                &user_pubkey,
+                serde_json::json!({}),
+            )
+            .await;
+            return Err(AuthError::UserNotFound);
+        }
+    };
 
     // Decrypt the secret key
     let decrypted_secret = key_manager
@@ -4133,6 +4411,23 @@ pub async fn export_key(
         }
     };
 
+    // Recorded before the key is handed back, so a crash between the two leaves a
+    // recorded-but-undelivered export rather than a delivered-but-unrecorded one.
+    // This is the row that answers "was this key ever exported, and when" after a
+    // compromise, so it is worth the ordering.
+    record_key_egress_event(
+        pool,
+        &headers,
+        tenant_id,
+        EXPORT_KEY_ENDPOINT,
+        "success",
+        None,
+        200,
+        &user_pubkey,
+        serde_json::json!({}),
+    )
+    .await;
+
     Ok(Json(ExportKeyResponse { key: key_string }))
 }
 
@@ -4150,8 +4445,18 @@ pub async fn change_key(
     let key_manager = auth_state.state.key_manager.as_ref();
     let user_repo = UserRepository::new(pool.clone());
 
-    // verified_minor accounts cannot swap to a self-held key (support-trust-safety#188).
-    refuse_key_egress_for_verified_minor(&user_repo, tenant_id, &old_pubkey, "change_key").await?;
+    // verified_minor policy gate (support-trust-safety#188), then the
+    // wrong-password lockout, which shares one budget with export-key.
+    authorize_key_egress(
+        pool,
+        &headers,
+        &user_repo,
+        tenant_id,
+        &old_pubkey,
+        CHANGE_KEY_ENDPOINT,
+        "change_key",
+    )
+    .await?;
 
     // Get user's email and verify password
     let (email, password_hash) = user_repo
@@ -4164,6 +4469,18 @@ pub async fn change_key(
         .map_err(|_| AuthError::Internal("Password verification failed".to_string()))?;
 
     if !valid {
+        record_key_egress_event(
+            pool,
+            &headers,
+            tenant_id,
+            CHANGE_KEY_ENDPOINT,
+            "failure",
+            Some(KEY_EGRESS_INVALID_PASSWORD_REASON),
+            401,
+            &old_pubkey,
+            serde_json::json!({}),
+        )
+        .await;
         return Err(AuthError::InvalidCredentials);
     }
 
@@ -4202,6 +4519,26 @@ pub async fn change_key(
             &encrypted_secret,
         )
         .await?;
+
+    // The account's custody changed hands here, so the row carries the new
+    // identity in full — the old pubkey is the event's subject, and without the
+    // new one the trail stops at the swap.
+    record_key_egress_event(
+        pool,
+        &headers,
+        tenant_id,
+        CHANGE_KEY_ENDPOINT,
+        "success",
+        None,
+        200,
+        &old_pubkey,
+        serde_json::json!({
+            "new_pubkey": new_pubkey,
+            "byok": req.nsec.is_some(),
+            "oauth_authorizations_deleted": oauth_count,
+        }),
+    )
+    .await;
 
     // Signal signer daemon to remove old authorizations
     if let Some(tx) = &auth_state.auth_tx {

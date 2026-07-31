@@ -35,6 +35,27 @@ const TENANT_ID: i64 = 1;
 /// The uniform, non-specific message every minor-egress refusal surfaces.
 const DENIED_MSG: &str = "Operation denied by policy";
 
+/// The uniform machine-readable code that accompanies it.
+const DENIED_CODE: &str = "KEY_EGRESS_DENIED";
+
+async fn response_json(response: axum::response::Response) -> serde_json::Value {
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should be readable");
+    serde_json::from_slice(&body).expect("response body should be JSON")
+}
+
+/// Pin the refusal as a client sees it: 403, the uniform message, and a code that
+/// is the *same* for every denial reason. A per-reason code here would re-leak the
+/// account state the uniform message exists to hide.
+async fn assert_key_egress_denied_wire_shape() {
+    let response = axum::response::IntoResponse::into_response(AuthError::KeyEgressDenied);
+    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    let body = response_json(response).await;
+    assert_eq!(body["error"], DENIED_MSG);
+    assert_eq!(body["code"], DENIED_CODE);
+}
+
 async fn setup_pool() -> PgPool {
     common::assert_test_database_url();
     let database_url = std::env::var("DATABASE_URL")
@@ -202,8 +223,8 @@ async fn minor_export_key_refused() {
     .expect_err("verified_minor export-key must be refused");
 
     match err {
-        AuthError::Forbidden(msg) => assert_eq!(msg, DENIED_MSG),
-        other => panic!("expected Forbidden({DENIED_MSG}), got: {other:?}"),
+        AuthError::KeyEgressDenied => assert_key_egress_denied_wire_shape().await,
+        other => panic!("expected KeyEgressDenied, got: {other:?}"),
     }
 }
 
@@ -231,8 +252,8 @@ async fn minor_export_key_refused_before_password_check() {
     .expect_err("verified_minor export-key must be refused regardless of password");
 
     match err {
-        AuthError::Forbidden(msg) => assert_eq!(msg, DENIED_MSG),
-        other => panic!("expected Forbidden({DENIED_MSG}) before password check, got: {other:?}"),
+        AuthError::KeyEgressDenied => assert_key_egress_denied_wire_shape().await,
+        other => panic!("expected KeyEgressDenied before password check, got: {other:?}"),
     }
 }
 
@@ -283,8 +304,8 @@ async fn export_key_missing_user_row_fails_closed() {
     .expect_err("unresolvable account must fail closed");
 
     match err {
-        AuthError::Forbidden(msg) => assert_eq!(msg, DENIED_MSG),
-        other => panic!("expected Forbidden({DENIED_MSG}) fail-closed, got: {other:?}"),
+        AuthError::KeyEgressDenied => assert_key_egress_denied_wire_shape().await,
+        other => panic!("expected KeyEgressDenied fail-closed, got: {other:?}"),
     }
 }
 
@@ -319,8 +340,8 @@ async fn minor_change_key_refused_and_key_unchanged() {
     .expect_err("verified_minor change-key must be refused");
 
     match err {
-        AuthError::Forbidden(msg) => assert_eq!(msg, DENIED_MSG),
-        other => panic!("expected Forbidden({DENIED_MSG}), got: {other:?}"),
+        AuthError::KeyEgressDenied => assert_key_egress_denied_wire_shape().await,
+        other => panic!("expected KeyEgressDenied, got: {other:?}"),
     }
     // No key swap happened: the original identity still exists, the new one was
     // never created.
@@ -390,7 +411,7 @@ async fn change_key_missing_user_row_fails_closed() {
     .expect_err("unresolvable account must fail closed");
 
     match err {
-        AuthError::Forbidden(msg) => assert_eq!(msg, DENIED_MSG),
-        other => panic!("expected Forbidden({DENIED_MSG}) fail-closed, got: {other:?}"),
+        AuthError::KeyEgressDenied => assert_key_egress_denied_wire_shape().await,
+        other => panic!("expected KeyEgressDenied fail-closed, got: {other:?}"),
     }
 }
