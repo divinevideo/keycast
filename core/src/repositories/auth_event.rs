@@ -230,6 +230,45 @@ impl AuthEventRepository {
         .map_err(Into::into)
     }
 
+    /// Count this account's failures of one `event_type`/`reason_code` since `since`,
+    /// with the oldest one still inside the window.
+    ///
+    /// This is the read side of a failed-attempt lockout: the audit trail is the
+    /// counter, so the budget is one per account across every replica and it
+    /// survives a restart. The oldest timestamp is what a caller needs to say when
+    /// the window reopens, since it is the next attempt to age out.
+    ///
+    /// Returns `(0, None)` when nothing matches. Uses the
+    /// `(tenant_id, pubkey, occurred_at DESC)` index.
+    pub async fn count_recent_failures(
+        &self,
+        tenant_id: i64,
+        pubkey: &str,
+        event_type: &str,
+        reason_code: &str,
+        since: DateTime<Utc>,
+    ) -> Result<(i64, Option<DateTime<Utc>>), RepositoryError> {
+        let row: (i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT COUNT(*), MIN(occurred_at)
+             FROM auth_events
+             WHERE tenant_id = $1
+               AND pubkey = $2
+               AND event_type = $3
+               AND outcome = 'failure'
+               AND reason_code = $4
+               AND occurred_at > $5",
+        )
+        .bind(tenant_id)
+        .bind(pubkey)
+        .bind(event_type)
+        .bind(reason_code)
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
     pub async fn delete_older_than(&self, cutoff: DateTime<Utc>) -> Result<u64, RepositoryError> {
         let result = sqlx::query("DELETE FROM auth_events WHERE occurred_at < $1")
             .bind(cutoff)
