@@ -4,7 +4,7 @@
 use crate::repositories::RepositoryError;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
 
 #[derive(Debug, Clone)]
 pub struct AuthEventRecord {
@@ -112,6 +112,69 @@ impl AuthEventRepository {
         .bind(record.user_agent)
         .bind(record.metadata_json)
         .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn record_in_transaction(
+        tx: &mut Transaction<'_, Postgres>,
+        record: AuthEventRecord,
+    ) -> Result<AuthEventRow, RepositoryError> {
+        sqlx::query_as::<_, AuthEventRow>(
+            "INSERT INTO auth_events (
+                request_id,
+                tenant_id,
+                endpoint,
+                event_type,
+                outcome,
+                reason_code,
+                http_status,
+                email,
+                email_hash,
+                pubkey,
+                pubkey_prefix,
+                client_id,
+                redirect_origin,
+                user_agent,
+                metadata_json
+             ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
+             )
+             RETURNING
+                id,
+                occurred_at,
+                request_id,
+                tenant_id,
+                endpoint,
+                event_type,
+                outcome,
+                reason_code,
+                http_status,
+                email,
+                email_hash,
+                pubkey,
+                pubkey_prefix,
+                client_id,
+                redirect_origin,
+                user_agent,
+                metadata_json",
+        )
+        .bind(record.request_id)
+        .bind(record.tenant_id)
+        .bind(record.endpoint)
+        .bind(record.event_type)
+        .bind(record.outcome)
+        .bind(record.reason_code)
+        .bind(record.http_status)
+        .bind(record.email)
+        .bind(record.email_hash)
+        .bind(record.pubkey)
+        .bind(record.pubkey_prefix)
+        .bind(record.client_id)
+        .bind(record.redirect_origin)
+        .bind(record.user_agent)
+        .bind(record.metadata_json)
+        .fetch_one(&mut **tx)
         .await
         .map_err(Into::into)
     }

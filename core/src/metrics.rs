@@ -576,6 +576,8 @@ fn normalize_auth_endpoint(endpoint: &str) -> &'static str {
         "/api/headless/authorize" => "/api/headless/authorize",
         "/api/claim" => "/api/claim",
         "/api/admin/auth-debug" => "/api/admin/auth-debug",
+        "/api/user/export-key" => "/api/user/export-key",
+        "/api/user/change-key" => "/api/user/change-key",
         _ => "other",
     }
 }
@@ -608,6 +610,14 @@ fn normalize_auth_reason(reason_code: Option<&str>) -> &'static str {
         "password_hash_updated" => "password_hash_updated",
         "unsupported_client" => "unsupported_client",
         "authorization_not_found" => "authorization_not_found",
+        "policy_denied" => "policy_denied",
+        "rate_limited" => "rate_limited",
+        "missing_password" => "missing_password",
+        "invalid_format" => "invalid_format",
+        "invalid_nsec" => "invalid_nsec",
+        "duplicate_key" => "duplicate_key",
+        "encryption_failed" => "encryption_failed",
+        "change_key_failed" => "change_key_failed",
         _ => "other",
     }
 }

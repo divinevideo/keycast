@@ -112,12 +112,11 @@ pub struct AuthEvent<'a> {
     pub metadata_json: Value,
 }
 
-pub async fn record_auth_event_and_log(
-    pool: &PgPool,
+pub fn auth_event_record_and_log(
     headers: &HeaderMap,
     request_context: Option<&RequestContext>,
     event: AuthEvent<'_>,
-) {
+) -> AuthEventRecord {
     let request_id = request_context
         .map(|context| context.request_id.clone())
         .or_else(|| request_id_from_headers(headers))
@@ -183,35 +182,56 @@ pub async fn record_auth_event_and_log(
         ),
     }
 
+    AuthEventRecord {
+        tenant_id: event.tenant_id,
+        request_id,
+        endpoint: event.endpoint.to_string(),
+        event_type: event.event_type.to_string(),
+        outcome: event.outcome.to_string(),
+        reason_code: event.reason_code.map(str::to_string),
+        http_status: Some(event.http_status),
+        email: event.email.map(str::to_string),
+        email_hash,
+        pubkey: event.pubkey.map(str::to_string),
+        pubkey_prefix,
+        client_id: event.client_id.map(str::to_string),
+        redirect_origin: event.redirect_origin.map(str::to_string),
+        user_agent,
+        metadata_json: event.metadata_json,
+    }
+}
+
+pub async fn record_auth_event_and_log_result(
+    pool: &PgPool,
+    headers: &HeaderMap,
+    request_context: Option<&RequestContext>,
+    event: AuthEvent<'_>,
+) -> Result<(), keycast_core::repositories::RepositoryError> {
+    let endpoint = event.endpoint;
+    let tenant_id = event.tenant_id;
+    let record = auth_event_record_and_log(headers, request_context, event);
     let repo = AuthEventRepository::new(pool.clone());
-    if let Err(error) = repo
-        .record(AuthEventRecord {
-            tenant_id: event.tenant_id,
-            request_id,
-            endpoint: event.endpoint.to_string(),
-            event_type: event.event_type.to_string(),
-            outcome: event.outcome.to_string(),
-            reason_code: event.reason_code.map(str::to_string),
-            http_status: Some(event.http_status),
-            email: event.email.map(str::to_string),
-            email_hash,
-            pubkey: event.pubkey.map(str::to_string),
-            pubkey_prefix,
-            client_id: event.client_id.map(str::to_string),
-            redirect_origin: event.redirect_origin.map(str::to_string),
-            user_agent,
-            metadata_json: event.metadata_json,
-        })
-        .await
-    {
-        METRICS.inc_auth_audit_write_failure(event.endpoint);
+    if let Err(error) = repo.record(record).await {
+        METRICS.inc_auth_audit_write_failure(endpoint);
         tracing::error!(
-            endpoint = event.endpoint,
-            tenant_id = event.tenant_id,
+            endpoint = endpoint,
+            tenant_id = tenant_id,
             error = %error,
             "Failed to write auth audit event"
         );
+        return Err(error);
     }
+
+    Ok(())
+}
+
+pub async fn record_auth_event_and_log(
+    pool: &PgPool,
+    headers: &HeaderMap,
+    request_context: Option<&RequestContext>,
+    event: AuthEvent<'_>,
+) {
+    let _ = record_auth_event_and_log_result(pool, headers, request_context, event).await;
 }
 
 pub async fn request_id_middleware(mut request: Request<Body>, next: Next) -> Response {

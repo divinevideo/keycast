@@ -3,7 +3,7 @@
 
 use cluster_hashring::ValkeyConnectionFactory;
 use redis::aio::ConnectionManager;
-use redis::{AsyncCommands, RedisResult};
+use redis::{AsyncCommands, FromRedisValue, RedisResult, Script};
 use std::borrow::Cow;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -132,6 +132,47 @@ impl PrefixedRedis {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Invoke one Lua script with every key in this wrapper's namespace.
+    ///
+    /// The script text is static so callers cannot accidentally construct code
+    /// from request data. Keys and arguments remain regular Redis values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Redis rejects the script or connection refresh fails.
+    pub(crate) async fn invoke_script<T>(
+        &self,
+        script: &'static str,
+        keys: &[String],
+        arguments: &[String],
+    ) -> RedisResult<T>
+    where
+        T: FromRedisValue,
+    {
+        let keys = keys
+            .iter()
+            .map(|key| self.prefixed_key(key).into_owned())
+            .collect::<Vec<_>>();
+        let arguments = arguments.to_vec();
+
+        self.with_refresh(|mut connection| {
+            let keys = keys.clone();
+            let arguments = arguments.clone();
+            async move {
+                let script = Script::new(script);
+                let mut invocation = script.prepare_invoke();
+                for key in keys {
+                    invocation.key(key);
+                }
+                for argument in arguments {
+                    invocation.arg(argument);
+                }
+                invocation.invoke_async(&mut connection).await
+            }
+        })
+        .await
     }
 
     /// Refresh the connection proactively (for IAM token rotation).

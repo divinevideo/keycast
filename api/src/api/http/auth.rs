@@ -15,18 +15,26 @@ use super::admin::{is_full_admin, is_support_admin};
 use crate::api::extractors::UcanAuth;
 use crate::bcrypt_queue::{BcryptJob, BcryptQueueError};
 use crate::brand::BRAND_NAME;
+use crate::key_egress_limiter::{
+    KeyEgressAdmission, KeyEgressLimiter, KeyEgressReservation, KEY_EGRESS_FINALIZATION_DEADLINE,
+    KEY_EGRESS_RESERVED_WORK_DEADLINE,
+};
 use crate::nip98;
+use crate::password_verifier::{
+    PasswordVerificationError, PasswordVerificationPermit, PasswordVerifier,
+};
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
-    AccountStatusWithMinorRow, CreateOAuthAuthorizationParams, OAuthAuthorizationRepository,
-    OAuthCodeRepository, PersonalKeysRepository, PolicyRepository, UserRepository,
-    VerifiedMinorRow,
+    AccountStatusWithMinorRow, AuthEventRepository, CreateOAuthAuthorizationParams,
+    OAuthAuthorizationRepository, OAuthCodeRepository, PersonalKeysRepository, PolicyRepository,
+    UserRepository, VerifiedMinorRow,
 };
 use keycast_core::traits::CustomPermission;
 use nostr_sdk::{Keys, PublicKey, ToBech32, UnsignedEvent};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
+use std::time::Duration as StdDuration;
 
 // Registration and login return simple JSON (not OAuth TokenResponse)
 
@@ -44,6 +52,32 @@ pub(crate) const INVALID_EMAIL_MESSAGE: &str = "Please enter a valid email addre
 pub(crate) const EMAIL_ALREADY_EXISTS_CODE: &str = "EMAIL_ALREADY_EXISTS";
 const EMAIL_ALREADY_EXISTS_MESSAGE: &str =
     "This email is already registered. Please log in instead.";
+pub(crate) const EMAIL_NOT_VERIFIED_CODE: &str = "EMAIL_NOT_VERIFIED";
+pub(crate) const EMAIL_NOT_VERIFIED_MESSAGE: &str =
+    "Please verify your email address before continuing. Check your inbox for the verification link.";
+/// Uniform refusal for raw-key egress denied by policy. The message deliberately
+/// does not say *why*, and the code is deliberately the same for every reason, so
+/// neither discloses account state (see `refuse_key_egress_for_verified_minor`).
+pub(crate) const KEY_EGRESS_DENIED_CODE: &str = "KEY_EGRESS_DENIED";
+pub(crate) const KEY_EGRESS_DENIED_MESSAGE: &str = "Operation denied by policy";
+pub(crate) const TOO_MANY_ATTEMPTS_CODE: &str = "TOO_MANY_ATTEMPTS";
+/// `auth_events.endpoint` for the two raw-key egress routes.
+pub(crate) const EXPORT_KEY_ENDPOINT: &str = "/api/user/export-key";
+pub(crate) const CHANGE_KEY_ENDPOINT: &str = "/api/user/change-key";
+/// `auth_events.event_type` shared by both raw-key egress routes, so one wrong-password
+/// budget covers the whole surface rather than one per endpoint.
+pub(crate) const KEY_EGRESS_EVENT_TYPE: &str = "key_egress";
+/// `auth_events.reason_code` the lockout counts. Only a wrong password counts: the
+/// gates that run before it refuse an account that cannot succeed anyway, so counting
+/// them would lock out a user who never guessed at anything.
+pub(crate) const KEY_EGRESS_INVALID_PASSWORD_REASON: &str = "invalid_password";
+/// Maximum wait for CPU verification capacity before load shedding.
+const KEY_EGRESS_VERIFIER_PERMIT_WAIT: StdDuration = StdDuration::from_millis(250);
+
+static KEY_EGRESS_PASSWORD_VERIFIER: once_cell::sync::Lazy<PasswordVerifier> =
+    once_cell::sync::Lazy::new(|| {
+        PasswordVerifier::new(num_cpus::get().max(1), KEY_EGRESS_VERIFIER_PERMIT_WAIT)
+    });
 
 /// Get token expiry in seconds. Uses `TOKEN_EXPIRY_SECONDS` env var if set,
 /// otherwise defaults to 24 hours (86400 seconds).
@@ -473,11 +507,17 @@ pub enum AuthError {
     InvalidEmail,
     BadRequest(String),
     Forbidden(String),   // User has no authorization for this origin
+    KeyEgressDenied,     // Policy refuses raw-key egress for this account
     RegistrationExpired, // Async bcrypt timed out (instance died)
     ServiceUnavailable {
         // Server at capacity or shutting down
         message: String,
         retry_after: Option<u32>,
+    },
+    TooManyRequests {
+        // Caller is locked out after repeated failures
+        message: String,
+        retry_after: u32,
     },
     Conflict(String),
 }
@@ -543,10 +583,13 @@ impl IntoResponse for AuthError {
                     EMAIL_ALREADY_EXISTS_CODE,
                 );
             }
-            AuthError::EmailNotVerified => (
-                StatusCode::FORBIDDEN,
-                "Please verify your email address before continuing. Check your inbox for the verification link.".to_string(),
-            ),
+            AuthError::EmailNotVerified => {
+                return coded_error_response(
+                    StatusCode::FORBIDDEN,
+                    EMAIL_NOT_VERIFIED_MESSAGE,
+                    EMAIL_NOT_VERIFIED_CODE,
+                );
+            }
             AuthError::UserNotFound => (
                 StatusCode::NOT_FOUND,
                 "No account found with this email. Please register first.".to_string(),
@@ -610,6 +653,13 @@ impl IntoResponse for AuthError {
                 StatusCode::FORBIDDEN,
                 msg,
             ),
+            AuthError::KeyEgressDenied => {
+                return coded_error_response(
+                    StatusCode::FORBIDDEN,
+                    KEY_EGRESS_DENIED_MESSAGE,
+                    KEY_EGRESS_DENIED_CODE,
+                );
+            }
             AuthError::RegistrationExpired => (
                 StatusCode::GONE,
                 "Registration expired. Please register again.".to_string(),
@@ -628,6 +678,16 @@ impl IntoResponse for AuthError {
                     ).into_response();
                 }
                 return response.into_response();
+            }
+            AuthError::TooManyRequests { message, retry_after } => {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("Retry-After", retry_after.to_string())],
+                    Json(serde_json::json!({
+                        "error": message,
+                        "code": TOO_MANY_ATTEMPTS_CODE,
+                    })),
+                ).into_response();
             }
         };
 
@@ -4053,11 +4113,259 @@ async fn refuse_key_egress_for_verified_minor(
             operation = %operation,
             "verified_minor raw-key egress refused"
         );
-        return Err(AuthError::Forbidden(
-            "Operation denied by policy".to_string(),
-        ));
+        return Err(AuthError::KeyEgressDenied);
     }
     Ok(())
+}
+
+/// Build an auth event for one raw-key egress outcome.
+#[allow(clippy::too_many_arguments)]
+fn key_egress_event_record(
+    headers: &HeaderMap,
+    tenant_id: i64,
+    endpoint: &'static str,
+    outcome: &'static str,
+    reason_code: Option<&str>,
+    http_status: i32,
+    pubkey: &str,
+    metadata_json: serde_json::Value,
+) -> keycast_core::repositories::AuthEventRecord {
+    super::auth_observability::auth_event_record_and_log(
+        headers,
+        None,
+        super::auth_observability::AuthEvent {
+            tenant_id,
+            endpoint,
+            event_type: KEY_EGRESS_EVENT_TYPE,
+            outcome,
+            reason_code,
+            http_status,
+            email: None,
+            pubkey: Some(pubkey),
+            client_id: None,
+            redirect_origin: None,
+            metadata_json,
+        },
+    )
+}
+
+/// Record one raw-key egress outcome in its own short database operation.
+#[allow(clippy::too_many_arguments)]
+async fn record_key_egress_event(
+    pool: &PgPool,
+    headers: &HeaderMap,
+    tenant_id: i64,
+    endpoint: &'static str,
+    outcome: &'static str,
+    reason_code: Option<&str>,
+    http_status: i32,
+    pubkey: &str,
+    metadata_json: serde_json::Value,
+) -> Result<(), AuthError> {
+    let record = key_egress_event_record(
+        headers,
+        tenant_id,
+        endpoint,
+        outcome,
+        reason_code,
+        http_status,
+        pubkey,
+        metadata_json,
+    );
+    AuthEventRepository::new(pool.clone())
+        .record(record)
+        .await?;
+    Ok(())
+}
+
+/// Record one raw-key egress outcome inside the caller's transaction.
+#[allow(clippy::too_many_arguments)]
+async fn record_key_egress_event_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    headers: &HeaderMap,
+    tenant_id: i64,
+    endpoint: &'static str,
+    outcome: &'static str,
+    reason_code: Option<&str>,
+    http_status: i32,
+    pubkey: &str,
+    metadata_json: serde_json::Value,
+) -> Result<(), AuthError> {
+    let record = key_egress_event_record(
+        headers,
+        tenant_id,
+        endpoint,
+        outcome,
+        reason_code,
+        http_status,
+        pubkey,
+        metadata_json,
+    );
+    AuthEventRepository::record_in_transaction(tx, record).await?;
+    Ok(())
+}
+
+fn key_egress_unavailable(message: &str) -> AuthError {
+    AuthError::ServiceUnavailable {
+        message: message.to_string(),
+        retry_after: Some(1),
+    }
+}
+
+fn password_verification_error(error: PasswordVerificationError) -> AuthError {
+    tracing::error!(
+        error = %error,
+        "raw-key egress password verification unavailable"
+    );
+    key_egress_unavailable("Password verification is temporarily unavailable. Please retry.")
+}
+
+async fn reserve_key_egress_attempt(
+    redis: Option<&crate::PrefixedRedis>,
+    tenant_id: i64,
+    current_pubkey: &str,
+    endpoint: &'static str,
+) -> Result<KeyEgressReservation, AuthError> {
+    let redis = redis.ok_or_else(|| {
+        key_egress_unavailable("Key egress protection is temporarily unavailable. Please retry.")
+    })?;
+    match KeyEgressLimiter::new(redis.clone())
+        .reserve(tenant_id, current_pubkey)
+        .await
+    {
+        Ok(KeyEgressAdmission::Reserved(reservation)) => Ok(reservation),
+        Ok(KeyEgressAdmission::Locked { retry_after }) => {
+            // The fifth durable wrong-password audit row records entry into
+            // lockout. Preserve aggregate denial volume here without making
+            // each subsequent refusal a synchronous database write.
+            METRICS.observe_auth_request(
+                endpoint,
+                "failure",
+                Some("rate_limited"),
+                StdDuration::ZERO,
+            );
+            tracing::warn!(
+                event = "key_egress_rate_limited",
+                endpoint,
+                retry_after_seconds = retry_after,
+                "raw-key egress refused after repeated wrong passwords"
+            );
+            Err(AuthError::TooManyRequests {
+                message: "Too many incorrect passwords. Please wait before trying again."
+                    .to_string(),
+                retry_after,
+            })
+        }
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "raw-key egress Redis admission failed"
+            );
+            Err(key_egress_unavailable(
+                "Key egress protection is temporarily unavailable. Please retry.",
+            ))
+        }
+    }
+}
+
+async fn begin_key_egress_attempt(
+    verifier: &PasswordVerifier,
+    redis: Option<&crate::PrefixedRedis>,
+    tenant_id: i64,
+    current_pubkey: &str,
+    endpoint: &'static str,
+) -> Result<
+    (
+        PasswordVerificationPermit,
+        KeyEgressReservation,
+        tokio::time::Instant,
+    ),
+    AuthError,
+> {
+    // CPU admission must happen before Redis admission: waiting for scarce
+    // bcrypt capacity must never consume one of the account's attempt leases.
+    let verifier = verifier
+        .acquire()
+        .await
+        .map_err(password_verification_error)?;
+    let reserved_work_deadline = tokio::time::Instant::now() + KEY_EGRESS_RESERVED_WORK_DEADLINE;
+    let reservation =
+        reserve_key_egress_attempt(redis, tenant_id, current_pubkey, endpoint).await?;
+    Ok((verifier, reservation, reserved_work_deadline))
+}
+
+async fn release_key_egress_reservation(
+    reservation: KeyEgressReservation,
+) -> Result<(), AuthError> {
+    match tokio::time::timeout(KEY_EGRESS_FINALIZATION_DEADLINE, reservation.release()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            tracing::error!(
+                error = %error,
+                "raw-key egress reservation release failed"
+            );
+            Err(key_egress_unavailable(
+                "Key egress protection is temporarily unavailable. Please retry.",
+            ))
+        }
+        Err(_) => Err(key_egress_unavailable(
+            "Key egress protection timed out. Please retry.",
+        )),
+    }
+}
+
+async fn record_key_egress_failure(reservation: KeyEgressReservation) -> Result<(), AuthError> {
+    match tokio::time::timeout(
+        KEY_EGRESS_FINALIZATION_DEADLINE,
+        reservation.record_failure(),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            tracing::error!(
+                error = %error,
+                "raw-key egress failure conversion failed"
+            );
+            Err(key_egress_unavailable(
+                "Key egress protection is temporarily unavailable. Please retry.",
+            ))
+        }
+        Err(_) => Err(key_egress_unavailable(
+            "Key egress protection timed out. Please retry.",
+        )),
+    }
+}
+
+/// Enforce the policy gate that must outrank password-attempt state.
+async fn enforce_key_egress_policy(
+    pool: &PgPool,
+    headers: &HeaderMap,
+    user_repo: &UserRepository,
+    tenant_id: i64,
+    user_pubkey: &str,
+    endpoint: &'static str,
+    operation: &str,
+) -> Result<(), AuthError> {
+    match refuse_key_egress_for_verified_minor(user_repo, tenant_id, user_pubkey, operation).await {
+        Ok(()) => Ok(()),
+        Err(AuthError::KeyEgressDenied) => {
+            record_key_egress_event(
+                pool,
+                headers,
+                tenant_id,
+                endpoint,
+                "failure",
+                Some("policy_denied"),
+                403,
+                user_pubkey,
+                serde_json::json!({}),
+            )
+            .await?;
+            Err(AuthError::KeyEgressDenied)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Export user's private key (requires password and verified email)
@@ -4073,42 +4381,151 @@ pub async fn export_key(
     let key_manager = auth_state.state.key_manager.as_ref();
     let user_repo = UserRepository::new(pool.clone());
 
-    // verified_minor accounts cannot export their raw key (support-trust-safety#188).
-    refuse_key_egress_for_verified_minor(&user_repo, tenant_id, &user_pubkey, "export_key").await?;
+    enforce_key_egress_policy(
+        pool,
+        &headers,
+        &user_repo,
+        tenant_id,
+        &user_pubkey,
+        EXPORT_KEY_ENDPOINT,
+        "export_key",
+    )
+    .await?;
 
-    // Extract password and format from request
-    let password = req
-        .get("password")
-        .and_then(|v| v.as_str())
-        .ok_or(AuthError::BadRequest("Missing password".to_string()))?;
+    let password = match req.get("password").and_then(|v| v.as_str()) {
+        Some(password) => password.to_string(),
+        None => {
+            record_key_egress_event(
+                pool,
+                &headers,
+                tenant_id,
+                EXPORT_KEY_ENDPOINT,
+                "failure",
+                Some("missing_password"),
+                400,
+                &user_pubkey,
+                serde_json::json!({}),
+            )
+            .await?;
+            return Err(AuthError::BadRequest("Missing password".to_string()));
+        }
+    };
 
-    let format = req.get("format").and_then(|v| v.as_str()).unwrap_or("nsec");
+    let format = req
+        .get("format")
+        .and_then(|value| value.as_str())
+        .unwrap_or("nsec")
+        .to_string();
 
-    // Verify password and email verification status
-    let result = user_repo
-        .find_with_password_and_verified(&user_pubkey, tenant_id)
-        .await?;
+    // CPU admission happens before Redis reservation. Waiting for verifier
+    // capacity therefore cannot consume an attempt slot.
+    let (verifier, reservation, reserved_work_deadline) = begin_key_egress_attempt(
+        &KEY_EGRESS_PASSWORD_VERIFIER,
+        auth_state.state.redis.as_ref(),
+        tenant_id,
+        &user_pubkey,
+        EXPORT_KEY_ENDPOINT,
+    )
+    .await?;
 
-    let (_email, password_hash, email_verified) = result.ok_or(AuthError::UserNotFound)?;
-
-    // Require email verification
-    if !email_verified {
-        return Err(AuthError::EmailNotVerified);
+    enum PasswordOutcome {
+        Correct,
+        Incorrect,
+        EmailNotVerified,
     }
 
-    let valid = verify(password, &password_hash)
-        .map_err(|_| AuthError::Internal("Password verification failed".to_string()))?;
+    let password_outcome = tokio::time::timeout_at(reserved_work_deadline, async {
+        let result = user_repo
+            .find_with_password_and_verified(&user_pubkey, tenant_id)
+            .await?;
+        let (_email, password_hash, email_verified) = result.ok_or(AuthError::UserNotFound)?;
+        if !email_verified {
+            return Ok::<PasswordOutcome, AuthError>(PasswordOutcome::EmailNotVerified);
+        }
+        let valid = verifier
+            .verify(password, password_hash)
+            .await
+            .map_err(password_verification_error)?;
+        Ok(if valid {
+            PasswordOutcome::Correct
+        } else {
+            PasswordOutcome::Incorrect
+        })
+    })
+    .await;
 
-    if !valid {
-        return Err(AuthError::InvalidCredentials);
+    match password_outcome {
+        Err(_) => {
+            release_key_egress_reservation(reservation).await?;
+            return Err(key_egress_unavailable(
+                "Password verification timed out. Please retry.",
+            ));
+        }
+        Ok(Err(error)) => {
+            release_key_egress_reservation(reservation).await?;
+            return Err(error);
+        }
+        Ok(Ok(PasswordOutcome::EmailNotVerified)) => {
+            release_key_egress_reservation(reservation).await?;
+            record_key_egress_event(
+                pool,
+                &headers,
+                tenant_id,
+                EXPORT_KEY_ENDPOINT,
+                "failure",
+                Some("email_not_verified"),
+                403,
+                &user_pubkey,
+                serde_json::json!({}),
+            )
+            .await?;
+            return Err(AuthError::EmailNotVerified);
+        }
+        Ok(Ok(PasswordOutcome::Incorrect)) => {
+            // Redis is the security counter. Convert before the forensic DB
+            // audit so an audit failure cannot refund the attempt.
+            record_key_egress_failure(reservation).await?;
+            record_key_egress_event(
+                pool,
+                &headers,
+                tenant_id,
+                EXPORT_KEY_ENDPOINT,
+                "failure",
+                Some(KEY_EGRESS_INVALID_PASSWORD_REASON),
+                401,
+                &user_pubkey,
+                serde_json::json!({}),
+            )
+            .await?;
+            return Err(AuthError::InvalidCredentials);
+        }
+        Ok(Ok(PasswordOutcome::Correct)) => {
+            release_key_egress_reservation(reservation).await?;
+        }
     }
 
-    // Get user's encrypted secret key
     let personal_keys_repo = PersonalKeysRepository::new(pool.clone());
-    let encrypted_key = personal_keys_repo
+    let encrypted_key = match personal_keys_repo
         .find_encrypted_key_for_tenant(&user_pubkey, tenant_id)
         .await?
-        .ok_or(AuthError::UserNotFound)?;
+    {
+        Some(encrypted_key) => encrypted_key,
+        None => {
+            record_key_egress_event(
+                pool,
+                &headers,
+                tenant_id,
+                EXPORT_KEY_ENDPOINT,
+                "failure",
+                Some("missing_personal_key"),
+                404,
+                &user_pubkey,
+                serde_json::json!({}),
+            )
+            .await?;
+            return Err(AuthError::UserNotFound);
+        }
+    };
 
     // Decrypt the secret key
     let decrypted_secret = key_manager
@@ -4116,22 +4533,45 @@ pub async fn export_key(
         .await
         .map_err(|e| AuthError::Internal(format!("Failed to decrypt key: {}", e)))?;
 
-    // Parse the secret key
     let keys = Keys::parse(&hex::encode(&decrypted_secret))
         .map_err(|e| AuthError::Internal(format!("Failed to parse key: {}", e)))?;
 
-    // Format the key based on requested format
-    let key_string = match format {
+    let key_string = match format.as_str() {
         "nsec" => keys
             .secret_key()
             .to_bech32()
             .map_err(|e| AuthError::Internal(format!("Failed to encode nsec: {}", e)))?,
         _ => {
+            record_key_egress_event(
+                pool,
+                &headers,
+                tenant_id,
+                EXPORT_KEY_ENDPOINT,
+                "failure",
+                Some("invalid_format"),
+                400,
+                &user_pubkey,
+                serde_json::json!({ "format": format }),
+            )
+            .await?;
             return Err(AuthError::BadRequest(
                 "Invalid format. Must be 'nsec'".to_string(),
-            ))
+            ));
         }
     };
+
+    record_key_egress_event(
+        pool,
+        &headers,
+        tenant_id,
+        EXPORT_KEY_ENDPOINT,
+        "success",
+        None,
+        200,
+        &user_pubkey,
+        serde_json::json!({}),
+    )
+    .await?;
 
     Ok(Json(ExportKeyResponse { key: key_string }))
 }
@@ -4149,29 +4589,115 @@ pub async fn change_key(
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
     let user_repo = UserRepository::new(pool.clone());
+    let ChangeKeyRequest { password, nsec } = req;
+    let byok = nsec.is_some();
 
-    // verified_minor accounts cannot swap to a self-held key (support-trust-safety#188).
-    refuse_key_egress_for_verified_minor(&user_repo, tenant_id, &old_pubkey, "change_key").await?;
+    enforce_key_egress_policy(
+        pool,
+        &headers,
+        &user_repo,
+        tenant_id,
+        &old_pubkey,
+        CHANGE_KEY_ENDPOINT,
+        "change_key",
+    )
+    .await?;
 
-    // Get user's email and verify password
-    let (email, password_hash) = user_repo
-        .get_credentials(&old_pubkey, tenant_id)
-        .await?
-        .ok_or(AuthError::UserNotFound)?;
+    let (verifier, reservation, reserved_work_deadline) = begin_key_egress_attempt(
+        &KEY_EGRESS_PASSWORD_VERIFIER,
+        auth_state.state.redis.as_ref(),
+        tenant_id,
+        &old_pubkey,
+        CHANGE_KEY_ENDPOINT,
+    )
+    .await?;
 
-    // Verify password
-    let valid = verify(&req.password, &password_hash)
-        .map_err(|_| AuthError::Internal("Password verification failed".to_string()))?;
-
-    if !valid {
-        return Err(AuthError::InvalidCredentials);
+    enum ChangePasswordOutcome {
+        Correct {
+            email: String,
+            password_hash: String,
+        },
+        Incorrect,
     }
 
-    // Generate or parse new key
-    let new_keys = if let Some(ref nsec_str) = req.nsec {
+    let password_outcome = tokio::time::timeout_at(reserved_work_deadline, async {
+        let (email, password_hash) = user_repo
+            .get_credentials(&old_pubkey, tenant_id)
+            .await?
+            .ok_or(AuthError::UserNotFound)?;
+        let valid = verifier
+            .verify(password, password_hash.clone())
+            .await
+            .map_err(password_verification_error)?;
+        Ok::<ChangePasswordOutcome, AuthError>(if valid {
+            ChangePasswordOutcome::Correct {
+                email,
+                password_hash,
+            }
+        } else {
+            ChangePasswordOutcome::Incorrect
+        })
+    })
+    .await;
+
+    let (email, password_hash) = match password_outcome {
+        Err(_) => {
+            release_key_egress_reservation(reservation).await?;
+            return Err(key_egress_unavailable(
+                "Password verification timed out. Please retry.",
+            ));
+        }
+        Ok(Err(error)) => {
+            release_key_egress_reservation(reservation).await?;
+            return Err(error);
+        }
+        Ok(Ok(ChangePasswordOutcome::Incorrect)) => {
+            record_key_egress_failure(reservation).await?;
+            record_key_egress_event(
+                pool,
+                &headers,
+                tenant_id,
+                CHANGE_KEY_ENDPOINT,
+                "failure",
+                Some(KEY_EGRESS_INVALID_PASSWORD_REASON),
+                401,
+                &old_pubkey,
+                serde_json::json!({}),
+            )
+            .await?;
+            return Err(AuthError::InvalidCredentials);
+        }
+        Ok(Ok(ChangePasswordOutcome::Correct {
+            email,
+            password_hash,
+        })) => {
+            release_key_egress_reservation(reservation).await?;
+            (email, password_hash)
+        }
+    };
+
+    let new_keys = if let Some(ref nsec_string) = nsec {
         tracing::info!("User provided new key (BYOK) for change");
-        Keys::parse(nsec_str)
-            .map_err(|e| AuthError::Internal(format!("Invalid nsec or secret key: {}", e)))?
+        match Keys::parse(nsec_string) {
+            Ok(keys) => keys,
+            Err(error) => {
+                record_key_egress_event(
+                    pool,
+                    &headers,
+                    tenant_id,
+                    CHANGE_KEY_ENDPOINT,
+                    "failure",
+                    Some("invalid_nsec"),
+                    500,
+                    &old_pubkey,
+                    serde_json::json!({ "byok": true }),
+                )
+                .await?;
+                return Err(AuthError::Internal(format!(
+                    "Invalid nsec or secret key: {error}"
+                )));
+            }
+        }
     } else {
         tracing::info!("Auto-generating new key for change");
         Keys::generate()
@@ -4180,30 +4706,111 @@ pub async fn change_key(
     let new_pubkey = new_keys.public_key().to_hex();
     let new_secret_bytes = new_keys.secret_key().to_secret_bytes();
 
-    // Check if new pubkey already exists in this tenant
     if user_repo.exists(&new_pubkey, tenant_id).await? {
+        record_key_egress_event(
+            pool,
+            &headers,
+            tenant_id,
+            CHANGE_KEY_ENDPOINT,
+            "failure",
+            Some("duplicate_key"),
+            409,
+            &old_pubkey,
+            serde_json::json!({
+                "new_pubkey": new_pubkey,
+                "byok": byok,
+            }),
+        )
+        .await?;
         return Err(AuthError::DuplicateKey);
     }
 
-    // Encrypt new secret key (as raw 32 bytes, consistent with registration)
-    let encrypted_secret = key_manager
-        .encrypt(&new_secret_bytes)
-        .await
-        .map_err(|e| AuthError::Encryption(e.to_string()))?;
+    let encrypted_secret = match key_manager.encrypt(&new_secret_bytes).await {
+        Ok(encrypted_secret) => encrypted_secret,
+        Err(error) => {
+            record_key_egress_event(
+                pool,
+                &headers,
+                tenant_id,
+                CHANGE_KEY_ENDPOINT,
+                "failure",
+                Some("encryption_failed"),
+                500,
+                &old_pubkey,
+                serde_json::json!({
+                    "new_pubkey": new_pubkey,
+                    "byok": byok,
+                }),
+            )
+            .await?;
+            return Err(AuthError::Encryption(error.to_string()));
+        }
+    };
 
-    // Execute key change transaction
-    let oauth_count = user_repo
-        .change_key_transaction(
-            &old_pubkey,
-            &new_pubkey,
+    // Every fallible response input is ready before custody can mutate.
+    let redirect_origin = extract_origin_from_headers(&headers)?;
+    let ucan_token =
+        generate_ucan_token(&new_keys, tenant_id, &email, &redirect_origin, None, None).await?;
+    let cookie = format!(
+        "keycast_session={ucan_token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400"
+    );
+
+    let mutation = async {
+        let mut transaction = pool.begin().await?;
+        let oauth_count = user_repo
+            .change_key_in_transaction(
+                &mut transaction,
+                &old_pubkey,
+                &new_pubkey,
+                tenant_id,
+                &email,
+                &password_hash,
+                &encrypted_secret,
+            )
+            .await?;
+        record_key_egress_event_in_transaction(
+            &mut transaction,
+            &headers,
             tenant_id,
-            &email,
-            &password_hash,
-            &encrypted_secret,
+            CHANGE_KEY_ENDPOINT,
+            "success",
+            None,
+            200,
+            &old_pubkey,
+            serde_json::json!({
+                "new_pubkey": new_pubkey,
+                "byok": byok,
+                "oauth_authorizations_deleted": oauth_count,
+            }),
         )
         .await?;
+        transaction.commit().await?;
+        Ok::<i64, AuthError>(oauth_count)
+    }
+    .await;
 
-    // Signal signer daemon to remove old authorizations
+    let oauth_count = match mutation {
+        Ok(oauth_count) => oauth_count,
+        Err(error) => {
+            record_key_egress_event(
+                pool,
+                &headers,
+                tenant_id,
+                CHANGE_KEY_ENDPOINT,
+                "failure",
+                Some("change_key_failed"),
+                500,
+                &old_pubkey,
+                serde_json::json!({
+                    "new_pubkey": new_pubkey,
+                    "byok": byok,
+                }),
+            )
+            .await?;
+            return Err(error);
+        }
+    };
+
     if let Some(tx) = &auth_state.auth_tx {
         use keycast_core::authorization_channel::AuthorizationCommand;
         if let Err(e) = tx
@@ -4221,29 +4828,6 @@ pub async fn change_key(
         old_pubkey,
         new_pubkey,
         oauth_count
-    );
-
-    // Issue new UCAN session cookie signed by the new key
-    let redirect_origin = extract_origin_from_headers(&headers)?;
-    let change_key_status = user_repo
-        .get_user_status(&new_pubkey, tenant_id)
-        .await
-        .ok()
-        .flatten()
-        .map(|(s, _, _)| s);
-    let ucan_token = generate_ucan_token(
-        &new_keys,
-        tenant_id,
-        &email,
-        &redirect_origin,
-        None,
-        change_key_status.as_ref(),
-    )
-    .await?;
-
-    let cookie = format!(
-        "keycast_session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400",
-        ucan_token
     );
 
     let response = ChangeKeyResponse {
@@ -4394,6 +4978,56 @@ mod tests {
     use super::validate_origin;
     use super::AccountStatusResponse;
     use axum::response::IntoResponse;
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn verifier_capacity_is_acquired_before_a_redis_attempt_lease() {
+        use crate::password_verifier::PasswordVerifier;
+        use crate::PrefixedRedis;
+        use redis::aio::ConnectionManager;
+        use std::time::Duration as StdDuration;
+        use uuid::Uuid;
+
+        let redis_url = std::env::var("TEST_REDIS_URL")
+            .expect("TEST_REDIS_URL must name the dedicated test Redis");
+        let client = redis::Client::open(redis_url).expect("valid Redis URL");
+        let connection = ConnectionManager::new(client.clone())
+            .await
+            .expect("connect to Redis");
+        let prefix = format!("keycast-pr326-independent-review:{}", Uuid::new_v4());
+        let redis = PrefixedRedis::new(connection, Some(prefix.clone()));
+        let verifier = PasswordVerifier::new(1, StdDuration::from_millis(10));
+        let held = verifier.acquire().await.expect("occupy verifier capacity");
+
+        let error = super::begin_key_egress_attempt(
+            &verifier,
+            Some(&redis),
+            1,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            super::EXPORT_KEY_ENDPOINT,
+        )
+        .await
+        .expect_err("occupied verifier must load-shed");
+        assert!(
+            matches!(error, super::AuthError::ServiceUnavailable { .. }),
+            "verifier overload should surface as temporary unavailability: {error:?}"
+        );
+
+        let mut raw = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("raw Redis connection");
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg(format!("{prefix}:key_egress:*"))
+            .query_async(&mut raw)
+            .await
+            .expect("list limiter keys");
+        assert!(
+            keys.is_empty(),
+            "load shedding before CPU admission must not create an attempt lease: {keys:?}"
+        );
+        drop(held);
+    }
 
     #[test]
     fn account_status_active_minor_surfaces_flag_without_status() {
