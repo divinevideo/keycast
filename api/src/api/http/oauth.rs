@@ -2662,8 +2662,8 @@ async fn handle_refresh_token_grant_inner(
         keycast_core::bunker_key::derive_bunker_keys(&user_secret_key, &oauth_auth.secret_hash);
     let bunker_public_key = bunker_keys.public_key();
 
-    // Generate new UCAN access token (server-signed)
-    // Note: refresh tokens don't preserve first_party status - users need fresh headless login
+    // Generate new UCAN access token (server-signed). First-party status belongs to the
+    // authorization, not to a single access token, so refresh rotation preserves it.
     let stored_pubkey =
         nostr_sdk::PublicKey::from_hex(&oauth_auth.user_pubkey).map_err(|error| {
             refresh_grant_rejection(
@@ -2679,7 +2679,7 @@ async fn handle_refresh_token_grant_inner(
         &oauth_auth.redirect_origin,
         Some(&bunker_public_key.to_hex()),
         &auth_state.state.server_keys,
-        false, // Refresh tokens are not first-party
+        oauth_auth.is_first_party,
         None,
         user_status.as_ref(),
     )
@@ -3167,6 +3167,7 @@ async fn create_oauth_authorization_and_token(
             secret_hash,
             relays: relays_json.clone(),
             policy_id: Some(policy_id),
+            is_first_party: is_headless,
             client_pubkey: None,
             authorization_handle: Some(authorization_handle.clone()),
             handle_expires_at,
@@ -4326,6 +4327,7 @@ pub async fn connect_post(
             secret_hash,
             relays: relays_json.clone(),
             policy_id: None,
+            is_first_party: false,
             client_pubkey: Some(form.client_pubkey.clone()),
             authorization_handle: Some(authorization_handle.clone()),
             handle_expires_at,

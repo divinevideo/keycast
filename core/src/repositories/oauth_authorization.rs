@@ -18,6 +18,7 @@ pub struct CreateOAuthAuthorizationParams {
     pub secret_hash: String,
     pub relays: String,
     pub policy_id: Option<i32>,
+    pub is_first_party: bool,
     pub client_pubkey: Option<String>,
     pub authorization_handle: Option<String>,
     pub handle_expires_at: DateTime<Utc>,
@@ -43,7 +44,7 @@ impl OAuthAuthorizationRepository {
             "SELECT id, user_pubkey, redirect_origin, client_id, bunker_public_key,
                     secret_hash, relays, policy_id, tenant_id, client_pubkey, connected_client_pubkey,
                     connected_at, created_at, updated_at, revoked_at, expires_at,
-                    handle_expires_at, authorization_handle
+                    handle_expires_at, authorization_handle, is_first_party
              FROM oauth_authorizations WHERE tenant_id = $1 AND id = $2",
         )
         .bind(tenant_id)
@@ -112,9 +113,9 @@ impl OAuthAuthorizationRepository {
         sqlx::query_scalar::<_, i32>(
             "INSERT INTO oauth_authorizations
              (tenant_id, user_pubkey, redirect_origin, client_id, bunker_public_key,
-              secret_hash, relays, policy_id, client_pubkey, authorization_handle, handle_expires_at,
-              created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+              secret_hash, relays, policy_id, is_first_party, client_pubkey, authorization_handle,
+              handle_expires_at, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
              RETURNING id",
         )
         .bind(params.tenant_id)
@@ -125,6 +126,7 @@ impl OAuthAuthorizationRepository {
         .bind(&params.secret_hash)
         .bind(&params.relays)
         .bind(params.policy_id)
+        .bind(params.is_first_party)
         .bind(&params.client_pubkey)
         .bind(&params.authorization_handle)
         .bind(params.handle_expires_at)
@@ -510,6 +512,49 @@ mod tests {
 
         let result = repo.find(1, 999999).await;
         assert!(matches!(result, Err(RepositoryError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_create_and_find_preserves_first_party_flag() {
+        use nostr_sdk::Keys;
+        use uuid::Uuid;
+
+        let pool = setup_pool().await;
+        let repo = OAuthAuthorizationRepository::new(pool.clone());
+
+        let user = Keys::generate().public_key().to_hex();
+        let bunker_pubkey = Keys::generate().public_key().to_hex();
+        let origin = format!("https://first-party-{}.example.com", Uuid::new_v4());
+
+        sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW()) ON CONFLICT (pubkey) DO NOTHING")
+            .bind(&user)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let id = repo
+            .create(CreateOAuthAuthorizationParams {
+                tenant_id: 1,
+                user_pubkey: user.clone(),
+                redirect_origin: origin,
+                client_id: "First Party".to_string(),
+                bunker_public_key: bunker_pubkey,
+                secret_hash: "$2b$10$test_hash".to_string(),
+                relays: "[]".to_string(),
+                policy_id: None,
+                is_first_party: true,
+                client_pubkey: None,
+                authorization_handle: None,
+                handle_expires_at: Utc::now() + chrono::Duration::days(30),
+            })
+            .await
+            .unwrap();
+
+        let authorization = repo.find(1, id).await.unwrap();
+        assert!(
+            authorization.is_first_party,
+            "refresh rotation must be able to recover first-party session authority"
+        );
     }
 
     #[tokio::test]
