@@ -628,7 +628,7 @@ async fn crosspost_enable_reconciles_app_claimed_username() {
 }
 
 #[tokio::test]
-async fn enable_dependency_failure_marks_failed_state_with_safe_message() {
+async fn enable_dependency_failure_rolls_back_the_opt_in() {
     let pool = common::setup_test_db().await;
     let repo = UserRepository::new(pool.clone());
     let tenant_id = 1_i64;
@@ -669,13 +669,63 @@ async fn enable_dependency_failure_marks_failed_state_with_safe_message() {
         .await
         .expect("status should succeed");
     assert_eq!(response.username.as_deref(), Some(username.as_str()));
-    assert!(response.enabled);
+    // The opt-in is written before the trigger runs, so a failed trigger must
+    // take it back — otherwise the account reads as publishing with no repo
+    // behind it, and switching it off needs the control plane that just failed.
+    assert!(!response.enabled);
     assert_eq!(response.state.as_deref(), Some("failed"));
     assert_eq!(response.did, None);
     assert_eq!(
         response.error.as_deref(),
         Some("ATProto enablement is temporarily unavailable. Please try again later."),
     );
+}
+
+#[tokio::test]
+async fn disable_trigger_failure_clears_a_stuck_unprovisioned_opt_in() {
+    let pool = common::setup_test_db().await;
+    let repo = UserRepository::new(pool.clone());
+    let session_repo = AtprotoOAuthSessionRepository::new(pool.clone());
+    let tenant_id = 1_i64;
+
+    let keys = Keys::generate();
+    let user_pubkey = keys.public_key().to_hex();
+    let username = format!("alice-disable-stuck-{}", &user_pubkey[..8]);
+
+    // The shape a failed enable left behind before the rollback above shipped.
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, username, atproto_enabled, atproto_state, created_at, updated_at)
+         VALUES ($1, $2, $3, true, 'failed', NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .bind(&username)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    let response = disable_user_atproto_with_trigger(
+        &repo,
+        &session_repo,
+        tenant_id,
+        &user_pubkey,
+        |_pubkey| async {
+            Err(
+                keycast_api::atproto_provisioning::AtprotoProvisioningError::DependencyNotConfigured,
+            )
+        },
+    )
+    .await
+    .expect("disable should succeed without a provisioned account");
+
+    assert!(!response.enabled);
+    assert_eq!(response.state.as_deref(), Some("disabled"));
+
+    let status = get_user_atproto_status(&repo, tenant_id, &user_pubkey)
+        .await
+        .expect("status should succeed");
+    assert!(!status.enabled);
+    assert_eq!(status.state.as_deref(), Some("disabled"));
 }
 
 #[tokio::test]
@@ -1280,6 +1330,52 @@ async fn crosspost_disable_uses_disable_trigger() {
     assert_eq!(opt_in_calls.load(Ordering::SeqCst), 0);
     assert_eq!(reenable_calls.load(Ordering::SeqCst), 0);
     assert_eq!(disable_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn crosspost_disable_releases_a_stuck_account_during_an_outage() {
+    let pool = common::setup_test_db().await;
+    let repo = UserRepository::new(pool.clone());
+    let session_repo = AtprotoOAuthSessionRepository::new(pool.clone());
+    let tenant_id = 1_i64;
+
+    let keys = Keys::generate();
+    let user_pubkey = keys.public_key().to_hex();
+    let username = format!("alice-stuck-crosspost-{}", &user_pubkey[..8]);
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, username, atproto_enabled, atproto_state, created_at, updated_at)
+         VALUES ($1, $2, $3, true, 'failed', NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .bind(&username)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    let response = set_user_atproto_crosspost(
+        SetCrosspostContext {
+            user_repo: &repo,
+            session_repo: &session_repo,
+            tenant_id,
+            authenticated_user_pubkey: &user_pubkey,
+            requested_pubkey: &user_pubkey,
+            enabled: false,
+        },
+        |_pubkey, _requested_username, _crosspost_enabled| async { Ok(()) },
+        |_pubkey| async { Ok(()) },
+        |_pubkey| async {
+            Err(
+                keycast_api::atproto_provisioning::AtprotoProvisioningError::DependencyNotConfigured,
+            )
+        },
+    )
+    .await
+    .expect("crosspost disable should not need a reachable control plane here");
+
+    assert!(!response.enabled);
+    assert_eq!(response.state.as_deref(), Some("disabled"));
 }
 
 #[tokio::test]

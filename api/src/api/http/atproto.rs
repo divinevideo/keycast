@@ -312,20 +312,39 @@ where
         .ok_or(AtprotoControlError::UsernameNotClaimed)?;
 
     if let Err(error) = trigger(user_pubkey.to_string(), username.clone()).await {
-        let error_message = error.public_message();
-        repo.set_atproto_state(
-            user_pubkey,
-            tenant_id,
-            true,
-            Some("failed"),
-            None,
-            Some(error_message),
-        )
-        .await?;
+        roll_back_failed_enable(repo, tenant_id, user_pubkey, &error).await?;
         return Err(AtprotoControlError::ProvisioningTrigger(error));
     }
 
     Ok(response)
+}
+
+/// Clears the opt-in that [`enable_user_atproto`] wrote ahead of the trigger.
+///
+/// The enabled flag is set before the control plane is called, so a failed
+/// trigger leaves an opt-in that exists nowhere but this row. Keeping it makes
+/// the account read as "publishing" while no repo exists, and traps the user:
+/// turning it back off needs a control-plane call the same outage is refusing.
+/// If the trigger did reach the control plane before failing, provisioning
+/// reports back through the internal sync endpoint and the state converges
+/// there.
+async fn roll_back_failed_enable(
+    repo: &UserRepository,
+    tenant_id: i64,
+    user_pubkey: &str,
+    error: &crate::atproto_provisioning::AtprotoProvisioningError,
+) -> Result<(), AtprotoControlError> {
+    repo.set_atproto_state(
+        user_pubkey,
+        tenant_id,
+        false,
+        Some("failed"),
+        None,
+        Some(error.public_message()),
+    )
+    .await?;
+
+    Ok(())
 }
 
 pub async fn reenable_user_atproto(
@@ -364,16 +383,7 @@ where
     let response = reenable_user_atproto(repo, tenant_id, user_pubkey).await?;
 
     if let Err(error) = trigger(user_pubkey.to_string()).await {
-        let error_message = error.public_message();
-        repo.set_atproto_state(
-            user_pubkey,
-            tenant_id,
-            true,
-            Some("failed"),
-            None,
-            Some(error_message),
-        )
-        .await?;
+        roll_back_failed_enable(repo, tenant_id, user_pubkey, &error).await?;
         return Err(AtprotoControlError::ProvisioningTrigger(error));
     }
 
@@ -484,9 +494,27 @@ where
         .await?
         .ok_or(AtprotoControlError::UserNotFound)?;
 
-    trigger(user_pubkey.to_string())
-        .await
-        .map_err(AtprotoControlError::ProvisioningTrigger)?;
+    let current = user_repo
+        .get_atproto_state(user_pubkey, tenant_id)
+        .await?
+        .ok_or(AtprotoControlError::UserNotFound)?;
+
+    if let Err(error) = trigger(user_pubkey.to_string()).await {
+        // A provisioned account has a live repo that can keep publishing, so
+        // reporting "off" without the control plane agreeing would be a lie.
+        // Without a DID there is nothing to publish from, and refusing here is
+        // what strands an account that a failed enable already left switched
+        // on: every attempt to switch it back off hits the same outage.
+        if current.did.is_some() {
+            return Err(AtprotoControlError::ProvisioningTrigger(error));
+        }
+
+        tracing::warn!(
+            "Disabling unprovisioned ATProto account for pubkey {} locally after control-plane failure: {}",
+            user_pubkey,
+            error
+        );
+    }
 
     disable_user_atproto_and_revoke_sessions(user_repo, session_repo, tenant_id, user_pubkey).await
 }
