@@ -167,6 +167,7 @@ async fn store_oauth_code(
     expires_at: chrono::DateTime<Utc>,
     previous_auth_id: Option<i32>,
     state: Option<&str>,
+    is_headless: bool,
 ) -> Result<(), OAuthError> {
     let repo = OAuthCodeRepository::new(pool.clone());
     repo.store(StoreOAuthCodeParams {
@@ -181,7 +182,7 @@ async fn store_oauth_code(
         expires_at,
         previous_auth_id,
         state,
-        is_headless: false,
+        is_headless,
     })
     .await?;
     Ok(())
@@ -649,18 +650,22 @@ pub async fn authorize_get(
 
     // Check for silent re-authentication via authorization_handle (primary mechanism)
     if let Some(ref pubkey) = user_pubkey {
-        let previous_auth_id: Option<i32> = if let Some(ref handle) = params.authorization_handle {
-            tracing::info!(
-                "Auto-approve check via authorization_handle for user {}",
-                pubkey
-            );
+        let (previous_auth_id, inherited_first_party): (Option<i32>, bool) =
+            if let Some(ref handle) = params.authorization_handle {
+                tracing::info!(
+                    "Auto-approve check via authorization_handle for user {}",
+                    pubkey
+                );
 
-            // Look up by handle, scoped to this user
-            let repo = OAuthAuthorizationRepository::new(pool.clone());
-            repo.find_id_by_handle(handle, pubkey).await?
-        } else {
-            None
-        };
+                // Look up by handle, scoped to this user
+                let repo = OAuthAuthorizationRepository::new(pool.clone());
+                match repo.find_first_party_by_handle(handle, pubkey).await? {
+                    Some((id, is_first_party)) => (Some(id), is_first_party),
+                    None => (None, false),
+                }
+            } else {
+                (None, false)
+            };
 
         tracing::info!(
             "Authorization handle lookup: found={}",
@@ -698,6 +703,7 @@ pub async fn authorize_get(
                 expires_at,
                 previous_auth_id,
                 params.state.as_deref(),
+                inherited_first_party,
             )
             .await?;
 
@@ -719,11 +725,11 @@ pub async fn authorize_get(
     if let Some(ref pubkey) = user_pubkey {
         let redirect_origin = extract_origin(&params.redirect_uri)?;
         let repo = OAuthAuthorizationRepository::new(pool.clone());
-        let has_active_origin_authorization = repo
-            .has_active_for_origin(pubkey, &redirect_origin, tenant_id)
+        let active_origin_first_party = repo
+            .active_first_party_for_origin(pubkey, &redirect_origin, tenant_id)
             .await?;
 
-        if has_active_origin_authorization {
+        if let Some(is_first_party) = active_origin_first_party {
             has_existing_authorization = true;
 
             if !force_consent {
@@ -755,6 +761,7 @@ pub async fn authorize_get(
                     expires_at,
                     None,
                     params.state.as_deref(),
+                    is_first_party,
                 )
                 .await?;
 
@@ -2351,6 +2358,7 @@ pub async fn authorize_post(
         expires_at,
         None,
         req.state.as_deref(),
+        false,
     )
     .await?;
 

@@ -104,6 +104,26 @@ impl OAuthAuthorizationRepository {
         .map_err(Into::into)
     }
 
+    pub async fn find_first_party_by_handle(
+        &self,
+        authorization_handle: &str,
+        user_pubkey: &str,
+    ) -> Result<Option<(i32, bool)>, RepositoryError> {
+        sqlx::query_as::<_, (i32, bool)>(
+            "SELECT id, is_first_party FROM oauth_authorizations
+             WHERE authorization_handle = $1
+               AND user_pubkey = $2
+               AND revoked_at IS NULL
+               AND (expires_at IS NULL OR expires_at > NOW())
+               AND handle_expires_at > NOW()",
+        )
+        .bind(authorization_handle)
+        .bind(user_pubkey)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Create a new OAuth authorization and return its ID.
     pub async fn create(
         &self,
@@ -337,6 +357,31 @@ impl OAuthAuthorizationRepository {
         .fetch_optional(&self.pool)
         .await?;
         Ok(exists.is_some())
+    }
+
+    pub async fn active_first_party_for_origin(
+        &self,
+        user_pubkey: &str,
+        redirect_origin: &str,
+        tenant_id: i64,
+    ) -> Result<Option<bool>, RepositoryError> {
+        sqlx::query_scalar(
+            "SELECT is_first_party FROM oauth_authorizations
+             WHERE user_pubkey = $1
+               AND redirect_origin = $2
+               AND tenant_id = $3
+               AND revoked_at IS NULL
+               AND (expires_at IS NULL OR expires_at > NOW())
+               AND handle_expires_at > NOW()
+             ORDER BY created_at DESC
+             LIMIT 1",
+        )
+        .bind(user_pubkey)
+        .bind(redirect_origin)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
     }
 
     /// Find the most recent bunker pubkey for a user.
