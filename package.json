@@ -22,8 +22,6 @@
 		"db:reset": "bun run deps:up && sqlx database reset -y --database-url postgres://postgres:password@localhost/keycast --source ./database/migrations",
 		"db:migrate": "bun run deps:up && sqlx migrate run --database-url postgres://postgres:password@localhost/keycast --source ./database/migrations",
 		"db:test:setup": "bun run deps:up && sqlx database setup --database-url postgres://postgres:password@localhost/keycast_test --source ./database/migrations",
-		"db:migrate:prod": "./tools/run-migrations.sh",
-		"db:sql:prod": "./tools/run-sql.sh",
 		"key:generate": "./scripts/generate_key.sh",
 		"key:generate:force": "./scripts/generate_key.sh --force",
 		"setup:hooks": "cp scripts/hooks/pre-push .git/hooks/ && chmod +x .git/hooks/pre-push",

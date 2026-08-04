@@ -134,8 +134,8 @@ impl Database {
             }
         };
 
-        // Migrations are run manually via tools/run-migrations.sh before deployment
-        // This avoids pg_advisory_lock thundering herd when many instances start simultaneously
+        // Migrations run before rollout through dedicated jobs that execute `./keycast --migrate`.
+        // Serving instances intentionally do not run sqlx::migrate! on startup.
 
         eprintln!("✅ PostgreSQL database initialized successfully");
 

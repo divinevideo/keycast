@@ -114,17 +114,17 @@ When touching OAuth, auth/session behavior, NIP-05/profile behavior, signer flow
 
 - New schema changes live in `database/migrations/` as a new timestamped migration. Do not edit shipped migrations.
 - Use SQLx for queries so compile-time verification stays meaningful. If you change a query, regenerate `sqlx-data.json` (where applicable) and commit it with the source change.
-- Locally, `bun run db:reset` recreates the dev database; `bun run db:migrate` applies new migrations. Production migrations are run via `tools/run-migrations.sh` from the deploy pipeline.
+- Locally, `bun run db:reset` recreates the dev database; `bun run db:migrate` applies new migrations. Production migrations are run by the deploy path as a dedicated one-shot job before serving rollout: the `keycast-migrate` Cloud Run Job for Cloud Run and the `keycast-db-migrate` ArgoCD sync hook for GKE. Both execute `./keycast --migrate`, which runs the embedded `sqlx::migrate!` migrations.
 
 ### Transaction-Mode Pooling
 
-Every environment runs a transaction-mode connection pooler in front of Postgres. The backend serving a connection can change between transactions, which breaks anything that assumes session continuity.
+When Keycast runs behind a transaction-mode connection pooler, the backend serving a connection can change between transactions, which breaks anything that assumes session continuity. Local dev and CI connect directly to Postgres unless explicitly using the loadtest pooler harness.
 
 - Do not use session-level `SET`; use `SET LOCAL` inside a transaction and confirm it cannot leak past its own unit of work. Do not use `LISTEN`/`NOTIFY`, `WITH HOLD` cursors, or session-scoped advisory locks. Use `pg_advisory_xact_lock`, which releases at commit.
 - Do not stream results with `.fetch()` across a transaction boundary. The connection may not survive it.
 - `SQLX_STATEMENT_CACHE` is only safe because the poolers set `max_prepared_statements`. Do not raise the cache above what the pooler tracks, and do not assume caching is safe against a pooler without it. sqlx caches prepared statements per connection, and in transaction mode a cached statement may not exist on the backend you land on.
 - Prepared-statement failures under pooling are **load-dependent**. Under low traffic the pooler has no pressure to reassign backends, so each client behaves as if it were in session mode and the bug never appears. A clean staging run is not evidence that a change is safe under production load.
-- Migrations run out-of-band via `tools/run-migrations.sh` rather than on startup, which avoids the `pg_advisory_lock` contention that `sqlx::migrate!` would cause across many instances. Keep it that way.
+- Serving instances must not run migrations on startup. Migrations run in the dedicated jobs above, before rollout, and their migration database URL must bypass the transaction-mode pooler because `sqlx::migrate!` uses a session-scoped advisory lock.
 
 ## Secrets, Local Stack, And Deployment
 
