@@ -107,7 +107,10 @@ export class AtprotoSettingsModel {
       return "ready";
     }
 
-    if (this.status.enabled && this.status.state === "failed") {
+    // A failed enable rolls the opt-in back to `enabled: false`, so the failure
+    // is reported by the state alone. Requiring `enabled` here would drop the
+    // "last attempt failed" explanation and show the plain enable card instead.
+    if (this.status.state === "failed") {
       return "failed";
     }
 
