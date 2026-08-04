@@ -283,8 +283,17 @@ pub async fn enable_user_atproto(
         return Err(AtprotoControlError::UsernameMismatch);
     }
 
-    repo.set_atproto_state(user_pubkey, tenant_id, true, Some("pending"), None, None)
-        .await?;
+    let existing_did = current_atproto_did(repo, tenant_id, user_pubkey).await?;
+
+    repo.set_atproto_state(
+        user_pubkey,
+        tenant_id,
+        true,
+        Some("pending"),
+        existing_did.as_deref(),
+        None,
+    )
+    .await?;
 
     let state = repo
         .get_atproto_state(user_pubkey, tenant_id)
@@ -292,6 +301,26 @@ pub async fn enable_user_atproto(
         .ok_or(AtprotoControlError::UserNotFound)?;
 
     Ok(map_state_to_response(Some(claimed_username), state))
+}
+
+/// Reads the DID currently on the row so a lifecycle write can carry it
+/// forward.
+///
+/// [`UserRepository::set_atproto_state`] writes `atproto_did` unconditionally,
+/// so passing `None` erases the link to a live repo. That column is what
+/// [`disable_user_atproto_with_trigger`] reads to decide whether a local-only
+/// disable is safe, so an enable that blanks it on its way through would let a
+/// later disable silently release a provisioned account.
+async fn current_atproto_did(
+    repo: &UserRepository,
+    tenant_id: i64,
+    user_pubkey: &str,
+) -> Result<Option<String>, AtprotoControlError> {
+    Ok(repo
+        .get_atproto_state(user_pubkey, tenant_id)
+        .await?
+        .ok_or(AtprotoControlError::UserNotFound)?
+        .did)
 }
 
 pub async fn enable_user_atproto_with_trigger<F, Fut>(
@@ -319,7 +348,8 @@ where
     Ok(response)
 }
 
-/// Clears the opt-in that [`enable_user_atproto`] wrote ahead of the trigger.
+/// Clears the opt-in that [`enable_user_atproto`] or [`reenable_user_atproto`]
+/// wrote ahead of the trigger.
 ///
 /// The enabled flag is set before the control plane is called, so a failed
 /// trigger leaves an opt-in that exists nowhere but this row. Keeping it makes
@@ -328,18 +358,24 @@ where
 /// If the trigger did reach the control plane before failing, provisioning
 /// reports back through the internal sync endpoint and the state converges
 /// there.
+///
+/// Any existing DID is carried through the rollback: it records a repo the
+/// control plane still owns, and [`disable_user_atproto_with_trigger`] reads it
+/// to keep refusing a local-only disable for a provisioned account.
 async fn roll_back_failed_enable(
     repo: &UserRepository,
     tenant_id: i64,
     user_pubkey: &str,
     error: &crate::atproto_provisioning::AtprotoProvisioningError,
 ) -> Result<(), AtprotoControlError> {
+    let existing_did = current_atproto_did(repo, tenant_id, user_pubkey).await?;
+
     repo.set_atproto_state(
         user_pubkey,
         tenant_id,
         false,
         Some("failed"),
-        None,
+        existing_did.as_deref(),
         Some(error.public_message()),
     )
     .await?;
@@ -359,8 +395,17 @@ pub async fn reenable_user_atproto(
         .await?,
     )?;
 
-    repo.set_atproto_state(user_pubkey, tenant_id, true, Some("pending"), None, None)
-        .await?;
+    let existing_did = current_atproto_did(repo, tenant_id, user_pubkey).await?;
+
+    repo.set_atproto_state(
+        user_pubkey,
+        tenant_id,
+        true,
+        Some("pending"),
+        existing_did.as_deref(),
+        None,
+    )
+    .await?;
 
     let state = repo
         .get_atproto_state(user_pubkey, tenant_id)
@@ -489,11 +534,6 @@ where
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = Result<(), crate::atproto_provisioning::AtprotoProvisioningError>>,
 {
-    let _username = user_repo
-        .get_username(user_pubkey, tenant_id)
-        .await?
-        .ok_or(AtprotoControlError::UserNotFound)?;
-
     let current = user_repo
         .get_atproto_state(user_pubkey, tenant_id)
         .await?

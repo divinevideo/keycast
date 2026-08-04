@@ -9,7 +9,8 @@ use chrono::{Duration, Utc};
 use keycast_api::api::http::atproto::{
     disable_user_atproto, disable_user_atproto_and_revoke_sessions,
     disable_user_atproto_with_trigger, enable_user_atproto, enable_user_atproto_with_trigger,
-    get_user_atproto_status, resolve_username_with_fallback_enabled, set_user_atproto_crosspost,
+    get_user_atproto_status, reenable_user_atproto_with_trigger,
+    resolve_username_with_fallback_enabled, set_user_atproto_crosspost,
     sync_user_atproto_state_by_pubkey, SetCrosspostContext, UsernameResolution,
 };
 use keycast_api::api::http::auth::AuthError;
@@ -677,6 +678,111 @@ async fn enable_dependency_failure_rolls_back_the_opt_in() {
     assert_eq!(response.did, None);
     assert_eq!(
         response.error.as_deref(),
+        Some("ATProto enablement is temporarily unavailable. Please try again later."),
+    );
+}
+
+#[tokio::test]
+async fn enable_failure_keeps_the_did_so_disable_still_refuses() {
+    let pool = common::setup_test_db().await;
+    let repo = UserRepository::new(pool.clone());
+    let session_repo = AtprotoOAuthSessionRepository::new(pool.clone());
+    let tenant_id = 1_i64;
+
+    let keys = Keys::generate();
+    let user_pubkey = keys.public_key().to_hex();
+    let username = format!("alice-enable-provisioned-{}", &user_pubkey[..8]);
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, username, atproto_enabled, atproto_state, atproto_did, created_at, updated_at)
+         VALUES ($1, $2, $3, true, 'ready', 'did:plc:testprovisioned', NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .bind(&username)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    enable_user_atproto_with_trigger(
+        &repo,
+        tenant_id,
+        &user_pubkey,
+        &username,
+        |_pubkey, _username| async {
+            Err(keycast_api::atproto_provisioning::AtprotoProvisioningError::DependencyNotConfigured)
+        },
+    )
+    .await
+    .expect_err("enable should surface dependency failure");
+
+    // The rollback must not blank the DID of an account the control plane has
+    // already provisioned: that column is the only local record that a live
+    // repo exists.
+    let status = get_user_atproto_status(&repo, tenant_id, &user_pubkey)
+        .await
+        .expect("status should succeed");
+    assert!(!status.enabled);
+    assert_eq!(status.state.as_deref(), Some("failed"));
+    assert_eq!(status.did.as_deref(), Some("did:plc:testprovisioned"));
+
+    // And with the DID intact, turning it off still refuses to report "off"
+    // while the control plane cannot confirm it.
+    disable_user_atproto_with_trigger(
+        &repo,
+        &session_repo,
+        tenant_id,
+        &user_pubkey,
+        |_pubkey| async {
+            Err(
+                keycast_api::atproto_provisioning::AtprotoProvisioningError::DependencyNotConfigured,
+            )
+        },
+    )
+    .await
+    .expect_err("disable should refuse while a provisioned repo exists");
+}
+
+#[tokio::test]
+async fn reenable_dependency_failure_rolls_back_the_opt_in() {
+    let pool = common::setup_test_db().await;
+    let repo = UserRepository::new(pool.clone());
+    let tenant_id = 1_i64;
+
+    let keys = Keys::generate();
+    let user_pubkey = keys.public_key().to_hex();
+    let username = format!("alice-reenable-failed-{}", &user_pubkey[..8]);
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, username, atproto_enabled, atproto_state, atproto_did, created_at, updated_at)
+         VALUES ($1, $2, $3, false, 'disabled', 'did:plc:testreenable', NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .bind(&username)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    let error = reenable_user_atproto_with_trigger(&repo, tenant_id, &user_pubkey, |_pubkey| async {
+        Err(keycast_api::atproto_provisioning::AtprotoProvisioningError::DependencyNotConfigured)
+    })
+    .await
+    .expect_err("reenable should surface dependency failure");
+
+    assert_eq!(
+        error.to_string(),
+        "ATProto enablement is temporarily unavailable. Please try again later."
+    );
+
+    let status = get_user_atproto_status(&repo, tenant_id, &user_pubkey)
+        .await
+        .expect("status should succeed");
+    assert!(!status.enabled);
+    assert_eq!(status.state.as_deref(), Some("failed"));
+    assert_eq!(status.did.as_deref(), Some("did:plc:testreenable"));
+    assert_eq!(
+        status.error.as_deref(),
         Some("ATProto enablement is temporarily unavailable. Please try again later."),
     );
 }
