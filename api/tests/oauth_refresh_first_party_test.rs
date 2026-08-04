@@ -81,6 +81,7 @@ impl KeyManager for TestKeyManager {
 fn create_test_auth_state(pool: PgPool) -> keycast_api::api::http::routes::AuthState {
     let bcrypt_queue = BcryptQueue::new();
     let secret_pool = SecretPool::new(1);
+    let _producer_handle = secret_pool.spawn_producer();
     let tenant_cache = Cache::builder().max_capacity(10).build();
     let key_manager: Arc<Box<dyn KeyManager>> = Arc::new(Box::new(TestKeyManager));
 
