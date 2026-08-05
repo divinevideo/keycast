@@ -1531,6 +1531,16 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
             "/oauth-authorization-server",
             get(keycast_api::api::http::atproto_oauth_metadata::authorization_server_metadata),
         )
+        // OIDC discovery sibling. Without this handler, the SPA fallback
+        // serves index.html for `/.well-known/openid-configuration`, breaking
+        // OIDC autodiscovery for any client that follows the standard.
+        // See `api/src/api/http/openid_configuration.rs` for the document
+        // shape and the rationale for advertising only the capabilities
+        // keycast actually supports today.
+        .route(
+            "/openid-configuration",
+            get(keycast_api::api::http::openid_configuration::openid_configuration_metadata),
+        )
         .with_state(web_build_dir.clone());
 
     let mut app = Router::new()

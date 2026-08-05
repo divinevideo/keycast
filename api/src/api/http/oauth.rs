@@ -2,10 +2,11 @@
 // ABOUTME: Implements authorization code flow that issues bunker URLs for NIP-46 remote signing
 
 use axum::{
-    extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    async_trait,
+    extract::{FromRequest, Query, Request, State},
+    http::{header::CONTENT_TYPE, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
-    Form, Json,
+    Form, Json, RequestExt,
 };
 use base64::Engine;
 use bcrypt::verify;
@@ -265,6 +266,54 @@ pub struct TokenRequest {
     pub redirect_uri: Option<String>, // For authorization_code grant
     pub code_verifier: Option<String>, // For PKCE (authorization_code grant)
     pub refresh_token: Option<String>, // For refresh_token grant
+}
+
+pub struct TokenRequestBody(pub TokenRequest);
+
+#[async_trait]
+impl<S> FromRequest<S> for TokenRequestBody
+where
+    S: Send + Sync,
+{
+    type Rejection = OAuthError;
+
+    async fn from_request(mut req: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        // Media type type/subtype are case-insensitive (RFC 9110 8.3.1). Normalize
+        // the header itself, because `Json` and `Form` disagree on case handling.
+        let content_type = req
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.to_ascii_lowercase())
+            .unwrap_or_default();
+
+        if let Ok(normalized) = axum::http::HeaderValue::from_str(&content_type) {
+            req.headers_mut().insert(CONTENT_TYPE, normalized);
+        }
+
+        if content_type.starts_with("application/json") {
+            let Json(req) = req
+                .extract::<Json<TokenRequest>, _>()
+                .await
+                .map_err(|err| {
+                    OAuthError::InvalidRequest(format!("Invalid JSON token request: {err}"))
+                })?;
+            Ok(Self(req))
+        } else if content_type.starts_with("application/x-www-form-urlencoded") {
+            let Form(req) = req
+                .extract::<Form<TokenRequest>, _>()
+                .await
+                .map_err(|err| {
+                    OAuthError::InvalidRequest(format!("Invalid form token request: {err}"))
+                })?;
+            Ok(Self(req))
+        } else {
+            Err(OAuthError::InvalidRequest(
+                "Token endpoint requires application/json or application/x-www-form-urlencoded"
+                    .to_string(),
+            ))
+        }
+    }
 }
 
 /// Generate UCAN token signed by user's key
@@ -2372,7 +2421,7 @@ pub async fn authorize_post(
 pub async fn token(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
-    Json(req): Json<TokenRequest>,
+    TokenRequestBody(req): TokenRequestBody,
 ) -> Result<Response, OAuthError> {
     let tenant_id = tenant.0.id;
     let grant_type = req.grant_type.as_deref().unwrap_or("authorization_code");

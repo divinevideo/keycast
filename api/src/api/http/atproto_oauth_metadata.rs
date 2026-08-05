@@ -20,32 +20,40 @@ pub struct AuthorizationServerMetadata {
     require_pushed_authorization_requests: bool,
 }
 
-pub fn authorization_server_origin() -> String {
-    std::env::var("ATPROTO_ENTRYWAY_ORIGIN")
+fn parse_origin(raw: &str) -> Option<String> {
+    Url::parse(raw).ok().and_then(|url| {
+        let host = url.host_str()?;
+        let scheme = url.scheme();
+        let mut origin = format!("{scheme}://{host}");
+
+        if let Some(port) = url.port() {
+            let is_default_port =
+                (scheme == "https" && port == 443) || (scheme == "http" && port == 80);
+            if !is_default_port {
+                origin.push_str(&format!(":{port}"));
+            }
+        }
+
+        Some(origin)
+    })
+}
+
+pub(crate) fn app_origin() -> String {
+    std::env::var("APP_URL")
         .ok()
-        .or_else(|| std::env::var("APP_URL").ok())
         .or_else(|| std::env::var("VITE_DOMAIN").ok())
-        .and_then(|raw| {
-            Url::parse(&raw).ok().and_then(|url| {
-                let host = url.host_str()?;
-                let scheme = url.scheme();
-                let mut origin = format!("{scheme}://{host}");
-
-                if let Some(port) = url.port() {
-                    let is_default_port =
-                        (scheme == "https" && port == 443) || (scheme == "http" && port == 80);
-                    if !is_default_port {
-                        origin.push_str(&format!(":{port}"));
-                    }
-                }
-
-                Some(origin)
-            })
-        })
+        .and_then(|raw| parse_origin(&raw))
         .unwrap_or_else(|| "http://localhost:3000".to_string())
 }
 
-fn endpoint(origin: &str, path: &str) -> String {
+pub fn authorization_server_origin() -> String {
+    std::env::var("ATPROTO_ENTRYWAY_ORIGIN")
+        .ok()
+        .and_then(|raw| parse_origin(&raw))
+        .unwrap_or_else(app_origin)
+}
+
+pub(crate) fn endpoint(origin: &str, path: &str) -> String {
     format!(
         "{}/{}",
         origin.trim_end_matches('/'),

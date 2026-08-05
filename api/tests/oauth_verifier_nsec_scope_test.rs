@@ -5,7 +5,7 @@
 
 mod common;
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode};
 use chrono::{Duration, Utc};
 use keycast_api::{
     api::{
@@ -135,7 +135,7 @@ async fn exchange_code(pool: &PgPool, code: &str, verifier: &str) -> StatusCode 
     let result = oauth::token(
         test_tenant(),
         State(auth_state),
-        Json(oauth::TokenRequest {
+        oauth::TokenRequestBody(oauth::TokenRequest {
             grant_type: Some("authorization_code".to_string()),
             code: Some(code.to_string()),
             client_id: "Verifier Scope Test".to_string(),
