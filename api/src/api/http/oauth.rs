@@ -2854,6 +2854,18 @@ async fn handle_authorization_code_grant(
     let previous_auth_id = auth_code.previous_auth_id;
     let is_headless = auth_code.is_headless;
 
+    // RFC 6749 §4.1.3 requires the token endpoint to ensure the authorization
+    // code was issued to the client_id in the request. RFC 6749 §5.2 specifies
+    // invalid_grant when a code was issued to another client.
+    if client_id != req.client_id {
+        tracing::warn!(
+            "Rejecting authorization code redemption: code was issued to a different client_id"
+        );
+        return Err(OAuthError::InvalidGrant(
+            "Authorization code was not issued to this client".into(),
+        ));
+    }
+
     // Validate redirect_uri matches
     if stored_redirect_uri != *redirect_uri {
         return Err(OAuthError::InvalidRequest(
