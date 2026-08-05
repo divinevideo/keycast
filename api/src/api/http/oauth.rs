@@ -502,10 +502,12 @@ fn validate_pkce(
                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&hash_bytes);
 
             if computed_challenge != code_challenge {
+                // `code_challenge` is stored verbatim from the authorization request, so it
+                // is not safe to slice by byte range here. Truncate by character instead.
                 tracing::warn!(
                     "PKCE validation failed: computed {} != stored {}",
-                    &computed_challenge[..16],
-                    &code_challenge[..16]
+                    challenge_log_prefix(&computed_challenge),
+                    challenge_log_prefix(code_challenge)
                 );
                 // RFC 7636 section 4.6: when the values are not equal the token endpoint
                 // MUST return `invalid_grant`.
@@ -536,6 +538,14 @@ fn validate_pkce(
             code_challenge_method
         ))),
     }
+}
+
+/// Truncate a PKCE challenge to a short, log-safe prefix.
+///
+/// Challenge values arrive unvalidated from clients, so truncation is done on character
+/// boundaries rather than by byte range.
+fn challenge_log_prefix(challenge: &str) -> String {
+    challenge.chars().take(16).collect()
 }
 
 /// Resolve policy ID from scope parameter.
@@ -5210,6 +5220,58 @@ mod tests {
             body["error_description"].is_string(),
             "expected an error_description string, got {body}"
         );
+    }
+
+    /// Run `validate_pkce` with a `WARN`-level subscriber installed, returning the
+    /// captured log events alongside the result.
+    ///
+    /// The failure branch formats the challenge inside `tracing::warn!`. Without an
+    /// interested subscriber the macro never evaluates its field expressions, so a test
+    /// that omits this would exercise none of that formatting while still passing.
+    fn validate_pkce_capturing_logs(
+        code_verifier: &str,
+        code_challenge: &str,
+        code_challenge_method: &str,
+    ) -> (Result<(), OAuthError>, Vec<serde_json::Value>) {
+        let logs = SharedLogWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(logs.clone())
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, || {
+            validate_pkce(code_verifier, code_challenge, code_challenge_method)
+        });
+        (result, logs.json_events())
+    }
+
+    #[test]
+    fn pkce_failure_logging_is_actually_exercised_by_these_tests() {
+        // Guards the two tests below: if the capture helper ever stops making the
+        // `warn!` fields evaluate, they would silently stop covering the formatting.
+        let (result, events) = validate_pkce_capturing_logs("wrong", RFC7636_CHALLENGE, "S256");
+        assert!(result.is_err());
+        assert!(
+            events.iter().any(|event| event["fields"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("PKCE validation failed"))),
+            "the failure branch must emit its warning, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn validate_pkce_handles_a_short_stored_challenge() {
+        // `code_challenge` is persisted verbatim from the authorization request, so its
+        // length is not constrained. Rejection stays orderly and the failure log renders.
+        let (result, _) = validate_pkce_capturing_logs(RFC7636_VERIFIER, "abc", "S256");
+        assert!(matches!(result, Err(OAuthError::InvalidGrant(_))));
+    }
+
+    #[test]
+    fn validate_pkce_handles_a_multibyte_stored_challenge() {
+        // Nor is its character set constrained. Same expectation for a non-ASCII value.
+        let (result, _) = validate_pkce_capturing_logs(RFC7636_VERIFIER, &"€".repeat(20), "S256");
+        assert!(matches!(result, Err(OAuthError::InvalidGrant(_))));
     }
 
     #[test]
