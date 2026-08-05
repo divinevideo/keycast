@@ -277,12 +277,19 @@ where
 {
     type Rejection = OAuthError;
 
-    async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request(mut req: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        // Media type type/subtype are case-insensitive (RFC 9110 8.3.1). Normalize
+        // the header itself, because `Json` and `Form` disagree on case handling.
         let content_type = req
             .headers()
             .get(CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
+            .map(|value| value.to_ascii_lowercase())
             .unwrap_or_default();
+
+        if let Ok(normalized) = axum::http::HeaderValue::from_str(&content_type) {
+            req.headers_mut().insert(CONTENT_TYPE, normalized);
+        }
 
         if content_type.starts_with("application/json") {
             let Json(req) = req

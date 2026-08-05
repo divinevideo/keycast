@@ -88,6 +88,53 @@ async fn token_request_keeps_existing_json_body_support() {
 }
 
 #[tokio::test]
+async fn token_request_accepts_mixed_case_form_content_type() {
+    let response = test_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/oauth/token")
+                .header(CONTENT_TYPE, "Application/X-Www-Form-Urlencoded")
+                .body(Body::from(
+                    "grant_type=authorization_code&code=code-123&client_id=client-123",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["client_id"], "client-123");
+}
+
+#[tokio::test]
+async fn token_request_accepts_mixed_case_json_content_type() {
+    let response = test_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/oauth/token")
+                .header(CONTENT_TYPE, "Application/JSON")
+                .body(Body::from(
+                    json!({
+                        "grant_type": "refresh_token",
+                        "client_id": "client-123",
+                        "refresh_token": "refresh-123"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["client_id"], "client-123");
+}
+
+#[tokio::test]
 async fn token_request_rejects_unsupported_content_type() {
     let response = test_app()
         .oneshot(
