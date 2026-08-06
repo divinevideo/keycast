@@ -505,12 +505,16 @@ fn validate_pkce(
                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&hash_bytes);
 
             if computed_challenge != code_challenge {
+                // `code_challenge` is stored verbatim from the authorization request, so it
+                // is not safe to slice by byte range here. Truncate by character instead.
                 tracing::warn!(
                     "PKCE validation failed: computed {} != stored {}",
-                    &computed_challenge[..16],
-                    &code_challenge[..16]
+                    challenge_log_prefix(&computed_challenge),
+                    challenge_log_prefix(code_challenge)
                 );
-                return Err(OAuthError::InvalidRequest(
+                // RFC 7636 section 4.6: when the values are not equal the token endpoint
+                // MUST return `invalid_grant`.
+                return Err(OAuthError::InvalidGrant(
                     "Invalid code_verifier: PKCE validation failed".to_string(),
                 ));
             }
@@ -518,17 +522,33 @@ fn validate_pkce(
         }
         "plain" => {
             if code_verifier != code_challenge {
-                return Err(OAuthError::InvalidRequest(
+                // RFC 7636 section 4.6 applies to the `plain` comparison as well.
+                return Err(OAuthError::InvalidGrant(
                     "Invalid code_verifier: plain PKCE validation failed".to_string(),
                 ));
             }
             Ok(())
         }
+        // Left as-is, deliberately. RFC 7636 section 4.6 governs only the
+        // verifier-versus-challenge comparison, so it does not reach this arm, and section
+        // 4.4.1's `invalid_request` requirement is addressed to the authorization endpoint
+        // rather than to token exchange. Nothing in RFC 7636 assigns an error code to an
+        // unsupported transform discovered here, so the pre-existing behavior stands.
+        // Rejecting unsupported transforms up front at `/oauth/authorize`, which is what
+        // section 4.4.1 actually asks for, belongs to the mandatory-PKCE work.
         _ => Err(OAuthError::InvalidRequest(format!(
             "Unsupported code_challenge_method: {}",
             code_challenge_method
         ))),
     }
+}
+
+/// Truncate a PKCE challenge to a short, log-safe prefix.
+///
+/// Challenge values arrive unvalidated from clients, so truncation is done on character
+/// boundaries rather than by byte range.
+fn challenge_log_prefix(challenge: &str) -> String {
+    challenge.chars().take(16).collect()
 }
 
 /// Resolve policy ID from scope parameter.
@@ -5242,5 +5262,126 @@ mod tests {
         assert!(
             matches!(err, OAuthError::InvalidRequest(msg) if msg.contains("Invalid redirect_uri"))
         );
+    }
+
+    // RFC 7636 Appendix B worked example. Using the published vector rather than a
+    // locally recomputed hash keeps the success case independent of this module's own
+    // hashing code, so a mistake there cannot make the failure cases pass by accident.
+    const RFC7636_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    const RFC7636_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+    async fn error_body(err: OAuthError) -> (StatusCode, serde_json::Value) {
+        let response = err.into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error response body should be readable");
+        let json = serde_json::from_slice(&bytes).expect("error response body should be JSON");
+        (status, json)
+    }
+
+    #[test]
+    fn validate_pkce_accepts_the_rfc7636_appendix_b_vector() {
+        validate_pkce(RFC7636_VERIFIER, RFC7636_CHALLENGE, "S256")
+            .expect("the published S256 vector must verify");
+    }
+
+    #[test]
+    fn validate_pkce_s256_mismatch_is_invalid_grant() {
+        let err = validate_pkce("a-different-verifier", RFC7636_CHALLENGE, "S256")
+            .expect_err("a mismatched verifier must be rejected");
+        assert!(
+            matches!(err, OAuthError::InvalidGrant(_)),
+            "RFC 7636 section 4.6 requires invalid_grant, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_pkce_plain_mismatch_is_invalid_grant() {
+        let err = validate_pkce("verifier", "a-different-challenge", "plain")
+            .expect_err("a mismatched verifier must be rejected");
+        assert!(
+            matches!(err, OAuthError::InvalidGrant(_)),
+            "RFC 7636 section 4.6 requires invalid_grant, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pkce_mismatch_serialises_as_an_rfc6749_invalid_grant_response() {
+        let err = validate_pkce("a-different-verifier", RFC7636_CHALLENGE, "S256")
+            .expect_err("a mismatched verifier must be rejected");
+        let (status, body) = error_body(err).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // RFC 6749 section 5.2 requires the `error` member to carry the registered code
+        // itself, not prose. The pre-existing `invalid_request` path returns
+        // `{"error": "Invalid request: ..."}`, which this response must not resemble.
+        assert_eq!(body["error"], "invalid_grant");
+        assert!(
+            body["error_description"].is_string(),
+            "expected an error_description string, got {body}"
+        );
+    }
+
+    /// Run `validate_pkce` with a `WARN`-level subscriber installed, returning the
+    /// captured log events alongside the result.
+    ///
+    /// The failure branch formats the challenge inside `tracing::warn!`. Without an
+    /// interested subscriber the macro never evaluates its field expressions, so a test
+    /// that omits this would exercise none of that formatting while still passing.
+    fn validate_pkce_capturing_logs(
+        code_verifier: &str,
+        code_challenge: &str,
+        code_challenge_method: &str,
+    ) -> (Result<(), OAuthError>, Vec<serde_json::Value>) {
+        let logs = SharedLogWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(logs.clone())
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, || {
+            validate_pkce(code_verifier, code_challenge, code_challenge_method)
+        });
+        (result, logs.json_events())
+    }
+
+    #[test]
+    fn pkce_failure_logging_is_actually_exercised_by_these_tests() {
+        // Guards the two tests below: if the capture helper ever stops making the
+        // `warn!` fields evaluate, they would silently stop covering the formatting.
+        let (result, events) = validate_pkce_capturing_logs("wrong", RFC7636_CHALLENGE, "S256");
+        assert!(result.is_err());
+        assert!(
+            events.iter().any(|event| event["fields"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("PKCE validation failed"))),
+            "the failure branch must emit its warning, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn validate_pkce_handles_a_short_stored_challenge() {
+        // `code_challenge` is persisted verbatim from the authorization request, so its
+        // length is not constrained. Rejection stays orderly and the failure log renders.
+        let (result, _) = validate_pkce_capturing_logs(RFC7636_VERIFIER, "abc", "S256");
+        assert!(matches!(result, Err(OAuthError::InvalidGrant(_))));
+    }
+
+    #[test]
+    fn validate_pkce_handles_a_multibyte_stored_challenge() {
+        // Nor is its character set constrained. Same expectation for a non-ASCII value.
+        let (result, _) = validate_pkce_capturing_logs(RFC7636_VERIFIER, &"€".repeat(20), "S256");
+        assert!(matches!(result, Err(OAuthError::InvalidGrant(_))));
+    }
+
+    #[test]
+    fn validate_pkce_unsupported_method_remains_invalid_request() {
+        // Pins the boundary of this change rather than endorsing the result: RFC 7636
+        // section 4.6 scopes invalid_grant to the verifier comparison, so this arm is
+        // outside it and keeps its pre-existing behavior.
+        let err = validate_pkce(RFC7636_VERIFIER, RFC7636_CHALLENGE, "S512")
+            .expect_err("an unknown transform must be rejected");
+        assert!(matches!(err, OAuthError::InvalidRequest(_)), "got {err:?}");
     }
 }
