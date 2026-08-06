@@ -391,7 +391,10 @@ pub enum OAuthError {
     InvalidEmail,
     InvalidRequest(String),
     InvalidGrant(String), // RFC 6749 - for invalid/expired refresh tokens or auth codes
-    Database(sqlx::Error),
+    /// A database operation failed, so the request could not be judged. Holds
+    /// the rendered diagnostic: callers reach this from `sqlx::Error` and from
+    /// `RepositoryError`, which has already rendered its own.
+    Database(String),
     Encryption(String),
     ServerError(String),
 }
@@ -471,7 +474,7 @@ impl IntoResponse for OAuthError {
 
 impl From<sqlx::Error> for OAuthError {
     fn from(e: sqlx::Error) -> Self {
-        OAuthError::Database(e)
+        OAuthError::Database(e.to_string())
     }
 }
 
@@ -545,7 +548,7 @@ async fn resolve_policy_from_scope(pool: &sqlx::PgPool, scope: &str) -> Result<i
                 "Unknown policy '{}'. See GET /api/policies for available options.",
                 policy_slug
             )),
-            _ => OAuthError::Database(sqlx::Error::Protocol(e.to_string())),
+            _ => OAuthError::Database(e.to_string()),
         })?;
 
     Ok(requested_policy.id)
@@ -2449,6 +2452,8 @@ async fn handle_refresh_token_grant(
 #[derive(Clone, Copy, Debug)]
 enum RefreshTokenRejectionReason {
     MissingRefreshToken,
+    BindingLookupFailed,
+    ClientMismatch,
     ConsumeFailed,
     DiagnosticLookupFailed,
     TokenNotFound,
@@ -2472,6 +2477,8 @@ impl RefreshTokenRejectionReason {
     const fn as_str(self) -> &'static str {
         match self {
             Self::MissingRefreshToken => "missing_refresh_token",
+            Self::BindingLookupFailed => "refresh_token_binding_lookup_failed",
+            Self::ClientMismatch => "refresh_token_client_mismatch",
             Self::ConsumeFailed => "refresh_token_consume_failed",
             Self::DiagnosticLookupFailed => "refresh_token_diagnostic_lookup_failed",
             Self::TokenNotFound => "refresh_token_not_found",
@@ -2568,20 +2575,63 @@ async fn handle_refresh_token_grant_inner(
         )
     })?;
 
+    let refresh_token_repo = RefreshTokenRepository::new(pool.clone());
+    let token_hash = hash_refresh_token(refresh_token);
+
+    // RFC 6749 §10.4 requires the authorization server to maintain the binding
+    // between a refresh token and the client it was issued to. This endpoint
+    // does not authenticate clients, so neither that section's "verify ...
+    // whenever the client identity can be authenticated" nor §6's
+    // authenticated-client check applies here, and the presented client_id is
+    // self-asserted: a caller that already holds this refresh token can assert
+    // the bound value and pass. Token rotation in `consume` below stays the
+    // §10.4 abuse-detection mechanism. What this comparison does establish is
+    // that a caller presenting itself as one client cannot redeem a refresh
+    // token the server issued to another, and that the contradiction is
+    // refused rather than served.
+    //
+    // It runs before `consume` so a rejected request does not spend the
+    // token; the binding is read without mutating it.
+    if let Some(binding) = refresh_token_repo
+        .find_binding(&token_hash, tenant_id)
+        .await
+        .map_err(|error| {
+            // A failed lookup means the binding could not be established, not
+            // that the caller sent a bad request. Reporting it as a generic
+            // service-unavailable keeps the repository diagnostic out of the
+            // response body and out of RFC 6749 §5.2's error codes, which
+            // describe client errors.
+            refresh_grant_rejection(
+                OAuthError::Database(error.to_string()),
+                RefreshTokenRejectionReason::BindingLookupFailed,
+                None,
+            )
+        })?
+    {
+        if binding.client_id.as_deref() != Some(req.client_id.as_str()) {
+            return Err(refresh_grant_rejection(
+                OAuthError::InvalidGrant("Refresh token was not issued to this client".into()),
+                RefreshTokenRejectionReason::ClientMismatch,
+                binding.client_id.as_deref(),
+            ));
+        }
+    }
+
     // Consume refresh token atomically (validates + marks as consumed)
     // This implements one-time use per RFC 9700 token rotation
-    let refresh_token_repo = RefreshTokenRepository::new(pool.clone());
-    let token_record = match refresh_token_repo.consume(refresh_token).await {
+    let token_record = match refresh_token_repo.consume(refresh_token, tenant_id).await {
         Ok(Some(token_record)) => token_record,
         Err(error) => {
+            // Same reasoning as the binding lookup above: the token's state is
+            // unknown, so this is an operational failure rather than a client
+            // error.
             return Err(refresh_grant_rejection(
-                OAuthError::from(error),
+                OAuthError::Database(error.to_string()),
                 RefreshTokenRejectionReason::ConsumeFailed,
                 None,
             ));
         }
         Ok(None) => {
-            let token_hash = hash_refresh_token(refresh_token);
             let diagnostic_record = refresh_token_repo
                 .find_by_token_hash(&token_hash)
                 .await
@@ -2672,7 +2722,7 @@ async fn handle_refresh_token_grant_inner(
         .await
         .map_err(|error| {
             refresh_grant_rejection(
-                OAuthError::from(error),
+                OAuthError::Database(error.to_string()),
                 RefreshTokenRejectionReason::StoredKeyLookupFailed,
                 stored_client_id.as_deref(),
             )
@@ -2748,7 +2798,7 @@ async fn handle_refresh_token_grant_inner(
         .await
         .map_err(|error| {
             refresh_grant_rejection(
-                OAuthError::from(error),
+                OAuthError::Database(error.to_string()),
                 RefreshTokenRejectionReason::RotatedTokenInsertFailed,
                 stored_client_id.as_deref(),
             )
@@ -2982,7 +3032,7 @@ async fn handle_authorization_code_grant(
                 code,
             )
             .await
-            .map_err(|e| OAuthError::Database(sqlx::Error::Protocol(e.to_string())))?;
+            .map_err(|e| OAuthError::Database(e.to_string()))?;
 
         tracing::info!(
             "Created user + personal_keys atomically for: {} (email: {})",
@@ -4721,7 +4771,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn refresh_grant_consume_failure_logs_once_without_credentials() {
+    async fn refresh_grant_binding_lookup_failure_logs_once_without_credentials() {
         let logs = SharedLogWriter::default();
         let subscriber = tracing_subscriber::fmt()
             .json()
@@ -4749,7 +4799,17 @@ mod tests {
             Ok(_) => panic!("unavailable database should reject the refresh grant"),
             Err(error) => error,
         };
-        assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
+        // An unreachable database is an operational failure, not a client
+        // error, and the response must not carry the repository diagnostic.
+        assert_eq!(error.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response_json(response).await,
+            serde_json::json!({
+                "error": "Service temporarily unavailable. Please try again in a few minutes."
+            })
+        );
 
         let rejection_events: Vec<_> = logs
             .json_events()
@@ -4758,8 +4818,10 @@ mod tests {
             .collect();
         assert_eq!(rejection_events.len(), 1);
         let fields = &rejection_events[0]["fields"];
-        assert_eq!(fields["reason_code"], "refresh_token_consume_failed");
-        assert_eq!(fields["http_status"], 400);
+        // The binding lookup is the first database call on this path, so an
+        // unreachable database fails there rather than in `consume`.
+        assert_eq!(fields["reason_code"], "refresh_token_binding_lookup_failed");
+        assert_eq!(fields["http_status"], 503);
         assert_eq!(fields["client_id"], "unavailable");
 
         let event_json = rejection_events[0].to_string();
@@ -4778,6 +4840,14 @@ mod tests {
             (
                 RefreshTokenRejectionReason::MissingRefreshToken,
                 "missing_refresh_token",
+            ),
+            (
+                RefreshTokenRejectionReason::BindingLookupFailed,
+                "refresh_token_binding_lookup_failed",
+            ),
+            (
+                RefreshTokenRejectionReason::ClientMismatch,
+                "refresh_token_client_mismatch",
             ),
             (
                 RefreshTokenRejectionReason::ConsumeFailed,
@@ -4988,6 +5058,17 @@ mod tests {
             (
                 OAuthError::Encryption("decrypt failed".to_string()),
                 RefreshTokenRejectionReason::StoredKeyDecryptFailed,
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({
+                    "error": "Service temporarily unavailable. Please try again in a few minutes."
+                }),
+            ),
+            (
+                OAuthError::Database(
+                    "Database error: pool timed out while waiting for an open connection"
+                        .to_string(),
+                ),
+                RefreshTokenRejectionReason::BindingLookupFailed,
                 StatusCode::SERVICE_UNAVAILABLE,
                 serde_json::json!({
                     "error": "Service temporarily unavailable. Please try again in a few minutes."
