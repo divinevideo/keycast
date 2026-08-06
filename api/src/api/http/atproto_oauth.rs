@@ -1,6 +1,6 @@
 use axum::{
     extract::{Query, State},
-    http::{HeaderMap, HeaderValue},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Redirect},
     Form, Json,
 };
@@ -1146,7 +1146,17 @@ pub async fn token(
 
             let expected_challenge = pkce_challenge(code_verifier);
             if session.code_challenge.as_deref() != Some(expected_challenge.as_str()) {
-                return Err(AuthError::BadRequest("Invalid PKCE verifier".to_string()));
+                tracing::warn!(
+                    client_id = %client_id,
+                    has_stored_code_challenge = session.code_challenge.is_some(),
+                    "ATProto OAuth PKCE verifier mismatch"
+                );
+                return Err(AuthError::OAuthProtocol {
+                    status: StatusCode::BAD_REQUEST,
+                    error: "invalid_grant",
+                    description: "PKCE code_verifier does not match the stored code_challenge"
+                        .to_string(),
+                });
             }
 
             let session_nonce = session.dpop_nonce.clone().ok_or_else(|| {

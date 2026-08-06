@@ -505,6 +505,11 @@ pub enum AuthError {
     EmailSendFailed(String),
     DuplicateKey, // Nostr pubkey already registered (BYOK case)
     InvalidEmail,
+    OAuthProtocol {
+        status: StatusCode,
+        error: &'static str,
+        description: String,
+    },
     BadRequest(String),
     Forbidden(String),   // User has no authorization for this origin
     KeyEgressDenied,     // Policy refuses raw-key egress for this account
@@ -641,6 +646,20 @@ impl IntoResponse for AuthError {
                 StatusCode::UNAUTHORIZED,
                 "Verification code or token has expired. Please request a new one.".to_string(),
             ),
+            AuthError::OAuthProtocol {
+                status,
+                error,
+                description,
+            } => {
+                return (
+                    status,
+                    Json(serde_json::json!({
+                        "error": error,
+                        "error_description": description,
+                    })),
+                )
+                    .into_response();
+            }
             AuthError::BadRequest(msg) => (
                 StatusCode::BAD_REQUEST,
                 msg,
