@@ -12,7 +12,7 @@ Implements GitHub issue #223. Validated against `main` @ 3d36601.
 
 ## Global Constraints
 
-- Migrations are forward-only, timestamped `YYYYMMDDHHmmss_name.sql`, run via `sqlx::migrate!` and `tools/run-migrations.sh`. No down migrations.
+- Migrations are forward-only, timestamped `YYYYMMDDHHmmss_name.sql`, and run via `sqlx::migrate!` or `sqlx migrate run` against the target database. No down migrations.
 - `event_type`, `endpoint`, `outcome` in `AuthEvent` are `&'static str`.
 - Anti-enumeration: the initiate endpoint always returns HTTP 200 success regardless of outcome.
 - Re-use `normalize_registration_email()` for all email normalization (case/dot bypass protection).
@@ -80,7 +80,7 @@ CREATE INDEX idx_users_pending_email_new_token
 
 - [ ] **Step 2: Run migration against the test DB**
 
-Run: `tools/run-migrations.sh` (or `sqlx migrate run` against `DATABASE_URL`). Expected: applies cleanly.
+Run: `sqlx migrate run` against `DATABASE_URL`. Expected: applies cleanly.
 
 - [ ] **Step 3: Commit** — `feat(db): add pending email change columns`
 
