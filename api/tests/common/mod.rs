@@ -1,7 +1,26 @@
 // ABOUTME: Shared test utilities and safety guards
 // ABOUTME: Ensures tests never accidentally connect to production database
 
+use chrono::Utc;
+use keycast_api::{
+    api::{
+        http::routes::AuthState,
+        tenant::{Tenant, TenantExtractor},
+    },
+    bcrypt_queue::BcryptQueue,
+    handlers::http_rpc_handler::new_http_handler_cache,
+    state::KeycastState,
+};
+use keycast_core::{
+    encryption::{KeyManager, KeyManagerError},
+    secret_pool::SecretPool,
+};
+use moka::future::Cache;
+use nostr_sdk::Keys;
 use sqlx::PgPool;
+use std::sync::Arc;
+use tokio::task::JoinHandle;
+use zeroize::Zeroizing;
 
 #[allow(dead_code)]
 pub type AuthEventRow = (String, String, String, Option<String>, String, Option<i32>);
@@ -112,6 +131,66 @@ pub async fn setup_test_db() -> PgPool {
         .expect("Failed to run migrations");
 
     pool
+}
+
+pub struct TestKeyManager;
+
+#[async_trait::async_trait]
+impl KeyManager for TestKeyManager {
+    async fn encrypt(&self, plaintext_bytes: &[u8]) -> Result<Vec<u8>, KeyManagerError> {
+        Ok(plaintext_bytes.to_vec())
+    }
+
+    async fn decrypt(
+        &self,
+        ciphertext_bytes: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, KeyManagerError> {
+        Ok(Zeroizing::new(ciphertext_bytes.to_vec()))
+    }
+}
+
+#[allow(dead_code)]
+pub async fn setup_oauth_test_db() -> PgPool {
+    std::env::set_var("BUNKER_RELAYS", "wss://relay.test.example");
+    setup_test_db().await
+}
+
+#[allow(dead_code)]
+pub fn create_test_auth_state(pool: PgPool) -> (AuthState, JoinHandle<()>) {
+    let bcrypt_queue = BcryptQueue::new();
+    let secret_pool = SecretPool::new(1);
+    let producer_handle = secret_pool.spawn_producer();
+    let tenant_cache = Cache::builder().max_capacity(10).build();
+    let key_manager: Arc<Box<dyn KeyManager>> = Arc::new(Box::new(TestKeyManager));
+
+    let auth_state = AuthState {
+        state: Arc::new(KeycastState {
+            db: pool,
+            key_manager,
+            signer_handlers: None,
+            http_handler_cache: new_http_handler_cache(),
+            server_keys: Keys::generate(),
+            tenant_cache,
+            bcrypt_sender: bcrypt_queue.sender(),
+            redis: None,
+            secret_pool: secret_pool.receiver(),
+        }),
+        auth_tx: None,
+    };
+
+    (auth_state, producer_handle)
+}
+
+#[allow(dead_code)]
+pub fn test_tenant() -> TenantExtractor {
+    TenantExtractor(Arc::new(Tenant {
+        id: 1,
+        domain: "localhost".to_string(),
+        name: "Test Tenant".to_string(),
+        settings: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }))
 }
 
 // Unit tests for the safety guard moved to a separate test file

@@ -2859,6 +2859,14 @@ async fn handle_authorization_code_grant(
     // invalid_grant when a code was issued to another client.
     if client_id != req.client_id {
         tracing::warn!(
+            event = "oauth_authorization_code_rejection",
+            grant_flow = "authorization_code",
+            outcome = "rejected",
+            reason_code = "client_id_mismatch",
+            http_status = StatusCode::BAD_REQUEST.as_u16(),
+            tenant_id,
+            stored_client_id = client_id.as_str(),
+            presented_client_id = req.client_id.as_str(),
             "Rejecting authorization code redemption: code was issued to a different client_id"
         );
         return Err(OAuthError::InvalidGrant(

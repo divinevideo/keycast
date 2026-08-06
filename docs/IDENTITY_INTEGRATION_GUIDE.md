@@ -513,8 +513,17 @@ Exchange authorization code for bunker URL.
 }
 ```
 
+**Error (400 Bad Request):**
+```json
+{
+  "error": "invalid_grant",
+  "error_description": "Authorization code was not issued to this client"
+}
+```
+
 **Notes:**
 - Code is deleted after successful exchange (single-use)
+- `client_id` must match the value sent when the authorization code was issued
 - `redirect_uri` must match exactly
 - Creates new OAuth authorization with unique connection secret per app
 
