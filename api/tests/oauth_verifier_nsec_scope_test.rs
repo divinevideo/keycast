@@ -7,95 +7,10 @@ mod common;
 
 use axum::{extract::State, http::StatusCode};
 use chrono::{Duration, Utc};
-use keycast_api::{
-    api::{
-        http::{oauth, routes::AuthState},
-        tenant::{Tenant, TenantExtractor},
-    },
-    bcrypt_queue::BcryptQueue,
-    handlers::http_rpc_handler::new_http_handler_cache,
-    state::KeycastState,
-};
-use keycast_core::{
-    encryption::{KeyManager, KeyManagerError},
-    secret_pool::SecretPool,
-};
-use moka::future::Cache;
+use keycast_api::api::http::oauth;
 use nostr_sdk::{Keys, ToBech32};
 use sqlx::PgPool;
-use std::sync::Arc;
-use tokio::task::JoinHandle;
 use uuid::Uuid;
-use zeroize::Zeroizing;
-
-struct TestKeyManager;
-
-#[async_trait::async_trait]
-impl KeyManager for TestKeyManager {
-    async fn encrypt(&self, plaintext_bytes: &[u8]) -> Result<Vec<u8>, KeyManagerError> {
-        Ok(plaintext_bytes.to_vec())
-    }
-
-    async fn decrypt(
-        &self,
-        ciphertext_bytes: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>, KeyManagerError> {
-        Ok(Zeroizing::new(ciphertext_bytes.to_vec()))
-    }
-}
-
-async fn setup_pool() -> PgPool {
-    common::assert_test_database_url();
-    std::env::set_var("BUNKER_RELAYS", "wss://relay.test.example");
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string());
-    let pool = PgPool::connect(&database_url)
-        .await
-        .expect("Failed to connect to database");
-
-    sqlx::migrate!("../database/migrations")
-        .run(&pool)
-        .await
-        .expect("Failed to run migrations");
-
-    pool
-}
-
-fn create_test_auth_state(pool: PgPool) -> (AuthState, JoinHandle<()>) {
-    let bcrypt_queue = BcryptQueue::new();
-    let secret_pool = SecretPool::new(1);
-    let producer_handle = secret_pool.spawn_producer();
-    let tenant_cache = Cache::builder().max_capacity(10).build();
-    let key_manager: Arc<Box<dyn KeyManager>> = Arc::new(Box::new(TestKeyManager));
-
-    let auth_state = AuthState {
-        state: Arc::new(KeycastState {
-            db: pool,
-            key_manager,
-            signer_handlers: None,
-            http_handler_cache: new_http_handler_cache(),
-            server_keys: Keys::generate(),
-            tenant_cache,
-            bcrypt_sender: bcrypt_queue.sender(),
-            redis: None,
-            secret_pool: secret_pool.receiver(),
-        }),
-        auth_tx: None,
-    };
-
-    (auth_state, producer_handle)
-}
-
-fn test_tenant() -> TenantExtractor {
-    TenantExtractor(Arc::new(Tenant {
-        id: 1,
-        domain: "localhost".to_string(),
-        name: "Test Tenant".to_string(),
-        settings: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-    }))
-}
 
 async fn insert_pending_registration(
     pool: &PgPool,
@@ -130,10 +45,10 @@ async fn insert_pending_registration(
 }
 
 async fn exchange_code(pool: &PgPool, code: &str, verifier: &str) -> StatusCode {
-    let (auth_state, producer_handle) = create_test_auth_state(pool.clone());
+    let (auth_state, producer_handle) = common::create_test_auth_state(pool.clone());
 
     let result = oauth::token(
-        test_tenant(),
+        common::test_tenant(),
         State(auth_state),
         oauth::TokenRequestBody(oauth::TokenRequest {
             grant_type: Some("authorization_code".to_string()),
@@ -152,7 +67,7 @@ async fn exchange_code(pool: &PgPool, code: &str, verifier: &str) -> StatusCode 
 
 #[tokio::test]
 async fn headless_exchange_ignores_mismatching_verifier_nsec_and_uses_stored_secret() {
-    let pool = setup_pool().await;
+    let pool = common::setup_oauth_test_db().await;
     let registration_keys = Keys::generate();
     let unrelated_keys = Keys::generate();
     let registration_pubkey = registration_keys.public_key().to_hex();
@@ -197,7 +112,7 @@ async fn headless_exchange_ignores_mismatching_verifier_nsec_and_uses_stored_sec
 
 #[tokio::test]
 async fn browser_byok_exchange_extracts_validates_and_stores_verifier_nsec() {
-    let pool = setup_pool().await;
+    let pool = common::setup_oauth_test_db().await;
     let browser_keys = Keys::generate();
     let browser_pubkey = browser_keys.public_key().to_hex();
     let browser_secret = browser_keys.secret_key().to_secret_bytes();
