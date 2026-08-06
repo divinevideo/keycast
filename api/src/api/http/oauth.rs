@@ -2619,7 +2619,7 @@ async fn handle_refresh_token_grant_inner(
 
     // Consume refresh token atomically (validates + marks as consumed)
     // This implements one-time use per RFC 9700 token rotation
-    let token_record = match refresh_token_repo.consume(refresh_token).await {
+    let token_record = match refresh_token_repo.consume(refresh_token, tenant_id).await {
         Ok(Some(token_record)) => token_record,
         Err(error) => {
             // Same reasoning as the binding lookup above: the token's state is
@@ -2722,7 +2722,7 @@ async fn handle_refresh_token_grant_inner(
         .await
         .map_err(|error| {
             refresh_grant_rejection(
-                OAuthError::from(error),
+                OAuthError::Database(error.to_string()),
                 RefreshTokenRejectionReason::StoredKeyLookupFailed,
                 stored_client_id.as_deref(),
             )
@@ -2798,7 +2798,7 @@ async fn handle_refresh_token_grant_inner(
         .await
         .map_err(|error| {
             refresh_grant_rejection(
-                OAuthError::from(error),
+                OAuthError::Database(error.to_string()),
                 RefreshTokenRejectionReason::RotatedTokenInsertFailed,
                 stored_client_id.as_deref(),
             )

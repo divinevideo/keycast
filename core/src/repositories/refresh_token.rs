@@ -65,18 +65,24 @@ impl RefreshTokenRepository {
     /// # Errors
     ///
     /// Returns `RepositoryError` if database query fails.
-    pub async fn consume(&self, token: &str) -> Result<Option<RefreshToken>, RepositoryError> {
+    pub async fn consume(
+        &self,
+        token: &str,
+        tenant_id: i64,
+    ) -> Result<Option<RefreshToken>, RepositoryError> {
         let token_hash = hash_refresh_token(token);
 
         let result = sqlx::query_as::<_, RefreshToken>(
             "UPDATE oauth_refresh_tokens
              SET consumed_at = NOW()
              WHERE token_hash = $1
+               AND tenant_id = $2
                AND consumed_at IS NULL
                AND expires_at > NOW()
              RETURNING *",
         )
         .bind(&token_hash)
+        .bind(tenant_id)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -266,7 +272,19 @@ mod integration_tests {
             .expect("raw-token lookup should execute")
             .is_none());
 
-        repo.consume(&raw_token)
+        assert!(repo
+            .consume(&raw_token, 2)
+            .await
+            .expect("cross-tenant consume should execute")
+            .is_none());
+        let still_active = repo
+            .find_by_token_hash(&token_hash)
+            .await
+            .expect("lookup refresh token after cross-tenant consume")
+            .expect("refresh token should still exist");
+        assert!(still_active.consumed_at.is_none());
+
+        repo.consume(&raw_token, 1)
             .await
             .expect("consume refresh token")
             .expect("refresh token should be consumable");

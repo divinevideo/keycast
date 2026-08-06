@@ -94,9 +94,9 @@ fn create_test_auth_state(pool: PgPool) -> (AuthState, JoinHandle<()>) {
     (auth_state, producer_handle)
 }
 
-fn test_tenant() -> TenantExtractor {
+fn test_tenant_with_id(id: i64) -> TenantExtractor {
     TenantExtractor(Arc::new(Tenant {
-        id: TENANT_ID,
+        id,
         domain: "localhost".to_string(),
         name: "Test Tenant".to_string(),
         settings: None,
@@ -167,10 +167,19 @@ async fn refresh(
     refresh_token: &str,
     client_id: &str,
 ) -> Result<axum::response::Response, oauth::OAuthError> {
+    refresh_for_tenant(pool, refresh_token, client_id, TENANT_ID).await
+}
+
+async fn refresh_for_tenant(
+    pool: &PgPool,
+    refresh_token: &str,
+    client_id: &str,
+    tenant_id: i64,
+) -> Result<axum::response::Response, oauth::OAuthError> {
     let (auth_state, producer_handle) = create_test_auth_state(pool.clone());
 
     let result = oauth::token(
-        test_tenant(),
+        test_tenant_with_id(tenant_id),
         State(auth_state),
         oauth::TokenRequestBody(oauth::TokenRequest {
             grant_type: Some("refresh_token".to_string()),
@@ -284,6 +293,30 @@ async fn refresh_grant_rejects_a_mismatched_client_before_disclosing_token_state
             "error_description": "Refresh token was not issued to this client"
         })
     );
+
+    cleanup(&pool, &user_pubkey).await;
+}
+
+#[tokio::test]
+async fn refresh_grant_rejects_a_cross_tenant_request_without_consuming_the_token() {
+    let pool = setup_pool().await;
+    let (user_pubkey, refresh_token) = seed_authorization_with_refresh_token(&pool).await;
+
+    let response = refresh_for_tenant(&pool, &refresh_token, BOUND_CLIENT_ID, TENANT_ID + 1)
+        .await
+        .expect_err("A refresh token must not be accepted from another tenant")
+        .into_response();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(response).await,
+        serde_json::json!({
+            "error": "invalid_grant",
+            "error_description": "Invalid or expired refresh token"
+        })
+    );
+
+    assert_eq!(consumed_at(&pool, &refresh_token).await, None);
 
     cleanup(&pool, &user_pubkey).await;
 }

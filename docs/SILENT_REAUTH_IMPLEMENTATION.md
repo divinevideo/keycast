@@ -240,6 +240,7 @@ async fn handle_refresh_token_grant(
     req: TokenRequest,
 ) -> Result<impl IntoResponse, OAuthError> {
     let pool = &state.pool;
+    let tenant_id = state.tenant_id;
 
     // 1. Validate request
     let refresh_token = req.refresh_token.ok_or_else(|| {
@@ -249,7 +250,7 @@ async fn handle_refresh_token_grant(
     // 2. Consume refresh token (atomic: validates + marks as used)
     let refresh_repo = RefreshTokenRepository::new(pool.clone());
     let token_record = refresh_repo
-        .consume(&refresh_token)
+        .consume(&refresh_token, tenant_id)
         .await
         .map_err(|e| OAuthError::Database(e))?
         .ok_or_else(|| {
