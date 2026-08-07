@@ -59,6 +59,8 @@ pub enum PinAttemptReservation {
     /// The registration has spent its lifetime cap across every PIN it has issued. A resend does
     /// not clear this; the emailed link remains the way in.
     LifetimeExhausted,
+    /// The registration's verification window has closed.
+    Expired,
 }
 
 /// Parameters for storing a basic OAuth code
@@ -401,6 +403,23 @@ impl OAuthCodeRepository {
     /// forever, so the only real limit becomes the resend cooldown. `max_lifetime_attempts` closes
     /// that by counting failures across every PIN the registration has issued, and nothing resets
     /// it. Exhausting it disables PIN entry for this registration; the emailed link still works.
+    ///
+    /// # Expiry
+    ///
+    /// The reservation also refuses an expired registration, so this statement is authoritative
+    /// rather than relying on the caller's earlier snapshot. Callers still check expiry up front to
+    /// classify it before paying for bcrypt, but a window that closes between that check and this
+    /// call is caught here instead of letting a comparison run against a dead registration.
+    ///
+    /// # Concurrency
+    ///
+    /// The increment and both caps are one conditional UPDATE, so row locking serializes concurrent
+    /// reservations and neither cap can be exceeded. The follow-up classification is a separate
+    /// read and is deliberately *not* serialized with it: it only chooses which recovery message
+    /// the user sees, and under concurrency it can transiently name a cap that a simultaneous
+    /// refund or resend has just reopened. That is accepted. Making the message choice
+    /// transactional would add contention to the hot path to fix wording, and the caps themselves
+    /// are already exact.
     pub async fn reserve_pin_attempt(
         &self,
         device_code: &str,
@@ -408,18 +427,20 @@ impl OAuthCodeRepository {
         max_attempts: i32,
         max_lifetime_attempts: i32,
     ) -> Result<PinAttemptReservation, RepositoryError> {
+        let now = Utc::now();
         let row: Option<(i32,)> = sqlx::query_as(
             "UPDATE oauth_codes \
              SET pin_attempts = pin_attempts + 1, pin_failed_total = pin_failed_total + 1 \
              WHERE device_code = $1 AND tenant_id = $2 \
                AND pin_attempts < $3 AND pin_failed_total < $4 \
-               AND pending_email IS NOT NULL AND consumed_at IS NULL \
+               AND pending_email IS NOT NULL AND consumed_at IS NULL AND expires_at > $5 \
              RETURNING pin_attempts",
         )
         .bind(device_code)
         .bind(tenant_id)
         .bind(max_attempts)
         .bind(max_lifetime_attempts)
+        .bind(now)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -427,10 +448,10 @@ impl OAuthCodeRepository {
             return Ok(PinAttemptReservation::Reserved { attempt });
         }
 
-        // The reservation failed. Re-read to say which cap did it, so the caller can tell the user
-        // whether a resend helps. Only on the failure path, which already writes an audit record.
-        let state: Option<(i32,)> = sqlx::query_as(
-            "SELECT pin_failed_total FROM oauth_codes \
+        // The reservation failed. Re-read to say why, so the caller can tell the user whether a
+        // resend helps. Only on the failure path, which already writes an audit record.
+        let state: Option<(i32, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT pin_failed_total, expires_at FROM oauth_codes \
              WHERE device_code = $1 AND tenant_id = $2 \
                AND pending_email IS NOT NULL AND consumed_at IS NULL",
         )
@@ -440,7 +461,8 @@ impl OAuthCodeRepository {
         .await?;
 
         match state {
-            Some((failed_total,)) if failed_total >= max_lifetime_attempts => {
+            Some((_, expires_at)) if expires_at <= now => Ok(PinAttemptReservation::Expired),
+            Some((failed_total, _)) if failed_total >= max_lifetime_attempts => {
                 Ok(PinAttemptReservation::LifetimeExhausted)
             }
             // Includes the row vanishing between the two statements: treating that as a per-PIN
@@ -1133,6 +1155,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(before.pin_attempts, 2, "attempts accumulated before reset");
+        assert_eq!(
+            before.pin_failed_total, 2,
+            "lifetime counter tracked them too"
+        );
 
         repo.reset_pin_attempts(&device_code, 1).await.unwrap();
 
@@ -1144,6 +1170,13 @@ mod tests {
         assert_eq!(
             after.pin_attempts, 0,
             "successful verify must clear the failed-attempt counter"
+        );
+        // The lifetime counter gives back exactly the one slot the successful attempt reserved. It
+        // must not be zeroed: a correct PIN cannot be allowed to wipe the registration's record of
+        // how much guessing it has already absorbed.
+        assert_eq!(
+            after.pin_failed_total, 1,
+            "successful verify releases only its own reservation from the lifetime counter"
         );
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
