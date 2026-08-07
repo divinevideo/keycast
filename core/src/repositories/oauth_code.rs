@@ -1290,6 +1290,52 @@ mod tests {
             .unwrap();
     }
 
+    /// The reservation itself refuses an expired registration, so the expiry decision does not rest
+    /// on the caller's earlier snapshot. Without this, a window closing between the caller's check
+    /// and the reservation would let a bcrypt comparison run against a dead registration and be
+    /// reported as a wrong PIN.
+    #[tokio::test]
+    async fn test_reserve_pin_attempt_refuses_an_expired_registration() {
+        let pool = setup_pool().await;
+        let repo = OAuthCodeRepository::new(pool.clone());
+
+        let device_code = format!("dc_{}", uuid::Uuid::new_v4());
+        insert_pending_registration(
+            &repo,
+            &device_code,
+            Some("pinhash123"),
+            Utc::now() - chrono::Duration::minutes(1),
+        )
+        .await;
+
+        let outcome = repo
+            .reserve_pin_attempt(&device_code, 1, 5, 50)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            PinAttemptReservation::Expired,
+            "an expired registration must be refused, and named as expired rather than as locked"
+        );
+
+        let after = repo
+            .find_by_device_code(&device_code, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (after.pin_attempts, after.pin_failed_total),
+            (0, 0),
+            "a refused reservation must not charge either counter"
+        );
+
+        sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
     /// The cooldown must be claimed by the same statement that rotates the credentials. Checking it
     /// with a separate read first would let two concurrent resends both mint a PIN and both send an
     /// email, leaving whichever UPDATE landed last as the only valid one — so a user could be

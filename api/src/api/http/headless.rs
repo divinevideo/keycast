@@ -998,6 +998,24 @@ pub async fn headless_verify_pin(
         }
     };
 
+    // bcrypt is deliberately slow, so the registration's window can close while it runs. Classify
+    // that as expiry rather than letting a wrong PIN read as "did not match" or a correct one fall
+    // through to a finalize that cannot succeed. Uses the window already loaded above, so this
+    // costs no query.
+    if pending.expires_at <= Utc::now() {
+        record_pin_verify_failure(
+            pool,
+            &headers,
+            tenant_id,
+            Some(&pending.user_pubkey),
+            pending.pending_email.as_deref(),
+            "registration_expired",
+            StatusCode::GONE.as_u16().into(),
+        )
+        .await;
+        return Err(HeadlessError::PinExpired);
+    }
+
     if !valid {
         // The slot was already consumed by the atomic reserve above; just classify and record.
         // Spending the last slot is reported as locked rather than merely wrong, so the user is
@@ -2190,28 +2208,42 @@ mod tests {
             .await;
     }
 
-    /// A correct PIN must give its reserved slot back. `reserve_pin_attempt` charges every attempt
-    /// up front, so without the release a correct PIN stays counted as a failed guess against the
-    /// registration's lifetime budget.
+    /// A correct PIN must give its reserved slot back even when what follows fails.
+    ///
+    /// `reserve_pin_attempt` charges every attempt up front, and finalize is fallible for reasons
+    /// that have nothing to do with the user's PIN. If the slot were released only after a
+    /// successful finalize, a correct PIN would stay counted as a failed guess on every such
+    /// failure, so repeated server-side errors could burn a legitimate user's lifetime budget while
+    /// they hold the right code.
+    ///
+    /// Clearing `pending_password_hash` is the deterministic finalize failure used here: unlike the
+    /// duplicate-email conflict, it leaves the pending row in place to be inspected.
     #[cfg(feature = "integration-tests")]
     #[tokio::test]
-    async fn test_correct_pin_releases_its_reserved_attempt_slot() {
+    async fn test_correct_pin_releases_its_slot_even_when_finalize_fails() {
         let auth_state = create_lazy_auth_state();
         let pool = auth_state.state.db.clone();
         let email = format!("verify-pin-release-{}@example.com", uuid::Uuid::new_v4());
         let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
 
-        // Two prior failures, so the release is visible as a decrement rather than as a reset.
+        // Two prior failures, so the release reads as a decrement rather than as a reset.
         sqlx::query(
-            "UPDATE oauth_codes SET pin_attempts = 2, pin_failed_total = 2 WHERE device_code = $1",
+            "UPDATE oauth_codes \
+             SET pin_attempts = 2, pin_failed_total = 2, pending_password_hash = NULL \
+             WHERE device_code = $1",
         )
         .bind(&device_code)
         .execute(&pool)
         .await
         .unwrap();
 
+        // Correct PIN, but finalize fails.
         let response = call_verify_pin(auth_state, &device_code, "123456").await;
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(
+            !response.status().is_success(),
+            "finalize must fail for this test to mean anything, got {}",
+            response.status()
+        );
 
         let (attempts, failed_total): (i32, i32) = sqlx::query_as(
             "SELECT pin_attempts, pin_failed_total FROM oauth_codes \
@@ -2220,20 +2252,56 @@ mod tests {
         .bind(&device_code)
         .fetch_one(&pool)
         .await
-        .unwrap();
+        .expect("the pending row must survive an incomplete-registration failure");
         assert_eq!(attempts, 0, "a correct PIN clears the per-PIN counter");
         assert_eq!(
             failed_total, 2,
-            "a correct PIN must give back exactly the slot it reserved, leaving the two real \
-             failures counted"
+            "a correct PIN must give back the slot it reserved even though finalize failed, \
+             leaving only the two real failures counted"
         );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
             .bind(&device_code)
             .execute(&pool)
             .await;
-        let _ = sqlx::query("DELETE FROM personal_keys WHERE user_pubkey = $1")
+        let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
             .bind(&pubkey)
+            .execute(&pool)
+            .await;
+    }
+
+    /// bcrypt is deliberately slow, so the registration's window can close while a comparison is
+    /// running. That must still read as expiry rather than as a wrong PIN. Simulated by expiring
+    /// the row mid-flight, which is what the elapsed bcrypt time would otherwise do.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_pin_expiring_during_the_comparison_reports_expired() {
+        let auth_state = create_lazy_auth_state();
+        let pool = auth_state.state.db.clone();
+        let email = format!("verify-pin-race-{}@example.com", uuid::Uuid::new_v4());
+        let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
+
+        // Alive at the snapshot check and at the reservation, so the request gets past both and
+        // runs a real comparison; the window then closes before the result is classified.
+        let expire_at = Utc::now() + Duration::milliseconds(120);
+        sqlx::query("UPDATE oauth_codes SET expires_at = $2 WHERE device_code = $1")
+            .bind(&device_code)
+            .bind(expire_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // A wrong PIN would otherwise be reported as simply not matching.
+        let response = call_verify_pin(auth_state, &device_code, "000000").await;
+        assert!(
+            Utc::now() > expire_at,
+            "the comparison must actually outlast the window for this test to mean anything"
+        );
+        assert_eq!(response.status(), axum::http::StatusCode::GONE);
+        assert_eq!(response_json(response).await["code"], "PIN_EXPIRED");
+
+        let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
