@@ -2300,6 +2300,25 @@ mod tests {
         assert_eq!(response.status(), axum::http::StatusCode::GONE);
         assert_eq!(response_json(response).await["code"], "PIN_EXPIRED");
 
+        // Prove the 410 came from the post-comparison check rather than from the reservation
+        // refusing an already-expired row. Reaching bcrypt requires the reservation to have
+        // succeeded while the window was still open, and a reservation charges both counters
+        // exactly once. Without this the test would pass vacuously whenever scheduling ate the
+        // window before the reservation ran.
+        let (attempts, failed_total): (i32, i32) = sqlx::query_as(
+            "SELECT pin_attempts, pin_failed_total FROM oauth_codes \
+             WHERE device_code = $1 AND pending_email IS NOT NULL",
+        )
+        .bind(&device_code)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (attempts, failed_total),
+            (1, 1),
+            "the reservation must have succeeded before expiry, so the comparison actually ran"
+        );
+
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
             .bind(&device_code)
             .execute(&pool)
