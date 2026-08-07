@@ -834,6 +834,123 @@ async fn disable_trigger_failure_clears_a_stuck_unprovisioned_opt_in() {
     assert_eq!(status.state.as_deref(), Some("disabled"));
 }
 
+/// The escape hatch must not act on a DID it read before calling the control
+/// plane. Provisioning can attach one while that call is in flight, and the
+/// account would then be reported off while a live repo can still publish.
+///
+/// The trigger closure performs the interleaving: it attaches a DID, as the
+/// internal sync endpoint would, and only then reports the failure.
+#[tokio::test]
+async fn disable_refuses_when_a_did_lands_during_the_trigger() {
+    let pool = common::setup_test_db().await;
+    let repo = UserRepository::new(pool.clone());
+    let session_repo = AtprotoOAuthSessionRepository::new(pool.clone());
+    let tenant_id = 1_i64;
+
+    let keys = Keys::generate();
+    let user_pubkey = keys.public_key().to_hex();
+    let username = format!("alice-did-lands-{}", &user_pubkey[..8]);
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, username, atproto_enabled, atproto_state, created_at, updated_at)
+         VALUES ($1, $2, $3, true, 'failed', NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .bind(&username)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    let trigger_pool = pool.clone();
+    let trigger_pubkey = user_pubkey.clone();
+
+    disable_user_atproto_with_trigger(
+        &repo,
+        &session_repo,
+        tenant_id,
+        &user_pubkey,
+        move |_pubkey| async move {
+            sqlx::query("UPDATE users SET atproto_did = $1 WHERE pubkey = $2")
+                .bind("did:plc:landedmidflight")
+                .bind(&trigger_pubkey)
+                .execute(&trigger_pool)
+                .await
+                .expect("failed to simulate provisioning sync");
+
+            Err(keycast_api::atproto_provisioning::AtprotoProvisioningError::DependencyNotConfigured)
+        },
+    )
+    .await
+    .expect_err("disable must fail closed once the account is provisioned");
+
+    // The account keeps its DID and is not reported as switched off.
+    let status = get_user_atproto_status(&repo, tenant_id, &user_pubkey)
+        .await
+        .expect("status should succeed");
+    assert_eq!(status.did.as_deref(), Some("did:plc:landedmidflight"));
+    assert_ne!(status.state.as_deref(), Some("disabled"));
+}
+
+/// A rollback must not clobber provisioning that reported back while the
+/// trigger call was still in flight. The opt-in is only taken back while the
+/// row still holds the `pending` state the same request wrote.
+#[tokio::test]
+async fn enable_rollback_yields_to_a_sync_that_lands_during_the_trigger() {
+    let pool = common::setup_test_db().await;
+    let repo = UserRepository::new(pool.clone());
+    let tenant_id = 1_i64;
+
+    let keys = Keys::generate();
+    let user_pubkey = keys.public_key().to_hex();
+    let username = format!("alice-sync-wins-{}", &user_pubkey[..8]);
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, username, created_at, updated_at)
+         VALUES ($1, $2, $3, NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .bind(&username)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    let trigger_pool = pool.clone();
+    let trigger_pubkey = user_pubkey.clone();
+
+    enable_user_atproto_with_trigger(
+        &repo,
+        tenant_id,
+        &user_pubkey,
+        &username,
+        move |_pubkey, _username| async move {
+            sync_user_atproto_state_by_pubkey(
+                &UserRepository::new(trigger_pool),
+                &trigger_pubkey,
+                true,
+                Some("ready"),
+                Some("did:plc:syncwins"),
+                None,
+            )
+            .await
+            .expect("internal sync should succeed");
+
+            Err(keycast_api::atproto_provisioning::AtprotoProvisioningError::DependencyNotConfigured)
+        },
+    )
+    .await
+    .expect_err("enable should still surface the dependency failure");
+
+    // Provisioning won: the account stays ready instead of being rolled back.
+    let status = get_user_atproto_status(&repo, tenant_id, &user_pubkey)
+        .await
+        .expect("status should succeed");
+    assert!(status.enabled);
+    assert_eq!(status.state.as_deref(), Some("ready"));
+    assert_eq!(status.did.as_deref(), Some("did:plc:syncwins"));
+}
+
 #[tokio::test]
 async fn disable_trigger_failure_preserves_existing_state() {
     let pool = common::setup_test_db().await;

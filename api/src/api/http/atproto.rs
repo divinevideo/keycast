@@ -360,25 +360,29 @@ where
 /// there.
 ///
 /// Any existing DID is carried through the rollback: it records a repo the
-/// control plane still owns, and [`disable_user_atproto_with_trigger`] reads it
-/// to keep refusing a local-only disable for a provisioned account.
+/// control plane still owns, and [`disable_user_atproto_with_trigger`] depends
+/// on it to keep refusing a local-only disable for a provisioned account.
+///
+/// The rollback only applies while the row still holds the `pending` state this
+/// request wrote. If the trigger did reach the control plane and provisioning
+/// reported back through the internal sync endpoint before the local call
+/// failed, that sync has already moved the row and must not be overwritten.
 async fn roll_back_failed_enable(
     repo: &UserRepository,
     tenant_id: i64,
     user_pubkey: &str,
     error: &crate::atproto_provisioning::AtprotoProvisioningError,
 ) -> Result<(), AtprotoControlError> {
-    let existing_did = current_atproto_did(repo, tenant_id, user_pubkey).await?;
+    let rolled_back = repo
+        .roll_back_atproto_enable(user_pubkey, tenant_id, Some(error.public_message()))
+        .await?;
 
-    repo.set_atproto_state(
-        user_pubkey,
-        tenant_id,
-        false,
-        Some("failed"),
-        existing_did.as_deref(),
-        Some(error.public_message()),
-    )
-    .await?;
+    if !rolled_back {
+        tracing::info!(
+            "Skipped ATProto enable rollback for pubkey {}: the row is no longer pending, so provisioning state took precedence",
+            user_pubkey
+        );
+    }
 
     Ok(())
 }
@@ -534,18 +538,32 @@ where
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = Result<(), crate::atproto_provisioning::AtprotoProvisioningError>>,
 {
-    let current = user_repo
-        .get_atproto_state(user_pubkey, tenant_id)
+    // Resolve the user before calling the control plane so a request for an
+    // unknown account still fails as `UserNotFound` rather than reaching the
+    // gateway. The DID is deliberately not read here: it is checked inside the
+    // conditional write below, because anything read before the trigger await
+    // can be stale by the time it would be acted on.
+    let username = user_repo
+        .get_username(user_pubkey, tenant_id)
         .await?
         .ok_or(AtprotoControlError::UserNotFound)?;
 
     if let Err(error) = trigger(user_pubkey.to_string()).await {
         // A provisioned account has a live repo that can keep publishing, so
         // reporting "off" without the control plane agreeing would be a lie.
-        // Without a DID there is nothing to publish from, and refusing here is
+        // Without a DID there is nothing to publish from, and refusing there is
         // what strands an account that a failed enable already left switched
         // on: every attempt to switch it back off hits the same outage.
-        if current.did.is_some() {
+        //
+        // The eligibility check is the `atproto_did IS NULL` predicate on this
+        // statement rather than an earlier read, so provisioning cannot attach a
+        // DID between the check and the write. A `false` result means the
+        // account became provisioned, and the request fails closed.
+        let released = user_repo
+            .disable_atproto_if_unprovisioned(user_pubkey, tenant_id)
+            .await?;
+
+        if !released {
             return Err(AtprotoControlError::ProvisioningTrigger(error));
         }
 
@@ -554,6 +572,15 @@ where
             user_pubkey,
             error
         );
+
+        session_repo.revoke_sessions_for_pubkey(user_pubkey).await?;
+
+        let state = user_repo
+            .get_atproto_state(user_pubkey, tenant_id)
+            .await?
+            .ok_or(AtprotoControlError::UserNotFound)?;
+
+        return Ok(map_state_to_response(username, state));
     }
 
     disable_user_atproto_and_revoke_sessions(user_repo, session_repo, tenant_id, user_pubkey).await

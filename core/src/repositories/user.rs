@@ -1470,6 +1470,89 @@ impl UserRepository {
         Ok(())
     }
 
+    /// Roll back an ATProto opt-in that this request wrote, but only if the row
+    /// still holds the `pending` state that request left behind.
+    ///
+    /// The opt-in is written before the control plane is called, so a failed
+    /// trigger has to take it back. Doing that with an unconditional write races
+    /// the control plane: if the trigger did land and provisioning reported back
+    /// through the internal sync endpoint before the local call failed, a blind
+    /// rollback would overwrite a successful `ready` state. Guarding on
+    /// `atproto_state = 'pending'` makes the check and the write one step, so a
+    /// sync that already moved the row wins.
+    ///
+    /// `atproto_did` is deliberately left out of the `SET` clause. That preserves
+    /// any DID without reading it first, so there is no window between reading
+    /// the DID and writing it back.
+    ///
+    /// Returns whether the rollback applied.
+    pub async fn roll_back_atproto_enable(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+        error: Option<&str>,
+    ) -> Result<bool, RepositoryError> {
+        let now = Utc::now();
+        let result = sqlx::query(
+            "UPDATE users
+             SET atproto_enabled = false,
+                 atproto_state = 'failed',
+                 atproto_error = $1,
+                 atproto_updated_at = $2,
+                 updated_at = $2
+             WHERE pubkey = $3
+               AND tenant_id = $4
+               AND atproto_state = 'pending'",
+        )
+        .bind(error)
+        .bind(now)
+        .bind(pubkey)
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Release an ATProto opt-in locally, but only while the account has no DID.
+    ///
+    /// This backs the escape hatch that lets a user switch crossposting off when
+    /// the control plane is unreachable. It is only safe without the control
+    /// plane's agreement when there is no repo to publish from, so the absence of
+    /// a DID is the authorization for the write and must be checked in the same
+    /// statement. Reading the DID first and deciding afterwards leaves a window —
+    /// as wide as the control-plane request timeout — in which provisioning can
+    /// attach a DID and the account is then reported off while still live.
+    ///
+    /// Returns whether the local release applied. A `false` result means the
+    /// account is no longer eligible, so the caller must fail closed.
+    pub async fn disable_atproto_if_unprovisioned(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<bool, RepositoryError> {
+        let now = Utc::now();
+        let result = sqlx::query(
+            "UPDATE users
+             SET atproto_enabled = false,
+                 atproto_state = 'disabled',
+                 atproto_did = NULL,
+                 atproto_error = NULL,
+                 atproto_updated_at = $1,
+                 updated_at = $1
+             WHERE pubkey = $2
+               AND tenant_id = $3
+               AND atproto_did IS NULL",
+        )
+        .bind(now)
+        .bind(pubkey)
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Update a user's ATProto lifecycle state using globally unique pubkey lookup.
     pub async fn set_atproto_state_by_pubkey(
         &self,
