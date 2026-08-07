@@ -905,6 +905,7 @@ impl OAuthCodeRepository {
 #[cfg(all(test, feature = "integration-tests"))]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn assert_localhost_db() {
         let url = std::env::var("DATABASE_URL").unwrap_or_default();
@@ -1044,6 +1045,9 @@ mod tests {
             .unwrap();
     }
 
+    // Serialized against `test_delete_expired_and_consumed_removes_dead_rows`: that cleanup is
+    // global by design, so an expired fixture is fair game for it while both run concurrently.
+    #[serial]
     #[tokio::test]
     async fn test_find_by_device_code_returns_expired_rows_for_the_caller_to_judge() {
         let pool = setup_pool().await;
@@ -1294,6 +1298,9 @@ mod tests {
     /// on the caller's earlier snapshot. Without this, a window closing between the caller's check
     /// and the reservation would let a bcrypt comparison run against a dead registration and be
     /// reported as a wrong PIN.
+    // Serialized against `test_delete_expired_and_consumed_removes_dead_rows`: that cleanup is
+    // global by design, so an expired fixture is fair game for it while both run concurrently.
+    #[serial]
     #[tokio::test]
     async fn test_reserve_pin_attempt_refuses_an_expired_registration() {
         let pool = setup_pool().await;
@@ -2013,6 +2020,9 @@ mod tests {
             .unwrap();
     }
 
+    // Serialized against `test_delete_expired_and_consumed_removes_dead_rows`: that cleanup is
+    // global by design, so an expired fixture is fair game for it while both run concurrently.
+    #[serial]
     #[tokio::test]
     async fn test_delete_expired_and_consumed_removes_dead_rows() {
         let pool = setup_pool().await;
