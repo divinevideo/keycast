@@ -1501,6 +1501,7 @@ pub async fn create_bunker(
             secret_hash,
             relays: relays_json.clone(),
             policy_id,
+            is_first_party: false,
             client_pubkey: None,
             authorization_handle: None,
             handle_expires_at,
@@ -4903,7 +4904,7 @@ pub async fn delete_account(
         tracing::warn!(
             event = "account_deletion_denied",
             tenant_id = tenant_id,
-            user = &user_pubkey[..8],
+            user_pubkey = %user_pubkey,
             redirect_origin = %redirect_origin,
             "Denied: not user-signed and not first-party"
         );
@@ -4916,7 +4917,7 @@ pub async fn delete_account(
     tracing::info!(
         event = "account_deletion_started",
         tenant_id = tenant_id,
-        user = &user_pubkey[..8],
+        user_pubkey = %user_pubkey,
         is_user_signed = is_user_signed,
         is_first_party = is_first_party,
         redirect_origin = %redirect_origin,
@@ -4932,7 +4933,7 @@ pub async fn delete_account(
             tracing::error!(
                 event = "account_deletion_failed",
                 tenant_id = tenant_id,
-                user = &user_pubkey[..8],
+                user_pubkey = %user_pubkey,
                 error = %e,
                 "Database error during deletion"
             );
@@ -4960,7 +4961,7 @@ pub async fn delete_account(
     tracing::info!(
         event = "account_deletion_completed",
         tenant_id = tenant_id,
-        user = &user_pubkey[..8],
+        user_pubkey = %user_pubkey,
         teams_removed = result.teams_removed,
         oauth_auths_deleted = result.oauth_authorizations_deleted,
         bunkers_notified = result.bunker_pubkeys.len(),
@@ -4975,9 +4976,63 @@ pub async fn delete_account(
 
 #[cfg(test)]
 mod tests {
+    use super::generate_server_signed_ucan;
     use super::validate_origin;
     use super::AccountStatusResponse;
     use axum::response::IntoResponse;
+    use ucan::Ucan;
+
+    #[tokio::test]
+    async fn server_signed_ucan_includes_first_party_only_when_requested() {
+        let user_keys = Keys::generate();
+        let server_keys = Keys::generate();
+
+        let first_party_token = generate_server_signed_ucan(
+            &user_keys.public_key(),
+            1,
+            "user@example.test",
+            "https://first-party.example.test",
+            None,
+            &server_keys,
+            true,
+            None,
+            None,
+        )
+        .await
+        .expect("first-party UCAN");
+        let first_party_ucan =
+            Ucan::try_from_token_string(&first_party_token).expect("decode first-party UCAN");
+        assert!(
+            first_party_ucan
+                .facts()
+                .iter()
+                .any(|fact| fact.get("first_party").and_then(|v| v.as_bool()) == Some(true)),
+            "first-party sessions must carry the deletion authorization fact"
+        );
+
+        let third_party_token = generate_server_signed_ucan(
+            &user_keys.public_key(),
+            1,
+            "user@example.test",
+            "https://third-party.example.test",
+            None,
+            &server_keys,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("third-party UCAN");
+        let third_party_ucan =
+            Ucan::try_from_token_string(&third_party_token).expect("decode third-party UCAN");
+        assert!(
+            third_party_ucan
+                .facts()
+                .iter()
+                .all(|fact| fact.get("first_party").is_none()),
+            "third-party sessions must not gain account deletion authority"
+        );
+    }
 
     #[cfg(feature = "integration-tests")]
     #[tokio::test]

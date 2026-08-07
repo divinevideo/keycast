@@ -26,6 +26,8 @@ pub struct OAuthAuthorization {
     pub relays: Relays,
     /// Optional policy for permission restrictions
     pub policy_id: Option<i32>,
+    /// Whether this authorization came from a first-party flow.
+    pub is_first_party: bool,
     /// Tenant ID for multi-tenancy isolation
     pub tenant_id: i64,
     /// App's ephemeral pubkey for NIP-46 communication (NIP-46: `client-pubkey`)
@@ -86,7 +88,7 @@ impl OAuthAuthorization {
             "SELECT id, user_pubkey, redirect_origin, client_id, bunker_public_key,
                     secret_hash, relays, policy_id, tenant_id, client_pubkey, connected_client_pubkey,
                     connected_at, created_at, updated_at, revoked_at, expires_at,
-                    handle_expires_at, authorization_handle
+                    handle_expires_at, authorization_handle, is_first_party
              FROM oauth_authorizations WHERE tenant_id = $1 AND id = $2",
         )
         .bind(tenant_id)

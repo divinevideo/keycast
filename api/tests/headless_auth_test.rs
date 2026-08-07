@@ -15,8 +15,11 @@ use chrono::{Duration, Utc};
 use keycast_api::{
     api::{
         http::{
+            auth::generate_server_signed_ucan,
             auth_observability::request_id_middleware,
-            headless::{headless_login, HeadlessLoginRequest},
+            headless::{
+                headless_authorize, headless_login, HeadlessAuthorizeRequest, HeadlessLoginRequest,
+            },
         },
         tenant::{Tenant, TenantExtractor},
     },
@@ -29,14 +32,17 @@ use keycast_core::{
     secret_pool::SecretPool,
 };
 use moka::future::Cache;
-use nostr_sdk::Keys;
+use nostr_sdk::{Keys, ToBech32};
 use sqlx::PgPool;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tower::ServiceExt;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 mod common;
+
+static SERVER_NSEC_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
 async fn setup_pool() -> PgPool {
     common::assert_test_database_url();
@@ -118,6 +124,21 @@ fn create_test_tenant() -> TenantExtractor {
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }))
+}
+
+fn build_headless_authorize_app(auth_state: keycast_api::api::http::routes::AuthState) -> Router {
+    Router::new().route(
+        "/headless/authorize",
+        post(
+            move |headers: axum::http::HeaderMap, Json(req): Json<HeadlessAuthorizeRequest>| {
+                let auth_state = auth_state.clone();
+                async move {
+                    headless_authorize(create_test_tenant(), State(auth_state), headers, Json(req))
+                        .await
+                }
+            },
+        ),
+    )
 }
 
 // ============================================================================
@@ -453,6 +474,156 @@ async fn test_headless_authorize_creates_code() {
     assert_eq!(record.1, "policy:readonly");
 
     // Cleanup
+    cleanup_test_user(&pool, &pubkey).await;
+}
+
+#[tokio::test]
+async fn test_headless_authorize_rejects_third_party_bearer_token() {
+    let _server_nsec_guard = SERVER_NSEC_TEST_LOCK.lock().await;
+    let pool = setup_pool().await;
+    let keys = Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    let email = format!(
+        "headless-authorize-third-party-{}@example.com",
+        Uuid::new_v4()
+    );
+
+    cleanup_test_user(&pool, &pubkey).await;
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, email, email_verified, created_at, updated_at)
+         VALUES ($1, 1, $2, true, NOW(), NOW())",
+    )
+    .bind(&pubkey)
+    .bind(&email)
+    .execute(&pool)
+    .await
+    .expect("Should create user");
+
+    let server_keys = Keys::generate();
+    std::env::set_var(
+        "SERVER_NSEC",
+        server_keys.secret_key().to_bech32().expect("server nsec"),
+    );
+    let bearer = generate_server_signed_ucan(
+        &keys.public_key(),
+        1,
+        &email,
+        "https://third-party.example.com",
+        None,
+        &server_keys,
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("third-party UCAN");
+
+    let response = build_headless_authorize_app(create_test_auth_state(pool.clone()))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/headless/authorize")
+                .header("authorization", format!("Bearer {}", bearer))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "client_id": "ThirdPartyApp",
+                        "redirect_uri": "https://third-party.example.com/callback",
+                        "scope": "policy:full"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .expect("headless authorize request should complete");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let code_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM oauth_codes WHERE user_pubkey = $1")
+            .bind(&pubkey)
+            .fetch_one(&pool)
+            .await
+            .expect("oauth code count should query");
+    assert_eq!(code_count, 0);
+
+    cleanup_test_user(&pool, &pubkey).await;
+}
+
+#[tokio::test]
+async fn test_headless_authorize_accepts_first_party_bearer_token() {
+    let _server_nsec_guard = SERVER_NSEC_TEST_LOCK.lock().await;
+    let pool = setup_pool().await;
+    let keys = Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    let email = format!(
+        "headless-authorize-first-party-{}@example.com",
+        Uuid::new_v4()
+    );
+
+    cleanup_test_user(&pool, &pubkey).await;
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, email, email_verified, created_at, updated_at)
+         VALUES ($1, 1, $2, true, NOW(), NOW())",
+    )
+    .bind(&pubkey)
+    .bind(&email)
+    .execute(&pool)
+    .await
+    .expect("Should create user");
+
+    let server_keys = Keys::generate();
+    std::env::set_var(
+        "SERVER_NSEC",
+        server_keys.secret_key().to_bech32().expect("server nsec"),
+    );
+    let bearer = generate_server_signed_ucan(
+        &keys.public_key(),
+        1,
+        &email,
+        "https://first-party.example.com",
+        None,
+        &server_keys,
+        true,
+        None,
+        None,
+    )
+    .await
+    .expect("first-party UCAN");
+
+    let response = build_headless_authorize_app(create_test_auth_state(pool.clone()))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/headless/authorize")
+                .header("authorization", format!("Bearer {}", bearer))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "client_id": "FirstPartyApp",
+                        "redirect_uri": "https://first-party.example.com/callback",
+                        "scope": "policy:full"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .expect("headless authorize request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let is_headless: bool =
+        sqlx::query_scalar("SELECT is_headless FROM oauth_codes WHERE user_pubkey = $1")
+            .bind(&pubkey)
+            .fetch_one(&pool)
+            .await
+            .expect("oauth code should exist");
+    assert!(is_headless);
+
     cleanup_test_user(&pool, &pubkey).await;
 }
 

@@ -561,10 +561,7 @@ pub async fn headless_authorize(
     let pool = &auth_state.state.db;
     let tenant_id = tenant.0.id;
 
-    // Extract user from UCAN Bearer token with tenant validation
-    let user_pubkey = super::auth::extract_user_from_token(&headers, tenant_id)
-        .await
-        .map_err(|_| HeadlessError::Unauthorized)?;
+    let user_pubkey = extract_first_party_or_user_signed_user(&headers, tenant_id).await?;
 
     tracing::info!(
         event = "headless_authorize",
@@ -612,6 +609,50 @@ pub async fn headless_authorize(
         code,
         state: req.state,
     }))
+}
+
+async fn extract_first_party_or_user_signed_user(
+    headers: &HeaderMap,
+    tenant_id: i64,
+) -> Result<String, HeadlessError> {
+    let auth_header = if let Some(auth_header) = headers.get("Authorization") {
+        auth_header
+            .to_str()
+            .map_err(|_| HeadlessError::Unauthorized)?
+            .to_string()
+    } else if let Some(token) = super::auth::extract_ucan_from_cookie(headers) {
+        format!("Bearer {}", token)
+    } else {
+        return Err(HeadlessError::Unauthorized);
+    };
+
+    let (user_pubkey, redirect_origin, _, ucan) =
+        crate::ucan_auth::validate_ucan_token(&auth_header, tenant_id)
+            .await
+            .map_err(|_| HeadlessError::Unauthorized)?;
+
+    let issuer = crate::ucan_auth::did_to_nostr_pubkey(ucan.issuer())
+        .map_err(|_| HeadlessError::Unauthorized)?
+        .to_hex();
+    let is_user_signed = issuer == user_pubkey;
+    let is_first_party = ucan
+        .facts()
+        .iter()
+        .find_map(|fact| fact.get("first_party").and_then(|value| value.as_bool()))
+        .unwrap_or(false);
+
+    if !is_user_signed && !is_first_party {
+        tracing::warn!(
+            event = "headless_authorize_denied",
+            tenant_id = tenant_id,
+            user_pubkey = %user_pubkey,
+            redirect_origin = %redirect_origin,
+            "Denied: bearer token is not user-signed or first-party"
+        );
+        return Err(HeadlessError::Unauthorized);
+    }
+
+    Ok(user_pubkey)
 }
 
 // ============================================================================
