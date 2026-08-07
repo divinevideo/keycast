@@ -431,52 +431,103 @@ impl OAuthCodeRepository {
     /// window. Otherwise repeated resends could extend a pending row indefinitely, defeating the
     /// row's finite lifecycle (keycast#262).
     ///
-    /// Deliberately NOT scoped to the pending row (unlike [`Self::reserve_pin_attempt`] /
-    /// [`Self::reset_pin_attempts`]): this rewrites `pending_email_verification_token`, which
-    /// minted sibling exchange-code rows copy and which redemption correlates on (see
-    /// [`Self::mark_pending_consumed`]). Restricting the UPDATE to the pending row would
-    /// desynchronize the token between a pre-resend minted code and the pending row, so redeeming
-    /// that code would no longer mark the registration consumed. If you need to narrow this,
-    /// change the redemption correlation key first.
+    /// The rewrite is applied to the pending row and to every sibling row sharing the
+    /// `device_code` (unlike [`Self::reserve_pin_attempt`] / [`Self::reset_pin_attempts`], which
+    /// are scoped to the pending row). That is deliberate: this rewrites
+    /// `pending_email_verification_token`, which minted sibling exchange-code rows copy and which
+    /// redemption correlates on (see [`Self::mark_pending_consumed`]). Restricting the rewrite to
+    /// the pending row would desynchronize the token between a pre-resend minted code and the
+    /// pending row, so redeeming that code would no longer mark the registration consumed. If you
+    /// need to narrow this, change the redemption correlation key first.
+    ///
+    /// # Cooldown claim
+    ///
+    /// The cooldown is enforced *here*, as part of the same conditional UPDATE that rotates the
+    /// credentials, and the whole rewrite runs in one transaction. Returns `true` only if this call
+    /// won the claim.
+    ///
+    /// Checking the cooldown with a separate read first would be a time-of-check/time-of-use gap:
+    /// two concurrent resends could both observe an expired cooldown, both mint a PIN, both send an
+    /// email, and leave whichever UPDATE landed last as the only valid PIN — so a user could be
+    /// looking at a freshly delivered code that does not work. Callers may still do a cheap
+    /// pre-check to avoid paying for bcrypt, but this claim is what actually decides.
     pub async fn reset_pin_for_resend(
         &self,
         device_code: &str,
         tenant_id: i64,
         new_verification_token: &str,
         new_pin_hash: &str,
-    ) -> Result<(), RepositoryError> {
-        sqlx::query(
+        cooldown_cutoff: DateTime<Utc>,
+    ) -> Result<bool, RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let now = Utc::now();
+
+        // Claim on the pending row only: sibling rows carry no PIN state, so including them here
+        // would make the claim succeed even when the pending row is still within its cooldown.
+        let claimed = sqlx::query(
             "UPDATE oauth_codes \
              SET pending_email_verification_token = $1, pin_hash = $2, pin_attempts = 0, \
                  pin_sent_at = $3, pin_resend_at = $3 \
-             WHERE device_code = $4 AND tenant_id = $5",
+             WHERE device_code = $4 AND tenant_id = $5 \
+               AND pending_email IS NOT NULL AND consumed_at IS NULL \
+               AND (pin_resend_at IS NULL OR pin_resend_at <= $6)",
         )
         .bind(new_verification_token)
         .bind(new_pin_hash)
-        .bind(Utc::now())
+        .bind(now)
         .bind(device_code)
         .bind(tenant_id)
-        .execute(&self.pool)
+        .bind(cooldown_cutoff)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+
+        if !claimed {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        // Keep sibling exchange-code rows correlated with the pending row's new token.
+        sqlx::query(
+            "UPDATE oauth_codes SET pending_email_verification_token = $1 \
+             WHERE device_code = $2 AND tenant_id = $3 AND pending_email IS NULL",
+        )
+        .bind(new_verification_token)
+        .bind(device_code)
+        .bind(tenant_id)
+        .execute(&mut *tx)
         .await?;
-        Ok(())
+
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Restore PIN resend fields after replacement email delivery fails.
     ///
-    /// Like [`Self::reset_pin_for_resend`], deliberately NOT scoped to the pending row: it must
-    /// undo that call's token rewrite on every row sharing the `device_code` (see the coupling
-    /// note there).
+    /// Like [`Self::reset_pin_for_resend`], the restore covers the pending row and its sibling
+    /// exchange-code rows, so it undoes that call's token rewrite everywhere (see the coupling note
+    /// there).
+    ///
+    /// `expected_pin_hash` is the hash the failing call itself wrote. The restore applies only
+    /// while that value is still current, so a resend whose delivery failed can never roll back
+    /// over a later resend that already succeeded and put a different PIN in the user's inbox.
+    /// Returns `true` if the restore applied.
     pub async fn restore_pin_after_failed_resend(
         &self,
         device_code: &str,
         tenant_id: i64,
         previous: PinResendSnapshot<'_>,
-    ) -> Result<(), RepositoryError> {
-        sqlx::query(
+        expected_pin_hash: &str,
+    ) -> Result<bool, RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+
+        let restored = sqlx::query(
             "UPDATE oauth_codes \
              SET pending_email_verification_token = $1, pin_hash = $2, pin_attempts = $3, \
                  pin_sent_at = $4, pin_resend_at = $5 \
-             WHERE device_code = $6 AND tenant_id = $7",
+             WHERE device_code = $6 AND tenant_id = $7 \
+               AND pending_email IS NOT NULL AND pin_hash = $8",
         )
         .bind(previous.verification_token)
         .bind(previous.pin_hash)
@@ -485,9 +536,29 @@ impl OAuthCodeRepository {
         .bind(previous.pin_resend_at)
         .bind(device_code)
         .bind(tenant_id)
-        .execute(&self.pool)
+        .bind(expected_pin_hash)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+
+        if !restored {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        sqlx::query(
+            "UPDATE oauth_codes SET pending_email_verification_token = $1 \
+             WHERE device_code = $2 AND tenant_id = $3 AND pending_email IS NULL",
+        )
+        .bind(previous.verification_token)
+        .bind(device_code)
+        .bind(tenant_id)
+        .execute(&mut *tx)
         .await?;
-        Ok(())
+
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Mark that a PIN email was successfully handed to the delivery provider.
@@ -1094,6 +1165,65 @@ mod tests {
             .unwrap();
     }
 
+    /// The cooldown must be claimed by the same statement that rotates the credentials. Checking it
+    /// with a separate read first would let two concurrent resends both mint a PIN and both send an
+    /// email, leaving whichever UPDATE landed last as the only valid one — so a user could be
+    /// holding a code that was just mailed to them and does not work.
+    #[tokio::test]
+    async fn test_concurrent_resends_only_one_wins_the_cooldown_claim() {
+        let pool = setup_pool().await;
+        let repo = OAuthCodeRepository::new(pool.clone());
+
+        let device_code = format!("dc_{}", uuid::Uuid::new_v4());
+        insert_pending_registration(
+            &repo,
+            &device_code,
+            Some("oldpin"),
+            Utc::now() + chrono::Duration::hours(12),
+        )
+        .await;
+
+        // Both callers pass the same cutoff, exactly as two requests arriving together would.
+        let cutoff = Utc::now();
+        let token_a = format!("verif_a_{}", uuid::Uuid::new_v4());
+        let token_b = format!("verif_b_{}", uuid::Uuid::new_v4());
+
+        let (a, b) = tokio::join!(
+            repo.reset_pin_for_resend(&device_code, 1, &token_a, "pin_a", cutoff),
+            repo.reset_pin_for_resend(&device_code, 1, &token_b, "pin_b", cutoff),
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+
+        assert!(
+            a ^ b,
+            "exactly one concurrent resend may claim the cooldown, got a={a} b={b}"
+        );
+
+        // The row must agree with whichever caller was told it won.
+        let winner_pin = if a { "pin_a" } else { "pin_b" };
+        let winner_token = if a { &token_a } else { &token_b };
+        let data = repo
+            .find_by_device_code(&device_code, 1)
+            .await
+            .unwrap()
+            .expect("pending row still exists");
+        assert_eq!(
+            data.pin_hash.as_deref(),
+            Some(winner_pin),
+            "the stored PIN must be the one the winning caller was told it installed"
+        );
+        assert_eq!(
+            data.pending_email_verification_token.as_deref(),
+            Some(winner_token.as_str())
+        );
+
+        sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn test_reset_pin_for_resend_rearms_token_pin_and_attempts() {
         let pool = setup_pool().await;
@@ -1115,9 +1245,10 @@ mod tests {
         repo.reserve_pin_attempt(&device_code, 1, 5).await.unwrap();
 
         let new_token = format!("verif_{}", uuid::Uuid::new_v4());
-        repo.reset_pin_for_resend(&device_code, 1, &new_token, "newpin")
+        assert!(repo
+            .reset_pin_for_resend(&device_code, 1, &new_token, "newpin", Utc::now())
             .await
-            .unwrap();
+            .unwrap());
 
         let data = repo
             .find_by_device_code(&device_code, 1)

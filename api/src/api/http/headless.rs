@@ -1079,8 +1079,10 @@ pub async fn headless_resend_pin(
         return Ok(success());
     }
 
-    // Cooldown: silently skip if a resend already ran within the window. Anchored on
-    // `pin_resend_at`, which registration leaves NULL, so the first resend always proceeds.
+    // Cheap pre-check so an obvious cooldown hit does not pay for bcrypt. This is an optimization,
+    // not the gate: `reset_pin_for_resend` re-evaluates the cooldown atomically as part of the
+    // rotation, which is what actually prevents two concurrent resends from both rotating.
+    // Anchored on `pin_resend_at`, which registration leaves NULL, so the first resend proceeds.
     if let Some(resent_at) = pending.pin_resend_at {
         if Utc::now() - resent_at < Duration::minutes(PIN_RESEND_COOLDOWN_MINUTES) {
             tracing::debug!("resend-pin: within cooldown, skipping (not revealed to client)");
@@ -1109,9 +1111,23 @@ pub async fn headless_resend_pin(
     let old_pin_sent_at = pending.pin_sent_at;
     let old_pin_resend_at = pending.pin_resend_at;
 
-    oauth_code_repo
-        .reset_pin_for_resend(&req.device_code, tenant_id, &new_token, &new_pin_hash)
-        .await?;
+    // Atomically claim the resend. A loser exits through the same uniform response, so a
+    // double-submit costs the user nothing and never leaves them holding a PIN that was overwritten
+    // by a concurrent rotation.
+    let cooldown_cutoff = Utc::now() - Duration::minutes(PIN_RESEND_COOLDOWN_MINUTES);
+    if !oauth_code_repo
+        .reset_pin_for_resend(
+            &req.device_code,
+            tenant_id,
+            &new_token,
+            &new_pin_hash,
+            cooldown_cutoff,
+        )
+        .await?
+    {
+        tracing::debug!("resend-pin: lost the resend claim, skipping (not revealed to client)");
+        return Ok(success());
+    }
 
     // Re-send the link + PIN. If delivery fails, roll back the mutation so the previous credential
     // remains valid and the resend cooldown is not armed by an undelivered replacement.
@@ -1132,7 +1148,9 @@ pub async fn headless_resend_pin(
 
     if let Err(e) = send_result {
         tracing::error!("Failed to resend verification email to {}: {}", email, e);
-        oauth_code_repo
+        // Guarded on the hash this call wrote, so a later resend that did reach the user is never
+        // rolled back out from under them.
+        let restored = oauth_code_repo
             .restore_pin_after_failed_resend(
                 &req.device_code,
                 tenant_id,
@@ -1143,8 +1161,14 @@ pub async fn headless_resend_pin(
                     pin_sent_at: old_pin_sent_at,
                     pin_resend_at: old_pin_resend_at,
                 },
+                &new_pin_hash,
             )
             .await?;
+        if !restored {
+            tracing::info!(
+                "resend-pin: skipped rollback because a later resend already replaced the PIN"
+            );
+        }
         return Ok(success());
     }
 
@@ -2497,6 +2521,84 @@ mod tests {
         assert_eq!(
             new_pin_resend_at, old_pin_resend_at,
             "failed resend must not arm a new cooldown"
+        );
+
+        let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(&pubkey)
+            .execute(&pool)
+            .await;
+    }
+
+    /// A resend whose email could not be delivered rolls its own mutation back. That rollback must
+    /// be guarded: if another resend already succeeded in the meantime, restoring the older
+    /// snapshot would invalidate the PIN that is sitting in the user's inbox right now, so the code
+    /// they were just sent would not work.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    #[serial]
+    async fn test_failed_resend_does_not_clobber_a_later_successful_one() {
+        let auth_state = create_lazy_auth_state();
+        let pool = auth_state.state.db.clone();
+        let email = format!("repro-clobber-{}@example.com", uuid::Uuid::new_v4());
+        let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
+
+        sqlx::query("UPDATE oauth_codes SET pin_resend_at = NOW() - INTERVAL '10 minutes' WHERE device_code = $1")
+            .bind(&device_code).execute(&pool).await.unwrap();
+
+        type Snap = (
+            Option<String>,
+            Option<String>,
+            i32,
+            Option<chrono::DateTime<Utc>>,
+            Option<chrono::DateTime<Utc>>,
+        );
+        let (b_hash, b_token, b_attempts, b_sent, b_resend): Snap =
+            sqlx::query_as("SELECT pin_hash, pending_email_verification_token, pin_attempts, pin_sent_at, pin_resend_at FROM oauth_codes WHERE device_code = $1")
+                .bind(&device_code).fetch_one(&pool).await.unwrap();
+
+        let r = call_resend_pin(auth_state, &device_code).await;
+        assert_eq!(r.status(), axum::http::StatusCode::OK);
+        let (a_hash,): (Option<String>,) =
+            sqlx::query_as("SELECT pin_hash FROM oauth_codes WHERE device_code = $1")
+                .bind(&device_code)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_ne!(
+            a_hash, b_hash,
+            "precondition: the successful resend rotated the PIN"
+        );
+
+        keycast_core::repositories::OAuthCodeRepository::new(pool.clone())
+            .restore_pin_after_failed_resend(
+                &device_code,
+                1,
+                keycast_core::repositories::PinResendSnapshot {
+                    verification_token: b_token.as_deref(),
+                    pin_hash: b_hash.as_deref(),
+                    pin_attempts: b_attempts,
+                    pin_sent_at: b_sent,
+                    pin_resend_at: b_resend,
+                },
+                b_hash.as_deref().expect("snapshot carries a PIN hash"),
+            )
+            .await
+            .unwrap();
+
+        let (final_hash,): (Option<String>,) =
+            sqlx::query_as("SELECT pin_hash FROM oauth_codes WHERE device_code = $1")
+                .bind(&device_code)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            final_hash, a_hash,
+            "a failed resend must not restore over a PIN a later resend already delivered"
         );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
