@@ -1920,7 +1920,7 @@ impl UserRepository {
         )
         .bind(old_pubkey)
         .bind(tenant_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
 
         // Orphan old identity (transfer email/password/username to NULL)
@@ -1969,7 +1969,7 @@ impl UserRepository {
         .bind(now)
         .bind(old_pubkey)
         .bind(tenant_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
         // Create personal_keys for new identity

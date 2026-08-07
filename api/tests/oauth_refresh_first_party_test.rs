@@ -14,7 +14,7 @@ use chrono::{Duration, Utc};
 use keycast_api::{
     api::{
         http::oauth::{authorize_get, AuthorizeRequest},
-        http::oauth::{token, TokenRequest},
+        http::oauth::{token, TokenRequest, TokenRequestBody},
         tenant::{Tenant, TenantExtractor},
     },
     bcrypt_queue::BcryptQueue,
@@ -324,7 +324,14 @@ fn build_oauth_app(pool: PgPool) -> Router {
             "/oauth/token",
             post(move |Json(req): Json<TokenRequest>| {
                 let auth_state = token_state.clone();
-                async move { token(create_test_tenant(), State(auth_state), Json(req)).await }
+                async move {
+                    token(
+                        create_test_tenant(),
+                        State(auth_state),
+                        TokenRequestBody(req),
+                    )
+                    .await
+                }
             }),
         )
 }
