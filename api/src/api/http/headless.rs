@@ -11,7 +11,8 @@ use bcrypt::verify;
 use chrono::{Duration, Utc};
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
-    OAuthCodeRepository, PolicyRepository, StoreOAuthCodeWithRegistrationParams, UserRepository,
+    OAuthCodeRepository, PinAttemptReservation, PolicyRepository,
+    StoreOAuthCodeWithRegistrationParams, UserRepository,
 };
 use nostr_sdk::Keys;
 use rand::Rng;
@@ -714,20 +715,26 @@ async fn extract_first_party_or_user_signed_user(
 // Headless Verify PIN (in-app fallback for the email verification link)
 // ============================================================================
 
-/// Failed PIN attempts allowed before the PIN is locked until resend (keycast#262).
+/// Failed attempts allowed against the *current* PIN before it locks (keycast#262). A resend
+/// clears this, which is what makes a resend the way out of a lockout.
 const MAX_PIN_ATTEMPTS: i32 = 5;
 
-/// How long an issued 6-digit PIN stays usable, measured from `pin_sent_at`.
+/// Failed attempts allowed across every PIN a single registration issues. Nothing clears this.
 ///
-/// Deliberately far shorter than the pending registration's own 24h window: a 6-digit secret has
-/// only a million values, so its useful lifetime should be bounded by how long a person plausibly
-/// takes to read the mail, not by how long the registration stays open. The email's verification
-/// link is unaffected and remains valid for the full registration window, and a resend re-arms a
-/// fresh PIN, so an aged-out PIN is a recoverable state rather than a dead end.
+/// [`MAX_PIN_ATTEMPTS`] alone is escapable: it resets on resend, so an attacker who resends each
+/// time it is spent gets a fresh PIN and a fresh cap indefinitely, leaving the resend cooldown as
+/// the only real limit — roughly 1,440 guesses over the registration's 24-hour window. This cap
+/// bounds the registration's whole life instead, and exhausting it disables PIN entry while
+/// leaving the emailed link working.
 ///
-/// Comfortably longer than [`PIN_RESEND_COOLDOWN_MINUTES`] so a user whose PIN ages out can always
-/// obtain a new one immediately instead of landing between an unusable PIN and a live cooldown.
-const PIN_VALIDITY_MINUTES: i64 = 60;
+/// 50 rather than a round guess, for three reasons. NIST SP 800-63B-4 §3.2.2 sets 100 as the
+/// normative ceiling for consecutive failed attempts against a specific authenticator before it
+/// must be disabled, so 50 sits inside a standard rather than being invented, at half that
+/// ceiling. A legitimate user's realistic worst case is around 15 — the 5-attempt cap across the
+/// two or three resends a real person makes — so 50 leaves more than three times that headroom.
+/// And against a 10^6 PIN space it holds lifetime exposure near 0.005%, against roughly 0.14% with
+/// no lifetime cap at all.
+const MAX_PIN_ATTEMPTS_LIFETIME: i32 = 50;
 
 #[derive(Debug, Deserialize)]
 pub struct HeadlessVerifyPinRequest {
@@ -854,6 +861,25 @@ pub async fn headless_verify_pin(
         return Err(HeadlessError::RegistrationAlreadyCompleted);
     }
 
+    // The registration's verification window has closed. `find_by_device_code` deliberately does
+    // not filter this out, so that an expired registration reads differently from an unknown
+    // device_code: telling the user their code did not match would be false and would invite them
+    // to retype it forever. The PIN carries no window of its own — it is one of two presentations
+    // of the same confirmation code as the emailed link, so it expires exactly when the link does.
+    if pending.expires_at <= Utc::now() {
+        record_pin_verify_failure(
+            pool,
+            &headers,
+            tenant_id,
+            Some(&pending.user_pubkey),
+            pending.pending_email.as_deref(),
+            "registration_expired",
+            StatusCode::GONE.as_u16().into(),
+        )
+        .await;
+        return Err(HeadlessError::PinExpired);
+    }
+
     let Some(pin_hash) = pending.pin_hash.clone() else {
         // No PIN was ever issued for this registration (for example a browser OAuth registration).
         // Say so, so the caller steers the user to the email link or a resend instead of insisting
@@ -873,7 +899,7 @@ pub async fn headless_verify_pin(
 
     // A PIN exists but was never confirmed delivered, so the user cannot be holding it. Treat it
     // as unavailable rather than wrong: a resend both delivers and re-arms.
-    let Some(pin_sent_at) = pending.pin_sent_at else {
+    if pending.pin_sent_at.is_none() {
         record_pin_verify_failure(
             pool,
             &headers,
@@ -885,42 +911,50 @@ pub async fn headless_verify_pin(
         )
         .await;
         return Err(HeadlessError::PinUnavailable);
-    };
-
-    // The PIN aged out of its own validity window while the registration is still open. Distinct
-    // from a wrong PIN and from a lockout, and recoverable by a resend.
-    if Utc::now() - pin_sent_at >= Duration::minutes(PIN_VALIDITY_MINUTES) {
-        record_pin_verify_failure(
-            pool,
-            &headers,
-            tenant_id,
-            Some(&pending.user_pubkey),
-            pending.pending_email.as_deref(),
-            "pin_expired",
-            StatusCode::GONE.as_u16().into(),
-        )
-        .await;
-        return Err(HeadlessError::PinExpired);
     }
 
     // Atomically reserve an attempt slot BEFORE the expensive bcrypt compare. The conditional
-    // UPDATE increments only while under the cap, so at most MAX_PIN_ATTEMPTS comparisons can run
-    // for this device_code even across concurrent requests. `None` means the row is at the cap.
-    let Some(attempt) = oauth_code_repo
-        .reserve_pin_attempt(&req.device_code, tenant_id, MAX_PIN_ATTEMPTS)
-        .await?
-    else {
-        record_pin_verify_failure(
-            pool,
-            &headers,
+    // UPDATE increments only while under both caps, so no more comparisons can run for this
+    // device_code than the caps allow, even across concurrent requests.
+    let attempt = match oauth_code_repo
+        .reserve_pin_attempt(
+            &req.device_code,
             tenant_id,
-            Some(&pending.user_pubkey),
-            pending.pending_email.as_deref(),
-            "pin_locked",
-            StatusCode::LOCKED.as_u16().into(),
+            MAX_PIN_ATTEMPTS,
+            MAX_PIN_ATTEMPTS_LIFETIME,
         )
-        .await;
-        return Err(HeadlessError::PinLocked);
+        .await?
+    {
+        PinAttemptReservation::Reserved { attempt } => attempt,
+        PinAttemptReservation::CurrentPinLocked => {
+            record_pin_verify_failure(
+                pool,
+                &headers,
+                tenant_id,
+                Some(&pending.user_pubkey),
+                pending.pending_email.as_deref(),
+                "pin_locked",
+                StatusCode::LOCKED.as_u16().into(),
+            )
+            .await;
+            return Err(HeadlessError::PinLocked);
+        }
+        // Lifetime cap spent: a resend cannot recover this, so do not say "request a new code".
+        // PIN entry is done for this registration; the emailed link still works, which is what
+        // the unavailable response steers the user to.
+        PinAttemptReservation::LifetimeExhausted => {
+            record_pin_verify_failure(
+                pool,
+                &headers,
+                tenant_id,
+                Some(&pending.user_pubkey),
+                pending.pending_email.as_deref(),
+                "pin_lifetime_exhausted",
+                StatusCode::FORBIDDEN.as_u16().into(),
+            )
+            .await;
+            return Err(HeadlessError::PinUnavailable);
+        }
     };
 
     // Constant-time PIN comparison (bcrypt's own compare; work factor dominates). Both this real
@@ -1076,6 +1110,14 @@ pub async fn headless_resend_pin(
     };
 
     if pending.consumed_at.is_some() {
+        return Ok(success());
+    }
+
+    // `find_by_device_code` no longer filters expired rows, so this path has to. A resend
+    // deliberately does not extend `expires_at` (keycast#262 bounded lifecycle), so re-arming a
+    // registration whose window has closed would mail the user a PIN and a link that both fail.
+    if pending.expires_at <= Utc::now() {
+        tracing::debug!("resend-pin: registration expired, skipping (not revealed to client)");
         return Ok(success());
     }
 
@@ -1339,7 +1381,7 @@ impl From<crate::bcrypt_queue::BcryptQueueError> for HeadlessError {
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "integration-tests")]
-    use super::{MAX_PIN_ATTEMPTS, PIN_VALIDITY_MINUTES};
+    use super::{MAX_PIN_ATTEMPTS, MAX_PIN_ATTEMPTS_LIFETIME};
     #[cfg(feature = "integration-tests")]
     use chrono::{Duration, Utc};
     use nostr_sdk::Keys;
@@ -1935,37 +1977,114 @@ mod tests {
             .await;
     }
 
-    /// A PIN past its validity window is reported as expired, not as a wrong PIN, so the caller
-    /// tells the user to request a new code. The registration itself is still open.
+    /// Once the registration's own window closes, the PIN goes with it — the PIN and the emailed
+    /// link are two presentations of the same confirmation code, so they expire together. That is
+    /// reported as expired rather than as a wrong PIN, which would be false and would invite the
+    /// user to retype a code that can never work again.
     #[cfg(feature = "integration-tests")]
     #[tokio::test]
-    async fn test_verify_pin_aged_out_pin_reports_expired() {
+    async fn test_verify_pin_expired_registration_reports_expired() {
         let auth_state = create_lazy_auth_state();
         let pool = auth_state.state.db.clone();
         let email = format!("verify-pin-expired-{}@example.com", uuid::Uuid::new_v4());
         let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
 
-        let aged_out = Utc::now() - Duration::minutes(PIN_VALIDITY_MINUTES + 1);
-        sqlx::query("UPDATE oauth_codes SET pin_sent_at = $2 WHERE device_code = $1")
+        sqlx::query("UPDATE oauth_codes SET expires_at = $2 WHERE device_code = $1")
             .bind(&device_code)
-            .bind(aged_out)
+            .bind(Utc::now() - Duration::minutes(1))
             .execute(&pool)
             .await
             .unwrap();
 
-        // Even the correct PIN is refused once it has aged out.
+        // Even the correct PIN is refused once the registration has expired.
         let response = call_verify_pin(auth_state, &device_code, "123456").await;
         assert_eq!(response.status(), axum::http::StatusCode::GONE);
         assert_eq!(response_json(response).await["code"], "PIN_EXPIRED");
 
-        // An expired PIN must not consume a lockout slot: the recovery action is a resend.
-        let (attempts,): (i32,) =
-            sqlx::query_as("SELECT pin_attempts FROM oauth_codes WHERE device_code = $1")
-                .bind(&device_code)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        // Expiry must not consume an attempt slot: there is nothing to brute-force here.
+        let (attempts, failed_total): (i32, i32) = sqlx::query_as(
+            "SELECT pin_attempts, pin_failed_total FROM oauth_codes WHERE device_code = $1",
+        )
+        .bind(&device_code)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(attempts, 0);
+        assert_eq!(failed_total, 0);
+
+        let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(&pubkey)
+            .execute(&pool)
+            .await;
+    }
+
+    /// The per-PIN cap resets on resend, which is what makes a resend the way out of a lockout.
+    /// That alone would be escapable forever, so a lifetime cap bounds the whole registration.
+    /// Exhausting it disables PIN entry permanently — a resend does not recover it — so the reply
+    /// must steer the user to the emailed link rather than telling them to request a new code.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    #[serial]
+    async fn test_verify_pin_lifetime_cap_is_not_cleared_by_a_resend() {
+        let auth_state = create_lazy_auth_state();
+        let pool = auth_state.state.db.clone();
+        let email = format!("verify-pin-lifetime-{}@example.com", uuid::Uuid::new_v4());
+        let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
+
+        // Park the registration one failure short of its lifetime cap, with the current PIN
+        // already locked and the resend cooldown clear — exactly the state an attacker who has
+        // been cycling resend-then-guess arrives in.
+        sqlx::query(
+            "UPDATE oauth_codes SET pin_attempts = $2, pin_failed_total = $3, \
+             pin_resend_at = NOW() - INTERVAL '10 minutes' WHERE device_code = $1",
+        )
+        .bind(&device_code)
+        .bind(MAX_PIN_ATTEMPTS)
+        .bind(MAX_PIN_ATTEMPTS_LIFETIME - 1)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // A resend clears the per-PIN lockout, as it must for legitimate recovery...
+        let resend = call_resend_pin(auth_state.clone(), &device_code).await;
+        assert_eq!(resend.status(), axum::http::StatusCode::OK);
+        let (attempts, failed_total): (i32, i32) = sqlx::query_as(
+            "SELECT pin_attempts, pin_failed_total FROM oauth_codes WHERE device_code = $1",
+        )
+        .bind(&device_code)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attempts, 0, "resend clears the per-PIN cap");
+        assert_eq!(
+            failed_total,
+            MAX_PIN_ATTEMPTS_LIFETIME - 1,
+            "resend must NOT clear the lifetime counter"
+        );
+
+        // ...and the very next failure spends the lifetime cap.
+        let last = call_verify_pin(auth_state.clone(), &device_code, "000000").await;
+        assert_eq!(last.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        // From here PIN entry is closed for this registration, and a resend does not reopen it.
+        let exhausted = call_verify_pin(auth_state.clone(), &device_code, "000000").await;
+        assert_eq!(exhausted.status(), axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(response_json(exhausted).await["code"], "PIN_UNAVAILABLE");
+
+        sqlx::query("UPDATE oauth_codes SET pin_resend_at = NOW() - INTERVAL '10 minutes' WHERE device_code = $1")
+            .bind(&device_code).execute(&pool).await.unwrap();
+        let resend_again = call_resend_pin(auth_state.clone(), &device_code).await;
+        assert_eq!(resend_again.status(), axum::http::StatusCode::OK);
+        let still_closed = call_verify_pin(auth_state, &device_code, "000000").await;
+        assert_eq!(
+            still_closed.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "a resend must not reopen PIN entry once the lifetime cap is spent"
+        );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
             .bind(&device_code)
@@ -2045,15 +2164,20 @@ mod tests {
             axum::http::StatusCode::SERVICE_UNAVAILABLE
         );
 
-        let (attempts,): (i32,) =
-            sqlx::query_as("SELECT pin_attempts FROM oauth_codes WHERE device_code = $1")
-                .bind(&device_code)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let (attempts, failed_total): (i32, i32) = sqlx::query_as(
+            "SELECT pin_attempts, pin_failed_total FROM oauth_codes WHERE device_code = $1",
+        )
+        .bind(&device_code)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             attempts, 0,
             "bcrypt backpressure must not advance the lockout counter"
+        );
+        assert_eq!(
+            failed_total, 0,
+            "bcrypt backpressure must not advance the lifetime counter either"
         );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")

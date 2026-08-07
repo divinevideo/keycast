@@ -29,8 +29,12 @@ pub struct OAuthCodeData {
     pub is_headless: bool,
     /// bcrypt hash of the 6-digit in-app PIN fallback (keycast#262), if one was issued
     pub pin_hash: Option<String>,
-    /// Failed verify-pin attempts; brute-force cap is enforced against this counter
+    /// Failed attempts against the *current* PIN; a resend clears this, which is what makes a
+    /// resend the recovery path out of a lockout
     pub pin_attempts: i32,
+    /// Failed attempts across every PIN this registration has issued; never reset, so it bounds
+    /// guessing over the registration's whole life even though resends clear `pin_attempts`
+    pub pin_failed_total: i32,
     /// When the current PIN was handed to the delivery provider; backs the PIN validity window
     pub pin_sent_at: Option<DateTime<Utc>>,
     /// When a PIN resend was last performed; backs the resend cooldown. Stays NULL through
@@ -40,6 +44,21 @@ pub struct OAuthCodeData {
     /// Terminal marker (keycast#262): set after the registration's exchange code successfully
     /// issues tokens. Once non-NULL, finalize refuses to re-mint and the row is eligible for cleanup.
     pub consumed_at: Option<DateTime<Utc>>,
+    /// End of the registration's verification window. Lookups that need to tell an expired
+    /// registration apart from an absent one select this and decide for themselves.
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Outcome of trying to reserve one PIN-verification attempt slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinAttemptReservation {
+    /// A slot was reserved; carries the resulting count against the current PIN.
+    Reserved { attempt: i32 },
+    /// The current PIN has spent its per-PIN cap. A resend clears this.
+    CurrentPinLocked,
+    /// The registration has spent its lifetime cap across every PIN it has issued. A resend does
+    /// not clear this; the emailed link remains the way in.
+    LifetimeExhausted,
 }
 
 /// Parameters for storing a basic OAuth code
@@ -288,8 +307,8 @@ impl OAuthCodeRepository {
     const SELECT_COLUMNS: &'static str =
         "user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method, \
          pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret, \
-         previous_auth_id, state, device_code, is_headless, pin_hash, pin_attempts, pin_sent_at, \
-         pin_resend_at, consumed_at";
+         previous_auth_id, state, device_code, is_headless, pin_hash, pin_attempts, \
+         pin_failed_total, pin_sent_at, pin_resend_at, consumed_at, expires_at";
 
     /// Find a valid (non-expired) OAuth code.
     pub async fn find_valid(
@@ -336,67 +355,106 @@ impl OAuthCodeRepository {
     ///
     /// This is the lookup gate for in-app PIN verification (keycast#262): the `device_code` is the
     /// real authenticator and the 6-digit PIN is defense-in-depth, so PIN verification MUST resolve
-    /// the pending row by `device_code` rather than by a global PIN scan (which would be brute-forceable
-    /// across all pending registrations). Only pending rows carry a non-null `device_code`, and the PIN
-    /// stays valid for the full 24h verify window, so this filters on `expires_at > now`.
+    /// the pending row by `device_code` rather than by a global PIN scan (which would be
+    /// brute-forceable across all pending registrations). Only pending rows carry a non-null
+    /// `device_code`.
+    ///
+    /// Deliberately does **not** filter on `expires_at`: an expired registration and an unknown
+    /// `device_code` are different situations for the user, and filtering here would collapse them
+    /// into one. Callers get `expires_at` on the returned row and decide. Every caller must
+    /// therefore check it — reaching a registration past its window must not let the flow proceed.
     pub async fn find_by_device_code(
         &self,
         device_code: &str,
         tenant_id: i64,
     ) -> Result<Option<OAuthCodeData>, RepositoryError> {
         let query = format!(
-            "SELECT {} FROM oauth_codes WHERE device_code = $1 AND tenant_id = $2 AND pending_email IS NOT NULL AND expires_at > $3",
+            "SELECT {} FROM oauth_codes WHERE device_code = $1 AND tenant_id = $2 AND pending_email IS NOT NULL",
             Self::SELECT_COLUMNS
         );
         let result = sqlx::query_as::<_, OAuthCodeData>(&query)
             .bind(device_code)
             .bind(tenant_id)
-            .bind(Utc::now())
             .fetch_optional(&self.pool)
             .await?;
 
         Ok(result)
     }
 
-    /// Atomically reserve one PIN-verification attempt slot for a pending registration, returning
-    /// the new attempt count. Returns `None` when no slot could be reserved — the row is already
-    /// at `max_attempts` (locked), no live pending row matches the `device_code`, or the
-    /// registration already completed token issuance.
+    /// Atomically reserve one PIN-verification attempt slot for a pending registration.
     ///
     /// Scoped to the pending registration row itself (`pending_email IS NOT NULL AND consumed_at
     /// IS NULL`): minted exchange-code rows copy `device_code` from the pending row, and a
     /// device_code-only UPDATE would mutate those siblings too.
     ///
-    /// The increment happens in a single conditional `UPDATE ... WHERE pin_attempts < $max
-    /// RETURNING`, so the cap is enforced by the database rather than by a snapshot read. This is
-    /// what bounds brute force: callers reserve a slot BEFORE running the (expensive) bcrypt
-    /// comparison, so at most `max_attempts` comparisons can ever run for a given `device_code`,
-    /// even across concurrent verify-pin requests on different Cloud Run instances.
+    /// The increment happens in a single conditional `UPDATE ... RETURNING`, so both caps are
+    /// enforced by the database rather than by a snapshot read. This is what bounds brute force:
+    /// callers reserve a slot BEFORE running the (expensive) bcrypt comparison, so no more
+    /// comparisons can ever run for a given `device_code` than the caps allow, even across
+    /// concurrent verify-pin requests on different instances.
+    ///
+    /// # Why two caps
+    ///
+    /// `max_attempts` bounds guesses against the current PIN, and a resend clears it — that reset
+    /// is what makes a resend the way out of a lockout. On its own, though, it is escapable: an
+    /// attacker who resends whenever the per-PIN cap is spent gets a fresh PIN and a fresh cap
+    /// forever, so the only real limit becomes the resend cooldown. `max_lifetime_attempts` closes
+    /// that by counting failures across every PIN the registration has issued, and nothing resets
+    /// it. Exhausting it disables PIN entry for this registration; the emailed link still works.
     pub async fn reserve_pin_attempt(
         &self,
         device_code: &str,
         tenant_id: i64,
         max_attempts: i32,
-    ) -> Result<Option<i32>, RepositoryError> {
+        max_lifetime_attempts: i32,
+    ) -> Result<PinAttemptReservation, RepositoryError> {
         let row: Option<(i32,)> = sqlx::query_as(
-            "UPDATE oauth_codes SET pin_attempts = pin_attempts + 1 \
-             WHERE device_code = $1 AND tenant_id = $2 AND pin_attempts < $3 \
+            "UPDATE oauth_codes \
+             SET pin_attempts = pin_attempts + 1, pin_failed_total = pin_failed_total + 1 \
+             WHERE device_code = $1 AND tenant_id = $2 \
+               AND pin_attempts < $3 AND pin_failed_total < $4 \
                AND pending_email IS NOT NULL AND consumed_at IS NULL \
              RETURNING pin_attempts",
         )
         .bind(device_code)
         .bind(tenant_id)
         .bind(max_attempts)
+        .bind(max_lifetime_attempts)
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|r| r.0))
+        if let Some((attempt,)) = row {
+            return Ok(PinAttemptReservation::Reserved { attempt });
+        }
+
+        // The reservation failed. Re-read to say which cap did it, so the caller can tell the user
+        // whether a resend helps. Only on the failure path, which already writes an audit record.
+        let state: Option<(i32,)> = sqlx::query_as(
+            "SELECT pin_failed_total FROM oauth_codes \
+             WHERE device_code = $1 AND tenant_id = $2 \
+               AND pending_email IS NOT NULL AND consumed_at IS NULL",
+        )
+        .bind(device_code)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match state {
+            Some((failed_total,)) if failed_total >= max_lifetime_attempts => {
+                Ok(PinAttemptReservation::LifetimeExhausted)
+            }
+            // Includes the row vanishing between the two statements: treating that as a per-PIN
+            // lockout is the conservative reading, and the caller has already established the row
+            // existed.
+            _ => Ok(PinAttemptReservation::CurrentPinLocked),
+        }
     }
 
     /// Refund a reserved PIN attempt when no bcrypt comparison ran.
     ///
-    /// The decrement is atomic so a concurrent failed comparison remains counted. The lower bound
-    /// protects the counter if a successful verification reset it before this refund completed.
+    /// Decrements both counters, since [`Self::reserve_pin_attempt`] incremented both. The
+    /// decrement is atomic so a concurrent failed comparison remains counted. The lower bounds
+    /// protect the counters if a successful verification reset them before this refund completed.
     ///
     /// # Errors
     ///
@@ -407,7 +465,9 @@ impl OAuthCodeRepository {
         tenant_id: i64,
     ) -> Result<(), RepositoryError> {
         sqlx::query(
-            "UPDATE oauth_codes SET pin_attempts = GREATEST(pin_attempts - 1, 0) \
+            "UPDATE oauth_codes \
+             SET pin_attempts = GREATEST(pin_attempts - 1, 0), \
+                 pin_failed_total = GREATEST(pin_failed_total - 1, 0) \
              WHERE device_code = $1 AND tenant_id = $2 \
                AND pending_email IS NOT NULL AND consumed_at IS NULL",
         )
@@ -587,6 +647,10 @@ impl OAuthCodeRepository {
     /// Resetting to zero on success keeps the invariant that only *failed* attempts lock, without
     /// weakening the brute-force cap: this is reachable only with a correct PIN.
     ///
+    /// Both counters are decremented by one rather than zeroed, undoing exactly the increment this
+    /// successful attempt made. Zeroing `pin_failed_total` would let a correct PIN wipe the
+    /// registration's lifetime guessing record, and that record is meant to survive everything.
+    ///
     /// Scoped to the live pending registration row like [`Self::reserve_pin_attempt`]; minted
     /// sibling exchange-code rows share the `device_code` and must not be touched.
     pub async fn reset_pin_attempts(
@@ -595,7 +659,8 @@ impl OAuthCodeRepository {
         tenant_id: i64,
     ) -> Result<(), RepositoryError> {
         sqlx::query(
-            "UPDATE oauth_codes SET pin_attempts = 0 \
+            "UPDATE oauth_codes \
+             SET pin_attempts = 0, pin_failed_total = GREATEST(pin_failed_total - 1, 0) \
              WHERE device_code = $1 AND tenant_id = $2 \
                AND pending_email IS NOT NULL AND consumed_at IS NULL",
         )
@@ -958,7 +1023,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_find_by_device_code_excludes_expired() {
+    async fn test_find_by_device_code_returns_expired_rows_for_the_caller_to_judge() {
         let pool = setup_pool().await;
         let repo = OAuthCodeRepository::new(pool.clone());
 
@@ -966,8 +1031,18 @@ mod tests {
         let expires_at = Utc::now() - chrono::Duration::hours(1); // already expired
         insert_pending_registration(&repo, &device_code, Some("pinhash123"), expires_at).await;
 
-        let found = repo.find_by_device_code(&device_code, 1).await.unwrap();
-        assert!(found.is_none(), "expired pending row must not be returned");
+        // The lookup returns the expired row and reports its window, rather than hiding it. An
+        // expired registration and an unknown device_code are different situations for the user,
+        // and filtering here would collapse them into one — so callers decide instead.
+        let found = repo
+            .find_by_device_code(&device_code, 1)
+            .await
+            .unwrap()
+            .expect("an expired pending row is still returned, so callers can tell it apart");
+        assert!(
+            found.expires_at <= Utc::now(),
+            "the caller must be able to see that the window has closed"
+        );
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
             .bind(&device_code)
@@ -985,30 +1060,36 @@ mod tests {
         let expires_at = Utc::now() + chrono::Duration::hours(24);
         insert_pending_registration(&repo, &device_code, Some("pinhash123"), expires_at).await;
 
-        // Reserve up to the cap; each call returns the post-increment count.
+        // Reserve up to the cap; each call returns the post-increment count. The lifetime cap is
+        // set far out of the way so this test isolates the per-PIN cap.
         let max = 3;
+        const LIFETIME: i32 = 1000;
         let first = repo
-            .reserve_pin_attempt(&device_code, 1, max)
+            .reserve_pin_attempt(&device_code, 1, max, LIFETIME)
             .await
             .unwrap();
-        assert_eq!(first, Some(1));
+        assert_eq!(first, PinAttemptReservation::Reserved { attempt: 1 });
         let second = repo
-            .reserve_pin_attempt(&device_code, 1, max)
+            .reserve_pin_attempt(&device_code, 1, max, LIFETIME)
             .await
             .unwrap();
-        assert_eq!(second, Some(2));
+        assert_eq!(second, PinAttemptReservation::Reserved { attempt: 2 });
         let third = repo
-            .reserve_pin_attempt(&device_code, 1, max)
+            .reserve_pin_attempt(&device_code, 1, max, LIFETIME)
             .await
             .unwrap();
-        assert_eq!(third, Some(3));
+        assert_eq!(third, PinAttemptReservation::Reserved { attempt: 3 });
 
         // At the cap: no slot can be reserved (atomic lockout), and the counter does not grow.
         let locked = repo
-            .reserve_pin_attempt(&device_code, 1, max)
+            .reserve_pin_attempt(&device_code, 1, max, LIFETIME)
             .await
             .unwrap();
-        assert_eq!(locked, None, "reserve must return None once at the cap");
+        assert_eq!(
+            locked,
+            PinAttemptReservation::CurrentPinLocked,
+            "reserve must refuse once at the per-PIN cap"
+        );
         let after = repo
             .find_by_device_code(&device_code, 1)
             .await
@@ -1016,12 +1097,12 @@ mod tests {
             .unwrap();
         assert_eq!(after.pin_attempts, max, "counter must not exceed the cap");
 
-        // Unknown device_code returns None (no row updated).
+        // Unknown device_code reserves nothing.
         let none = repo
-            .reserve_pin_attempt("nonexistent", 1, max)
+            .reserve_pin_attempt("nonexistent", 1, max, LIFETIME)
             .await
             .unwrap();
-        assert_eq!(none, None);
+        assert_eq!(none, PinAttemptReservation::CurrentPinLocked);
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
             .bind(&device_code)
@@ -1040,8 +1121,12 @@ mod tests {
         insert_pending_registration(&repo, &device_code, Some("pinhash123"), expires_at).await;
 
         // Burn a couple of attempt slots (as a near-success run would), then reset on success.
-        repo.reserve_pin_attempt(&device_code, 1, 5).await.unwrap();
-        repo.reserve_pin_attempt(&device_code, 1, 5).await.unwrap();
+        repo.reserve_pin_attempt(&device_code, 1, 5, 1000)
+            .await
+            .unwrap();
+        repo.reserve_pin_attempt(&device_code, 1, 5, 1000)
+            .await
+            .unwrap();
         let before = repo
             .find_by_device_code(&device_code, 1)
             .await
@@ -1118,8 +1203,11 @@ mod tests {
         };
 
         // Reserving an attempt must touch only the pending row, never the minted sibling.
-        let reserved = repo.reserve_pin_attempt(&device_code, 1, 5).await.unwrap();
-        assert_eq!(reserved, Some(1));
+        let reserved = repo
+            .reserve_pin_attempt(&device_code, 1, 5, 1000)
+            .await
+            .unwrap();
+        assert_eq!(reserved, PinAttemptReservation::Reserved { attempt: 1 });
         assert_eq!(
             sibling_attempts(pool.clone(), minted_code.clone()).await,
             0,
@@ -1152,9 +1240,13 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        let after_consumed = repo.reserve_pin_attempt(&device_code, 1, 5).await.unwrap();
+        let after_consumed = repo
+            .reserve_pin_attempt(&device_code, 1, 5, 1000)
+            .await
+            .unwrap();
         assert_eq!(
-            after_consumed, None,
+            after_consumed,
+            PinAttemptReservation::CurrentPinLocked,
             "reserve_pin_attempt must not reserve a slot on a consumed registration"
         );
 
@@ -1241,8 +1333,12 @@ mod tests {
                 .unwrap();
 
         // Burn two attempts.
-        repo.reserve_pin_attempt(&device_code, 1, 5).await.unwrap();
-        repo.reserve_pin_attempt(&device_code, 1, 5).await.unwrap();
+        repo.reserve_pin_attempt(&device_code, 1, 5, 1000)
+            .await
+            .unwrap();
+        repo.reserve_pin_attempt(&device_code, 1, 5, 1000)
+            .await
+            .unwrap();
 
         let new_token = format!("verif_{}", uuid::Uuid::new_v4());
         assert!(repo
