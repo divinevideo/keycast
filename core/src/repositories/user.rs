@@ -424,6 +424,19 @@ pub struct FullAdminStatusRow {
     pub verified_minor_at: Option<DateTime<Utc>>,
 }
 
+/// Identity state read off the old pubkey in `change_key_transaction` and
+/// re-applied to the replacement row, so a Nostr key rotation moves the account
+/// wholesale — including the restrictions that gate Nostr and ActivityPub signing.
+#[derive(Debug, FromRow)]
+struct RotatedIdentityRow {
+    username: Option<String>,
+    status: UserStatus,
+    suspended_reason: Option<String>,
+    suspended_at: Option<DateTime<Utc>>,
+    verified_minor: bool,
+    verified_minor_at: Option<DateTime<Utc>>,
+}
+
 /// Outcome of atomically consuming a claim token and claiming the account.
 /// Only `Claimed` mutates anything; the other outcomes guarantee both the
 /// token and the user row are untouched (see
@@ -1821,8 +1834,8 @@ impl UserRepository {
     /// Performs a complete key rotation:
     /// 1. Counts and deletes OAuth authorizations for the old pubkey
     /// 2. Deletes personal_keys for the old pubkey
-    /// 3. Orphans the old user identity (clears email/password)
-    /// 4. Creates new user identity with email/password
+    /// 3. Orphans the old user identity (clears email/password/username)
+    /// 4. Creates new user identity with email/password/username
     /// 5. Creates personal_keys for the new identity
     ///
     /// Returns the count of OAuth authorizations that were deleted.
@@ -1895,9 +1908,24 @@ impl UserRepository {
             .execute(&mut **tx)
             .await?;
 
-        // Orphan old identity (transfer email/password to NULL)
+        // Everything that must move with the identity, read before the old row is
+        // orphaned. Account restrictions (status/suspension, verified-minor) travel
+        // with the username and the AP key: a suspended or banned actor that rotates
+        // its Nostr key must stay restricted on the new pubkey, otherwise the
+        // replacement row would default to `active` and hand the actor back both
+        // Nostr and ActivityPub signing.
+        let old_identity: RotatedIdentityRow = sqlx::query_as(
+            "SELECT username, status, suspended_reason, suspended_at, verified_minor, verified_minor_at \
+             FROM users WHERE pubkey = $1 AND tenant_id = $2",
+        )
+        .bind(old_pubkey)
+        .bind(tenant_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        // Orphan old identity (transfer email/password/username to NULL)
         sqlx::query(
-            "UPDATE users SET email = NULL, password_hash = NULL, updated_at = $1
+            "UPDATE users SET email = NULL, password_hash = NULL, username = NULL, updated_at = $1
              WHERE pubkey = $2 AND tenant_id = $3",
         )
         .bind(now)
@@ -1906,19 +1934,42 @@ impl UserRepository {
         .execute(&mut **tx)
         .await?;
 
-        // Create new user identity with email/password
+        // Create new user identity with email/password/username. The AP gateway
+        // resolves actor URLs by username, so it must move with the AP key row.
         sqlx::query(
-            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, username, \
+                                status, suspended_reason, suspended_at, verified_minor, verified_minor_at, \
+                                created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(new_pubkey)
         .bind(tenant_id)
         .bind(email)
         .bind(password_hash)
         .bind(true) // Keep email verified status
+        .bind(old_identity.username)
+        .bind(old_identity.status.as_str())
+        .bind(old_identity.suspended_reason)
+        .bind(old_identity.suspended_at)
+        .bind(old_identity.verified_minor)
+        .bind(old_identity.verified_minor_at)
         .bind(now)
         .bind(now)
         .execute(&mut **tx)
+        .await?;
+
+        // Preserve the actor's published ActivityPub RSA public key across
+        // Nostr key rotation; remote servers cache publicKeyPem.
+        sqlx::query(
+            "UPDATE ap_actor_keys
+             SET user_pubkey = $1, updated_at = $2
+             WHERE user_pubkey = $3 AND tenant_id = $4",
+        )
+        .bind(new_pubkey)
+        .bind(now)
+        .bind(old_pubkey)
+        .bind(tenant_id)
+        .execute(&mut *tx)
         .await?;
 
         // Create personal_keys for new identity
@@ -2619,7 +2670,16 @@ impl UserRepository {
             .execute(&mut *tx)
             .await?;
 
-        // 3. Delete user (cascades to personal_keys, oauth_authorizations -> refresh_tokens,
+        // 3. Delete AP RSA key material. The FK cascade also handles this, but
+        // keeping it explicit preserves account deletion semantics if an older
+        // database has not applied the FK-hardening migration yet.
+        sqlx::query("DELETE FROM ap_actor_keys WHERE user_pubkey = $1 AND tenant_id = $2")
+            .bind(pubkey)
+            .bind(tenant_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // 4. Delete user (cascades to personal_keys, oauth_authorizations -> refresh_tokens,
         //    email_verification_tokens, password_reset_tokens, user_profiles,
         //    account_claim_tokens)
         let result = sqlx::query("DELETE FROM users WHERE pubkey = $1 AND tenant_id = $2")

@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod ap;
 pub mod atproto;
 pub mod atproto_oauth;
 pub mod atproto_oauth_metadata;

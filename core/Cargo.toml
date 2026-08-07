@@ -26,9 +26,10 @@ nostr = { workspace = true }
 nostr-sdk = {workspace = true}
 once_cell = "1.2"
 rand = { workspace = true }
+rsa = { version = "0.9", features = ["pem"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["oid"] }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

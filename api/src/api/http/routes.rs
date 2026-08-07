@@ -9,7 +9,7 @@ use sqlx::PgPool;
 use std::sync::Arc;
 
 use crate::api::http::{
-    admin, atproto, atproto_oauth, auth, claim, headless, metrics, nostr_rpc, oauth, policies,
+    admin, ap, atproto, atproto_oauth, auth, claim, headless, metrics, nostr_rpc, oauth, policies,
     teams,
 };
 use crate::state::KeycastState;
@@ -100,6 +100,14 @@ pub fn api_routes(
     // NIP-46 RPC endpoint (OAuth access token auth, public CORS for third-party apps)
     let nostr_rpc_routes = Router::new()
         .route("/nostr", post(nostr_rpc::nostr_rpc))
+        .with_state(auth_state.clone());
+
+    // ActivityPub RSA signing endpoints (service-token OR UCAN auth; tenant from Host)
+    // Public CORS: server-to-server (the AP gateway), not browser-credentialed.
+    let ap_routes = Router::new()
+        .route("/ap/keys", post(ap::create_key))
+        .route("/ap/keys/:pubkey", get(ap::get_key))
+        .route("/ap/sign", post(ap::sign))
         .with_state(auth_state.clone());
 
     // Protected user routes (authentication required via UCAN cookie)
@@ -311,6 +319,7 @@ pub fn api_routes(
         .merge(connect_routes.layer(public_cors.clone()))
         .merge(signing_routes.layer(public_cors.clone()))
         .merge(nostr_rpc_routes.layer(public_cors.clone())) // NIP-46 RPC for OAuth apps
+        .merge(ap_routes.layer(public_cors.clone())) // AP RSA signing (gateway service-to-service)
         .merge(team_routes.layer(auth_cors.clone())) // Team routes need credentials
         .merge(discovery_route.layer(public_cors.clone()))
         .merge(policy_routes.layer(public_cors.clone())) // Public - available to third-party OAuth apps
