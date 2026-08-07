@@ -31,8 +31,12 @@ pub struct OAuthCodeData {
     pub pin_hash: Option<String>,
     /// Failed verify-pin attempts; brute-force cap is enforced against this counter
     pub pin_attempts: i32,
-    /// Timestamp of the last PIN issuance; backs the PIN-resend cooldown
+    /// When the current PIN was handed to the delivery provider; backs the PIN validity window
     pub pin_sent_at: Option<DateTime<Utc>>,
+    /// When a PIN resend was last performed; backs the resend cooldown. Stays NULL through
+    /// registration so a user's first resend request is never swallowed by a cooldown they
+    /// never started.
+    pub pin_resend_at: Option<DateTime<Utc>>,
     /// Terminal marker (keycast#262): set after the registration's exchange code successfully
     /// issues tokens. Once non-NULL, finalize refuses to re-mint and the row is eligible for cleanup.
     pub consumed_at: Option<DateTime<Utc>>,
@@ -89,6 +93,21 @@ pub struct StoredPendingRegistration {
     pub device_code: Option<String>,
     /// Whether this call re-armed an existing live pending registration instead of creating one.
     pub superseded: bool,
+}
+
+/// The PIN-resend fields of a pending registration as they stood before a resend attempt.
+///
+/// Captured so [`OAuthCodeRepository::restore_pin_after_failed_resend`] can put the row back
+/// exactly as it was when the replacement email could not be delivered — leaving the previous PIN
+/// usable and neither the validity window nor the resend cooldown restamped by a send that never
+/// reached the user.
+#[derive(Debug, Clone, Copy)]
+pub struct PinResendSnapshot<'a> {
+    pub verification_token: Option<&'a str>,
+    pub pin_hash: Option<&'a str>,
+    pub pin_attempts: i32,
+    pub pin_sent_at: Option<DateTime<Utc>>,
+    pub pin_resend_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -269,7 +288,8 @@ impl OAuthCodeRepository {
     const SELECT_COLUMNS: &'static str =
         "user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method, \
          pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret, \
-         previous_auth_id, state, device_code, is_headless, pin_hash, pin_attempts, pin_sent_at, consumed_at";
+         previous_auth_id, state, device_code, is_headless, pin_hash, pin_attempts, pin_sent_at, \
+         pin_resend_at, consumed_at";
 
     /// Find a valid (non-expired) OAuth code.
     pub async fn find_valid(
@@ -399,10 +419,13 @@ impl OAuthCodeRepository {
     }
 
     /// Re-arm a pending registration for PIN resend: install a fresh verification token + PIN hash,
-    /// reset the attempt counter to zero, and refresh `pin_sent_at`.
+    /// reset the attempt counter to zero, and stamp both `pin_sent_at` (the new PIN's validity
+    /// anchor) and `pin_resend_at` (the resend-cooldown anchor).
     ///
     /// Used by the lockout-recovery path: after the attempt cap is hit, the user must request a resend
-    /// (subject to the cooldown) which mints a new PIN and clears the lockout.
+    /// which mints a new PIN and clears the lockout. Because `pin_resend_at` starts NULL at
+    /// registration and is only stamped here, that first recovery resend is always available;
+    /// the cooldown then bounds the ones after it.
     ///
     /// Deliberately does NOT touch `expires_at`: the pending row keeps its original 24h registration
     /// window. Otherwise repeated resends could extend a pending row indefinitely, defeating the
@@ -425,7 +448,7 @@ impl OAuthCodeRepository {
         sqlx::query(
             "UPDATE oauth_codes \
              SET pending_email_verification_token = $1, pin_hash = $2, pin_attempts = 0, \
-                 pin_sent_at = $3 \
+                 pin_sent_at = $3, pin_resend_at = $3 \
              WHERE device_code = $4 AND tenant_id = $5",
         )
         .bind(new_verification_token)
@@ -447,21 +470,19 @@ impl OAuthCodeRepository {
         &self,
         device_code: &str,
         tenant_id: i64,
-        verification_token: Option<&str>,
-        pin_hash: Option<&str>,
-        pin_attempts: i32,
-        pin_sent_at: Option<DateTime<Utc>>,
+        previous: PinResendSnapshot<'_>,
     ) -> Result<(), RepositoryError> {
         sqlx::query(
             "UPDATE oauth_codes \
              SET pending_email_verification_token = $1, pin_hash = $2, pin_attempts = $3, \
-                 pin_sent_at = $4 \
-             WHERE device_code = $5 AND tenant_id = $6",
+                 pin_sent_at = $4, pin_resend_at = $5 \
+             WHERE device_code = $6 AND tenant_id = $7",
         )
-        .bind(verification_token)
-        .bind(pin_hash)
-        .bind(pin_attempts)
-        .bind(pin_sent_at)
+        .bind(previous.verification_token)
+        .bind(previous.pin_hash)
+        .bind(previous.pin_attempts)
+        .bind(previous.pin_sent_at)
+        .bind(previous.pin_resend_at)
         .bind(device_code)
         .bind(tenant_id)
         .execute(&self.pool)

@@ -717,6 +717,18 @@ async fn extract_first_party_or_user_signed_user(
 /// Failed PIN attempts allowed before the PIN is locked until resend (keycast#262).
 const MAX_PIN_ATTEMPTS: i32 = 5;
 
+/// How long an issued 6-digit PIN stays usable, measured from `pin_sent_at`.
+///
+/// Deliberately far shorter than the pending registration's own 24h window: a 6-digit secret has
+/// only a million values, so its useful lifetime should be bounded by how long a person plausibly
+/// takes to read the mail, not by how long the registration stays open. The email's verification
+/// link is unaffected and remains valid for the full registration window, and a resend re-arms a
+/// fresh PIN, so an aged-out PIN is a recoverable state rather than a dead end.
+///
+/// Comfortably longer than [`PIN_RESEND_COOLDOWN_MINUTES`] so a user whose PIN ages out can always
+/// obtain a new one immediately instead of landing between an unusable PIN and a live cooldown.
+const PIN_VALIDITY_MINUTES: i64 = 60;
+
 #[derive(Debug, Deserialize)]
 pub struct HeadlessVerifyPinRequest {
     /// RFC 8628 device_code from registration — the 64-char app-held secret and real gate.
@@ -737,8 +749,10 @@ pub struct HeadlessVerifyPinResponse {
     pub state: Option<String>,
 }
 
-/// Record a verify-pin failure to the shared brute-force feed (#258). The `reason` is internal
-/// only — the client always sees the same uniform error (anti-enumeration).
+/// Record a verify-pin failure to the shared brute-force feed (#258).
+///
+/// `reason` is the internal classification and `http_status` the status actually returned, so the
+/// feed stays aligned with what the caller observed.
 async fn record_pin_verify_failure(
     pool: &sqlx::PgPool,
     headers: &HeaderMap,
@@ -746,6 +760,7 @@ async fn record_pin_verify_failure(
     pubkey: Option<&str>,
     email: Option<&str>,
     reason: &str,
+    http_status: i32,
 ) {
     super::auth_observability::record_auth_event_and_log(
         pool,
@@ -757,7 +772,7 @@ async fn record_pin_verify_failure(
             event_type: "email_pin_verify",
             outcome: "failure",
             reason_code: Some(reason),
-            http_status: 401,
+            http_status,
             email,
             pubkey,
             client_id: None,
@@ -770,9 +785,9 @@ async fn record_pin_verify_failure(
 
 /// Spend bcrypt work equivalent to a real PIN comparison.
 ///
-/// Verify-pin rejects several states before ever reaching the bcrypt compare (unknown
-/// `device_code`, no PIN issued, already locked). Burning a dummy hash on those paths keeps their
-/// latency comparable to a wrong-PIN attempt so the rejected state is not distinguishable by timing.
+/// Used on the one verify-pin rejection that must stay indistinguishable from a wrong PIN: an
+/// unknown `device_code`. Every other rejection reports its own status and code, so burning work
+/// on those would buy no secrecy while consuming the bounded bcrypt worker pool.
 async fn burn_dummy_bcrypt(
     bcrypt_sender: &crate::bcrypt_queue::BcryptSender,
 ) -> Result<(), HeadlessError> {
@@ -786,6 +801,20 @@ async fn burn_dummy_bcrypt(
 /// row is located by `device_code` (the real authenticator); the PIN is defense-in-depth, bounded
 /// by [`MAX_PIN_ATTEMPTS`]. On success the same finalize path as the link runs and the OAuth
 /// authorization code is returned synchronously in the body (no Redis dependency).
+///
+/// # Rejection detail
+///
+/// Rejections are specific rather than uniform, so the caller can tell the user what to do:
+/// [`HeadlessError::PinLocked`], [`HeadlessError::PinExpired`], and
+/// [`HeadlessError::PinUnavailable`] each direct the user to request a new code, while
+/// [`HeadlessError::PinInvalid`] means "check the digits and retry".
+///
+/// The single state kept deliberately uniform is an unknown `device_code`, which is reported as
+/// [`HeadlessError::PinInvalid`] with matching bcrypt work burned so it is indistinguishable from
+/// a wrong PIN. Every state that *is* reported specifically is reachable only by a caller already
+/// holding the 64-char server-issued `device_code` for that registration, so naming it discloses
+/// nothing to anyone else. What bounds PIN guessing is the [`MAX_PIN_ATTEMPTS`] cap enforced in
+/// [`OAuthCodeRepository::reserve_pin_attempt`], not the opacity of the reply.
 pub async fn headless_verify_pin(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
@@ -801,7 +830,8 @@ pub async fn headless_verify_pin(
         .await?;
 
     let Some(pending) = pending else {
-        // Burn comparable time so an unknown/expired device_code isn't distinguishable by latency.
+        // The only rejection kept uniform: an unknown or expired device_code must be
+        // indistinguishable from a wrong PIN, in latency as well as in status and code.
         burn_dummy_bcrypt(&auth_state.state.bcrypt_sender).await?;
         record_pin_verify_failure(
             pool,
@@ -810,24 +840,24 @@ pub async fn headless_verify_pin(
             None,
             None,
             "device_code_not_found",
+            StatusCode::UNAUTHORIZED.as_u16().into(),
         )
         .await;
-        return Err(HeadlessError::PinVerificationFailed);
+        return Err(HeadlessError::PinInvalid);
     };
 
+    // The registration already finished issuing tokens. Report it as a terminal conflict rather
+    // than a success carrying no code: the caller's poll can never complete against a consumed
+    // row, so a success-shaped reply would leave it waiting out its own timeout instead of
+    // telling the user the account exists and they should sign in.
     if pending.consumed_at.is_some() {
-        return Ok(Json(HeadlessVerifyPinResponse {
-            success: true,
-            code: String::new(),
-            pubkey: pending.user_pubkey,
-            state: pending.state,
-        }));
+        return Err(HeadlessError::RegistrationAlreadyCompleted);
     }
 
     let Some(pin_hash) = pending.pin_hash.clone() else {
-        // No PIN was issued for this registration. Burn comparable bcrypt work so this is
-        // indistinguishable by latency from a wrong-PIN attempt before rejecting uniformly.
-        burn_dummy_bcrypt(&auth_state.state.bcrypt_sender).await?;
+        // No PIN was ever issued for this registration (for example a browser OAuth registration).
+        // Say so, so the caller steers the user to the email link or a resend instead of insisting
+        // the digits were wrong.
         record_pin_verify_failure(
             pool,
             &headers,
@@ -835,20 +865,51 @@ pub async fn headless_verify_pin(
             Some(&pending.user_pubkey),
             pending.pending_email.as_deref(),
             "no_pin_issued",
+            StatusCode::FORBIDDEN.as_u16().into(),
         )
         .await;
-        return Err(HeadlessError::PinVerificationFailed);
+        return Err(HeadlessError::PinUnavailable);
     };
+
+    // A PIN exists but was never confirmed delivered, so the user cannot be holding it. Treat it
+    // as unavailable rather than wrong: a resend both delivers and re-arms.
+    let Some(pin_sent_at) = pending.pin_sent_at else {
+        record_pin_verify_failure(
+            pool,
+            &headers,
+            tenant_id,
+            Some(&pending.user_pubkey),
+            pending.pending_email.as_deref(),
+            "pin_never_delivered",
+            StatusCode::FORBIDDEN.as_u16().into(),
+        )
+        .await;
+        return Err(HeadlessError::PinUnavailable);
+    };
+
+    // The PIN aged out of its own validity window while the registration is still open. Distinct
+    // from a wrong PIN and from a lockout, and recoverable by a resend.
+    if Utc::now() - pin_sent_at >= Duration::minutes(PIN_VALIDITY_MINUTES) {
+        record_pin_verify_failure(
+            pool,
+            &headers,
+            tenant_id,
+            Some(&pending.user_pubkey),
+            pending.pending_email.as_deref(),
+            "pin_expired",
+            StatusCode::GONE.as_u16().into(),
+        )
+        .await;
+        return Err(HeadlessError::PinExpired);
+    }
 
     // Atomically reserve an attempt slot BEFORE the expensive bcrypt compare. The conditional
     // UPDATE increments only while under the cap, so at most MAX_PIN_ATTEMPTS comparisons can run
-    // for this device_code even across concurrent requests. `None` means the row is at the cap
-    // (locked) — reject uniformly, burning comparable time so lockout is not a timing signal.
+    // for this device_code even across concurrent requests. `None` means the row is at the cap.
     let Some(attempt) = oauth_code_repo
         .reserve_pin_attempt(&req.device_code, tenant_id, MAX_PIN_ATTEMPTS)
         .await?
     else {
-        burn_dummy_bcrypt(&auth_state.state.bcrypt_sender).await?;
         record_pin_verify_failure(
             pool,
             &headers,
@@ -856,9 +917,10 @@ pub async fn headless_verify_pin(
             Some(&pending.user_pubkey),
             pending.pending_email.as_deref(),
             "pin_locked",
+            StatusCode::LOCKED.as_u16().into(),
         )
         .await;
-        return Err(HeadlessError::PinVerificationFailed);
+        return Err(HeadlessError::PinLocked);
     };
 
     // Constant-time PIN comparison (bcrypt's own compare; work factor dominates). Both this real
@@ -882,10 +944,17 @@ pub async fn headless_verify_pin(
 
     if !valid {
         // The slot was already consumed by the atomic reserve above; just classify and record.
-        let reason = if attempt >= MAX_PIN_ATTEMPTS {
-            "pin_locked"
+        // Spending the last slot is reported as locked rather than merely wrong, so the user is
+        // told to request a new code on the attempt that exhausts the cap instead of on the next
+        // one.
+        let (error, reason, status) = if attempt >= MAX_PIN_ATTEMPTS {
+            (HeadlessError::PinLocked, "pin_locked", StatusCode::LOCKED)
         } else {
-            "wrong_pin"
+            (
+                HeadlessError::PinInvalid,
+                "wrong_pin",
+                StatusCode::UNAUTHORIZED,
+            )
         };
         record_pin_verify_failure(
             pool,
@@ -894,9 +963,10 @@ pub async fn headless_verify_pin(
             Some(&pending.user_pubkey),
             pending.pending_email.as_deref(),
             reason,
+            status.as_u16().into(),
         )
         .await;
-        return Err(HeadlessError::PinVerificationFailed);
+        return Err(error);
     }
 
     // Correct PIN: run the SAME finalize path as the link (idempotent; does not delete the row).
@@ -911,13 +981,10 @@ pub async fn headless_verify_pin(
     .await
     {
         Ok(finalized) => finalized,
+        // Same terminal case as the `consumed_at` check above, reached when the registration
+        // completed between that read and this call.
         Err(super::auth::AuthError::RegistrationAlreadyCompleted) => {
-            return Ok(Json(HeadlessVerifyPinResponse {
-                success: true,
-                code: String::new(),
-                pubkey: pending.user_pubkey,
-                state: pending.state,
-            }))
+            return Err(HeadlessError::RegistrationAlreadyCompleted)
         }
         Err(e) => return Err(e.into()),
     };
@@ -956,7 +1023,11 @@ pub async fn headless_verify_pin(
 // Headless Resend PIN (lockout recovery + new code)
 // ============================================================================
 
-/// Minutes between PIN resends (mirrors the users-table `email_verification_sent_at` cooldown).
+/// Minutes between successive PIN resends.
+///
+/// Measured from `pin_resend_at`, which is stamped only by an actual resend. Registration stamps
+/// `pin_sent_at` instead, so the first resend a user asks for is never swallowed by a cooldown
+/// they never started — which matters because a resend is the only way out of a PIN lockout.
 const PIN_RESEND_COOLDOWN_MINUTES: i64 = 5;
 
 #[derive(Debug, Deserialize)]
@@ -1008,9 +1079,10 @@ pub async fn headless_resend_pin(
         return Ok(success());
     }
 
-    // Cooldown: silently skip if a PIN was sent within the window.
-    if let Some(sent_at) = pending.pin_sent_at {
-        if (Utc::now() - sent_at).num_minutes() < PIN_RESEND_COOLDOWN_MINUTES {
+    // Cooldown: silently skip if a resend already ran within the window. Anchored on
+    // `pin_resend_at`, which registration leaves NULL, so the first resend always proceeds.
+    if let Some(resent_at) = pending.pin_resend_at {
+        if Utc::now() - resent_at < Duration::minutes(PIN_RESEND_COOLDOWN_MINUTES) {
             tracing::debug!("resend-pin: within cooldown, skipping (not revealed to client)");
             return Ok(success());
         }
@@ -1035,6 +1107,7 @@ pub async fn headless_resend_pin(
     let old_pin_hash = pending.pin_hash.clone();
     let old_pin_attempts = pending.pin_attempts;
     let old_pin_sent_at = pending.pin_sent_at;
+    let old_pin_resend_at = pending.pin_resend_at;
 
     oauth_code_repo
         .reset_pin_for_resend(&req.device_code, tenant_id, &new_token, &new_pin_hash)
@@ -1063,10 +1136,13 @@ pub async fn headless_resend_pin(
             .restore_pin_after_failed_resend(
                 &req.device_code,
                 tenant_id,
-                old_token.as_deref(),
-                old_pin_hash.as_deref(),
-                old_pin_attempts,
-                old_pin_sent_at,
+                keycast_core::repositories::PinResendSnapshot {
+                    verification_token: old_token.as_deref(),
+                    pin_hash: old_pin_hash.as_deref(),
+                    pin_attempts: old_pin_attempts,
+                    pin_sent_at: old_pin_sent_at,
+                    pin_resend_at: old_pin_resend_at,
+                },
             )
             .await?;
         return Ok(success());
@@ -1096,9 +1172,19 @@ pub enum HeadlessError {
     /// body carries the documented `EMAIL_ALREADY_EXISTS` code byte-identical to the link path.
     EmailAlreadyExists,
     Internal(String),
-    /// Uniform rejection for every verify-pin failure mode (unknown device_code, wrong/locked/
-    /// expired PIN) — never reveals which, nor lockout state (anti-enumeration).
-    PinVerificationFailed,
+    /// The registration this PIN belongs to already completed token issuance. Terminal: the
+    /// account exists, so the caller should stop waiting and sign in.
+    RegistrationAlreadyCompleted,
+    /// The submitted PIN did not match. Also covers an unknown `device_code`, deliberately, so
+    /// that case stays indistinguishable from a wrong PIN.
+    PinInvalid,
+    /// The attempt cap is spent. Recoverable only by requesting a new code.
+    PinLocked,
+    /// The PIN aged out of its validity window while the registration is still open. Recoverable
+    /// by requesting a new code.
+    PinExpired,
+    /// No usable PIN exists for this registration — none was issued, or none was delivered.
+    PinUnavailable,
     ServiceUnavailable {
         message: String,
         retry_after: Option<u32>,
@@ -1130,11 +1216,32 @@ impl IntoResponse for HeadlessError {
                 EMAIL_ALREADY_EXISTS_MESSAGE.to_string(),
                 EMAIL_ALREADY_EXISTS_CODE,
             ),
-            HeadlessError::PinVerificationFailed => (
+            HeadlessError::RegistrationAlreadyCompleted => (
+                StatusCode::CONFLICT,
+                "This registration has already been completed. Please sign in.".to_string(),
+                EMAIL_ALREADY_EXISTS_CODE,
+            ),
+            HeadlessError::PinInvalid => (
                 StatusCode::UNAUTHORIZED,
-                "Invalid or expired verification code. Please try again or request a new one."
+                "That code did not match. Please check it and try again.".to_string(),
+                "PIN_INVALID",
+            ),
+            HeadlessError::PinLocked => (
+                StatusCode::LOCKED,
+                "Too many incorrect attempts. Please request a new code.".to_string(),
+                "PIN_LOCKED",
+            ),
+            HeadlessError::PinExpired => (
+                StatusCode::GONE,
+                "That code has expired. Please request a new one.".to_string(),
+                "PIN_EXPIRED",
+            ),
+            HeadlessError::PinUnavailable => (
+                StatusCode::FORBIDDEN,
+                "Code entry is not available for this registration. Please use the link in your \
+                 email or request a new code."
                     .to_string(),
-                "PIN_VERIFICATION_FAILED",
+                "PIN_UNAVAILABLE",
             ),
             HeadlessError::Internal(msg) => {
                 tracing::error!("Headless internal error: {}", msg);
@@ -1207,6 +1314,10 @@ impl From<crate::bcrypt_queue::BcryptQueueError> for HeadlessError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "integration-tests")]
+    use super::{MAX_PIN_ATTEMPTS, PIN_VALIDITY_MINUTES};
+    #[cfg(feature = "integration-tests")]
+    use chrono::{Duration, Utc};
     use nostr_sdk::Keys;
     #[cfg(feature = "integration-tests")]
     use serial_test::serial;
@@ -1575,7 +1686,7 @@ mod tests {
     #[cfg(feature = "integration-tests")]
     #[tokio::test]
     #[serial]
-    async fn test_headless_register_email_failure_does_not_start_resend_cooldown() {
+    async fn test_headless_register_leaves_the_resend_cooldown_unarmed() {
         let _email_env = force_email_service_failure();
 
         let auth_state = create_lazy_auth_state();
@@ -1607,8 +1718,11 @@ mod tests {
             .expect("response carries device_code")
             .to_string();
 
-        let (pin_sent_at,): (Option<chrono::DateTime<chrono::Utc>>,) = sqlx::query_as(
-            "SELECT pin_sent_at FROM oauth_codes WHERE device_code = $1 AND tenant_id = 1",
+        let (pin_sent_at, pin_resend_at): (
+            Option<chrono::DateTime<Utc>>,
+            Option<chrono::DateTime<Utc>>,
+        ) = sqlx::query_as(
+            "SELECT pin_sent_at, pin_resend_at FROM oauth_codes WHERE device_code = $1 AND tenant_id = 1",
         )
         .bind(&device_code)
         .fetch_one(&pool)
@@ -1617,7 +1731,11 @@ mod tests {
 
         assert!(
             pin_sent_at.is_none(),
-            "failed initial email delivery must allow immediate resend"
+            "an undelivered PIN must not be stamped as sent"
+        );
+        assert!(
+            pin_resend_at.is_none(),
+            "registration must never arm the resend cooldown, delivered or not"
         );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
@@ -1630,7 +1748,12 @@ mod tests {
             .await;
     }
 
-    /// Insert a pending headless registration with a known PIN. Returns (pubkey, device_code).
+    /// Insert a pending headless registration with a known, freshly delivered PIN.
+    ///
+    /// Mirrors the state `headless_register` leaves behind on a successful send: `pin_sent_at`
+    /// stamped, `pin_resend_at` still NULL because no resend has happened yet.
+    ///
+    /// Returns (pubkey, device_code).
     #[cfg(feature = "integration-tests")]
     async fn insert_pending_with_pin(
         pool: &sqlx::PgPool,
@@ -1652,8 +1775,8 @@ mod tests {
                 tenant_id, code, user_pubkey, client_id, redirect_uri, scope,
                 expires_at, created_at, pending_email, pending_password_hash,
                 pending_email_verification_token, pending_encrypted_secret,
-                device_code, is_headless, pin_hash, pin_attempts
-            ) VALUES (1, $1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, $10, $11, true, $12, 0)",
+                device_code, is_headless, pin_hash, pin_attempts, pin_sent_at
+            ) VALUES (1, $1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, $10, $11, true, $12, 0, NOW())",
         )
         .bind(&placeholder)
         .bind(&pubkey)
@@ -1738,31 +1861,45 @@ mod tests {
             .await;
     }
 
-    /// After 5 failed attempts the PIN is locked; even the correct PIN then fails uniformly.
+    /// After 5 failed attempts the PIN is locked, and lockout is reported distinguishably from a
+    /// merely wrong PIN so the caller can tell the user to request a new code instead of repeating
+    /// "that code didn't match" forever.
     #[cfg(feature = "integration-tests")]
     #[tokio::test]
-    async fn test_verify_pin_attempt_cap_locks_at_5() {
+    async fn test_verify_pin_attempt_cap_reports_lockout_distinguishably() {
         let auth_state = create_lazy_auth_state();
         let pool = auth_state.state.db.clone();
         let email = format!("verify-pin-lock-{}@example.com", uuid::Uuid::new_v4());
         let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
 
-        let mut statuses = Vec::new();
-        for _ in 0..5 {
+        // Attempts 1..=4 are ordinary wrong-PIN rejections.
+        for attempt in 1..MAX_PIN_ATTEMPTS {
             let r = call_verify_pin(auth_state.clone(), &device_code, "000000").await;
-            statuses.push(r.status());
+            assert_eq!(
+                r.status(),
+                axum::http::StatusCode::UNAUTHORIZED,
+                "attempt {attempt} is below the cap and must read as a wrong PIN"
+            );
+            assert_eq!(response_json(r).await["code"], "PIN_INVALID");
         }
-        assert!(
-            statuses.iter().all(|s| !s.is_success()),
-            "wrong PIN attempts must all fail"
-        );
 
-        // Correct PIN after the cap must still fail (locked), not succeed.
-        let locked = call_verify_pin(auth_state, &device_code, "123456").await;
-        assert!(
-            !locked.status().is_success(),
-            "correct PIN after lockout must not finalize"
+        // The attempt that spends the last slot already reports lockout.
+        let capped = call_verify_pin(auth_state.clone(), &device_code, "000000").await;
+        assert_eq!(
+            capped.status(),
+            axum::http::StatusCode::LOCKED,
+            "the attempt exhausting the cap must report lockout, not a wrong PIN"
         );
+        assert_eq!(response_json(capped).await["code"], "PIN_LOCKED");
+
+        // Correct PIN after the cap must still fail, and say why.
+        let locked = call_verify_pin(auth_state, &device_code, "123456").await;
+        assert_eq!(
+            locked.status(),
+            axum::http::StatusCode::LOCKED,
+            "correct PIN after lockout must not finalize, and must report lockout"
+        );
+        assert_eq!(response_json(locked).await["code"], "PIN_LOCKED");
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
             .bind(&device_code)
@@ -1770,6 +1907,94 @@ mod tests {
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
             .bind(&pubkey)
+            .execute(&pool)
+            .await;
+    }
+
+    /// A PIN past its validity window is reported as expired, not as a wrong PIN, so the caller
+    /// tells the user to request a new code. The registration itself is still open.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_pin_aged_out_pin_reports_expired() {
+        let auth_state = create_lazy_auth_state();
+        let pool = auth_state.state.db.clone();
+        let email = format!("verify-pin-expired-{}@example.com", uuid::Uuid::new_v4());
+        let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
+
+        let aged_out = Utc::now() - Duration::minutes(PIN_VALIDITY_MINUTES + 1);
+        sqlx::query("UPDATE oauth_codes SET pin_sent_at = $2 WHERE device_code = $1")
+            .bind(&device_code)
+            .bind(aged_out)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Even the correct PIN is refused once it has aged out.
+        let response = call_verify_pin(auth_state, &device_code, "123456").await;
+        assert_eq!(response.status(), axum::http::StatusCode::GONE);
+        assert_eq!(response_json(response).await["code"], "PIN_EXPIRED");
+
+        // An expired PIN must not consume a lockout slot: the recovery action is a resend.
+        let (attempts,): (i32,) =
+            sqlx::query_as("SELECT pin_attempts FROM oauth_codes WHERE device_code = $1")
+                .bind(&device_code)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(attempts, 0);
+
+        let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(&pubkey)
+            .execute(&pool)
+            .await;
+    }
+
+    /// A registration carrying no usable PIN reports that, rather than insisting the digits were
+    /// wrong, so the caller steers the user to the email link or a resend.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_pin_without_usable_pin_reports_unavailable() {
+        let auth_state = create_lazy_auth_state();
+        let pool = auth_state.state.db.clone();
+
+        // No PIN was ever issued for this registration.
+        let no_pin_email = format!("verify-pin-nopin-{}@example.com", uuid::Uuid::new_v4());
+        let (no_pin_pubkey, no_pin_device) =
+            insert_pending_with_pin(&pool, &no_pin_email, "123456").await;
+        sqlx::query("UPDATE oauth_codes SET pin_hash = NULL WHERE device_code = $1")
+            .bind(&no_pin_device)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let response = call_verify_pin(auth_state.clone(), &no_pin_device, "123456").await;
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(response_json(response).await["code"], "PIN_UNAVAILABLE");
+
+        // A PIN exists but was never confirmed delivered, so the user cannot be holding it.
+        let undelivered_email = format!("verify-pin-undeliv-{}@example.com", uuid::Uuid::new_v4());
+        let (undelivered_pubkey, undelivered_device) =
+            insert_pending_with_pin(&pool, &undelivered_email, "123456").await;
+        sqlx::query("UPDATE oauth_codes SET pin_sent_at = NULL WHERE device_code = $1")
+            .bind(&undelivered_device)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let response = call_verify_pin(auth_state, &undelivered_device, "123456").await;
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(response_json(response).await["code"], "PIN_UNAVAILABLE");
+
+        let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = ANY($1)")
+            .bind(vec![no_pin_device, undelivered_device])
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE pubkey = ANY($1)")
+            .bind(vec![no_pin_pubkey, undelivered_pubkey])
             .execute(&pool)
             .await;
     }
@@ -1817,10 +2042,12 @@ mod tests {
             .await;
     }
 
-    /// Anti-enumeration: an unknown device_code and a wrong PIN are indistinguishable to the client.
+    /// The one rejection that must stay uniform: an unknown device_code is indistinguishable from
+    /// a wrong PIN. Every other rejection is reported specifically, but this one is reachable
+    /// without holding a device_code, so it must reveal nothing.
     #[cfg(feature = "integration-tests")]
     #[tokio::test]
-    async fn test_verify_pin_anti_enumeration_uniform_errors() {
+    async fn test_verify_pin_unknown_device_code_is_indistinguishable_from_wrong_pin() {
         let auth_state = create_lazy_auth_state();
         let pool = auth_state.state.db.clone();
         let email = format!("verify-pin-enum-{}@example.com", uuid::Uuid::new_v4());
@@ -1899,9 +2126,13 @@ mod tests {
             .await;
     }
 
+    /// A registration that already issued tokens is terminal. It must not answer with a
+    /// success-shaped body carrying no code: a caller that keeps polling against a consumed row
+    /// can never complete, so it would sit until its own timeout instead of telling the user the
+    /// account exists and they should sign in.
     #[cfg(feature = "integration-tests")]
     #[tokio::test]
-    async fn test_verify_pin_completed_registration_returns_idempotent_success() {
+    async fn test_verify_pin_completed_registration_is_terminal_conflict() {
         let auth_state = create_lazy_auth_state();
         let pool = auth_state.state.db.clone();
         let email = format!("verify-pin-complete-{}@example.com", uuid::Uuid::new_v4());
@@ -1916,14 +2147,14 @@ mod tests {
         let response = call_verify_pin(auth_state, &device_code, "123456").await;
         assert_eq!(
             response.status(),
-            axum::http::StatusCode::OK,
-            "completed registrations should match the link path's friendly success semantics"
+            axum::http::StatusCode::CONFLICT,
+            "a completed registration must be reported as terminal, not as a codeless success"
         );
         let body = response_json(response).await;
-        assert_eq!(body["success"], true);
-        assert!(
-            body["code"].as_str().is_none_or(str::is_empty),
-            "already-completed idempotent success must not mint a new exchange code"
+        assert_eq!(
+            body["code"],
+            super::super::auth::EMAIL_ALREADY_EXISTS_CODE,
+            "the account exists, so reuse the documented already-registered code"
         );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
@@ -1966,9 +2197,10 @@ mod tests {
         let email = format!("resend-pin-ok-{}@example.com", uuid::Uuid::new_v4());
         let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
 
-        // Simulate a locked PIN whose last send is past the cooldown.
+        // Simulate a locked PIN whose last resend is past the cooldown.
         sqlx::query(
-            "UPDATE oauth_codes SET pin_attempts = 5, pin_sent_at = NOW() - INTERVAL '10 minutes' WHERE device_code = $1",
+            "UPDATE oauth_codes SET pin_attempts = 5, pin_sent_at = NOW() - INTERVAL '10 minutes', \
+             pin_resend_at = NOW() - INTERVAL '10 minutes' WHERE device_code = $1",
         )
         .bind(&device_code)
         .execute(&pool)
@@ -2011,7 +2243,78 @@ mod tests {
             .await;
     }
 
-    /// Within the 5-minute cooldown, resend is a silent no-op (PIN/token unchanged).
+    /// The resend a user asks for right after registering must actually send. Registration stamps
+    /// `pin_sent_at`, so anchoring the cooldown there would swallow that first request while still
+    /// reporting success — and since a resend is the only way out of a PIN lockout, a user who
+    /// burns the attempt cap in the first few minutes would have no working recovery at all.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    #[serial]
+    async fn test_resend_pin_after_registration_is_not_swallowed_by_a_cooldown() {
+        let auth_state = create_lazy_auth_state();
+        let pool = auth_state.state.db.clone();
+        let email = format!("resend-pin-first-{}@example.com", uuid::Uuid::new_v4());
+        let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
+
+        // Exactly the state registration leaves behind, plus a lockout the user must escape:
+        // the PIN was delivered moments ago and no resend has happened yet.
+        sqlx::query(
+            "UPDATE oauth_codes SET pin_attempts = 5, pin_sent_at = NOW() WHERE device_code = $1",
+        )
+        .bind(&device_code)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (old_hash, old_resend_at): (Option<String>, Option<chrono::DateTime<Utc>>) =
+            sqlx::query_as(
+                "SELECT pin_hash, pin_resend_at FROM oauth_codes WHERE device_code = $1",
+            )
+            .bind(&device_code)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            old_resend_at.is_none(),
+            "registration must not pre-arm the resend cooldown"
+        );
+
+        let response = call_resend_pin(auth_state, &device_code).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let (attempts, new_hash, new_resend_at): (
+            i32,
+            Option<String>,
+            Option<chrono::DateTime<Utc>>,
+        ) = sqlx::query_as(
+            "SELECT pin_attempts, pin_hash, pin_resend_at FROM oauth_codes WHERE device_code = $1",
+        )
+        .bind(&device_code)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_ne!(
+            new_hash, old_hash,
+            "the first resend after registration must mint a fresh PIN, not silently do nothing"
+        );
+        assert_eq!(attempts, 0, "the first resend must clear the lockout");
+        assert!(
+            new_resend_at.is_some(),
+            "a real resend arms the cooldown for the ones after it"
+        );
+
+        let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(&pubkey)
+            .execute(&pool)
+            .await;
+    }
+
+    /// Within the 5-minute cooldown, a *subsequent* resend is a silent no-op (PIN/token unchanged).
     #[cfg(feature = "integration-tests")]
     #[tokio::test]
     async fn test_resend_pin_respects_cooldown() {
@@ -2020,8 +2323,10 @@ mod tests {
         let email = format!("resend-pin-cooldown-{}@example.com", uuid::Uuid::new_v4());
         let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
 
-        // Last send just now → inside the cooldown window.
-        sqlx::query("UPDATE oauth_codes SET pin_sent_at = NOW() WHERE device_code = $1")
+        // A resend already ran just now → inside the cooldown window.
+        sqlx::query(
+            "UPDATE oauth_codes SET pin_sent_at = NOW(), pin_resend_at = NOW() WHERE device_code = $1",
+        )
             .bind(&device_code)
             .execute(&pool)
             .await
@@ -2071,9 +2376,10 @@ mod tests {
         let email = format!("resend-pin-email-fail-{}@example.com", uuid::Uuid::new_v4());
         let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
 
-        let old_sent_at = chrono::Utc::now() - chrono::Duration::minutes(10);
+        let old_sent_at = Utc::now() - Duration::minutes(10);
         sqlx::query(
-            "UPDATE oauth_codes SET pin_attempts = 5, pin_sent_at = $2 WHERE device_code = $1",
+            "UPDATE oauth_codes SET pin_attempts = 5, pin_sent_at = $2, pin_resend_at = $2 \
+             WHERE device_code = $1",
         )
         .bind(&device_code)
         .bind(old_sent_at)
@@ -2081,34 +2387,33 @@ mod tests {
         .await
         .unwrap();
 
-        let (old_hash, old_token, old_attempts, old_pin_sent_at): (
+        type ResendFields = (
             Option<String>,
             Option<String>,
             i32,
-            Option<chrono::DateTime<chrono::Utc>>,
-        ) = sqlx::query_as(
-            "SELECT pin_hash, pending_email_verification_token, pin_attempts, pin_sent_at FROM oauth_codes WHERE device_code = $1",
-        )
-        .bind(&device_code)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+            Option<chrono::DateTime<Utc>>,
+            Option<chrono::DateTime<Utc>>,
+        );
+        const RESEND_FIELDS_SQL: &str = "SELECT pin_hash, pending_email_verification_token, \
+                                         pin_attempts, pin_sent_at, pin_resend_at \
+                                         FROM oauth_codes WHERE device_code = $1";
+
+        let (old_hash, old_token, old_attempts, old_pin_sent_at, old_pin_resend_at): ResendFields =
+            sqlx::query_as(RESEND_FIELDS_SQL)
+                .bind(&device_code)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
 
         let response = call_resend_pin(auth_state, &device_code).await;
         assert_eq!(response.status(), axum::http::StatusCode::OK);
 
-        let (new_hash, new_token, new_attempts, new_pin_sent_at): (
-            Option<String>,
-            Option<String>,
-            i32,
-            Option<chrono::DateTime<chrono::Utc>>,
-        ) = sqlx::query_as(
-            "SELECT pin_hash, pending_email_verification_token, pin_attempts, pin_sent_at FROM oauth_codes WHERE device_code = $1",
-        )
-        .bind(&device_code)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let (new_hash, new_token, new_attempts, new_pin_sent_at, new_pin_resend_at): ResendFields =
+            sqlx::query_as(RESEND_FIELDS_SQL)
+                .bind(&device_code)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
 
         assert_eq!(new_hash, old_hash, "failed resend must preserve old PIN");
         assert_eq!(
@@ -2121,6 +2426,10 @@ mod tests {
         );
         assert_eq!(
             new_pin_sent_at, old_pin_sent_at,
+            "failed resend must not restamp the PIN validity window"
+        );
+        assert_eq!(
+            new_pin_resend_at, old_pin_resend_at,
             "failed resend must not arm a new cooldown"
         );
 
