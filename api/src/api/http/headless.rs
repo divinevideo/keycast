@@ -2167,6 +2167,72 @@ mod tests {
             .await;
     }
 
+    /// The PIN path runs the same finalize as the email link, so it must inherit the link path's
+    /// recovery for a users row that already exists without the pending credentials — created, for
+    /// example, by team membership or authorization pre-creation. Treating "a row exists" as
+    /// "nothing left to do" would leave that row permanently without an email, a password, or a
+    /// personal key while still handing the caller a usable exchange code.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_pin_completes_a_bare_pre_existing_user_row() {
+        let auth_state = create_lazy_auth_state();
+        let pool = auth_state.state.db.clone();
+        let email = format!("verify-pin-bare-{}@example.com", uuid::Uuid::new_v4());
+        let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
+
+        // A bare row for the same pubkey, carrying none of the pending registration.
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, created_at, updated_at) \
+             VALUES ($1, 1, NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response = call_verify_pin(auth_state, &device_code, "123456").await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(
+            response_json(response).await["code"]
+                .as_str()
+                .is_some_and(|c| !c.is_empty()),
+            "verify-pin still returns an exchange code"
+        );
+
+        let (row_email, verified, has_password, has_key): (Option<String>, bool, bool, bool) =
+            sqlx::query_as(
+                "SELECT u.email, u.email_verified, u.password_hash IS NOT NULL, \
+                 EXISTS(SELECT 1 FROM personal_keys pk WHERE pk.user_pubkey = u.pubkey) \
+                 FROM users u WHERE u.pubkey = $1 AND u.tenant_id = 1",
+            )
+            .bind(&pubkey)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            row_email.as_deref(),
+            Some(email.as_str()),
+            "the pending email must be applied to the pre-existing row"
+        );
+        assert!(verified, "the row must end up verified");
+        assert!(has_password, "the pending password must be applied");
+        assert!(has_key, "the pending personal key must be applied");
+
+        let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM personal_keys WHERE user_pubkey = $1")
+            .bind(&pubkey)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(&pubkey)
+            .execute(&pool)
+            .await;
+    }
+
     #[cfg(feature = "integration-tests")]
     async fn call_resend_pin(
         auth_state: crate::api::http::routes::AuthState,
