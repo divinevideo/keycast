@@ -439,6 +439,34 @@ pub enum ClaimConsumeOutcome {
     UserNotClaimable,
 }
 
+/// Outcome of a conditional ATProto lifecycle write.
+///
+/// These writes are guarded so the condition that authorizes them is evaluated
+/// in the same statement that applies them. That makes "nothing was written"
+/// ambiguous on its own: the row may still exist but no longer qualify, or it
+/// may be gone. Callers map those to different errors, so the two are reported
+/// separately and are determined from a single statement rather than a second
+/// lookup that would reintroduce the race the guard removes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalWrite {
+    /// The predicate matched and the row was updated.
+    Applied,
+    /// The row exists but no longer satisfies the predicate.
+    Ineligible,
+    /// No such user row.
+    NotFound,
+}
+
+fn classify_conditional_write(existed: i64, updated: i64) -> ConditionalWrite {
+    if updated > 0 {
+        ConditionalWrite::Applied
+    } else if existed > 0 {
+        ConditionalWrite::Ineligible
+    } else {
+        ConditionalWrite::NotFound
+    }
+}
+
 /// Repository for user-related database operations.
 #[derive(Debug, Clone)]
 pub struct UserRepository {
@@ -1473,6 +1501,9 @@ impl UserRepository {
     /// Roll back an ATProto opt-in that this request wrote, but only if the row
     /// still holds the `pending` state that request left behind.
     ///
+    /// See [`ConditionalWrite`] for why the result distinguishes an ineligible
+    /// row from a missing one.
+    ///
     /// The opt-in is written before the control plane is called, so a failed
     /// trigger has to take it back. Doing that with an unconditional write races
     /// the control plane: if the trigger did land and provisioning reported back
@@ -1485,33 +1516,40 @@ impl UserRepository {
     /// any DID without reading it first, so there is no window between reading
     /// the DID and writing it back.
     ///
-    /// Returns whether the rollback applied.
     pub async fn roll_back_atproto_enable(
         &self,
         pubkey: &str,
         tenant_id: i64,
         error: Option<&str>,
-    ) -> Result<bool, RepositoryError> {
+    ) -> Result<ConditionalWrite, RepositoryError> {
         let now = Utc::now();
-        let result = sqlx::query(
-            "UPDATE users
-             SET atproto_enabled = false,
-                 atproto_state = 'failed',
-                 atproto_error = $1,
-                 atproto_updated_at = $2,
-                 updated_at = $2
-             WHERE pubkey = $3
-               AND tenant_id = $4
-               AND atproto_state = 'pending'",
+        let (existed, updated): (i64, i64) = sqlx::query_as(
+            "WITH target AS (
+                 SELECT 1 FROM users WHERE pubkey = $3 AND tenant_id = $4
+             ), applied AS (
+                 UPDATE users
+                 SET atproto_enabled = false,
+                     atproto_state = 'failed',
+                     atproto_error = $1,
+                     atproto_updated_at = $2,
+                     updated_at = $2
+                 WHERE pubkey = $3
+                   AND tenant_id = $4
+                   AND atproto_state = 'pending'
+                 RETURNING 1
+             )
+             SELECT
+                 (SELECT COUNT(*) FROM target) AS existed,
+                 (SELECT COUNT(*) FROM applied) AS updated",
         )
         .bind(error)
         .bind(now)
         .bind(pubkey)
         .bind(tenant_id)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(classify_conditional_write(existed, updated))
     }
 
     /// Release an ATProto opt-in locally, but only while the account has no DID.
@@ -1524,33 +1562,41 @@ impl UserRepository {
     /// as wide as the control-plane request timeout — in which provisioning can
     /// attach a DID and the account is then reported off while still live.
     ///
-    /// Returns whether the local release applied. A `false` result means the
-    /// account is no longer eligible, so the caller must fail closed.
+    /// Anything other than [`ConditionalWrite::Applied`] means the local release
+    /// did not happen and the caller must fail closed.
     pub async fn disable_atproto_if_unprovisioned(
         &self,
         pubkey: &str,
         tenant_id: i64,
-    ) -> Result<bool, RepositoryError> {
+    ) -> Result<ConditionalWrite, RepositoryError> {
         let now = Utc::now();
-        let result = sqlx::query(
-            "UPDATE users
-             SET atproto_enabled = false,
-                 atproto_state = 'disabled',
-                 atproto_did = NULL,
-                 atproto_error = NULL,
-                 atproto_updated_at = $1,
-                 updated_at = $1
-             WHERE pubkey = $2
-               AND tenant_id = $3
-               AND atproto_did IS NULL",
+        let (existed, updated): (i64, i64) = sqlx::query_as(
+            "WITH target AS (
+                 SELECT 1 FROM users WHERE pubkey = $2 AND tenant_id = $3
+             ), applied AS (
+                 UPDATE users
+                 SET atproto_enabled = false,
+                     atproto_state = 'disabled',
+                     atproto_did = NULL,
+                     atproto_error = NULL,
+                     atproto_updated_at = $1,
+                     updated_at = $1
+                 WHERE pubkey = $2
+                   AND tenant_id = $3
+                   AND atproto_did IS NULL
+                 RETURNING 1
+             )
+             SELECT
+                 (SELECT COUNT(*) FROM target) AS existed,
+                 (SELECT COUNT(*) FROM applied) AS updated",
         )
         .bind(now)
         .bind(pubkey)
         .bind(tenant_id)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(classify_conditional_write(existed, updated))
     }
 
     /// Update a user's ATProto lifecycle state using globally unique pubkey lookup.

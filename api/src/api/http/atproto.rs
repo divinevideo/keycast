@@ -4,7 +4,9 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
-use keycast_core::repositories::{AtprotoOAuthSessionRepository, RepositoryError, UserRepository};
+use keycast_core::repositories::{
+    AtprotoOAuthSessionRepository, ConditionalWrite, RepositoryError, UserRepository,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::future::Future;
@@ -373,15 +375,21 @@ async fn roll_back_failed_enable(
     user_pubkey: &str,
     error: &crate::atproto_provisioning::AtprotoProvisioningError,
 ) -> Result<(), AtprotoControlError> {
-    let rolled_back = repo
+    match repo
         .roll_back_atproto_enable(user_pubkey, tenant_id, Some(error.public_message()))
-        .await?;
-
-    if !rolled_back {
-        tracing::info!(
-            "Skipped ATProto enable rollback for pubkey {}: the row is no longer pending, so provisioning state took precedence",
-            user_pubkey
-        );
+        .await?
+    {
+        ConditionalWrite::Applied => {}
+        ConditionalWrite::Ineligible => {
+            tracing::info!(
+                "Skipped ATProto enable rollback for pubkey {}: the row is no longer pending, so provisioning state took precedence",
+                user_pubkey
+            );
+        }
+        // The row disappeared while the trigger was in flight. Report that as
+        // the missing user it is, matching what the caller saw before the
+        // rollback became conditional.
+        ConditionalWrite::NotFound => return Err(AtprotoControlError::UserNotFound),
     }
 
     Ok(())
@@ -559,12 +567,18 @@ where
         // statement rather than an earlier read, so provisioning cannot attach a
         // DID between the check and the write. A `false` result means the
         // account became provisioned, and the request fails closed.
-        let released = user_repo
+        match user_repo
             .disable_atproto_if_unprovisioned(user_pubkey, tenant_id)
-            .await?;
-
-        if !released {
-            return Err(AtprotoControlError::ProvisioningTrigger(error));
+            .await?
+        {
+            ConditionalWrite::Applied => {}
+            ConditionalWrite::Ineligible => {
+                return Err(AtprotoControlError::ProvisioningTrigger(error))
+            }
+            // The account was removed while the trigger was in flight. That is a
+            // missing user, not a provisioning outage, and the caller saw it as
+            // such before this write became conditional.
+            ConditionalWrite::NotFound => return Err(AtprotoControlError::UserNotFound),
         }
 
         tracing::warn!(

@@ -951,6 +951,102 @@ async fn enable_rollback_yields_to_a_sync_that_lands_during_the_trigger() {
     assert_eq!(status.did.as_deref(), Some("did:plc:syncwins"));
 }
 
+/// A conditional write that applies to no rows is ambiguous on its own: the
+/// account may have become ineligible, or it may be gone. Those map to
+/// different errors, and an account deleted while the trigger was in flight
+/// must still read as a missing user rather than a provisioning outage.
+#[tokio::test]
+async fn disable_reports_user_not_found_when_deleted_during_the_trigger() {
+    let pool = common::setup_test_db().await;
+    let repo = UserRepository::new(pool.clone());
+    let session_repo = AtprotoOAuthSessionRepository::new(pool.clone());
+    let tenant_id = 1_i64;
+
+    let keys = Keys::generate();
+    let user_pubkey = keys.public_key().to_hex();
+    let username = format!("alice-deleted-disable-{}", &user_pubkey[..8]);
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, username, atproto_enabled, atproto_state, created_at, updated_at)
+         VALUES ($1, $2, $3, true, 'failed', NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .bind(&username)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    let trigger_pool = pool.clone();
+    let trigger_pubkey = user_pubkey.clone();
+
+    let error = disable_user_atproto_with_trigger(
+        &repo,
+        &session_repo,
+        tenant_id,
+        &user_pubkey,
+        move |_pubkey| async move {
+            sqlx::query("DELETE FROM users WHERE pubkey = $1")
+                .bind(&trigger_pubkey)
+                .execute(&trigger_pool)
+                .await
+                .expect("failed to simulate account deletion");
+
+            Err(keycast_api::atproto_provisioning::AtprotoProvisioningError::DependencyNotConfigured)
+        },
+    )
+    .await
+    .expect_err("disable should fail once the account is gone");
+
+    assert_eq!(error.to_string(), "user not found");
+}
+
+/// Same classification requirement on the rollback path.
+#[tokio::test]
+async fn enable_rollback_reports_user_not_found_when_deleted_during_the_trigger() {
+    let pool = common::setup_test_db().await;
+    let repo = UserRepository::new(pool.clone());
+    let tenant_id = 1_i64;
+
+    let keys = Keys::generate();
+    let user_pubkey = keys.public_key().to_hex();
+    let username = format!("alice-deleted-enable-{}", &user_pubkey[..8]);
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, username, created_at, updated_at)
+         VALUES ($1, $2, $3, NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .bind(&username)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    let trigger_pool = pool.clone();
+    let trigger_pubkey = user_pubkey.clone();
+
+    let error = enable_user_atproto_with_trigger(
+        &repo,
+        tenant_id,
+        &user_pubkey,
+        &username,
+        move |_pubkey, _username| async move {
+            sqlx::query("DELETE FROM users WHERE pubkey = $1")
+                .bind(&trigger_pubkey)
+                .execute(&trigger_pool)
+                .await
+                .expect("failed to simulate account deletion");
+
+            Err(keycast_api::atproto_provisioning::AtprotoProvisioningError::DependencyNotConfigured)
+        },
+    )
+    .await
+    .expect_err("enable should fail once the account is gone");
+
+    assert_eq!(error.to_string(), "user not found");
+}
+
 #[tokio::test]
 async fn disable_trigger_failure_preserves_existing_state() {
     let pool = common::setup_test_db().await;
