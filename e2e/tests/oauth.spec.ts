@@ -142,7 +142,7 @@ test.describe("OAuth consent flow", () => {
     await page.locator("text=Continue as").click();
 
     await expect(page.locator("text=Signed in as")).toBeVisible();
-    await expect(page.locator(`text=${email}`)).toBeVisible();
+    await expect(page.locator(".session_identity")).toHaveText(email);
     await page.locator("text=Use a different account").click();
 
     await expect(page.locator("h1")).toContainText("Sign in");
