@@ -365,10 +365,15 @@ where
 /// control plane still owns, and [`disable_user_atproto_with_trigger`] depends
 /// on it to keep refusing a local-only disable for a provisioned account.
 ///
-/// The rollback only applies while the row still holds the `pending` state this
-/// request wrote. If the trigger did reach the control plane and provisioning
-/// reported back through the internal sync endpoint before the local call
-/// failed, that sync has already moved the row and must not be overwritten.
+/// The rollback only applies while the row is still `pending`. If the trigger
+/// did reach the control plane and provisioning reported back through the
+/// internal sync endpoint before the local call failed, that sync has already
+/// moved the row and must not be overwritten.
+///
+/// That guard is a state check and not a claim of request ownership: the row
+/// records no operation identity, so a rollback cannot tell its own `pending`
+/// write apart from one a later concurrent request left behind, and it can
+/// still compensate a newer opt-in.
 async fn roll_back_failed_enable(
     repo: &UserRepository,
     tenant_id: i64,

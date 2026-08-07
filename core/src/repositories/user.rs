@@ -1498,8 +1498,7 @@ impl UserRepository {
         Ok(())
     }
 
-    /// Roll back an ATProto opt-in that this request wrote, but only if the row
-    /// still holds the `pending` state that request left behind.
+    /// Roll back an ATProto opt-in, but only while the row is still `pending`.
     ///
     /// See [`ConditionalWrite`] for why the result distinguishes an ineligible
     /// row from a missing one.
@@ -1516,6 +1515,11 @@ impl UserRepository {
     /// any DID without reading it first, so there is no window between reading
     /// the DID and writing it back.
     ///
+    /// The predicate is a state check, **not** a claim of request ownership. The
+    /// row carries no operation identity, so this cannot tell its own `pending`
+    /// write apart from one left by a later concurrent request, and a rollback
+    /// can still compensate a newer opt-in. Distinguishing those needs an
+    /// operation generation on the row, which this does not attempt.
     pub async fn roll_back_atproto_enable(
         &self,
         pubkey: &str,

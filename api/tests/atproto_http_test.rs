@@ -951,6 +951,109 @@ async fn enable_rollback_yields_to_a_sync_that_lands_during_the_trigger() {
     assert_eq!(status.did.as_deref(), Some("did:plc:syncwins"));
 }
 
+/// Session revocation is required on every path that reports an account as
+/// switched off, including the local release taken when the control plane is
+/// unreachable. The other escape-hatch tests create no OAuth session, so none
+/// of them would notice if that revocation were dropped from this branch.
+#[tokio::test]
+async fn disable_escape_hatch_revokes_atproto_oauth_refresh_sessions() {
+    let pool = common::setup_test_db().await;
+    let user_repo = UserRepository::new(pool.clone());
+    let session_repo = AtprotoOAuthSessionRepository::new(pool.clone());
+    let tenant_id = 1_i64;
+
+    let keys = Keys::generate();
+    let user_pubkey = keys.public_key().to_hex();
+    let username = format!("alice-hatch-revoke-{}", &user_pubkey[..8]);
+    let request_uri = format!("urn:ietf:params:oauth:request_uri:{}", Uuid::new_v4());
+    let refresh_token_hash =
+        hash_refresh_token(&format!("refresh-token-hatch-revoke-{}", Uuid::new_v4()));
+
+    // Stuck and unprovisioned: the shape the escape hatch exists to release.
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, username, atproto_enabled, atproto_state, created_at, updated_at)
+         VALUES ($1, $2, $3, true, 'failed', NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .bind(&username)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    session_repo
+        .create_par(CreateAtprotoOAuthSessionParams {
+            tenant_id,
+            client_id: "https://client.example".to_string(),
+            redirect_uri: "https://client.example/callback".to_string(),
+            scope: "atproto".to_string(),
+            state: Some("csrf-state".to_string()),
+            code_challenge: Some("challenge".to_string()),
+            code_challenge_method: Some("S256".to_string()),
+            request_uri: request_uri.clone(),
+            par_expires_at: Utc::now() + Duration::minutes(10),
+            dpop_jkt: Some("dpop-jkt".to_string()),
+            dpop_nonce: Some("dpop-nonce".to_string()),
+            client_auth_method: "none".to_string(),
+            client_auth_alg: None,
+            client_auth_kid: None,
+            client_auth_jkt: None,
+        })
+        .await
+        .expect("failed to create PAR session");
+
+    session_repo
+        .approve_request(&request_uri, &user_pubkey, "did:plc:testhatch")
+        .await
+        .expect("failed to approve PAR session");
+
+    session_repo
+        .store_token_artifacts(
+            &request_uri,
+            IssueAtprotoTokensParams {
+                authorization_code: format!("auth-code-{}", Uuid::new_v4()),
+                authorization_code_expires_at: Utc::now() + Duration::minutes(5),
+                access_token_jti: format!("access-jti-{}", Uuid::new_v4()),
+                access_token_expires_at: Utc::now() + Duration::minutes(15),
+                refresh_token_hash: refresh_token_hash.clone(),
+                refresh_token_expires_at: Utc::now() + Duration::days(30),
+                dpop_jkt: Some("dpop-jkt".to_string()),
+                dpop_nonce: Some("dpop-nonce-2".to_string()),
+            },
+        )
+        .await
+        .expect("failed to issue ATProto OAuth session tokens");
+
+    let response = disable_user_atproto_with_trigger(
+        &user_repo,
+        &session_repo,
+        tenant_id,
+        &user_pubkey,
+        |_pubkey| async {
+            Err(
+                keycast_api::atproto_provisioning::AtprotoProvisioningError::DependencyNotConfigured,
+            )
+        },
+    )
+    .await
+    .expect("escape hatch should release an unprovisioned account");
+
+    assert!(!response.enabled);
+    assert_eq!(response.state.as_deref(), Some("disabled"));
+
+    let revoked_at: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT refresh_token_revoked_at FROM atproto_oauth_sessions WHERE request_uri = $1",
+    )
+    .bind(&request_uri)
+    .fetch_one(&pool)
+    .await
+    .expect("failed to load refresh revocation marker");
+    assert!(
+        revoked_at.is_some(),
+        "the local release must still revoke refresh sessions"
+    );
+}
+
 /// A conditional write that applies to no rows is ambiguous on its own: the
 /// account may have become ineligible, or it may be gone. Those map to
 /// different errors, and an account deleted while the trigger was in flight
