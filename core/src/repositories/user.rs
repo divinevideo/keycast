@@ -1498,6 +1498,67 @@ impl UserRepository {
         Ok(())
     }
 
+    /// Record an ATProto opt-in ahead of the control-plane trigger, unless the
+    /// account is already confirmed live.
+    ///
+    /// See [`ConditionalWrite`] for why the result distinguishes an ineligible
+    /// row from a missing one. [`ConditionalWrite::Ineligible`] here means the
+    /// account is already `ready`, so there is nothing to opt in to.
+    ///
+    /// A confirmed `ready` account is excluded because this write is optimistic:
+    /// it moves the row to `pending` before the control plane is called, and a
+    /// failed trigger then rolls it back to `failed` with the opt-in off. Doing
+    /// that to an account with a live repo would report it as switched off while
+    /// it can still publish — the same lie
+    /// [`Self::disable_atproto_if_unprovisioned`] exists to prevent on the
+    /// disable path. `pending` is deliberately still eligible, so a stuck opt-in
+    /// can be retried against the control plane.
+    ///
+    /// `atproto_did` is deliberately left out of the `SET` clause, for the same
+    /// reason as [`Self::roll_back_atproto_enable`]: reading the DID and writing
+    /// it back leaves a window in which provisioning can attach one, and the
+    /// write then erases the only local record that a live repo exists. That
+    /// record is what [`Self::disable_atproto_if_unprovisioned`] reads to decide
+    /// whether a local-only release is safe, so losing it would let a later
+    /// disable report a live account as switched off. Omitting the column
+    /// preserves any DID without a read to go stale.
+    pub async fn begin_atproto_enable(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<ConditionalWrite, RepositoryError> {
+        let now = Utc::now();
+        let (existed, updated): (i64, i64) = sqlx::query_as(
+            "WITH target AS (
+                 SELECT 1 FROM users WHERE pubkey = $2 AND tenant_id = $3
+             ), applied AS (
+                 UPDATE users
+                 SET atproto_enabled = true,
+                     atproto_state = 'pending',
+                     atproto_error = NULL,
+                     atproto_updated_at = $1,
+                     updated_at = $1
+                 WHERE pubkey = $2
+                   AND tenant_id = $3
+                   AND NOT (
+                       atproto_enabled
+                       AND atproto_state IS NOT DISTINCT FROM 'ready'
+                   )
+                 RETURNING 1
+             )
+             SELECT
+                 (SELECT COUNT(*) FROM target) AS existed,
+                 (SELECT COUNT(*) FROM applied) AS updated",
+        )
+        .bind(now)
+        .bind(pubkey)
+        .bind(tenant_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(classify_conditional_write(existed, updated))
+    }
+
     /// Roll back an ATProto opt-in, but only while the row is still `pending`.
     ///
     /// See [`ConditionalWrite`] for why the result distinguishes an ineligible

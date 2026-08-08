@@ -285,48 +285,52 @@ pub async fn enable_user_atproto(
         return Err(AtprotoControlError::UsernameMismatch);
     }
 
-    let existing_did = current_atproto_did(repo, tenant_id, user_pubkey).await?;
-
-    repo.set_atproto_state(
-        user_pubkey,
-        tenant_id,
-        true,
-        Some("pending"),
-        existing_did.as_deref(),
-        None,
+    Ok(
+        begin_atproto_opt_in(repo, tenant_id, user_pubkey, claimed_username)
+            .await?
+            .0,
     )
-    .await?;
+}
+
+/// Whether the optimistic opt-in write actually moved the row.
+///
+/// A confirmed `ready` account is left alone, so there is nothing for a failed
+/// trigger to roll back and no reason to call the control plane again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptIn {
+    Written,
+    AlreadyReady,
+}
+
+/// Writes the pre-trigger opt-in and reports the resulting status.
+///
+/// Shared by [`enable_user_atproto`] and [`reenable_user_atproto`] so both go
+/// through the same conditional write. See
+/// [`UserRepository::begin_atproto_enable`] for why the write is conditional and
+/// why it leaves `atproto_did` alone.
+async fn begin_atproto_opt_in(
+    repo: &UserRepository,
+    tenant_id: i64,
+    user_pubkey: &str,
+    claimed_username: String,
+) -> Result<(AtprotoStatusResponse, OptIn), AtprotoControlError> {
+    let opt_in = match repo.begin_atproto_enable(user_pubkey, tenant_id).await? {
+        ConditionalWrite::Applied => OptIn::Written,
+        ConditionalWrite::Ineligible => OptIn::AlreadyReady,
+        ConditionalWrite::NotFound => return Err(AtprotoControlError::UserNotFound),
+    };
 
     let state = repo
         .get_atproto_state(user_pubkey, tenant_id)
         .await?
         .ok_or(AtprotoControlError::UserNotFound)?;
 
-    Ok(map_state_to_response(Some(claimed_username), state))
-}
-
-/// Reads the DID currently on the row so a lifecycle write can carry it
-/// forward.
-///
-/// [`UserRepository::set_atproto_state`] writes `atproto_did` unconditionally,
-/// so passing `None` erases the link to a live repo. That column is what
-/// [`disable_user_atproto_with_trigger`] reads to decide whether a local-only
-/// disable is safe, so an enable that blanks it on its way through would let a
-/// later disable silently release a provisioned account.
-async fn current_atproto_did(
-    repo: &UserRepository,
-    tenant_id: i64,
-    user_pubkey: &str,
-) -> Result<Option<String>, AtprotoControlError> {
-    Ok(repo
-        .get_atproto_state(user_pubkey, tenant_id)
-        .await?
-        .ok_or(AtprotoControlError::UserNotFound)?
-        .did)
+    Ok((map_state_to_response(Some(claimed_username), state), opt_in))
 }
 
 pub async fn enable_user_atproto_with_trigger<F, Fut>(
     repo: &UserRepository,
+    session_repo: &AtprotoOAuthSessionRepository,
     tenant_id: i64,
     user_pubkey: &str,
     requested_username: &str,
@@ -336,14 +340,31 @@ where
     F: FnOnce(String, String) -> Fut,
     Fut: Future<Output = Result<(), crate::atproto_provisioning::AtprotoProvisioningError>>,
 {
-    let response = enable_user_atproto(repo, tenant_id, user_pubkey, requested_username).await?;
+    let claimed_username = require_resolved_username(
+        resolve_username_with_fallback(repo, tenant_id, user_pubkey, |pubkey| async move {
+            divine_names::lookup_by_pubkey(&pubkey).await
+        })
+        .await?,
+    )?;
+
+    if claimed_username != requested_username {
+        return Err(AtprotoControlError::UsernameMismatch);
+    }
+
+    let (response, opt_in) =
+        begin_atproto_opt_in(repo, tenant_id, user_pubkey, claimed_username).await?;
+
+    if opt_in == OptIn::AlreadyReady {
+        return Ok(response);
+    }
+
     let username = response
         .username
         .clone()
         .ok_or(AtprotoControlError::UsernameNotClaimed)?;
 
     if let Err(error) = trigger(user_pubkey.to_string(), username.clone()).await {
-        roll_back_failed_enable(repo, tenant_id, user_pubkey, &error).await?;
+        roll_back_failed_enable(repo, session_repo, tenant_id, user_pubkey, &error).await?;
         return Err(AtprotoControlError::ProvisioningTrigger(error));
     }
 
@@ -374,8 +395,15 @@ where
 /// records no operation identity, so a rollback cannot tell its own `pending`
 /// write apart from one a later concurrent request left behind, and it can
 /// still compensate a newer opt-in.
+///
+/// A rollback that lands reports the account as switched off, so it revokes
+/// ATProto OAuth sessions like every other path that does. The refresh grant
+/// checks only the session's own binding and never re-reads the lifecycle state,
+/// so a session left behind here would keep working against an account the
+/// status endpoint calls off.
 async fn roll_back_failed_enable(
     repo: &UserRepository,
+    session_repo: &AtprotoOAuthSessionRepository,
     tenant_id: i64,
     user_pubkey: &str,
     error: &crate::atproto_provisioning::AtprotoProvisioningError,
@@ -384,7 +412,9 @@ async fn roll_back_failed_enable(
         .roll_back_atproto_enable(user_pubkey, tenant_id, Some(error.public_message()))
         .await?
     {
-        ConditionalWrite::Applied => {}
+        ConditionalWrite::Applied => {
+            session_repo.revoke_sessions_for_pubkey(user_pubkey).await?;
+        }
         ConditionalWrite::Ineligible => {
             tracing::info!(
                 "Skipped ATProto enable rollback for pubkey {}: the row is no longer pending, so provisioning state took precedence",
@@ -412,28 +442,16 @@ pub async fn reenable_user_atproto(
         .await?,
     )?;
 
-    let existing_did = current_atproto_did(repo, tenant_id, user_pubkey).await?;
-
-    repo.set_atproto_state(
-        user_pubkey,
-        tenant_id,
-        true,
-        Some("pending"),
-        existing_did.as_deref(),
-        None,
+    Ok(
+        begin_atproto_opt_in(repo, tenant_id, user_pubkey, claimed_username)
+            .await?
+            .0,
     )
-    .await?;
-
-    let state = repo
-        .get_atproto_state(user_pubkey, tenant_id)
-        .await?
-        .ok_or(AtprotoControlError::UserNotFound)?;
-
-    Ok(map_state_to_response(Some(claimed_username), state))
 }
 
 pub async fn reenable_user_atproto_with_trigger<F, Fut>(
     repo: &UserRepository,
+    session_repo: &AtprotoOAuthSessionRepository,
     tenant_id: i64,
     user_pubkey: &str,
     trigger: F,
@@ -442,10 +460,22 @@ where
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = Result<(), crate::atproto_provisioning::AtprotoProvisioningError>>,
 {
-    let response = reenable_user_atproto(repo, tenant_id, user_pubkey).await?;
+    let claimed_username = require_resolved_username(
+        resolve_username_with_fallback(repo, tenant_id, user_pubkey, |pubkey| async move {
+            divine_names::lookup_by_pubkey(&pubkey).await
+        })
+        .await?,
+    )?;
+
+    let (response, opt_in) =
+        begin_atproto_opt_in(repo, tenant_id, user_pubkey, claimed_username).await?;
+
+    if opt_in == OptIn::AlreadyReady {
+        return Ok(response);
+    }
 
     if let Err(error) = trigger(user_pubkey.to_string()).await {
-        roll_back_failed_enable(repo, tenant_id, user_pubkey, &error).await?;
+        roll_back_failed_enable(repo, session_repo, tenant_id, user_pubkey, &error).await?;
         return Err(AtprotoControlError::ProvisioningTrigger(error));
     }
 
@@ -660,6 +690,7 @@ where
         if current.state.as_deref() == Some("disabled") {
             return reenable_user_atproto_with_trigger(
                 user_repo,
+                session_repo,
                 tenant_id,
                 authenticated_user_pubkey,
                 reenable_trigger,
@@ -672,6 +703,7 @@ where
 
         return enable_user_atproto_with_trigger(
             user_repo,
+            session_repo,
             tenant_id,
             authenticated_user_pubkey,
             &username,
@@ -751,10 +783,12 @@ pub async fn enable_atproto(
 ) -> Result<(StatusCode, Json<AtprotoStatusResponse>), AuthError> {
     let tenant_id = tenant.0.id;
     let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
-    let repo = UserRepository::new(pool);
+    let repo = UserRepository::new(pool.clone());
+    let session_repo = AtprotoOAuthSessionRepository::new(pool);
 
     let response = enable_user_atproto_with_trigger(
         &repo,
+        &session_repo,
         tenant_id,
         &user_pubkey,
         &request.username,

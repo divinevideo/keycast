@@ -247,6 +247,134 @@ async fn enable_sets_pending_and_returns_accepted() {
     assert_eq!(response.error, None);
 }
 
+/// The pre-trigger opt-in write must leave `atproto_did` alone. It is the only
+/// local record that a live repo exists, and it is what the local-release path
+/// reads to decide whether reporting an account off is safe. Clearing it here
+/// and re-enabling would hand a provisioned account to that path.
+#[tokio::test]
+async fn enable_leaves_an_existing_did_in_place() {
+    let pool = common::setup_test_db().await;
+    let repo = UserRepository::new(pool.clone());
+    let tenant_id = 1_i64;
+
+    let keys = Keys::generate();
+    let user_pubkey = keys.public_key().to_hex();
+    let username = format!("alice-enable-keeps-did-{}", &user_pubkey[..8]);
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, username, atproto_enabled, atproto_state, atproto_did, atproto_error, created_at, updated_at)
+         VALUES ($1, $2, $3, false, 'failed', 'did:plc:testkeepsdid', 'previous failure', NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .bind(&username)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    let response = enable_user_atproto(&repo, tenant_id, &user_pubkey, &username)
+        .await
+        .expect("enable should succeed");
+
+    assert!(response.enabled);
+    assert_eq!(response.state.as_deref(), Some("pending"));
+    assert_eq!(response.did.as_deref(), Some("did:plc:testkeepsdid"));
+    // The stale explanation from the previous attempt is cleared.
+    assert_eq!(response.error, None);
+}
+
+/// Same requirement on the re-enable path.
+#[tokio::test]
+async fn reenable_leaves_an_existing_did_in_place() {
+    let pool = common::setup_test_db().await;
+    let repo = UserRepository::new(pool.clone());
+    let session_repo = AtprotoOAuthSessionRepository::new(pool.clone());
+    let tenant_id = 1_i64;
+
+    let keys = Keys::generate();
+    let user_pubkey = keys.public_key().to_hex();
+    let username = format!("alice-reenable-keeps-did-{}", &user_pubkey[..8]);
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, username, atproto_enabled, atproto_state, atproto_did, created_at, updated_at)
+         VALUES ($1, $2, $3, false, 'disabled', 'did:plc:testreenablekeeps', NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .bind(&username)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    let response = reenable_user_atproto_with_trigger(
+        &repo,
+        &session_repo,
+        tenant_id,
+        &user_pubkey,
+        |_pubkey| async { Ok(()) },
+    )
+    .await
+    .expect("reenable should succeed");
+
+    assert!(response.enabled);
+    assert_eq!(response.state.as_deref(), Some("pending"));
+    assert_eq!(response.did.as_deref(), Some("did:plc:testreenablekeeps"));
+}
+
+/// A confirmed `ready` account has a live repo. The opt-in write is optimistic
+/// and a failed trigger rolls it back to `failed` with the opt-in off, so
+/// letting a redundant enable move that row would report a publishing account
+/// as switched off during any control-plane outage.
+#[tokio::test]
+async fn enable_leaves_a_ready_account_alone_and_skips_the_trigger() {
+    let pool = common::setup_test_db().await;
+    let repo = UserRepository::new(pool.clone());
+    let session_repo = AtprotoOAuthSessionRepository::new(pool.clone());
+    let tenant_id = 1_i64;
+
+    let keys = Keys::generate();
+    let user_pubkey = keys.public_key().to_hex();
+    let username = format!("alice-enable-ready-{}", &user_pubkey[..8]);
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, username, atproto_enabled, atproto_state, atproto_did, created_at, updated_at)
+         VALUES ($1, $2, $3, true, 'ready', 'did:plc:testalreadyready', NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .bind(&username)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    let trigger_calls = Arc::new(AtomicUsize::new(0));
+    let observed = trigger_calls.clone();
+
+    let response = enable_user_atproto_with_trigger(
+        &repo,
+        &session_repo,
+        tenant_id,
+        &user_pubkey,
+        &username,
+        move |_pubkey, _username| {
+            let observed = observed.clone();
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Err(
+                    keycast_api::atproto_provisioning::AtprotoProvisioningError::DependencyNotConfigured,
+                )
+            }
+        },
+    )
+    .await
+    .expect("enabling an already-ready account should succeed without the control plane");
+
+    assert_eq!(trigger_calls.load(Ordering::SeqCst), 0);
+    assert!(response.enabled);
+    assert_eq!(response.state.as_deref(), Some("ready"));
+    assert_eq!(response.did.as_deref(), Some("did:plc:testalreadyready"));
+}
+
 #[tokio::test]
 async fn disable_marks_disabled() {
     let pool = common::setup_test_db().await;
@@ -632,6 +760,7 @@ async fn crosspost_enable_reconciles_app_claimed_username() {
 async fn enable_dependency_failure_rolls_back_the_opt_in() {
     let pool = common::setup_test_db().await;
     let repo = UserRepository::new(pool.clone());
+    let session_repo = AtprotoOAuthSessionRepository::new(pool.clone());
     let tenant_id = 1_i64;
 
     let keys = Keys::generate();
@@ -651,6 +780,7 @@ async fn enable_dependency_failure_rolls_back_the_opt_in() {
 
     let error = enable_user_atproto_with_trigger(
         &repo,
+        &session_repo,
         tenant_id,
         &user_pubkey,
         &username,
@@ -693,9 +823,12 @@ async fn enable_failure_keeps_the_did_so_disable_still_refuses() {
     let user_pubkey = keys.public_key().to_hex();
     let username = format!("alice-enable-provisioned-{}", &user_pubkey[..8]);
 
+    // Provisioning is in flight: the control plane has already attached a DID
+    // but has not reported `ready` yet, so the opt-in write still applies and a
+    // failed trigger still rolls it back.
     sqlx::query(
         "INSERT INTO users (pubkey, tenant_id, username, atproto_enabled, atproto_state, atproto_did, created_at, updated_at)
-         VALUES ($1, $2, $3, true, 'ready', 'did:plc:testprovisioned', NOW(), NOW())",
+         VALUES ($1, $2, $3, true, 'pending', 'did:plc:testprovisioned', NOW(), NOW())",
     )
     .bind(&user_pubkey)
     .bind(tenant_id)
@@ -706,6 +839,7 @@ async fn enable_failure_keeps_the_did_so_disable_still_refuses() {
 
     enable_user_atproto_with_trigger(
         &repo,
+        &session_repo,
         tenant_id,
         &user_pubkey,
         &username,
@@ -747,6 +881,7 @@ async fn enable_failure_keeps_the_did_so_disable_still_refuses() {
 async fn reenable_dependency_failure_rolls_back_the_opt_in() {
     let pool = common::setup_test_db().await;
     let repo = UserRepository::new(pool.clone());
+    let session_repo = AtprotoOAuthSessionRepository::new(pool.clone());
     let tenant_id = 1_i64;
 
     let keys = Keys::generate();
@@ -764,9 +899,17 @@ async fn reenable_dependency_failure_rolls_back_the_opt_in() {
     .await
     .expect("failed to insert user");
 
-    let error = reenable_user_atproto_with_trigger(&repo, tenant_id, &user_pubkey, |_pubkey| async {
-        Err(keycast_api::atproto_provisioning::AtprotoProvisioningError::DependencyNotConfigured)
-    })
+    let error = reenable_user_atproto_with_trigger(
+        &repo,
+        &session_repo,
+        tenant_id,
+        &user_pubkey,
+        |_pubkey| async {
+            Err(
+                keycast_api::atproto_provisioning::AtprotoProvisioningError::DependencyNotConfigured,
+            )
+        },
+    )
     .await
     .expect_err("reenable should surface dependency failure");
 
@@ -899,6 +1042,7 @@ async fn disable_refuses_when_a_did_lands_during_the_trigger() {
 async fn enable_rollback_yields_to_a_sync_that_lands_during_the_trigger() {
     let pool = common::setup_test_db().await;
     let repo = UserRepository::new(pool.clone());
+    let session_repo = AtprotoOAuthSessionRepository::new(pool.clone());
     let tenant_id = 1_i64;
 
     let keys = Keys::generate();
@@ -921,6 +1065,7 @@ async fn enable_rollback_yields_to_a_sync_that_lands_during_the_trigger() {
 
     enable_user_atproto_with_trigger(
         &repo,
+        &session_repo,
         tenant_id,
         &user_pubkey,
         &username,
@@ -1054,6 +1199,111 @@ async fn disable_escape_hatch_revokes_atproto_oauth_refresh_sessions() {
     );
 }
 
+/// A rollback also reports the account as switched off, so it owes the same
+/// revocation. The ATProto refresh grant checks only the session's own binding
+/// and never re-reads the lifecycle state, so a session left behind here would
+/// keep minting access tokens for an account the status endpoint calls off.
+#[tokio::test]
+async fn enable_rollback_revokes_atproto_oauth_refresh_sessions() {
+    let pool = common::setup_test_db().await;
+    let user_repo = UserRepository::new(pool.clone());
+    let session_repo = AtprotoOAuthSessionRepository::new(pool.clone());
+    let tenant_id = 1_i64;
+
+    let keys = Keys::generate();
+    let user_pubkey = keys.public_key().to_hex();
+    let username = format!("alice-rollback-revoke-{}", &user_pubkey[..8]);
+    let request_uri = format!("urn:ietf:params:oauth:request_uri:{}", Uuid::new_v4());
+    let refresh_token_hash =
+        hash_refresh_token(&format!("refresh-token-rollback-{}", Uuid::new_v4()));
+
+    // Provisioning is in flight, so the opt-in write still applies and a failed
+    // trigger still rolls it back.
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, username, atproto_enabled, atproto_state, atproto_did, created_at, updated_at)
+         VALUES ($1, $2, $3, true, 'pending', 'did:plc:testrollbackrevoke', NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(tenant_id)
+    .bind(&username)
+    .execute(&pool)
+    .await
+    .expect("failed to insert user");
+
+    session_repo
+        .create_par(CreateAtprotoOAuthSessionParams {
+            tenant_id,
+            client_id: "https://client.example".to_string(),
+            redirect_uri: "https://client.example/callback".to_string(),
+            scope: "atproto".to_string(),
+            state: Some("csrf-state".to_string()),
+            code_challenge: Some("challenge".to_string()),
+            code_challenge_method: Some("S256".to_string()),
+            request_uri: request_uri.clone(),
+            par_expires_at: Utc::now() + Duration::minutes(10),
+            dpop_jkt: Some("dpop-jkt".to_string()),
+            dpop_nonce: Some("dpop-nonce".to_string()),
+            client_auth_method: "none".to_string(),
+            client_auth_alg: None,
+            client_auth_kid: None,
+            client_auth_jkt: None,
+        })
+        .await
+        .expect("failed to create PAR session");
+
+    session_repo
+        .approve_request(&request_uri, &user_pubkey, "did:plc:testrollbackrevoke")
+        .await
+        .expect("failed to approve PAR session");
+
+    session_repo
+        .store_token_artifacts(
+            &request_uri,
+            IssueAtprotoTokensParams {
+                authorization_code: format!("auth-code-{}", Uuid::new_v4()),
+                authorization_code_expires_at: Utc::now() + Duration::minutes(5),
+                access_token_jti: format!("access-jti-{}", Uuid::new_v4()),
+                access_token_expires_at: Utc::now() + Duration::minutes(15),
+                refresh_token_hash: refresh_token_hash.clone(),
+                refresh_token_expires_at: Utc::now() + Duration::days(30),
+                dpop_jkt: Some("dpop-jkt".to_string()),
+                dpop_nonce: Some("dpop-nonce-2".to_string()),
+            },
+        )
+        .await
+        .expect("failed to issue ATProto OAuth session tokens");
+
+    enable_user_atproto_with_trigger(
+        &user_repo,
+        &session_repo,
+        tenant_id,
+        &user_pubkey,
+        &username,
+        |_pubkey, _username| async {
+            Err(keycast_api::atproto_provisioning::AtprotoProvisioningError::DependencyNotConfigured)
+        },
+    )
+    .await
+    .expect_err("enable should surface dependency failure");
+
+    let status = get_user_atproto_status(&user_repo, tenant_id, &user_pubkey)
+        .await
+        .expect("status should succeed");
+    assert!(!status.enabled);
+
+    let revoked_at: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT refresh_token_revoked_at FROM atproto_oauth_sessions WHERE request_uri = $1",
+    )
+    .bind(&request_uri)
+    .fetch_one(&pool)
+    .await
+    .expect("failed to load refresh revocation marker");
+    assert!(
+        revoked_at.is_some(),
+        "a rollback that reports the account off must revoke refresh sessions"
+    );
+}
+
 /// A conditional write that applies to no rows is ambiguous on its own: the
 /// account may have become ineligible, or it may be gone. Those map to
 /// different errors, and an account deleted while the trigger was in flight
@@ -1109,6 +1359,7 @@ async fn disable_reports_user_not_found_when_deleted_during_the_trigger() {
 async fn enable_rollback_reports_user_not_found_when_deleted_during_the_trigger() {
     let pool = common::setup_test_db().await;
     let repo = UserRepository::new(pool.clone());
+    let session_repo = AtprotoOAuthSessionRepository::new(pool.clone());
     let tenant_id = 1_i64;
 
     let keys = Keys::generate();
@@ -1131,6 +1382,7 @@ async fn enable_rollback_reports_user_not_found_when_deleted_during_the_trigger(
 
     let error = enable_user_atproto_with_trigger(
         &repo,
+        &session_repo,
         tenant_id,
         &user_pubkey,
         &username,
