@@ -1421,6 +1421,21 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     let _secret_pool_producer = secret_pool.spawn_producer();
     tracing::info!("✔︎ Secret pool initialized (capacity: 100, bcrypt cost: 10)");
 
+    // Setup task tracking before API state so API-owned background workers are
+    // drained during graceful shutdown.
+    let task_tracker = TaskTracker::new();
+    let shutdown_signal = Arc::new(Notify::new());
+
+    let (activity_logger, activity_log_worker) =
+        keycast_api::activity_log::ActivityLogger::new(database.pool.clone());
+    let activity_log_shutdown = shutdown_signal.clone();
+    task_tracker.spawn(async move {
+        activity_log_worker
+            .run_until_shutdown(activity_log_shutdown)
+            .await;
+    });
+    tracing::info!("✔︎ OAuth activity logger initialized (bounded queue: 4096)");
+
     // Create API state with http_handler_cache for on-demand loading
     // Note: api no longer depends on signer's handler cache (decoupled)
     let api_state = Arc::new(keycast_api::state::KeycastState {
@@ -1433,6 +1448,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         bcrypt_sender,
         redis: Some(prefixed_redis),
         secret_pool: secret_pool_receiver,
+        activity_logger,
     });
 
     // Set global state for routes that use it
@@ -1692,11 +1708,9 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     tracing::info!("✔︎ API server ready on port {}", api_port);
 
     // Setup graceful shutdown with TaskTracker for background tasks
-    let shutdown_signal = Arc::new(Notify::new());
     let shutdown_for_api = shutdown_signal.clone();
     let client_for_shutdown = signer.client();
     let pool_for_shutdown = database.pool.clone();
-    let task_tracker = TaskTracker::new();
 
     // Spawn API server with graceful shutdown
     let api_handle = tokio::spawn(async move {

@@ -41,6 +41,7 @@ subtle = "2.6"
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tower = { version = "0.5", features = ["timeout", "util"] }
 tower-http = { version = "0.6", features = ["trace", "util", "cors", "fs"] }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
@@ -63,7 +64,6 @@ redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "aio
 cluster-hashring = { path = "../cluster-hashring" }
 
 [dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
 hyper = { version = "1.5", features = ["full"] }
 http-body-util = "0.1"
 aes-gcm = "0.10"

@@ -16,6 +16,9 @@ const MAX_KMS_RETRIES: u32 = 3;
 /// Base delay for exponential backoff (doubles each attempt: 100ms, 200ms, 400ms).
 const KMS_BASE_DELAY_MS: u64 = 100;
 
+/// Per-attempt wall clock bound for Google Cloud KMS calls.
+const KMS_ATTEMPT_TIMEOUT_SECS: u64 = 5;
+
 pub struct GcpKeyManager {
     client: Client,
     key_name: String,
@@ -90,9 +93,14 @@ impl KeyManager for GcpKeyManager {
         let mut attempt = 0u32;
         let response = loop {
             attempt += 1;
-            match self.client.encrypt(request.clone(), None).await {
-                Ok(resp) => break resp,
-                Err(e) if attempt < MAX_KMS_RETRIES => {
+            match tokio::time::timeout(
+                Duration::from_secs(KMS_ATTEMPT_TIMEOUT_SECS),
+                self.client.encrypt(request.clone(), None),
+            )
+            .await
+            {
+                Ok(Ok(resp)) => break resp,
+                Ok(Err(e)) if attempt < MAX_KMS_RETRIES => {
                     let delay_ms = KMS_BASE_DELAY_MS * 2u64.pow(attempt - 1);
                     warn!(
                         attempt = attempt,
@@ -103,11 +111,33 @@ impl KeyManager for GcpKeyManager {
                     );
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     error!("KMS encrypt failed after {} attempts: {}", attempt, e);
                     return Err(KeyManagerError::EncryptionError(format!(
                         "KMS encryption failed after {} attempts: {}",
                         attempt, e
+                    )));
+                }
+                Err(_) if attempt < MAX_KMS_RETRIES => {
+                    let delay_ms = KMS_BASE_DELAY_MS * 2u64.pow(attempt - 1);
+                    warn!(
+                        attempt = attempt,
+                        max_retries = MAX_KMS_RETRIES,
+                        timeout_secs = KMS_ATTEMPT_TIMEOUT_SECS,
+                        delay_ms = delay_ms,
+                        "KMS encrypt timed out, retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                Err(_) => {
+                    error!(
+                        attempt = attempt,
+                        timeout_secs = KMS_ATTEMPT_TIMEOUT_SECS,
+                        "KMS encrypt timed out after all attempts"
+                    );
+                    return Err(KeyManagerError::EncryptionError(format!(
+                        "KMS encryption timed out after {} attempts",
+                        attempt
                     )));
                 }
             }
@@ -139,9 +169,14 @@ impl KeyManager for GcpKeyManager {
         let mut attempt = 0u32;
         let response = loop {
             attempt += 1;
-            match self.client.decrypt(request.clone(), None).await {
-                Ok(resp) => break resp,
-                Err(e) if attempt < MAX_KMS_RETRIES => {
+            match tokio::time::timeout(
+                Duration::from_secs(KMS_ATTEMPT_TIMEOUT_SECS),
+                self.client.decrypt(request.clone(), None),
+            )
+            .await
+            {
+                Ok(Ok(resp)) => break resp,
+                Ok(Err(e)) if attempt < MAX_KMS_RETRIES => {
                     let delay_ms = KMS_BASE_DELAY_MS * 2u64.pow(attempt - 1);
                     warn!(
                         attempt = attempt,
@@ -152,11 +187,33 @@ impl KeyManager for GcpKeyManager {
                     );
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     error!("KMS decrypt failed after {} attempts: {}", attempt, e);
                     return Err(KeyManagerError::DecryptionError(format!(
                         "KMS decryption failed after {} attempts: {}",
                         attempt, e
+                    )));
+                }
+                Err(_) if attempt < MAX_KMS_RETRIES => {
+                    let delay_ms = KMS_BASE_DELAY_MS * 2u64.pow(attempt - 1);
+                    warn!(
+                        attempt = attempt,
+                        max_retries = MAX_KMS_RETRIES,
+                        timeout_secs = KMS_ATTEMPT_TIMEOUT_SECS,
+                        delay_ms = delay_ms,
+                        "KMS decrypt timed out, retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                Err(_) => {
+                    error!(
+                        attempt = attempt,
+                        timeout_secs = KMS_ATTEMPT_TIMEOUT_SECS,
+                        "KMS decrypt timed out after all attempts"
+                    );
+                    return Err(KeyManagerError::DecryptionError(format!(
+                        "KMS decryption timed out after {} attempts",
+                        attempt
                     )));
                 }
             }

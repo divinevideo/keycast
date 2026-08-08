@@ -111,6 +111,7 @@ fn create_test_auth_state_with_redis(
             bcrypt_sender: bcrypt_queue.sender(),
             redis,
             secret_pool: secret_pool.receiver(),
+            activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),
         }),
         auth_tx: None,
     }

@@ -98,6 +98,7 @@ fn create_test_auth_state(pool: PgPool, key_manager: Arc<Box<dyn KeyManager>>) -
             bcrypt_sender: bcrypt_queue.sender(),
             redis: None,
             secret_pool: secret_pool.receiver(),
+            activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),
         }),
         auth_tx: None,
     }
@@ -1067,6 +1068,7 @@ async fn minor_user_sign_fast_path_denial_is_forbidden_not_503() {
         bcrypt_sender: BcryptQueue::new().sender(),
         redis: None,
         secret_pool: SecretPool::new(1).receiver(),
+        activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),
     });
     let mallory = Keys::generate();
 

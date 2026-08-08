@@ -1,3 +1,4 @@
+pub mod activity_log;
 pub mod api;
 pub mod atproto_provisioning;
 pub mod bcrypt_queue;

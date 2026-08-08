@@ -1,6 +1,7 @@
 // ABOUTME: REST RPC API that mirrors NIP-46 methods for low-latency signing
 // ABOUTME: Allows HTTP-based signing instead of relay-based NIP-46 communication
 
+use crate::activity_log::ActivityLogResult;
 use crate::handlers::http_rpc_handler::{HandlerError, HttpRpcHandler};
 use axum::{
     extract::State,
@@ -21,8 +22,7 @@ use nostr_sdk::{Event, JsonUtil, Keys, PublicKey, UnsignedEvent};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use sqlx::PgPool;
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use super::auth::AuthError;
 use super::routes::AuthState;
@@ -79,6 +79,7 @@ pub enum RpcError {
     SigningFailed(String),
     EncryptionFailed(String),
     DecryptionFailed(String),
+    Unavailable(String),
     Internal(String),
 }
 
@@ -95,6 +96,7 @@ impl IntoResponse for RpcError {
             RpcError::SigningFailed(msg) => (StatusCode::BAD_REQUEST, msg),
             RpcError::EncryptionFailed(msg) => (StatusCode::BAD_REQUEST, msg),
             RpcError::DecryptionFailed(msg) => (StatusCode::BAD_REQUEST, msg),
+            RpcError::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
             RpcError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
 
@@ -146,6 +148,20 @@ pub async fn nostr_rpc(
     State(auth_state): State<AuthState>,
     headers: HeaderMap,
     Json(req): Json<NostrRpcRequest>,
+) -> Result<Json<NostrRpcResponse>, RpcError> {
+    let method = req.method.clone();
+    let started = Instant::now();
+    let response = nostr_rpc_inner(tenant, auth_state, headers, req).await;
+    let outcome = http_rpc_outcome(&response);
+    METRICS.observe_http_rpc_request(&method, outcome, started.elapsed());
+    response
+}
+
+async fn nostr_rpc_inner(
+    tenant: crate::api::tenant::TenantExtractor,
+    auth_state: AuthState,
+    headers: HeaderMap,
+    req: NostrRpcRequest,
 ) -> Result<Json<NostrRpcResponse>, RpcError> {
     // Track total HTTP RPC requests
     METRICS.inc_http_rpc_request();
@@ -204,8 +220,7 @@ pub async fn nostr_rpc(
                 signed.kind.as_u16()
             );
 
-            // Log activity in background (non-blocking)
-            spawn_log_activity(pool.clone(), handler.is_oauth(), handler.authorization_id());
+            log_activity(&auth_state, handler.is_oauth(), handler.authorization_id());
 
             serde_json::to_value(&signed)
                 .map_err(|e| RpcError::Internal(format!("JSON serialization failed: {}", e)))?
@@ -240,8 +255,7 @@ pub async fn nostr_rpc(
             // Crypto runs on spawn_blocking to avoid blocking async workers
             let ciphertext = handler.nip44_encrypt(&recipient_pubkey, &plaintext).await?;
 
-            // Log activity in background (non-blocking)
-            spawn_log_activity(pool.clone(), handler.is_oauth(), handler.authorization_id());
+            log_activity(&auth_state, handler.is_oauth(), handler.authorization_id());
 
             JsonValue::String(ciphertext)
         }
@@ -253,8 +267,7 @@ pub async fn nostr_rpc(
             // Crypto runs on spawn_blocking to avoid blocking async workers
             let plaintext = handler.nip44_decrypt(&sender_pubkey, &ciphertext).await?;
 
-            // Log activity in background (non-blocking)
-            spawn_log_activity(pool.clone(), handler.is_oauth(), handler.authorization_id());
+            log_activity(&auth_state, handler.is_oauth(), handler.authorization_id());
 
             // Expose secret only at serialization boundary
             JsonValue::String(plaintext.expose_secret().to_string())
@@ -285,7 +298,7 @@ pub async fn nostr_rpc(
             let results = unwrap_gift_wrap_batch(&handler, &req.params).await;
 
             // One coalesced activity log for the whole batch (per-request semantics).
-            spawn_log_activity(pool.clone(), handler.is_oauth(), handler.authorization_id());
+            log_activity(&auth_state, handler.is_oauth(), handler.authorization_id());
 
             JsonValue::Array(results)
         }
@@ -330,7 +343,7 @@ pub async fn nostr_rpc(
             let results = wrap_gift_wrap_batch(&handler, &batch.rumor, &batch.recipients).await;
 
             // One coalesced activity update for the whole RPC request.
-            spawn_log_activity(pool.clone(), handler.is_oauth(), handler.authorization_id());
+            log_activity(&auth_state, handler.is_oauth(), handler.authorization_id());
 
             JsonValue::Array(results)
         }
@@ -346,8 +359,7 @@ pub async fn nostr_rpc(
             // Crypto runs on spawn_blocking to avoid blocking async workers
             let ciphertext = handler.nip04_encrypt(&recipient_pubkey, &plaintext).await?;
 
-            // Log activity in background (non-blocking)
-            spawn_log_activity(pool.clone(), handler.is_oauth(), handler.authorization_id());
+            log_activity(&auth_state, handler.is_oauth(), handler.authorization_id());
 
             JsonValue::String(ciphertext)
         }
@@ -359,8 +371,7 @@ pub async fn nostr_rpc(
             // Crypto runs on spawn_blocking to avoid blocking async workers
             let plaintext = handler.nip04_decrypt(&sender_pubkey, &ciphertext).await?;
 
-            // Log activity in background (non-blocking)
-            spawn_log_activity(pool.clone(), handler.is_oauth(), handler.authorization_id());
+            log_activity(&auth_state, handler.is_oauth(), handler.authorization_id());
 
             // Expose secret only at serialization boundary
             JsonValue::String(plaintext.expose_secret().to_string())
@@ -377,6 +388,21 @@ pub async fn nostr_rpc(
     Ok(Json(NostrRpcResponse::success(result)))
 }
 
+fn http_rpc_outcome(response: &Result<Json<NostrRpcResponse>, RpcError>) -> &'static str {
+    match response {
+        Ok(_) => "success",
+        Err(RpcError::Auth(_)) => "auth_error",
+        Err(RpcError::InvalidParams(_))
+        | Err(RpcError::UnsupportedMethod(_))
+        | Err(RpcError::SigningFailed(_))
+        | Err(RpcError::EncryptionFailed(_))
+        | Err(RpcError::DecryptionFailed(_)) => "client_error",
+        Err(RpcError::AccountSuspended(_)) => "account_restricted",
+        Err(RpcError::Unavailable(_)) => "unavailable",
+        Err(RpcError::Internal(_)) => "error",
+    }
+}
+
 /// Check that the user's account is active before allowing mutating operations.
 /// This runs a DB query per request (not cached) so status changes take effect immediately.
 /// Returns the account's `verified_minor` flag (same row, no extra query) for
@@ -386,19 +412,65 @@ async fn check_user_status_active(
     user_pubkey_hex: &str,
     tenant_id: i64,
 ) -> Result<bool, RpcError> {
+    let status_started = Instant::now();
+    METRICS.set_http_rpc_db_pool_state(pool.size(), pool.num_idle() as u32);
+
+    let acquire_started = Instant::now();
+    let mut conn = match pool.acquire().await {
+        Ok(conn) => {
+            METRICS.observe_http_rpc_db_acquire(
+                "check_user_status_active",
+                "success",
+                acquire_started.elapsed(),
+            );
+            conn
+        }
+        Err(e) => {
+            METRICS.observe_http_rpc_db_acquire(
+                "check_user_status_active",
+                "unavailable",
+                acquire_started.elapsed(),
+            );
+            METRICS.observe_http_rpc_status_check("unavailable", status_started.elapsed());
+            return Err(RpcError::Unavailable(format!(
+                "Database connection unavailable checking user status: {}",
+                e
+            )));
+        }
+    };
+
     let status: Option<(String, bool)> = sqlx::query_as(
         "SELECT status, verified_minor FROM users WHERE pubkey = $1 AND tenant_id = $2",
     )
     .bind(user_pubkey_hex)
     .bind(tenant_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await
-    .map_err(|e| RpcError::Internal(format!("Database error checking user status: {}", e)))?;
+    .map_err(|e| {
+        METRICS.observe_http_rpc_status_check("error", status_started.elapsed());
+        RpcError::Internal(format!("Database error checking user status: {}", e))
+    })?;
 
-    match status {
+    let result = match status {
         Some((s, verified_minor)) if s == "active" => Ok(verified_minor),
         Some(_) => Err(RpcError::AccountSuspended("Account restricted".to_string())),
         None => Err(RpcError::Auth(AuthError::InvalidToken)),
+    };
+
+    METRICS.observe_http_rpc_status_check(
+        http_rpc_outcome_for_status_check(&result),
+        status_started.elapsed(),
+    );
+    result
+}
+
+fn http_rpc_outcome_for_status_check(result: &Result<bool, RpcError>) -> &'static str {
+    match result {
+        Ok(_) => "success",
+        Err(RpcError::Auth(_)) => "auth_error",
+        Err(RpcError::AccountSuspended(_)) => "account_restricted",
+        Err(RpcError::Unavailable(_)) => "unavailable",
+        Err(_) => "error",
     }
 }
 
@@ -1099,26 +1171,20 @@ async fn unwrap_gift_wrap_batch(
     results
 }
 
-/// Spawn activity logging in background (non-blocking)
-/// Updates oauth_authorizations stats without blocking the response
-fn spawn_log_activity(pool: PgPool, is_oauth: bool, authorization_id: i64) {
-    if !is_oauth {
-        return;
-    }
-
-    tokio::spawn(async move {
-        if let Err(e) = sqlx::query(
-            "UPDATE oauth_authorizations
-             SET last_activity = NOW(), activity_count = activity_count + 1
-             WHERE id = $1",
-        )
-        .bind(authorization_id)
-        .execute(&pool)
-        .await
-        {
-            tracing::error!("Failed to update oauth_authorizations activity: {}", e);
+fn log_activity(auth_state: &AuthState, is_oauth: bool, authorization_id: i64) {
+    match auth_state
+        .state
+        .activity_logger
+        .record(is_oauth, authorization_id)
+    {
+        ActivityLogResult::Queued
+        | ActivityLogResult::SkippedNonOauth
+        | ActivityLogResult::Disabled => {}
+        ActivityLogResult::Dropped => {
+            METRICS.inc_http_rpc_activity_dropped();
+            tracing::warn!("Dropped OAuth authorization activity update because queue is full");
         }
-    });
+    }
 }
 
 #[cfg(test)]

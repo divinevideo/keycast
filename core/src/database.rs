@@ -11,7 +11,7 @@ use tokio::time::sleep;
 // Example: 100 instances × 10 connections = 1000 client connections → 200 backend connections
 // Override with SQLX_POOL_SIZE env var (higher = better throughput per instance)
 const DEFAULT_MAX_CONNECTIONS_PER_INSTANCE: u32 = 10;
-const ACQUIRE_TIMEOUT_SECS: u64 = 60;
+const ACQUIRE_TIMEOUT_SECS: u64 = 5;
 const MAX_CONNECTION_ATTEMPTS: u32 = 5;
 
 #[derive(Error, Debug)]

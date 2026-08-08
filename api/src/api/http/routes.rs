@@ -1,12 +1,14 @@
 use axum::{
+    error_handling::HandleErrorLayer,
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, patch, post, put},
-    Router,
+    BoxError, Router,
 };
 use keycast_core::authorization_channel::AuthorizationSender;
 use sqlx::PgPool;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
+use tower::{timeout::error::Elapsed, ServiceBuilder};
 
 use crate::api::http::{
     admin, ap, atproto, atproto_oauth, auth, claim, headless, metrics, nostr_rpc, oauth, policies,
@@ -15,6 +17,22 @@ use crate::api::http::{
 use crate::state::KeycastState;
 use axum::response::Json as AxumJson;
 use serde_json::Value as JsonValue;
+
+async fn nostr_rpc_timeout_error(error: BoxError) -> axum::response::Response {
+    if error.is::<Elapsed>() {
+        (
+            StatusCode::GATEWAY_TIMEOUT,
+            AxumJson(serde_json::json!({ "error": "RPC request timed out" })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            AxumJson(serde_json::json!({ "error": "Unhandled RPC service error" })),
+        )
+            .into_response()
+    }
+}
 
 // State wrapper to pass state to auth handlers
 #[derive(Clone)]
@@ -98,8 +116,13 @@ pub fn api_routes(
         .with_state(auth_state.clone());
 
     // NIP-46 RPC endpoint (OAuth access token auth, public CORS for third-party apps)
+    let nostr_rpc_timeout = ServiceBuilder::new()
+        .layer(HandleErrorLayer::new(nostr_rpc_timeout_error))
+        .layer(tower::timeout::TimeoutLayer::new(Duration::from_secs(8)));
+
     let nostr_rpc_routes = Router::new()
         .route("/nostr", post(nostr_rpc::nostr_rpc))
+        .layer(nostr_rpc_timeout)
         .with_state(auth_state.clone());
 
     // ActivityPub RSA signing endpoints (service-token OR UCAN auth; tenant from Host)
@@ -434,4 +457,40 @@ pub async fn nostr_discovery_public(
         .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
         .body(Body::from(serde_json::to_string(&discovery).unwrap()))
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn nostr_rpc_timeout_layer_maps_elapsed_to_504() {
+        let app = Router::new()
+            .route(
+                "/slow",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    "ok"
+                }),
+            )
+            .layer(
+                ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(nostr_rpc_timeout_error))
+                    .layer(tower::timeout::TimeoutLayer::new(Duration::from_millis(1))),
+            );
+
+        let response = app
+            .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
+            .await
+            .expect("timeout response");
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(body["error"], "RPC request timed out");
+    }
 }
