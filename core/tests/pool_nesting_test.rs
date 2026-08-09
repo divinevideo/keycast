@@ -131,7 +131,7 @@ where
                  whole time and starving every other endpoint on the instance.\n\n\
                  Fix: thread the open transaction into the inner call (`&mut *tx`) instead of \
                  letting it reach for the pool.",
-                stall = 60,
+                stall = 5,
             );
         }
         Err(error) => panic!("{label} did not reach its expected success path: {error:?}"),
