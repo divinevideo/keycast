@@ -42,6 +42,11 @@ pub trait CustomPermission: Send + Sync {
     /// This is intentionally separate from [`Self::can_sign`] because the
     /// payload is not a Nostr event and has no event kind. Implementations should
     /// map this to their nearest signing restriction.
+    ///
+    /// Callers must validate the payload with
+    /// `validate_creator_binding_payload` before invoking this hook. Permission
+    /// implementations may rely on that closed, validated shape when deciding
+    /// which fields are caller-controlled content.
     fn can_sign_creator_binding(&self, payload: &[u8]) -> bool;
 
     /// A function that returns true if allowed to encrypt the content for the recipient.
