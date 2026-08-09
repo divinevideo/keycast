@@ -22,6 +22,13 @@ pub enum RepositoryError {
     /// A database error occurred
     #[error("Database error: {0}")]
     Database(String),
+
+    /// The database could not be reached in time -- typically a pool acquire
+    /// timeout under connection saturation. Separated from [`Self::Database`]
+    /// because it is transient: callers should surface it as retryable rather
+    /// than as an internal failure.
+    #[error("Database unavailable: {0}")]
+    Unavailable(String),
 }
 
 impl From<sqlx::Error> for RepositoryError {
@@ -40,6 +47,8 @@ impl From<sqlx::Error> for RepositoryError {
                     _ => Self::Database(db_err.message().to_string()),
                 }
             }
+            sqlx::Error::PoolTimedOut => Self::Unavailable("pool timed out".into()),
+            sqlx::Error::PoolClosed => Self::Unavailable("pool closed".into()),
             other => Self::Database(other.to_string()),
         }
     }

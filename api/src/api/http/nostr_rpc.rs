@@ -414,6 +414,28 @@ async fn nostr_rpc_inner(
     Ok(Json(NostrRpcResponse::success(result)))
 }
 
+/// Classify a repository error from the cold RPC path.
+///
+/// A pool acquire timeout under saturation is transient, so it gets the same
+/// retryable 503 the warm status check already returns. Anything else stays a
+/// 500. Detail goes to the log, never to the response: this endpoint is reached
+/// before the caller is known to be legitimate, and connect-level failures carry
+/// host, DNS and TLS text.
+fn map_repo_error(context: &str, error: keycast_core::repositories::RepositoryError) -> RpcError {
+    use keycast_core::repositories::RepositoryError;
+
+    match error {
+        RepositoryError::Unavailable(detail) => {
+            tracing::warn!(context, %detail, "HTTP RPC database unavailable");
+            RpcError::Unavailable("Database temporarily unavailable".to_string())
+        }
+        other => {
+            tracing::error!(context, error = %other, "HTTP RPC database error");
+            RpcError::Internal(format!("Database error: {}", context))
+        }
+    }
+}
+
 fn http_rpc_outcome(response: &Result<Json<NostrRpcResponse>, RpcError>) -> &'static str {
     match response {
         Ok(_) => "success",
@@ -459,10 +481,13 @@ async fn check_user_status_active(
                 acquire_started.elapsed(),
             );
             METRICS.observe_http_rpc_status_check("unavailable", status_started.elapsed());
-            return Err(RpcError::Unavailable(format!(
-                "Database connection unavailable checking user status: {}",
-                e
-            )));
+            // Detail to the log only: connect-level failures carry host, DNS and
+            // TLS text and this response is reachable before the caller is known
+            // to be legitimate.
+            tracing::warn!(error = %e, "HTTP RPC could not acquire a connection for the status check");
+            return Err(RpcError::Unavailable(
+                "Database temporarily unavailable".to_string(),
+            ));
         }
     };
 
@@ -475,7 +500,8 @@ async fn check_user_status_active(
     .await
     .map_err(|e| {
         METRICS.observe_http_rpc_status_check("error", status_started.elapsed());
-        RpcError::Internal(format!("Database error checking user status: {}", e))
+        tracing::error!(error = %e, "HTTP RPC user status query failed");
+        RpcError::Internal("Database error checking user status".to_string())
     })?;
 
     let result = match status {
@@ -581,7 +607,7 @@ async fn load_handler_on_demand(
     let auth_data = oauth_auth_repo
         .find_by_bunker_pubkey_for_tenant(bunker_pubkey_hex, tenant_id)
         .await
-        .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?;
+        .map_err(|e| map_repo_error("loading authorization", e))?;
 
     let (auth_id, user_pubkey, auth_handle_opt, expires_at, revoked_at, policy_id) =
         auth_data.ok_or(RpcError::Auth(AuthError::InvalidToken))?;
@@ -589,9 +615,10 @@ async fn load_handler_on_demand(
     // Load permissions for this authorization's policy (if any)
     let permissions: Vec<Box<dyn CustomPermission>> = if let Some(pid) = policy_id {
         let policy_repo = PolicyRepository::new(pool.clone());
-        let db_permissions = policy_repo.get_permissions(pid).await.map_err(|e| {
-            RpcError::Internal(format!("Database error loading permissions: {}", e))
-        })?;
+        let db_permissions = policy_repo
+            .get_permissions(pid)
+            .await
+            .map_err(|e| map_repo_error("loading permissions", e))?;
 
         // Convert to CustomPermission trait objects
         db_permissions
@@ -608,7 +635,7 @@ async fn load_handler_on_demand(
     let encrypted_secret: Vec<u8> = personal_keys_repo
         .find_encrypted_key_for_tenant(&user_pubkey, tenant_id)
         .await
-        .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?
+        .map_err(|e| map_repo_error("loading personal key", e))?
         .ok_or_else(|| RpcError::Internal("Personal keys not found".to_string()))?;
 
     // Decrypt the secret key
@@ -753,7 +780,7 @@ async fn load_preloaded_user_handler(
     if user_repo
         .is_unclaimed(user_pubkey_hex, tenant_id)
         .await
-        .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?
+        .map_err(|e| map_repo_error("checking preloaded user", e))?
         .is_none()
     {
         tracing::warn!(
@@ -768,7 +795,7 @@ async fn load_preloaded_user_handler(
     let encrypted_secret: Vec<u8> = personal_keys_repo
         .find_encrypted_key_for_tenant(user_pubkey_hex, tenant_id)
         .await
-        .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?
+        .map_err(|e| map_repo_error("loading preloaded personal key", e))?
         .ok_or_else(|| {
             RpcError::Internal("Personal keys not found for preloaded user".to_string())
         })?;
@@ -1230,6 +1257,33 @@ mod tests {
     use p256::ecdsa::signature::Signer;
     use p256::ecdsa::{Signature as P256Signature, SigningKey};
     use rand::rngs::OsRng;
+
+    #[test]
+    fn cold_path_pool_exhaustion_is_a_retryable_503_without_leaking_detail() {
+        use keycast_core::repositories::RepositoryError;
+
+        let unavailable = map_repo_error(
+            "loading authorization",
+            RepositoryError::Unavailable("pool timed out".into()),
+        );
+        assert_eq!(http_rpc_outcome(&Err(unavailable)), "unavailable");
+
+        let leaky = map_repo_error(
+            "loading authorization",
+            RepositoryError::Unavailable("connect to db.internal:5432 refused".into()),
+        );
+        let body = format!("{:?}", leaky);
+        assert!(
+            !body.contains("db.internal"),
+            "connect-level detail must stay in the log, not the response: {body}"
+        );
+
+        let internal = map_repo_error(
+            "loading authorization",
+            RepositoryError::Database("relation does not exist".into()),
+        );
+        assert_eq!(http_rpc_outcome(&Err(internal)), "error");
+    }
 
     #[test]
     fn handler_timeout_is_a_504_observed_as_its_own_outcome() {

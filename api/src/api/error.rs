@@ -45,7 +45,12 @@ impl From<RepositoryError> for ApiError {
             RepositoryError::NotFound(msg) => ApiError::NotFound(msg),
             RepositoryError::Duplicate => ApiError::BadRequest("Already exists".to_string()),
             RepositoryError::Integrity(msg) => ApiError::BadRequest(msg),
-            RepositoryError::Database(msg) => ApiError::Internal(msg),
+            // No 503-shaped variant here yet, so a transient acquire failure
+            // keeps the pre-existing 500 on these endpoints. The HTTP RPC path
+            // maps it to a retryable 503 of its own.
+            RepositoryError::Database(msg) | RepositoryError::Unavailable(msg) => {
+                ApiError::Internal(msg)
+            }
         }
     }
 }

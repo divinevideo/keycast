@@ -141,7 +141,7 @@ where
 fn is_pool_timeout(error: &RepositoryError) -> bool {
     matches!(
         error,
-        RepositoryError::Database(message)
+        RepositoryError::Unavailable(message) | RepositoryError::Database(message)
             if message.contains("PoolTimedOut") || message.contains("pool timed out")
     )
 }
