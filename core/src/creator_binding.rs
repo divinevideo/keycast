@@ -40,8 +40,10 @@ pub enum CreatorBindingError {
     InvalidSignatureAlgorithm,
     #[error("creator-binding pubkey must match signer")]
     PubkeyMismatch,
-    #[error("creator-binding claims must be an object")]
+    #[error("creator-binding claims must be an object of known string fields")]
     InvalidClaims,
+    #[error("creator-binding claims has unexpected field: {0}")]
+    UnexpectedClaim(String),
     #[error("creator-binding referenced_assertions must be an array of strings")]
     InvalidReferencedAssertions,
     #[error("creator-binding hard_binding must be {{alg: \"sha256\", value: <64 hex>}}")]
@@ -101,9 +103,7 @@ pub fn validate_creator_binding_payload(
         _ => return Err(CreatorBindingError::PubkeyMismatch),
     }
 
-    if !object.get("claims").is_some_and(Value::is_object) {
-        return Err(CreatorBindingError::InvalidClaims);
-    }
+    validate_claims(object.get("claims"))?;
 
     // `created_at` is optional, but when present it must be a plain string so it
     // cannot smuggle structured caller data.
@@ -124,6 +124,66 @@ pub fn validate_creator_binding_payload(
     }
 
     validate_hard_binding(object.get("hard_binding"))?;
+
+    Ok(())
+}
+
+/// `claims` is pinned to divine-mobile's `CreatorBindingClaims.toJson()` shape:
+/// every key optional, but no key outside the known set at any depth.
+///
+/// Keys are pinned rather than content-filtered on purpose. A caller-chosen key
+/// would be free text that `ContentFilter` never sees, since
+/// `contains_blocked_word` only walks values. Scanning keys instead would deny
+/// on the fixed names themselves — a blocklist holding "and" or "for" matches
+/// `social_handles` and `platform` — which is the false-denial trap this module
+/// already avoids elsewhere.
+fn validate_claims(claims: Option<&Value>) -> Result<(), CreatorBindingError> {
+    const ALLOWED_CLAIMS: [&str; 3] = ["nip05", "website", "social_handles"];
+    const ALLOWED_HANDLE_FIELDS: [&str; 2] = ["platform", "handle"];
+
+    let object = claims
+        .and_then(Value::as_object)
+        .ok_or(CreatorBindingError::InvalidClaims)?;
+
+    if let Some(unexpected) = object
+        .keys()
+        .find(|key| !ALLOWED_CLAIMS.contains(&key.as_str()))
+    {
+        return Err(CreatorBindingError::UnexpectedClaim(unexpected.clone()));
+    }
+
+    for key in ["nip05", "website"] {
+        if object.get(key).is_some_and(|value| !value.is_string()) {
+            return Err(CreatorBindingError::InvalidClaims);
+        }
+    }
+
+    let Some(handles) = object.get("social_handles") else {
+        return Ok(());
+    };
+
+    for handle in handles
+        .as_array()
+        .ok_or(CreatorBindingError::InvalidClaims)?
+    {
+        let handle = handle
+            .as_object()
+            .ok_or(CreatorBindingError::InvalidClaims)?;
+
+        if let Some(unexpected) = handle
+            .keys()
+            .find(|key| !ALLOWED_HANDLE_FIELDS.contains(&key.as_str()))
+        {
+            return Err(CreatorBindingError::UnexpectedClaim(unexpected.clone()));
+        }
+
+        if !ALLOWED_HANDLE_FIELDS
+            .iter()
+            .all(|key| handle.get(*key).is_some_and(Value::is_string))
+        {
+            return Err(CreatorBindingError::InvalidClaims);
+        }
+    }
 
     Ok(())
 }
@@ -307,6 +367,67 @@ mod tests {
             err,
             CreatorBindingError::UnexpectedField("note".to_string())
         );
+    }
+
+    #[test]
+    fn rejects_caller_controlled_claim_key() {
+        // Claim keys are caller-supplied text that the content filter never sees,
+        // because it only walks values.
+        let keys = Keys::generate();
+        let mut value: Value = serde_json::from_slice(&valid_payload(keys.public_key())).unwrap();
+        value["claims"] = json!({"scam: arbitrary caller-controlled text": ""});
+        let payload = serde_json::to_vec(&value).unwrap();
+
+        let err = validate_creator_binding_payload(&payload, keys.public_key()).unwrap_err();
+        assert_eq!(
+            err,
+            CreatorBindingError::UnexpectedClaim(
+                "scam: arbitrary caller-controlled text".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_caller_controlled_social_handle_key() {
+        let keys = Keys::generate();
+        let mut value: Value = serde_json::from_slice(&valid_payload(keys.public_key())).unwrap();
+        value["claims"] = json!({
+            "social_handles": [{"platform": "x", "handle": "creator", "scam: text": ""}]
+        });
+        let payload = serde_json::to_vec(&value).unwrap();
+
+        let err = validate_creator_binding_payload(&payload, keys.public_key()).unwrap_err();
+        assert_eq!(
+            err,
+            CreatorBindingError::UnexpectedClaim("scam: text".to_string())
+        );
+    }
+
+    #[test]
+    fn accepts_full_mobile_claims_shape() {
+        let keys = Keys::generate();
+        let mut value: Value = serde_json::from_slice(&valid_payload(keys.public_key())).unwrap();
+        value["claims"] = json!({
+            "nip05": "creator@example.com",
+            "website": "https://example.com",
+            "social_handles": [{"platform": "x", "handle": "creator"}]
+        });
+        let payload = serde_json::to_vec(&value).unwrap();
+
+        validate_creator_binding_payload(&payload, keys.public_key())
+            .expect("full CreatorBindingClaims shape must validate");
+    }
+
+    #[test]
+    fn accepts_empty_claims() {
+        // Every claim field is conditional on the mobile side, so `{}` is legitimate.
+        let keys = Keys::generate();
+        let mut value: Value = serde_json::from_slice(&valid_payload(keys.public_key())).unwrap();
+        value["claims"] = json!({});
+        let payload = serde_json::to_vec(&value).unwrap();
+
+        validate_creator_binding_payload(&payload, keys.public_key())
+            .expect("claims with no fields must validate");
     }
 
     #[test]

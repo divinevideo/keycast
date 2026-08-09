@@ -9,7 +9,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Returns true if any string value reachable from `value` contains a blocked
-/// word. Object keys are skipped so only creator-supplied content is matched.
+/// word.
+///
+/// Object keys are skipped: `validate_creator_binding_payload` pins every key in
+/// the payload to a known name, so keys are structure rather than creator
+/// content, and matching them would deny on the fixed names themselves.
 fn contains_blocked_word(value: &Value, words: &[String]) -> bool {
     match value {
         Value::String(text) => words.iter().any(|word| text.contains(word)),
