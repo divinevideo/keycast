@@ -304,8 +304,9 @@ enum OptIn {
 
 /// Writes the pre-trigger opt-in and reports the resulting status.
 ///
-/// Shared by [`enable_user_atproto`] and [`reenable_user_atproto`] so both go
-/// through the same conditional write. See
+/// Shared by [`enable_user_atproto`] and
+/// [`reenable_user_atproto_with_trigger`] so both go through the same
+/// conditional write. See
 /// [`UserRepository::begin_atproto_enable`] for why the write is conditional and
 /// why it leaves `atproto_did` alone.
 async fn begin_atproto_opt_in(
@@ -371,8 +372,7 @@ where
     Ok(response)
 }
 
-/// Clears the opt-in that [`enable_user_atproto`] or [`reenable_user_atproto`]
-/// wrote ahead of the trigger.
+/// Clears the opt-in that [`begin_atproto_opt_in`] wrote ahead of the trigger.
 ///
 /// The enabled flag is set before the control plane is called, so a failed
 /// trigger leaves an opt-in that exists nowhere but this row. Keeping it makes
@@ -428,25 +428,6 @@ async fn roll_back_failed_enable(
     }
 
     Ok(())
-}
-
-pub async fn reenable_user_atproto(
-    repo: &UserRepository,
-    tenant_id: i64,
-    user_pubkey: &str,
-) -> Result<AtprotoStatusResponse, AtprotoControlError> {
-    let claimed_username = require_resolved_username(
-        resolve_username_with_fallback(repo, tenant_id, user_pubkey, |pubkey| async move {
-            divine_names::lookup_by_pubkey(&pubkey).await
-        })
-        .await?,
-    )?;
-
-    Ok(
-        begin_atproto_opt_in(repo, tenant_id, user_pubkey, claimed_username)
-            .await?
-            .0,
-    )
 }
 
 pub async fn reenable_user_atproto_with_trigger<F, Fut>(
