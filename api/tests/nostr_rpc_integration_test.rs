@@ -5,7 +5,12 @@
 
 mod common;
 
-use axum::{extract::State, http::HeaderMap, Json};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+    Json,
+};
 use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
@@ -26,6 +31,7 @@ use keycast_api::state::KeycastState;
 use keycast_api::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::KeyManager;
+use keycast_core::request_bounds::{HTTP_RPC_HANDLER_TIMEOUT, SQLX_ACQUIRE_TIMEOUT};
 use keycast_core::secret_pool::SecretPool;
 use keycast_core::signing_session::{parse_cache_key, SigningSession};
 use moka::future::Cache;
@@ -35,8 +41,9 @@ use p256::ecdsa::{Signature as P256Signature, SigningKey};
 use rand::rngs::OsRng;
 use serde_json::{json, Value};
 use serial_test::serial;
-use sqlx::PgPool;
+use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::sync::Arc;
+use std::time::Instant;
 use ucan::builder::UcanBuilder;
 use uuid::Uuid;
 
@@ -47,34 +54,55 @@ use uuid::Uuid;
 async fn setup_db() -> PgPool {
     common::assert_test_database_url();
 
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string());
-
-    let pool = PgPool::connect(&database_url)
+    let pool = PgPool::connect(&test_database_url())
         .await
         .expect("Failed to connect to database");
 
+    prepare_test_db(&pool).await;
+    pool
+}
+
+async fn setup_single_connection_db() -> PgPool {
+    common::assert_test_database_url();
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(SQLX_ACQUIRE_TIMEOUT)
+        .connect(&test_database_url())
+        .await
+        .expect("Failed to connect single-connection database pool");
+
+    prepare_test_db(&pool).await;
+    pool
+}
+
+fn test_database_url() -> String {
+    std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string())
+}
+
+async fn prepare_test_db(pool: &PgPool) {
     // Run migrations
     sqlx::migrate!("../database/migrations")
-        .run(&pool)
+        .run(pool)
         .await
         .expect("Failed to run migrations");
 
     // Clean up test data from previous runs (preserve tenant ID 1 which is seeded)
     sqlx::query("DELETE FROM oauth_authorizations WHERE tenant_id > 1")
-        .execute(&pool)
+        .execute(pool)
         .await
         .ok();
     sqlx::query("DELETE FROM personal_keys WHERE tenant_id > 1")
-        .execute(&pool)
+        .execute(pool)
         .await
         .ok();
     sqlx::query("DELETE FROM users WHERE tenant_id > 1")
-        .execute(&pool)
+        .execute(pool)
         .await
         .ok();
     sqlx::query("DELETE FROM tenants WHERE id > 1")
-        .execute(&pool)
+        .execute(pool)
         .await
         .ok();
 
@@ -82,11 +110,9 @@ async fn setup_db() -> PgPool {
     sqlx::query(
         "SELECT setval('tenants_id_seq', (SELECT COALESCE(MAX(id), 1) FROM tenants), true)",
     )
-    .execute(&pool)
+    .execute(pool)
     .await
     .ok();
-
-    pool
 }
 
 async fn create_test_tenant(pool: &PgPool) -> i64 {
@@ -1706,6 +1732,82 @@ async fn test_suspended_user_denied_nostr_rpc_sign() {
         }
         other => panic!("expected AccountSuspended, got: {:?}", other),
     }
+}
+
+/// Test: a saturated DB pool returns retryable 503 before the handler timeout.
+#[tokio::test]
+#[serial]
+async fn warm_status_check_pool_exhaustion_is_retryable_503() {
+    let pool = setup_single_connection_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (user_keys, pubkey) = create_test_user();
+    let key_manager = FileKeyManager::new().expect("Failed to create key manager");
+
+    insert_user(&pool, tenant_id, &pubkey).await;
+    create_personal_key(&pool, tenant_id, &pubkey, &user_keys, &key_manager).await;
+
+    let redirect_origin = format!("https://pool-saturated-{}.example.com", Uuid::new_v4());
+    let (_auth_id, bunker_pubkey) = create_test_oauth_authorization(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &redirect_origin,
+        None,
+        None,
+        None,
+    )
+    .await;
+    let token = build_self_signed_ucan(
+        &user_keys,
+        tenant_id,
+        &redirect_origin,
+        Some(&bunker_pubkey),
+    )
+    .await;
+    let auth_state = create_test_auth_state(
+        pool.clone(),
+        Arc::new(Box::new(key_manager) as Box<dyn KeyManager>),
+    );
+    let auth_header = format!("Bearer {}", token);
+
+    invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state.clone(),
+        &auth_header,
+        None,
+        get_public_key_request(),
+    )
+    .await
+    .expect("warm-up request should load the handler into cache");
+
+    let _held_connection = pool
+        .acquire()
+        .await
+        .expect("single connection should be available before the RPC starts");
+
+    let unsigned = EventBuilder::text_note("pool saturated").build(user_keys.public_key());
+    let event_json = serde_json::to_value(&unsigned).expect("Failed to serialize unsigned event");
+    let started = Instant::now();
+
+    let err = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state,
+        &auth_header,
+        None,
+        NostrRpcRequest {
+            method: "sign_event".to_string(),
+            params: vec![event_json],
+        },
+    )
+    .await
+    .expect_err("saturated status-check acquire should fail as unavailable");
+
+    assert!(
+        started.elapsed() < HTTP_RPC_HANDLER_TIMEOUT,
+        "pool acquire must fail before the handler timeout fires"
+    );
+    let response = err.into_response();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 /// Test: suspended user can still call get_public_key via nostr_rpc

@@ -11,7 +11,6 @@ use tokio::time::sleep;
 // Example: 100 instances × 10 connections = 1000 client connections → 200 backend connections
 // Override with SQLX_POOL_SIZE env var (higher = better throughput per instance)
 const DEFAULT_MAX_CONNECTIONS_PER_INSTANCE: u32 = 10;
-const ACQUIRE_TIMEOUT_SECS: u64 = 60;
 const MAX_CONNECTION_ATTEMPTS: u32 = 5;
 
 #[derive(Error, Debug)]
@@ -65,7 +64,10 @@ impl Database {
                 "disabled".to_string()
             }
         );
-        eprintln!("   Acquire timeout: {}s", ACQUIRE_TIMEOUT_SECS);
+        eprintln!(
+            "   Acquire timeout: {}s",
+            crate::request_bounds::SQLX_ACQUIRE_TIMEOUT.as_secs()
+        );
         eprintln!("   ⚠️  If PoolTimedOut errors occur, check:");
         eprintln!("      - Cloud SQL max_connections (db-f1-micro ≈ 25)");
         eprintln!(
@@ -76,7 +78,7 @@ impl Database {
 
         // Main pool options - may go through connection pooler
         let pool_options = PgPoolOptions::new()
-            .acquire_timeout(Duration::from_secs(ACQUIRE_TIMEOUT_SECS))
+            .acquire_timeout(crate::request_bounds::SQLX_ACQUIRE_TIMEOUT)
             .max_connections(max_connections);
 
         // Statement cache size - configurable for PgBouncer with max_prepared_statements
