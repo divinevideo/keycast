@@ -17,7 +17,25 @@ const MAX_KMS_RETRIES: u32 = 3;
 const KMS_BASE_DELAY_MS: u64 = 100;
 
 /// Per-attempt wall clock bound for Google Cloud KMS calls.
-const KMS_ATTEMPT_TIMEOUT_SECS: u64 = 5;
+///
+/// Sized so the whole retry loop fits inside the HTTP RPC request budget. A
+/// cold-path signing request reaches `decrypt` behind an 8s handler bound
+/// (`HANDLER_TIMEOUT` in `api/src/api/http/nostr_rpc.rs`), and with
+/// [`MAX_KMS_RETRIES`] attempts plus [`KMS_BASE_DELAY_MS`] backoff the worst
+/// case here is 2s + 0.1s + 2s + 0.2s + 2s = 6.3s. At 5s per attempt the second
+/// and third attempts could never deliver a response inside that budget, so the
+/// retries were dead weight on the hot path: the request was cancelled mid-loop
+/// instead of failing over. Keep [`KMS_TOTAL_BUDGET`] under the request bound
+/// if any of these are retuned.
+const KMS_ATTEMPT_TIMEOUT_SECS: u64 = 2;
+
+/// Worst-case wall clock for a full [`MAX_KMS_RETRIES`] loop, asserted in tests
+/// so a change to any of the three constants has to face the request bound.
+const KMS_TOTAL_BUDGET: Duration = Duration::from_millis(
+    KMS_ATTEMPT_TIMEOUT_SECS * 1000 * MAX_KMS_RETRIES as u64
+        + KMS_BASE_DELAY_MS
+        + KMS_BASE_DELAY_MS * 2,
+);
 
 pub struct GcpKeyManager {
     client: Client,
@@ -230,6 +248,21 @@ impl KeyManager for GcpKeyManager {
 mod tests {
     use super::*;
     use tokio;
+
+    /// The KMS retry loop sits under the HTTP RPC handler bound on the cold
+    /// signing path. If it can outlast that bound the later attempts can never
+    /// produce a response, so retuning any of the three constants has to keep
+    /// this true.
+    #[test]
+    fn kms_retry_loop_fits_inside_the_http_rpc_request_bound() {
+        const HTTP_RPC_HANDLER_TIMEOUT: Duration = Duration::from_secs(8);
+
+        assert!(
+            KMS_TOTAL_BUDGET < HTTP_RPC_HANDLER_TIMEOUT,
+            "KMS retry loop worst case {KMS_TOTAL_BUDGET:?} must stay under the \
+             {HTTP_RPC_HANDLER_TIMEOUT:?} HTTP RPC handler bound"
+        );
+    }
 
     #[tokio::test]
     async fn test_encrypt_decrypt_roundtrip() {
