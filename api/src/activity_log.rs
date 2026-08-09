@@ -137,6 +137,15 @@ impl ActivityLogWorker {
         tokio::pin!(shutdown_notified);
         shutdown_notified.as_mut().enable();
 
+        // Because a failed flush retains its batch, `pending.len()` stays above
+        // `max_batch_ids` while the database is unhappy. Without this latch the
+        // size trigger below would then fire on every single received event —
+        // one acquire attempt per RPC request, competing for the very pool this
+        // change exists to relieve. While it is set, only the interval tick
+        // retries, which is the pacing the size trigger was never meant to
+        // override.
+        let mut last_flush_failed = false;
+
         loop {
             tokio::select! {
                 event = self.receiver.recv() => {
@@ -146,15 +155,15 @@ impl ActivityLogWorker {
                     }
                 }
                 _ = flush_interval.tick() => {
-                    self.flush(&mut pending).await;
+                    last_flush_failed = !self.flush(&mut pending).await;
                 }
                 _ = &mut shutdown_notified => {
                     break;
                 }
             }
 
-            if pending.len() >= self.max_batch_ids {
-                self.flush(&mut pending).await;
+            if !last_flush_failed && pending.len() >= self.max_batch_ids {
+                last_flush_failed = !self.flush(&mut pending).await;
             }
         }
 
@@ -162,13 +171,30 @@ impl ActivityLogWorker {
             accumulate(&mut pending, event.authorization_id);
         }
         self.flush(&mut pending).await;
+
+        // Last chance is gone: the task is about to return and `pending` dies
+        // with it, so anything still retained is lost and has to say so.
+        if !pending.is_empty() {
+            let lost: u64 = pending.values().map(|count| *count as u64).sum();
+            METRICS.add_http_rpc_activity_dropped(lost);
+            tracing::error!(
+                lost_events = lost,
+                "Lost OAuth authorization activity: the final flush before shutdown failed"
+            );
+        }
     }
 
-    async fn flush(&self, pending: &mut BTreeMap<i64, i64>) {
+    /// Returns whether the write succeeded, so the caller can stop using the
+    /// batch-size trigger while the database is failing.
+    async fn flush(&self, pending: &mut BTreeMap<i64, i64>) -> bool {
+        let before = pending.len();
         let lost = flush_pending(&self.pool, pending).await;
         if lost > 0 {
             METRICS.add_http_rpc_activity_dropped(lost);
         }
+        // A successful write always empties the map; a failure either retains
+        // the batch or gives it up and reports the loss.
+        before == 0 || (pending.is_empty() && lost == 0)
     }
 }
 
@@ -364,6 +390,97 @@ mod tests {
 
         assert_eq!(lost, MAX_RETAINED_IDS as u64 + 1);
         assert!(pending.is_empty(), "the retained map is bounded");
+    }
+
+    /// Every flush attempt opens one connection to this listener, which never
+    /// answers, so the accept count is a direct measurement of how many times
+    /// the worker retried a failing write.
+    #[tokio::test]
+    async fn a_failing_flush_stops_the_batch_size_trigger_from_retrying_per_event() {
+        const EVENTS: i64 = 10;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind blackhole listener");
+        let port = listener.local_addr().expect("listener addr").port();
+        let attempts = Arc::new(AtomicU64::new(0));
+        let attempts_for_listener = attempts.clone();
+        let _blackhole = tokio::spawn(async move {
+            let mut accepted = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                attempts_for_listener.fetch_add(1, Ordering::Relaxed);
+                accepted.push(socket);
+            }
+        });
+
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy(&format!("postgres://postgres:postgres@127.0.0.1:{port}/x"))
+            .expect("lazy pool");
+        // A 60s interval never fires inside this test, so only the batch-size
+        // trigger can drive a flush. `max_batch_ids = 1` means every event is
+        // eligible to trigger one.
+        let (logger, worker) = ActivityLogger::with_config(pool, 64, Duration::from_secs(60), 1);
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_for_task = shutdown.clone();
+        let worker_task = tokio::spawn(async move {
+            worker.run_until_shutdown(shutdown_for_task).await;
+        });
+
+        for id in 1..=EVENTS {
+            assert_eq!(logger.record(true, id), ActivityLogResult::Queued);
+        }
+        // Long enough for the worker to take every event and, without the
+        // latch, to have attempted a flush for each one.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let attempted = attempts.load(Ordering::Relaxed);
+        assert!(
+            attempted <= 2,
+            "worker made {attempted} write attempts for {EVENTS} events while the database \
+             was failing; the batch-size trigger is retrying per event instead of leaving \
+             retries to the interval"
+        );
+
+        shutdown.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(10), worker_task)
+            .await
+            .expect("worker should exit")
+            .expect("worker task should not panic");
+    }
+
+    #[tokio::test]
+    async fn a_failed_final_flush_reports_the_counts_it_could_not_write() {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/x")
+            .expect("lazy pool");
+        let (logger, worker) = ActivityLogger::with_config(pool, 8, Duration::from_secs(60), 64);
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_for_task = shutdown.clone();
+        let worker_task = tokio::spawn(async move {
+            worker.run_until_shutdown(shutdown_for_task).await;
+        });
+
+        assert_eq!(logger.record(true, 900), ActivityLogResult::Queued);
+        assert_eq!(logger.record(true, 900), ActivityLogResult::Queued);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let before = METRICS.http_rpc_activity_dropped.load(Ordering::Relaxed);
+        shutdown.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(10), worker_task)
+            .await
+            .expect("worker should exit")
+            .expect("worker task should not panic");
+        let after = METRICS.http_rpc_activity_dropped.load(Ordering::Relaxed);
+
+        assert!(
+            after >= before + 2,
+            "the two events the final flush could not write must be reported as lost \
+             (counter went {before} -> {after})"
+        );
     }
 
     #[test]
