@@ -22,10 +22,17 @@ use nostr_sdk::{Event, JsonUtil, Keys, PublicKey, UnsignedEvent};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use super::auth::AuthError;
 use super::routes::AuthState;
+
+/// Wall-clock bound for a single HTTP RPC request, held just under the route's
+/// tower timeout so this handler is the one that normally reports the timeout.
+const HANDLER_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Maximum gift wraps accepted in a single `nip17_unwrap_batch` request.
 /// Bounds per-request work and keeps the body well under axum's 2 MB default
@@ -80,6 +87,7 @@ pub enum RpcError {
     EncryptionFailed(String),
     DecryptionFailed(String),
     Unavailable(String),
+    Timeout(String),
     Internal(String),
 }
 
@@ -97,6 +105,7 @@ impl IntoResponse for RpcError {
             RpcError::EncryptionFailed(msg) => (StatusCode::BAD_REQUEST, msg),
             RpcError::DecryptionFailed(msg) => (StatusCode::BAD_REQUEST, msg),
             RpcError::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
+            RpcError::Timeout(msg) => (StatusCode::GATEWAY_TIMEOUT, msg),
             RpcError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
 
@@ -151,7 +160,24 @@ pub async fn nostr_rpc(
 ) -> Result<Json<NostrRpcResponse>, RpcError> {
     let method = req.method.clone();
     let started = Instant::now();
-    let response = nostr_rpc_inner(tenant, auth_state, headers, req).await;
+    // The route also carries a tower timeout, but that layer drops this future
+    // whole, so a request bounded there records no latency sample at all — the
+    // long tail this endpoint exists to measure would be the one bucket that
+    // stays empty. Bound the handler here instead, where the method label and
+    // the observation survive, and leave the layer as a wider backstop for the
+    // work outside this function.
+    let response = match tokio::time::timeout(
+        HANDLER_TIMEOUT,
+        nostr_rpc_inner(tenant, auth_state, headers, req),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => Err(RpcError::Timeout(format!(
+            "RPC request timed out after {}s",
+            HANDLER_TIMEOUT.as_secs()
+        ))),
+    };
     let outcome = http_rpc_outcome(&response);
     METRICS.observe_http_rpc_request(&method, outcome, started.elapsed());
     response
@@ -399,6 +425,7 @@ fn http_rpc_outcome(response: &Result<Json<NostrRpcResponse>, RpcError>) -> &'st
         | Err(RpcError::DecryptionFailed(_)) => "client_error",
         Err(RpcError::AccountSuspended(_)) => "account_restricted",
         Err(RpcError::Unavailable(_)) => "unavailable",
+        Err(RpcError::Timeout(_)) => "timeout",
         Err(RpcError::Internal(_)) => "error",
     }
 }
@@ -1194,6 +1221,20 @@ mod tests {
     use p256::ecdsa::signature::Signer;
     use p256::ecdsa::{Signature as P256Signature, SigningKey};
     use rand::rngs::OsRng;
+
+    #[test]
+    fn handler_timeout_is_a_504_observed_as_its_own_outcome() {
+        let timed_out: Result<Json<NostrRpcResponse>, RpcError> =
+            Err(RpcError::Timeout("RPC request timed out after 8s".into()));
+
+        assert_eq!(http_rpc_outcome(&timed_out), "timeout");
+        assert_eq!(
+            RpcError::Timeout("RPC request timed out after 8s".into())
+                .into_response()
+                .status(),
+            StatusCode::GATEWAY_TIMEOUT
+        );
+    }
 
     fn create_test_handler_with_dpop(expected_jkt: Option<String>) -> HttpRpcHandler {
         let keys = Keys::generate();

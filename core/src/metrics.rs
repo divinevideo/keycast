@@ -830,6 +830,7 @@ fn normalize_http_rpc_outcome(outcome: &str) -> &'static str {
         "client_error" => "client_error",
         "account_restricted" => "account_restricted",
         "unavailable" => "unavailable",
+        "timeout" => "timeout",
         "error" => "error",
         _ => "other",
     }

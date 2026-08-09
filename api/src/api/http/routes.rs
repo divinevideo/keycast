@@ -116,9 +116,13 @@ pub fn api_routes(
         .with_state(auth_state.clone());
 
     // NIP-46 RPC endpoint (OAuth access token auth, public CORS for third-party apps)
+    // Backstop only. The handler carries its own 8s bound so timed-out requests
+    // still land in the RPC latency histogram with their method label; this
+    // layer covers what runs outside the handler (body read, extractors) and
+    // sits above that bound so it does not pre-empt the observed path.
     let nostr_rpc_timeout = ServiceBuilder::new()
         .layer(HandleErrorLayer::new(nostr_rpc_timeout_error))
-        .layer(tower::timeout::TimeoutLayer::new(Duration::from_secs(8)));
+        .layer(tower::timeout::TimeoutLayer::new(Duration::from_secs(10)));
 
     let nostr_rpc_routes = Router::new()
         .route("/nostr", post(nostr_rpc::nostr_rpc))
