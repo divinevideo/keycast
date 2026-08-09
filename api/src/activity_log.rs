@@ -261,6 +261,7 @@ async fn flush_pending(pool: &PgPool, pending: &mut BTreeMap<i64, i64>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use sqlx::postgres::PgPoolOptions;
 
     #[test]
@@ -315,6 +316,7 @@ mod tests {
     /// but never replies) and signals shutdown there, so the worker is *not*
     /// parked in its `select!` when the signal lands.
     #[tokio::test]
+    #[serial(activity_log_dropped_metric)]
     async fn worker_observes_shutdown_signalled_during_a_flush() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -396,6 +398,7 @@ mod tests {
     /// answers, so the accept count is a direct measurement of how many times
     /// the worker retried a failing write.
     #[tokio::test]
+    #[serial(activity_log_dropped_metric)]
     async fn a_failing_flush_stops_the_batch_size_trigger_from_retrying_per_event() {
         const EVENTS: i64 = 10;
 
@@ -450,7 +453,12 @@ mod tests {
             .expect("worker task should not panic");
     }
 
+    // Serialised with the other tests whose shutdown drain feeds the same
+    // process-global counter: a concurrent add landing inside the before/after
+    // window would satisfy this assertion without the code under test doing
+    // anything, and that contamination only ever pushes the test toward passing.
     #[tokio::test]
+    #[serial(activity_log_dropped_metric)]
     async fn a_failed_final_flush_reports_the_counts_it_could_not_write() {
         let pool = PgPoolOptions::new()
             .max_connections(1)
