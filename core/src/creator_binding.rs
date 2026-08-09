@@ -2,29 +2,74 @@
 // ABOUTME: Keeps non-event signing scoped to the expected Divine assertion shape
 
 use nostr_sdk::PublicKey;
+use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 
 pub const MAX_CREATOR_BINDING_PAYLOAD_BYTES: usize = 64 * 1024;
 
-/// The exact top-level fields divine-mobile's `NostrCreatorBindingService` emits.
+/// divine-mobile's `NostrCreatorBindingService` assertion, as a closed shape.
 ///
-/// The allowlist is closed on purpose: every byte of the payload is signed with
-/// the user's key, so anything accepted here becomes caller-chosen content
-/// inside a signed blob. `content_filter` scans only the free-text fields
-/// (`claims`, `created_at`, `referenced_assertions`), so an unknown field would
-/// bypass policy entirely. Adding a field means updating this list, the
-/// per-field shape checks below, and `ContentFilter::can_sign_creator_binding`
-/// together, in lockstep with the mobile client.
-const ALLOWED_TOP_LEVEL_FIELDS: [&str; 7] = [
-    "version",
-    "pubkey",
-    "sig_alg",
-    "created_at",
-    "claims",
-    "referenced_assertions",
-    "hard_binding",
-];
+/// Every byte of the payload is signed with the user's key, so anything accepted
+/// here becomes caller-chosen content inside a signed blob. `ContentFilter` only
+/// scans the free-text values (`claims`, `created_at`, `referenced_assertions`),
+/// so any field it cannot see must be structurally impossible rather than merely
+/// unexpected.
+///
+/// `deny_unknown_fields` does the work at every depth, and it also makes serde
+/// reject *duplicate* keys. That second property is load-bearing: `serde_json`
+/// collapses duplicates last-wins, but the caller signs the original bytes, so a
+/// shadowed duplicate would ride into the signature without ever being validated
+/// or content-filtered — and a first-wins reader downstream would see a different
+/// assertion than the one Keycast approved.
+///
+/// Adding a field means updating this struct and
+/// `ContentFilter::can_sign_creator_binding` together, in lockstep with mobile.
+// Most fields are never read: they exist so serde enforces the shape. The
+// caller signs the original bytes, so this type is a validator, not a model.
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreatorBindingPayload {
+    version: u64,
+    pubkey: String,
+    sig_alg: String,
+    #[serde(default)]
+    created_at: Option<String>,
+    claims: Claims,
+    referenced_assertions: Vec<String>,
+    hard_binding: HardBinding,
+}
+
+/// Mirrors `CreatorBindingClaims.toJson()`; every field is conditional there, so
+/// every field is optional here and `{}` is legitimate.
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Claims {
+    #[serde(default)]
+    nip05: Option<String>,
+    #[serde(default)]
+    website: Option<String>,
+    #[serde(default)]
+    social_handles: Option<Vec<SocialHandle>>,
+}
+
+/// Mirrors `CreatorSocialHandle.toJson()`.
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SocialHandle {
+    platform: String,
+    handle: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HardBinding {
+    alg: String,
+    value: String,
+}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CreatorBindingError {
@@ -32,39 +77,28 @@ pub enum CreatorBindingError {
     PayloadTooLarge,
     #[error("creator-binding payload must be UTF-8 JSON")]
     InvalidUtf8,
-    #[error("creator-binding payload must be a JSON object")]
-    NotObject,
+    #[error("creator-binding payload must not include a signature")]
+    PreSignedPayload,
+    #[error("creator-binding payload shape is invalid: {0}")]
+    InvalidShape(String),
     #[error("creator-binding version must be 1")]
     InvalidVersion,
     #[error("creator-binding sig_alg must be nostr.secp256k1")]
     InvalidSignatureAlgorithm,
     #[error("creator-binding pubkey must match signer")]
     PubkeyMismatch,
-    #[error("creator-binding claims must be an object of known string fields")]
-    InvalidClaims,
-    #[error("creator-binding claims has unexpected field: {0}")]
-    UnexpectedClaim(String),
-    #[error("creator-binding referenced_assertions must be an array of strings")]
-    InvalidReferencedAssertions,
-    #[error("creator-binding hard_binding must be {{alg: \"sha256\", value: <64 hex>}}")]
+    #[error("creator-binding hard_binding must be {{alg: \"sha256\", value: <64 lowercase hex>}}")]
     InvalidHardBinding,
-    #[error("creator-binding created_at must be a string")]
-    InvalidCreatedAt,
-    #[error("creator-binding payload must not include a signature")]
-    PreSignedPayload,
-    #[error("creator-binding payload is invalid JSON")]
-    InvalidJson,
-    #[error("creator-binding payload has unexpected field: {0}")]
-    UnexpectedField(String),
 }
 
 /// Validate that a canonical-signing payload is a creator-binding assertion for
-/// the signing key. The caller signs the original bytes after this check, so this
-/// function must not reserialize or normalize the JSON.
+/// the signing key.
 ///
-/// The accepted shape is closed, not just checked for required fields: unknown
-/// top-level fields are rejected so the signed bytes cannot carry
-/// caller-controlled content past the policy layer.
+/// The caller signs the original bytes after this check, so this function must
+/// not reserialize or normalize the JSON — which is exactly why the accepted
+/// shape is closed rather than merely checked for required fields. Unknown
+/// fields, duplicate keys, and unexpected types are all rejected, so the bytes
+/// that get signed cannot carry anything the policy layer never saw.
 pub fn validate_creator_binding_payload(
     payload: &[u8],
     signer_pubkey: PublicKey,
@@ -74,145 +108,48 @@ pub fn validate_creator_binding_payload(
     }
 
     let text = std::str::from_utf8(payload).map_err(|_| CreatorBindingError::InvalidUtf8)?;
-    let value: Value = serde_json::from_str(text).map_err(|_| CreatorBindingError::InvalidJson)?;
-    let object = value.as_object().ok_or(CreatorBindingError::NotObject)?;
 
-    if object.contains_key("signature") || object.contains_key("sig") {
-        return Err(CreatorBindingError::PreSignedPayload);
+    // Checked ahead of the struct so re-submitting an already-signed assertion
+    // gets a specific answer instead of a generic unknown-field message.
+    if let Ok(Value::Object(object)) = serde_json::from_str::<Value>(text) {
+        if object.contains_key("signature") || object.contains_key("sig") {
+            return Err(CreatorBindingError::PreSignedPayload);
+        }
     }
 
-    if let Some(unexpected) = object
-        .keys()
-        .find(|key| !ALLOWED_TOP_LEVEL_FIELDS.contains(&key.as_str()))
-    {
-        return Err(CreatorBindingError::UnexpectedField(unexpected.clone()));
+    let parsed: CreatorBindingPayload =
+        serde_json::from_str(text).map_err(|e| CreatorBindingError::InvalidShape(e.to_string()))?;
+
+    if parsed.version != 1 {
+        return Err(CreatorBindingError::InvalidVersion);
     }
 
-    match object.get("version").and_then(Value::as_u64) {
-        Some(1) => {}
-        _ => return Err(CreatorBindingError::InvalidVersion),
+    if parsed.sig_alg != "nostr.secp256k1" {
+        return Err(CreatorBindingError::InvalidSignatureAlgorithm);
     }
 
-    match object.get("sig_alg").and_then(Value::as_str) {
-        Some("nostr.secp256k1") => {}
-        _ => return Err(CreatorBindingError::InvalidSignatureAlgorithm),
+    if parsed.pubkey != signer_pubkey.to_hex() {
+        return Err(CreatorBindingError::PubkeyMismatch);
     }
 
-    match object.get("pubkey").and_then(Value::as_str) {
-        Some(pubkey) if pubkey == signer_pubkey.to_hex() => {}
-        _ => return Err(CreatorBindingError::PubkeyMismatch),
-    }
-
-    validate_claims(object.get("claims"))?;
-
-    // `created_at` is optional, but when present it must be a plain string so it
-    // cannot smuggle structured caller data.
-    if object
-        .get("created_at")
-        .is_some_and(|value| !value.is_string())
-    {
-        return Err(CreatorBindingError::InvalidCreatedAt);
-    }
-
-    // divine-mobile sends a sorted `List<String>` of assertion labels.
-    match object
-        .get("referenced_assertions")
-        .and_then(Value::as_array)
-    {
-        Some(items) if items.iter().all(Value::is_string) => {}
-        _ => return Err(CreatorBindingError::InvalidReferencedAssertions),
-    }
-
-    validate_hard_binding(object.get("hard_binding"))?;
+    validate_hard_binding(&parsed.hard_binding)?;
 
     Ok(())
 }
 
-/// `claims` is pinned to divine-mobile's `CreatorBindingClaims.toJson()` shape:
-/// every key optional, but no key outside the known set at any depth.
-///
-/// Keys are pinned rather than content-filtered on purpose. A caller-chosen key
-/// would be free text that `ContentFilter` never sees, since
-/// `contains_blocked_word` only walks values. Scanning keys instead would deny
-/// on the fixed names themselves — a blocklist holding "and" or "for" matches
-/// `social_handles` and `platform` — which is the false-denial trap this module
-/// already avoids elsewhere.
-fn validate_claims(claims: Option<&Value>) -> Result<(), CreatorBindingError> {
-    const ALLOWED_CLAIMS: [&str; 3] = ["nip05", "website", "social_handles"];
-    const ALLOWED_HANDLE_FIELDS: [&str; 2] = ["platform", "handle"];
-
-    let object = claims
-        .and_then(Value::as_object)
-        .ok_or(CreatorBindingError::InvalidClaims)?;
-
-    if let Some(unexpected) = object
-        .keys()
-        .find(|key| !ALLOWED_CLAIMS.contains(&key.as_str()))
-    {
-        return Err(CreatorBindingError::UnexpectedClaim(unexpected.clone()));
-    }
-
-    for key in ["nip05", "website"] {
-        if object.get(key).is_some_and(|value| !value.is_string()) {
-            return Err(CreatorBindingError::InvalidClaims);
-        }
-    }
-
-    let Some(handles) = object.get("social_handles") else {
-        return Ok(());
-    };
-
-    for handle in handles
-        .as_array()
-        .ok_or(CreatorBindingError::InvalidClaims)?
-    {
-        let handle = handle
-            .as_object()
-            .ok_or(CreatorBindingError::InvalidClaims)?;
-
-        if let Some(unexpected) = handle
-            .keys()
-            .find(|key| !ALLOWED_HANDLE_FIELDS.contains(&key.as_str()))
-        {
-            return Err(CreatorBindingError::UnexpectedClaim(unexpected.clone()));
-        }
-
-        if !ALLOWED_HANDLE_FIELDS
-            .iter()
-            .all(|key| handle.get(*key).is_some_and(Value::is_string))
-        {
-            return Err(CreatorBindingError::InvalidClaims);
-        }
-    }
-
-    Ok(())
-}
-
-/// `hard_binding` is pinned to exactly `{alg: "sha256", value: <64 lowercase hex>}`.
+/// `hard_binding` is pinned to `{alg: "sha256", value: <64 lowercase hex>}`.
 ///
 /// Pinning it leaves no free-text surface here, which is what lets the content
 /// filter skip this field: a hex digest would otherwise trip blocklists on words
 /// that are also valid hex ("bad", "dead", "cafe").
-fn validate_hard_binding(hard_binding: Option<&Value>) -> Result<(), CreatorBindingError> {
-    let object = hard_binding
-        .and_then(Value::as_object)
-        .ok_or(CreatorBindingError::InvalidHardBinding)?;
-
-    if object.len() != 2 || !object.contains_key("alg") || !object.contains_key("value") {
+fn validate_hard_binding(hard_binding: &HardBinding) -> Result<(), CreatorBindingError> {
+    if hard_binding.alg != "sha256" {
         return Err(CreatorBindingError::InvalidHardBinding);
     }
 
-    if object.get("alg").and_then(Value::as_str) != Some("sha256") {
-        return Err(CreatorBindingError::InvalidHardBinding);
-    }
-
-    let value = object
-        .get("value")
-        .and_then(Value::as_str)
-        .ok_or(CreatorBindingError::InvalidHardBinding)?;
-
-    if value.len() != 64
-        || !value
+    if hard_binding.value.len() != 64
+        || !hard_binding
+            .value
             .chars()
             .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
     {
@@ -264,7 +201,7 @@ mod tests {
             validate_creator_binding_payload(b"\"divine-creator-binding-test\"", keys.public_key())
                 .expect_err("bare test vector is not a creator-binding object");
 
-        assert_eq!(err, CreatorBindingError::NotObject);
+        assert!(matches!(err, CreatorBindingError::InvalidShape(_)), "{err}");
     }
 
     #[test]
@@ -307,7 +244,7 @@ mod tests {
         let payload = serde_json::to_vec(&value).unwrap();
 
         let err = validate_creator_binding_payload(&payload, keys.public_key()).unwrap_err();
-        assert_eq!(err, CreatorBindingError::InvalidClaims);
+        assert!(matches!(err, CreatorBindingError::InvalidShape(_)), "{err}");
     }
 
     #[test]
@@ -321,7 +258,7 @@ mod tests {
         let payload = serde_json::to_vec(&value).unwrap();
 
         let err = validate_creator_binding_payload(&payload, keys.public_key()).unwrap_err();
-        assert_eq!(err, CreatorBindingError::InvalidReferencedAssertions);
+        assert!(matches!(err, CreatorBindingError::InvalidShape(_)), "{err}");
     }
 
     #[test]
@@ -332,7 +269,10 @@ mod tests {
         let payload = serde_json::to_vec(&value).unwrap();
 
         let err = validate_creator_binding_payload(&payload, keys.public_key()).unwrap_err();
-        assert_eq!(err, CreatorBindingError::InvalidHardBinding);
+        assert!(
+            err.to_string().contains("missing field `hard_binding`"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -356,17 +296,54 @@ mod tests {
     #[test]
     fn rejects_unknown_top_level_field() {
         // An extra field would otherwise ride into the signed bytes untouched by
-        // `content_filter`, which only inspects `claims`.
+        // `content_filter`, which only inspects the known free-text fields.
         let keys = Keys::generate();
         let mut value: Value = serde_json::from_slice(&valid_payload(keys.public_key())).unwrap();
         value["note"] = json!("arbitrary caller-controlled text");
         let payload = serde_json::to_vec(&value).unwrap();
 
         let err = validate_creator_binding_payload(&payload, keys.public_key()).unwrap_err();
-        assert_eq!(
-            err,
-            CreatorBindingError::UnexpectedField("note".to_string())
+        assert!(err.to_string().contains("unknown field `note`"), "{err}");
+    }
+
+    /// `serde_json::Value` collapses duplicate keys last-wins, but the caller
+    /// signs the original bytes. A shadowed duplicate would therefore be signed
+    /// without ever being validated or content-filtered, and a first-wins reader
+    /// downstream would see a different assertion than the one approved here.
+    #[test]
+    fn rejects_duplicate_top_level_key() {
+        let keys = Keys::generate();
+        let valid = String::from_utf8(valid_payload(keys.public_key())).unwrap();
+        let smuggled = valid.replacen(
+            r#""created_at":"#,
+            r#""created_at":"scam: caller text in created_at","created_at":"#,
+            1,
         );
+
+        let err =
+            validate_creator_binding_payload(smuggled.as_bytes(), keys.public_key()).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate field `created_at`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_nested_claim_key() {
+        let keys = Keys::generate();
+        let payload = format!(
+            r#"{{"version":1,"pubkey":"{}","sig_alg":"nostr.secp256k1",
+                 "created_at":"2026-04-29T00:00:00Z",
+                 "claims":{{"nip05":"scam: caller text","nip05":"creator@example.com"}},
+                 "referenced_assertions":[],
+                 "hard_binding":{{"alg":"sha256","value":"{}"}}}}"#,
+            keys.public_key().to_hex(),
+            "3".repeat(64)
+        );
+
+        let err =
+            validate_creator_binding_payload(payload.as_bytes(), keys.public_key()).unwrap_err();
+        assert!(err.to_string().contains("duplicate field `nip05`"), "{err}");
     }
 
     #[test]
@@ -379,11 +356,10 @@ mod tests {
         let payload = serde_json::to_vec(&value).unwrap();
 
         let err = validate_creator_binding_payload(&payload, keys.public_key()).unwrap_err();
-        assert_eq!(
-            err,
-            CreatorBindingError::UnexpectedClaim(
-                "scam: arbitrary caller-controlled text".to_string()
-            )
+        assert!(
+            err.to_string()
+                .contains("unknown field `scam: arbitrary caller-controlled text`"),
+            "{err}"
         );
     }
 
@@ -397,9 +373,9 @@ mod tests {
         let payload = serde_json::to_vec(&value).unwrap();
 
         let err = validate_creator_binding_payload(&payload, keys.public_key()).unwrap_err();
-        assert_eq!(
-            err,
-            CreatorBindingError::UnexpectedClaim("scam: text".to_string())
+        assert!(
+            err.to_string().contains("unknown field `scam: text`"),
+            "{err}"
         );
     }
 
@@ -438,7 +414,7 @@ mod tests {
         let payload = serde_json::to_vec(&value).unwrap();
 
         let err = validate_creator_binding_payload(&payload, keys.public_key()).unwrap_err();
-        assert_eq!(err, CreatorBindingError::InvalidCreatedAt);
+        assert!(matches!(err, CreatorBindingError::InvalidShape(_)), "{err}");
     }
 
     #[test]
@@ -449,7 +425,7 @@ mod tests {
         let payload = serde_json::to_vec(&value).unwrap();
 
         let err = validate_creator_binding_payload(&payload, keys.public_key()).unwrap_err();
-        assert_eq!(err, CreatorBindingError::InvalidReferencedAssertions);
+        assert!(matches!(err, CreatorBindingError::InvalidShape(_)), "{err}");
     }
 
     #[test]
@@ -470,7 +446,13 @@ mod tests {
 
             let err = validate_creator_binding_payload(&payload, keys.public_key())
                 .expect_err(&format!("hard_binding {bad} must be rejected"));
-            assert_eq!(err, CreatorBindingError::InvalidHardBinding);
+            assert!(
+                matches!(
+                    err,
+                    CreatorBindingError::InvalidHardBinding | CreatorBindingError::InvalidShape(_)
+                ),
+                "{err}"
+            );
         }
     }
 
