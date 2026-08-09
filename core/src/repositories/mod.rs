@@ -42,7 +42,7 @@ pub use stored_key::StoredKeyRepository;
 pub use team::TeamRepository;
 pub use user::{
     AccountStatusRow, AccountStatusWithMinorRow, AdminUserDetails, AdminUserLookup,
-    AdminUserMatchKind, ClaimConsumeOutcome, DeleteAccountResult, FinalizeEmailOutcome,
-    FullAdminStatusRow, PendingEmailChange, PendingEmailSide, UserRepository,
+    AdminUserMatchKind, ClaimConsumeOutcome, ConditionalWrite, DeleteAccountResult,
+    FinalizeEmailOutcome, FullAdminStatusRow, PendingEmailChange, PendingEmailSide, UserRepository,
     VerificationTokenData, VerifiedMinorRow,
 };

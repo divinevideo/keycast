@@ -172,8 +172,10 @@ test.describe("Bluesky settings", () => {
       lud16: null,
     };
 
+    // The shape a failed enable leaves behind: the opt-in is rolled back, so
+    // the failure is carried by the state and the error alone.
     let atproto: AtprotoStatusResponse = {
-      enabled: true,
+      enabled: false,
       state: "failed",
       did: null,
       error: "provisioning service returned 502 Bad Gateway: gateway unavailable",
