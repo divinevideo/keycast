@@ -7,6 +7,23 @@ use thiserror::Error;
 
 pub const MAX_CREATOR_BINDING_PAYLOAD_BYTES: usize = 64 * 1024;
 
+/// The exact top-level fields divine-mobile's `NostrCreatorBindingService` emits.
+///
+/// The allowlist is closed on purpose: every byte of the payload is signed with
+/// the user's key, so anything accepted here becomes attacker-chosen content
+/// inside a signed blob and escapes the `content_filter` policy, which only
+/// inspects creator-supplied `claims`. Adding a field must happen in lockstep
+/// with the mobile client.
+const ALLOWED_TOP_LEVEL_FIELDS: [&str; 7] = [
+    "version",
+    "pubkey",
+    "sig_alg",
+    "created_at",
+    "claims",
+    "referenced_assertions",
+    "hard_binding",
+];
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CreatorBindingError {
     #[error("creator-binding payload exceeds maximum size")]
@@ -31,11 +48,17 @@ pub enum CreatorBindingError {
     PreSignedPayload,
     #[error("creator-binding payload is invalid JSON")]
     InvalidJson,
+    #[error("creator-binding payload has unexpected field: {0}")]
+    UnexpectedField(String),
 }
 
 /// Validate that a canonical-signing payload is a creator-binding assertion for
 /// the signing key. The caller signs the original bytes after this check, so this
 /// function must not reserialize or normalize the JSON.
+///
+/// The accepted shape is closed, not just checked for required fields: unknown
+/// top-level fields are rejected so the signed bytes cannot carry
+/// caller-controlled content past the policy layer.
 pub fn validate_creator_binding_payload(
     payload: &[u8],
     signer_pubkey: PublicKey,
@@ -50,6 +73,13 @@ pub fn validate_creator_binding_payload(
 
     if object.contains_key("signature") || object.contains_key("sig") {
         return Err(CreatorBindingError::PreSignedPayload);
+    }
+
+    if let Some(unexpected) = object
+        .keys()
+        .find(|key| !ALLOWED_TOP_LEVEL_FIELDS.contains(&key.as_str()))
+    {
+        return Err(CreatorBindingError::UnexpectedField(unexpected.clone()));
     }
 
     match object.get("version").and_then(Value::as_u64) {
@@ -214,6 +244,33 @@ mod tests {
 
         let err = validate_creator_binding_payload(&payload, keys.public_key()).unwrap_err();
         assert_eq!(err, CreatorBindingError::InvalidUtf8);
+    }
+
+    #[test]
+    fn rejects_unknown_top_level_field() {
+        // An extra field would otherwise ride into the signed bytes untouched by
+        // `content_filter`, which only inspects `claims`.
+        let keys = Keys::generate();
+        let mut value: Value = serde_json::from_slice(&valid_payload(keys.public_key())).unwrap();
+        value["note"] = json!("arbitrary caller-controlled text");
+        let payload = serde_json::to_vec(&value).unwrap();
+
+        let err = validate_creator_binding_payload(&payload, keys.public_key()).unwrap_err();
+        assert_eq!(
+            err,
+            CreatorBindingError::UnexpectedField("note".to_string())
+        );
+    }
+
+    #[test]
+    fn accepts_payload_without_optional_created_at() {
+        let keys = Keys::generate();
+        let mut value: Value = serde_json::from_slice(&valid_payload(keys.public_key())).unwrap();
+        value.as_object_mut().unwrap().remove("created_at");
+        let payload = serde_json::to_vec(&value).unwrap();
+
+        validate_creator_binding_payload(&payload, keys.public_key())
+            .expect("created_at is allowed but not required");
     }
 
     #[test]

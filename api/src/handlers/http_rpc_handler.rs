@@ -881,6 +881,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sign_canonical_rejects_extra_top_level_field() {
+        // Regression: an unknown top-level field is caller-controlled content that
+        // would be signed with the user's key while `content_filter` only inspects
+        // `claims`. Validation must reject it before signing.
+        let handler = create_test_handler(None, None);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&creator_binding_payload(handler.public_key())).unwrap();
+        value["note"] = serde_json::json!("arbitrary caller-controlled text");
+        let payload = serde_json::to_vec(&value).unwrap();
+
+        let result = handler.sign_canonical(payload).await;
+        assert!(matches!(result, Err(HandlerError::InvalidRequest(_))));
+    }
+
+    #[tokio::test]
     async fn test_sign_canonical_denied_by_readonly_permission() {
         let handler =
             create_test_handler_with_permissions(None, None, vec![decrypt_only_permission()]);
