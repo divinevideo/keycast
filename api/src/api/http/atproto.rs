@@ -745,7 +745,8 @@ fn map_control_error(error: AtprotoControlError) -> AuthError {
             tracing::warn!("ATProto repository integrity error: {}", err);
             AuthError::BadRequest("ATProto state update is invalid".to_string())
         }
-        AtprotoControlError::Repository(RepositoryError::Database(err)) => {
+        AtprotoControlError::Repository(RepositoryError::Database(err))
+        | AtprotoControlError::Repository(RepositoryError::Unavailable(err)) => {
             tracing::error!("ATProto repository error: {}", err);
             AuthError::ServiceUnavailable {
                 message: "ATProto state is temporarily unavailable. Please try again shortly."

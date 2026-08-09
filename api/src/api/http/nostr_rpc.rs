@@ -1,6 +1,7 @@
 // ABOUTME: REST RPC API that mirrors NIP-46 methods for low-latency signing
 // ABOUTME: Allows HTTP-based signing instead of relay-based NIP-46 communication
 
+use crate::activity_log::ActivityLogResult;
 use crate::handlers::http_rpc_handler::{HandlerError, HttpRpcHandler};
 use axum::{
     extract::State,
@@ -21,11 +22,20 @@ use nostr_sdk::{Event, JsonUtil, Keys, PublicKey, UnsignedEvent};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use sqlx::PgPool;
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use super::auth::AuthError;
 use super::routes::AuthState;
+
+/// Wall-clock bound for a single HTTP RPC request, held just under the route's
+/// tower timeout so this handler is the one that normally reports the timeout.
+///
+/// Defined in `core` because the budgets nested inside it — the SQLx acquire
+/// timeout and the KMS retry loop — are asserted against it there.
+const HANDLER_TIMEOUT: Duration = keycast_core::request_bounds::HTTP_RPC_HANDLER_TIMEOUT;
 
 /// Maximum gift wraps accepted in a single `nip17_unwrap_batch` request.
 /// Bounds per-request work and keeps the body well under axum's 2 MB default
@@ -79,6 +89,8 @@ pub enum RpcError {
     SigningFailed(String),
     EncryptionFailed(String),
     DecryptionFailed(String),
+    Unavailable(String),
+    Timeout(String),
     Internal(String),
 }
 
@@ -95,6 +107,8 @@ impl IntoResponse for RpcError {
             RpcError::SigningFailed(msg) => (StatusCode::BAD_REQUEST, msg),
             RpcError::EncryptionFailed(msg) => (StatusCode::BAD_REQUEST, msg),
             RpcError::DecryptionFailed(msg) => (StatusCode::BAD_REQUEST, msg),
+            RpcError::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
+            RpcError::Timeout(msg) => (StatusCode::GATEWAY_TIMEOUT, msg),
             RpcError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
 
@@ -146,6 +160,37 @@ pub async fn nostr_rpc(
     State(auth_state): State<AuthState>,
     headers: HeaderMap,
     Json(req): Json<NostrRpcRequest>,
+) -> Result<Json<NostrRpcResponse>, RpcError> {
+    let method = req.method.clone();
+    let started = Instant::now();
+    // The route also carries a tower timeout, but that layer drops this future
+    // whole, so a request bounded there records no latency sample at all — the
+    // long tail this endpoint exists to measure would be the one bucket that
+    // stays empty. Bound the handler here instead, where the method label and
+    // the observation survive, and leave the layer as a wider backstop for the
+    // work outside this function.
+    let response = match tokio::time::timeout(
+        HANDLER_TIMEOUT,
+        nostr_rpc_inner(tenant, auth_state, headers, req),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => Err(RpcError::Timeout(format!(
+            "RPC request timed out after {}s",
+            HANDLER_TIMEOUT.as_secs()
+        ))),
+    };
+    let outcome = http_rpc_outcome(&response);
+    METRICS.observe_http_rpc_request(&method, outcome, started.elapsed());
+    response
+}
+
+async fn nostr_rpc_inner(
+    tenant: crate::api::tenant::TenantExtractor,
+    auth_state: AuthState,
+    headers: HeaderMap,
+    req: NostrRpcRequest,
 ) -> Result<Json<NostrRpcResponse>, RpcError> {
     // Track total HTTP RPC requests
     METRICS.inc_http_rpc_request();
@@ -204,8 +249,7 @@ pub async fn nostr_rpc(
                 signed.kind.as_u16()
             );
 
-            // Log activity in background (non-blocking)
-            spawn_log_activity(pool.clone(), handler.is_oauth(), handler.authorization_id());
+            log_activity(&auth_state, handler.is_oauth(), handler.authorization_id());
 
             serde_json::to_value(&signed)
                 .map_err(|e| RpcError::Internal(format!("JSON serialization failed: {}", e)))?
@@ -224,7 +268,7 @@ pub async fn nostr_rpc(
                 handler.authorization_id()
             );
 
-            spawn_log_activity(pool.clone(), handler.is_oauth(), handler.authorization_id());
+            log_activity(&auth_state, handler.is_oauth(), handler.authorization_id());
 
             JsonValue::String(signature)
         }
@@ -240,8 +284,7 @@ pub async fn nostr_rpc(
             // Crypto runs on spawn_blocking to avoid blocking async workers
             let ciphertext = handler.nip44_encrypt(&recipient_pubkey, &plaintext).await?;
 
-            // Log activity in background (non-blocking)
-            spawn_log_activity(pool.clone(), handler.is_oauth(), handler.authorization_id());
+            log_activity(&auth_state, handler.is_oauth(), handler.authorization_id());
 
             JsonValue::String(ciphertext)
         }
@@ -253,8 +296,7 @@ pub async fn nostr_rpc(
             // Crypto runs on spawn_blocking to avoid blocking async workers
             let plaintext = handler.nip44_decrypt(&sender_pubkey, &ciphertext).await?;
 
-            // Log activity in background (non-blocking)
-            spawn_log_activity(pool.clone(), handler.is_oauth(), handler.authorization_id());
+            log_activity(&auth_state, handler.is_oauth(), handler.authorization_id());
 
             // Expose secret only at serialization boundary
             JsonValue::String(plaintext.expose_secret().to_string())
@@ -285,7 +327,7 @@ pub async fn nostr_rpc(
             let results = unwrap_gift_wrap_batch(&handler, &req.params).await;
 
             // One coalesced activity log for the whole batch (per-request semantics).
-            spawn_log_activity(pool.clone(), handler.is_oauth(), handler.authorization_id());
+            log_activity(&auth_state, handler.is_oauth(), handler.authorization_id());
 
             JsonValue::Array(results)
         }
@@ -330,7 +372,7 @@ pub async fn nostr_rpc(
             let results = wrap_gift_wrap_batch(&handler, &batch.rumor, &batch.recipients).await;
 
             // One coalesced activity update for the whole RPC request.
-            spawn_log_activity(pool.clone(), handler.is_oauth(), handler.authorization_id());
+            log_activity(&auth_state, handler.is_oauth(), handler.authorization_id());
 
             JsonValue::Array(results)
         }
@@ -346,8 +388,7 @@ pub async fn nostr_rpc(
             // Crypto runs on spawn_blocking to avoid blocking async workers
             let ciphertext = handler.nip04_encrypt(&recipient_pubkey, &plaintext).await?;
 
-            // Log activity in background (non-blocking)
-            spawn_log_activity(pool.clone(), handler.is_oauth(), handler.authorization_id());
+            log_activity(&auth_state, handler.is_oauth(), handler.authorization_id());
 
             JsonValue::String(ciphertext)
         }
@@ -359,8 +400,7 @@ pub async fn nostr_rpc(
             // Crypto runs on spawn_blocking to avoid blocking async workers
             let plaintext = handler.nip04_decrypt(&sender_pubkey, &ciphertext).await?;
 
-            // Log activity in background (non-blocking)
-            spawn_log_activity(pool.clone(), handler.is_oauth(), handler.authorization_id());
+            log_activity(&auth_state, handler.is_oauth(), handler.authorization_id());
 
             // Expose secret only at serialization boundary
             JsonValue::String(plaintext.expose_secret().to_string())
@@ -377,6 +417,44 @@ pub async fn nostr_rpc(
     Ok(Json(NostrRpcResponse::success(result)))
 }
 
+/// Classify a repository error from the cold RPC path.
+///
+/// A pool acquire timeout under saturation is transient, so it gets the same
+/// retryable 503 the warm status check already returns. Anything else stays a
+/// 500. Detail goes to the log, never to the response: this endpoint is reached
+/// before the caller is known to be legitimate, and connect-level failures carry
+/// host, DNS and TLS text.
+fn map_repo_error(context: &str, error: keycast_core::repositories::RepositoryError) -> RpcError {
+    use keycast_core::repositories::RepositoryError;
+
+    match error {
+        RepositoryError::Unavailable(detail) => {
+            tracing::warn!(context, %detail, "HTTP RPC database unavailable");
+            RpcError::Unavailable("Database temporarily unavailable".to_string())
+        }
+        other => {
+            tracing::error!(context, error = %other, "HTTP RPC database error");
+            RpcError::Internal(format!("Database error: {}", context))
+        }
+    }
+}
+
+fn http_rpc_outcome(response: &Result<Json<NostrRpcResponse>, RpcError>) -> &'static str {
+    match response {
+        Ok(_) => "success",
+        Err(RpcError::Auth(_)) => "auth_error",
+        Err(RpcError::InvalidParams(_))
+        | Err(RpcError::UnsupportedMethod(_))
+        | Err(RpcError::SigningFailed(_))
+        | Err(RpcError::EncryptionFailed(_))
+        | Err(RpcError::DecryptionFailed(_)) => "client_error",
+        Err(RpcError::AccountSuspended(_)) => "account_restricted",
+        Err(RpcError::Unavailable(_)) => "unavailable",
+        Err(RpcError::Timeout(_)) => "timeout",
+        Err(RpcError::Internal(_)) => "error",
+    }
+}
+
 /// Check that the user's account is active before allowing mutating operations.
 /// This runs a DB query per request (not cached) so status changes take effect immediately.
 /// Returns the account's `verified_minor` flag (same row, no extra query) for
@@ -386,19 +464,69 @@ async fn check_user_status_active(
     user_pubkey_hex: &str,
     tenant_id: i64,
 ) -> Result<bool, RpcError> {
+    let status_started = Instant::now();
+    METRICS.set_http_rpc_db_pool_state(pool.size(), pool.num_idle() as u32);
+
+    let acquire_started = Instant::now();
+    let mut conn = match pool.acquire().await {
+        Ok(conn) => {
+            METRICS.observe_http_rpc_db_acquire(
+                "check_user_status_active",
+                "success",
+                acquire_started.elapsed(),
+            );
+            conn
+        }
+        Err(e) => {
+            METRICS.observe_http_rpc_db_acquire(
+                "check_user_status_active",
+                "unavailable",
+                acquire_started.elapsed(),
+            );
+            METRICS.observe_http_rpc_status_check("unavailable", status_started.elapsed());
+            // Detail to the log only: connect-level failures carry host, DNS and
+            // TLS text and this response is reachable before the caller is known
+            // to be legitimate.
+            tracing::warn!(error = %e, "HTTP RPC could not acquire a connection for the status check");
+            return Err(RpcError::Unavailable(
+                "Database temporarily unavailable".to_string(),
+            ));
+        }
+    };
+
     let status: Option<(String, bool)> = sqlx::query_as(
         "SELECT status, verified_minor FROM users WHERE pubkey = $1 AND tenant_id = $2",
     )
     .bind(user_pubkey_hex)
     .bind(tenant_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await
-    .map_err(|e| RpcError::Internal(format!("Database error checking user status: {}", e)))?;
+    .map_err(|e| {
+        METRICS.observe_http_rpc_status_check("error", status_started.elapsed());
+        tracing::error!(error = %e, "HTTP RPC user status query failed");
+        RpcError::Internal("Database error checking user status".to_string())
+    })?;
 
-    match status {
+    let result = match status {
         Some((s, verified_minor)) if s == "active" => Ok(verified_minor),
         Some(_) => Err(RpcError::AccountSuspended("Account restricted".to_string())),
         None => Err(RpcError::Auth(AuthError::InvalidToken)),
+    };
+
+    METRICS.observe_http_rpc_status_check(
+        http_rpc_outcome_for_status_check(&result),
+        status_started.elapsed(),
+    );
+    result
+}
+
+fn http_rpc_outcome_for_status_check(result: &Result<bool, RpcError>) -> &'static str {
+    match result {
+        Ok(_) => "success",
+        Err(RpcError::Auth(_)) => "auth_error",
+        Err(RpcError::AccountSuspended(_)) => "account_restricted",
+        Err(RpcError::Unavailable(_)) => "unavailable",
+        Err(_) => "error",
     }
 }
 
@@ -482,7 +610,7 @@ async fn load_handler_on_demand(
     let auth_data = oauth_auth_repo
         .find_by_bunker_pubkey_for_tenant(bunker_pubkey_hex, tenant_id)
         .await
-        .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?;
+        .map_err(|e| map_repo_error("loading authorization", e))?;
 
     let (auth_id, user_pubkey, auth_handle_opt, expires_at, revoked_at, policy_id) =
         auth_data.ok_or(RpcError::Auth(AuthError::InvalidToken))?;
@@ -490,9 +618,10 @@ async fn load_handler_on_demand(
     // Load permissions for this authorization's policy (if any)
     let permissions: Vec<Box<dyn CustomPermission>> = if let Some(pid) = policy_id {
         let policy_repo = PolicyRepository::new(pool.clone());
-        let db_permissions = policy_repo.get_permissions(pid).await.map_err(|e| {
-            RpcError::Internal(format!("Database error loading permissions: {}", e))
-        })?;
+        let db_permissions = policy_repo
+            .get_permissions(pid)
+            .await
+            .map_err(|e| map_repo_error("loading permissions", e))?;
 
         // Convert to CustomPermission trait objects
         db_permissions
@@ -509,7 +638,7 @@ async fn load_handler_on_demand(
     let encrypted_secret: Vec<u8> = personal_keys_repo
         .find_encrypted_key_for_tenant(&user_pubkey, tenant_id)
         .await
-        .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?
+        .map_err(|e| map_repo_error("loading personal key", e))?
         .ok_or_else(|| RpcError::Internal("Personal keys not found".to_string()))?;
 
     // Decrypt the secret key
@@ -654,7 +783,7 @@ async fn load_preloaded_user_handler(
     if user_repo
         .is_unclaimed(user_pubkey_hex, tenant_id)
         .await
-        .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?
+        .map_err(|e| map_repo_error("checking preloaded user", e))?
         .is_none()
     {
         tracing::warn!(
@@ -669,7 +798,7 @@ async fn load_preloaded_user_handler(
     let encrypted_secret: Vec<u8> = personal_keys_repo
         .find_encrypted_key_for_tenant(user_pubkey_hex, tenant_id)
         .await
-        .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?
+        .map_err(|e| map_repo_error("loading preloaded personal key", e))?
         .ok_or_else(|| {
             RpcError::Internal("Personal keys not found for preloaded user".to_string())
         })?;
@@ -1099,26 +1228,29 @@ async fn unwrap_gift_wrap_batch(
     results
 }
 
-/// Spawn activity logging in background (non-blocking)
-/// Updates oauth_authorizations stats without blocking the response
-fn spawn_log_activity(pool: PgPool, is_oauth: bool, authorization_id: i64) {
-    if !is_oauth {
-        return;
-    }
-
-    tokio::spawn(async move {
-        if let Err(e) = sqlx::query(
-            "UPDATE oauth_authorizations
-             SET last_activity = NOW(), activity_count = activity_count + 1
-             WHERE id = $1",
-        )
-        .bind(authorization_id)
-        .execute(&pool)
-        .await
-        {
-            tracing::error!("Failed to update oauth_authorizations activity: {}", e);
+fn log_activity(auth_state: &AuthState, is_oauth: bool, authorization_id: i64) {
+    match auth_state
+        .state
+        .activity_logger
+        .record(is_oauth, authorization_id)
+    {
+        ActivityLogResult::Queued
+        | ActivityLogResult::SkippedNonOauth
+        | ActivityLogResult::Disabled => {}
+        ActivityLogResult::Dropped => {
+            METRICS.inc_http_rpc_activity_dropped();
+            tracing::warn!("Dropped OAuth authorization activity update because queue is full");
         }
-    });
+        // The writer should stop after the HTTP drain. If it is already gone,
+        // this is a real lost update and not the no-op that a never-configured
+        // logger is.
+        ActivityLogResult::WriterStopped => {
+            METRICS.inc_http_rpc_activity_dropped();
+            tracing::warn!(
+                "Dropped OAuth authorization activity update because the writer stopped"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1128,6 +1260,47 @@ mod tests {
     use p256::ecdsa::signature::Signer;
     use p256::ecdsa::{Signature as P256Signature, SigningKey};
     use rand::rngs::OsRng;
+
+    #[test]
+    fn cold_path_pool_exhaustion_is_a_retryable_503_without_leaking_detail() {
+        use keycast_core::repositories::RepositoryError;
+
+        let unavailable = map_repo_error(
+            "loading authorization",
+            RepositoryError::Unavailable("pool timed out".into()),
+        );
+        assert_eq!(http_rpc_outcome(&Err(unavailable)), "unavailable");
+
+        let leaky = map_repo_error(
+            "loading authorization",
+            RepositoryError::Unavailable("connect to db.internal:5432 refused".into()),
+        );
+        let body = format!("{:?}", leaky);
+        assert!(
+            !body.contains("db.internal"),
+            "connect-level detail must stay in the log, not the response: {body}"
+        );
+
+        let internal = map_repo_error(
+            "loading authorization",
+            RepositoryError::Database("relation does not exist".into()),
+        );
+        assert_eq!(http_rpc_outcome(&Err(internal)), "error");
+    }
+
+    #[test]
+    fn handler_timeout_is_a_504_observed_as_its_own_outcome() {
+        let timed_out: Result<Json<NostrRpcResponse>, RpcError> =
+            Err(RpcError::Timeout("RPC request timed out after 8s".into()));
+
+        assert_eq!(http_rpc_outcome(&timed_out), "timeout");
+        assert_eq!(
+            RpcError::Timeout("RPC request timed out after 8s".into())
+                .into_response()
+                .status(),
+            StatusCode::GATEWAY_TIMEOUT
+        );
+    }
 
     fn create_test_handler_with_dpop(expected_jkt: Option<String>) -> HttpRpcHandler {
         let keys = Keys::generate();

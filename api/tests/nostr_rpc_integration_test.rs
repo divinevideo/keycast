@@ -11,6 +11,7 @@ use base64::{
     Engine as _,
 };
 use chrono::{Duration, Utc};
+use keycast_api::activity_log::ActivityLogger;
 use keycast_api::api::{
     http::{
         auth::{sign_event, AuthError, SignEventRequest},
@@ -115,6 +116,14 @@ fn create_test_tenant_extractor(tenant_id: i64) -> TenantExtractor {
 }
 
 fn create_test_auth_state(pool: PgPool, key_manager: Arc<Box<dyn KeyManager>>) -> AuthState {
+    create_test_auth_state_with_activity_logger(pool, key_manager, ActivityLogger::disabled())
+}
+
+fn create_test_auth_state_with_activity_logger(
+    pool: PgPool,
+    key_manager: Arc<Box<dyn KeyManager>>,
+    activity_logger: ActivityLogger,
+) -> AuthState {
     let bcrypt_queue = BcryptQueue::new();
     let secret_pool = SecretPool::new(1);
     let tenant_cache = Cache::builder().max_capacity(10).build();
@@ -130,6 +139,7 @@ fn create_test_auth_state(pool: PgPool, key_manager: Arc<Box<dyn KeyManager>>) -
             bcrypt_sender: bcrypt_queue.sender(),
             redis: None,
             secret_pool: secret_pool.receiver(),
+            activity_logger,
         }),
         auth_tx: None,
     }
@@ -1379,6 +1389,7 @@ async fn test_warm_cache_preload_handler_rejected_after_ucan_expiry() {
                 bcrypt_sender: bcrypt_queue.sender(),
                 redis: None,
                 secret_pool: secret_pool.receiver(),
+                activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),
             }),
             auth_tx: None,
         }
@@ -1496,6 +1507,7 @@ async fn test_server_signed_non_preload_redirect_origin_rejected() {
                 bcrypt_sender: bcrypt_queue.sender(),
                 redis: None,
                 secret_pool: secret_pool.receiver(),
+                activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),
             }),
             auth_tx: None,
         }
@@ -1803,6 +1815,23 @@ async fn setup_wrap_rpc_account(
     expires_at: Option<chrono::DateTime<Utc>>,
     revoked_at: Option<chrono::DateTime<Utc>>,
 ) -> WrapRpcAccount {
+    setup_wrap_rpc_account_with_activity_logger(
+        pool,
+        tenant_id,
+        expires_at,
+        revoked_at,
+        ActivityLogger::disabled(),
+    )
+    .await
+}
+
+async fn setup_wrap_rpc_account_with_activity_logger(
+    pool: &PgPool,
+    tenant_id: i64,
+    expires_at: Option<chrono::DateTime<Utc>>,
+    revoked_at: Option<chrono::DateTime<Utc>>,
+    activity_logger: ActivityLogger,
+) -> WrapRpcAccount {
     let (user_keys, pubkey) = create_test_user();
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
     insert_user(pool, tenant_id, &pubkey).await;
@@ -1826,9 +1855,10 @@ async fn setup_wrap_rpc_account(
         Some(&bunker_pubkey),
     )
     .await;
-    let auth_state = create_test_auth_state(
+    let auth_state = create_test_auth_state_with_activity_logger(
         pool.clone(),
         Arc::new(Box::new(key_manager) as Box<dyn KeyManager>),
+        activity_logger,
     );
 
     WrapRpcAccount {
@@ -2062,7 +2092,18 @@ async fn test_suspended_user_denied_nip17_unwrap_batch() {
 async fn test_nip17_wrap_batch_happy_path_order_duplicates_partial_failure_and_activity() {
     let pool = setup_db().await;
     let tenant_id = create_test_tenant(&pool).await;
-    let account = setup_wrap_rpc_account(&pool, tenant_id, None, None).await;
+    let (activity_logger, activity_worker) =
+        ActivityLogger::with_config(pool.clone(), 16, std::time::Duration::from_millis(10), 16);
+    let activity_shutdown = Arc::new(tokio::sync::Notify::new());
+    let activity_worker_shutdown = activity_shutdown.clone();
+    let activity_worker = tokio::spawn(async move {
+        activity_worker
+            .run_until_shutdown(activity_worker_shutdown)
+            .await;
+    });
+    let account =
+        setup_wrap_rpc_account_with_activity_logger(&pool, tenant_id, None, None, activity_logger)
+            .await;
     let recipient = Keys::generate();
     let rumor = wrap_rumor_param(
         &account.user_keys,
@@ -2142,6 +2183,11 @@ async fn test_nip17_wrap_batch_happy_path_order_duplicates_partial_failure_and_a
         activity_count, 1,
         "the whole batch records exactly one coalesced activity update"
     );
+
+    activity_shutdown.notify_one();
+    activity_worker
+        .await
+        .expect("activity worker exits after shutdown");
 }
 
 #[tokio::test]

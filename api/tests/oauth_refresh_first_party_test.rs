@@ -96,6 +96,7 @@ fn create_test_auth_state(pool: PgPool) -> keycast_api::api::http::routes::AuthS
             bcrypt_sender: bcrypt_queue.sender(),
             redis: None,
             secret_pool: secret_pool.receiver(),
+            activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),
         }),
         auth_tx: None,
     }

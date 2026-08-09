@@ -798,6 +798,7 @@ mod tests {
                 bcrypt_sender: bcrypt_queue.sender(),
                 redis: None,
                 secret_pool: secret_pool.receiver(),
+                activity_logger: crate::activity_log::ActivityLogger::disabled(),
             }),
             auth_tx: None,
         }

@@ -1,3 +1,4 @@
+use crate::activity_log::ActivityLogger;
 use crate::api::tenant::Tenant;
 use crate::bcrypt_queue::BcryptSender;
 use crate::handlers::http_rpc_handler::HttpHandlerCache;
@@ -46,6 +47,8 @@ pub struct KeycastState {
     /// Pre-computed secret pool for instant authorization creation
     /// Background producer generates (secret, bcrypt_hash) pairs ahead of time
     pub secret_pool: SecretPoolReceiver,
+    /// Bounded writer for OAuth authorization activity updates.
+    pub activity_logger: ActivityLogger,
 }
 
 pub static KEYCAST_STATE: OnceCell<Arc<KeycastState>> = OnceCell::new();

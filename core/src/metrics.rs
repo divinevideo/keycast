@@ -12,6 +12,10 @@ use std::{
 };
 
 const AUTH_DURATION_BUCKETS: [f64; 8] = [0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
+const HTTP_RPC_DURATION_BUCKETS: [f64; 12] = [
+    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+];
+const HTTP_RPC_ACQUIRE_BUCKETS: [f64; 9] = [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1.0, 5.0];
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct AuthRequestKey {
@@ -31,6 +35,52 @@ struct AuthDurationMetric {
     buckets: [u64; AUTH_DURATION_BUCKETS.len()],
     count: u64,
     sum: f64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct HttpRpcDurationKey {
+    method: String,
+    outcome: String,
+}
+
+#[derive(Clone, Debug)]
+struct HttpRpcDurationMetric {
+    buckets: [u64; HTTP_RPC_DURATION_BUCKETS.len()],
+    count: u64,
+    sum: f64,
+}
+
+impl Default for HttpRpcDurationMetric {
+    fn default() -> Self {
+        Self {
+            buckets: [0; HTTP_RPC_DURATION_BUCKETS.len()],
+            count: 0,
+            sum: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct HttpRpcAcquireKey {
+    operation: String,
+    outcome: String,
+}
+
+#[derive(Clone, Debug)]
+struct HttpRpcAcquireMetric {
+    buckets: [u64; HTTP_RPC_ACQUIRE_BUCKETS.len()],
+    count: u64,
+    sum: f64,
+}
+
+impl Default for HttpRpcAcquireMetric {
+    fn default() -> Self {
+        Self {
+            buckets: [0; HTTP_RPC_ACQUIRE_BUCKETS.len()],
+            count: 0,
+            sum: 0.0,
+        }
+    }
 }
 
 /// Global metrics counters accessible from any crate
@@ -72,6 +122,13 @@ pub struct Metrics {
     pub http_rpc_success: AtomicU64,
     /// HTTP RPC authorization errors
     pub http_rpc_auth_errors: AtomicU64,
+    /// Current SQLx pool size observed by HTTP RPC.
+    pub http_rpc_db_pool_size: AtomicU64,
+    /// Current SQLx idle connection count observed by HTTP RPC.
+    pub http_rpc_db_pool_idle: AtomicU64,
+    /// OAuth activity updates that never reached the database: queue full,
+    /// writer already stopped, or given up after repeated flush failures.
+    pub http_rpc_activity_dropped: AtomicU64,
 
     // === Auth Metrics ===
     /// Total successful user registrations
@@ -94,6 +151,9 @@ pub struct Metrics {
     auth_request_durations: Mutex<BTreeMap<AuthDurationKey, AuthDurationMetric>>,
     auth_audit_write_failures_total: Mutex<BTreeMap<String, u64>>,
     auth_email_send_failures_total: Mutex<BTreeMap<String, u64>>,
+    http_rpc_request_durations: Mutex<BTreeMap<HttpRpcDurationKey, HttpRpcDurationMetric>>,
+    http_rpc_status_check_durations: Mutex<BTreeMap<String, HttpRpcDurationMetric>>,
+    http_rpc_db_acquire_durations: Mutex<BTreeMap<HttpRpcAcquireKey, HttpRpcAcquireMetric>>,
 }
 
 impl Metrics {
@@ -117,6 +177,9 @@ impl Metrics {
             http_rpc_cache_size: AtomicU64::new(0),
             http_rpc_success: AtomicU64::new(0),
             http_rpc_auth_errors: AtomicU64::new(0),
+            http_rpc_db_pool_size: AtomicU64::new(0),
+            http_rpc_db_pool_idle: AtomicU64::new(0),
+            http_rpc_activity_dropped: AtomicU64::new(0),
             // Auth metrics
             registrations_total: AtomicU64::new(0),
             logins_total: AtomicU64::new(0),
@@ -130,6 +193,9 @@ impl Metrics {
             auth_request_durations: Mutex::new(BTreeMap::new()),
             auth_audit_write_failures_total: Mutex::new(BTreeMap::new()),
             auth_email_send_failures_total: Mutex::new(BTreeMap::new()),
+            http_rpc_request_durations: Mutex::new(BTreeMap::new()),
+            http_rpc_status_check_durations: Mutex::new(BTreeMap::new()),
+            http_rpc_db_acquire_durations: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -203,6 +269,58 @@ impl Metrics {
 
     pub fn inc_http_rpc_auth_error(&self) {
         self.http_rpc_auth_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn observe_http_rpc_request(&self, method: &str, outcome: &str, duration: Duration) {
+        let method = normalize_http_rpc_method(method).to_string();
+        let outcome = normalize_http_rpc_outcome(outcome).to_string();
+        let mut duration_metrics = self
+            .http_rpc_request_durations
+            .lock()
+            .expect("http rpc duration metrics lock poisoned");
+        let metric = duration_metrics
+            .entry(HttpRpcDurationKey { method, outcome })
+            .or_default();
+        observe_http_rpc_duration(metric, duration);
+    }
+
+    pub fn observe_http_rpc_status_check(&self, outcome: &str, duration: Duration) {
+        let outcome = normalize_http_rpc_outcome(outcome).to_string();
+        let mut duration_metrics = self
+            .http_rpc_status_check_durations
+            .lock()
+            .expect("http rpc status check metrics lock poisoned");
+        let metric = duration_metrics.entry(outcome).or_default();
+        observe_http_rpc_duration(metric, duration);
+    }
+
+    pub fn observe_http_rpc_db_acquire(&self, operation: &str, outcome: &str, duration: Duration) {
+        let operation = normalize_http_rpc_db_operation(operation).to_string();
+        let outcome = normalize_http_rpc_outcome(outcome).to_string();
+        let mut duration_metrics = self
+            .http_rpc_db_acquire_durations
+            .lock()
+            .expect("http rpc db acquire metrics lock poisoned");
+        let metric = duration_metrics
+            .entry(HttpRpcAcquireKey { operation, outcome })
+            .or_default();
+        observe_http_rpc_acquire_duration(metric, duration);
+    }
+
+    pub fn set_http_rpc_db_pool_state(&self, size: u32, idle: u32) {
+        self.http_rpc_db_pool_size
+            .store(size as u64, Ordering::Relaxed);
+        self.http_rpc_db_pool_idle
+            .store(idle as u64, Ordering::Relaxed);
+    }
+
+    pub fn inc_http_rpc_activity_dropped(&self) {
+        self.add_http_rpc_activity_dropped(1);
+    }
+
+    pub fn add_http_rpc_activity_dropped(&self, count: u64) {
+        self.http_rpc_activity_dropped
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     // === Auth metric methods ===
@@ -426,6 +544,123 @@ impl Metrics {
             self.http_rpc_auth_errors.load(Ordering::Relaxed)
         ));
 
+        output.push_str(
+            "\n# HELP keycast_http_rpc_request_duration_seconds HTTP RPC request latency by method and outcome\n",
+        );
+        output.push_str("# TYPE keycast_http_rpc_request_duration_seconds histogram\n");
+        for (key, metric) in self
+            .http_rpc_request_durations
+            .lock()
+            .expect("http rpc duration metrics lock poisoned")
+            .iter()
+        {
+            for (index, bucket) in HTTP_RPC_DURATION_BUCKETS.iter().enumerate() {
+                output.push_str(&format!(
+                    "keycast_http_rpc_request_duration_seconds_bucket{{method=\"{}\",outcome=\"{}\",le=\"{}\"}} {}\n",
+                    key.method, key.outcome, bucket, metric.buckets[index]
+                ));
+            }
+            output.push_str(&format!(
+                "keycast_http_rpc_request_duration_seconds_bucket{{method=\"{}\",outcome=\"{}\",le=\"+Inf\"}} {}\n",
+                key.method, key.outcome, metric.count
+            ));
+            output.push_str(&format!(
+                "keycast_http_rpc_request_duration_seconds_sum{{method=\"{}\",outcome=\"{}\"}} {}\n",
+                key.method, key.outcome, metric.sum
+            ));
+            output.push_str(&format!(
+                "keycast_http_rpc_request_duration_seconds_count{{method=\"{}\",outcome=\"{}\"}} {}\n",
+                key.method, key.outcome, metric.count
+            ));
+        }
+
+        output.push_str(
+            "\n# HELP keycast_http_rpc_status_check_duration_seconds HTTP RPC live user status check latency by outcome\n",
+        );
+        output.push_str("# TYPE keycast_http_rpc_status_check_duration_seconds histogram\n");
+        for (outcome, metric) in self
+            .http_rpc_status_check_durations
+            .lock()
+            .expect("http rpc status check metrics lock poisoned")
+            .iter()
+        {
+            for (index, bucket) in HTTP_RPC_DURATION_BUCKETS.iter().enumerate() {
+                output.push_str(&format!(
+                    "keycast_http_rpc_status_check_duration_seconds_bucket{{outcome=\"{}\",le=\"{}\"}} {}\n",
+                    outcome, bucket, metric.buckets[index]
+                ));
+            }
+            output.push_str(&format!(
+                "keycast_http_rpc_status_check_duration_seconds_bucket{{outcome=\"{}\",le=\"+Inf\"}} {}\n",
+                outcome, metric.count
+            ));
+            output.push_str(&format!(
+                "keycast_http_rpc_status_check_duration_seconds_sum{{outcome=\"{}\"}} {}\n",
+                outcome, metric.sum
+            ));
+            output.push_str(&format!(
+                "keycast_http_rpc_status_check_duration_seconds_count{{outcome=\"{}\"}} {}\n",
+                outcome, metric.count
+            ));
+        }
+
+        output.push_str(
+            "\n# HELP keycast_http_rpc_db_acquire_duration_seconds HTTP RPC DB acquire wait by operation and outcome\n",
+        );
+        output.push_str("# TYPE keycast_http_rpc_db_acquire_duration_seconds histogram\n");
+        for (key, metric) in self
+            .http_rpc_db_acquire_durations
+            .lock()
+            .expect("http rpc db acquire metrics lock poisoned")
+            .iter()
+        {
+            for (index, bucket) in HTTP_RPC_ACQUIRE_BUCKETS.iter().enumerate() {
+                output.push_str(&format!(
+                    "keycast_http_rpc_db_acquire_duration_seconds_bucket{{operation=\"{}\",outcome=\"{}\",le=\"{}\"}} {}\n",
+                    key.operation, key.outcome, bucket, metric.buckets[index]
+                ));
+            }
+            output.push_str(&format!(
+                "keycast_http_rpc_db_acquire_duration_seconds_bucket{{operation=\"{}\",outcome=\"{}\",le=\"+Inf\"}} {}\n",
+                key.operation, key.outcome, metric.count
+            ));
+            output.push_str(&format!(
+                "keycast_http_rpc_db_acquire_duration_seconds_sum{{operation=\"{}\",outcome=\"{}\"}} {}\n",
+                key.operation, key.outcome, metric.sum
+            ));
+            output.push_str(&format!(
+                "keycast_http_rpc_db_acquire_duration_seconds_count{{operation=\"{}\",outcome=\"{}\"}} {}\n",
+                key.operation, key.outcome, metric.count
+            ));
+        }
+
+        output.push_str(
+            "\n# HELP keycast_http_rpc_db_pool_size Current SQLx pool size observed by HTTP RPC\n",
+        );
+        output.push_str("# TYPE keycast_http_rpc_db_pool_size gauge\n");
+        output.push_str(&format!(
+            "keycast_http_rpc_db_pool_size {}\n",
+            self.http_rpc_db_pool_size.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(
+            "\n# HELP keycast_http_rpc_db_pool_idle Current SQLx idle connection count observed by HTTP RPC\n",
+        );
+        output.push_str("# TYPE keycast_http_rpc_db_pool_idle gauge\n");
+        output.push_str(&format!(
+            "keycast_http_rpc_db_pool_idle {}\n",
+            self.http_rpc_db_pool_idle.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(
+            "\n# HELP keycast_http_rpc_activity_dropped_total OAuth activity updates that never reached the database (queue full, writer stopped, or given up after repeated flush failures)\n",
+        );
+        output.push_str("# TYPE keycast_http_rpc_activity_dropped_total counter\n");
+        output.push_str(&format!(
+            "keycast_http_rpc_activity_dropped_total {}\n",
+            self.http_rpc_activity_dropped.load(Ordering::Relaxed)
+        ));
+
         // Auth metrics
         output
             .push_str("\n# HELP keycast_registrations_total Total successful user registrations\n");
@@ -557,6 +792,62 @@ impl Metrics {
     }
 }
 
+fn observe_http_rpc_duration(metric: &mut HttpRpcDurationMetric, duration: Duration) {
+    let seconds = duration.as_secs_f64();
+    metric.count += 1;
+    metric.sum += seconds;
+    for (index, bucket) in HTTP_RPC_DURATION_BUCKETS.iter().enumerate() {
+        if seconds <= *bucket {
+            metric.buckets[index] += 1;
+        }
+    }
+}
+
+fn observe_http_rpc_acquire_duration(metric: &mut HttpRpcAcquireMetric, duration: Duration) {
+    let seconds = duration.as_secs_f64();
+    metric.count += 1;
+    metric.sum += seconds;
+    for (index, bucket) in HTTP_RPC_ACQUIRE_BUCKETS.iter().enumerate() {
+        if seconds <= *bucket {
+            metric.buckets[index] += 1;
+        }
+    }
+}
+
+fn normalize_http_rpc_method(method: &str) -> &'static str {
+    match method {
+        "get_public_key" => "get_public_key",
+        "sign_event" => "sign_event",
+        "nip04_encrypt" => "nip04_encrypt",
+        "nip04_decrypt" => "nip04_decrypt",
+        "nip44_encrypt" => "nip44_encrypt",
+        "nip44_decrypt" => "nip44_decrypt",
+        "nip17_unwrap_batch" => "nip17_unwrap_batch",
+        "nip17_wrap_batch" => "nip17_wrap_batch",
+        _ => "unsupported",
+    }
+}
+
+fn normalize_http_rpc_outcome(outcome: &str) -> &'static str {
+    match outcome {
+        "success" => "success",
+        "auth_error" => "auth_error",
+        "client_error" => "client_error",
+        "account_restricted" => "account_restricted",
+        "unavailable" => "unavailable",
+        "timeout" => "timeout",
+        "error" => "error",
+        _ => "other",
+    }
+}
+
+fn normalize_http_rpc_db_operation(operation: &str) -> &'static str {
+    match operation {
+        "check_user_status_active" => "check_user_status_active",
+        _ => "other",
+    }
+}
+
 fn normalize_auth_endpoint(endpoint: &str) -> &'static str {
     match endpoint {
         "/api/auth/register" => "/api/auth/register",
@@ -668,5 +959,38 @@ mod tests {
         ));
         assert!(output
             .contains("keycast_auth_email_send_failures_total{template=\"password_reset\"} 1"));
+    }
+
+    #[test]
+    fn test_http_rpc_labeled_metrics_render_long_tail_buckets() {
+        let metrics = Metrics::new();
+
+        metrics.observe_http_rpc_request("nip44_encrypt", "success", Duration::from_secs(23));
+        metrics.observe_http_rpc_status_check("success", Duration::from_millis(25));
+        metrics.observe_http_rpc_db_acquire(
+            "check_user_status_active",
+            "success",
+            Duration::from_millis(20),
+        );
+        metrics.set_http_rpc_db_pool_state(50, 2);
+        metrics.inc_http_rpc_activity_dropped();
+
+        let output = metrics.to_prometheus();
+
+        assert!(output.contains(
+            "keycast_http_rpc_request_duration_seconds_bucket{method=\"nip44_encrypt\",outcome=\"success\",le=\"30\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_http_rpc_request_duration_seconds_bucket{method=\"nip44_encrypt\",outcome=\"success\",le=\"10\"} 0"
+        ));
+        assert!(output.contains(
+            "keycast_http_rpc_status_check_duration_seconds_count{outcome=\"success\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_http_rpc_db_acquire_duration_seconds_count{operation=\"check_user_status_active\",outcome=\"success\"} 1"
+        ));
+        assert!(output.contains("keycast_http_rpc_db_pool_size 50"));
+        assert!(output.contains("keycast_http_rpc_db_pool_idle 2"));
+        assert!(output.contains("keycast_http_rpc_activity_dropped_total 1"));
     }
 }

@@ -15,8 +15,10 @@
 //! an open transaction while independently acquiring a second connection from
 //! the same pool needs TWO connections to serve ONE request. That does not fail
 //! in a quiet test suite -- it fails under concurrency, by stalling every
-//! stalled request for the full 60s while it keeps holding its first
-//! connection. One exposed handler can starve login, OAuth and the signer.
+//! stalled request for the full acquire timeout while it keeps holding its
+//! first connection. One exposed handler can starve login, OAuth and the
+//! signer. The shorter timeout caps how long each stall lasts; it does not stop
+//! the second connection from being demanded.
 //!
 //! Concurrency tests cannot pin this down: whether they trip depends on burst
 //! size versus pool size, which makes them knife edges that pass for the wrong
@@ -129,7 +131,7 @@ where
                  whole time and starving every other endpoint on the instance.\n\n\
                  Fix: thread the open transaction into the inner call (`&mut *tx`) instead of \
                  letting it reach for the pool.",
-                stall = 60,
+                stall = 5,
             );
         }
         Err(error) => panic!("{label} did not reach its expected success path: {error:?}"),
@@ -139,7 +141,7 @@ where
 fn is_pool_timeout(error: &RepositoryError) -> bool {
     matches!(
         error,
-        RepositoryError::Database(message)
+        RepositoryError::Unavailable(message) | RepositoryError::Database(message)
             if message.contains("PoolTimedOut") || message.contains("pool timed out")
     )
 }
