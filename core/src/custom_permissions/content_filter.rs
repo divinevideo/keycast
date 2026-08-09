@@ -48,6 +48,17 @@ impl CustomPermission for ContentFilter {
         }
     }
 
+    fn can_sign_creator_binding(&self, payload: &[u8]) -> bool {
+        let Ok(payload) = std::str::from_utf8(payload) else {
+            return false;
+        };
+
+        match &self.config.blocked_words {
+            None => true,
+            Some(words) => !words.iter().any(|word| payload.contains(word)),
+        }
+    }
+
     fn can_encrypt(
         &self,
         plaintext: &str,

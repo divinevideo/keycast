@@ -6,7 +6,10 @@
 mod common;
 
 use axum::{extract::State, http::HeaderMap, Json};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use chrono::{Duration, Utc};
 use keycast_api::api::{
     http::{
@@ -398,6 +401,35 @@ async fn create_kind_restricted_policy(pool: &PgPool, allowed_kinds: Vec<u16>) -
     policy_id
 }
 
+async fn policy_id_by_slug(pool: &PgPool, slug: &str) -> i32 {
+    sqlx::query_scalar("SELECT id FROM policies WHERE slug = $1")
+        .bind(slug)
+        .fetch_one(pool)
+        .await
+        .expect("seeded policy should exist")
+}
+
+fn creator_binding_payload(pubkey: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "version": 1,
+        "pubkey": pubkey,
+        "sig_alg": "nostr.secp256k1",
+        "created_at": "2026-04-29T00:00:00Z",
+        "claims": {
+            "nip05": "creator@example.com",
+            "website": "https://example.com"
+        },
+        "referenced_assertions": [
+            {"url": "self#jumbf=/c2pa/assertions/c2pa.hash.data"}
+        ],
+        "hard_binding": {
+            "alg": "sha256",
+            "value": "39341a12a2f77007d6e72841f667523d39463a825d82c6c98981881283fb7ed0"
+        }
+    }))
+    .expect("valid creator-binding JSON")
+}
+
 /// Simulates load_handler_on_demand - loads user keys from DB and creates HttpRpcHandler
 /// Note: This loads regardless of expiration/revocation - caller should check is_valid()
 async fn load_handler_from_db(
@@ -766,6 +798,329 @@ async fn test_sign_event_blocked_by_policy() {
         .expect("Signing allowed event should succeed");
 
     signed.verify().expect("Signature should be valid");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_sign_canonical_returns_hex_signature_for_profile_policy() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (user_keys, pubkey) = create_test_user();
+    let key_manager: Arc<Box<dyn KeyManager>> = Arc::new(Box::new(
+        FileKeyManager::new().expect("Failed to create key manager"),
+    ));
+
+    insert_user(&pool, tenant_id, &pubkey).await;
+    create_personal_key(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &user_keys,
+        key_manager.as_ref().as_ref(),
+    )
+    .await;
+
+    let policy_id = create_kind_restricted_policy(&pool, vec![0]).await;
+    let redirect_origin = format!("https://canonical-ok-{}.example.com", Uuid::new_v4());
+    let (_auth_id, bunker_pubkey) = create_test_oauth_authorization(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &redirect_origin,
+        Some(policy_id),
+        None,
+        None,
+    )
+    .await;
+    let token = build_self_signed_ucan(
+        &user_keys,
+        tenant_id,
+        &redirect_origin,
+        Some(&bunker_pubkey),
+    )
+    .await;
+    let auth_state = create_test_auth_state(pool.clone(), key_manager);
+    let payload = creator_binding_payload(&pubkey);
+
+    let response = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state,
+        &format!("Bearer {}", token),
+        None,
+        NostrRpcRequest {
+            method: "sign_canonical".to_string(),
+            params: vec![Value::String(STANDARD.encode(payload))],
+        },
+    )
+    .await
+    .expect("sign_canonical should succeed");
+
+    let signature = response
+        .result
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .expect("signature result");
+    assert_eq!(signature.len(), 128);
+    assert!(signature.chars().all(|c| c.is_ascii_hexdigit()));
+}
+
+#[tokio::test]
+#[serial]
+async fn test_sign_canonical_rejects_invalid_payload_without_unsupported_latch_text() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (user_keys, pubkey) = create_test_user();
+    let key_manager: Arc<Box<dyn KeyManager>> = Arc::new(Box::new(
+        FileKeyManager::new().expect("Failed to create key manager"),
+    ));
+
+    insert_user(&pool, tenant_id, &pubkey).await;
+    create_personal_key(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &user_keys,
+        key_manager.as_ref().as_ref(),
+    )
+    .await;
+
+    let policy_id = create_kind_restricted_policy(&pool, vec![0]).await;
+    let redirect_origin = format!("https://canonical-invalid-{}.example.com", Uuid::new_v4());
+    let (_auth_id, bunker_pubkey) = create_test_oauth_authorization(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &redirect_origin,
+        Some(policy_id),
+        None,
+        None,
+    )
+    .await;
+    let token = build_self_signed_ucan(
+        &user_keys,
+        tenant_id,
+        &redirect_origin,
+        Some(&bunker_pubkey),
+    )
+    .await;
+    let auth_state = create_test_auth_state(pool.clone(), key_manager);
+
+    let err = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state,
+        &format!("Bearer {}", token),
+        None,
+        NostrRpcRequest {
+            method: "sign_canonical".to_string(),
+            params: vec![Value::String(
+                STANDARD.encode("divine-creator-binding-test"),
+            )],
+        },
+    )
+    .await
+    .expect_err("bare string payload should be rejected");
+
+    match err {
+        RpcError::InvalidParams(message) => {
+            let lower = message.to_lowercase();
+            assert!(!lower.contains("unsupported method"));
+            assert!(!lower.contains("method not found"));
+        }
+        other => panic!("expected InvalidParams, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_sign_canonical_denied_by_non_profile_policy() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (user_keys, pubkey) = create_test_user();
+    let key_manager: Arc<Box<dyn KeyManager>> = Arc::new(Box::new(
+        FileKeyManager::new().expect("Failed to create key manager"),
+    ));
+
+    insert_user(&pool, tenant_id, &pubkey).await;
+    create_personal_key(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &user_keys,
+        key_manager.as_ref().as_ref(),
+    )
+    .await;
+
+    let policy_id = create_kind_restricted_policy(&pool, vec![1]).await;
+    let redirect_origin = format!("https://canonical-policy-{}.example.com", Uuid::new_v4());
+    let (_auth_id, bunker_pubkey) = create_test_oauth_authorization(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &redirect_origin,
+        Some(policy_id),
+        None,
+        None,
+    )
+    .await;
+    let token = build_self_signed_ucan(
+        &user_keys,
+        tenant_id,
+        &redirect_origin,
+        Some(&bunker_pubkey),
+    )
+    .await;
+    let auth_state = create_test_auth_state(pool.clone(), key_manager);
+
+    let err = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state,
+        &format!("Bearer {}", token),
+        None,
+        NostrRpcRequest {
+            method: "sign_canonical".to_string(),
+            params: vec![Value::String(
+                STANDARD.encode(creator_binding_payload(&pubkey)),
+            )],
+        },
+    )
+    .await
+    .expect_err("kind 1 policy should deny creator-binding signing");
+
+    match err {
+        RpcError::Auth(AuthError::Forbidden(message)) => {
+            assert_eq!(message, "Operation denied by policy");
+        }
+        other => panic!("expected Forbidden, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_sign_canonical_denied_by_readonly_policy() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (user_keys, pubkey) = create_test_user();
+    let key_manager: Arc<Box<dyn KeyManager>> = Arc::new(Box::new(
+        FileKeyManager::new().expect("Failed to create key manager"),
+    ));
+
+    insert_user(&pool, tenant_id, &pubkey).await;
+    create_personal_key(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &user_keys,
+        key_manager.as_ref().as_ref(),
+    )
+    .await;
+
+    let policy_id = policy_id_by_slug(&pool, "readonly").await;
+    let redirect_origin = format!("https://canonical-readonly-{}.example.com", Uuid::new_v4());
+    let (_auth_id, bunker_pubkey) = create_test_oauth_authorization(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &redirect_origin,
+        Some(policy_id),
+        None,
+        None,
+    )
+    .await;
+    let token = build_self_signed_ucan(
+        &user_keys,
+        tenant_id,
+        &redirect_origin,
+        Some(&bunker_pubkey),
+    )
+    .await;
+    let auth_state = create_test_auth_state(pool.clone(), key_manager);
+
+    let err = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state,
+        &format!("Bearer {}", token),
+        None,
+        NostrRpcRequest {
+            method: "sign_canonical".to_string(),
+            params: vec![Value::String(
+                STANDARD.encode(creator_binding_payload(&pubkey)),
+            )],
+        },
+    )
+    .await
+    .expect_err("readonly policy should deny creator-binding signing");
+
+    match err {
+        RpcError::Auth(AuthError::Forbidden(message)) => {
+            assert_eq!(message, "Operation denied by policy");
+        }
+        other => panic!("expected Forbidden, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_suspended_user_denied_nostr_rpc_sign_canonical() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (user_keys, pubkey) = create_test_user();
+    let key_manager: Arc<Box<dyn KeyManager>> = Arc::new(Box::new(
+        FileKeyManager::new().expect("Failed to create key manager"),
+    ));
+
+    insert_user(&pool, tenant_id, &pubkey).await;
+    create_personal_key(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &user_keys,
+        key_manager.as_ref().as_ref(),
+    )
+    .await;
+
+    let policy_id = create_kind_restricted_policy(&pool, vec![0]).await;
+    let redirect_origin = format!("https://canonical-suspend-{}.example.com", Uuid::new_v4());
+    let (_auth_id, bunker_pubkey) = create_test_oauth_authorization(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &redirect_origin,
+        Some(policy_id),
+        None,
+        None,
+    )
+    .await;
+    suspend_user(&pool, &pubkey, tenant_id).await;
+
+    let token = build_self_signed_ucan(
+        &user_keys,
+        tenant_id,
+        &redirect_origin,
+        Some(&bunker_pubkey),
+    )
+    .await;
+    let auth_state = create_test_auth_state(pool.clone(), key_manager);
+
+    let err = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state,
+        &format!("Bearer {}", token),
+        None,
+        NostrRpcRequest {
+            method: "sign_canonical".to_string(),
+            params: vec![Value::String(
+                STANDARD.encode(creator_binding_payload(&pubkey)),
+            )],
+        },
+    )
+    .await
+    .expect_err("suspended user should be denied creator-binding signing");
+
+    match err {
+        RpcError::AccountSuspended(message) => {
+            assert_eq!(message, "Account restricted");
+        }
+        other => panic!("expected AccountSuspended, got {other:?}"),
+    }
 }
 
 // ============================================================================

@@ -29,6 +29,10 @@ impl CustomPermission for EncryptToSelf {
         true
     }
 
+    fn can_sign_creator_binding(&self, _payload: &[u8]) -> bool {
+        true
+    }
+
     fn can_encrypt(
         &self,
         _plaintext: &str,

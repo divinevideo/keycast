@@ -131,6 +131,11 @@ curl -X POST https://login.divine.video/api/nostr \
   }'
 ```
 
+`POST /api/nostr` also supports `sign_canonical` for C2PA creator-binding payloads.
+Pass a single base64-encoded creator-binding JSON payload; Keycast validates the
+payload shape and authorization policy before returning a deterministic BIP-340
+signature as lowercase hex.
+
 An OpenAPI description is served at `/docs/openapi.json` and lives at [`api/openapi.yaml`](./api/openapi.yaml).
 
 ## Architecture

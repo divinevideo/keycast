@@ -41,6 +41,10 @@ impl CustomPermission for DecryptOnly {
         kind == NIP42_AUTH_KIND
     }
 
+    fn can_sign_creator_binding(&self, _payload: &[u8]) -> bool {
+        false
+    }
+
     fn can_encrypt(
         &self,
         _plaintext: &str,

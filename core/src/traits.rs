@@ -37,6 +37,13 @@ pub trait CustomPermission: Send + Sync {
     /// A function that returns true if allowed to sign the event.
     fn can_sign(&self, event: &UnsignedEvent) -> bool;
 
+    /// A function that returns true if allowed to sign a creator-binding payload.
+    ///
+    /// This is intentionally separate from [`Self::can_sign`] because the
+    /// payload is not a Nostr event and has no event kind. Implementations should
+    /// map this to their nearest signing restriction.
+    fn can_sign_creator_binding(&self, payload: &[u8]) -> bool;
+
     /// A function that returns true if allowed to encrypt the content for the recipient.
     /// Sender is the pubkey of the user requesting the encryption
     fn can_encrypt(

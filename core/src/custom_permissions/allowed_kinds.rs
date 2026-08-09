@@ -26,6 +26,7 @@ impl AllowedKinds {
 
 /// Event kind categories for DM-related kinds
 const DM_KINDS: [u16; 3] = [4, 44, 1059];
+const PROFILE_KIND: u16 = 0;
 
 /// Map a Nostr event kind to a user-friendly description
 fn kind_to_friendly_name(kind: u16) -> &'static str {
@@ -66,6 +67,13 @@ impl CustomPermission for AllowedKinds {
         match &self.config.allowed_kinds {
             None => true,
             Some(kinds) => kinds.contains(&event.kind.into()),
+        }
+    }
+
+    fn can_sign_creator_binding(&self, _payload: &[u8]) -> bool {
+        match &self.config.allowed_kinds {
+            None => true,
+            Some(kinds) => kinds.contains(&PROFILE_KIND),
         }
     }
 
