@@ -26,7 +26,13 @@ const KMS_BASE_DELAY_MS: u64 = 100;
 /// and third attempts could never deliver a response inside that budget, so the
 /// retries were dead weight on the hot path: the request was cancelled mid-loop
 /// instead of failing over. `kms_retry_loop_fits_inside_the_http_rpc_request_bound`
-/// holds that arithmetic if any of these are retuned.
+/// holds that arithmetic against
+/// [`crate::request_bounds::HTTP_RPC_HANDLER_TIMEOUT`] if any of these are
+/// retuned.
+///
+/// 6.3s reserves the KMS loop alone. A cold handler load does its database work
+/// before it reaches `decrypt`, so more than ~1.7s of database latency ahead of
+/// this still cancels the request mid-loop.
 const KMS_ATTEMPT_TIMEOUT_SECS: u64 = 2;
 
 /// Worst-case wall clock for a full [`MAX_KMS_RETRIES`] loop, asserted below so
@@ -256,7 +262,7 @@ mod tests {
     /// this true.
     #[test]
     fn kms_retry_loop_fits_inside_the_http_rpc_request_bound() {
-        const HTTP_RPC_HANDLER_TIMEOUT: Duration = Duration::from_secs(8);
+        use crate::request_bounds::HTTP_RPC_HANDLER_TIMEOUT;
 
         assert!(
             KMS_TOTAL_BUDGET < HTTP_RPC_HANDLER_TIMEOUT,

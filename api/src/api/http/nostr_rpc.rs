@@ -32,7 +32,10 @@ use super::routes::AuthState;
 
 /// Wall-clock bound for a single HTTP RPC request, held just under the route's
 /// tower timeout so this handler is the one that normally reports the timeout.
-const HANDLER_TIMEOUT: Duration = Duration::from_secs(8);
+///
+/// Defined in `core` because the budgets nested inside it — the SQLx acquire
+/// timeout and the KMS retry loop — are asserted against it there.
+const HANDLER_TIMEOUT: Duration = keycast_core::request_bounds::HTTP_RPC_HANDLER_TIMEOUT;
 
 /// Maximum gift wraps accepted in a single `nip17_unwrap_batch` request.
 /// Bounds per-request work and keeps the body well under axum's 2 MB default
