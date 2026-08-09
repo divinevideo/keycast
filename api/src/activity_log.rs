@@ -3,14 +3,7 @@
 
 use keycast_core::metrics::METRICS;
 use sqlx::PgPool;
-use std::{
-    collections::BTreeMap,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::{
     sync::{mpsc, Notify},
     time::MissedTickBehavior,
@@ -31,16 +24,14 @@ pub enum ActivityLogResult {
     Dropped,
     SkippedNonOauth,
     Disabled,
-    /// The writer has already stopped. Distinct from `Disabled` because it is a
-    /// lost update: the API keeps serving in-flight requests through the HTTP
-    /// drain after the writer exits, and those records have nowhere to go.
+    /// The writer has already stopped. Distinct from `Disabled` because the
+    /// record would have been accepted before shutdown drain completed.
     WriterStopped,
 }
 
 #[derive(Debug, Clone)]
 pub struct ActivityLogger {
     sender: Option<mpsc::Sender<ActivityLogEvent>>,
-    dropped_total: Arc<AtomicU64>,
 }
 
 impl ActivityLogger {
@@ -60,12 +51,10 @@ impl ActivityLogger {
         max_batch_ids: usize,
     ) -> (Self, ActivityLogWorker) {
         let (sender, receiver) = mpsc::channel(queue_capacity);
-        let dropped_total = Arc::new(AtomicU64::new(0));
 
         (
             Self {
                 sender: Some(sender),
-                dropped_total: dropped_total.clone(),
             },
             ActivityLogWorker {
                 pool,
@@ -77,10 +66,7 @@ impl ActivityLogger {
     }
 
     pub fn disabled() -> Self {
-        Self {
-            sender: None,
-            dropped_total: Arc::new(AtomicU64::new(0)),
-        }
+        Self { sender: None }
     }
 
     pub fn record(&self, is_oauth: bool, authorization_id: i64) -> ActivityLogResult {
@@ -94,16 +80,9 @@ impl ActivityLogger {
 
         match sender.try_send(ActivityLogEvent { authorization_id }) {
             Ok(()) => ActivityLogResult::Queued,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                self.dropped_total.fetch_add(1, Ordering::Relaxed);
-                ActivityLogResult::Dropped
-            }
+            Err(mpsc::error::TrySendError::Full(_)) => ActivityLogResult::Dropped,
             Err(mpsc::error::TrySendError::Closed(_)) => ActivityLogResult::WriterStopped,
         }
-    }
-
-    pub fn dropped_total(&self) -> u64 {
-        self.dropped_total.load(Ordering::Relaxed)
     }
 }
 
@@ -263,6 +242,7 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use sqlx::postgres::PgPoolOptions;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn disabled_logger_does_not_queue() {
@@ -270,7 +250,6 @@ mod tests {
 
         assert_eq!(logger.record(false, 1), ActivityLogResult::SkippedNonOauth);
         assert_eq!(logger.record(true, 1), ActivityLogResult::Disabled);
-        assert_eq!(logger.dropped_total(), 0);
     }
 
     #[tokio::test]
@@ -284,7 +263,6 @@ mod tests {
 
         assert_eq!(logger.record(true, 10), ActivityLogResult::Queued);
         assert_eq!(logger.record(true, 11), ActivityLogResult::Dropped);
-        assert_eq!(logger.dropped_total(), 1);
     }
 
     #[tokio::test]

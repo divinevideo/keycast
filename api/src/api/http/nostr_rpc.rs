@@ -268,7 +268,7 @@ async fn nostr_rpc_inner(
                 handler.authorization_id()
             );
 
-            spawn_log_activity(pool.clone(), handler.is_oauth(), handler.authorization_id());
+            log_activity(&auth_state, handler.is_oauth(), handler.authorization_id());
 
             JsonValue::String(signature)
         }
@@ -1241,9 +1241,9 @@ fn log_activity(auth_state: &AuthState, is_oauth: bool, authorization_id: i64) {
             METRICS.inc_http_rpc_activity_dropped();
             tracing::warn!("Dropped OAuth authorization activity update because queue is full");
         }
-        // The writer stops at the start of the HTTP drain while axum keeps
-        // serving in-flight requests, so this is a real lost update and not the
-        // no-op that a never-configured logger is.
+        // The writer should stop after the HTTP drain. If it is already gone,
+        // this is a real lost update and not the no-op that a never-configured
+        // logger is.
         ActivityLogResult::WriterStopped => {
             METRICS.inc_http_rpc_activity_dropped();
             tracing::warn!(

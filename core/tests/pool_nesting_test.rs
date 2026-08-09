@@ -11,7 +11,7 @@
 //! it would be testing something that cannot happen.
 //!
 //! Production runs `max_connections = 10` per instance with
-//! `ACQUIRE_TIMEOUT_SECS = 5` (`core/src/database.rs`). A code path that holds
+//! `ACQUIRE_TIMEOUT_SECS = 60` (`core/src/database.rs`). A code path that holds
 //! an open transaction while independently acquiring a second connection from
 //! the same pool needs TWO connections to serve ONE request. That does not fail
 //! in a quiet test suite -- it fails under concurrency, by stalling every

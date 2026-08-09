@@ -2194,9 +2194,8 @@ fn map_repo_error(err: RepositoryError) -> ApiError {
         }
         RepositoryError::NotFound(msg) => ApiError::not_found(msg),
         RepositoryError::Integrity(msg) => ApiError::bad_request(msg),
-        RepositoryError::Database(msg) | RepositoryError::Unavailable(msg) => {
-            ApiError::Internal(msg)
-        }
+        RepositoryError::Database(msg) => ApiError::Internal(msg),
+        RepositoryError::Unavailable(msg) => ApiError::service_unavailable(msg),
     }
 }
 

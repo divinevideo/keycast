@@ -32,6 +32,9 @@ pub enum ApiError {
     #[error("Internal server error: {0}")]
     Internal(String),
 
+    #[error("Service unavailable: {0}")]
+    ServiceUnavailable(String),
+
     #[error("User error: {0}")]
     User(#[from] UserError),
 
@@ -45,12 +48,8 @@ impl From<RepositoryError> for ApiError {
             RepositoryError::NotFound(msg) => ApiError::NotFound(msg),
             RepositoryError::Duplicate => ApiError::BadRequest("Already exists".to_string()),
             RepositoryError::Integrity(msg) => ApiError::BadRequest(msg),
-            // No 503-shaped variant here yet, so a transient acquire failure
-            // keeps the pre-existing 500 on these endpoints. The HTTP RPC path
-            // maps it to a retryable 503 of its own.
-            RepositoryError::Database(msg) | RepositoryError::Unavailable(msg) => {
-                ApiError::Internal(msg)
-            }
+            RepositoryError::Database(msg) => ApiError::Internal(msg),
+            RepositoryError::Unavailable(msg) => ApiError::ServiceUnavailable(msg),
         }
     }
 }
@@ -74,6 +73,10 @@ impl ApiError {
 
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::Internal(msg.into())
+    }
+
+    pub fn service_unavailable(msg: impl Into<String>) -> Self {
+        Self::ServiceUnavailable(msg.into())
     }
 
     pub fn conflict(msg: impl Into<String>) -> Self {
@@ -103,6 +106,13 @@ impl IntoResponse for ApiError {
                     "Something went wrong. Please try again.".to_string(),
                 )
             }
+            ApiError::ServiceUnavailable(msg) => {
+                tracing::warn!("Service unavailable: {}", msg);
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Service temporarily unavailable. Please try again.".to_string(),
+                )
+            }
             ApiError::User(e) => {
                 tracing::error!("User error: {}", e);
                 (
@@ -128,3 +138,16 @@ impl IntoResponse for ApiError {
 }
 
 pub type ApiResult<T> = Result<T, ApiError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repository_unavailable_maps_to_503() {
+        let response =
+            ApiError::from(RepositoryError::Unavailable("pool timed out".into())).into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+}

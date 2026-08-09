@@ -1425,13 +1425,14 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     // drained during graceful shutdown.
     let task_tracker = TaskTracker::new();
     let shutdown_signal = Arc::new(Notify::new());
+    let activity_log_shutdown = Arc::new(Notify::new());
 
     let (activity_logger, activity_log_worker) =
         keycast_api::activity_log::ActivityLogger::new(database.pool.clone());
-    let activity_log_shutdown = shutdown_signal.clone();
+    let activity_log_shutdown_for_task = activity_log_shutdown.clone();
     task_tracker.spawn(async move {
         activity_log_worker
-            .run_until_shutdown(activity_log_shutdown)
+            .run_until_shutdown(activity_log_shutdown_for_task)
             .await;
     });
     tracing::info!("✔︎ OAuth activity logger initialized (bounded queue: 4096)");
@@ -1899,13 +1900,14 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     // deregister (it cancels the shared token), so it cannot re-register us
     // after this point.
     //
-    // Then close the relay queue so relay workers stop accepting new events,
-    // drain queued relay work while the relay client remains connected, then
-    // tear down the relay client (stopping signer.run()'s subscription) and
-    // wait for signer + other tracked tasks. This runs **after** HTTP drain so
-    // NIP-46 requests that arrived before the queue closed have a chance to
-    // complete and publish responses back to the requesting client before we
-    // disconnect from the relays.
+    // Then stop the activity writer after HTTP handlers are drained, close the
+    // relay queue so relay workers stop accepting new events, drain queued relay
+    // work while the relay client remains connected, then tear down the relay
+    // client (stopping signer.run()'s subscription) and wait for signer + other
+    // tracked tasks. This runs **after** HTTP drain so NIP-46 requests that
+    // arrived before the queue closed have a chance to complete and publish
+    // responses back to the requesting client before we disconnect from the
+    // relays.
     //
     // `drain_signer_or_abort` bounds the drain by the signer budget REMAINING
     // after the deregister (split into a drain sub-budget plus a reserved
@@ -1925,6 +1927,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         timings.signer_drain,
     )
     .await;
+    activity_log_shutdown.notify_waiters();
     let signer_handle_for_abort = signer_handle;
     let close_relay_queue = move || relay_queue.close();
     // Factory (not a single future) so the relay close can be re-attempted on
