@@ -472,6 +472,7 @@
 							<tbody>
 								<tr><td><code>get_public_key</code></td><td>Returns the user's hex pubkey</td></tr>
 								<tr><td><code>sign_event</code></td><td>Signs an unsigned event</td></tr>
+								<tr><td><code>sign_canonical</code></td><td>Signs a creator-binding payload</td></tr>
 								<tr><td><code>nip04_encrypt</code></td><td>Encrypts using NIP-04</td></tr>
 								<tr><td><code>nip04_decrypt</code></td><td>Decrypts using NIP-04</td></tr>
 								<tr><td><code>nip44_encrypt</code></td><td>Encrypts using NIP-44</td></tr>

@@ -1,6 +1,7 @@
 pub mod ap_signing;
 pub mod authorization_channel;
 pub mod bunker_key;
+pub mod creator_binding;
 pub mod custom_permissions;
 pub mod database;
 pub mod encryption;

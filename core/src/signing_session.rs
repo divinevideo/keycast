@@ -3,8 +3,10 @@
 // ABOUTME: All CPU-bound crypto runs on spawn_blocking to avoid blocking async runtime
 
 use nostr_sdk::nips::nip44;
+use nostr_sdk::secp256k1::{Message, SECP256K1};
 use nostr_sdk::{Event, Keys, PublicKey, UnsignedEvent};
 use secrecy::SecretString;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::task::JoinError;
 
@@ -58,7 +60,7 @@ pub enum SessionError {
 }
 
 /// Pure crypto signing session wrapping Nostr Keys.
-/// Provides sign_event, nip44_encrypt, and nip44_decrypt operations.
+/// Provides sign_event, sign_canonical, nip44_encrypt, and nip44_decrypt operations.
 ///
 /// This is a building block used by HttpRpcHandler and Nip46Handler.
 /// All authorization metadata (expiration, permissions, cache keys) lives
@@ -107,6 +109,26 @@ impl SigningSession {
         })
         .await?
         .map_err(|e| SessionError::Signing(e.to_string()))
+    }
+
+    /// Sign SHA-256(payload) with deterministic BIP-340 Schnorr.
+    ///
+    /// Creator-binding signatures must match local signers byte-for-byte across
+    /// implementations, so the BIP-340 auxiliary random input is pinned to 32
+    /// zero bytes. Do not use `Keys::sign_schnorr`; it intentionally uses OS
+    /// randomness for aux data.
+    pub async fn sign_canonical(&self, payload: Vec<u8>) -> Result<String, SessionError> {
+        let keys = self.keys.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let digest = Sha256::digest(&payload);
+            let message = Message::from_digest_slice(&digest)
+                .map_err(|e| SessionError::Signing(e.to_string()))?;
+            let keypair = keys.key_pair(SECP256K1);
+            let signature = SECP256K1.sign_schnorr_with_aux_rand(&message, keypair, &[0u8; 32]);
+            Ok(hex::encode(signature.as_ref()))
+        })
+        .await?
     }
 
     /// Encrypt plaintext using NIP-44 (CPU-bound crypto runs on spawn_blocking)
@@ -183,7 +205,9 @@ mod tests {
     // canonicalizes the pubkey field to `self.keys.public_key()` to keep the
     // bunker as the source of truth (NIP-46 semantics).
 
+    use nostr_sdk::secp256k1::{schnorr::Signature, XOnlyPublicKey};
     use nostr_sdk::{EventBuilder, JsonUtil, Kind, Tag, Timestamp, UnsignedEvent};
+    use std::str::FromStr;
 
     #[tokio::test]
     async fn sign_event_passthrough_when_pubkey_matches() {
@@ -201,6 +225,48 @@ mod tests {
         signed
             .verify()
             .expect("signature must verify against signer's pubkey");
+    }
+
+    #[tokio::test]
+    async fn sign_canonical_matches_cross_implementation_vector() {
+        let keys = Keys::parse("5ee1c8000ab28edd64d74a7d951ac2dd559814887b1b9e1ac7c5f89e96125c12")
+            .expect("valid secret key");
+        let session = SigningSession::new(keys);
+
+        let sig = session
+            .sign_canonical(b"divine-creator-binding-test".to_vec())
+            .await
+            .expect("canonical signing should succeed");
+
+        assert_eq!(
+            sig,
+            "9baed2647e5f9d059b68eb03c6e3e6dcdf53cbe94fb143af70fb6e7332ee9997cc7ba5ac9cdb9049a0e47c8c20e2031843e88c59dcba3c3ff8fc34eeae4a565f"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_canonical_is_deterministic_and_verifies() {
+        let keys = Keys::generate();
+        let session = SigningSession::new(keys.clone());
+        let payload = br#"{"version":1}"#.to_vec();
+
+        let first = session
+            .sign_canonical(payload.clone())
+            .await
+            .expect("canonical signing should succeed");
+        let second = session
+            .sign_canonical(payload.clone())
+            .await
+            .expect("canonical signing should succeed");
+        assert_eq!(first, second);
+
+        let digest = Sha256::digest(&payload);
+        let message = Message::from_digest_slice(&digest).expect("sha256 digest is 32 bytes");
+        let signature = Signature::from_str(&first).expect("valid schnorr signature");
+        let public_key: XOnlyPublicKey = keys.public_key().xonly().expect("x-only public key");
+        SECP256K1
+            .verify_schnorr(&signature, &message, &public_key)
+            .expect("canonical signature should verify");
     }
 
     #[tokio::test]

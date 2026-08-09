@@ -2,6 +2,7 @@
 // ABOUTME: Caches authorization metadata AND permissions for spam protection without DB hits
 
 use chrono::{DateTime, Utc};
+use keycast_core::creator_binding::validate_creator_binding_payload;
 use keycast_core::secret_types::DecryptedPlaintext;
 use keycast_core::signing_session::{CacheKey, SigningSession};
 use keycast_core::traits::CustomPermission;
@@ -23,6 +24,8 @@ pub enum HandlerError {
     AuthorizationInvalid,
     #[error("permission denied")]
     PermissionDenied,
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
     #[error("signing error: {0}")]
     Signing(String),
     #[error("encryption error: {0}")]
@@ -237,6 +240,31 @@ impl HttpRpcHandler {
         }
     }
 
+    /// Validate creator-binding signing permission against cached policy rules.
+    ///
+    /// Creator-binding payloads are not Nostr events, so the permission trait
+    /// maps them to the closest signing capability instead of fabricating an
+    /// event kind at the RPC layer.
+    pub fn validate_sign_creator_binding_permission(
+        &self,
+        payload: &[u8],
+    ) -> Result<(), HandlerError> {
+        if self.permissions.is_empty() {
+            return Ok(());
+        }
+
+        let allowed = self
+            .permissions
+            .iter()
+            .all(|p| p.can_sign_creator_binding(payload));
+
+        if allowed {
+            Ok(())
+        } else {
+            Err(HandlerError::PermissionDenied)
+        }
+    }
+
     /// Validate encryption permission against cached policy rules (no DB hit)
     pub fn validate_encrypt_permission(
         &self,
@@ -358,6 +386,22 @@ impl HttpRpcHandler {
             .map_err(|e| HandlerError::Signing(e.to_string()))
     }
 
+    /// Sign a validated creator-binding payload after checking validity and permissions.
+    pub async fn sign_canonical(&self, payload: Vec<u8>) -> Result<String, HandlerError> {
+        if !self.is_valid() {
+            return Err(HandlerError::AuthorizationInvalid);
+        }
+
+        validate_creator_binding_payload(&payload, self.public_key())
+            .map_err(|e| HandlerError::InvalidRequest(e.to_string()))?;
+        self.validate_sign_creator_binding_permission(&payload)?;
+
+        self.signing
+            .sign_canonical(payload)
+            .await
+            .map_err(|e| HandlerError::Signing(e.to_string()))
+    }
+
     /// Encrypt plaintext using NIP-44 after checking validity and permissions
     /// (CPU-bound crypto runs on spawn_blocking via SigningSession)
     pub async fn nip44_encrypt(
@@ -443,9 +487,9 @@ impl HttpRpcHandler {
                 .map_err(|error| match error {
                     HandlerError::AuthorizationInvalid => WrapError::AuthorizationInvalid,
                     HandlerError::PermissionDenied => WrapError::PermissionDenied,
-                    HandlerError::Encryption(_) | HandlerError::Signing(_) => {
-                        WrapError::EncryptFailed
-                    }
+                    HandlerError::InvalidRequest(_)
+                    | HandlerError::Encryption(_)
+                    | HandlerError::Signing(_) => WrapError::EncryptFailed,
                 })?;
 
         let seal = EventBuilder::new(Kind::Seal, ciphertext)
@@ -454,7 +498,9 @@ impl HttpRpcHandler {
         let signed_seal = self.sign_event(seal).await.map_err(|error| match error {
             HandlerError::AuthorizationInvalid => WrapError::AuthorizationInvalid,
             HandlerError::PermissionDenied => WrapError::PermissionDenied,
-            HandlerError::Signing(_) | HandlerError::Encryption(_) => WrapError::SignFailed,
+            HandlerError::InvalidRequest(_)
+            | HandlerError::Signing(_)
+            | HandlerError::Encryption(_) => WrapError::SignFailed,
         })?;
 
         let recipient = *recipient;
@@ -689,6 +735,39 @@ mod tests {
         .expect("allowed_kinds test permission")
     }
 
+    fn decrypt_only_permission() -> Box<dyn CustomPermission> {
+        use keycast_core::types::permission::{JsonConfig, Permission};
+
+        let now = Utc::now();
+        Permission {
+            id: 1,
+            identifier: "decrypt_only".to_string(),
+            config: JsonConfig(serde_json::json!({})),
+            created_at: now,
+            updated_at: now,
+        }
+        .to_custom_permission()
+        .expect("decrypt_only test permission")
+    }
+
+    fn creator_binding_payload(pubkey: PublicKey) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "pubkey": pubkey.to_hex(),
+            "sig_alg": "nostr.secp256k1",
+            "created_at": "2026-04-29T00:00:00Z",
+            "claims": {
+                "nip05": "creator@example.com"
+            },
+            "referenced_assertions": [],
+            "hard_binding": {
+                "alg": "sha256",
+                "value": "39341a12a2f77007d6e72841f667523d39463a825d82c6c98981881283fb7ed0"
+            }
+        }))
+        .expect("valid creator binding")
+    }
+
     #[test]
     fn test_is_valid_no_expiration() {
         let handler = create_test_handler(None, None);
@@ -764,6 +843,90 @@ mod tests {
 
         let result = handler.sign_event(unsigned).await;
         assert!(matches!(result, Err(HandlerError::AuthorizationInvalid)));
+    }
+
+    #[tokio::test]
+    async fn test_sign_canonical_when_valid() {
+        let handler = create_test_handler(None, None);
+        let payload = creator_binding_payload(handler.public_key());
+
+        let sig = handler
+            .sign_canonical(payload)
+            .await
+            .expect("creator-binding signing should succeed");
+
+        assert_eq!(sig.len(), 128);
+        assert!(sig.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[tokio::test]
+    async fn test_sign_canonical_when_expired() {
+        let expires = Utc::now() - chrono::Duration::hours(1);
+        let handler = create_test_handler(Some(expires), None);
+        let payload = creator_binding_payload(handler.public_key());
+
+        let result = handler.sign_canonical(payload).await;
+        assert!(matches!(result, Err(HandlerError::AuthorizationInvalid)));
+    }
+
+    #[tokio::test]
+    async fn test_sign_canonical_requires_creator_binding_payload() {
+        let handler = create_test_handler(None, None);
+
+        let result = handler
+            .sign_canonical(b"divine-creator-binding-test".to_vec())
+            .await;
+
+        assert!(matches!(result, Err(HandlerError::InvalidRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn test_sign_canonical_rejects_extra_top_level_field() {
+        // Regression: an unknown top-level field is caller-controlled content that
+        // would be signed with the user's key while `content_filter` only inspects
+        // `claims`. Validation must reject it before signing.
+        let handler = create_test_handler(None, None);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&creator_binding_payload(handler.public_key())).unwrap();
+        value["note"] = serde_json::json!("arbitrary caller-controlled text");
+        let payload = serde_json::to_vec(&value).unwrap();
+
+        let result = handler.sign_canonical(payload).await;
+        assert!(matches!(result, Err(HandlerError::InvalidRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn test_sign_canonical_denied_by_readonly_permission() {
+        let handler =
+            create_test_handler_with_permissions(None, None, vec![decrypt_only_permission()]);
+        let payload = creator_binding_payload(handler.public_key());
+
+        let result = handler.sign_canonical(payload).await;
+        assert!(matches!(result, Err(HandlerError::PermissionDenied)));
+    }
+
+    #[tokio::test]
+    async fn test_sign_canonical_allowed_by_profile_kind_permission() {
+        let handler =
+            create_test_handler_with_permissions(None, None, vec![allowed_kinds_permission(&[0])]);
+        let payload = creator_binding_payload(handler.public_key());
+
+        let sig = handler
+            .sign_canonical(payload)
+            .await
+            .expect("kind 0 policy should allow creator-binding signing");
+
+        assert_eq!(sig.len(), 128);
+    }
+
+    #[tokio::test]
+    async fn test_sign_canonical_denied_by_non_profile_kind_permission() {
+        let handler =
+            create_test_handler_with_permissions(None, None, vec![allowed_kinds_permission(&[1])]);
+        let payload = creator_binding_payload(handler.public_key());
+
+        let result = handler.sign_canonical(payload).await;
+        assert!(matches!(result, Err(HandlerError::PermissionDenied)));
     }
 
     #[tokio::test]

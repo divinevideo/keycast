@@ -8,7 +8,9 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use base64::prelude::*;
 use chrono::{DateTime, Utc};
+use keycast_core::creator_binding::MAX_CREATOR_BINDING_PAYLOAD_BYTES;
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
     OAuthAuthorizationRepository, PersonalKeysRepository, PolicyRepository, UserRepository,
@@ -113,6 +115,7 @@ impl From<HandlerError> for RpcError {
             HandlerError::PermissionDenied => {
                 RpcError::Auth(AuthError::Forbidden("Operation denied by policy".into()))
             }
+            HandlerError::InvalidRequest(msg) => RpcError::InvalidParams(msg),
             HandlerError::Signing(msg) => RpcError::SigningFailed(msg),
             HandlerError::Encryption(msg) => RpcError::EncryptionFailed(msg),
         }
@@ -124,6 +127,7 @@ impl From<HandlerError> for RpcError {
 /// Supports all NIP-46 methods:
 /// - get_public_key: Returns user's hex pubkey
 /// - sign_event: Signs an unsigned event
+/// - sign_canonical: Signs a base64-encoded creator-binding payload
 /// - nip04_encrypt: Encrypts plaintext using NIP-04
 /// - nip04_decrypt: Decrypts ciphertext using NIP-04
 /// - nip44_encrypt: Encrypts plaintext using NIP-44
@@ -205,6 +209,24 @@ pub async fn nostr_rpc(
 
             serde_json::to_value(&signed)
                 .map_err(|e| RpcError::Internal(format!("JSON serialization failed: {}", e)))?
+        }
+
+        "sign_canonical" => {
+            let payload = parse_canonical_payload_params(&req.params)?;
+
+            // Creator-binding payloads are not DMs, so the verified_minor DM
+            // containment gate does not apply. Handler validity and custom
+            // signing permissions still apply before signing.
+            let signature = handler.sign_canonical(payload).await?;
+
+            tracing::info!(
+                "RPC: Signed creator-binding payload authorization_id={}",
+                handler.authorization_id()
+            );
+
+            spawn_log_activity(pool.clone(), handler.is_oauth(), handler.authorization_id());
+
+            JsonValue::String(signature)
         }
 
         "nip44_encrypt" => {
@@ -894,6 +916,39 @@ fn parse_decrypt_params(params: &[JsonValue]) -> Result<(PublicKey, String), Rpc
     Ok((pubkey, ciphertext.to_string()))
 }
 
+/// Parse sign_canonical params: [base64_payload]
+fn parse_canonical_payload_params(params: &[JsonValue]) -> Result<Vec<u8>, RpcError> {
+    if params.len() != 1 {
+        return Err(RpcError::InvalidParams(
+            "Expected base64 payload parameter".into(),
+        ));
+    }
+
+    let encoded = params
+        .first()
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| RpcError::InvalidParams("Missing base64 payload parameter".into()))?;
+
+    let max_encoded_len = MAX_CREATOR_BINDING_PAYLOAD_BYTES.div_ceil(3) * 4;
+    if encoded.len() > max_encoded_len {
+        return Err(RpcError::InvalidParams(
+            "Creator-binding payload exceeds maximum size".into(),
+        ));
+    }
+
+    let payload = BASE64_STANDARD
+        .decode(encoded)
+        .map_err(|e| RpcError::InvalidParams(format!("Invalid base64 payload: {}", e)))?;
+
+    if payload.len() > MAX_CREATOR_BINDING_PAYLOAD_BYTES {
+        return Err(RpcError::InvalidParams(
+            "Creator-binding payload exceeds maximum size".into(),
+        ));
+    }
+
+    Ok(payload)
+}
+
 struct Nip17WrapBatchParams {
     rumor: UnsignedEvent,
     recipients: Vec<Result<PublicKey, ()>>,
@@ -1069,7 +1124,7 @@ fn spawn_log_activity(pool: PgPool, is_oauth: bool, authorization_id: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use p256::ecdsa::signature::Signer;
     use p256::ecdsa::{Signature as P256Signature, SigningKey};
     use rand::rngs::OsRng;
@@ -1202,6 +1257,46 @@ mod tests {
         )];
         let result = parse_encrypt_params(&params);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_canonical_payload_params() {
+        let payload = br#"{"version":1}"#;
+        let params = vec![JsonValue::String(BASE64_STANDARD.encode(payload))];
+
+        let parsed =
+            parse_canonical_payload_params(&params).expect("valid base64 payload should parse");
+
+        assert_eq!(parsed, payload);
+    }
+
+    #[test]
+    fn test_parse_canonical_payload_params_rejects_invalid_base64() {
+        let params = vec![JsonValue::String("***".to_string())];
+
+        let err = parse_canonical_payload_params(&params).expect_err("invalid base64 rejects");
+
+        match err {
+            RpcError::InvalidParams(message) => {
+                assert!(message.contains("Invalid base64 payload"));
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_canonical_payload_params_rejects_oversize_payload() {
+        let payload = vec![b'a'; MAX_CREATOR_BINDING_PAYLOAD_BYTES + 1];
+        let params = vec![JsonValue::String(BASE64_STANDARD.encode(payload))];
+
+        let err = parse_canonical_payload_params(&params).expect_err("oversize payload rejects");
+
+        match err {
+            RpcError::InvalidParams(message) => {
+                assert!(message.contains("exceeds maximum size"));
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
     }
 
     fn wrap_rumor_value(author: PublicKey, recipient: PublicKey) -> JsonValue {

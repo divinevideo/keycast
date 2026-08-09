@@ -208,6 +208,27 @@ Get the user's public key.
 }
 ```
 
+#### sign_canonical
+
+Sign a base64-encoded C2PA creator-binding payload. The payload must be a
+creator-binding JSON object for the signing pubkey. Authorizations must permit
+profile/identity signing.
+
+**Request:**
+```json
+{
+  "method": "sign_canonical",
+  "params": ["<base64 creator-binding JSON bytes>"]
+}
+```
+
+**Response:**
+```json
+{
+  "result": "9baed2647e5f9d059b68eb03c6e3e6dcdf53cbe94fb143af70fb6e7332ee9997cc7ba5ac9cdb9049a0e47c8c20e2031843e88c59dcba3c3ff8fc34eeae4a565f"
+}
+```
+
 #### nip44_encrypt
 
 Encrypt a message using NIP-44.
