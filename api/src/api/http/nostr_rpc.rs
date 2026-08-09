@@ -1211,6 +1211,15 @@ fn log_activity(auth_state: &AuthState, is_oauth: bool, authorization_id: i64) {
             METRICS.inc_http_rpc_activity_dropped();
             tracing::warn!("Dropped OAuth authorization activity update because queue is full");
         }
+        // The writer stops at the start of the HTTP drain while axum keeps
+        // serving in-flight requests, so this is a real lost update and not the
+        // no-op that a never-configured logger is.
+        ActivityLogResult::WriterStopped => {
+            METRICS.inc_http_rpc_activity_dropped();
+            tracing::warn!(
+                "Dropped OAuth authorization activity update because the writer stopped"
+            );
+        }
     }
 }
 

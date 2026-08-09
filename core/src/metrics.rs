@@ -126,7 +126,8 @@ pub struct Metrics {
     pub http_rpc_db_pool_size: AtomicU64,
     /// Current SQLx idle connection count observed by HTTP RPC.
     pub http_rpc_db_pool_idle: AtomicU64,
-    /// OAuth activity updates dropped because the bounded queue was full.
+    /// OAuth activity updates that never reached the database: queue full,
+    /// writer already stopped, or given up after repeated flush failures.
     pub http_rpc_activity_dropped: AtomicU64,
 
     // === Auth Metrics ===
@@ -314,8 +315,12 @@ impl Metrics {
     }
 
     pub fn inc_http_rpc_activity_dropped(&self) {
+        self.add_http_rpc_activity_dropped(1);
+    }
+
+    pub fn add_http_rpc_activity_dropped(&self, count: u64) {
         self.http_rpc_activity_dropped
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     // === Auth metric methods ===
@@ -648,7 +653,7 @@ impl Metrics {
         ));
 
         output.push_str(
-            "\n# HELP keycast_http_rpc_activity_dropped_total OAuth activity updates dropped because the HTTP RPC activity queue was full\n",
+            "\n# HELP keycast_http_rpc_activity_dropped_total OAuth activity updates that never reached the database (queue full, writer stopped, or given up after repeated flush failures)\n",
         );
         output.push_str("# TYPE keycast_http_rpc_activity_dropped_total counter\n");
         output.push_str(&format!(

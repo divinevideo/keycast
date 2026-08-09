@@ -1,6 +1,7 @@
 // ABOUTME: Bounded OAuth activity logger for HTTP RPC requests
 // ABOUTME: Coalesces authorization activity updates so request handlers never spawn DB work
 
+use keycast_core::metrics::METRICS;
 use sqlx::PgPool;
 use std::{
     collections::BTreeMap,
@@ -19,12 +20,21 @@ const DEFAULT_QUEUE_CAPACITY: usize = 4096;
 const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_BATCH_IDS: usize = 256;
 
+/// Ceiling on retained-but-unwritten authorization ids after failed flushes.
+/// A failed flush is retried on the next tick rather than discarded, but a
+/// database that stays unhappy must not grow this map without bound.
+const MAX_RETAINED_IDS: usize = 4096;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivityLogResult {
     Queued,
     Dropped,
     SkippedNonOauth,
     Disabled,
+    /// The writer has already stopped. Distinct from `Disabled` because it is a
+    /// lost update: the API keeps serving in-flight requests through the HTTP
+    /// drain after the writer exits, and those records have nowhere to go.
+    WriterStopped,
 }
 
 #[derive(Debug, Clone)]
@@ -88,7 +98,7 @@ impl ActivityLogger {
                 self.dropped_total.fetch_add(1, Ordering::Relaxed);
                 ActivityLogResult::Dropped
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => ActivityLogResult::Disabled,
+            Err(mpsc::error::TrySendError::Closed(_)) => ActivityLogResult::WriterStopped,
         }
     }
 
@@ -136,7 +146,7 @@ impl ActivityLogWorker {
                     }
                 }
                 _ = flush_interval.tick() => {
-                    flush_pending(&self.pool, &mut pending).await;
+                    self.flush(&mut pending).await;
                 }
                 _ = &mut shutdown_notified => {
                     break;
@@ -144,29 +154,43 @@ impl ActivityLogWorker {
             }
 
             if pending.len() >= self.max_batch_ids {
-                flush_pending(&self.pool, &mut pending).await;
+                self.flush(&mut pending).await;
             }
         }
 
         while let Ok(event) = self.receiver.try_recv() {
             accumulate(&mut pending, event.authorization_id);
         }
-        flush_pending(&self.pool, &mut pending).await;
+        self.flush(&mut pending).await;
+    }
+
+    async fn flush(&self, pending: &mut BTreeMap<i64, i64>) {
+        let lost = flush_pending(&self.pool, pending).await;
+        if lost > 0 {
+            METRICS.add_http_rpc_activity_dropped(lost);
+        }
     }
 }
 
 fn accumulate(pending: &mut BTreeMap<i64, i64>, authorization_id: i64) {
-    *pending.entry(authorization_id).or_insert(0) += 1;
+    accumulate_by(pending, authorization_id, 1);
 }
 
-async fn flush_pending(pool: &PgPool, pending: &mut BTreeMap<i64, i64>) {
+fn accumulate_by(pending: &mut BTreeMap<i64, i64>, authorization_id: i64, count: i64) {
+    *pending.entry(authorization_id).or_insert(0) += count;
+}
+
+/// Writes the coalesced counts and returns the number of events that were lost
+/// outright. A failed write is normally retained for the next flush; it is only
+/// given up when retaining it would grow `pending` past [`MAX_RETAINED_IDS`].
+async fn flush_pending(pool: &PgPool, pending: &mut BTreeMap<i64, i64>) -> u64 {
     if pending.is_empty() {
-        return;
+        return 0;
     }
 
     let ids: Vec<i64> = pending.keys().copied().collect();
     let counts: Vec<i64> = pending.values().copied().collect();
-    pending.clear();
+    let batch = std::mem::take(pending);
 
     if let Err(error) = sqlx::query(
         "UPDATE oauth_authorizations AS oa
@@ -182,12 +206,30 @@ async fn flush_pending(pool: &PgPool, pending: &mut BTreeMap<i64, i64>) {
     .execute(pool)
     .await
     {
+        for (id, count) in batch {
+            accumulate_by(pending, id, count);
+        }
+
+        if pending.len() > MAX_RETAINED_IDS {
+            let lost: u64 = pending.values().map(|count| *count as u64).sum();
+            pending.clear();
+            tracing::error!(
+                error = %error,
+                batch_size = ids.len(),
+                lost_events = lost,
+                "Gave up on OAuth authorization activity after repeated flush failures"
+            );
+            return lost;
+        }
+
         tracing::error!(
             error = %error,
             batch_size = ids.len(),
-            "Failed to flush OAuth authorization activity"
+            "Failed to flush OAuth authorization activity, retaining for the next flush"
         );
     }
+
+    0
 }
 
 #[cfg(test)]
@@ -282,6 +324,46 @@ mod tests {
             .await
             .expect("worker should observe a shutdown signalled outside its select")
             .expect("worker task should not panic");
+    }
+
+    #[tokio::test]
+    async fn failed_flush_retains_counts_for_the_next_attempt() {
+        // Port 1 refuses instantly, so the write fails without a long wait.
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/x")
+            .expect("lazy pool");
+        let mut pending = BTreeMap::new();
+        accumulate(&mut pending, 42);
+        accumulate(&mut pending, 42);
+        accumulate(&mut pending, 7);
+
+        let lost = flush_pending(&pool, &mut pending).await;
+
+        assert_eq!(lost, 0, "a single failure gives up nothing");
+        assert_eq!(
+            pending.get(&42),
+            Some(&2),
+            "coalesced counts survive a failed write"
+        );
+        assert_eq!(pending.get(&7), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn flush_gives_up_and_reports_loss_once_retention_is_exceeded() {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:1/x")
+            .expect("lazy pool");
+        let mut pending: BTreeMap<i64, i64> =
+            (0..=MAX_RETAINED_IDS as i64).map(|id| (id, 1)).collect();
+
+        let lost = flush_pending(&pool, &mut pending).await;
+
+        assert_eq!(lost, MAX_RETAINED_IDS as u64 + 1);
+        assert!(pending.is_empty(), "the retained map is bounded");
     }
 
     #[test]
