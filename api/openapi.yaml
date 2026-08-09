@@ -60,6 +60,9 @@ components:
         code:
           type: string
           description: Stable application error code, when available
+        error_description:
+          type: string
+          description: Human-readable detail accompanying an RFC 6749 OAuth error code, when available
       required:
         - error
 
@@ -1046,7 +1049,7 @@ paths:
                   sub:
                     type: string
         '400':
-          description: Invalid grant or DPoP proof
+          description: Invalid grant or DPoP proof. A PKCE `code_verifier` that does not match the stored `code_challenge` returns the RFC 6749 error code `invalid_grant` with an `error_description`.
           content:
             application/json:
               schema:
