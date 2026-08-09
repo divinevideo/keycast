@@ -213,7 +213,7 @@ pub async fn technical_docs() -> Html<&'static str> {
         <li><code>connect</code> - Initial connection handshake</li>
         <li><code>get_public_key</code> - Returns user's public key</li>
         <li><code>sign_event</code> - Signs a Nostr event</li>
-        <li><code>sign_canonical</code> - Signs a C2PA creator-binding payload</li>
+        <li><code>sign_canonical</code> - Signs a C2PA creator-binding payload (Divine extension, <code>POST /api/nostr</code> only; not available over the bunker transport)</li>
         <li><code>nip04_encrypt</code> - Legacy DM encryption</li>
         <li><code>nip04_decrypt</code> - Legacy DM decryption</li>
         <li><code>nip44_encrypt</code> - Modern DM encryption (preferred)</li>
