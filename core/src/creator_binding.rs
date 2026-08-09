@@ -10,10 +10,12 @@ pub const MAX_CREATOR_BINDING_PAYLOAD_BYTES: usize = 64 * 1024;
 /// The exact top-level fields divine-mobile's `NostrCreatorBindingService` emits.
 ///
 /// The allowlist is closed on purpose: every byte of the payload is signed with
-/// the user's key, so anything accepted here becomes attacker-chosen content
-/// inside a signed blob and escapes the `content_filter` policy, which only
-/// inspects creator-supplied `claims`. Adding a field must happen in lockstep
-/// with the mobile client.
+/// the user's key, so anything accepted here becomes caller-chosen content
+/// inside a signed blob. `content_filter` scans only the free-text fields
+/// (`claims`, `created_at`, `referenced_assertions`), so an unknown field would
+/// bypass policy entirely. Adding a field means updating this list, the
+/// per-field shape checks below, and `ContentFilter::can_sign_creator_binding`
+/// together, in lockstep with the mobile client.
 const ALLOWED_TOP_LEVEL_FIELDS: [&str; 7] = [
     "version",
     "pubkey",
@@ -40,10 +42,12 @@ pub enum CreatorBindingError {
     PubkeyMismatch,
     #[error("creator-binding claims must be an object")]
     InvalidClaims,
-    #[error("creator-binding referenced_assertions must be an array")]
+    #[error("creator-binding referenced_assertions must be an array of strings")]
     InvalidReferencedAssertions,
-    #[error("creator-binding hard_binding must be an object")]
+    #[error("creator-binding hard_binding must be {{alg: \"sha256\", value: <64 hex>}}")]
     InvalidHardBinding,
+    #[error("creator-binding created_at must be a string")]
+    InvalidCreatedAt,
     #[error("creator-binding payload must not include a signature")]
     PreSignedPayload,
     #[error("creator-binding payload is invalid JSON")]
@@ -101,14 +105,57 @@ pub fn validate_creator_binding_payload(
         return Err(CreatorBindingError::InvalidClaims);
     }
 
-    if !object
-        .get("referenced_assertions")
-        .is_some_and(Value::is_array)
+    // `created_at` is optional, but when present it must be a plain string so it
+    // cannot smuggle structured caller data.
+    if object
+        .get("created_at")
+        .is_some_and(|value| !value.is_string())
     {
-        return Err(CreatorBindingError::InvalidReferencedAssertions);
+        return Err(CreatorBindingError::InvalidCreatedAt);
     }
 
-    if !object.get("hard_binding").is_some_and(Value::is_object) {
+    // divine-mobile sends a sorted `List<String>` of assertion labels.
+    match object
+        .get("referenced_assertions")
+        .and_then(Value::as_array)
+    {
+        Some(items) if items.iter().all(Value::is_string) => {}
+        _ => return Err(CreatorBindingError::InvalidReferencedAssertions),
+    }
+
+    validate_hard_binding(object.get("hard_binding"))?;
+
+    Ok(())
+}
+
+/// `hard_binding` is pinned to exactly `{alg: "sha256", value: <64 lowercase hex>}`.
+///
+/// Pinning it leaves no free-text surface here, which is what lets the content
+/// filter skip this field: a hex digest would otherwise trip blocklists on words
+/// that are also valid hex ("bad", "dead", "cafe").
+fn validate_hard_binding(hard_binding: Option<&Value>) -> Result<(), CreatorBindingError> {
+    let object = hard_binding
+        .and_then(Value::as_object)
+        .ok_or(CreatorBindingError::InvalidHardBinding)?;
+
+    if object.len() != 2 || !object.contains_key("alg") || !object.contains_key("value") {
+        return Err(CreatorBindingError::InvalidHardBinding);
+    }
+
+    if object.get("alg").and_then(Value::as_str) != Some("sha256") {
+        return Err(CreatorBindingError::InvalidHardBinding);
+    }
+
+    let value = object
+        .get("value")
+        .and_then(Value::as_str)
+        .ok_or(CreatorBindingError::InvalidHardBinding)?;
+
+    if value.len() != 64
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    {
         return Err(CreatorBindingError::InvalidHardBinding);
     }
 
@@ -260,6 +307,50 @@ mod tests {
             err,
             CreatorBindingError::UnexpectedField("note".to_string())
         );
+    }
+
+    #[test]
+    fn rejects_non_string_created_at() {
+        let keys = Keys::generate();
+        let mut value: Value = serde_json::from_slice(&valid_payload(keys.public_key())).unwrap();
+        value["created_at"] = json!({"smuggled": "structured data"});
+        let payload = serde_json::to_vec(&value).unwrap();
+
+        let err = validate_creator_binding_payload(&payload, keys.public_key()).unwrap_err();
+        assert_eq!(err, CreatorBindingError::InvalidCreatedAt);
+    }
+
+    #[test]
+    fn rejects_non_string_referenced_assertion() {
+        let keys = Keys::generate();
+        let mut value: Value = serde_json::from_slice(&valid_payload(keys.public_key())).unwrap();
+        value["referenced_assertions"] = json!([{"url": "self#jumbf=/c2pa"}]);
+        let payload = serde_json::to_vec(&value).unwrap();
+
+        let err = validate_creator_binding_payload(&payload, keys.public_key()).unwrap_err();
+        assert_eq!(err, CreatorBindingError::InvalidReferencedAssertions);
+    }
+
+    #[test]
+    fn rejects_hard_binding_with_extra_or_bad_fields() {
+        let keys = Keys::generate();
+
+        for bad in [
+            json!({"alg": "sha256", "value": "a".repeat(64), "note": "extra"}),
+            json!({"alg": "scam: free text", "value": "a".repeat(64)}),
+            json!({"alg": "sha256", "value": "not-hex"}),
+            json!({"alg": "sha256", "value": "A".repeat(64)}),
+            json!({"alg": "sha256"}),
+        ] {
+            let mut value: Value =
+                serde_json::from_slice(&valid_payload(keys.public_key())).unwrap();
+            value["hard_binding"] = bad.clone();
+            let payload = serde_json::to_vec(&value).unwrap();
+
+            let err = validate_creator_binding_payload(&payload, keys.public_key())
+                .expect_err(&format!("hard_binding {bad} must be rejected"));
+            assert_eq!(err, CreatorBindingError::InvalidHardBinding);
+        }
     }
 
     #[test]
