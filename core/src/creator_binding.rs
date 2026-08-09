@@ -101,9 +101,8 @@ mod tests {
                 "nip05": "creator@example.com",
                 "website": "https://example.com"
             },
-            "referenced_assertions": [
-                {"url": "self#jumbf=/c2pa/assertions/c2pa.hash.data"}
-            ],
+            // divine-mobile sends a sorted list of assertion label strings.
+            "referenced_assertions": ["c2pa.actions.v2", "cawg.training-mining"],
             "hard_binding": {
                 "alg": "sha256",
                 "value": "39341a12a2f77007d6e72841f667523d39463a825d82c6c98981881283fb7ed0"
