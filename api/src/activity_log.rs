@@ -110,40 +110,23 @@ pub struct ActivityLogWorker {
 }
 
 impl ActivityLogWorker {
-    pub async fn run(mut self) {
-        let mut pending: BTreeMap<i64, i64> = BTreeMap::new();
-        let mut flush_interval = tokio::time::interval(self.flush_interval);
-        flush_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
-        loop {
-            tokio::select! {
-                event = self.receiver.recv() => {
-                    match event {
-                        Some(event) => accumulate(&mut pending, event.authorization_id),
-                        None => break,
-                    }
-                }
-                _ = flush_interval.tick() => {
-                    flush_pending(&self.pool, &mut pending).await;
-                }
-            }
-
-            if pending.len() >= self.max_batch_ids {
-                flush_pending(&self.pool, &mut pending).await;
-            }
-        }
-
-        while let Ok(event) = self.receiver.try_recv() {
-            accumulate(&mut pending, event.authorization_id);
-        }
-        flush_pending(&self.pool, &mut pending).await;
-    }
-
     pub async fn run_until_shutdown(mut self, shutdown: Arc<Notify>) {
         let mut pending: BTreeMap<i64, i64> = BTreeMap::new();
         let mut flush_interval = tokio::time::interval(self.flush_interval);
         flush_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
+        // `Notify::notify_waiters` (what graceful shutdown calls) only wakes
+        // waiters already registered when it fires; it stores no permit. A
+        // `notified()` future created fresh on each `select!` iteration is not
+        // registered while the loop is inside `flush_pending`, so a shutdown
+        // landing in that window would be lost forever and this task would
+        // never exit — the sender lives in the process-lifetime `KeycastState`,
+        // so `recv()` never returns `None` either. Register once, up front, and
+        // keep that registration across iterations.
+        let shutdown_notified = shutdown.notified();
+        tokio::pin!(shutdown_notified);
+        shutdown_notified.as_mut().enable();
+
         loop {
             tokio::select! {
                 event = self.receiver.recv() => {
@@ -155,7 +138,7 @@ impl ActivityLogWorker {
                 _ = flush_interval.tick() => {
                     flush_pending(&self.pool, &mut pending).await;
                 }
-                _ = shutdown.notified() => {
+                _ = &mut shutdown_notified => {
                     break;
                 }
             }
@@ -255,6 +238,49 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), worker_task)
             .await
             .expect("worker should observe shutdown")
+            .expect("worker task should not panic");
+    }
+
+    /// Graceful shutdown calls `Notify::notify_waiters`, which wakes only the
+    /// waiters registered at that instant. This drives the worker into the
+    /// middle of a flush (a Postgres handshake against a listener that accepts
+    /// but never replies) and signals shutdown there, so the worker is *not*
+    /// parked in its `select!` when the signal lands.
+    #[tokio::test]
+    async fn worker_observes_shutdown_signalled_during_a_flush() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind blackhole listener");
+        let port = listener.local_addr().expect("listener addr").port();
+        let _blackhole = tokio::spawn(async move {
+            let mut accepted = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                accepted.push(socket);
+            }
+        });
+
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(2))
+            .connect_lazy(&format!("postgres://postgres:postgres@127.0.0.1:{port}/x"))
+            .expect("lazy pool");
+        // `max_batch_ids = 1` makes the worker flush as soon as it takes the
+        // event, so the shutdown below lands while it is inside that flush.
+        let (logger, worker) = ActivityLogger::with_config(pool, 8, Duration::from_secs(60), 1);
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_for_task = shutdown.clone();
+
+        let worker_task = tokio::spawn(async move {
+            worker.run_until_shutdown(shutdown_for_task).await;
+        });
+
+        assert_eq!(logger.record(true, 1), ActivityLogResult::Queued);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        shutdown.notify_waiters();
+
+        tokio::time::timeout(Duration::from_secs(15), worker_task)
+            .await
+            .expect("worker should observe a shutdown signalled outside its select")
             .expect("worker task should not panic");
     }
 
