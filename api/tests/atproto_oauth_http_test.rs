@@ -456,6 +456,153 @@ async fn par_authorize_and_token_exchange_with_existing_login_session() {
 
 #[tokio::test]
 #[serial]
+async fn atproto_token_exchange_rejects_mismatched_pkce_verifier_with_invalid_grant() {
+    let server_keys = configure_atproto_env();
+
+    let pool = common::setup_test_db().await;
+    let app = app(pool.clone());
+
+    let user_keys = Keys::generate();
+    let user_pubkey = user_keys.public_key().to_hex();
+    let user_did = "did:plc:testpkcemismatch";
+    let email = format!("pkce-mismatch-{}@example.com", Uuid::new_v4());
+    let code_verifier = "pkce-verifier-1234567890";
+    let code_challenge = pkce_challenge(code_verifier);
+    let dpop_key = dpop_key_material();
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, email, email_verified, atproto_enabled, atproto_state, atproto_did, created_at, updated_at)
+         VALUES ($1, 1, $2, true, true, 'ready', $3, NOW(), NOW())",
+    )
+    .bind(&user_pubkey)
+    .bind(&email)
+    .bind(user_did)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let par_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/atproto/oauth/par")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(
+                    "DPoP",
+                    dpop_proof(&dpop_key, "POST", &http_uri("/atproto/oauth/par"), None, None),
+                )
+                .body(Body::from(format!(
+                    "client_id={}&redirect_uri={}&scope=atproto&state=csrf-pkce-mismatch&code_challenge={}&code_challenge_method=S256",
+                    urlencoding::encode("https://client.example"),
+                    urlencoding::encode("https://client.example/callback"),
+                    urlencoding::encode(&code_challenge),
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(par_response.status(), StatusCode::OK);
+    let par_body = par_response.into_body().collect().await.unwrap().to_bytes();
+    let par_payload: Value = serde_json::from_slice(&par_body).unwrap();
+    let request_uri = par_payload["request_uri"].as_str().unwrap().to_string();
+
+    let redirect_to_login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/atproto/oauth/authorize?request_uri={}",
+                    urlencoding::encode(&request_uri)
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(redirect_to_login.status(), StatusCode::SEE_OTHER);
+
+    let session_token = generate_server_signed_ucan(
+        &user_keys.public_key(),
+        1,
+        &email,
+        "https://login.divine.video",
+        None,
+        &server_keys,
+        true,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let authorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/atproto/oauth/authorize?request_uri={}",
+                    urlencoding::encode(&request_uri)
+                ))
+                .header(header::COOKIE, format!("keycast_session={session_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(authorized.status(), StatusCode::SEE_OTHER);
+    let callback_location = authorized
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let callback_url = reqwest::Url::parse(&callback_location).unwrap();
+    let code = callback_url
+        .query_pairs()
+        .find(|(key, _)| key == "code")
+        .map(|(_, value)| value.to_string())
+        .unwrap();
+
+    let token_response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/atproto/oauth/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "grant_type=authorization_code&code={}&client_id={}&redirect_uri={}&code_verifier={}",
+                    urlencoding::encode(&code),
+                    urlencoding::encode("https://client.example"),
+                    urlencoding::encode("https://client.example/callback"),
+                    urlencoding::encode("different-pkce-verifier"),
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(token_response.status(), StatusCode::BAD_REQUEST);
+    let token_body = token_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let token_payload: Value = serde_json::from_slice(&token_body).unwrap();
+
+    assert_eq!(token_payload["error"], "invalid_grant");
+    assert!(token_payload["error_description"]
+        .as_str()
+        .is_some_and(|description| !description.is_empty()));
+}
+
+#[tokio::test]
+#[serial]
 async fn authorize_rejects_when_atproto_link_is_not_ready() {
     let server_keys = configure_atproto_env();
 
