@@ -65,8 +65,8 @@ impl Database {
             }
         );
         eprintln!(
-            "   Acquire timeout: {}s",
-            crate::request_bounds::SQLX_ACQUIRE_TIMEOUT.as_secs()
+            "   Acquire timeout: {:?}",
+            crate::request_bounds::SQLX_ACQUIRE_TIMEOUT
         );
         eprintln!("   ⚠️  If PoolTimedOut errors occur, check:");
         eprintln!("      - Cloud SQL max_connections (db-f1-micro ≈ 25)");
