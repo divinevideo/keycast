@@ -677,19 +677,10 @@ async fn test_9_expired_oauth_authorization_not_loaded() {
     let (bunker_pubkey, _user_keys) =
         create_oauth_authorization_with_expiry(&pool, 1, Some(expired_at), &key_manager).await;
 
-    // Query using the same SQL the signer uses (lines 761-771 in signer_daemon.rs)
-    let auth_opt: Option<OAuthAuthorization> = sqlx::query_as(
-        r#"
-        SELECT * FROM oauth_authorizations
-        WHERE bunker_public_key = $1
-          AND revoked_at IS NULL
-          AND (expires_at IS NULL OR expires_at > NOW())
-        "#,
-    )
-    .bind(&bunker_pubkey)
-    .fetch_optional(&pool)
-    .await
-    .expect("Query failed");
+    let auth_opt =
+        OAuthAuthorization::find_active_by_bunker_pubkey_for_tenant(&pool, &bunker_pubkey, 1)
+            .await
+            .expect("Query failed");
 
     // Should NOT find the expired authorization
     assert!(
@@ -708,19 +699,10 @@ async fn test_10_non_expired_oauth_authorization_loads() {
     let (bunker_pubkey, _user_keys) =
         create_oauth_authorization_with_expiry(&pool, 1, Some(expires_at), &key_manager).await;
 
-    // Query using the same SQL the signer uses
-    let auth_opt: Option<OAuthAuthorization> = sqlx::query_as(
-        r#"
-        SELECT * FROM oauth_authorizations
-        WHERE bunker_public_key = $1
-          AND revoked_at IS NULL
-          AND (expires_at IS NULL OR expires_at > NOW())
-        "#,
-    )
-    .bind(&bunker_pubkey)
-    .fetch_optional(&pool)
-    .await
-    .expect("Query failed");
+    let auth_opt =
+        OAuthAuthorization::find_active_by_bunker_pubkey_for_tenant(&pool, &bunker_pubkey, 1)
+            .await
+            .expect("Query failed");
 
     // Should find the non-expired authorization
     assert!(
@@ -738,19 +720,10 @@ async fn test_11_null_expiry_oauth_authorization_loads() {
     let (bunker_pubkey, _user_keys) =
         create_oauth_authorization_with_expiry(&pool, 1, None, &key_manager).await;
 
-    // Query using the same SQL the signer uses
-    let auth_opt: Option<OAuthAuthorization> = sqlx::query_as(
-        r#"
-        SELECT * FROM oauth_authorizations
-        WHERE bunker_public_key = $1
-          AND revoked_at IS NULL
-          AND (expires_at IS NULL OR expires_at > NOW())
-        "#,
-    )
-    .bind(&bunker_pubkey)
-    .fetch_optional(&pool)
-    .await
-    .expect("Query failed");
+    let auth_opt =
+        OAuthAuthorization::find_active_by_bunker_pubkey_for_tenant(&pool, &bunker_pubkey, 1)
+            .await
+            .expect("Query failed");
 
     // Should find the authorization (NULL expiry means never expires)
     assert!(
@@ -776,19 +749,10 @@ async fn test_12_revoked_oauth_authorization_not_loaded() {
         .await
         .expect("Failed to revoke authorization");
 
-    // Query using the same SQL the signer uses
-    let auth_opt: Option<OAuthAuthorization> = sqlx::query_as(
-        r#"
-        SELECT * FROM oauth_authorizations
-        WHERE bunker_public_key = $1
-          AND revoked_at IS NULL
-          AND (expires_at IS NULL OR expires_at > NOW())
-        "#,
-    )
-    .bind(&bunker_pubkey)
-    .fetch_optional(&pool)
-    .await
-    .expect("Query failed");
+    let auth_opt =
+        OAuthAuthorization::find_active_by_bunker_pubkey_for_tenant(&pool, &bunker_pubkey, 1)
+            .await
+            .expect("Query failed");
 
     // Should NOT find the revoked authorization
     assert!(

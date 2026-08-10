@@ -6,6 +6,13 @@ use crate::types::claim_token::{
     ClaimToken, ClaimTokenState, ClaimTokenStats, CLAIM_TOKEN_EXPIRY_DAYS,
 };
 
+macro_rules! claim_token_columns {
+    () => {
+        "id, token, user_pubkey, expires_at, used_at, created_at, created_by_pubkey, \
+         tenant_id, invalidated_at, invalidated_by, invalidation_reason"
+    };
+}
+
 /// Repository for account claim token operations.
 /// Used for preloaded users to claim their accounts by setting email/password.
 #[derive(Debug)]
@@ -57,13 +64,15 @@ impl ClaimTokenRepository {
     /// prevents a future code path that sets `invalidated_at` without also
     /// clamping `expires_at` from surfacing invalidated tokens.
     pub async fn find_valid(&self, token: &str) -> Result<Option<ClaimToken>, RepositoryError> {
-        sqlx::query_as::<_, ClaimToken>(
-            "SELECT * FROM account_claim_tokens
+        sqlx::query_as::<_, ClaimToken>(concat!(
+            "SELECT ",
+            claim_token_columns!(),
+            " FROM account_claim_tokens
              WHERE token = $1
                AND expires_at > NOW()
                AND used_at IS NULL
-               AND invalidated_at IS NULL",
-        )
+               AND invalidated_at IS NULL"
+        ))
         .bind(token)
         .fetch_optional(&self.pool)
         .await
@@ -99,16 +108,18 @@ impl ClaimTokenRepository {
         user_pubkey: &str,
         tenant_id: i64,
     ) -> Result<Option<ClaimToken>, RepositoryError> {
-        sqlx::query_as::<_, ClaimToken>(
-            "SELECT * FROM account_claim_tokens
+        sqlx::query_as::<_, ClaimToken>(concat!(
+            "SELECT ",
+            claim_token_columns!(),
+            " FROM account_claim_tokens
              WHERE user_pubkey = $1
                AND tenant_id = $2
                AND expires_at > NOW()
                AND used_at IS NULL
                AND invalidated_at IS NULL
              ORDER BY created_at DESC
-             LIMIT 1",
-        )
+             LIMIT 1"
+        ))
         .bind(user_pubkey)
         .bind(tenant_id)
         .fetch_optional(&self.pool)
@@ -122,11 +133,13 @@ impl ClaimTokenRepository {
         user_pubkey: &str,
         tenant_id: i64,
     ) -> Result<Vec<ClaimToken>, RepositoryError> {
-        sqlx::query_as::<_, ClaimToken>(
-            "SELECT * FROM account_claim_tokens
+        sqlx::query_as::<_, ClaimToken>(concat!(
+            "SELECT ",
+            claim_token_columns!(),
+            " FROM account_claim_tokens
              WHERE user_pubkey = $1 AND tenant_id = $2
-             ORDER BY created_at DESC",
-        )
+             ORDER BY created_at DESC"
+        ))
         .bind(user_pubkey)
         .bind(tenant_id)
         .fetch_all(&self.pool)
@@ -281,10 +294,12 @@ impl ClaimTokenRepository {
         token: &str,
         tenant_id: i64,
     ) -> Result<ClaimTokenState, RepositoryError> {
-        let ct = sqlx::query_as::<_, ClaimToken>(
-            "SELECT * FROM account_claim_tokens
-             WHERE token = $1 AND tenant_id = $2",
-        )
+        let ct = sqlx::query_as::<_, ClaimToken>(concat!(
+            "SELECT ",
+            claim_token_columns!(),
+            " FROM account_claim_tokens
+                 WHERE token = $1 AND tenant_id = $2"
+        ))
         .bind(token)
         .bind(tenant_id)
         .fetch_optional(&self.pool)
@@ -306,8 +321,10 @@ impl ClaimTokenRepository {
         }
 
         // Expired, not admin-invalidated; check for newer valid token for same user.
-        let newer = sqlx::query_as::<_, ClaimToken>(
-            "SELECT * FROM account_claim_tokens
+        let newer = sqlx::query_as::<_, ClaimToken>(concat!(
+            "SELECT ",
+            claim_token_columns!(),
+            " FROM account_claim_tokens
              WHERE user_pubkey = $1
                AND tenant_id = $2
                AND created_at > $3
@@ -315,8 +332,8 @@ impl ClaimTokenRepository {
                AND invalidated_at IS NULL
                AND expires_at > NOW()
              ORDER BY created_at DESC
-             LIMIT 1",
-        )
+             LIMIT 1"
+        ))
         .bind(&ct.user_pubkey)
         .bind(tenant_id)
         .bind(ct.created_at)

@@ -1336,15 +1336,11 @@ impl UnifiedSigner {
     ) -> SignerResult<()> {
         if is_oauth {
             // Load active OAuth authorization (filter out revoked/expired)
-            let auth: Option<OAuthAuthorization> = sqlx::query_as(
-                "SELECT * FROM oauth_authorizations
-                 WHERE bunker_public_key = $1 AND tenant_id = $2
-                   AND revoked_at IS NULL
-                   AND (expires_at IS NULL OR expires_at > NOW())",
+            let auth = OAuthAuthorization::find_active_by_bunker_pubkey_for_tenant(
+                pool,
+                bunker_pubkey,
+                tenant_id,
             )
-            .bind(bunker_pubkey)
-            .bind(tenant_id)
-            .fetch_optional(pool)
             .await?;
 
             if let Some(auth) = auth {
@@ -1510,15 +1506,9 @@ impl UnifiedSigner {
 
                 // Query database for OAuth authorization with this bunker pubkey
                 // Include revoked/expired to support tombstone error responses
-                let auth_opt = sqlx::query_as::<_, OAuthAuthorization>(
-                    r#"
-                    SELECT * FROM oauth_authorizations
-                    WHERE bunker_public_key = $1
-                    "#,
-                )
-                .bind(bunker_pubkey)
-                .fetch_optional(pool)
-                .await?;
+                let auth_opt =
+                    OAuthAuthorization::find_by_bunker_pubkey_for_signer(pool, bunker_pubkey)
+                        .await?;
 
                 match auth_opt {
                     Some(auth) => {
