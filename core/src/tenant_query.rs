@@ -115,7 +115,7 @@ pub fn inject_tenant_filter_sql(sql: &str) -> String {
 ///     pool,
 ///     tenant_id,
 ///     User,
-///     "SELECT * FROM users WHERE public_key = ?",
+///     "SELECT id, public_key FROM users WHERE public_key = ?",
 ///     pubkey
 /// ).fetch_one().await?;
 /// ```
@@ -150,20 +150,20 @@ mod tests {
 
     #[test]
     fn test_inject_tenant_filter_with_where() {
-        let sql = "SELECT * FROM users WHERE email = ?";
+        let sql = "SELECT id, email FROM users WHERE email = ?";
         let result = inject_tenant_filter_sql(sql);
         assert!(result.contains("AND tenant_id = ?"));
         assert_eq!(
             result,
-            "SELECT * FROM users WHERE email = ? AND tenant_id = ?"
+            "SELECT id, email FROM users WHERE email = ? AND tenant_id = ?"
         );
     }
 
     #[test]
     fn test_inject_tenant_filter_without_where() {
-        let sql = "SELECT * FROM users";
+        let sql = "SELECT id, email FROM users";
         let result = inject_tenant_filter_sql(sql);
         assert!(result.contains("WHERE tenant_id = ?"));
-        assert_eq!(result, "SELECT * FROM users WHERE tenant_id = ?");
+        assert_eq!(result, "SELECT id, email FROM users WHERE tenant_id = ?");
     }
 }

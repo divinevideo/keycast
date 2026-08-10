@@ -55,6 +55,60 @@ pub struct OAuthAuthorization {
 }
 
 impl OAuthAuthorization {
+    /// Find an active authorization for the signer cache.
+    ///
+    /// Keep the projection explicit: these queries are prepared through a
+    /// transaction-mode pooler in production, and `SELECT *` changes its result
+    /// type whenever a migration adds a column.
+    pub async fn find_active_by_bunker_pubkey_for_tenant(
+        pool: &PgPool,
+        bunker_pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<Option<Self>, AuthorizationError> {
+        sqlx::query_as::<_, Self>(
+            "SELECT id, user_pubkey, redirect_origin, client_id, bunker_public_key,
+                    secret_hash, relays, policy_id, tenant_id, client_pubkey,
+                    connected_client_pubkey, connected_at, created_at, updated_at,
+                    revoked_at, expires_at, handle_expires_at, authorization_handle,
+                    is_first_party
+             FROM oauth_authorizations
+             WHERE bunker_public_key = $1 AND tenant_id = $2
+               AND revoked_at IS NULL
+               AND (expires_at IS NULL OR expires_at > NOW())",
+        )
+        .bind(bunker_pubkey)
+        .bind(tenant_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Find an authorization for an on-demand signer lookup.
+    ///
+    /// Revoked and expired rows are deliberately included so the signer can
+    /// return a tombstone response instead of timing out.
+    /// This lookup is intentionally not tenant-scoped because the relay event
+    /// reaches the signer with only its globally derived bunker key. Do not use
+    /// it from tenant-scoped HTTP request paths.
+    pub async fn find_by_bunker_pubkey_for_signer(
+        pool: &PgPool,
+        bunker_pubkey: &str,
+    ) -> Result<Option<Self>, AuthorizationError> {
+        sqlx::query_as::<_, Self>(
+            "SELECT id, user_pubkey, redirect_origin, client_id, bunker_public_key,
+                    secret_hash, relays, policy_id, tenant_id, client_pubkey,
+                    connected_client_pubkey, connected_at, created_at, updated_at,
+                    revoked_at, expires_at, handle_expires_at, authorization_handle,
+                    is_first_party
+             FROM oauth_authorizations
+             WHERE bunker_public_key = $1",
+        )
+        .bind(bunker_pubkey)
+        .fetch_optional(pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Get the permissions for this OAuth authorization (if policy exists)
     pub async fn permissions(
         &self,

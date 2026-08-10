@@ -2,6 +2,17 @@ use crate::repositories::RepositoryError;
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
 
+macro_rules! atproto_oauth_session_columns {
+    () => {
+        "id, tenant_id, client_id, redirect_uri, scope, state, code_challenge, \
+         code_challenge_method, request_uri, par_expires_at, user_pubkey, atproto_did, \
+         approved_at, authorization_code, authorization_code_expires_at, access_token_jti, \
+         access_token_expires_at, refresh_token_hash, refresh_token_expires_at, \
+         refresh_token_revoked_at, revoked_at, dpop_jkt, dpop_nonce, client_auth_method, \
+         client_auth_alg, client_auth_kid, client_auth_jkt, created_at, updated_at"
+    };
+}
+
 #[derive(Debug, Clone, FromRow)]
 pub struct AtprotoOAuthSession {
     pub id: i32,
@@ -110,11 +121,13 @@ impl AtprotoOAuthSessionRepository {
         &self,
         request_uri: &str,
     ) -> Result<Option<AtprotoOAuthSession>, RepositoryError> {
-        sqlx::query_as::<_, AtprotoOAuthSession>(
-            "SELECT * FROM atproto_oauth_sessions
+        sqlx::query_as::<_, AtprotoOAuthSession>(concat!(
+            "SELECT ",
+            atproto_oauth_session_columns!(),
+            " FROM atproto_oauth_sessions
              WHERE request_uri = $1
-               AND revoked_at IS NULL",
-        )
+               AND revoked_at IS NULL"
+        ))
         .bind(request_uri)
         .fetch_optional(&self.pool)
         .await
@@ -181,12 +194,14 @@ impl AtprotoOAuthSessionRepository {
         &self,
         authorization_code: &str,
     ) -> Result<Option<AtprotoOAuthSession>, RepositoryError> {
-        sqlx::query_as::<_, AtprotoOAuthSession>(
-            "SELECT * FROM atproto_oauth_sessions
+        sqlx::query_as::<_, AtprotoOAuthSession>(concat!(
+            "SELECT ",
+            atproto_oauth_session_columns!(),
+            " FROM atproto_oauth_sessions
              WHERE authorization_code = $1
                AND revoked_at IS NULL
-               AND authorization_code_expires_at > NOW()",
-        )
+               AND authorization_code_expires_at > NOW()"
+        ))
         .bind(authorization_code)
         .fetch_optional(&self.pool)
         .await
@@ -238,13 +253,15 @@ impl AtprotoOAuthSessionRepository {
         &self,
         refresh_token_hash: &str,
     ) -> Result<Option<AtprotoOAuthSession>, RepositoryError> {
-        sqlx::query_as::<_, AtprotoOAuthSession>(
-            "SELECT * FROM atproto_oauth_sessions
+        sqlx::query_as::<_, AtprotoOAuthSession>(concat!(
+            "SELECT ",
+            atproto_oauth_session_columns!(),
+            " FROM atproto_oauth_sessions
              WHERE refresh_token_hash = $1
                AND revoked_at IS NULL
                AND refresh_token_revoked_at IS NULL
-               AND refresh_token_expires_at > NOW()",
-        )
+               AND refresh_token_expires_at > NOW()"
+        ))
         .bind(refresh_token_hash)
         .fetch_optional(&self.pool)
         .await
