@@ -1802,9 +1802,19 @@ async fn warm_status_check_pool_exhaustion_is_retryable_503() {
     .await
     .expect_err("saturated status-check acquire should fail as unavailable");
 
+    let elapsed = started.elapsed();
     assert!(
-        started.elapsed() < HTTP_RPC_HANDLER_TIMEOUT,
-        "pool acquire must fail before the handler timeout fires"
+        elapsed < HTTP_RPC_HANDLER_TIMEOUT,
+        "pool acquire must fail before the handler timeout fires, took {elapsed:?}"
+    );
+    // Without a lower bound this passes for any acquire timeout under 8s, and
+    // also for a 503 raised instantly by some unrelated failure -- neither of
+    // which is what this test claims to cover. Waiting the full acquire budget
+    // is what identifies the pool timeout as the thing that fired.
+    assert!(
+        elapsed >= SQLX_ACQUIRE_TIMEOUT,
+        "saturated acquire should have waited the full {SQLX_ACQUIRE_TIMEOUT:?} \
+         acquire budget, but failed after {elapsed:?}"
     );
     let response = err.into_response();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
