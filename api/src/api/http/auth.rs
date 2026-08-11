@@ -2348,7 +2348,44 @@ pub async fn verify_email(
     Json(req): Json<VerifyEmailRequest>,
 ) -> Result<impl IntoResponse, AuthError> {
     let tenant_id = tenant.0.id;
-    let outcome = perform_email_verification(&auth_state, &headers, tenant_id, &req.token).await?;
+    // Emitted with the same event_type as the GET path so both transports are comparable in the
+    // auth-event feed (keycast#262 made the GET primary).
+    let outcome =
+        match perform_email_verification(&auth_state, &headers, tenant_id, &req.token).await {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                record_verify_email_event(
+                    &auth_state.state.db,
+                    &headers,
+                    tenant_id,
+                    "POST",
+                    "failure",
+                    Some(verify_email_reason_code(&err)),
+                    verify_email_error_status(&err),
+                )
+                .await;
+                return Err(err);
+            }
+        };
+
+    let outcome_reason = match &outcome {
+        VerifyOutcome::Headless => "headless",
+        VerifyOutcome::OAuthRedirect { .. } => "oauth_redirect",
+        VerifyOutcome::AlreadyVerified => "already_verified",
+        VerifyOutcome::Processing => "processing",
+        VerifyOutcome::Expired => "expired",
+        VerifyOutcome::LoggedIn { .. } => "logged_in",
+    };
+    record_verify_email_event(
+        &auth_state.state.db,
+        &headers,
+        tenant_id,
+        "POST",
+        "success",
+        Some(outcome_reason),
+        200,
+    )
+    .await;
 
     let response = match outcome {
         VerifyOutcome::Headless => (
@@ -2443,12 +2480,22 @@ pub struct VerifyEmailQuery {
 pub async fn verify_email_get(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     Query(query): Query<VerifyEmailQuery>,
 ) -> Response {
     let tenant_id = tenant.0.id;
+    let pool = auth_state.state.db.clone();
+    let emit = |outcome: &'static str, reason: Option<&'static str>, status: i32| {
+        let pool = pool.clone();
+        let headers = headers.clone();
+        async move {
+            record_verify_email_event(&pool, &headers, tenant_id, "GET", outcome, reason, status)
+                .await;
+        }
+    };
 
     let Some(token) = query.token.filter(|t| !t.is_empty()) else {
+        emit("failure", Some("missing_token"), 400).await;
         return verify_html_page(
             StatusCode::BAD_REQUEST,
             "Invalid link",
@@ -2458,18 +2505,25 @@ pub async fn verify_email_get(
 
     match perform_pending_email_verification(&auth_state, tenant_id, &token).await {
         Ok(Some(PendingVerifyOutcome::OAuthRedirect { redirect_url })) => {
+            emit("success", Some("oauth_redirect"), 303).await;
             Redirect::to(&redirect_url).into_response()
         }
-        Ok(Some(PendingVerifyOutcome::Headless)) => verify_html_page(
-            StatusCode::OK,
-            "Email verified!",
-            "Your email is verified. You can return to the app to continue.",
-        ),
-        Ok(Some(PendingVerifyOutcome::AlreadyVerified)) => verify_html_page(
-            StatusCode::OK,
-            "Already verified",
-            "Your email is already verified. You can return to the app or log in.",
-        ),
+        Ok(Some(PendingVerifyOutcome::Headless)) => {
+            emit("success", Some("headless"), 200).await;
+            verify_html_page(
+                StatusCode::OK,
+                "Email verified!",
+                "Your email is verified. You can return to the app to continue.",
+            )
+        }
+        Ok(Some(PendingVerifyOutcome::AlreadyVerified)) => {
+            emit("success", Some("already_verified"), 200).await;
+            verify_html_page(
+                StatusCode::OK,
+                "Already verified",
+                "Your email is already verified. You can return to the app or log in.",
+            )
+        }
         Ok(None) => {
             // Not a pending registration. Only a token that still resolves to a users row belongs
             // to the first-party interactive flow, which the SPA owns (it POSTs and mints the
@@ -2477,13 +2531,21 @@ pub async fn verify_email_get(
             // a 401 "Please log in again" — the one place this GET would still need client-side
             // JavaScript, which is exactly what verifying on GET exists to avoid (keycast#268).
             let user_repo = UserRepository::new(auth_state.state.db.clone());
-            match user_repo.find_by_verification_token(&token, tenant_id).await {
+            match user_repo
+                .find_by_verification_token(&token, tenant_id)
+                .await
+            {
                 Ok(Some(_)) => {
+                    // Not an outcome yet: the interactive POST records the terminal one.
+                    emit("accepted", Some("interactive_handoff"), 303).await;
                     let interactive_url =
                         format!("/verify-email?token={}", urlencoding::encode(&token));
                     Redirect::to(&interactive_url).into_response()
                 }
-                Ok(None) => verify_link_superseded_page(),
+                Ok(None) => {
+                    emit("failure", Some("verification_link_superseded"), 200).await;
+                    verify_link_superseded_page()
+                }
                 // Can't tell a dead link from a database blip, so retry rather than declaring the
                 // link dead.
                 Err(err) => {
@@ -2492,6 +2554,7 @@ pub async fn verify_email_get(
                         error = %err,
                         "Failed to resolve verification token on GET verify"
                     );
+                    emit("failure", Some("database_error"), 503).await;
                     verify_html_retry_page(5)
                 }
             }
@@ -2499,17 +2562,21 @@ pub async fn verify_email_get(
         // Retryable: the link may still be good, so render a non-terminal page that retries
         // itself instead of a success-looking 2xx or terminal invalid-link page.
         Err(AuthError::ServiceUnavailable { retry_after, .. }) => {
+            emit("failure", Some("retryable_unavailable"), 503).await;
             verify_html_retry_page(retry_after.unwrap_or(5))
         }
         // Terminal: the email belongs to another account (mirrors the POST path's 409).
-        Err(AuthError::EmailAlreadyExists) => verify_html_page(
-            StatusCode::CONFLICT,
-            "Email already registered",
-            "This email is already registered. Please log in instead.",
-        ),
-        Err(AuthError::Database(err))
-            if has_database_constraint(&err, USERS_EMAIL_TENANT_CONSTRAINT) =>
+        Err(AuthError::EmailAlreadyExists) => {
+            emit("failure", Some("email_already_exists"), 409).await;
+            verify_html_page(
+                StatusCode::CONFLICT,
+                "Email already registered",
+                "This email is already registered. Please log in instead.",
+            )
+        }
+        Err(err @ AuthError::Database(_)) if matches!(&err, AuthError::Database(e) if has_database_constraint(e, USERS_EMAIL_TENANT_CONSTRAINT)) =>
         {
+            emit("failure", Some("email_already_exists"), 409).await;
             verify_html_page(
                 StatusCode::CONFLICT,
                 "Email already registered",
@@ -2517,33 +2584,116 @@ pub async fn verify_email_get(
             )
         }
         // Rate limited: the link is still good, so retry rather than declaring it dead.
-        Err(AuthError::TooManyRequests { retry_after, .. }) => verify_html_retry_page(retry_after),
-        Err(AuthError::Database(_))
-        | Err(AuthError::PasswordHash(_))
-        | Err(AuthError::Encryption(_))
-        | Err(AuthError::Internal(_))
-        | Err(AuthError::EmailSendFailed(_)) => verify_html_retry_page(5),
+        Err(AuthError::TooManyRequests { retry_after, .. }) => {
+            emit("failure", Some("rate_limited"), 429).await;
+            verify_html_retry_page(retry_after)
+        }
+        Err(
+            err @ (AuthError::Database(_)
+            | AuthError::PasswordHash(_)
+            | AuthError::Encryption(_)
+            | AuthError::Internal(_)
+            | AuthError::EmailSendFailed(_)),
+        ) => {
+            emit("failure", Some(verify_email_reason_code(&err)), 503).await;
+            verify_html_retry_page(5)
+        }
         // A link that no longer resolves gets the actionable dead-link page, not a generic failure.
-        Err(AuthError::VerificationLinkSuperseded) => verify_link_superseded_page(),
-        Err(AuthError::InvalidCredentials)
-        | Err(AuthError::EmailNotVerified)
-        | Err(AuthError::UserNotFound)
-        | Err(AuthError::MissingToken)
-        | Err(AuthError::InvalidToken)
-        | Err(AuthError::TokenExpired)
-        | Err(AuthError::DuplicateKey)
-        | Err(AuthError::InvalidEmail)
-        | Err(AuthError::BadRequest(_))
-        | Err(AuthError::Forbidden(_))
-        | Err(AuthError::RegistrationExpired)
-        | Err(AuthError::RegistrationAlreadyCompleted)
-        | Err(AuthError::KeyEgressDenied)
-        | Err(AuthError::OAuthProtocol { .. })
-        | Err(AuthError::Conflict(_)) => verify_html_page(
-            StatusCode::OK,
-            "Verification failed",
-            "This verification link is invalid or has expired. If you already verified, you can log in.",
-        ),
+        Err(AuthError::VerificationLinkSuperseded) => {
+            emit("failure", Some("verification_link_superseded"), 200).await;
+            verify_link_superseded_page()
+        }
+        Err(err) => {
+            emit("failure", Some(verify_email_reason_code(&err)), 200).await;
+            verify_html_page(
+                StatusCode::OK,
+                "Verification failed",
+                "This verification link is invalid or has expired. If you already verified, you can log in.",
+            )
+        }
+    }
+}
+
+/// `auth_events.endpoint` for both verify-email transports.
+pub(crate) const VERIFY_EMAIL_ENDPOINT: &str = "/api/auth/verify-email";
+
+/// Record one verify-email attempt to the shared auth-event feed.
+///
+/// Both transports emit this with the same `event_type`, differing only in `metadata_json.method`,
+/// so GET and POST outcomes are directly comparable. That matters most right after the switch to
+/// verifying on GET (keycast#262): the GET is now the primary path, and the
+/// `verification_link_superseded` rate is the signal for whether duplicate signups
+/// (keycast#268 Fix A) actually stopped in production.
+async fn record_verify_email_event(
+    pool: &PgPool,
+    headers: &HeaderMap,
+    tenant_id: i64,
+    method: &'static str,
+    outcome: &'static str,
+    reason_code: Option<&str>,
+    http_status: i32,
+) {
+    super::auth_observability::record_auth_event_and_log(
+        pool,
+        headers,
+        None,
+        super::auth_observability::AuthEvent {
+            tenant_id,
+            endpoint: VERIFY_EMAIL_ENDPOINT,
+            event_type: "email_verification",
+            outcome,
+            reason_code,
+            http_status,
+            email: None,
+            pubkey: None,
+            client_id: None,
+            redirect_origin: None,
+            metadata_json: serde_json::json!({ "method": method }),
+        },
+    )
+    .await;
+}
+
+/// HTTP status a verify-email failure will answer with, for the auth-event feed.
+///
+/// Kept in step with `AuthError`'s `IntoResponse`; only the statuses this route can actually
+/// produce are enumerated, and anything else records the 503 the catch-all answers with.
+fn verify_email_error_status(error: &AuthError) -> i32 {
+    match error {
+        AuthError::EmailAlreadyExists => 409,
+        AuthError::Database(err) if has_database_constraint(err, USERS_EMAIL_TENANT_CONSTRAINT) => {
+            409
+        }
+        AuthError::DuplicateKey
+        | AuthError::Conflict(_)
+        | AuthError::RegistrationAlreadyCompleted => 409,
+        AuthError::VerificationLinkSuperseded | AuthError::InvalidToken => 401,
+        AuthError::TooManyRequests { .. } => 429,
+        AuthError::RegistrationExpired => 410,
+        AuthError::BadRequest(_) | AuthError::InvalidEmail => 400,
+        AuthError::Forbidden(_) | AuthError::KeyEgressDenied => 403,
+        _ => 503,
+    }
+}
+
+/// Classify a verify-email failure into a stable `reason_code` for the auth-event feed.
+fn verify_email_reason_code(error: &AuthError) -> &'static str {
+    match error {
+        AuthError::ServiceUnavailable { .. } => "retryable_unavailable",
+        AuthError::TooManyRequests { .. } => "rate_limited",
+        AuthError::EmailAlreadyExists => "email_already_exists",
+        AuthError::Database(err) if has_database_constraint(err, USERS_EMAIL_TENANT_CONSTRAINT) => {
+            "email_already_exists"
+        }
+        AuthError::Database(_) => "database_error",
+        AuthError::VerificationLinkSuperseded => "verification_link_superseded",
+        AuthError::RegistrationExpired => "registration_expired",
+        AuthError::RegistrationAlreadyCompleted => "registration_already_completed",
+        AuthError::DuplicateKey => "account_email_conflict",
+        AuthError::InvalidToken | AuthError::MissingToken | AuthError::TokenExpired => {
+            "invalid_token"
+        }
+        _ => "other",
     }
 }
 
@@ -6615,6 +6765,70 @@ mod tests {
             !body.contains("log in again"),
             "dead-link page must not tell a user with no session to log in again, got: {body}"
         );
+    }
+
+    /// The GET path records auth events for its outcomes, matching the POST path's event_type so
+    /// the two transports are comparable. Post-merge the GET is the primary verification path, and
+    /// the `verification_link_superseded` rate is the signal for whether duplicate signups
+    /// actually stopped in production (keycast#268).
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_email_get_records_auth_event_for_dead_link() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+        let token = format!("nonexistent_{}", Uuid::new_v4());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            crate::api::http::auth_observability::REQUEST_ID_HEADER,
+            token.parse().expect("token is a valid header value"),
+        );
+
+        let _ = verify_email_get(
+            create_test_tenant(),
+            State(auth_state),
+            headers,
+            axum::extract::Query(VerifyEmailQuery {
+                token: Some(token.clone()),
+            }),
+        )
+        .await
+        .into_response();
+
+        let event: Option<(String,)> = sqlx::query_as(
+            "SELECT concat_ws('|', endpoint, event_type, outcome, reason_code, http_status)
+             FROM auth_events WHERE request_id = $1",
+        )
+        .bind(&token)
+        .fetch_optional(&pool)
+        .await
+        .expect("query should succeed");
+
+        let event = event
+            .expect("GET verify must record an auth event, not silently drop the outcome")
+            .0;
+        assert_eq!(
+            event,
+            "/api/auth/verify-email|email_verification|failure|verification_link_superseded|200"
+        );
+
+        let method: Option<String> = sqlx::query_scalar(
+            "SELECT metadata_json->>'method' FROM auth_events WHERE request_id = $1",
+        )
+        .bind(&token)
+        .fetch_one(&pool)
+        .await
+        .expect("query should succeed");
+        assert_eq!(
+            method.as_deref(),
+            Some("GET"),
+            "the transport must be recorded so GET and POST stay comparable"
+        );
+
+        let _ = sqlx::query("DELETE FROM auth_events WHERE request_id = $1")
+            .bind(&token)
+            .execute(&pool)
+            .await;
     }
 
     /// A superseded token reaching the POST/SPA path answers with the same actionable copy and a
