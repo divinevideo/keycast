@@ -1247,8 +1247,8 @@ pub async fn headless_resend_pin(
 
     if let Err(e) = send_result {
         tracing::error!("Failed to resend verification email to {}: {}", email, e);
-        // Guarded on the hash this call wrote, so a later resend that did reach the user is never
-        // rolled back out from under them.
+        // Guarded on the token and hash this call wrote, and serialized with redemption, so neither
+        // a later resend nor an in-progress token exchange is rolled back out from under the user.
         let restored = oauth_code_repo
             .restore_pin_after_failed_resend(
                 &req.device_code,
@@ -1260,12 +1260,13 @@ pub async fn headless_resend_pin(
                     pin_sent_at: old_pin_sent_at,
                     pin_resend_at: old_pin_resend_at,
                 },
+                &new_token,
                 &new_pin_hash,
             )
             .await?;
         if !restored {
             tracing::info!(
-                "resend-pin: skipped rollback because a later resend already replaced the PIN"
+                "resend-pin: skipped rollback because the replacement generation is no longer safe to restore"
             );
         }
         return Ok(success());
@@ -3024,6 +3025,7 @@ mod tests {
                     pin_sent_at: b_sent,
                     pin_resend_at: b_resend,
                 },
+                b_token.as_deref().expect("snapshot carries a token"),
                 b_hash.as_deref().expect("snapshot carries a PIN hash"),
             )
             .await
