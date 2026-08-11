@@ -5359,6 +5359,7 @@ mod tests {
     use super::generate_server_signed_ucan;
     use super::validate_origin;
     use super::AccountStatusResponse;
+    #[cfg(feature = "integration-tests")]
     use super::{VERIFICATION_LINK_SUPERSEDED_CODE, VERIFICATION_LINK_SUPERSEDED_HEADING};
     use axum::response::IntoResponse;
     use ucan::Ucan;
