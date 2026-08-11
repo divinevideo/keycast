@@ -989,7 +989,11 @@ async fn cache_control_middleware(request: Request<Body>, next: Next) -> Respons
     let cache_value = if path.starts_with("/_app/") {
         // SvelteKit hash-versioned assets - cache forever (1 year)
         "public, max-age=31536000, immutable"
-    } else if path.starts_with("/api/") || path.starts_with("/health") || path == "/livez" {
+    } else if path.starts_with("/api/")
+        || path.starts_with("/health")
+        || path == "/livez"
+        || path == "/verify-email"
+    {
         // Dynamic content - no caching
         // (`/health`, `/healthz/startup`, `/healthz/ready` all match `/health`;
         //  `/livez` is the only probe route not under that prefix.)
@@ -1523,6 +1527,11 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     });
 
     // Get pure API routes (JSON endpoints only) - pass authorization sender
+    let public_verify_email_route = keycast_api::api::http::routes::public_verify_email_route(
+        api_state.clone(),
+        public_cors.clone(),
+        Some(auth_tx.clone()),
+    );
     let api_routes = keycast_api::api::http::routes::api_routes(
         database.pool.clone(),
         api_state.clone(),
@@ -1572,6 +1581,8 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
             get(keycast_api::api::http::nostr_discovery_public),
         )
         .with_state(database.pool.clone())
+        // Canonical public verification path used by iOS Universal Links and Android App Links.
+        .merge(public_verify_email_route)
         // Apple/Android app association files
         .nest("/.well-known", well_known_routes)
         // All API endpoints under /api prefix
@@ -2327,6 +2338,28 @@ mod tests {
 
         let request_id = response.headers().get("x-request-id").unwrap();
         assert!(!request_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_public_verify_email_route_is_not_cached() {
+        let app = Router::new()
+            .route("/verify-email", get(|| async { "verification result" }))
+            .layer(middleware::from_fn(cache_control_middleware));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/verify-email?token=sensitive")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
     }
 
     #[tokio::test]
