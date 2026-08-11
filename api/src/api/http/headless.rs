@@ -1702,16 +1702,19 @@ mod tests {
         );
 
         // Exactly one pending row, one live verification token: only one email is actionable.
-        let rows: Vec<(
-            String,
-            Option<String>,
-            Option<String>,
-            i32,
-            i32,
-            Option<DateTime<Utc>>,
-            Option<DateTime<Utc>>,
-            DateTime<Utc>,
-        )> = sqlx::query_as(
+        #[derive(sqlx::FromRow)]
+        struct PendingRegistrationState {
+            pending_password_hash: String,
+            code_challenge: Option<String>,
+            pending_email_verification_token: Option<String>,
+            pin_attempts: i32,
+            pin_failed_total: i32,
+            pin_sent_at: Option<DateTime<Utc>>,
+            pin_resend_at: Option<DateTime<Utc>>,
+            expires_at: DateTime<Utc>,
+        }
+
+        let rows: Vec<PendingRegistrationState> = sqlx::query_as(
             "SELECT pending_password_hash, code_challenge, pending_email_verification_token,
                     pin_attempts, pin_failed_total, pin_sent_at, pin_resend_at, expires_at
              FROM oauth_codes
@@ -1727,56 +1730,53 @@ mod tests {
             1,
             "a duplicate register must not create a second pending registration"
         );
-        let (
-            password_hash,
-            code_challenge,
-            token,
-            pin_attempts,
-            pin_failed_total,
-            pin_sent_at,
-            pin_resend_at,
-            expires_at,
-        ) = rows.into_iter().next().unwrap();
+        let row = rows.into_iter().next().unwrap();
 
         // The newest attempt wins: a user who retyped their password must be able to log in with
         // the password they last submitted, and the stored PKCE challenge must match the verifier
         // the app is now holding or token exchange would fail PKCE.
         assert!(
-            bcrypt::verify("secondpassword456", &password_hash)
+            bcrypt::verify("secondpassword456", &row.pending_password_hash)
                 .expect("stored hash should be verifiable"),
             "the second attempt's password must win"
         );
         assert!(
-            !bcrypt::verify("firstpassword123", &password_hash)
+            !bcrypt::verify("firstpassword123", &row.pending_password_hash)
                 .expect("stored hash should be verifiable"),
             "the superseded attempt's password must not survive"
         );
         assert_eq!(
-            code_challenge.as_deref(),
+            row.code_challenge.as_deref(),
             Some("challenge-two"),
             "the second attempt's PKCE challenge must win"
         );
-        assert_eq!(pin_attempts, 0, "superseding re-arms the attempt counter");
         assert_eq!(
-            pin_failed_total, 5,
+            row.pin_attempts, 0,
+            "superseding re-arms the attempt counter"
+        );
+        assert_eq!(
+            row.pin_failed_total, 5,
             "superseding must not grant a fresh lifetime guessing budget"
         );
         assert!(
-            pin_resend_at.is_none(),
+            row.pin_resend_at.is_none(),
             "superseding must not inherit the old PIN's resend cooldown"
         );
         assert!(
-            pin_sent_at.is_some_and(|sent_at| sent_at > first_sent_at),
+            row.pin_sent_at
+                .is_some_and(|sent_at| sent_at > first_sent_at),
             "the replacement PIN should be stamped only after its delivery succeeds"
         );
         assert!(
-            expires_at > first_expiry,
+            row.expires_at > first_expiry,
             "an explicit re-registration should start a fresh verification window"
         );
 
         // The first email's token is dead — that link now renders the terminal
         // superseded page rather than stranding the user on a 401.
-        let token = token.expect("pending row keeps a verification token");
+        let token = row
+            .pending_email_verification_token
+            .expect("pending row keeps a verification token");
         let stale_token_rows: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM oauth_codes
              WHERE pending_email_verification_token = $1 AND tenant_id = 1",
