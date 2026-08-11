@@ -2926,7 +2926,11 @@ async fn handle_authorization_code_grant(
     let auth_code = oauth_code_repo
         .find_valid(tenant_id, code)
         .await?
-        .ok_or(OAuthError::Unauthorized)?;
+        .ok_or_else(|| {
+            OAuthError::InvalidGrant(
+                "Authorization code is invalid, expired, or already used.".to_string(),
+            )
+        })?;
     let auth_code_for_redeem = auth_code.clone();
 
     let user_pubkey = auth_code.user_pubkey;
@@ -3115,7 +3119,9 @@ async fn handle_authorization_code_grant(
             .redeem_code(tenant_id, code, &auth_code_for_redeem)
             .await?
         {
-            return Err(OAuthError::Unauthorized);
+            return Err(OAuthError::InvalidGrant(
+                "Authorization code is invalid, expired, or already used.".to_string(),
+            ));
         }
         email
     };

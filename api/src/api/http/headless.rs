@@ -171,9 +171,7 @@ pub async fn headless_register(
         .await?
         .is_some()
     {
-        return Err(HeadlessError::Conflict(
-            "This email is already registered. Please log in instead.".to_string(),
-        ));
+        return Err(HeadlessError::EmailAlreadyExists);
     }
 
     // Encrypt the secret key
@@ -241,7 +239,13 @@ pub async fn headless_register(
             is_headless: true,
             pin_hash: Some(&pin_hash),
         })
-        .await?;
+        .await
+        .map_err(|error| match error {
+            keycast_core::repositories::RepositoryError::Duplicate => {
+                HeadlessError::EmailAlreadyExists
+            }
+            other => other.into(),
+        })?;
 
     // A duplicate register supersedes the earlier pending registration in place and keeps its
     // device_code (keycast#268). Poll on the row's device_code, not the one we just generated, so
@@ -1828,6 +1832,58 @@ mod tests {
             .bind(&email)
             .execute(&pool)
             .await;
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    #[serial]
+    async fn test_headless_register_existing_email_uses_documented_error_code() {
+        let auth_state = create_lazy_auth_state();
+        let pool = auth_state.state.db.clone();
+        let email = format!("headless-existing-{}@example.com", uuid::Uuid::new_v4());
+        let pubkey = Keys::generate().public_key().to_hex();
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, email_verified, created_at, updated_at)
+             VALUES ($1, 1, $2, true, NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .bind(&email)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = super::headless_register(
+            create_unit_test_tenant(),
+            axum::extract::State(auth_state),
+            axum::Json(super::HeadlessRegisterRequest {
+                email: email.clone(),
+                password: "testpassword123".to_string(),
+                client_id: "TestClient".to_string(),
+                redirect_uri: "https://client.example/callback".to_string(),
+                nsec: None,
+                scope: None,
+                code_challenge: Some("challenge".to_string()),
+                code_challenge_method: Some("S256".to_string()),
+                state: None,
+            }),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("an already-materialized email must be rejected"),
+            Err(error) => error,
+        };
+        let response = axum::response::IntoResponse::into_response(error);
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(response).await["code"],
+            super::super::auth::EMAIL_ALREADY_EXISTS_CODE
+        );
+
+        sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(&pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     /// headless_register stores a hashed 6-digit PIN on the pending row (keycast#262).

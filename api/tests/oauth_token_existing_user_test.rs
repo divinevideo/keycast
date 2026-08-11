@@ -179,6 +179,26 @@ async fn oauth_token_exchanges_plain_existing_user_code() {
 
     let response = match token(
         create_test_tenant(),
+        State(auth_state.clone()),
+        TokenRequestBody(TokenRequest {
+            grant_type: Some("authorization_code".to_string()),
+            code: Some(code.clone()),
+            client_id: client_id.clone(),
+            redirect_uri: Some(redirect_uri.to_string()),
+            code_verifier: Some(format!("verifier.{}", nsec)),
+            refresh_token: None,
+        }),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    };
+    let status = response.status();
+    let body = response_json(response).await;
+
+    let replay = match token(
+        create_test_tenant(),
         State(auth_state),
         TokenRequestBody(TokenRequest {
             grant_type: Some("authorization_code".to_string()),
@@ -194,14 +214,16 @@ async fn oauth_token_exchanges_plain_existing_user_code() {
         Ok(response) => response,
         Err(error) => error.into_response(),
     };
-    let status = response.status();
-    let body = response_json(response).await;
+    let replay_status = replay.status();
+    let replay_body = response_json(replay).await;
 
     cleanup_user(&pool, &user_pubkey, &code).await;
 
     assert_eq!(status, StatusCode::OK, "unexpected token response: {body}");
     assert!(body["access_token"].is_string(), "token response: {body}");
     assert!(body["bunker_url"].is_string(), "token response: {body}");
+    assert_eq!(replay_status, StatusCode::BAD_REQUEST);
+    assert_eq!(replay_body["error"], "invalid_grant");
 }
 
 #[tokio::test]
