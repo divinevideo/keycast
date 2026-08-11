@@ -1191,6 +1191,9 @@ pub async fn headless_resend_pin(
     let Some(email) = pending.pending_email.clone() else {
         return Ok(success());
     };
+    let Some(old_token) = pending.pending_email_verification_token.clone() else {
+        return Ok(success());
+    };
 
     // Mint a fresh token + PIN and reset the attempt counter. The original 24h verify window is
     // preserved (resend does not extend expires_at) so the pending row stays bounded (keycast#262).
@@ -1203,7 +1206,6 @@ pub async fn headless_resend_pin(
             .map_err(|e| HeadlessError::Internal(format!("Task join error: {}", e)))?
             .map_err(|e| HeadlessError::Internal(format!("PIN hash error: {}", e)))?;
 
-    let old_token = pending.pending_email_verification_token.clone();
     let old_pin_hash = pending.pin_hash.clone();
     let old_pin_attempts = pending.pin_attempts;
     let old_pin_sent_at = pending.pin_sent_at;
@@ -1217,6 +1219,7 @@ pub async fn headless_resend_pin(
         .reset_pin_for_resend(
             &req.device_code,
             tenant_id,
+            &old_token,
             &new_token,
             &new_pin_hash,
             cooldown_cutoff,
@@ -1253,7 +1256,7 @@ pub async fn headless_resend_pin(
                 &req.device_code,
                 tenant_id,
                 keycast_core::repositories::PinResendSnapshot {
-                    verification_token: old_token.as_deref(),
+                    verification_token: Some(&old_token),
                     pin_hash: old_pin_hash.as_deref(),
                     pin_attempts: old_pin_attempts,
                     pin_sent_at: old_pin_sent_at,

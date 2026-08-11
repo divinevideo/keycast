@@ -26,8 +26,9 @@ use crate::password_verifier::{
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
     AccountStatusWithMinorRow, AuthEventRepository, CreateOAuthAuthorizationParams,
-    OAuthAuthorizationRepository, OAuthCodeData, OAuthCodeRepository, PersonalKeysRepository,
-    PolicyRepository, UserRepository, VerifiedMinorRow,
+    MaterializePendingRegistrationOutcome, OAuthAuthorizationRepository, OAuthCodeData,
+    OAuthCodeRepository, PersonalKeysRepository, PolicyRepository, UserRepository,
+    VerifiedMinorRow,
 };
 use keycast_core::traits::CustomPermission;
 use nostr_sdk::{Keys, PublicKey, ToBech32, UnsignedEvent};
@@ -1726,23 +1727,6 @@ pub enum HeadlessDelivery {
     RedisBestEffort,
 }
 
-/// Delete a pending registration row that can never complete (terminal conflict).
-///
-/// Pending rows are otherwise kept so re-verification re-arms a fresh exchange code; deletion is
-/// reserved for conflicts where no exchange code could ever be minted from the row.
-async fn delete_pending_registration(
-    oauth_code_repo: &OAuthCodeRepository,
-    kept_token: Option<&str>,
-    tenant_id: i64,
-) -> Result<(), AuthError> {
-    if let Some(token) = kept_token {
-        oauth_code_repo
-            .delete_by_verification_token(token, tenant_id)
-            .await?;
-    }
-    Ok(())
-}
-
 /// Shared completion path for a pending email-verification registration (keycast#262).
 ///
 /// Invoked by both the email-link verification path and the in-app PIN path so they produce
@@ -1769,262 +1753,24 @@ pub async fn finalize_pending_registration(
         .pending_email_verification_token
         .as_deref()
         .ok_or_else(|| account_incomplete("Registration is incomplete. Please register again."))?;
-    let claim = generate_secure_token();
     let oauth_code_repo = OAuthCodeRepository::new(pool.clone());
-    if !oauth_code_repo
-        .claim_pending_finalization(tenant_id, verification_token, &claim)
+    let oauth_data = match oauth_code_repo
+        .materialize_pending_registration(tenant_id, verification_token)
         .await?
     {
-        return Err(AuthError::ServiceUnavailable {
-            message: "Registration changed or is already being finalized. Please retry shortly."
-                .to_string(),
-            retry_after: Some(1),
-        });
-    }
-
-    let result =
-        finalize_claimed_pending_registration(pool, redis, tenant_id, oauth_data, delivery).await;
-    if let Err(error) = oauth_code_repo
-        .release_pending_finalization(tenant_id, verification_token, &claim)
-        .await
-    {
-        tracing::error!(
-            tenant_id,
-            error = %error,
-            "Failed to release pending-registration finalization claim"
-        );
-    }
-    result
-}
-
-async fn finalize_claimed_pending_registration(
-    pool: &PgPool,
-    redis: Option<&crate::redis::PrefixedRedis>,
-    tenant_id: i64,
-    oauth_data: &OAuthCodeData,
-    delivery: HeadlessDelivery,
-) -> Result<FinalizedRegistration, AuthError> {
-    // Terminal: once the registration's exchange code has issued tokens, the row is consumed and
-    // must not re-mint again (keycast#262). Re-clicks before redemption still re-arm a fresh code
-    // (the intended harmless idempotency); re-clicks after completion are refused here.
-    if oauth_data.consumed_at.is_some() {
-        tracing::info!(
-            "Registration already completed (consumed), refusing to re-mint: {}",
-            oauth_data.user_pubkey
-        );
-        return Err(AuthError::RegistrationAlreadyCompleted);
-    }
-
-    let email = oauth_data
-        .pending_email
-        .as_ref()
-        .ok_or_else(|| account_incomplete("Registration is incomplete. Please register again."))?;
-    let password_hash = oauth_data
-        .pending_password_hash
-        .as_ref()
-        .ok_or_else(|| account_incomplete("Registration is incomplete. Please register again."))?;
-    // The token kept on the materialized user row is the one already stored on the pending row,
-    // so the link path can be re-clicked idempotently (it resolves the same user).
-    let kept_token = oauth_data.pending_email_verification_token.as_deref();
-
-    let oauth_code_repo = OAuthCodeRepository::new(pool.clone());
-    let user_repo = UserRepository::new(pool.clone());
-    let existing_user = user_repo
-        .oauth_registration_state(&oauth_data.user_pubkey, tenant_id)
-        .await?;
-
-    if let Some(existing) = existing_user {
-        match existing.email.as_deref() {
-            Some(existing_email) if existing_email == email => {
-                if existing.email_verified && existing.has_password_hash {
-                    // Genuine retry: a prior attempt already applied the pending
-                    // credentials. Backfill the personal key if that attempt (or
-                    // another creation path) left it missing.
-                    tracing::info!(
-                        "Retrying email verification for existing user: {}",
-                        oauth_data.user_pubkey
-                    );
-                    if let (Some(encrypted_secret), false) = (
-                        oauth_data.pending_encrypted_secret.as_deref(),
-                        existing.has_personal_key,
-                    ) {
-                        user_repo
-                            .backfill_personal_key(
-                                &oauth_data.user_pubkey,
-                                tenant_id,
-                                encrypted_secret,
-                            )
-                            .await?;
-                        tracing::info!(
-                            "Backfilled missing personal key during verification retry: {}",
-                            oauth_data.user_pubkey
-                        );
-                    }
-                } else {
-                    // A same-email row can come from standard registration before
-                    // verification or before bcrypt finishes. Complete it before
-                    // minting an OAuth code.
-                    if let Err(err) = user_repo
-                        .complete_pending_oauth_registration(
-                            &oauth_data.user_pubkey,
-                            tenant_id,
-                            email,
-                            password_hash,
-                            kept_token,
-                            oauth_data.pending_encrypted_secret.as_deref(),
-                        )
-                        .await
-                    {
-                        if matches!(err, keycast_core::repositories::RepositoryError::Duplicate) {
-                            delete_pending_registration(&oauth_code_repo, kept_token, tenant_id)
-                                .await?;
-                            return Err(AuthError::EmailAlreadyExists);
-                        }
-                        return Err(err.into());
-                    }
-                    tracing::info!(
-                        "Completed incomplete same-email registration row: {}",
-                        oauth_data.user_pubkey
-                    );
-                }
-            }
-            Some(_) => {
-                // The pubkey is already bound to a different email. Never
-                // overwrite an existing account's credentials from an
-                // unauthenticated verification.
-                tracing::warn!(
-                    "Email verification for pubkey {} conflicts with an existing account email",
-                    oauth_data.user_pubkey
-                );
-                delete_pending_registration(&oauth_code_repo, kept_token, tenant_id).await?;
-                return Err(AuthError::DuplicateKey);
-            }
-            None => {
-                // Bare row pre-created by another path (team membership,
-                // authorization pre-creation): apply the pending registration
-                // instead of silently dropping it.
-                if let Err(err) = user_repo
-                    .complete_pending_oauth_registration(
-                        &oauth_data.user_pubkey,
-                        tenant_id,
-                        email,
-                        password_hash,
-                        kept_token,
-                        oauth_data.pending_encrypted_secret.as_deref(),
-                    )
-                    .await
-                {
-                    if matches!(err, keycast_core::repositories::RepositoryError::Duplicate) {
-                        delete_pending_registration(&oauth_code_repo, kept_token, tenant_id)
-                            .await?;
-                        return Err(AuthError::EmailAlreadyExists);
-                    }
-                    return Err(err.into());
-                }
-                tracing::info!(
-                    "Applied pending registration to pre-existing user row: {}",
-                    oauth_data.user_pubkey
-                );
-            }
+        MaterializePendingRegistrationOutcome::Materialized(pending) => *pending,
+        MaterializePendingRegistrationOutcome::DuplicateKey => return Err(AuthError::DuplicateKey),
+        MaterializePendingRegistrationOutcome::EmailAlreadyExists => {
+            return Err(AuthError::EmailAlreadyExists)
         }
-    } else if let Some(ref encrypted_secret) = oauth_data.pending_encrypted_secret {
-        // Auto-generated or direct nsec: create user + personal_keys atomically.
-        //
-        // Idempotent under concurrency (link GET + PIN, mail prefetch, multiple instances): the
-        // users INSERT uses ON CONFLICT (pubkey) DO NOTHING RETURNING, and the personal_keys INSERT
-        // only runs when we actually created the user. `personal_keys` has no unique key on
-        // user_pubkey, so a blind insert on the losing race would duplicate key material; gating on
-        // the RETURNING row prevents that. No returned row => a concurrent finalize already
-        // materialized this user, so we fall through as "already exists" and re-mint a fresh code
-        // (keycast#262 finalize-race).
-        let now = Utc::now();
-        let mut tx = pool.begin().await?;
-
-        let inserted: Option<(String,)> = match sqlx::query_as(
-            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, email_verification_token, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-             ON CONFLICT (pubkey) DO NOTHING
-             RETURNING pubkey",
-        )
-        .bind(&oauth_data.user_pubkey)
-        .bind(tenant_id)
-        .bind(email)
-        .bind(password_hash)
-        .bind(true) // email_verified = true
-        .bind(kept_token)
-        .bind(now)
-        .bind(now)
-        .fetch_optional(&mut *tx)
-        .await
-        {
-            Ok(row) => row,
-            Err(err) if has_database_constraint(&err, USERS_EMAIL_TENANT_CONSTRAINT) => {
-                // Duplicate email: this registration can never complete (the email belongs to
-                // another user), so terminate it — delete the pending row so the 409 is terminal
-                // and a retried token no longer loops through duplicate insertion (#236). This is
-                // the one exception to the keep-the-pending-row re-arm rule: no exchange code can
-                // ever be minted from this row, so deleting it strands nothing.
-                tx.rollback().await?;
-                delete_pending_registration(&oauth_code_repo, kept_token, tenant_id).await?;
-                return Err(AuthError::EmailAlreadyExists);
-            }
-            Err(err) => return Err(err.into()),
-        };
-
-        if inserted.is_some() {
-            sqlx::query(
-                "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
-                 VALUES ($1, $2, $3, $4, $5)",
-            )
-            .bind(&oauth_data.user_pubkey)
-            .bind(encrypted_secret)
-            .bind(tenant_id)
-            .bind(now)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-
-            tx.commit().await?;
-
-            tracing::info!(
-                "Created user and personal_keys for OAuth registration: {}",
-                oauth_data.user_pubkey
-            );
-        } else {
-            // Lost the race: another finalize already created this user (and its keys). Nothing to
-            // insert; commit the empty tx and proceed to re-mint a fresh exchange code.
-            tx.commit().await?;
-            tracing::info!(
-                "User already materialized by concurrent finalize, skipping creation: {}",
-                oauth_data.user_pubkey
-            );
+        MaterializePendingRegistrationOutcome::NotFound => {
+            return Err(AuthError::ServiceUnavailable {
+                message: "Registration changed while it was being finalized. Please retry."
+                    .to_string(),
+                retry_after: Some(1),
+            })
         }
-    } else {
-        // BYOK flow: just create user, keys will come at token exchange.
-        if let Err(err) = user_repo
-            .create_with_password_verified(
-                &oauth_data.user_pubkey,
-                tenant_id,
-                email,
-                password_hash,
-                true, // email_verified = true
-                kept_token,
-            )
-            .await
-        {
-            if matches!(err, keycast_core::repositories::RepositoryError::Duplicate) {
-                // Same terminal duplicate-email handling as the keyed path above (#236).
-                delete_pending_registration(&oauth_code_repo, kept_token, tenant_id).await?;
-                return Err(AuthError::EmailAlreadyExists);
-            }
-            return Err(err.into());
-        }
-
-        tracing::info!(
-            "Created user for BYOK OAuth registration: {}",
-            oauth_data.user_pubkey
-        );
-    }
+    };
 
     let headless_retry_error = || AuthError::ServiceUnavailable {
         message: "Email verified, but app sign-in is still finishing. Please retry shortly."
@@ -2067,7 +1813,7 @@ async fn finalize_claimed_pending_registration(
     // It gates the delivery-failure cleanup below: a reused code is owned by a prior finalize.
     let (new_code, code_expires_at, freshly_minted) = if let Some((existing, expires_at)) =
         oauth_code_repo
-            .find_live_exchange_code_with_expiry_for_pending(tenant_id, oauth_data)
+            .find_live_exchange_code_with_expiry_for_pending(tenant_id, &oauth_data)
             .await?
     {
         (existing, expires_at, false)
@@ -2094,7 +1840,7 @@ async fn finalize_claimed_pending_registration(
             is_headless: oauth_data.is_headless, // Inherit from original registration
         };
         if !oauth_code_repo
-            .store_for_pending_registration(store_params, oauth_data)
+            .store_for_pending_registration(store_params, &oauth_data)
             .await?
         {
             return Err(AuthError::RegistrationAlreadyCompleted);
