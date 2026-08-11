@@ -702,7 +702,27 @@ mod tests {
                 .release_redeemed_code(1, &release_code, &release_data)
                 .await
         });
-        sleep(TokioDuration::from_millis(50)).await;
+        let deadline = tokio::time::Instant::now() + TokioDuration::from_secs(5);
+        loop {
+            let release_is_waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pg_stat_activity activity
+                    WHERE cardinality(pg_blocking_pids(activity.pid)) > 0
+                      AND activity.query LIKE '%UPDATE oauth_codes SET consumed_at = NULL%'
+                )",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if release_is_waiting {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "release did not reach the exchange-row lock"
+            );
+            sleep(TokioDuration::from_millis(10)).await;
+        }
 
         let authorization_repo = OAuthAuthorizationRepository::new(pool.clone());
         let create_code = code.clone();
@@ -712,7 +732,6 @@ mod tests {
                 .create_from_redeemed_code(params, &create_code, &create_data)
                 .await
         });
-        sleep(TokioDuration::from_millis(50)).await;
         blocker.commit().await.unwrap();
 
         assert!(release.await.unwrap().unwrap());
