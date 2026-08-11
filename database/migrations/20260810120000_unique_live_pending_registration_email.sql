@@ -10,6 +10,12 @@
 -- Only pending rows are covered: minted exchange-code rows carry pending_email = NULL, and a
 -- completed registration is marked consumed_at, so neither participates in the constraint.
 
+-- The migration job runs before the new service rollout while old instances may still insert
+-- duplicates. Serialize writes before choosing survivors so a row cannot commit between the
+-- DELETE snapshot and unique-index creation. The table is small and the index build is bounded;
+-- this brief write pause is safer than a load-dependent migration failure.
+LOCK TABLE oauth_codes IN SHARE ROW EXCLUSIVE MODE;
+
 -- Collapse pre-existing duplicates so the unique index can be created. The newest row is the
 -- one the app is polling (it holds the device_code returned by the last register call); older
 -- rows are already unreachable. Their short-lived minted exchange codes, if any, expire on

@@ -15,7 +15,8 @@ use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
     CreateOAuthAuthorizationParams, OAuthAuthorizationRepository, OAuthCodeRepository,
     PersonalKeysRepository, PolicyRepository, RefreshTokenRepository, RepositoryError,
-    StoreOAuthCodeParams, StoreOAuthCodeWithRegistrationParams, UserRepository,
+    StoreOAuthCodeParams, StoreOAuthCodeWithRegistrationParams, StoredPendingRegistration,
+    UserRepository,
 };
 use keycast_core::types::refresh_token::{generate_refresh_token, hash_refresh_token};
 use nostr_sdk::{Keys, ToBech32};
@@ -209,7 +210,7 @@ async fn store_oauth_code_with_pending_registration(
     pending_encrypted_secret: Option<&[u8]>,
     state: Option<&str>,
     device_code: Option<&str>,
-) -> Result<(), OAuthError> {
+) -> Result<StoredPendingRegistration, OAuthError> {
     let repo = OAuthCodeRepository::new(pool.clone());
     repo.store_with_pending_registration(StoreOAuthCodeWithRegistrationParams {
         tenant_id,
@@ -231,8 +232,8 @@ async fn store_oauth_code_with_pending_registration(
         // Browser OAuth registration verifies via the email link in a real browser; no PIN fallback.
         pin_hash: None,
     })
-    .await?;
-    Ok(())
+    .await
+    .map_err(Into::into)
 }
 
 #[derive(Debug, Deserialize)]
@@ -483,7 +484,13 @@ impl From<sqlx::Error> for OAuthError {
 
 impl From<keycast_core::repositories::RepositoryError> for OAuthError {
     fn from(e: keycast_core::repositories::RepositoryError) -> Self {
-        OAuthError::InvalidRequest(e.to_string())
+        match e {
+            keycast_core::repositories::RepositoryError::Unavailable(message)
+            | keycast_core::repositories::RepositoryError::Database(message) => {
+                OAuthError::Database(message)
+            }
+            other => OAuthError::InvalidRequest(other.to_string()),
+        }
     }
 }
 
@@ -3854,7 +3861,7 @@ pub async fn oauth_register(
     // Store authorization code with pending registration data (including state for redirect after verification)
     // User + personal_keys will be created atomically when email is verified
     let scope = req.scope.as_deref().unwrap_or("sign_event");
-    store_oauth_code_with_pending_registration(
+    let stored = store_oauth_code_with_pending_registration(
         pool,
         tenant_id,
         &code,
@@ -3873,6 +3880,7 @@ pub async fn oauth_register(
         Some(&device_code),
     )
     .await?;
+    let device_code = stored.device_code.unwrap_or(device_code);
 
     tracing::info!(
         "OAuth registration pending email verification: user {}, email {}",

@@ -251,7 +251,7 @@ impl OAuthCodeRepository {
         &self,
         params: StoreOAuthCodeWithRegistrationParams<'_>,
     ) -> Result<StoredPendingRegistration, RepositoryError> {
-        let row: (Option<String>,) = sqlx::query_as(
+        let row: Option<(Option<String>,)> = sqlx::query_as(
             "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at,
              pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret, state, device_code, is_headless, pin_hash, pin_sent_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
@@ -274,8 +274,17 @@ impl OAuthCodeRepository {
                  pin_hash = EXCLUDED.pin_hash,
                  pin_attempts = 0,
                  pin_sent_at = NULL,
-                 pin_resend_at = NULL
-             RETURNING device_code",
+                 pin_resend_at = NULL,
+                 finalization_claim = NULL,
+                 finalization_claimed_at = NULL
+              WHERE (oauth_codes.finalization_claim IS NULL
+                     OR oauth_codes.finalization_claimed_at < NOW() - INTERVAL '5 minutes')
+                AND NOT EXISTS (
+                    SELECT 1 FROM users
+                    WHERE users.tenant_id = EXCLUDED.tenant_id
+                      AND lower(users.email) = lower(EXCLUDED.pending_email)
+                )
+              RETURNING device_code",
         )
         .bind(params.tenant_id)
         .bind(params.code)
@@ -297,10 +306,28 @@ impl OAuthCodeRepository {
         .bind(params.pin_hash)
         // pin_sent_at tracks confirmed delivery; callers set it after the email send succeeds.
         .bind(None::<DateTime<Utc>>)
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
 
-        let device_code = row.0;
+        let Some((device_code,)) = row else {
+            let materialized: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM users
+                    WHERE tenant_id = $1 AND lower(email) = lower($2)
+                )",
+            )
+            .bind(params.tenant_id)
+            .bind(params.pending_email)
+            .fetch_one(&self.pool)
+            .await?;
+            return Err(if materialized {
+                RepositoryError::Duplicate
+            } else {
+                RepositoryError::Unavailable(
+                    "pending registration is currently being finalized".to_string(),
+                )
+            });
+        };
         // The UPDATE branch leaves device_code untouched, so a returned value different from the
         // one we offered means we superseded an existing pending registration.
         let superseded = device_code.as_deref() != params.device_code;
@@ -309,6 +336,53 @@ impl OAuthCodeRepository {
             device_code,
             superseded,
         })
+    }
+
+    /// Claim one exact pending generation while its user is materialized.
+    pub async fn claim_pending_finalization(
+        &self,
+        tenant_id: i64,
+        verification_token: &str,
+        claim: &str,
+    ) -> Result<bool, RepositoryError> {
+        let claimed = sqlx::query(
+            "UPDATE oauth_codes
+             SET finalization_claim = $1, finalization_claimed_at = NOW()
+             WHERE tenant_id = $2 AND pending_email_verification_token = $3
+               AND pending_email IS NOT NULL AND consumed_at IS NULL
+               AND expires_at > NOW()
+               AND (finalization_claim IS NULL
+                    OR finalization_claimed_at < NOW() - INTERVAL '5 minutes')",
+        )
+        .bind(claim)
+        .bind(tenant_id)
+        .bind(verification_token)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            > 0;
+        Ok(claimed)
+    }
+
+    /// Release a finalization claim without disturbing a newer claim holder.
+    pub async fn release_pending_finalization(
+        &self,
+        tenant_id: i64,
+        verification_token: &str,
+        claim: &str,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "UPDATE oauth_codes
+             SET finalization_claim = NULL, finalization_claimed_at = NULL
+             WHERE tenant_id = $1 AND pending_email_verification_token = $2
+               AND finalization_claim = $3",
+        )
+        .bind(tenant_id)
+        .bind(verification_token)
+        .bind(claim)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Columns selected for every `OAuthCodeData` lookup (matches the struct's `FromRow` fields).
@@ -356,6 +430,26 @@ impl OAuthCodeRepository {
             .fetch_optional(&self.pool)
             .await?;
 
+        Ok(result)
+    }
+
+    /// Find a pending registration token even after its verification window closes.
+    pub async fn find_by_verification_token_including_expired(
+        &self,
+        token: &str,
+        tenant_id: i64,
+    ) -> Result<Option<OAuthCodeData>, RepositoryError> {
+        let query = format!(
+            "SELECT {} FROM oauth_codes
+             WHERE pending_email_verification_token = $1 AND tenant_id = $2
+               AND pending_email IS NOT NULL",
+            Self::SELECT_COLUMNS
+        );
+        let result = sqlx::query_as::<_, OAuthCodeData>(&query)
+            .bind(token)
+            .bind(tenant_id)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(result)
     }
 
@@ -555,10 +649,11 @@ impl OAuthCodeRepository {
         let claimed = sqlx::query(
             "UPDATE oauth_codes \
              SET pending_email_verification_token = $1, pin_hash = $2, pin_attempts = 0, \
-                 pin_sent_at = $3, pin_resend_at = $3 \
+                 pin_sent_at = NULL, pin_resend_at = $3 \
              WHERE device_code = $4 AND tenant_id = $5 \
-               AND pending_email IS NOT NULL AND consumed_at IS NULL \
-               AND (pin_resend_at IS NULL OR pin_resend_at <= $6)",
+                AND pending_email IS NOT NULL AND consumed_at IS NULL \
+                AND expires_at > $3 \
+                AND (pin_resend_at IS NULL OR pin_resend_at <= $6)",
         )
         .bind(new_verification_token)
         .bind(new_pin_hash)
@@ -654,17 +749,23 @@ impl OAuthCodeRepository {
         &self,
         device_code: &str,
         tenant_id: i64,
-    ) -> Result<(), RepositoryError> {
-        sqlx::query(
+        expected_verification_token: &str,
+    ) -> Result<bool, RepositoryError> {
+        let marked = sqlx::query(
             "UPDATE oauth_codes SET pin_sent_at = $1 \
-             WHERE device_code = $2 AND tenant_id = $3",
+             WHERE device_code = $2 AND tenant_id = $3 \
+               AND pending_email_verification_token = $4 \
+               AND pending_email IS NOT NULL AND consumed_at IS NULL",
         )
         .bind(Utc::now())
         .bind(device_code)
         .bind(tenant_id)
+        .bind(expected_verification_token)
         .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await?
+        .rows_affected()
+            > 0;
+        Ok(marked)
     }
 
     /// Clear the failed-attempt counter for a pending registration after a correct PIN (keycast#262).
@@ -1084,6 +1185,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_finalization_claim_blocks_supersession_until_materialization_is_visible() {
+        use nostr_sdk::Keys;
+
+        let pool = setup_pool().await;
+        let repo = OAuthCodeRepository::new(pool.clone());
+        let device_code = format!("dc_{}", uuid::Uuid::new_v4());
+        let expires_at = Utc::now() + chrono::Duration::hours(1);
+        let (token, email) =
+            insert_pending_registration(&repo, &device_code, Some("old-pin"), expires_at).await;
+        let pending = repo
+            .find_by_device_code(&device_code, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        let claim = format!("claim_{}", uuid::Uuid::new_v4());
+        assert!(repo
+            .claim_pending_finalization(1, &token, &claim)
+            .await
+            .unwrap());
+
+        let replacement_pubkey = Keys::generate().public_key().to_hex();
+        let replacement_device = format!("replacement_{}", uuid::Uuid::new_v4());
+        let replacement = || StoreOAuthCodeWithRegistrationParams {
+            tenant_id: 1,
+            code: "replacement-code",
+            user_pubkey: &replacement_pubkey,
+            client_id: "replacement-client",
+            redirect_uri: "http://localhost:3000/replacement",
+            scope: "policy:social",
+            code_challenge: None,
+            code_challenge_method: None,
+            expires_at: Utc::now() + chrono::Duration::hours(24),
+            pending_email: &email,
+            pending_password_hash: "replacement-hash",
+            pending_email_verification_token: "replacement-token",
+            pending_encrypted_secret: Some(b"replacement-secret"),
+            state: None,
+            device_code: Some(&replacement_device),
+            is_headless: true,
+            pin_hash: Some("replacement-pin"),
+        };
+        assert!(matches!(
+            repo.store_with_pending_registration(replacement()).await,
+            Err(RepositoryError::Unavailable(_))
+        ));
+
+        sqlx::query(
+            "INSERT INTO users
+                 (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
+             VALUES ($1, 1, $2, 'materialized-hash', true, NOW(), NOW())",
+        )
+        .bind(&pending.user_pubkey)
+        .bind(&email)
+        .execute(&pool)
+        .await
+        .unwrap();
+        repo.release_pending_finalization(1, &token, &claim)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            repo.store_with_pending_registration(replacement()).await,
+            Err(RepositoryError::Duplicate)
+        ));
+        let surviving = repo
+            .find_by_device_code(&device_code, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(surviving.user_pubkey, pending.user_pubkey);
+        assert_eq!(
+            surviving.pending_email_verification_token.as_deref(),
+            Some(token.as_str())
+        );
+
+        sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(&pending.user_pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn test_reserve_pin_attempt_accumulates_and_enforces_cap() {
         let pool = setup_pool().await;
         let repo = OAuthCodeRepository::new(pool.clone());
@@ -1464,6 +1653,78 @@ mod tests {
             .await
             .unwrap();
         assert!(by_token.is_some(), "new token should resolve to the row");
+
+        sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_reset_pin_for_resend_refuses_registration_expired_during_hashing() {
+        let pool = setup_pool().await;
+        let repo = OAuthCodeRepository::new(pool.clone());
+        let device_code = format!("dc_{}", uuid::Uuid::new_v4());
+        let expires_at = Utc::now() + chrono::Duration::hours(1);
+        let (old_token, _) =
+            insert_pending_registration(&repo, &device_code, Some("oldpin"), expires_at).await;
+
+        sqlx::query("UPDATE oauth_codes SET expires_at = NOW() - INTERVAL '1 second' WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(!repo
+            .reset_pin_for_resend(
+                &device_code,
+                1,
+                "new-token",
+                "new-pin",
+                Utc::now() - chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap());
+        let pending = repo
+            .find_by_device_code(&device_code, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pending.pending_email_verification_token.as_deref(),
+            Some(old_token.as_str()),
+            "an expired registration must keep its last usable generation"
+        );
+        assert_eq!(pending.pin_hash.as_deref(), Some("oldpin"));
+
+        sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_mark_pin_sent_only_stamps_the_delivered_generation() {
+        let pool = setup_pool().await;
+        let repo = OAuthCodeRepository::new(pool.clone());
+        let device_code = format!("dc_{}", uuid::Uuid::new_v4());
+        let expires_at = Utc::now() + chrono::Duration::hours(1);
+        let (token, _) =
+            insert_pending_registration(&repo, &device_code, Some("pinhash"), expires_at).await;
+
+        assert!(!repo
+            .mark_pin_sent(&device_code, 1, "superseded-token")
+            .await
+            .unwrap());
+        assert!(repo.mark_pin_sent(&device_code, 1, &token).await.unwrap());
+        let pending = repo
+            .find_by_device_code(&device_code, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(pending.pin_sent_at.is_some());
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
             .bind(&device_code)

@@ -770,6 +770,10 @@ impl From<keycast_core::repositories::RepositoryError> for AuthError {
         match e {
             RepositoryError::Duplicate => AuthError::EmailAlreadyExists,
             RepositoryError::NotFound(_) => AuthError::UserNotFound,
+            RepositoryError::Unavailable(message) => AuthError::ServiceUnavailable {
+                message,
+                retry_after: Some(1),
+            },
             _ => AuthError::Internal(e.to_string()),
         }
     }
@@ -1758,6 +1762,48 @@ pub async fn finalize_pending_registration(
     oauth_data: &OAuthCodeData,
     delivery: HeadlessDelivery,
 ) -> Result<FinalizedRegistration, AuthError> {
+    if oauth_data.consumed_at.is_some() {
+        return Err(AuthError::RegistrationAlreadyCompleted);
+    }
+    let verification_token = oauth_data
+        .pending_email_verification_token
+        .as_deref()
+        .ok_or_else(|| account_incomplete("Registration is incomplete. Please register again."))?;
+    let claim = generate_secure_token();
+    let oauth_code_repo = OAuthCodeRepository::new(pool.clone());
+    if !oauth_code_repo
+        .claim_pending_finalization(tenant_id, verification_token, &claim)
+        .await?
+    {
+        return Err(AuthError::ServiceUnavailable {
+            message: "Registration changed or is already being finalized. Please retry shortly."
+                .to_string(),
+            retry_after: Some(1),
+        });
+    }
+
+    let result =
+        finalize_claimed_pending_registration(pool, redis, tenant_id, oauth_data, delivery).await;
+    if let Err(error) = oauth_code_repo
+        .release_pending_finalization(tenant_id, verification_token, &claim)
+        .await
+    {
+        tracing::error!(
+            tenant_id,
+            error = %error,
+            "Failed to release pending-registration finalization claim"
+        );
+    }
+    result
+}
+
+async fn finalize_claimed_pending_registration(
+    pool: &PgPool,
+    redis: Option<&crate::redis::PrefixedRedis>,
+    tenant_id: i64,
+    oauth_data: &OAuthCodeData,
+    delivery: HeadlessDelivery,
+) -> Result<FinalizedRegistration, AuthError> {
     // Terminal: once the registration's exchange code has issued tokens, the row is consumed and
     // must not re-mint again (keycast#262). Re-clicks before redemption still re-arm a fresh code
     // (the intended harmless idempotency); re-clicks after completion are refused here.
@@ -2139,6 +2185,7 @@ enum PendingVerifyOutcome {
     OAuthRedirect { redirect_url: String },
     Headless,
     AlreadyVerified,
+    Expired,
 }
 
 /// Finalize only an OAuth/headless pending registration, if the token belongs to one.
@@ -2150,11 +2197,14 @@ async fn perform_pending_email_verification(
     let pool = &auth_state.state.db;
     let oauth_code_repo = OAuthCodeRepository::new(pool.clone());
     let Some(oauth_data) = oauth_code_repo
-        .find_by_verification_token(token, tenant_id)
+        .find_by_verification_token_including_expired(token, tenant_id)
         .await?
     else {
         return Ok(None);
     };
+    if oauth_data.expires_at <= Utc::now() {
+        return Ok(Some(PendingVerifyOutcome::Expired));
+    }
 
     tracing::info!(
         "Email verification for OAuth registration: pubkey {}, email {:?}",
@@ -2221,6 +2271,7 @@ async fn perform_email_verification(
             }
             PendingVerifyOutcome::Headless => VerifyOutcome::Headless,
             PendingVerifyOutcome::AlreadyVerified => VerifyOutcome::AlreadyVerified,
+            PendingVerifyOutcome::Expired => VerifyOutcome::Expired,
         });
     }
 
@@ -2376,12 +2427,17 @@ pub async fn verify_email(
         VerifyOutcome::Expired => "expired",
         VerifyOutcome::LoggedIn { .. } => "logged_in",
     };
+    let event_outcome = if matches!(&outcome, VerifyOutcome::Expired) {
+        "failure"
+    } else {
+        "success"
+    };
     record_verify_email_event(
         &auth_state.state.db,
         &headers,
         tenant_id,
         "POST",
-        "success",
+        event_outcome,
         Some(outcome_reason),
         200,
     )
@@ -2522,6 +2578,14 @@ pub async fn verify_email_get(
                 StatusCode::OK,
                 "Already verified",
                 "Your email is already verified. You can return to the app or log in.",
+            )
+        }
+        Ok(Some(PendingVerifyOutcome::Expired)) => {
+            emit("failure", Some("expired"), 410).await;
+            verify_html_page(
+                StatusCode::GONE,
+                "Verification link expired",
+                "This verification link has expired. Please sign up again.",
             )
         }
         Ok(None) => {
@@ -6765,6 +6829,83 @@ mod tests {
             !body.contains("log in again"),
             "dead-link page must not tell a user with no session to log in again, got: {body}"
         );
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_expired_pending_token_is_not_reported_as_superseded_or_successful() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+        let email = format!("verify-expired-{}@example.com", Uuid::new_v4());
+        let (pubkey, token) = insert_oauth_pending_registration(&pool, &email).await;
+        sqlx::query(
+            "UPDATE oauth_codes SET expires_at = NOW() - INTERVAL '1 second'
+             WHERE pending_email_verification_token = $1 AND tenant_id = 1",
+        )
+        .bind(&token)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let get_request_id = format!("get_{}", Uuid::new_v4());
+        let mut get_headers = HeaderMap::new();
+        get_headers.insert(
+            crate::api::http::auth_observability::REQUEST_ID_HEADER,
+            get_request_id.parse().unwrap(),
+        );
+        let get_response = verify_email_get(
+            create_test_tenant(),
+            State(auth_state.clone()),
+            get_headers,
+            Query(VerifyEmailQuery {
+                token: Some(token.clone()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(get_response.status(), StatusCode::GONE);
+
+        let post_request_id = format!("post_{}", Uuid::new_v4());
+        let mut post_headers = HeaderMap::new();
+        post_headers.insert(
+            crate::api::http::auth_observability::REQUEST_ID_HEADER,
+            post_request_id.parse().unwrap(),
+        );
+        let post_response = verify_email(
+            create_test_tenant(),
+            State(auth_state),
+            post_headers,
+            Json(VerifyEmailRequest {
+                token: token.clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(post_response.status(), StatusCode::OK);
+
+        for (request_id, expected) in [
+            (
+                &get_request_id,
+                "/api/auth/verify-email|email_verification|failure|expired|410",
+            ),
+            (
+                &post_request_id,
+                "/api/auth/verify-email|email_verification|failure|expired|200",
+            ),
+        ] {
+            let event: String = sqlx::query_scalar(
+                "SELECT concat_ws('|', endpoint, event_type, outcome, reason_code, http_status)
+                 FROM auth_events WHERE request_id = $1",
+            )
+            .bind(request_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(event, expected);
+        }
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
     }
 
     /// The GET path records auth events for its outcomes, matching the POST path's event_type so

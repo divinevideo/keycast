@@ -281,7 +281,7 @@ pub async fn headless_register(
     }
     if email_delivered {
         oauth_code_repo
-            .mark_pin_sent(&device_code, tenant_id)
+            .mark_pin_sent(&device_code, tenant_id, &verification_token)
             .await?;
     }
 
@@ -1270,6 +1270,12 @@ pub async fn headless_resend_pin(
         return Ok(success());
     }
 
+    // A later registration or resend may have replaced this generation while delivery was in
+    // flight. Stamp only the token that was actually handed to the provider.
+    oauth_code_repo
+        .mark_pin_sent(&req.device_code, tenant_id, &new_token)
+        .await?;
+
     tracing::info!(
         event = "email_pin_resend",
         tenant_id = tenant_id,
@@ -1420,6 +1426,11 @@ impl From<keycast_core::repositories::RepositoryError> for HeadlessError {
                 HeadlessError::Conflict("Resource already exists".to_string())
             }
             RepositoryError::NotFound(msg) => HeadlessError::InvalidRequest(msg),
+            RepositoryError::Unavailable(_) => HeadlessError::ServiceUnavailable {
+                message: "Registration is currently being finalized. Please retry shortly."
+                    .to_string(),
+                retry_after: Some(1),
+            },
             _ => HeadlessError::Internal(e.to_string()),
         }
     }
@@ -1665,6 +1676,14 @@ mod tests {
         };
 
         let first = register("firstpassword123", "challenge-one").await;
+        let first_token: String = sqlx::query_scalar(
+            "SELECT pending_email_verification_token FROM oauth_codes
+             WHERE pending_email = $1 AND tenant_id = 1 AND consumed_at IS NULL",
+        )
+        .bind(&email)
+        .fetch_one(&pool)
+        .await
+        .expect("first registration should retain its verification token");
 
         // Registration itself is an uncooldowned recovery path: model a current PIN that has hit
         // its five-attempt lockout and whose resend cooldown is armed. Supersession may restore
@@ -1774,21 +1793,30 @@ mod tests {
 
         // The first email's token is dead — that link now renders the terminal
         // superseded page rather than stranding the user on a 401.
-        let token = row
+        let current_token = row
             .pending_email_verification_token
             .expect("pending row keeps a verification token");
         let stale_token_rows: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM oauth_codes
              WHERE pending_email_verification_token = $1 AND tenant_id = 1",
         )
-        .bind(&token)
+        .bind(&first_token)
         .fetch_one(&pool)
         .await
         .expect("query should succeed");
         assert_eq!(
-            stale_token_rows, 1,
-            "only the surviving registration's token resolves"
+            stale_token_rows, 0,
+            "the superseded registration's token must no longer resolve"
         );
+        let current_token_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oauth_codes
+             WHERE pending_email_verification_token = $1 AND tenant_id = 1",
+        )
+        .bind(&current_token)
+        .fetch_one(&pool)
+        .await
+        .expect("query should succeed");
+        assert_eq!(current_token_rows, 1, "only the newest token resolves");
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE pending_email = $1")
             .bind(&email)
