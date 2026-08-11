@@ -27,15 +27,79 @@ pub struct CapturedEmail {
     pub subject: String,
     pub verification_url: Option<String>,
     pub reset_url: Option<String>,
+    /// 6-digit in-app verification PIN, when one was issued alongside the link (keycast#262).
+    pub pin: Option<String>,
+}
+
+/// Build the HTML body of a verification email.
+///
+/// When `pin` is present (headless registrations, keycast#262), the body shows a 6-digit code the
+/// user can type in the app — a second transport for the same proof, for contexts where the link
+/// can't open the app (sandboxed in-app browsers, a different device, a mangled link).
+fn verification_email_html(verification_url: &str, pin: Option<&str>) -> String {
+    let pin_block = match pin {
+        Some(pin) => format!(
+            r#"<p style="color: #666; font-size: 14px; margin-top: 30px;">
+                    Or enter this verification code in the app:
+                </p>
+                <p style="font-size: 28px; font-weight: bold; letter-spacing: 4px; color: #00B488; margin: 8px 0;">{pin}</p>"#,
+            pin = html_escape(pin)
+        ),
+        None => String::new(),
+    };
+    format!(
+        r#"
+            <html>
+            <body style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+                <h1 style="color: #00B488;">Verify your {brand} email</h1>
+                <p>Thanks for signing up! Please verify your email address by clicking the button below:</p>
+                <div style="margin: 30px 0;">
+                    <a href="{url}"
+                       style="background: #00B488; color: #fff; padding: 12px 24px; text-decoration: none; border-radius: 4px; display: inline-block; font-weight: bold;">
+                        Verify Email Address
+                    </a>
+                </div>
+                <p style="color: #666; font-size: 14px;">
+                    Or copy and paste this link into your browser:<br>
+                    <a href="{url}" style="color: #00B488;">{url}</a>
+                </p>
+                {pin_block}
+                <p style="color: #666; font-size: 14px; margin-top: 30px;">
+                    If you didn't sign up for {brand}, you can safely ignore this email.
+                </p>
+            </body>
+            </html>
+            "#,
+        url = verification_url,
+        brand = BRAND_NAME,
+        pin_block = pin_block,
+    )
+}
+
+/// Build the plain-text body of a verification email (see [`verification_email_html`]).
+fn verification_email_text(verification_url: &str, pin: Option<&str>) -> String {
+    let pin_block = match pin {
+        Some(pin) => format!("\n\nOr enter this verification code in the app: {pin}"),
+        None => String::new(),
+    };
+    format!(
+        "Thanks for signing up! Please verify your email address by clicking this link:\n\n{url}{pin_block}\n\nIf you didn't sign up for {brand}, you can safely ignore this email.",
+        url = verification_url,
+        pin_block = pin_block,
+        brand = BRAND_NAME
+    )
 }
 
 /// Trait for email sending - allows swapping implementations for testing
 #[async_trait]
 pub trait EmailSender: Send + Sync {
+    /// Send the verification email. `pin`, when present, is the 6-digit in-app code emailed
+    /// alongside the link (keycast#262).
     async fn send_verification_email(
         &self,
         to_email: &str,
         verification_token: &str,
+        pin: Option<&str>,
     ) -> Result<(), String>;
     async fn send_password_reset_email(
         &self,
@@ -118,9 +182,12 @@ impl EmailSender for DevEmailSender {
         &self,
         to_email: &str,
         verification_token: &str,
+        pin: Option<&str>,
     ) -> Result<(), String> {
+        // Point at the server-side GET endpoint so verification works without client JS
+        // (sandboxed in-app browsers never run the SPA page's fetch — keycast#262).
         let verification_url = format!(
-            "{}/verify-email?token={}",
+            "{}/api/auth/verify-email?token={}",
             self.base_url, verification_token
         );
 
@@ -133,6 +200,9 @@ impl EmailSender for DevEmailSender {
         tracing::info!("");
         tracing::info!("  Click to verify:");
         tracing::info!("  {}", verification_url);
+        if let Some(pin) = pin {
+            tracing::info!("  Or enter code in app: {}", pin);
+        }
         tracing::info!("==================================================");
         tracing::info!("");
 
@@ -149,6 +219,7 @@ impl EmailSender for DevEmailSender {
                 subject: format!("Verify your {} email address", BRAND_NAME),
                 verification_url: Some(verification_url),
                 reset_url: None,
+                pin: pin.map(str::to_string),
             });
         }
 
@@ -192,6 +263,7 @@ impl EmailSender for DevEmailSender {
                 subject: format!("Reset your {} password", BRAND_NAME),
                 verification_url: None,
                 reset_url: Some(reset_url),
+                pin: None,
             });
         }
 
@@ -225,6 +297,7 @@ impl EmailSender for DevEmailSender {
                 subject: format!("Your Vine account on {} is ready to claim", BRAND_NAME),
                 verification_url: Some(claim_url.to_string()),
                 reset_url: None,
+                pin: None,
             });
         }
 
@@ -251,6 +324,7 @@ impl EmailSender for DevEmailSender {
                 subject: format!("Confirm your new {} email address", BRAND_NAME),
                 verification_url: Some(confirm_url),
                 reset_url: None,
+                pin: None,
             });
         }
 
@@ -284,6 +358,7 @@ impl EmailSender for DevEmailSender {
                 // Store the confirm link for test inspection; cancel link goes in reset_url.
                 verification_url: Some(confirm_url),
                 reset_url: Some(cancel_url),
+                pin: None,
             });
         }
 
@@ -453,43 +528,18 @@ impl EmailSender for SendGridEmailSender {
         &self,
         to_email: &str,
         verification_token: &str,
+        pin: Option<&str>,
     ) -> Result<(), String> {
+        // Point at the server-side GET endpoint so verification works without client JS
+        // (sandboxed in-app browsers never run the SPA page's fetch — keycast#262).
         let verification_url = format!(
-            "{}/verify-email?token={}",
+            "{}/api/auth/verify-email?token={}",
             self.base_url, verification_token
         );
 
         let subject = format!("Verify your {} email address", BRAND_NAME);
-        let html_content = format!(
-            r#"
-            <html>
-            <body style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-                <h1 style="color: #00B488;">Verify your {brand} email</h1>
-                <p>Thanks for signing up! Please verify your email address by clicking the button below:</p>
-                <div style="margin: 30px 0;">
-                    <a href="{url}"
-                       style="background: #00B488; color: #fff; padding: 12px 24px; text-decoration: none; border-radius: 4px; display: inline-block; font-weight: bold;">
-                        Verify Email Address
-                    </a>
-                </div>
-                <p style="color: #666; font-size: 14px;">
-                    Or copy and paste this link into your browser:<br>
-                    <a href="{url}" style="color: #00B488;">{url}</a>
-                </p>
-                <p style="color: #666; font-size: 14px; margin-top: 30px;">
-                    If you didn't sign up for {brand}, you can safely ignore this email.
-                </p>
-            </body>
-            </html>
-            "#,
-            url = verification_url,
-            brand = BRAND_NAME
-        );
-
-        let text_content = format!(
-            "Thanks for signing up! Please verify your email address by clicking this link:\n\n{url}\n\nIf you didn't sign up for {brand}, you can safely ignore this email.",
-            url = verification_url, brand = BRAND_NAME
-        );
+        let html_content = verification_email_html(&verification_url, pin);
+        let text_content = verification_email_text(&verification_url, pin);
 
         self.send_email(to_email, &subject, &html_content, &text_content)
             .await
@@ -733,9 +783,10 @@ impl EmailService {
         &self,
         to_email: &str,
         verification_token: &str,
+        pin: Option<&str>,
     ) -> Result<(), String> {
         self.inner
-            .send_verification_email(to_email, verification_token)
+            .send_verification_email(to_email, verification_token, pin)
             .await
     }
 
@@ -780,6 +831,41 @@ impl EmailService {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn verification_email_bodies_include_pin_when_present() {
+        let url = "https://login.example/api/auth/verify-email?token=abc";
+        let html = verification_email_html(url, Some("482913"));
+        let text = verification_email_text(url, Some("482913"));
+        assert!(html.contains("482913"), "HTML body must show the PIN");
+        assert!(text.contains("482913"), "text body must show the PIN");
+        // Link is still present alongside the PIN (two transports for the same proof).
+        assert!(html.contains(url));
+        assert!(text.contains(url));
+    }
+
+    #[test]
+    fn verification_email_bodies_omit_pin_when_absent() {
+        let url = "https://login.example/api/auth/verify-email?token=abc";
+        let html = verification_email_html(url, None);
+        let text = verification_email_text(url, None);
+        // No 6-digit code block when no PIN was issued (browser/OAuth flows).
+        assert!(!html.to_lowercase().contains("verification code"));
+        assert!(!text.to_lowercase().contains("verification code"));
+        assert!(html.contains(url));
+    }
+
+    #[tokio::test]
+    async fn dev_sender_captures_pin() {
+        let sender = DevEmailSender::new();
+        sender
+            .send_verification_email("user@example.com", "tok123", Some("482913"))
+            .await
+            .unwrap();
+        let captured = sender.get_captured_emails();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].pin.as_deref(), Some("482913"));
+    }
 
     // Serial test lock to prevent env var races between tests
     static ENV_LOCK: Mutex<()> = Mutex::new(());

@@ -13,9 +13,10 @@ use bcrypt::verify;
 use chrono::{Duration, Utc};
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
-    CreateOAuthAuthorizationParams, OAuthAuthorizationRepository, OAuthCodeRepository,
-    PersonalKeysRepository, PolicyRepository, RefreshTokenRepository, RepositoryError,
-    StoreOAuthCodeParams, StoreOAuthCodeWithRegistrationParams, UserRepository,
+    CreateOAuthAuthorizationParams, OAuthAuthorizationRepository, OAuthCodeData,
+    OAuthCodeRepository, PersonalKeysRepository, PolicyRepository, RefreshTokenRepository,
+    RepositoryError, StoreOAuthCodeParams, StoreOAuthCodeWithRegistrationParams,
+    StoredPendingRegistration, UserRepository,
 };
 use keycast_core::types::refresh_token::{generate_refresh_token, hash_refresh_token};
 use nostr_sdk::{Keys, ToBech32};
@@ -209,7 +210,7 @@ async fn store_oauth_code_with_pending_registration(
     pending_encrypted_secret: Option<&[u8]>,
     state: Option<&str>,
     device_code: Option<&str>,
-) -> Result<(), OAuthError> {
+) -> Result<StoredPendingRegistration, OAuthError> {
     let repo = OAuthCodeRepository::new(pool.clone());
     repo.store_with_pending_registration(StoreOAuthCodeWithRegistrationParams {
         tenant_id,
@@ -228,9 +229,11 @@ async fn store_oauth_code_with_pending_registration(
         state,
         device_code,
         is_headless: false,
+        // Browser OAuth registration verifies via the email link in a real browser; no PIN fallback.
+        pin_hash: None,
     })
-    .await?;
-    Ok(())
+    .await
+    .map_err(Into::into)
 }
 
 #[derive(Debug, Deserialize)]
@@ -481,7 +484,13 @@ impl From<sqlx::Error> for OAuthError {
 
 impl From<keycast_core::repositories::RepositoryError> for OAuthError {
     fn from(e: keycast_core::repositories::RepositoryError) -> Self {
-        OAuthError::InvalidRequest(e.to_string())
+        match e {
+            keycast_core::repositories::RepositoryError::Unavailable(message)
+            | keycast_core::repositories::RepositoryError::Database(message) => {
+                OAuthError::Database(message)
+            }
+            other => OAuthError::InvalidRequest(other.to_string()),
+        }
     }
 }
 
@@ -2917,7 +2926,12 @@ async fn handle_authorization_code_grant(
     let auth_code = oauth_code_repo
         .find_valid(tenant_id, code)
         .await?
-        .ok_or(OAuthError::Unauthorized)?;
+        .ok_or_else(|| {
+            OAuthError::InvalidGrant(
+                "Authorization code is invalid, expired, or already used.".to_string(),
+            )
+        })?;
+    let auth_code_for_redeem = auth_code.clone();
 
     let user_pubkey = auth_code.user_pubkey;
     let client_id = auth_code.client_id;
@@ -3072,7 +3086,7 @@ async fn handle_authorization_code_grant(
         match crate::email_service::EmailService::new() {
             Ok(email_service) => {
                 if let Err(e) = email_service
-                    .send_verification_email(pending_email_val, &verification_token)
+                    .send_verification_email(pending_email_val, &verification_token, None)
                     .await
                 {
                     tracing::error!(
@@ -3094,13 +3108,22 @@ async fn handle_authorization_code_grant(
 
         pending_email_val.clone()
     } else {
-        // Normal token exchange (existing user, not registration)
-        // Delete the authorization code (one-time use)
-        oauth_code_repo.delete(tenant_id, code).await?;
-
-        // Get user's email for UCAN
+        // Resolve the email before claiming the code so a lookup failure leaves it immediately
+        // redeemable.
         let user_repo = UserRepository::new(pool.clone());
-        user_repo.get_email(&user_pubkey, tenant_id).await?
+        let email = user_repo.get_email(&user_pubkey, tenant_id).await?;
+
+        // Claim, but do not delete, the exchange code. Downstream failures release this claim so
+        // the same code can retry.
+        if !oauth_code_repo
+            .redeem_code(tenant_id, code, &auth_code_for_redeem)
+            .await?
+        {
+            return Err(OAuthError::InvalidGrant(
+                "Authorization code is invalid, expired, or already used.".to_string(),
+            ));
+        }
+        email
     };
 
     tracing::info!(
@@ -3111,7 +3134,7 @@ async fn handle_authorization_code_grant(
     );
 
     // Create OAuth authorization and generate token response
-    create_oauth_authorization_and_token(
+    let issuance = create_oauth_authorization_and_token(
         CreateAuthorizationParams {
             tenant_id,
             user_pubkey: &user_pubkey,
@@ -3122,10 +3145,57 @@ async fn handle_authorization_code_grant(
             nsec_from_verifier,
             previous_auth_id,
             is_headless,
+            exchange_code: pending_email.is_none().then_some(code.as_str()),
+            exchange_code_data: pending_email.is_none().then_some(&auth_code_for_redeem),
         },
         auth_state,
     )
-    .await
+    .await;
+    let response = match issuance {
+        Ok(response) => response,
+        Err(error) => {
+            if pending_email.is_none() {
+                match oauth_code_repo
+                    .release_redeemed_code(tenant_id, code, &auth_code_for_redeem)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => tracing::warn!(
+                        tenant_id,
+                        code = %code,
+                        "Token issuance failed after the exchange claim expired or changed"
+                    ),
+                    Err(release_error) => tracing::error!(
+                        tenant_id,
+                        code = %code,
+                        error = %release_error,
+                        "Failed to release OAuth exchange-code claim after issuance error"
+                    ),
+                }
+            }
+            return Err(error);
+        }
+    };
+
+    // `consumed_at` is the terminal registration marker. Set it only after the authorization,
+    // refresh token, and response have all been created successfully; otherwise recovery remains
+    // possible through the still-active pending row.
+    if pending_email.is_none()
+        && !oauth_code_repo
+            .mark_pending_consumed(tenant_id, code, &auth_code_for_redeem)
+            .await?
+    {
+        tracing::error!(
+            tenant_id,
+            user_pubkey,
+            "OAuth token issuance succeeded but pending registration completion failed"
+        );
+        return Err(OAuthError::ServerError(
+            "Failed to complete pending registration".to_string(),
+        ));
+    }
+
+    Ok(response)
 }
 
 // handle_password_grant() removed - ROPC grant type deprecated and removed
@@ -3142,6 +3212,8 @@ struct CreateAuthorizationParams<'a> {
     previous_auth_id: Option<i32>,
     /// Whether this code was issued via headless flow (for first_party UCAN fact)
     is_headless: bool,
+    exchange_code: Option<&'a str>,
+    exchange_code_data: Option<&'a OAuthCodeData>,
 }
 
 /// Common function to create OAuth authorization and generate TokenResponse
@@ -3161,6 +3233,8 @@ async fn create_oauth_authorization_and_token(
         nsec_from_verifier,
         previous_auth_id,
         is_headless,
+        exchange_code,
+        exchange_code_data,
     } = params;
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
@@ -3304,22 +3378,36 @@ async fn create_oauth_authorization_and_token(
     // Each authorization is a separate "ticket" for one client/device
     // Old authorizations remain valid until explicitly revoked
     let oauth_auth_repo = OAuthAuthorizationRepository::new(pool.clone());
-    let auth_id = oauth_auth_repo
-        .create(CreateOAuthAuthorizationParams {
-            tenant_id,
-            user_pubkey: user_pubkey.to_string(),
-            redirect_origin: redirect_origin.clone(),
-            client_id: client_id.to_string(),
-            bunker_public_key: bunker_public_key.to_hex(),
-            secret_hash,
-            relays: relays_json.clone(),
-            policy_id: Some(policy_id),
-            is_first_party: is_headless,
-            client_pubkey: None,
-            authorization_handle: Some(authorization_handle.clone()),
-            handle_expires_at,
-        })
-        .await?;
+    let authorization_params = CreateOAuthAuthorizationParams {
+        tenant_id,
+        user_pubkey: user_pubkey.to_string(),
+        redirect_origin: redirect_origin.clone(),
+        client_id: client_id.to_string(),
+        bunker_public_key: bunker_public_key.to_hex(),
+        secret_hash,
+        relays: relays_json.clone(),
+        policy_id: Some(policy_id),
+        is_first_party: is_headless,
+        client_pubkey: None,
+        authorization_handle: Some(authorization_handle.clone()),
+        handle_expires_at,
+    };
+    let auth_id = match (exchange_code, exchange_code_data) {
+        (Some(code), Some(auth_code)) => oauth_auth_repo
+            .create_from_redeemed_code(authorization_params, code, auth_code)
+            .await?
+            .ok_or_else(|| {
+                OAuthError::ServerError(
+                    "Authorization code processing claim expired; retry the exchange".to_string(),
+                )
+            })?,
+        (None, None) => oauth_auth_repo.create(authorization_params).await?,
+        _ => {
+            return Err(OAuthError::ServerError(
+                "Incomplete authorization code processing claim".to_string(),
+            ))
+        }
+    };
 
     tracing::info!(
         "Created OAuth authorization {} for user {} app {}",
@@ -3825,7 +3913,7 @@ pub async fn oauth_register(
     // Store authorization code with pending registration data (including state for redirect after verification)
     // User + personal_keys will be created atomically when email is verified
     let scope = req.scope.as_deref().unwrap_or("sign_event");
-    store_oauth_code_with_pending_registration(
+    let stored = store_oauth_code_with_pending_registration(
         pool,
         tenant_id,
         &code,
@@ -3844,6 +3932,7 @@ pub async fn oauth_register(
         Some(&device_code),
     )
     .await?;
+    let device_code = stored.device_code.unwrap_or(device_code);
 
     tracing::info!(
         "OAuth registration pending email verification: user {}, email {}",
@@ -3855,7 +3944,7 @@ pub async fn oauth_register(
     match crate::email_service::EmailService::new() {
         Ok(email_service) => {
             if let Err(e) = email_service
-                .send_verification_email(&req.email, &verification_token)
+                .send_verification_email(&req.email, &verification_token, None)
                 .await
             {
                 tracing::error!("Failed to send verification email to {}: {}", req.email, e);
@@ -4715,9 +4804,9 @@ mod tests {
     }
 
     fn create_lazy_auth_state() -> crate::api::http::routes::AuthState {
-        create_lazy_auth_state_with_database_url(
-            "postgres://postgres:password@localhost/keycast_test",
-        )
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string());
+        create_lazy_auth_state_with_database_url(&database_url)
     }
 
     fn create_unit_test_tenant() -> crate::api::tenant::TenantExtractor {

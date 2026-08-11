@@ -6,6 +6,7 @@
 mod common;
 
 use chrono::{Duration, Utc};
+use keycast_core::repositories::{OAuthCodeRepository, StoreOAuthCodeWithRegistrationParams};
 use nostr_sdk::Keys;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -269,35 +270,62 @@ async fn test_incomplete_oauth_allows_reregistration() {
 
     assert!(!user_exists, "User should not exist yet");
 
-    // Second OAuth register with SAME email (user can retry after abandoning first flow)
+    // Second OAuth register with SAME email (user can retry after abandoning first flow).
+    // This still succeeds - the email check passes because no user row exists - but it now
+    // supersedes the first pending row in place instead of racing a second one into existence
+    // (keycast#268).
     let user_keys_2 = Keys::generate();
     let user_pubkey_2 = user_keys_2.public_key().to_hex();
     let code_2 = format!("code-{}", Uuid::new_v4());
 
-    // This should succeed - email check passes because no user row exists
-    sqlx::query(
-        "INSERT INTO oauth_codes (code, user_pubkey, client_id, redirect_uri, scope, expires_at, tenant_id, created_at,
-         pending_email, pending_password_hash, pending_email_verification_token)
-         VALUES ($1, $2, 'Test App', $3, 'sign', $4, 1, NOW(), $5, 'hash2', 'token2')"
+    OAuthCodeRepository::new(pool.clone())
+        .store_with_pending_registration(StoreOAuthCodeWithRegistrationParams {
+            tenant_id: 1,
+            code: &code_2,
+            user_pubkey: &user_pubkey_2,
+            client_id: "Test App",
+            redirect_uri: &format!("{}/callback", redirect_origin),
+            scope: "sign",
+            code_challenge: None,
+            code_challenge_method: None,
+            expires_at: Utc::now() + Duration::minutes(10),
+            pending_email: &email,
+            pending_password_hash: "hash2",
+            pending_email_verification_token: "token2",
+            pending_encrypted_secret: None,
+            state: None,
+            device_code: None,
+            is_headless: false,
+            pin_hash: None,
+        })
+        .await
+        .expect("Second registration should succeed (no user exists yet)");
+
+    // Exactly one live pending registration survives, and it carries the second attempt.
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT user_pubkey, pending_password_hash, pending_email_verification_token
+         FROM oauth_codes
+         WHERE pending_email = $1 AND tenant_id = 1 AND consumed_at IS NULL",
     )
-    .bind(&code_2)
-    .bind(&user_pubkey_2)
-    .bind(format!("{}/callback", redirect_origin))
-    .bind(Utc::now() + Duration::minutes(10))
     .bind(&email)
-    .execute(&pool)
+    .fetch_all(&pool)
     .await
-    .expect("Second registration should succeed (no user exists yet)");
+    .expect("Query should succeed");
 
-    // Both oauth_codes should exist (old one will expire)
-    let code_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM oauth_codes WHERE pending_email = $1")
-            .bind(&email)
-            .fetch_one(&pool)
-            .await
-            .expect("Query should succeed");
-
-    assert_eq!(code_count, 2, "Both oauth_codes should exist (pending)");
+    assert_eq!(
+        rows.len(),
+        1,
+        "re-registering must supersede the pending row, not add a second one"
+    );
+    assert_eq!(
+        rows[0],
+        (
+            user_pubkey_2.clone(),
+            "hash2".to_string(),
+            "token2".to_string()
+        ),
+        "the newest registration attempt must win every pending field"
+    );
 }
 
 // ============================================================================
@@ -634,8 +662,9 @@ async fn test_email_race_condition_at_token_exchange() {
     let email = format!("test-{}@example.com", Uuid::new_v4());
     let redirect_origin = format!("https://test-{}.example.com", Uuid::new_v4());
 
-    // Two users start OAuth registration with same email (race condition)
-    // Both pass early check because no user exists yet
+    // Two registrations start with the same email. Since keycast#268 they can no longer coexist
+    // as two pending rows: the second supersedes the first in place. The race this test covers
+    // therefore moves entirely to token exchange, where email uniqueness is re-checked.
 
     let user_keys_a = Keys::generate();
     let user_pubkey_a = user_keys_a.public_key().to_hex();
@@ -645,36 +674,74 @@ async fn test_email_race_condition_at_token_exchange() {
     let user_pubkey_b = user_keys_b.public_key().to_hex();
     let code_b = format!("code-b-{}", Uuid::new_v4());
 
-    // Step 1: Both OAuth registrations succeed (early check passes for both)
-    sqlx::query(
-        "INSERT INTO oauth_codes (code, user_pubkey, client_id, redirect_uri, scope, expires_at, tenant_id, created_at,
-         pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret)
-         VALUES ($1, $2, 'App', $3, 'sign', $4, 1, NOW(), $5, 'hash_a', 'token_a', $6)"
+    let repo = OAuthCodeRepository::new(pool.clone());
+    let register = |code: String,
+                    pubkey: String,
+                    hash: &'static str,
+                    token: &'static str,
+                    secret: &'static [u8]| {
+        let repo = repo.clone();
+        let email = email.clone();
+        let redirect_uri = format!("{}/callback", redirect_origin);
+        async move {
+            repo.store_with_pending_registration(StoreOAuthCodeWithRegistrationParams {
+                tenant_id: 1,
+                code: &code,
+                user_pubkey: &pubkey,
+                client_id: "App",
+                redirect_uri: &redirect_uri,
+                scope: "sign",
+                code_challenge: None,
+                code_challenge_method: None,
+                expires_at: Utc::now() + Duration::minutes(10),
+                pending_email: &email,
+                pending_password_hash: hash,
+                pending_email_verification_token: token,
+                pending_encrypted_secret: Some(secret),
+                state: None,
+                device_code: None,
+                is_headless: false,
+                pin_hash: None,
+            })
+            .await
+        }
+    };
+
+    // Step 1: Both registrations succeed (early check passes for both).
+    register(
+        code_a.clone(),
+        user_pubkey_a.clone(),
+        "hash_a",
+        "token_a",
+        &[1u8, 2, 3, 4],
     )
-    .bind(&code_a)
-    .bind(&user_pubkey_a)
-    .bind(format!("{}/callback", redirect_origin))
-    .bind(Utc::now() + Duration::minutes(10))
-    .bind(&email)
-    .bind(&[1u8, 2, 3, 4][..])
-    .execute(&pool)
     .await
     .expect("oauth_code A should succeed");
-
-    sqlx::query(
-        "INSERT INTO oauth_codes (code, user_pubkey, client_id, redirect_uri, scope, expires_at, tenant_id, created_at,
-         pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret)
-         VALUES ($1, $2, 'App', $3, 'sign', $4, 1, NOW(), $5, 'hash_b', 'token_b', $6)"
+    register(
+        code_b.clone(),
+        user_pubkey_b.clone(),
+        "hash_b",
+        "token_b",
+        &[5u8, 6, 7, 8],
     )
-    .bind(&code_b)
-    .bind(&user_pubkey_b)
-    .bind(format!("{}/callback", redirect_origin))
-    .bind(Utc::now() + Duration::minutes(10))
-    .bind(&email)
-    .bind(&[5u8, 6, 7, 8][..])
-    .execute(&pool)
     .await
     .expect("oauth_code B should succeed");
+
+    // Only registration B survives as pending: A was superseded, so it can never be redeemed.
+    let pending_pubkeys: Vec<(String,)> = sqlx::query_as(
+        "SELECT user_pubkey FROM oauth_codes
+         WHERE pending_email = $1 AND tenant_id = 1 AND consumed_at IS NULL",
+    )
+    .bind(&email)
+    .fetch_all(&pool)
+    .await
+    .expect("Query should succeed");
+
+    assert_eq!(
+        pending_pubkeys,
+        vec![(user_pubkey_b.clone(),)],
+        "the second registration must supersede the first, leaving one live pending row"
+    );
 
     // Step 2: Token exchange for oauth_code A succeeds (first to complete wins)
     // Check email uniqueness again at token exchange time
@@ -690,7 +757,8 @@ async fn test_email_race_condition_at_token_exchange() {
         "Email should not be taken before first token exchange"
     );
 
-    // Create user A
+    // Step 2: another path (first-party registration, or A's own exchange before it was
+    // superseded) materializes the email first.
     sqlx::query(
         "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
          VALUES ($1, 1, $2, 'hash_a', false, NOW(), NOW())"
@@ -711,7 +779,7 @@ async fn test_email_race_condition_at_token_exchange() {
     .await
     .expect("Should create personal_keys A");
 
-    // Step 3: Token exchange for oauth_code B fails (email now taken)
+    // Step 3: token exchange for the surviving pending registration B fails (email now taken)
     let email_taken_now: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE email = $1 AND tenant_id = 1)")
             .bind(&email)
@@ -724,6 +792,6 @@ async fn test_email_race_condition_at_token_exchange() {
         "Email should be taken after first token exchange completes"
     );
 
-    // User B's token exchange would return: "This email is already registered. Please sign in instead."
-    // (The oauth_code B just expires unused)
+    // B's token exchange returns "This email is already registered. Please sign in instead."
+    // and the pending row just expires unused.
 }

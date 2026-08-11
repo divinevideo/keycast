@@ -1,7 +1,7 @@
 // ABOUTME: Repository for OAuth authorization database operations
 // ABOUTME: Handles OAuth-based remote signing authorizations
 
-use crate::repositories::RepositoryError;
+use crate::repositories::{oauth_code::OAuthCodeData, RepositoryError};
 use crate::types::oauth_authorization::OAuthAuthorization;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
@@ -155,6 +155,79 @@ impl OAuthAuthorizationRepository {
         .fetch_one(&self.pool)
         .await
         .map_err(Into::into)
+    }
+
+    /// Create an authorization only while its exact redeemed exchange-code claim is live.
+    ///
+    /// This locks only the exchange row and never the pending registration row. Callers that also
+    /// operate on pending registrations must preserve the pending-then-exchange lock order.
+    pub async fn create_from_redeemed_code(
+        &self,
+        params: CreateOAuthAuthorizationParams,
+        code: &str,
+        auth_code: &OAuthCodeData,
+    ) -> Result<Option<i32>, RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let now = Utc::now();
+        let id = sqlx::query_scalar::<_, i32>(
+            "WITH locked_claim AS MATERIALIZED (
+                 SELECT exchange.code, exchange.user_pubkey, exchange.client_id,
+                        exchange.expires_at
+                 FROM oauth_codes exchange
+                 WHERE exchange.tenant_id = $1 AND exchange.code = $2
+                   AND exchange.user_pubkey = $3 AND exchange.client_id = $4
+                   AND exchange.redirect_uri = $5 AND exchange.scope = $6
+                   AND exchange.code_challenge IS NOT DISTINCT FROM $7
+                   AND exchange.code_challenge_method IS NOT DISTINCT FROM $8
+                   AND exchange.state IS NOT DISTINCT FROM $9
+                   AND exchange.is_headless = $10
+                   AND exchange.pending_email_verification_token IS NOT DISTINCT FROM $11
+                   AND exchange.device_code IS NOT DISTINCT FROM $12
+                   AND exchange.pending_email IS NULL
+                   AND exchange.consumed_at IS NOT NULL
+                 FOR UPDATE
+             ),
+             live_claim AS MATERIALIZED (
+                 SELECT code FROM locked_claim
+                 WHERE expires_at > clock_timestamp()
+                   AND user_pubkey = $13 AND client_id = $15
+             )
+             INSERT INTO oauth_authorizations
+                 (tenant_id, user_pubkey, redirect_origin, client_id, bunker_public_key,
+                  secret_hash, relays, policy_id, is_first_party, client_pubkey,
+                  authorization_handle, handle_expires_at, created_at, updated_at)
+             SELECT $1, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $24
+             FROM live_claim
+             RETURNING id",
+        )
+        .bind(params.tenant_id)
+        .bind(code)
+        .bind(&auth_code.user_pubkey)
+        .bind(&auth_code.client_id)
+        .bind(&auth_code.redirect_uri)
+        .bind(&auth_code.scope)
+        .bind(auth_code.code_challenge.as_deref())
+        .bind(auth_code.code_challenge_method.as_deref())
+        .bind(auth_code.state.as_deref())
+        .bind(auth_code.is_headless)
+        .bind(auth_code.pending_email_verification_token.as_deref())
+        .bind(auth_code.device_code.as_deref())
+        .bind(&params.user_pubkey)
+        .bind(&params.redirect_origin)
+        .bind(&params.client_id)
+        .bind(&params.bunker_public_key)
+        .bind(&params.secret_hash)
+        .bind(&params.relays)
+        .bind(params.policy_id)
+        .bind(params.is_first_party)
+        .bind(&params.client_pubkey)
+        .bind(&params.authorization_handle)
+        .bind(params.handle_expires_at)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(id)
     }
 
     /// Revoke an authorization by setting revoked_at to now.
@@ -523,6 +596,9 @@ impl OAuthAuthorizationRepository {
 #[cfg(all(test, feature = "integration-tests"))]
 mod tests {
     use super::*;
+    use crate::repositories::{OAuthCodeRepository, StoreOAuthCodeParams};
+    use sqlx::postgres::PgPoolOptions;
+    use tokio::time::{sleep, Duration as TokioDuration};
 
     fn assert_localhost_db() {
         let url = std::env::var("DATABASE_URL").unwrap_or_default();
@@ -539,6 +615,179 @@ mod tests {
         PgPool::connect(&database_url)
             .await
             .expect("Failed to connect to database")
+    }
+
+    async fn insert_redeemed_code(
+        pool: &PgPool,
+        expires_at: DateTime<Utc>,
+    ) -> (String, OAuthCodeData, CreateOAuthAuthorizationParams) {
+        use nostr_sdk::Keys;
+        use uuid::Uuid;
+
+        let user_pubkey = Keys::generate().public_key().to_hex();
+        let bunker_public_key = Keys::generate().public_key().to_hex();
+        let code = format!("exchange-{}", Uuid::new_v4());
+        let client_id = format!("client-{}", Uuid::new_v4());
+        let redirect_uri = format!("https://example.com/{}/callback", Uuid::new_v4());
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
+             VALUES ($1, 1, NOW(), NOW())",
+        )
+        .bind(&user_pubkey)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let code_repo = OAuthCodeRepository::new(pool.clone());
+        code_repo
+            .store(StoreOAuthCodeParams {
+                tenant_id: 1,
+                code: &code,
+                user_pubkey: &user_pubkey,
+                client_id: &client_id,
+                redirect_uri: &redirect_uri,
+                scope: "policy:social",
+                code_challenge: Some("challenge"),
+                code_challenge_method: Some("S256"),
+                expires_at,
+                previous_auth_id: None,
+                state: Some("state"),
+                is_headless: true,
+            })
+            .await
+            .unwrap();
+        let auth_code = code_repo.find_valid(1, &code).await.unwrap().unwrap();
+        sqlx::query("UPDATE oauth_codes SET consumed_at = clock_timestamp() WHERE code = $1")
+            .bind(&code)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        let params = CreateOAuthAuthorizationParams {
+            tenant_id: 1,
+            user_pubkey,
+            redirect_origin: "https://example.com".to_string(),
+            client_id,
+            bunker_public_key,
+            secret_hash: "$2b$10$test_hash".to_string(),
+            relays: "[]".to_string(),
+            policy_id: None,
+            is_first_party: true,
+            client_pubkey: None,
+            authorization_handle: None,
+            handle_expires_at: Utc::now() + chrono::Duration::days(30),
+        };
+        (code, auth_code, params)
+    }
+
+    #[tokio::test]
+    async fn test_create_from_redeemed_code_serializes_release_before_insert() {
+        let pool = setup_pool().await;
+        let (code, auth_code, params) =
+            insert_redeemed_code(&pool, Utc::now() + chrono::Duration::minutes(10)).await;
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT code FROM oauth_codes WHERE code = $1 FOR UPDATE")
+            .bind(&code)
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+
+        let release_repo = OAuthCodeRepository::new(pool.clone());
+        let release_code = code.clone();
+        let release_data = auth_code.clone();
+        let release = tokio::spawn(async move {
+            release_repo
+                .release_redeemed_code(1, &release_code, &release_data)
+                .await
+        });
+        let deadline = tokio::time::Instant::now() + TokioDuration::from_secs(5);
+        loop {
+            let release_is_waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pg_stat_activity activity
+                    WHERE cardinality(pg_blocking_pids(activity.pid)) > 0
+                      AND activity.query LIKE '%UPDATE oauth_codes SET consumed_at = NULL%'
+                )",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if release_is_waiting {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "release did not reach the exchange-row lock"
+            );
+            sleep(TokioDuration::from_millis(10)).await;
+        }
+
+        let authorization_repo = OAuthAuthorizationRepository::new(pool.clone());
+        let create_code = code.clone();
+        let create_data = auth_code.clone();
+        let create = tokio::spawn(async move {
+            authorization_repo
+                .create_from_redeemed_code(params, &create_code, &create_data)
+                .await
+        });
+        blocker.commit().await.unwrap();
+
+        assert!(release.await.unwrap().unwrap());
+        assert!(
+            create.await.unwrap().unwrap().is_none(),
+            "a release queued before claim locking must prevent authorization insertion"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_from_redeemed_code_rechecks_expiry_after_lock_wait() {
+        let pool = setup_pool().await;
+        let (code, auth_code, params) =
+            insert_redeemed_code(&pool, Utc::now() + chrono::Duration::milliseconds(200)).await;
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT code FROM oauth_codes WHERE code = $1 FOR UPDATE")
+            .bind(&code)
+            .fetch_one(&mut *blocker)
+            .await
+            .unwrap();
+
+        let repo = OAuthAuthorizationRepository::new(pool.clone());
+        let create_code = code.clone();
+        let create = tokio::spawn(async move {
+            repo.create_from_redeemed_code(params, &create_code, &auth_code)
+                .await
+        });
+        sleep(TokioDuration::from_millis(300)).await;
+        blocker.commit().await.unwrap();
+
+        assert!(
+            create.await.unwrap().unwrap().is_none(),
+            "a claim that expires while awaiting its lock must not authorize"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_from_redeemed_code_uses_one_pool_connection() {
+        assert_localhost_db();
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string());
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        let (code, auth_code, params) =
+            insert_redeemed_code(&pool, Utc::now() + chrono::Duration::minutes(10)).await;
+
+        let id = OAuthAuthorizationRepository::new(pool)
+            .create_from_redeemed_code(params, &code, &auth_code)
+            .await
+            .unwrap();
+
+        assert!(id.is_some());
     }
 
     #[tokio::test]

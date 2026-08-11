@@ -8,7 +8,7 @@
 
 	const api = new KeycastApi();
 
-	let status = $state<'loading' | 'processing' | 'success' | 'oauth_redirect' | 'headless_verified' | 'error' | 'no-token'>('loading');
+	let status = $state<'loading' | 'processing' | 'success' | 'oauth_redirect' | 'headless_verified' | 'error' | 'superseded' | 'no-token'>('loading');
 	let message = $state('');
 	let redirectUrl = $state('');
 
@@ -103,6 +103,14 @@
 				}
 				return; // Exit after successful handling
 			} catch (err: any) {
+				// The link was already used or a newer verification email replaced it. Telling the
+				// user to "log in again" is a dead end - they have no session and no account yet
+				// - so give the one instruction that resolves it (keycast#268).
+				if (err.code === 'VERIFICATION_LINK_SUPERSEDED') {
+					status = 'superseded';
+					message = err.message;
+					return;
+				}
 				// Check for 410 Gone (registration expired)
 				if (err.status === 410) {
 					status = 'error';
@@ -215,6 +223,18 @@
 			<div class="actions">
 				<a href="/login" class="btn-secondary">Go to Login</a>
 				<a href="/register" class="btn-primary">Create New Account</a>
+			</div>
+
+		{:else if status === 'superseded'}
+			<div class="status-icon error">
+				<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" fill="currentColor" viewBox="0 0 256 256">
+					<path d="M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24Zm-8,56a8,8,0,0,1,16,0v56a8,8,0,0,1-16,0Zm8,104a12,12,0,1,1,12-12A12,12,0,0,1,128,184Z"></path>
+				</svg>
+			</div>
+			<h1>Link no longer valid</h1>
+			<p class="subtitle">{message}</p>
+			<div class="actions">
+				<a href="/login" class="btn-secondary">Go to Login</a>
 			</div>
 
 		{:else if status === 'no-token'}

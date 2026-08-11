@@ -691,6 +691,12 @@ impl UserRepository {
     }
 
     /// Create a new user with email/password and pre-verified status.
+    ///
+    /// Idempotent on `pubkey`: concurrent finalize of the same pending registration may call this
+    /// twice for the same pubkey, so a pubkey conflict is a no-op (`ON CONFLICT (pubkey) DO
+    /// NOTHING`) rather than an error — the caller then proceeds as "user already exists". A
+    /// genuine duplicate *email* on a different pubkey still surfaces via the email unique
+    /// constraint, which the caller maps to a 409 (keycast#262 finalize-race).
     pub async fn create_with_password_verified(
         &self,
         pubkey: &str,
@@ -702,7 +708,8 @@ impl UserRepository {
     ) -> Result<(), RepositoryError> {
         sqlx::query(
             "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, email_verification_token, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (pubkey) DO NOTHING",
         )
         .bind(pubkey)
         .bind(tenant_id)
@@ -1948,13 +1955,17 @@ impl UserRepository {
     /// Returns [`RepositoryError::NotFound`] if no row exists for this pubkey.
     /// Returns [`RepositoryError::Duplicate`] if the email is owned by another
     /// user or the row is already bound to a different email.
+    ///
+    /// `verification_token` is the token kept on the materialized row so the
+    /// email link stays idempotently re-resolvable; pass `None` when the
+    /// pending registration carries no token.
     pub async fn complete_pending_oauth_registration(
         &self,
         pubkey: &str,
         tenant_id: i64,
         email: &str,
         password_hash: &str,
-        verification_token: &str,
+        verification_token: Option<&str>,
         encrypted_secret: Option<&[u8]>,
     ) -> Result<(), RepositoryError> {
         let mut tx = self.pool.begin().await?;
@@ -2971,6 +2982,34 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_create_with_password_verified_is_idempotent_on_pubkey() {
+        // Concurrent finalize of the same pending registration can call this twice for the same
+        // pubkey; the second call must be a no-op rather than a unique-violation error so finalize
+        // can proceed to re-mint a fresh exchange code (keycast#262 finalize-race).
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let pubkey = Keys::generate().public_key().to_hex();
+        let email = format!("idem-{}@example.com", test_suffix());
+
+        repo.create_with_password_verified(&pubkey, 1, &email, "hash", true, None)
+            .await
+            .expect("first create should succeed");
+
+        // Second identical create must NOT error (ON CONFLICT (pubkey) DO NOTHING).
+        repo.create_with_password_verified(&pubkey, 1, &email, "hash", true, None)
+            .await
+            .expect("second create on same pubkey must be a no-op, not an error");
+
+        assert!(repo.exists(&pubkey, 1).await.unwrap());
+
+        sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(&pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -4087,9 +4126,16 @@ mod tests {
 
         create_bare_user(&pool, &pubkey).await;
 
-        repo.complete_pending_oauth_registration(&pubkey, 1, &email, "hash", &token, Some(&secret))
-            .await
-            .unwrap();
+        repo.complete_pending_oauth_registration(
+            &pubkey,
+            1,
+            &email,
+            "hash",
+            Some(&token),
+            Some(&secret),
+        )
+        .await
+        .unwrap();
 
         let row: (Option<String>, Option<String>, bool, Option<String>) = sqlx::query_as(
             "SELECT email, password_hash, email_verified, email_verification_token
@@ -4140,7 +4186,7 @@ mod tests {
             1,
             &email,
             "hash",
-            "token",
+            Some("token"),
             Some(&[1_u8; 32]),
         )
         .await
@@ -4207,7 +4253,7 @@ mod tests {
         create_bare_user(&pool, &pubkey).await;
 
         let result = repo
-            .complete_pending_oauth_registration(&pubkey, 1, &email, "hash", "token", None)
+            .complete_pending_oauth_registration(&pubkey, 1, &email, "hash", Some("token"), None)
             .await;
         assert!(
             matches!(result, Err(RepositoryError::Duplicate)),
@@ -4253,7 +4299,7 @@ mod tests {
                 1,
                 &pending_email,
                 "pending-hash",
-                "token",
+                Some("token"),
                 Some(&[1_u8; 32]),
             )
             .await;
@@ -4309,7 +4355,7 @@ mod tests {
             1,
             &email,
             "pending-hash",
-            "token",
+            Some("token"),
             Some(&secret),
         )
         .await
@@ -4366,7 +4412,7 @@ mod tests {
             1,
             &email,
             "pending-hash",
-            "token",
+            Some("token"),
             Some(&secret),
         )
         .await
@@ -4409,7 +4455,7 @@ mod tests {
                 1,
                 "oauth-missing@example.com",
                 "hash",
-                "token",
+                Some("token"),
                 None,
             )
             .await;

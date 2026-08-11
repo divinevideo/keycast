@@ -72,7 +72,12 @@ pub fn api_routes(
 
     // verify_email needs auth_state for key_manager (to decrypt keys and issue UCAN)
     let verify_email_route = Router::new()
-        .route("/auth/verify-email", post(auth::verify_email))
+        // GET is the link target in verification emails: it verifies server-side (no client JS),
+        // which is what fixes sandboxed in-app browsers (keycast#262). POST stays for the SPA page.
+        .route(
+            "/auth/verify-email",
+            post(auth::verify_email).get(auth::verify_email_get),
+        )
         .with_state(auth_state.clone());
 
     let email_routes = Router::new()
@@ -218,6 +223,8 @@ pub fn api_routes(
         .route("/headless/register", post(headless::headless_register))
         .route("/headless/login", post(headless::headless_login))
         .route("/headless/authorize", post(headless::headless_authorize))
+        .route("/headless/verify-pin", post(headless::headless_verify_pin))
+        .route("/headless/resend-pin", post(headless::headless_resend_pin))
         .with_state(auth_state.clone());
 
     // Admin routes (for preloaded accounts and claim tokens)

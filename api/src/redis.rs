@@ -18,6 +18,8 @@ pub struct PrefixedRedis {
     conn: Arc<RwLock<ConnectionManager>>,
     factory: Option<Arc<ValkeyConnectionFactory>>,
     prefix: Option<String>,
+    #[cfg(any(test, feature = "integration-tests"))]
+    fail_setex: bool,
 }
 
 impl std::fmt::Debug for PrefixedRedis {
@@ -42,7 +44,18 @@ impl PrefixedRedis {
             conn: Arc::new(RwLock::new(conn)),
             factory: None,
             prefix,
+            #[cfg(any(test, feature = "integration-tests"))]
+            fail_setex: false,
         }
+    }
+
+    /// Create a test Redis wrapper that rejects every SETEX operation.
+    #[cfg(any(test, feature = "integration-tests"))]
+    #[must_use]
+    pub fn new_failing(conn: ConnectionManager, prefix: Option<String>) -> Self {
+        let mut redis = Self::new(conn, prefix);
+        redis.fail_setex = true;
+        redis
     }
 
     /// Create a new PrefixedRedis wrapper with a factory for connection refresh.
@@ -61,6 +74,8 @@ impl PrefixedRedis {
             conn: Arc::new(RwLock::new(conn)),
             factory: Some(factory),
             prefix,
+            #[cfg(any(test, feature = "integration-tests"))]
+            fail_setex: false,
         }
     }
 
@@ -208,6 +223,14 @@ impl PrefixedRedis {
     ///
     /// Returns error if Redis operation fails or connection refresh fails.
     pub async fn setex(&self, key: &str, seconds: u64, value: &str) -> RedisResult<()> {
+        #[cfg(any(test, feature = "integration-tests"))]
+        if self.fail_setex {
+            return Err(redis::RedisError::from((
+                redis::ErrorKind::IoError,
+                "injected SETEX failure",
+            )));
+        }
+
         let prefixed = self.prefixed_key(key).into_owned();
         let value = value.to_string();
         self.with_refresh(|mut conn| {

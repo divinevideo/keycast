@@ -364,7 +364,7 @@ async fn complete_pending_oauth_registration_uses_one_connection() {
                     TENANT_ID,
                     &probe_email,
                     "hash",
-                    &Uuid::new_v4().to_string(),
+                    Some(&Uuid::new_v4().to_string()),
                     Some(b"encrypted"),
                 )
                 .await

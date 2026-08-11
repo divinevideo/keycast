@@ -2,9 +2,9 @@
 // ABOUTME: Implements UCAN-based authentication and NIP-46 bunker URL generation
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     Json,
 };
 use bcrypt::{hash, verify, DEFAULT_COST};
@@ -26,8 +26,9 @@ use crate::password_verifier::{
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
     AccountStatusWithMinorRow, AuthEventRepository, CreateOAuthAuthorizationParams,
-    OAuthAuthorizationRepository, OAuthCodeRepository, PersonalKeysRepository, PolicyRepository,
-    UserRepository, VerifiedMinorRow,
+    MaterializePendingRegistrationOutcome, OAuthAuthorizationRepository, OAuthCodeData,
+    OAuthCodeRepository, PersonalKeysRepository, PolicyRepository, UserRepository,
+    VerifiedMinorRow,
 };
 use keycast_core::traits::CustomPermission;
 use nostr_sdk::{Keys, PublicKey, ToBech32, UnsignedEvent};
@@ -50,8 +51,18 @@ const USERS_EMAIL_TENANT_CONSTRAINT: &str = "idx_users_email_tenant";
 pub(crate) const INVALID_EMAIL_CODE: &str = "INVALID_EMAIL";
 pub(crate) const INVALID_EMAIL_MESSAGE: &str = "Please enter a valid email address.";
 pub(crate) const EMAIL_ALREADY_EXISTS_CODE: &str = "EMAIL_ALREADY_EXISTS";
-const EMAIL_ALREADY_EXISTS_MESSAGE: &str =
+pub(crate) const EMAIL_ALREADY_EXISTS_MESSAGE: &str =
     "This email is already registered. Please log in instead.";
+/// A verification link that resolves to nothing: already used, or replaced by a newer
+/// verification email (keycast#268). Deliberately distinct from [`AuthError::InvalidToken`], whose
+/// "Please log in again." copy is correct for a bad *session* token but is a dead end here — the
+/// user has no session to return to, and the actionable advice is to open the newest email or
+/// resend from the app.
+pub(crate) const VERIFICATION_LINK_SUPERSEDED_CODE: &str = "VERIFICATION_LINK_SUPERSEDED";
+pub(crate) const VERIFICATION_LINK_SUPERSEDED_HEADING: &str = "Link no longer valid";
+pub(crate) const VERIFICATION_LINK_SUPERSEDED_MESSAGE: &str =
+    "This link was already used or replaced by a newer verification email. \
+     Check your most recent email, or tap Resend in the app.";
 pub(crate) const EMAIL_NOT_VERIFIED_CODE: &str = "EMAIL_NOT_VERIFIED";
 pub(crate) const EMAIL_NOT_VERIFIED_MESSAGE: &str =
     "Please verify your email address before continuing. Check your inbox for the verification link.";
@@ -501,6 +512,10 @@ pub enum AuthError {
     Internal(String),
     MissingToken,
     InvalidToken,
+    /// An email-verification link that no longer resolves: already used, or superseded by a newer
+    /// verification email (keycast#268). Distinct from [`AuthError::InvalidToken`] so the dead-link
+    /// copy can be actionable instead of telling a logged-out user to log in again.
+    VerificationLinkSuperseded,
     TokenExpired,
     EmailSendFailed(String),
     DuplicateKey, // Nostr pubkey already registered (BYOK case)
@@ -514,6 +529,9 @@ pub enum AuthError {
     Forbidden(String),   // User has no authorization for this origin
     KeyEgressDenied,     // Policy refuses raw-key egress for this account
     RegistrationExpired, // Async bcrypt timed out (instance died)
+    /// The pending registration already completed token issuance; re-mint is refused
+    /// (keycast#262 bounded lifecycle).
+    RegistrationAlreadyCompleted,
     ServiceUnavailable {
         // Server at capacity or shutting down
         message: String,
@@ -623,6 +641,15 @@ impl IntoResponse for AuthError {
                 StatusCode::UNAUTHORIZED,
                 "Invalid or expired token. Please log in again.".to_string(),
             ),
+            // Status deliberately unchanged from the InvalidToken it replaced (401): only the copy
+            // and the machine-readable code are new, so no client keying off the status breaks.
+            AuthError::VerificationLinkSuperseded => {
+                return coded_error_response(
+                    StatusCode::UNAUTHORIZED,
+                    VERIFICATION_LINK_SUPERSEDED_MESSAGE,
+                    VERIFICATION_LINK_SUPERSEDED_CODE,
+                );
+            }
             AuthError::EmailSendFailed(e) => {
                 // Log the real error but return generic message to user
                 tracing::error!("Email send error: {}", e);
@@ -683,6 +710,10 @@ impl IntoResponse for AuthError {
                 StatusCode::GONE,
                 "Registration expired. Please register again.".to_string(),
             ),
+            AuthError::RegistrationAlreadyCompleted => (
+                StatusCode::CONFLICT,
+                "This registration is already complete. Please sign in.".to_string(),
+            ),
             AuthError::ServiceUnavailable { message, retry_after } => {
                 // Return with Retry-After header if provided
                 let response = (
@@ -740,6 +771,10 @@ impl From<keycast_core::repositories::RepositoryError> for AuthError {
         match e {
             RepositoryError::Duplicate => AuthError::EmailAlreadyExists,
             RepositoryError::NotFound(_) => AuthError::UserNotFound,
+            RepositoryError::Unavailable(message) => AuthError::ServiceUnavailable {
+                message,
+                retry_after: Some(1),
+            },
             _ => AuthError::Internal(e.to_string()),
         }
     }
@@ -748,6 +783,40 @@ impl From<keycast_core::repositories::RepositoryError> for AuthError {
 impl From<bcrypt::BcryptError> for AuthError {
     fn from(e: bcrypt::BcryptError) -> Self {
         AuthError::PasswordHash(e)
+    }
+}
+
+/// Map a verification finalize error into the headless API's error type so the in-app PIN path
+/// (keycast#262) inherits the link path's behavior — in particular the duplicate-email 409.
+impl From<AuthError> for super::headless::HeadlessError {
+    fn from(e: AuthError) -> Self {
+        use super::headless::HeadlessError;
+        match e {
+            // Dedicated variant so the response body carries the documented EMAIL_ALREADY_EXISTS
+            // code byte-identical to the link path (keycast#198/#236 contract), while the shared
+            // Conflict variant keeps emitting the generic CONFLICT code for its other cases.
+            AuthError::EmailAlreadyExists => HeadlessError::EmailAlreadyExists,
+            AuthError::Database(ref db_err)
+                if has_database_constraint(db_err, USERS_EMAIL_TENANT_CONSTRAINT) =>
+            {
+                HeadlessError::EmailAlreadyExists
+            }
+            AuthError::Conflict(msg) => HeadlessError::Conflict(msg),
+            AuthError::RegistrationAlreadyCompleted => HeadlessError::Conflict(
+                "This registration is already complete. Please sign in.".to_string(),
+            ),
+            AuthError::ServiceUnavailable {
+                message,
+                retry_after,
+            } => HeadlessError::ServiceUnavailable {
+                message,
+                retry_after,
+            },
+            other => {
+                tracing::error!("PIN verification finalize failed: {:?}", other);
+                HeadlessError::Internal("Email verification could not be completed".to_string())
+            }
+        }
     }
 }
 
@@ -1075,7 +1144,7 @@ pub async fn register(
     match crate::email_service::EmailService::new() {
         Ok(email_service) => {
             if let Err(e) = email_service
-                .send_verification_email(&req.email, &verification_token)
+                .send_verification_email(&req.email, &verification_token, None)
                 .await
             {
                 tracing::error!("Failed to send verification email to {}: {}", req.email, e);
@@ -1637,461 +1706,326 @@ pub async fn get_bunker_url(
     }
 }
 
-/// Verify email address with token
-/// Handles two flows:
-/// 1. OAuth registration: token in oauth_codes → complete OAuth flow → redirect to client
-/// 2. Normal registration: token in users → mark verified → issue UCAN → set cookie
-pub async fn verify_email(
-    tenant: crate::api::tenant::TenantExtractor,
-    State(auth_state): State<super::routes::AuthState>,
-    headers: HeaderMap,
-    Json(req): Json<VerifyEmailRequest>,
-) -> Result<impl IntoResponse, AuthError> {
-    let pool = &auth_state.state.db;
-    let key_manager = auth_state.state.key_manager.as_ref();
-    let tenant_id = tenant.0.id;
+/// Outcome of completing a pending registration: the freshly minted 10-minute exchange code
+/// plus the routing context the caller needs to build its response.
+pub struct FinalizedRegistration {
+    /// Fresh 10-minute OAuth authorization code the app/browser exchanges for tokens.
+    pub new_code: String,
+    pub redirect_uri: String,
+    pub state: Option<String>,
+    pub is_headless: bool,
+}
 
-    // First: Check oauth_codes for pending OAuth registration
+/// How a freshly minted headless exchange code reaches the waiting app.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HeadlessDelivery {
+    /// Email-link path: the app only learns the code via Redis polling, so Redis must be available
+    /// and the push must succeed — otherwise the app would be stranded with no code to pick up.
+    RedisRequired,
+    /// In-app PIN path: the code is returned synchronously in the response body, so the Redis push
+    /// is best-effort and a Redis outage must not fail the flow.
+    RedisBestEffort,
+}
+
+/// Shared completion path for a pending email-verification registration (keycast#262).
+///
+/// Invoked by both the email-link verification path and the in-app PIN path so they produce
+/// identical results: deferred user creation (including duplicate-email handling), a fresh
+/// 10-minute exchange code, and the headless Redis polling push.
+///
+/// The pending `oauth_codes` row is intentionally NOT deleted here. Re-verifying within the 24h
+/// window re-arms a fresh exchange code, which is what makes link prefetch/preview harmless: a
+/// mail-scanner GET can no longer materialize the user, mint a short-lived code, delete the row,
+/// and strand the user's real visit. The row expires on its own at the end of the verify window.
+/// The one exception is a duplicate email (#236): that registration can never complete, so the
+/// pending row is deleted to make the 409 terminal instead of looping on every retry.
+pub async fn finalize_pending_registration(
+    pool: &PgPool,
+    redis: Option<&crate::redis::PrefixedRedis>,
+    tenant_id: i64,
+    oauth_data: &OAuthCodeData,
+    delivery: HeadlessDelivery,
+) -> Result<FinalizedRegistration, AuthError> {
+    if oauth_data.consumed_at.is_some() {
+        return Err(AuthError::RegistrationAlreadyCompleted);
+    }
+    let verification_token = oauth_data
+        .pending_email_verification_token
+        .as_deref()
+        .ok_or_else(|| account_incomplete("Registration is incomplete. Please register again."))?;
     let oauth_code_repo = OAuthCodeRepository::new(pool.clone());
-    if let Some(oauth_data) = oauth_code_repo
-        .find_by_verification_token(&req.token, tenant_id)
+    let headless_retry_error = || AuthError::ServiceUnavailable {
+        message: "Email verified, but app sign-in is still finishing. Please retry shortly."
+            .to_string(),
+        retry_after: Some(5),
+    };
+
+    // For the link path (RedisRequired), validate device_code + Redis BEFORE minting so we never
+    // mint a code the polling app could never receive.
+    let strict_delivery = if oauth_data.is_headless && delivery == HeadlessDelivery::RedisRequired {
+        let device_code = oauth_data.device_code.as_ref().ok_or_else(|| {
+            tracing::error!(
+                event = "headless_poll_delivery_failed",
+                tenant_id = tenant_id,
+                user_pubkey = %oauth_data.user_pubkey,
+                "Headless verification is missing device_code"
+            );
+            headless_retry_error()
+        })?;
+        let redis = redis.ok_or_else(|| {
+            tracing::error!(
+                event = "headless_poll_delivery_failed",
+                tenant_id = tenant_id,
+                user_pubkey = %oauth_data.user_pubkey,
+                "Headless verification requires Redis, but Redis is unavailable"
+            );
+            headless_retry_error()
+        })?;
+        Some((device_code, redis))
+    } else {
+        None
+    };
+
+    let candidate: String = rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect();
+    let finalized = match oauth_code_repo
+        .materialize_pending_registration(tenant_id, verification_token, &candidate)
         .await?
     {
-        // Found in oauth_codes - this is an OAuth registration flow
-        tracing::info!(
-            "Email verification for OAuth registration: pubkey {}, email {:?}",
-            oauth_data.user_pubkey,
-            oauth_data.pending_email
-        );
-
-        let email = oauth_data.pending_email.as_ref().ok_or_else(|| {
-            account_incomplete("Registration is incomplete. Please register again.")
-        })?;
-        let password_hash = oauth_data.pending_password_hash.as_ref().ok_or_else(|| {
-            account_incomplete("Registration is incomplete. Please register again.")
-        })?;
-
-        // Create user with email_verified=true (they just verified!)
-        let user_repo = UserRepository::new(pool.clone());
-        let existing_user = user_repo
-            .oauth_registration_state(&oauth_data.user_pubkey, tenant_id)
-            .await?;
-
-        if let Some(existing) = existing_user {
-            match existing.email.as_deref() {
-                Some(existing_email) if existing_email == email => {
-                    if existing.email_verified && existing.has_password_hash {
-                        // Genuine retry: a prior attempt already applied the pending
-                        // credentials. Backfill the personal key if that attempt (or
-                        // another creation path) left it missing.
-                        tracing::info!(
-                            "Retrying OAuth email verification for existing user: {}",
-                            oauth_data.user_pubkey
-                        );
-                        if let (Some(encrypted_secret), false) = (
-                            oauth_data.pending_encrypted_secret.as_deref(),
-                            existing.has_personal_key,
-                        ) {
-                            user_repo
-                                .backfill_personal_key(
-                                    &oauth_data.user_pubkey,
-                                    tenant_id,
-                                    encrypted_secret,
-                                )
-                                .await?;
-                            tracing::info!(
-                                "Backfilled missing personal key during OAuth verification retry: {}",
-                                oauth_data.user_pubkey
-                            );
-                        }
-                    } else {
-                        // A same-email row can come from standard registration before
-                        // verification or before bcrypt finishes. Complete it before
-                        // minting an OAuth code.
-                        if let Err(err) = user_repo
-                            .complete_pending_oauth_registration(
-                                &oauth_data.user_pubkey,
-                                tenant_id,
-                                email,
-                                password_hash,
-                                &req.token,
-                                oauth_data.pending_encrypted_secret.as_deref(),
-                            )
-                            .await
-                        {
-                            if matches!(err, keycast_core::repositories::RepositoryError::Duplicate)
-                            {
-                                oauth_code_repo
-                                    .delete_by_verification_token(&req.token, tenant_id)
-                                    .await?;
-                                return Err(AuthError::EmailAlreadyExists);
-                            }
-                            return Err(err.into());
-                        }
-                        tracing::info!(
-                            "Completed incomplete same-email OAuth registration row: {}",
-                            oauth_data.user_pubkey
-                        );
-                    }
-                }
-                Some(_) => {
-                    // The pubkey is already bound to a different email. Never
-                    // overwrite an existing account's credentials from an
-                    // unauthenticated verification link.
-                    tracing::warn!(
-                        "OAuth email verification for pubkey {} conflicts with an existing account email",
-                        oauth_data.user_pubkey
-                    );
-                    oauth_code_repo
-                        .delete_by_verification_token(&req.token, tenant_id)
-                        .await?;
-                    return Err(AuthError::DuplicateKey);
-                }
-                None => {
-                    // Bare row pre-created by another path (team membership,
-                    // authorization pre-creation): apply the pending registration
-                    // instead of silently dropping it.
-                    if let Err(err) = user_repo
-                        .complete_pending_oauth_registration(
-                            &oauth_data.user_pubkey,
-                            tenant_id,
-                            email,
-                            password_hash,
-                            &req.token,
-                            oauth_data.pending_encrypted_secret.as_deref(),
-                        )
-                        .await
-                    {
-                        if matches!(err, keycast_core::repositories::RepositoryError::Duplicate) {
-                            oauth_code_repo
-                                .delete_by_verification_token(&req.token, tenant_id)
-                                .await?;
-                            return Err(AuthError::EmailAlreadyExists);
-                        }
-                        return Err(err.into());
-                    }
-                    tracing::info!(
-                        "Applied pending OAuth registration to pre-existing user row: {}",
-                        oauth_data.user_pubkey
-                    );
-                }
-            }
-        } else if let Some(ref encrypted_secret) = oauth_data.pending_encrypted_secret {
-            // Auto-generated or direct nsec: create user + personal_keys
-            // Use a transaction to ensure atomicity
-            let now = Utc::now();
-            let mut tx = pool.begin().await?;
-
-            if let Err(err) = sqlx::query(
-                "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, email_verification_token, created_at, updated_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-            )
-            .bind(&oauth_data.user_pubkey)
-            .bind(tenant_id)
-            .bind(email)
-            .bind(password_hash)
-            .bind(true) // email_verified = true
-            .bind(&req.token) // Keep token for idempotent re-verification
-            .bind(now)
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-            {
-                if has_database_constraint(&err, USERS_EMAIL_TENANT_CONSTRAINT) {
-                    tx.rollback().await?;
-                    oauth_code_repo
-                        .delete_by_verification_token(&req.token, tenant_id)
-                        .await?;
-                    return Err(AuthError::EmailAlreadyExists);
-                }
-                return Err(err.into());
-            }
-
-            sqlx::query(
-                "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
-                 VALUES ($1, $2, $3, $4, $5)",
-            )
-            .bind(&oauth_data.user_pubkey)
-            .bind(encrypted_secret)
-            .bind(tenant_id)
-            .bind(now)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-
-            tx.commit().await?;
-
-            tracing::info!(
-                "Created user and personal_keys for OAuth registration: {}",
-                oauth_data.user_pubkey
-            );
-        } else {
-            // BYOK flow: just create user, keys will come at token exchange
-            if let Err(err) = user_repo
-                .create_with_password_verified(
-                    &oauth_data.user_pubkey,
-                    tenant_id,
-                    email,
-                    password_hash,
-                    true,             // email_verified = true
-                    Some(&req.token), // Keep token for idempotent re-verification
-                )
-                .await
-            {
-                if matches!(err, keycast_core::repositories::RepositoryError::Duplicate) {
-                    oauth_code_repo
-                        .delete_by_verification_token(&req.token, tenant_id)
-                        .await?;
-                    return Err(AuthError::EmailAlreadyExists);
-                }
-                return Err(err.into());
-            }
-
-            tracing::info!(
-                "Created user for BYOK OAuth registration: {}",
-                oauth_data.user_pubkey
-            );
+        MaterializePendingRegistrationOutcome::Ready(finalized) => *finalized,
+        MaterializePendingRegistrationOutcome::Processing => return Err(headless_retry_error()),
+        MaterializePendingRegistrationOutcome::DuplicateKey => return Err(AuthError::DuplicateKey),
+        MaterializePendingRegistrationOutcome::EmailAlreadyExists => {
+            return Err(AuthError::EmailAlreadyExists)
         }
-
-        let headless_retry_error = || AuthError::ServiceUnavailable {
-            message: "Email verified, but app sign-in is still finishing. Please retry shortly."
-                .to_string(),
-            retry_after: Some(5),
-        };
-
-        let required_device_code = if oauth_data.is_headless {
-            Some(oauth_data.device_code.as_ref().ok_or_else(|| {
-                tracing::error!(
-                    event = "headless_poll_delivery_failed",
-                    tenant_id = tenant_id,
-                    user_pubkey = %oauth_data.user_pubkey,
-                    "Headless verification is missing device_code"
-                );
-                headless_retry_error()
-            })?)
-        } else {
-            None
-        };
-
-        let required_redis = if oauth_data.is_headless {
-            Some(auth_state.state.redis.as_ref().ok_or_else(|| {
-                tracing::error!(
-                    event = "headless_poll_delivery_failed",
-                    tenant_id = tenant_id,
-                    user_pubkey = %oauth_data.user_pubkey,
-                    "Headless verification requires Redis, but Redis is unavailable"
-                );
-                headless_retry_error()
-            })?)
-        } else {
-            None
-        };
-
-        // Generate new authorization code for the redirect
-        let new_code: String = rand::thread_rng()
-            .sample_iter(&rand::distributions::Alphanumeric)
-            .take(32)
-            .map(char::from)
-            .collect();
-
-        // Store the new code (10 minute expiry for exchange)
-        let code_expires_at = Utc::now() + Duration::minutes(10);
-        let store_params = keycast_core::repositories::StoreOAuthCodeParams {
-            tenant_id,
-            code: &new_code,
-            user_pubkey: &oauth_data.user_pubkey,
-            client_id: &oauth_data.client_id,
-            redirect_uri: &oauth_data.redirect_uri,
-            scope: &oauth_data.scope,
-            code_challenge: oauth_data.code_challenge.as_deref(),
-            code_challenge_method: oauth_data.code_challenge_method.as_deref(),
-            expires_at: code_expires_at,
-            previous_auth_id: oauth_data.previous_auth_id,
-            state: oauth_data.state.as_deref(),
-            is_headless: oauth_data.is_headless, // Inherit from original registration
-        };
-        oauth_code_repo.store(store_params).await?;
-
-        if let Some(device_code) = required_device_code {
-            let redis =
-                required_redis.expect("headless flow must validate Redis before storing code");
-            let key = format!("oauth_poll:{}", device_code);
-            if let Err(e) = redis.setex(&key, 600, &new_code).await {
-                tracing::error!(
-                    event = "headless_poll_delivery_failed",
-                    tenant_id = tenant_id,
-                    user_pubkey = %oauth_data.user_pubkey,
-                    device_code = %device_code,
-                    error = %e,
-                    "Failed to store headless OAuth code in Redis for polling"
-                );
-                if let Err(cleanup_err) = oauth_code_repo.delete(tenant_id, &new_code).await {
-                    tracing::error!(
-                        tenant_id = tenant_id,
-                        user_pubkey = %oauth_data.user_pubkey,
-                        code = %new_code,
-                        error = %cleanup_err,
-                        "Failed to clean up OAuth code after Redis polling write failed"
-                    );
-                }
-                return Err(headless_retry_error());
-            }
-            tracing::debug!(
-                "Stored OAuth code in Redis for headless polling: device_code={}",
-                device_code
-            );
-        } else if let Some(ref device_code) = oauth_data.device_code {
-            if let Some(redis) = &auth_state.state.redis {
-                let key = format!("oauth_poll:{}", device_code);
-                if let Err(e) = redis.setex(&key, 600, &new_code).await {
-                    tracing::warn!("Failed to store OAuth code in Redis for polling: {}", e);
-                    // Continue - redirect flow still works for same-device verification
-                } else {
-                    tracing::debug!(
-                        "Stored OAuth code in Redis for polling: device_code={}",
-                        device_code
-                    );
-                }
-            }
+        MaterializePendingRegistrationOutcome::NotFound => {
+            return Err(AuthError::ServiceUnavailable {
+                message: "Registration changed while it was being finalized. Please retry."
+                    .to_string(),
+                retry_after: Some(1),
+            })
         }
+    };
+    let oauth_data = finalized.pending;
+    let new_code = finalized.exchange_code.code;
+    let redis_ttl_seconds = (finalized.exchange_code.expires_at - Utc::now())
+        .num_seconds()
+        .max(1) as u64;
 
-        // Delete the pending registration entry
-        oauth_code_repo
-            .delete_by_verification_token(&req.token, tenant_id)
-            .await?;
-
-        // For headless flows (mobile app), don't redirect — the app is polling
-        // via device_code/Redis and will pick up the code automatically.
-        // The browser just shows a success page.
-        if oauth_data.is_headless {
-            tracing::info!(
-                event = "email_verification",
+    if let Some((device_code, redis)) = strict_delivery {
+        let key = format!("oauth_poll:{}", device_code);
+        if let Err(e) = redis.setex(&key, redis_ttl_seconds, &new_code).await {
+            tracing::error!(
+                event = "headless_poll_delivery_failed",
                 tenant_id = tenant_id,
-                flow = "oauth_headless",
-                success = true,
-                "Email verified (headless), app will pick up code via polling"
+                user_pubkey = %oauth_data.user_pubkey,
+                device_code = %device_code,
+                error = %e,
+                "Failed to store headless OAuth code in Redis for polling"
             );
-
-            return Ok((
-                axum::http::StatusCode::OK,
-                axum::Json(VerifyEmailResponse {
-                    success: true,
-                    message: "Email verified! Open the app to continue.".to_string(),
-                    redirect_to: None,
-                    authenticated: None,
-                    status: Some("headless".to_string()),
-                    retry_after: None,
-                }),
-            )
-                .into_response());
+            // Keep the code for retry. Another concurrent finalizer may already have reused and
+            // delivered it, so even the call that minted it cannot safely delete it here.
+            return Err(headless_retry_error());
         }
-
-        // Non-headless: redirect to OAuth client's callback URL
-        let mut redirect_url = format!("{}?code={}", oauth_data.redirect_uri, new_code);
-        if let Some(ref state) = oauth_data.state {
-            redirect_url = format!("{}&state={}", redirect_url, state);
+        tracing::debug!(
+            "Stored OAuth code in Redis for headless polling: device_code={}",
+            device_code
+        );
+    } else if let Some(ref device_code) = oauth_data.device_code {
+        // Best-effort push: non-headless same-device verification, or the PIN path where the code
+        // is also returned synchronously in the response body (so a Redis miss is not fatal).
+        if let Some(redis) = redis {
+            let key = format!("oauth_poll:{}", device_code);
+            if let Err(e) = redis.setex(&key, redis_ttl_seconds, &new_code).await {
+                tracing::warn!("Failed to store OAuth code in Redis for polling: {}", e);
+                // Continue - redirect flow / synchronous return still works.
+            } else {
+                tracing::debug!(
+                    "Stored OAuth code in Redis for polling: device_code={}",
+                    device_code
+                );
+            }
         }
+    }
 
+    Ok(FinalizedRegistration {
+        new_code,
+        redirect_uri: oauth_data.redirect_uri.clone(),
+        state: oauth_data.state.clone(),
+        is_headless: oauth_data.is_headless,
+    })
+}
+
+/// Result of running the interactive POST email-verification logic.
+enum VerifyOutcome {
+    /// Non-headless OAuth: send the browser to the client callback carrying a fresh code.
+    OAuthRedirect { redirect_url: String },
+    /// Headless (mobile app): the app polls for the code; the page just shows success.
+    Headless,
+    /// First-party normal registration: user is logged in; carries the session cookie.
+    LoggedIn { cookie: String },
+    /// Idempotent re-click on an already-verified first-party account.
+    AlreadyVerified,
+    /// Async bcrypt hash still running; the caller should retry shortly.
+    Processing,
+    /// The verification link has expired.
+    Expired,
+}
+
+/// Outcomes that a server-side GET may produce. This deliberately excludes first-party user
+/// verification and session issuance, which require the interactive POST flow.
+enum PendingVerifyOutcome {
+    OAuthRedirect { redirect_url: String },
+    Headless,
+    AlreadyVerified,
+    Expired,
+}
+
+/// Finalize only an OAuth/headless pending registration, if the token belongs to one.
+async fn perform_pending_email_verification(
+    auth_state: &super::routes::AuthState,
+    tenant_id: i64,
+    token: &str,
+) -> Result<Option<PendingVerifyOutcome>, AuthError> {
+    let pool = &auth_state.state.db;
+    let oauth_code_repo = OAuthCodeRepository::new(pool.clone());
+    let Some(oauth_data) = oauth_code_repo
+        .find_by_verification_token_including_expired(token, tenant_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if oauth_data.expires_at <= Utc::now() {
+        return Ok(Some(PendingVerifyOutcome::Expired));
+    }
+
+    tracing::info!(
+        "Email verification for OAuth registration: pubkey {}, email {:?}",
+        oauth_data.user_pubkey,
+        oauth_data.pending_email
+    );
+
+    // Complete via the shared finalize path. This intentionally does NOT delete the pending row:
+    // re-verifying within the 24h window re-arms a fresh 10-minute code, which makes link
+    // prefetch/preview harmless. Once token issuance completes, finalize refuses to re-mint.
+    let finalized = match finalize_pending_registration(
+        pool,
+        auth_state.state.redis.as_ref(),
+        tenant_id,
+        &oauth_data,
+        HeadlessDelivery::RedisRequired,
+    )
+    .await
+    {
+        Ok(finalized) => finalized,
+        Err(AuthError::RegistrationAlreadyCompleted) => {
+            return Ok(Some(PendingVerifyOutcome::AlreadyVerified))
+        }
+        Err(e) => return Err(e),
+    };
+
+    if finalized.is_headless {
         tracing::info!(
             event = "email_verification",
             tenant_id = tenant_id,
-            flow = "oauth",
+            flow = "oauth_headless",
             success = true,
-            "Email verified, redirecting to OAuth client"
+            "Email verified (headless), app will pick up code via polling"
         );
-
-        return Ok((
-            axum::http::StatusCode::OK,
-            axum::Json(VerifyEmailResponse {
-                success: true,
-                message: "Email verified! Redirecting to app...".to_string(),
-                redirect_to: Some(redirect_url),
-                authenticated: None,
-                status: None,
-                retry_after: None,
-            }),
-        )
-            .into_response());
+        return Ok(Some(PendingVerifyOutcome::Headless));
     }
 
-    // Second: Check users table for normal registration
+    let mut redirect_url = format!("{}?code={}", finalized.redirect_uri, finalized.new_code);
+    if let Some(ref state) = finalized.state {
+        redirect_url = format!("{}&state={}", redirect_url, state);
+    }
+    tracing::info!(
+        event = "email_verification",
+        tenant_id = tenant_id,
+        flow = "oauth",
+        success = true,
+        "Email verified, redirecting to OAuth client"
+    );
+    Ok(Some(PendingVerifyOutcome::OAuthRedirect { redirect_url }))
+}
+
+/// Core POST email-verification logic. OAuth/headless pending rows finalize server-side; normal
+/// first-party registrations are verified and receive a session only through this interactive POST.
+async fn perform_email_verification(
+    auth_state: &super::routes::AuthState,
+    headers: &HeaderMap,
+    tenant_id: i64,
+    token: &str,
+) -> Result<VerifyOutcome, AuthError> {
+    if let Some(outcome) = perform_pending_email_verification(auth_state, tenant_id, token).await? {
+        return Ok(match outcome {
+            PendingVerifyOutcome::OAuthRedirect { redirect_url } => {
+                VerifyOutcome::OAuthRedirect { redirect_url }
+            }
+            PendingVerifyOutcome::Headless => VerifyOutcome::Headless,
+            PendingVerifyOutcome::AlreadyVerified => VerifyOutcome::AlreadyVerified,
+            PendingVerifyOutcome::Expired => VerifyOutcome::Expired,
+        });
+    }
+
+    let pool = &auth_state.state.db;
+    let key_manager = auth_state.state.key_manager.as_ref();
     let user_repo = UserRepository::new(pool.clone());
+    // Matches neither a pending registration nor a users row: the link was already used or a
+    // newer verification email replaced it (keycast#268).
     let token_data = user_repo
-        .find_by_verification_token(&req.token, tenant_id)
+        .find_by_verification_token(token, tenant_id)
         .await?
-        .ok_or(AuthError::InvalidToken)?;
+        .ok_or(AuthError::VerificationLinkSuperseded)?;
 
     let public_key = token_data.pubkey;
+    let verification_expired = token_data
+        .email_verification_expires_at
+        .as_ref()
+        .is_none_or(|expires| expires < &Utc::now());
 
-    // Already verified (e.g. user clicked the link again) - show success
+    // Keep an already-verified first-party token useful for retrying the interactive POST during
+    // its original verification window (for example, if the first response was lost). Once the
+    // window expires, the retained token remains a harmless acknowledgement and must not mint a
+    // new session.
     if token_data.email_verified {
-        return Ok((
-            axum::http::StatusCode::OK,
-            axum::Json(VerifyEmailResponse {
-                success: true,
-                message: "Your email is already verified. You can log in.".to_string(),
-                redirect_to: None,
-                authenticated: None,
-                status: None,
-                retry_after: None,
-            }),
-        )
-            .into_response());
-    }
-
-    // Check if token is expired
-    if let Some(expires) = token_data.email_verification_expires_at {
-        if expires < Utc::now() {
-            return Ok((
-                axum::http::StatusCode::OK,
-                axum::Json(VerifyEmailResponse {
-                    success: false,
-                    message: "Verification link has expired. Please request a new one.".to_string(),
-                    redirect_to: None,
-                    authenticated: None,
-                    status: None,
-                    retry_after: None,
-                }),
-            )
-                .into_response());
+        if verification_expired {
+            return Ok(VerifyOutcome::AlreadyVerified);
         }
-    }
+    } else {
+        // An unverified account cannot complete after the verification window expires.
+        if verification_expired {
+            return Ok(VerifyOutcome::Expired);
+        }
 
-    // Check async bcrypt state: password_hash IS NULL means still processing
-    if token_data.password_hash.is_none() {
-        let age = Utc::now().signed_duration_since(token_data.created_at);
-        if age.num_seconds() > 120 {
-            // Hash should complete in <1s normally. After 2min, assume instance died.
-            // User needs to re-register (cleanup job will delete this row)
-            tracing::warn!(
-                "Password hash not completed after {}s for token {}..., likely instance died",
+        // Check async bcrypt state: password_hash IS NULL means still processing
+        if token_data.password_hash.is_none() {
+            let age = Utc::now().signed_duration_since(token_data.created_at);
+            if age.num_seconds() > 120 {
+                // Hash should complete in <1s normally. After 2min, assume instance died.
+                // User needs to re-register (cleanup job will delete this row)
+                tracing::warn!(
+                    "Password hash not completed after {}s for token {}..., likely instance died",
+                    age.num_seconds(),
+                    &token[..std::cmp::min(8, token.len())]
+                );
+                return Err(AuthError::RegistrationExpired);
+            }
+            // Still processing - tell caller to retry
+            tracing::debug!(
+                "Password hash still processing (age: {}s) for token {}...",
                 age.num_seconds(),
-                &req.token[..std::cmp::min(8, req.token.len())]
+                &token[..std::cmp::min(8, token.len())]
             );
-            return Err(AuthError::RegistrationExpired);
+            return Ok(VerifyOutcome::Processing);
         }
-        // Still processing - tell frontend to poll
-        tracing::debug!(
-            "Password hash still processing (age: {}s) for token {}...",
-            age.num_seconds(),
-            &req.token[..std::cmp::min(8, req.token.len())]
-        );
-        return Ok((
-            axum::http::StatusCode::OK,
-            axum::Json(VerifyEmailResponse {
-                success: false,
-                message: "Processing your registration, please wait...".to_string(),
-                redirect_to: None,
-                authenticated: None,
-                status: Some("processing".to_string()),
-                retry_after: Some(1),
-            }),
-        )
-            .into_response());
-    }
 
-    // Mark email as verified (token kept for idempotent re-verification)
-    user_repo.verify_email(&public_key, tenant_id).await?;
+        // Mark email as verified (token kept for idempotent re-verification).
+        user_repo.verify_email(&public_key, tenant_id).await?;
+    }
 
     // Get user's email and account status for UCAN
     let email = user_repo.get_email(&public_key, tenant_id).await?;
@@ -2120,7 +2054,7 @@ pub async fn verify_email(
     let keys = Keys::new(secret_key.into());
 
     // Extract redirect_origin from Origin header for UCAN
-    let redirect_origin = extract_origin_from_headers(&headers)
+    let redirect_origin = extract_origin_from_headers(headers)
         .or_else(|_| std::env::var("APP_URL"))
         .unwrap_or_else(|_| "http://localhost:3000".to_string());
 
@@ -2143,25 +2077,452 @@ pub async fn verify_email(
         "Email verified successfully, issuing UCAN"
     );
 
-    // Set UCAN session cookie
     let cookie = format!(
         "keycast_session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400",
         ucan_token
     );
+    Ok(VerifyOutcome::LoggedIn { cookie })
+}
 
-    Ok((
-        axum::http::StatusCode::OK,
-        [(axum::http::header::SET_COOKIE, cookie)],
-        axum::Json(VerifyEmailResponse {
-            success: true,
-            message: "Email verified successfully! You are now logged in.".to_string(),
-            redirect_to: None,
-            authenticated: Some(true),
-            status: None,
-            retry_after: None,
-        }),
+/// Verify email address with token (POST, JSON — used by the SPA verify page / clients).
+/// Handles two flows:
+/// 1. OAuth registration: token in oauth_codes → complete OAuth flow → redirect to client
+/// 2. Normal registration: token in users → mark verified → issue UCAN → set cookie
+pub async fn verify_email(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<super::routes::AuthState>,
+    headers: HeaderMap,
+    Json(req): Json<VerifyEmailRequest>,
+) -> Result<impl IntoResponse, AuthError> {
+    let tenant_id = tenant.0.id;
+    // Emitted with the same event_type as the GET path so both transports are comparable in the
+    // auth-event feed (keycast#262 made the GET primary).
+    let outcome =
+        match perform_email_verification(&auth_state, &headers, tenant_id, &req.token).await {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                record_verify_email_event(
+                    &auth_state.state.db,
+                    &headers,
+                    tenant_id,
+                    "POST",
+                    "failure",
+                    Some(verify_email_reason_code(&err)),
+                    verify_email_error_status(&err),
+                )
+                .await;
+                return Err(err);
+            }
+        };
+
+    let outcome_reason = match &outcome {
+        VerifyOutcome::Headless => "headless",
+        VerifyOutcome::OAuthRedirect { .. } => "oauth_redirect",
+        VerifyOutcome::AlreadyVerified => "already_verified",
+        VerifyOutcome::Processing => "processing",
+        VerifyOutcome::Expired => "expired",
+        VerifyOutcome::LoggedIn { .. } => "logged_in",
+    };
+    let event_outcome = if matches!(&outcome, VerifyOutcome::Expired) {
+        "failure"
+    } else {
+        "success"
+    };
+    record_verify_email_event(
+        &auth_state.state.db,
+        &headers,
+        tenant_id,
+        "POST",
+        event_outcome,
+        Some(outcome_reason),
+        200,
     )
-        .into_response())
+    .await;
+
+    let response = match outcome {
+        VerifyOutcome::Headless => (
+            StatusCode::OK,
+            Json(VerifyEmailResponse {
+                success: true,
+                message: "Email verified! Open the app to continue.".to_string(),
+                redirect_to: None,
+                authenticated: None,
+                status: Some("headless".to_string()),
+                retry_after: None,
+            }),
+        )
+            .into_response(),
+        VerifyOutcome::OAuthRedirect { redirect_url } => (
+            StatusCode::OK,
+            Json(VerifyEmailResponse {
+                success: true,
+                message: "Email verified! Redirecting to app...".to_string(),
+                redirect_to: Some(redirect_url),
+                authenticated: None,
+                status: None,
+                retry_after: None,
+            }),
+        )
+            .into_response(),
+        VerifyOutcome::AlreadyVerified => (
+            StatusCode::OK,
+            Json(VerifyEmailResponse {
+                success: true,
+                message: "Your email is already verified. You can log in.".to_string(),
+                redirect_to: None,
+                authenticated: None,
+                status: None,
+                retry_after: None,
+            }),
+        )
+            .into_response(),
+        VerifyOutcome::Expired => (
+            StatusCode::OK,
+            Json(VerifyEmailResponse {
+                success: false,
+                message: "Verification link has expired. Please request a new one.".to_string(),
+                redirect_to: None,
+                authenticated: None,
+                status: None,
+                retry_after: None,
+            }),
+        )
+            .into_response(),
+        VerifyOutcome::Processing => (
+            StatusCode::OK,
+            Json(VerifyEmailResponse {
+                success: false,
+                message: "Processing your registration, please wait...".to_string(),
+                redirect_to: None,
+                authenticated: None,
+                status: Some("processing".to_string()),
+                retry_after: Some(1),
+            }),
+        )
+            .into_response(),
+        VerifyOutcome::LoggedIn { cookie } => (
+            StatusCode::OK,
+            [(axum::http::header::SET_COOKIE, cookie)],
+            Json(VerifyEmailResponse {
+                success: true,
+                message: "Email verified successfully! You are now logged in.".to_string(),
+                redirect_to: None,
+                authenticated: Some(true),
+                status: None,
+                retry_after: None,
+            }),
+        )
+            .into_response(),
+    };
+
+    Ok(response)
+}
+
+/// Query parameters for the GET verify-email link.
+#[derive(Debug, Deserialize)]
+pub struct VerifyEmailQuery {
+    pub token: Option<String>,
+}
+
+/// Verify email address by GET (the link target in verification emails).
+///
+/// OAuth/headless pending registrations finalize on this server-side GET so sandboxed in-app
+/// browsers do not need JavaScript. First-party tokens are handed to the interactive page without
+/// mutating user state or issuing a session; only that page's POST may do so.
+pub async fn verify_email_get(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<super::routes::AuthState>,
+    headers: HeaderMap,
+    Query(query): Query<VerifyEmailQuery>,
+) -> Response {
+    let tenant_id = tenant.0.id;
+    let pool = auth_state.state.db.clone();
+    let emit = |outcome: &'static str, reason: Option<&'static str>, status: i32| {
+        let pool = pool.clone();
+        let headers = headers.clone();
+        async move {
+            record_verify_email_event(&pool, &headers, tenant_id, "GET", outcome, reason, status)
+                .await;
+        }
+    };
+
+    let Some(token) = query.token.filter(|t| !t.is_empty()) else {
+        emit("failure", Some("missing_token"), 400).await;
+        return verify_html_page(
+            StatusCode::BAD_REQUEST,
+            "Invalid link",
+            "This verification link is missing its token. Please use the link from your email.",
+        );
+    };
+
+    match perform_pending_email_verification(&auth_state, tenant_id, &token).await {
+        Ok(Some(PendingVerifyOutcome::OAuthRedirect { redirect_url })) => {
+            emit("success", Some("oauth_redirect"), 303).await;
+            Redirect::to(&redirect_url).into_response()
+        }
+        Ok(Some(PendingVerifyOutcome::Headless)) => {
+            emit("success", Some("headless"), 200).await;
+            verify_html_page(
+                StatusCode::OK,
+                "Email verified!",
+                "Your email is verified. You can return to the app to continue.",
+            )
+        }
+        Ok(Some(PendingVerifyOutcome::AlreadyVerified)) => {
+            emit("success", Some("already_verified"), 200).await;
+            verify_html_page(
+                StatusCode::OK,
+                "Already verified",
+                "Your email is already verified. You can return to the app or log in.",
+            )
+        }
+        Ok(Some(PendingVerifyOutcome::Expired)) => {
+            emit("failure", Some("expired"), 410).await;
+            verify_html_page(
+                StatusCode::GONE,
+                "Verification link expired",
+                "This verification link has expired. Please sign up again.",
+            )
+        }
+        Ok(None) => {
+            // Not a pending registration. Only a token that still resolves to a users row belongs
+            // to the first-party interactive flow, which the SPA owns (it POSTs and mints the
+            // session). Anything else is a dead link, and bouncing it to the SPA just relays it to
+            // a 401 "Please log in again" — the one place this GET would still need client-side
+            // JavaScript, which is exactly what verifying on GET exists to avoid (keycast#268).
+            let user_repo = UserRepository::new(auth_state.state.db.clone());
+            match user_repo
+                .find_by_verification_token(&token, tenant_id)
+                .await
+            {
+                Ok(Some(_)) => {
+                    // Not an outcome yet: the interactive POST records the terminal one.
+                    emit("accepted", Some("interactive_handoff"), 303).await;
+                    let interactive_url =
+                        format!("/verify-email?token={}", urlencoding::encode(&token));
+                    Redirect::to(&interactive_url).into_response()
+                }
+                Ok(None) => {
+                    emit("failure", Some("verification_link_superseded"), 200).await;
+                    verify_link_superseded_page()
+                }
+                // Can't tell a dead link from a database blip, so retry rather than declaring the
+                // link dead.
+                Err(err) => {
+                    tracing::error!(
+                        tenant_id = tenant_id,
+                        error = %err,
+                        "Failed to resolve verification token on GET verify"
+                    );
+                    emit("failure", Some("database_error"), 503).await;
+                    verify_html_retry_page(5)
+                }
+            }
+        }
+        // Retryable: the link may still be good, so render a non-terminal page that retries
+        // itself instead of a success-looking 2xx or terminal invalid-link page.
+        Err(AuthError::ServiceUnavailable { retry_after, .. }) => {
+            emit("failure", Some("retryable_unavailable"), 503).await;
+            verify_html_retry_page(retry_after.unwrap_or(5))
+        }
+        // Terminal: the email belongs to another account (mirrors the POST path's 409).
+        Err(AuthError::EmailAlreadyExists) => {
+            emit("failure", Some("email_already_exists"), 409).await;
+            verify_html_page(
+                StatusCode::CONFLICT,
+                "Email already registered",
+                "This email is already registered. Please log in instead.",
+            )
+        }
+        Err(err @ AuthError::Database(_)) if matches!(&err, AuthError::Database(e) if has_database_constraint(e, USERS_EMAIL_TENANT_CONSTRAINT)) =>
+        {
+            emit("failure", Some("email_already_exists"), 409).await;
+            verify_html_page(
+                StatusCode::CONFLICT,
+                "Email already registered",
+                "This email is already registered. Please log in instead.",
+            )
+        }
+        // Rate limited: the link is still good, so retry rather than declaring it dead.
+        Err(AuthError::TooManyRequests { retry_after, .. }) => {
+            emit("failure", Some("rate_limited"), 429).await;
+            verify_html_retry_page(retry_after)
+        }
+        Err(
+            err @ (AuthError::Database(_)
+            | AuthError::PasswordHash(_)
+            | AuthError::Encryption(_)
+            | AuthError::Internal(_)
+            | AuthError::EmailSendFailed(_)),
+        ) => {
+            emit("failure", Some(verify_email_reason_code(&err)), 503).await;
+            verify_html_retry_page(5)
+        }
+        // A link that no longer resolves gets the actionable dead-link page, not a generic failure.
+        Err(AuthError::VerificationLinkSuperseded) => {
+            emit("failure", Some("verification_link_superseded"), 200).await;
+            verify_link_superseded_page()
+        }
+        Err(err) => {
+            emit("failure", Some(verify_email_reason_code(&err)), 200).await;
+            verify_html_page(
+                StatusCode::OK,
+                "Verification failed",
+                "This verification link is invalid or has expired. If you already verified, you can log in.",
+            )
+        }
+    }
+}
+
+/// `auth_events.endpoint` for both verify-email transports.
+pub(crate) const VERIFY_EMAIL_ENDPOINT: &str = "/api/auth/verify-email";
+
+/// Record one verify-email attempt to the shared auth-event feed.
+///
+/// Both transports emit this with the same `event_type`, differing only in `metadata_json.method`,
+/// so GET and POST outcomes are directly comparable. That matters most right after the switch to
+/// verifying on GET (keycast#262): the GET is now the primary path, and the
+/// `verification_link_superseded` rate is the signal for whether duplicate signups
+/// (keycast#268 Fix A) actually stopped in production.
+async fn record_verify_email_event(
+    pool: &PgPool,
+    headers: &HeaderMap,
+    tenant_id: i64,
+    method: &'static str,
+    outcome: &'static str,
+    reason_code: Option<&str>,
+    http_status: i32,
+) {
+    super::auth_observability::record_auth_event_and_log(
+        pool,
+        headers,
+        None,
+        super::auth_observability::AuthEvent {
+            tenant_id,
+            endpoint: VERIFY_EMAIL_ENDPOINT,
+            event_type: "email_verification",
+            outcome,
+            reason_code,
+            http_status,
+            email: None,
+            pubkey: None,
+            client_id: None,
+            redirect_origin: None,
+            metadata_json: serde_json::json!({ "method": method }),
+        },
+    )
+    .await;
+}
+
+/// HTTP status a verify-email failure will answer with, for the auth-event feed.
+///
+/// Kept in step with `AuthError`'s `IntoResponse`; only the statuses this route can actually
+/// produce are enumerated, and anything else records the 503 the catch-all answers with.
+fn verify_email_error_status(error: &AuthError) -> i32 {
+    match error {
+        AuthError::EmailAlreadyExists => 409,
+        AuthError::Database(err) if has_database_constraint(err, USERS_EMAIL_TENANT_CONSTRAINT) => {
+            409
+        }
+        AuthError::DuplicateKey
+        | AuthError::Conflict(_)
+        | AuthError::RegistrationAlreadyCompleted => 409,
+        AuthError::VerificationLinkSuperseded | AuthError::InvalidToken => 401,
+        AuthError::TooManyRequests { .. } => 429,
+        AuthError::RegistrationExpired => 410,
+        AuthError::BadRequest(_) | AuthError::InvalidEmail => 400,
+        AuthError::Forbidden(_) | AuthError::KeyEgressDenied => 403,
+        _ => 503,
+    }
+}
+
+/// Classify a verify-email failure into a stable `reason_code` for the auth-event feed.
+fn verify_email_reason_code(error: &AuthError) -> &'static str {
+    match error {
+        AuthError::ServiceUnavailable { .. } => "retryable_unavailable",
+        AuthError::TooManyRequests { .. } => "rate_limited",
+        AuthError::EmailAlreadyExists => "email_already_exists",
+        AuthError::Database(err) if has_database_constraint(err, USERS_EMAIL_TENANT_CONSTRAINT) => {
+            "email_already_exists"
+        }
+        AuthError::Database(_) => "database_error",
+        AuthError::VerificationLinkSuperseded => "verification_link_superseded",
+        AuthError::RegistrationExpired => "registration_expired",
+        AuthError::RegistrationAlreadyCompleted => "registration_already_completed",
+        AuthError::DuplicateKey => "account_email_conflict",
+        AuthError::InvalidToken | AuthError::MissingToken | AuthError::TokenExpired => {
+            "invalid_token"
+        }
+        _ => "other",
+    }
+}
+
+/// Terminal page for a verification link that no longer resolves — already used, or replaced by a
+/// newer verification email (keycast#268).
+///
+/// Served as 200 like the other terminal outcomes on this route: in-app browsers replace 4xx/5xx
+/// bodies with their own error chrome, which would hide the one instruction that resolves this.
+fn verify_link_superseded_page() -> Response {
+    verify_html_page(
+        StatusCode::OK,
+        VERIFICATION_LINK_SUPERSEDED_HEADING,
+        VERIFICATION_LINK_SUPERSEDED_MESSAGE,
+    )
+}
+
+/// Render the retryable-failure page for the GET verify flow: 503 + `Retry-After` plus an HTML
+/// meta refresh, so both HTTP clients and webview users (who may have no address bar to reload
+/// with) retry automatically instead of reading a dead end.
+fn verify_html_retry_page(retry_after_secs: u32) -> Response {
+    let mut response = verify_html_page_with_refresh(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Almost there…",
+        "We hit a temporary problem verifying your link. This page will retry automatically in a few seconds.",
+        Some(retry_after_secs),
+    );
+    if let Ok(value) = retry_after_secs.to_string().parse() {
+        response.headers_mut().insert("Retry-After", value);
+    }
+    response
+}
+
+/// Render a minimal, self-contained HTML status page for the GET verify flow.
+fn verify_html_page(status: StatusCode, heading: &str, message: &str) -> Response {
+    verify_html_page_with_refresh(status, heading, message, None)
+}
+
+/// [`verify_html_page`] with an optional `<meta http-equiv="refresh">` interval in seconds.
+fn verify_html_page_with_refresh(
+    status: StatusCode,
+    heading: &str,
+    message: &str,
+    refresh_secs: Option<u32>,
+) -> Response {
+    let refresh_tag = refresh_secs
+        .map(|secs| format!("<meta http-equiv=\"refresh\" content=\"{secs}\">"))
+        .unwrap_or_default();
+    let body = format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">{refresh_tag}\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>{heading}</title>\
+         <style>body{{font-family:system-ui,-apple-system,sans-serif;background:#0d1117;color:#e6edf3;\
+         display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:1rem}}\
+         .card{{max-width:420px;text-align:center;background:#161b22;border:1px solid #30363d;\
+         border-radius:1rem;padding:2rem}}h1{{font-size:1.4rem;margin:0 0 .5rem}}\
+         p{{color:#9da7b3;margin:0;font-size:.95rem}}</style></head>\
+         <body><div class=\"card\"><h1>{heading}</h1><p>{message}</p></div></body></html>",
+        heading = html_escape(heading),
+        message = html_escape(message),
+    );
+    (status, Html(body)).into_response()
+}
+
+/// Minimal HTML-escaping for the small set of static status strings rendered above.
+fn html_escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 #[derive(Debug, Deserialize)]
@@ -2282,7 +2643,7 @@ pub async fn resend_verification(
         match crate::email_service::EmailService::new() {
             Ok(email_service) => {
                 if let Err(e) = email_service
-                    .send_verification_email(&email_clone, &token_clone)
+                    .send_verification_email(&email_clone, &token_clone, None)
                     .await
                 {
                     tracing::error!(
@@ -4998,6 +5359,8 @@ mod tests {
     use super::generate_server_signed_ucan;
     use super::validate_origin;
     use super::AccountStatusResponse;
+    #[cfg(feature = "integration-tests")]
+    use super::{VERIFICATION_LINK_SUPERSEDED_CODE, VERIFICATION_LINK_SUPERSEDED_HEADING};
     use axum::response::IntoResponse;
     use ucan::Ucan;
 
@@ -5234,7 +5597,8 @@ mod tests {
 
     #[cfg(feature = "integration-tests")]
     use super::{
-        generate_ucan_token, login, update_profile, verify_email, ProfileData, VerifyEmailRequest,
+        generate_ucan_token, login, update_profile, verify_email, verify_email_get, ProfileData,
+        VerifyEmailQuery, VerifyEmailRequest,
     };
     #[cfg(feature = "integration-tests")]
     use crate::api::http::routes::AuthState;
@@ -5248,7 +5612,7 @@ mod tests {
     use crate::state::KeycastState;
     #[cfg(feature = "integration-tests")]
     use axum::{
-        extract::State,
+        extract::{Query, State},
         http::{
             header::{AUTHORIZATION, ORIGIN},
             HeaderMap, HeaderValue, StatusCode,
@@ -5298,8 +5662,10 @@ mod tests {
     }
 
     fn create_lazy_auth_state() -> crate::api::http::routes::AuthState {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string());
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://postgres:password@localhost/keycast_test")
+            .connect_lazy(&database_url)
             .expect("lazy pool should be created");
         let bcrypt_queue = crate::bcrypt_queue::BcryptQueue::new();
         let secret_pool = keycast_core::secret_pool::SecretPool::new(1);
@@ -5532,8 +5898,8 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(
-            user_count.0, 1,
-            "retry should reuse the created user instead of duplicating it"
+            user_count.0, 0,
+            "strict Redis validation must run before user materialization"
         );
 
         cleanup_verify_email_test_data(&pool, &pubkey, &verification_token).await;
@@ -5643,6 +6009,1078 @@ mod tests {
 
         cleanup_verify_email_test_data(&pool, &existing_pubkey, &verification_token).await;
         cleanup_verify_email_test_data(&pool, &pending_pubkey, &verification_token).await;
+    }
+
+    /// Extract the `code` query parameter from a verify redirect URL like `{uri}?code=XXX&state=YYY`.
+    #[cfg(feature = "integration-tests")]
+    fn extract_code_from_redirect(redirect_to: &str) -> String {
+        let after = redirect_to
+            .split("code=")
+            .nth(1)
+            .expect("redirect should carry a code");
+        after.split('&').next().unwrap().to_string()
+    }
+
+    /// Insert a non-headless OAuth pending registration (browser flow) and return (pubkey, token).
+    #[cfg(feature = "integration-tests")]
+    async fn insert_oauth_pending_registration(pool: &PgPool, email: &str) -> (String, String) {
+        let pending_keys = Keys::generate();
+        let pending_pubkey = pending_keys.public_key().to_hex();
+        let verification_token = format!("verify_{}", Uuid::new_v4());
+        let placeholder_code = format!("placeholder_{}", Uuid::new_v4());
+        let password_hash = bcrypt::hash("testpassword123", bcrypt::DEFAULT_COST).unwrap();
+        let expires_at = Utc::now() + Duration::hours(24);
+        let encrypted_secret = pending_keys.secret_key().to_secret_bytes().to_vec();
+
+        cleanup_verify_email_test_data(pool, &pending_pubkey, &verification_token).await;
+
+        sqlx::query(
+            "INSERT INTO oauth_codes (
+                tenant_id, code, user_pubkey, client_id, redirect_uri, scope,
+                expires_at, created_at, pending_email, pending_password_hash,
+                pending_email_verification_token, pending_encrypted_secret
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8, $9, $10, $11)",
+        )
+        .bind(1_i64)
+        .bind(&placeholder_code)
+        .bind(&pending_pubkey)
+        .bind("TestApp")
+        .bind("https://test.example.com/callback")
+        .bind("policy:social")
+        .bind(expires_at)
+        .bind(email)
+        .bind(&password_hash)
+        .bind(&verification_token)
+        .bind(&encrypted_secret)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        (pending_pubkey, verification_token)
+    }
+
+    /// Re-verifying an OAuth registration within the window must re-arm a fresh 10-min code
+    /// WITHOUT deleting the pending row (keycast#262 Part A idempotency).
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_email_oauth_idempotent_rearms_without_deleting_pending() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+        let email = format!("verify-idem-{}@example.com", Uuid::new_v4());
+        let (pubkey, token) = insert_oauth_pending_registration(&pool, &email).await;
+
+        let first = verify_email(
+            create_test_tenant(),
+            State(auth_state.clone()),
+            HeaderMap::new(),
+            Json(VerifyEmailRequest {
+                token: token.clone(),
+            }),
+        )
+        .await
+        .map(|r| r.into_response())
+        .unwrap_or_else(|e| e.into_response());
+        assert_eq!(first.status(), StatusCode::OK);
+        let body1 = response_json(first).await;
+        let code1 = extract_code_from_redirect(body1["redirect_to"].as_str().unwrap());
+
+        // Pending row must survive the first verify (so prefetch can't strand a later real visit).
+        let repo = keycast_core::repositories::OAuthCodeRepository::new(pool.clone());
+        assert!(
+            repo.find_by_verification_token(&token, 1)
+                .await
+                .unwrap()
+                .is_some(),
+            "pending row must survive verify (idempotent re-arm)"
+        );
+
+        let second = verify_email(
+            create_test_tenant(),
+            State(auth_state.clone()),
+            HeaderMap::new(),
+            Json(VerifyEmailRequest {
+                token: token.clone(),
+            }),
+        )
+        .await
+        .map(|r| r.into_response())
+        .unwrap_or_else(|e| e.into_response());
+        assert_eq!(
+            second.status(),
+            StatusCode::OK,
+            "re-verify must still succeed, not fail with InvalidToken"
+        );
+        let body2 = response_json(second).await;
+        let code2 = extract_code_from_redirect(body2["redirect_to"].as_str().unwrap());
+
+        assert_eq!(
+            code1, code2,
+            "idempotent re-arm reuses the same live exchange code"
+        );
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_concurrent_finalizers_return_the_same_exchange_code() {
+        let pool = create_test_db().await;
+        let email = format!("verify-concurrent-{}@example.com", Uuid::new_v4());
+        let (pubkey, token) = insert_oauth_pending_registration(&pool, &email).await;
+        let repo = keycast_core::repositories::OAuthCodeRepository::new(pool.clone());
+        let pending = repo
+            .find_by_verification_token(&token, 1)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (first, second) = tokio::join!(
+            super::finalize_pending_registration(
+                &pool,
+                None,
+                1,
+                &pending,
+                super::HeadlessDelivery::RedisBestEffort,
+            ),
+            super::finalize_pending_registration(
+                &pool,
+                None,
+                1,
+                &pending,
+                super::HeadlessDelivery::RedisBestEffort,
+            ),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.new_code, second.new_code);
+
+        let exchange_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oauth_codes
+             WHERE tenant_id = 1 AND pending_email_verification_token = $1
+               AND pending_email IS NULL",
+        )
+        .bind(&token)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(exchange_count, 1);
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
+    }
+
+    /// A prefetch (mail scanner / link preview) of the verify link must not strand the user:
+    /// the pending row survives, so the user's later real click still completes.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_email_prefetch_does_not_strand_user() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+
+        // OAuth registrations retain their pending row so a scanner hit cannot consume the
+        // redirect/code that the user's later visit needs.
+        let email = format!("verify-prefetch-{}@example.com", Uuid::new_v4());
+        let (pubkey, token) = insert_oauth_pending_registration(&pool, &email).await;
+
+        // Simulated prefetch hit.
+        let prefetch = verify_email(
+            create_test_tenant(),
+            State(auth_state.clone()),
+            HeaderMap::new(),
+            Json(VerifyEmailRequest {
+                token: token.clone(),
+            }),
+        )
+        .await
+        .map(|r| r.into_response())
+        .unwrap_or_else(|e| e.into_response());
+        assert_eq!(prefetch.status(), StatusCode::OK);
+
+        // The user's real click afterwards must still complete (not InvalidToken / stranded).
+        let real = verify_email(
+            create_test_tenant(),
+            State(auth_state.clone()),
+            HeaderMap::new(),
+            Json(VerifyEmailRequest {
+                token: token.clone(),
+            }),
+        )
+        .await
+        .map(|r| r.into_response())
+        .unwrap_or_else(|e| e.into_response());
+        assert_eq!(
+            real.status(),
+            StatusCode::OK,
+            "user's real click after a prefetch must still verify"
+        );
+        let body = response_json(real).await;
+        assert_eq!(body["success"], true);
+        // Must re-arm via the pending-registration path (fresh redirect + code), NOT fall through
+        // to the degenerate users-table "already verified" branch that mints no exchange code.
+        assert!(
+            body["redirect_to"].is_string(),
+            "real click after prefetch must re-arm a fresh exchange code, not silently strand"
+        );
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
+
+        // First-party registration links hand off to the interactive page. A scanner GET must not
+        // verify the user or mint a first-party session; the page's POST performs that transition.
+        let first_party_keys = Keys::generate();
+        let first_party_pubkey = first_party_keys.public_key().to_hex();
+        let first_party_token = format!("verify_first_party_{}", Uuid::new_v4());
+        let first_party_email = format!("verify-first-party-{}@example.com", Uuid::new_v4());
+        let first_party_password_hash =
+            bcrypt::hash("testpassword123", bcrypt::DEFAULT_COST).unwrap();
+        let first_party_expires_at = Utc::now() + Duration::hours(24);
+        let first_party_secret = first_party_keys.secret_key().to_secret_bytes();
+        let user_repo = keycast_core::repositories::UserRepository::new(pool.clone());
+
+        cleanup_verify_email_test_data(&pool, &first_party_pubkey, &first_party_token).await;
+        user_repo
+            .register_with_personal_key(
+                &first_party_pubkey,
+                1,
+                &first_party_email,
+                Some(&first_party_password_hash),
+                &first_party_token,
+                first_party_expires_at,
+                &first_party_secret,
+            )
+            .await
+            .unwrap();
+
+        let scanner_get = verify_email_get(
+            create_test_tenant(),
+            State(auth_state.clone()),
+            HeaderMap::new(),
+            Query(VerifyEmailQuery {
+                token: Some(first_party_token.clone()),
+            }),
+        )
+        .await;
+        assert!(scanner_get.status().is_redirection());
+        assert!(
+            !scanner_get
+                .headers()
+                .contains_key(axum::http::header::SET_COOKIE),
+            "a first-party GET must never issue a session cookie"
+        );
+        let (verified_after_get,): (bool,) =
+            sqlx::query_as("SELECT email_verified FROM users WHERE pubkey = $1 AND tenant_id = 1")
+                .bind(&first_party_pubkey)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            !verified_after_get,
+            "a first-party GET must not mutate verification state"
+        );
+
+        let interactive_post = verify_email(
+            create_test_tenant(),
+            State(auth_state.clone()),
+            HeaderMap::new(),
+            Json(VerifyEmailRequest {
+                token: first_party_token.clone(),
+            }),
+        )
+        .await
+        .map(|r| r.into_response())
+        .unwrap_or_else(|e| e.into_response());
+        assert_eq!(interactive_post.status(), StatusCode::OK);
+        assert!(
+            interactive_post
+                .headers()
+                .contains_key(axum::http::header::SET_COOKIE),
+            "the interactive POST must still issue the first-party session cookie"
+        );
+        let (verified_after_post,): (bool,) =
+            sqlx::query_as("SELECT email_verified FROM users WHERE pubkey = $1 AND tenant_id = 1")
+                .bind(&first_party_pubkey)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            verified_after_post,
+            "the interactive POST must complete first-party verification"
+        );
+
+        cleanup_verify_email_test_data(&pool, &first_party_pubkey, &first_party_token).await;
+    }
+
+    /// Build a Redis-backed AuthState for headless GET tests (the link path requires Redis).
+    #[cfg(feature = "integration-tests")]
+    async fn create_test_auth_state_with_redis(pool: PgPool) -> AuthState {
+        let mut state = create_test_auth_state(pool);
+        let redis_url =
+            std::env::var("TEST_REDIS_URL").unwrap_or_else(|_| "redis://localhost:16379".into());
+        let client = redis::Client::open(redis_url.as_str()).unwrap();
+        let conn = redis::aio::ConnectionManager::new(client).await.unwrap();
+        let redis = crate::redis::PrefixedRedis::new(conn, Some("test_verify".to_string()));
+        let inner = Arc::get_mut(&mut state.state).expect("unique Arc");
+        inner.redis = Some(redis);
+        state
+    }
+
+    /// Build an AuthState whose Redis wrapper deterministically rejects SETEX operations.
+    #[cfg(feature = "integration-tests")]
+    async fn create_test_auth_state_with_failing_redis(pool: PgPool) -> AuthState {
+        let mut state = create_test_auth_state(pool);
+        let redis_url =
+            std::env::var("TEST_REDIS_URL").unwrap_or_else(|_| "redis://localhost:16379".into());
+        let client = redis::Client::open(redis_url.as_str()).unwrap();
+        let conn = redis::aio::ConnectionManager::new(client).await.unwrap();
+        let redis =
+            crate::redis::PrefixedRedis::new_failing(conn, Some("test_verify_fail".to_string()));
+        let inner = Arc::get_mut(&mut state.state).expect("unique Arc");
+        inner.redis = Some(redis);
+        state
+    }
+
+    /// Insert a headless pending registration (device_code set) and return (pubkey, token, device_code).
+    #[cfg(feature = "integration-tests")]
+    async fn insert_headless_pending_registration(
+        pool: &PgPool,
+        email: &str,
+    ) -> (String, String, String) {
+        let pending_keys = Keys::generate();
+        let pending_pubkey = pending_keys.public_key().to_hex();
+        let verification_token = format!("verify_{}", Uuid::new_v4());
+        let placeholder_code = format!("placeholder_{}", Uuid::new_v4());
+        let device_code = format!("dc_{}", Uuid::new_v4());
+        let password_hash = bcrypt::hash("testpassword123", bcrypt::DEFAULT_COST).unwrap();
+        let expires_at = Utc::now() + Duration::hours(24);
+        let encrypted_secret = pending_keys.secret_key().to_secret_bytes().to_vec();
+
+        cleanup_verify_email_test_data(pool, &pending_pubkey, &verification_token).await;
+
+        sqlx::query(
+            "INSERT INTO oauth_codes (
+                tenant_id, code, user_pubkey, client_id, redirect_uri, scope,
+                expires_at, created_at, pending_email, pending_password_hash,
+                pending_email_verification_token, pending_encrypted_secret, device_code, is_headless
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8, $9, $10, $11, $12, true)",
+        )
+        .bind(1_i64)
+        .bind(&placeholder_code)
+        .bind(&pending_pubkey)
+        .bind("TestApp")
+        .bind("https://test.example.com/callback")
+        .bind("policy:social")
+        .bind(expires_at)
+        .bind(email)
+        .bind(&password_hash)
+        .bind(&verification_token)
+        .bind(&encrypted_secret)
+        .bind(&device_code)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        (pending_pubkey, verification_token, device_code)
+    }
+
+    /// GET /api/auth/verify-email for a non-headless OAuth registration must verify server-side
+    /// (no client JS) and 3xx-redirect the browser to the client callback carrying a fresh code.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_email_get_oauth_redirects_with_code() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+        let email = format!("verify-get-oauth-{}@example.com", Uuid::new_v4());
+        let (pubkey, token) = insert_oauth_pending_registration(&pool, &email).await;
+
+        let response = verify_email_get(
+            create_test_tenant(),
+            State(auth_state),
+            HeaderMap::new(),
+            axum::extract::Query(VerifyEmailQuery {
+                token: Some(token.clone()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert!(
+            response.status().is_redirection(),
+            "GET verify for OAuth should redirect, got {}",
+            response.status()
+        );
+        let location = response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .expect("redirect must set Location")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            location.contains("code="),
+            "redirect Location must carry an exchange code: {location}"
+        );
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
+    }
+
+    /// GET verify for a headless registration shows an HTML success page (the app polls for the
+    /// code) and re-arms a fresh code without deleting the pending row.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_email_get_headless_returns_success_page() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state_with_redis(pool.clone()).await;
+        let email = format!("verify-get-headless-{}@example.com", Uuid::new_v4());
+        let (pubkey, token, _device_code) =
+            insert_headless_pending_registration(&pool, &email).await;
+
+        let response = verify_email_get(
+            create_test_tenant(),
+            State(auth_state),
+            HeaderMap::new(),
+            axum::extract::Query(VerifyEmailQuery {
+                token: Some(token.clone()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        assert!(
+            content_type.contains("text/html"),
+            "headless GET verify should render an HTML page, got {content_type}"
+        );
+
+        // Pending row survives (idempotent re-arm).
+        let repo = keycast_core::repositories::OAuthCodeRepository::new(pool.clone());
+        assert!(repo
+            .find_by_verification_token(&token, 1)
+            .await
+            .unwrap()
+            .is_some());
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
+    }
+
+    /// Insert a first-party (users-table) row carrying a live verification token.
+    #[cfg(feature = "integration-tests")]
+    async fn insert_first_party_pending_user(pool: &PgPool, email: &str) -> (String, String) {
+        let pubkey = Keys::generate().public_key().to_hex();
+        let token = format!("verify_first_party_{}", Uuid::new_v4());
+        let password_hash = bcrypt::hash("testpassword123", bcrypt::DEFAULT_COST).unwrap();
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, email_verification_token, email_verification_expires_at, created_at, updated_at)
+             VALUES ($1, 1, $2, $3, false, $4, NOW() + INTERVAL \'24 hours\', NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .bind(email)
+        .bind(&password_hash)
+        .bind(&token)
+        .execute(pool)
+        .await
+        .expect("first-party user row should insert");
+
+        (pubkey, token)
+    }
+
+    /// A token that still resolves to a first-party users row is handed to the interactive page,
+    /// which owns that flow (it POSTs and mints the session).
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_email_get_first_party_token_redirects_to_interactive_page() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+        let email = format!("verify-get-first-party-{}@example.com", Uuid::new_v4());
+        let (pubkey, token) = insert_first_party_pending_user(&pool, &email).await;
+
+        let response = verify_email_get(
+            create_test_tenant(),
+            State(auth_state),
+            HeaderMap::new(),
+            axum::extract::Query(VerifyEmailQuery {
+                token: Some(token.clone()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert!(response.status().is_redirection());
+        assert!(
+            !response
+                .headers()
+                .contains_key(axum::http::header::SET_COOKIE),
+            "GET must not issue a first-party session"
+        );
+        let location = response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert!(
+            location.starts_with("/verify-email?token="),
+            "first-party tokens must be handed to the interactive page, got {location}"
+        );
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
+    }
+
+    /// A token that resolves to nothing - already used, or superseded by a newer verification
+    /// email - renders a terminal server-side page saying so (keycast#268).
+    ///
+    /// It must NOT bounce to the SPA: that path POSTs, 401s, and tells a user with no account and
+    /// no session to "log in again", and it is the one place this GET would still need client-side
+    /// JavaScript, which is what verifying on GET exists to avoid.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_email_get_dead_token_renders_superseded_page() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+
+        let response = verify_email_get(
+            create_test_tenant(),
+            State(auth_state),
+            HeaderMap::new(),
+            axum::extract::Query(VerifyEmailQuery {
+                token: Some(format!("nonexistent_{}", Uuid::new_v4())),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert!(
+            !response.status().is_redirection(),
+            "a dead token must not be relayed to the SPA"
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains(VERIFICATION_LINK_SUPERSEDED_HEADING),
+            "dead-link page should carry the superseded heading, got: {body}"
+        );
+        assert!(
+            body.contains("replaced by a newer verification email"),
+            "dead-link page should explain the real cause, got: {body}"
+        );
+        assert!(
+            !body.contains("log in again"),
+            "dead-link page must not tell a user with no session to log in again, got: {body}"
+        );
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_expired_pending_token_is_not_reported_as_superseded_or_successful() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+        let email = format!("verify-expired-{}@example.com", Uuid::new_v4());
+        let (pubkey, token) = insert_oauth_pending_registration(&pool, &email).await;
+        sqlx::query(
+            "UPDATE oauth_codes SET expires_at = NOW() - INTERVAL '1 second'
+             WHERE pending_email_verification_token = $1 AND tenant_id = 1",
+        )
+        .bind(&token)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let get_request_id = format!("get_{}", Uuid::new_v4());
+        let mut get_headers = HeaderMap::new();
+        get_headers.insert(
+            crate::api::http::auth_observability::REQUEST_ID_HEADER,
+            get_request_id.parse().unwrap(),
+        );
+        let get_response = verify_email_get(
+            create_test_tenant(),
+            State(auth_state.clone()),
+            get_headers,
+            Query(VerifyEmailQuery {
+                token: Some(token.clone()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(get_response.status(), StatusCode::GONE);
+
+        let post_request_id = format!("post_{}", Uuid::new_v4());
+        let mut post_headers = HeaderMap::new();
+        post_headers.insert(
+            crate::api::http::auth_observability::REQUEST_ID_HEADER,
+            post_request_id.parse().unwrap(),
+        );
+        let post_response = verify_email(
+            create_test_tenant(),
+            State(auth_state),
+            post_headers,
+            Json(VerifyEmailRequest {
+                token: token.clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(post_response.status(), StatusCode::OK);
+
+        for (request_id, expected) in [
+            (
+                &get_request_id,
+                "/api/auth/verify-email|email_verification|failure|expired|410",
+            ),
+            (
+                &post_request_id,
+                "/api/auth/verify-email|email_verification|failure|expired|200",
+            ),
+        ] {
+            let event: String = sqlx::query_scalar(
+                "SELECT concat_ws('|', endpoint, event_type, outcome, reason_code, http_status)
+                 FROM auth_events WHERE request_id = $1",
+            )
+            .bind(request_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(event, expected);
+        }
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
+    }
+
+    /// The GET path records auth events for its outcomes, matching the POST path's event_type so
+    /// the two transports are comparable. Post-merge the GET is the primary verification path, and
+    /// the `verification_link_superseded` rate is the signal for whether duplicate signups
+    /// actually stopped in production (keycast#268).
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_email_get_records_auth_event_for_dead_link() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+        let token = format!("nonexistent_{}", Uuid::new_v4());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            crate::api::http::auth_observability::REQUEST_ID_HEADER,
+            token.parse().expect("token is a valid header value"),
+        );
+
+        let _ = verify_email_get(
+            create_test_tenant(),
+            State(auth_state),
+            headers,
+            axum::extract::Query(VerifyEmailQuery {
+                token: Some(token.clone()),
+            }),
+        )
+        .await
+        .into_response();
+
+        let event: Option<(String,)> = sqlx::query_as(
+            "SELECT concat_ws('|', endpoint, event_type, outcome, reason_code, http_status)
+             FROM auth_events WHERE request_id = $1",
+        )
+        .bind(&token)
+        .fetch_optional(&pool)
+        .await
+        .expect("query should succeed");
+
+        let event = event
+            .expect("GET verify must record an auth event, not silently drop the outcome")
+            .0;
+        assert_eq!(
+            event,
+            "/api/auth/verify-email|email_verification|failure|verification_link_superseded|200"
+        );
+
+        let method: Option<String> = sqlx::query_scalar(
+            "SELECT metadata_json->>'method' FROM auth_events WHERE request_id = $1",
+        )
+        .bind(&token)
+        .fetch_one(&pool)
+        .await
+        .expect("query should succeed");
+        assert_eq!(
+            method.as_deref(),
+            Some("GET"),
+            "the transport must be recorded so GET and POST stay comparable"
+        );
+
+        let _ = sqlx::query("DELETE FROM auth_events WHERE request_id = $1")
+            .bind(&token)
+            .execute(&pool)
+            .await;
+    }
+
+    /// A superseded token reaching the POST/SPA path answers with the same actionable copy and a
+    /// machine-readable code, instead of the generic "Please log in again." (keycast#268).
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_email_post_dead_token_does_not_say_log_in_again() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+
+        let response = verify_email(
+            create_test_tenant(),
+            State(auth_state),
+            HeaderMap::new(),
+            Json(VerifyEmailRequest {
+                token: format!("nonexistent_{}", Uuid::new_v4()),
+            }),
+        )
+        .await
+        .map(axum::response::IntoResponse::into_response)
+        .unwrap_or_else(axum::response::IntoResponse::into_response);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("error body should be JSON");
+
+        assert_eq!(
+            body["code"].as_str(),
+            Some(VERIFICATION_LINK_SUPERSEDED_CODE),
+            "clients need a machine-readable code to branch on, got: {body}"
+        );
+        let message = body["error"].as_str().unwrap_or_default();
+        assert!(
+            !message.contains("log in again"),
+            "superseded verification links must not say 'log in again', got: {message}"
+        );
+        assert!(
+            message.contains("replaced by a newer verification email"),
+            "message should explain the real cause, got: {message}"
+        );
+    }
+
+    /// GET verify hitting the duplicate-email conflict must render the "log in instead" page with
+    /// a 409, not the generic invalid-link page (f4): the registration is terminally dead, and
+    /// the page must say why.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_email_get_duplicate_email_shows_login_page() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+        let existing_pubkey = Keys::generate().public_key().to_hex();
+        let duplicate_email = format!("verify-get-dup-{}@example.com", Uuid::new_v4());
+        let password_hash = bcrypt::hash("testpassword123", bcrypt::DEFAULT_COST).unwrap();
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
+             VALUES ($1, 1, $2, $3, true, NOW(), NOW())",
+        )
+        .bind(&existing_pubkey)
+        .bind(&duplicate_email)
+        .bind(&password_hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (pending_pubkey, token) =
+            insert_oauth_pending_registration(&pool, &duplicate_email).await;
+
+        let response = verify_email_get(
+            create_test_tenant(),
+            State(auth_state),
+            HeaderMap::new(),
+            axum::extract::Query(VerifyEmailQuery {
+                token: Some(token.clone()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "duplicate email on GET verify should surface as 409"
+        );
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body_bytes);
+        assert!(
+            body.contains("already registered"),
+            "page must tell the user the email is already registered: {body}"
+        );
+
+        cleanup_verify_email_test_data(&pool, &existing_pubkey, &token).await;
+        cleanup_verify_email_test_data(&pool, &pending_pubkey, &token).await;
+    }
+
+    /// GET verify for a headless registration when Redis is unavailable must render a
+    /// retry-friendly 503 page (finalize returns ServiceUnavailable), not a terminal
+    /// "verification failed" page: the link is still good and a refresh will succeed (f4).
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_email_get_headless_without_redis_returns_retry_page() {
+        let pool = create_test_db().await;
+        // No Redis on this state: the headless RedisRequired path must fail retryably.
+        let auth_state = create_test_auth_state(pool.clone());
+        let email = format!("verify-get-noredis-{}@example.com", Uuid::new_v4());
+        let (pubkey, token, _device_code) =
+            insert_headless_pending_registration(&pool, &email).await;
+
+        let response = verify_email_get(
+            create_test_tenant(),
+            State(auth_state),
+            HeaderMap::new(),
+            axum::extract::Query(VerifyEmailQuery {
+                token: Some(token.clone()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "retryable failure must not render as a 2xx success-looking page"
+        );
+        assert!(
+            response.headers().get("Retry-After").is_some(),
+            "retryable page should carry Retry-After"
+        );
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body_bytes);
+        assert!(
+            body.contains("http-equiv=\"refresh\""),
+            "retry page should auto-refresh so webview users are not stranded: {body}"
+        );
+        assert!(
+            !body.contains("invalid"),
+            "retry page must not read as a terminal failure: {body}"
+        );
+        assert!(
+            !body.contains("Your email is verified"),
+            "retry page must not claim verification succeeded before retryable work completes: {body}"
+        );
+        assert!(
+            body.contains("temporary problem verifying your link"),
+            "retry page should explain the temporary verification problem neutrally: {body}"
+        );
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
+    }
+
+    /// A failed strict Redis delivery preserves the exchange code for a retry.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_finalize_pending_registration_fresh_code_redis_failure_preserves_code() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state_with_failing_redis(pool.clone()).await;
+        let redis = auth_state.state.redis.as_ref().expect("failing Redis");
+        let repo = keycast_core::repositories::OAuthCodeRepository::new(pool.clone());
+        let email = format!("verify-fresh-redis-fail-{}@example.com", Uuid::new_v4());
+        let (pubkey, token, _device_code) =
+            insert_headless_pending_registration(&pool, &email).await;
+        let pending = repo
+            .find_by_verification_token(&token, 1)
+            .await
+            .unwrap()
+            .expect("pending registration");
+
+        let result = super::finalize_pending_registration(
+            &pool,
+            Some(redis),
+            1,
+            &pending,
+            super::HeadlessDelivery::RedisRequired,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(super::AuthError::ServiceUnavailable { .. })
+        ));
+        assert!(
+            repo.find_by_verification_token(&token, 1)
+                .await
+                .unwrap()
+                .is_some(),
+            "Redis failure must preserve the pending registration for retry"
+        );
+        let (email_verified,): (bool,) =
+            sqlx::query_as("SELECT email_verified FROM users WHERE pubkey = $1 AND tenant_id = 1")
+                .bind(&pubkey)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            email_verified,
+            "the user must remain materialized and verified"
+        );
+        assert!(
+            repo.find_live_exchange_code_with_expiry_for_pending(1, &pending)
+                .await
+                .unwrap()
+                .is_some(),
+            "the live code must remain reusable after a retryable Redis failure"
+        );
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
+    }
+
+    /// A failed strict Redis redelivery must not delete a still-live code owned by a prior
+    /// successful finalize, because the polling app may already hold that code.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_finalize_pending_registration_reused_code_redis_failure_preserves_code() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state_with_failing_redis(pool.clone()).await;
+        let redis = auth_state.state.redis.as_ref().expect("failing Redis");
+        let repo = keycast_core::repositories::OAuthCodeRepository::new(pool.clone());
+        let email = format!("verify-reused-redis-fail-{}@example.com", Uuid::new_v4());
+        let (pubkey, token, _device_code) =
+            insert_headless_pending_registration(&pool, &email).await;
+        let pending = repo
+            .find_by_verification_token(&token, 1)
+            .await
+            .unwrap()
+            .expect("pending registration");
+
+        let first = super::finalize_pending_registration(
+            &pool,
+            None,
+            1,
+            &pending,
+            super::HeadlessDelivery::RedisBestEffort,
+        )
+        .await
+        .expect("first finalize mints a reusable live code");
+
+        let result = super::finalize_pending_registration(
+            &pool,
+            Some(redis),
+            1,
+            &pending,
+            super::HeadlessDelivery::RedisRequired,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(super::AuthError::ServiceUnavailable { .. })
+        ));
+        let live_code = repo
+            .find_live_exchange_code_with_expiry_for_pending(1, &pending)
+            .await
+            .unwrap()
+            .map(|(code, _expires_at)| code);
+        assert_eq!(
+            live_code.as_deref(),
+            Some(first.new_code.as_str()),
+            "Redis redelivery failure must leave the reused code intact"
+        );
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
+    }
+
+    /// Acceptance: the link path and the PIN path produce identical materialization, because both
+    /// funnel through finalize_pending_registration (keycast#262). The only difference is the
+    /// headless Redis-delivery strictness, which does not change the user/keys/code outcome.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_link_and_pin_paths_finalize_identically() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state_with_redis(pool.clone()).await;
+        let redis = auth_state.state.redis.clone();
+        let repo = keycast_core::repositories::OAuthCodeRepository::new(pool.clone());
+
+        let email_a = format!("identical-link-{}@example.com", Uuid::new_v4());
+        let email_b = format!("identical-pin-{}@example.com", Uuid::new_v4());
+        let (pubkey_a, token_a, _dc_a) =
+            insert_headless_pending_registration(&pool, &email_a).await;
+        let (pubkey_b, token_b, _dc_b) =
+            insert_headless_pending_registration(&pool, &email_b).await;
+
+        let data_a = repo
+            .find_by_verification_token(&token_a, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        let data_b = repo
+            .find_by_verification_token(&token_b, 1)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A finalizes via the link path's delivery mode; B via the PIN path's.
+        let ra = super::finalize_pending_registration(
+            &pool,
+            redis.as_ref(),
+            1,
+            &data_a,
+            super::HeadlessDelivery::RedisRequired,
+        )
+        .await
+        .expect("link-path finalize succeeds");
+        let rb = super::finalize_pending_registration(
+            &pool,
+            redis.as_ref(),
+            1,
+            &data_b,
+            super::HeadlessDelivery::RedisBestEffort,
+        )
+        .await
+        .expect("pin-path finalize succeeds");
+
+        assert_eq!(ra.is_headless, rb.is_headless);
+        assert!(!ra.new_code.is_empty() && !rb.new_code.is_empty());
+
+        // Both paths materialize an identically-shaped result: verified user + 1 personal key +
+        // a fresh headless 10-minute exchange code, with the pending row preserved.
+        for (pubkey, code) in [(&pubkey_a, &ra.new_code), (&pubkey_b, &rb.new_code)] {
+            let (verified,): (bool,) = sqlx::query_as(
+                "SELECT email_verified FROM users WHERE pubkey = $1 AND tenant_id = 1",
+            )
+            .bind(pubkey)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(verified, "user must be materialized as verified");
+
+            let (key_count,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM personal_keys WHERE user_pubkey = $1 AND tenant_id = 1",
+            )
+            .bind(pubkey)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(key_count, 1, "personal_keys must be created exactly once");
+
+            let minted = repo
+                .find_valid(1, code)
+                .await
+                .unwrap()
+                .expect("a fresh exchange code must be minted");
+            assert!(minted.is_headless);
+        }
+
+        assert!(
+            repo.find_by_verification_token(&token_a, 1)
+                .await
+                .unwrap()
+                .is_some(),
+            "link-path pending row must be preserved"
+        );
+        assert!(
+            repo.find_by_verification_token(&token_b, 1)
+                .await
+                .unwrap()
+                .is_some(),
+            "pin-path pending row must be preserved"
+        );
+
+        cleanup_verify_email_test_data(&pool, &pubkey_a, &token_a).await;
+        cleanup_verify_email_test_data(&pool, &pubkey_b, &token_b).await;
     }
 
     #[cfg(feature = "integration-tests")]
