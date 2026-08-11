@@ -52,6 +52,16 @@ pub(crate) const INVALID_EMAIL_MESSAGE: &str = "Please enter a valid email addre
 pub(crate) const EMAIL_ALREADY_EXISTS_CODE: &str = "EMAIL_ALREADY_EXISTS";
 pub(crate) const EMAIL_ALREADY_EXISTS_MESSAGE: &str =
     "This email is already registered. Please log in instead.";
+/// A verification link that resolves to nothing: already used, or replaced by a newer
+/// verification email (keycast#268). Deliberately distinct from [`AuthError::InvalidToken`], whose
+/// "Please log in again." copy is correct for a bad *session* token but is a dead end here — the
+/// user has no session to return to, and the actionable advice is to open the newest email or
+/// resend from the app.
+pub(crate) const VERIFICATION_LINK_SUPERSEDED_CODE: &str = "VERIFICATION_LINK_SUPERSEDED";
+pub(crate) const VERIFICATION_LINK_SUPERSEDED_HEADING: &str = "Link no longer valid";
+pub(crate) const VERIFICATION_LINK_SUPERSEDED_MESSAGE: &str =
+    "This link was already used or replaced by a newer verification email. \
+     Check your most recent email, or tap Resend in the app.";
 pub(crate) const EMAIL_NOT_VERIFIED_CODE: &str = "EMAIL_NOT_VERIFIED";
 pub(crate) const EMAIL_NOT_VERIFIED_MESSAGE: &str =
     "Please verify your email address before continuing. Check your inbox for the verification link.";
@@ -501,6 +511,10 @@ pub enum AuthError {
     Internal(String),
     MissingToken,
     InvalidToken,
+    /// An email-verification link that no longer resolves: already used, or superseded by a newer
+    /// verification email (keycast#268). Distinct from [`AuthError::InvalidToken`] so the dead-link
+    /// copy can be actionable instead of telling a logged-out user to log in again.
+    VerificationLinkSuperseded,
     TokenExpired,
     EmailSendFailed(String),
     DuplicateKey, // Nostr pubkey already registered (BYOK case)
@@ -626,6 +640,15 @@ impl IntoResponse for AuthError {
                 StatusCode::UNAUTHORIZED,
                 "Invalid or expired token. Please log in again.".to_string(),
             ),
+            // Status deliberately unchanged from the InvalidToken it replaced (401): only the copy
+            // and the machine-readable code are new, so no client keying off the status breaks.
+            AuthError::VerificationLinkSuperseded => {
+                return coded_error_response(
+                    StatusCode::UNAUTHORIZED,
+                    VERIFICATION_LINK_SUPERSEDED_MESSAGE,
+                    VERIFICATION_LINK_SUPERSEDED_CODE,
+                );
+            }
             AuthError::EmailSendFailed(e) => {
                 // Log the real error but return generic message to user
                 tracing::error!("Email send error: {}", e);
@@ -2204,10 +2227,12 @@ async fn perform_email_verification(
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
     let user_repo = UserRepository::new(pool.clone());
+    // Matches neither a pending registration nor a users row: the link was already used or a
+    // newer verification email replaced it (keycast#268).
     let token_data = user_repo
         .find_by_verification_token(token, tenant_id)
         .await?
-        .ok_or(AuthError::InvalidToken)?;
+        .ok_or(AuthError::VerificationLinkSuperseded)?;
 
     let public_key = token_data.pubkey;
     let verification_expired = token_data
@@ -2446,9 +2471,30 @@ pub async fn verify_email_get(
             "Your email is already verified. You can return to the app or log in.",
         ),
         Ok(None) => {
-            let interactive_url =
-                format!("/verify-email?token={}", urlencoding::encode(&token));
-            Redirect::to(&interactive_url).into_response()
+            // Not a pending registration. Only a token that still resolves to a users row belongs
+            // to the first-party interactive flow, which the SPA owns (it POSTs and mints the
+            // session). Anything else is a dead link, and bouncing it to the SPA just relays it to
+            // a 401 "Please log in again" — the one place this GET would still need client-side
+            // JavaScript, which is exactly what verifying on GET exists to avoid (keycast#268).
+            let user_repo = UserRepository::new(auth_state.state.db.clone());
+            match user_repo.find_by_verification_token(&token, tenant_id).await {
+                Ok(Some(_)) => {
+                    let interactive_url =
+                        format!("/verify-email?token={}", urlencoding::encode(&token));
+                    Redirect::to(&interactive_url).into_response()
+                }
+                Ok(None) => verify_link_superseded_page(),
+                // Can't tell a dead link from a database blip, so retry rather than declaring the
+                // link dead.
+                Err(err) => {
+                    tracing::error!(
+                        tenant_id = tenant_id,
+                        error = %err,
+                        "Failed to resolve verification token on GET verify"
+                    );
+                    verify_html_retry_page(5)
+                }
+            }
         }
         // Retryable: the link may still be good, so render a non-terminal page that retries
         // itself instead of a success-looking 2xx or terminal invalid-link page.
@@ -2477,6 +2523,8 @@ pub async fn verify_email_get(
         | Err(AuthError::Encryption(_))
         | Err(AuthError::Internal(_))
         | Err(AuthError::EmailSendFailed(_)) => verify_html_retry_page(5),
+        // A link that no longer resolves gets the actionable dead-link page, not a generic failure.
+        Err(AuthError::VerificationLinkSuperseded) => verify_link_superseded_page(),
         Err(AuthError::InvalidCredentials)
         | Err(AuthError::EmailNotVerified)
         | Err(AuthError::UserNotFound)
@@ -2497,6 +2545,19 @@ pub async fn verify_email_get(
             "This verification link is invalid or has expired. If you already verified, you can log in.",
         ),
     }
+}
+
+/// Terminal page for a verification link that no longer resolves — already used, or replaced by a
+/// newer verification email (keycast#268).
+///
+/// Served as 200 like the other terminal outcomes on this route: in-app browsers replace 4xx/5xx
+/// bodies with their own error chrome, which would hide the one instruction that resolves this.
+fn verify_link_superseded_page() -> Response {
+    verify_html_page(
+        StatusCode::OK,
+        VERIFICATION_LINK_SUPERSEDED_HEADING,
+        VERIFICATION_LINK_SUPERSEDED_MESSAGE,
+    )
 }
 
 /// Render the retryable-failure page for the GET verify flow: 503 + `Retry-After` plus an HTML
@@ -5388,6 +5449,7 @@ mod tests {
     use super::generate_server_signed_ucan;
     use super::validate_origin;
     use super::AccountStatusResponse;
+    use super::{VERIFICATION_LINK_SUPERSEDED_CODE, VERIFICATION_LINK_SUPERSEDED_HEADING};
     use axum::response::IntoResponse;
     use ucan::Ucan;
 
@@ -6445,20 +6507,44 @@ mod tests {
         cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
     }
 
-    /// A token not belonging to a pending OAuth/headless row is handed to the interactive page.
-    /// GET does not inspect the first-party users table, so valid and bogus tokens behave alike.
+    /// Insert a first-party (users-table) row carrying a live verification token.
+    #[cfg(feature = "integration-tests")]
+    async fn insert_first_party_pending_user(pool: &PgPool, email: &str) -> (String, String) {
+        let pubkey = Keys::generate().public_key().to_hex();
+        let token = format!("verify_first_party_{}", Uuid::new_v4());
+        let password_hash = bcrypt::hash("testpassword123", bcrypt::DEFAULT_COST).unwrap();
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, email_verification_token, email_verification_expires_at, created_at, updated_at)
+             VALUES ($1, 1, $2, $3, false, $4, NOW() + INTERVAL \'24 hours\', NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .bind(email)
+        .bind(&password_hash)
+        .bind(&token)
+        .execute(pool)
+        .await
+        .expect("first-party user row should insert");
+
+        (pubkey, token)
+    }
+
+    /// A token that still resolves to a first-party users row is handed to the interactive page,
+    /// which owns that flow (it POSTs and mints the session).
     #[cfg(feature = "integration-tests")]
     #[tokio::test]
-    async fn test_verify_email_get_non_pending_token_redirects_to_interactive_page() {
+    async fn test_verify_email_get_first_party_token_redirects_to_interactive_page() {
         let pool = create_test_db().await;
         let auth_state = create_test_auth_state(pool.clone());
+        let email = format!("verify-get-first-party-{}@example.com", Uuid::new_v4());
+        let (pubkey, token) = insert_first_party_pending_user(&pool, &email).await;
 
         let response = verify_email_get(
             create_test_tenant(),
             State(auth_state),
             HeaderMap::new(),
             axum::extract::Query(VerifyEmailQuery {
-                token: Some(format!("nonexistent_{}", Uuid::new_v4())),
+                token: Some(token.clone()),
             }),
         )
         .await
@@ -6478,7 +6564,98 @@ mod tests {
             .unwrap();
         assert!(
             location.starts_with("/verify-email?token="),
-            "non-pending tokens must be handed to the interactive page, got {location}"
+            "first-party tokens must be handed to the interactive page, got {location}"
+        );
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
+    }
+
+    /// A token that resolves to nothing - already used, or superseded by a newer verification
+    /// email - renders a terminal server-side page saying so (keycast#268).
+    ///
+    /// It must NOT bounce to the SPA: that path POSTs, 401s, and tells a user with no account and
+    /// no session to "log in again", and it is the one place this GET would still need client-side
+    /// JavaScript, which is what verifying on GET exists to avoid.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_email_get_dead_token_renders_superseded_page() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+
+        let response = verify_email_get(
+            create_test_tenant(),
+            State(auth_state),
+            HeaderMap::new(),
+            axum::extract::Query(VerifyEmailQuery {
+                token: Some(format!("nonexistent_{}", Uuid::new_v4())),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert!(
+            !response.status().is_redirection(),
+            "a dead token must not be relayed to the SPA"
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains(VERIFICATION_LINK_SUPERSEDED_HEADING),
+            "dead-link page should carry the superseded heading, got: {body}"
+        );
+        assert!(
+            body.contains("replaced by a newer verification email"),
+            "dead-link page should explain the real cause, got: {body}"
+        );
+        assert!(
+            !body.contains("log in again"),
+            "dead-link page must not tell a user with no session to log in again, got: {body}"
+        );
+    }
+
+    /// A superseded token reaching the POST/SPA path answers with the same actionable copy and a
+    /// machine-readable code, instead of the generic "Please log in again." (keycast#268).
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_verify_email_post_dead_token_does_not_say_log_in_again() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+
+        let response = verify_email(
+            create_test_tenant(),
+            State(auth_state),
+            HeaderMap::new(),
+            Json(VerifyEmailRequest {
+                token: format!("nonexistent_{}", Uuid::new_v4()),
+            }),
+        )
+        .await
+        .map(axum::response::IntoResponse::into_response)
+        .unwrap_or_else(axum::response::IntoResponse::into_response);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("error body should be JSON");
+
+        assert_eq!(
+            body["code"].as_str(),
+            Some(VERIFICATION_LINK_SUPERSEDED_CODE),
+            "clients need a machine-readable code to branch on, got: {body}"
+        );
+        let message = body["error"].as_str().unwrap_or_default();
+        assert!(
+            !message.contains("log in again"),
+            "superseded verification links must not say 'log in again', got: {message}"
+        );
+        assert!(
+            message.contains("replaced by a newer verification email"),
+            "message should explain the real cause, got: {message}"
         );
     }
 

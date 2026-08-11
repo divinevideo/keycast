@@ -3,9 +3,14 @@ import { getViteDomain } from "$lib/utils/env";
 
 export class ApiError extends Error {
     status: number;
-    constructor(message: string, status: number) {
+    /// Machine-readable error code from the response body, when the endpoint sends one
+    /// (e.g. VERIFICATION_LINK_SUPERSEDED). Callers should branch on this rather than on
+    /// message text.
+    code?: string;
+    constructor(message: string, status: number, code?: string) {
         super(message);
         this.status = status;
+        this.code = code;
         this.name = 'ApiError';
     }
 }
@@ -42,14 +47,16 @@ export class KeycastApi {
         if (!response.ok) {
             // Try to get the error message from the response body
             let errorMessage: string;
+            let errorCode: string | undefined;
             try {
                 const errorBody = await response.json();
                 errorMessage = errorBody.error || errorBody.message || `Something went wrong. Please try again.`;
+                errorCode = typeof errorBody.code === 'string' ? errorBody.code : undefined;
             } catch {
                 // If we can't parse JSON, use a generic message
                 errorMessage = 'Something went wrong. Please try again.';
             }
-            throw new ApiError(errorMessage, response.status);
+            throw new ApiError(errorMessage, response.status, errorCode);
         }
 
         if (response.status === 204) {
