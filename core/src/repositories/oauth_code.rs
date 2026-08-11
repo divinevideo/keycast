@@ -32,8 +32,8 @@ pub struct OAuthCodeData {
     /// Failed attempts against the *current* PIN; a resend clears this, which is what makes a
     /// resend the recovery path out of a lockout
     pub pin_attempts: i32,
-    /// Failed attempts across every PIN this registration has issued; never reset, so it bounds
-    /// guessing over the registration's whole life even though resends clear `pin_attempts`
+    /// Failed attempts across every PIN this email's live registration lineage has issued; never
+    /// reset by resend or same-email supersession, so it is the adversarial guessing bound
     pub pin_failed_total: i32,
     /// When the current PIN was handed to the delivery provider; backs the PIN validity window
     pub pin_sent_at: Option<DateTime<Utc>>,
@@ -240,6 +240,11 @@ impl OAuthCodeRepository {
     /// row would block its own email from ever registering again, since the unique index has no
     /// expiry predicate.
     ///
+    /// Supersession resets the current-PIN lockout and resend cooldown for usability, so neither is
+    /// a security boundary: a caller can always register again. `pin_failed_total` is deliberately
+    /// omitted from `DO UPDATE` below so the guessing budget survives that route. This also means
+    /// repeated registration can extend time, but cannot grant additional PIN guesses.
+    ///
     /// Race-proofed by `idx_oauth_codes_live_pending_email`; the insert-or-supersede decision is a
     /// single statement, so concurrent duplicate registers cannot both create a row.
     pub async fn store_with_pending_registration(
@@ -268,7 +273,8 @@ impl OAuthCodeRepository {
                  is_headless = EXCLUDED.is_headless,
                  pin_hash = EXCLUDED.pin_hash,
                  pin_attempts = 0,
-                 pin_sent_at = NULL
+                 pin_sent_at = NULL,
+                 pin_resend_at = NULL
              RETURNING device_code",
         )
         .bind(params.tenant_id)

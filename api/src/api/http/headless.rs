@@ -1439,7 +1439,7 @@ mod tests {
     #[cfg(feature = "integration-tests")]
     use super::{MAX_PIN_ATTEMPTS, MAX_PIN_ATTEMPTS_LIFETIME};
     #[cfg(feature = "integration-tests")]
-    use chrono::{Duration, Utc};
+    use chrono::{DateTime, Duration, Utc};
     use nostr_sdk::Keys;
     #[cfg(feature = "integration-tests")]
     use serial_test::serial;
@@ -1665,6 +1665,25 @@ mod tests {
         };
 
         let first = register("firstpassword123", "challenge-one").await;
+
+        // Registration itself is an uncooldowned recovery path: model a current PIN that has hit
+        // its five-attempt lockout and whose resend cooldown is armed. Supersession may restore
+        // usability, but it must not restore the lifetime guessing budget.
+        let first_expiry = Utc::now() + chrono::Duration::hours(1);
+        let first_sent_at = Utc::now() - chrono::Duration::minutes(1);
+        sqlx::query(
+            "UPDATE oauth_codes
+             SET pin_attempts = 5, pin_failed_total = 5,
+                 pin_sent_at = $2, pin_resend_at = $2, expires_at = $3
+             WHERE pending_email = $1 AND tenant_id = 1 AND consumed_at IS NULL",
+        )
+        .bind(&email)
+        .bind(first_sent_at)
+        .bind(first_expiry)
+        .execute(&pool)
+        .await
+        .expect("locked registration setup should succeed");
+
         let second = register("secondpassword456", "challenge-two").await;
 
         let first_device_code = first["device_code"]
@@ -1683,8 +1702,18 @@ mod tests {
         );
 
         // Exactly one pending row, one live verification token: only one email is actionable.
-        let rows: Vec<(String, Option<String>, Option<String>, i32)> = sqlx::query_as(
-            "SELECT pending_password_hash, code_challenge, pending_email_verification_token, pin_attempts
+        let rows: Vec<(
+            String,
+            Option<String>,
+            Option<String>,
+            i32,
+            i32,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+            DateTime<Utc>,
+        )> = sqlx::query_as(
+            "SELECT pending_password_hash, code_challenge, pending_email_verification_token,
+                    pin_attempts, pin_failed_total, pin_sent_at, pin_resend_at, expires_at
              FROM oauth_codes
              WHERE pending_email = $1 AND tenant_id = 1 AND consumed_at IS NULL",
         )
@@ -1698,7 +1727,16 @@ mod tests {
             1,
             "a duplicate register must not create a second pending registration"
         );
-        let (password_hash, code_challenge, token, pin_attempts) = rows.into_iter().next().unwrap();
+        let (
+            password_hash,
+            code_challenge,
+            token,
+            pin_attempts,
+            pin_failed_total,
+            pin_sent_at,
+            pin_resend_at,
+            expires_at,
+        ) = rows.into_iter().next().unwrap();
 
         // The newest attempt wins: a user who retyped their password must be able to log in with
         // the password they last submitted, and the stored PKCE challenge must match the verifier
@@ -1719,6 +1757,22 @@ mod tests {
             "the second attempt's PKCE challenge must win"
         );
         assert_eq!(pin_attempts, 0, "superseding re-arms the attempt counter");
+        assert_eq!(
+            pin_failed_total, 5,
+            "superseding must not grant a fresh lifetime guessing budget"
+        );
+        assert!(
+            pin_resend_at.is_none(),
+            "superseding must not inherit the old PIN's resend cooldown"
+        );
+        assert!(
+            pin_sent_at.is_some_and(|sent_at| sent_at > first_sent_at),
+            "the replacement PIN should be stamped only after its delivery succeeds"
+        );
+        assert!(
+            expires_at > first_expiry,
+            "an explicit re-registration should start a fresh verification window"
+        );
 
         // The first email's token is dead — that link now renders the terminal
         // superseded page rather than stranding the user on a 401.
