@@ -30,9 +30,10 @@ pub use claim_token::ClaimTokenRepository;
 pub use error::RepositoryError;
 pub use oauth_authorization::{CreateOAuthAuthorizationParams, OAuthAuthorizationRepository};
 pub use oauth_code::{
-    MaterializePendingRegistrationOutcome, OAuthCodeData, OAuthCodeRepository,
-    PinAttemptReservation, PinResendSnapshot, StoreOAuthCodeParams,
-    StoreOAuthCodeWithRegistrationParams, StoredExchangeCode, StoredPendingRegistration,
+    FinalizedPendingRegistration, MaterializePendingRegistrationOutcome, OAuthCodeData,
+    OAuthCodeRepository, PinAttemptRelease, PinAttemptReservation, PinResendSnapshot,
+    StoreOAuthCodeParams, StoreOAuthCodeWithRegistrationParams, StoredExchangeCode,
+    StoredPendingRegistration,
 };
 pub use personal_keys::PersonalKeysRepository;
 pub use policy::PolicyRepository;

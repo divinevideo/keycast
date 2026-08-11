@@ -18,10 +18,7 @@ use keycast_api::{
 };
 use keycast_core::{
     encryption::{KeyManager, KeyManagerError},
-    repositories::{
-        OAuthCodeRepository, PersonalKeysRepository, StoreOAuthCodeParams,
-        StoreOAuthCodeWithRegistrationParams,
-    },
+    repositories::{OAuthCodeRepository, PersonalKeysRepository, StoreOAuthCodeParams},
     secret_pool::{SecretPool, SecretPoolReceiver},
 };
 use moka::future::Cache;
@@ -216,7 +213,6 @@ async fn oauth_token_issuance_failure_leaves_pending_registration_rearmable() {
     let email = format!("oauth-token-recovery-{}@example.com", Uuid::new_v4());
     let pending_code = format!("oauth_pending_{}", Uuid::new_v4());
     let exchange_code = format!("oauth_exchange_{}", Uuid::new_v4());
-    let replacement_code = format!("oauth_replacement_{}", Uuid::new_v4());
     let device_code = format!("device_{}", Uuid::new_v4());
     let verification_token = format!("verification_{}", Uuid::new_v4());
     let client_id = format!("client_{}", Uuid::new_v4());
@@ -237,25 +233,24 @@ async fn oauth_token_issuance_failure_leaves_pending_registration_rearmable() {
         .await
         .unwrap();
 
-    repo.store_with_pending_registration(StoreOAuthCodeWithRegistrationParams {
-        tenant_id: 1,
-        code: &pending_code,
-        user_pubkey: &user_pubkey,
-        client_id: &client_id,
-        redirect_uri,
-        scope: "policy:social",
-        code_challenge: None,
-        code_challenge_method: None,
-        expires_at: Utc::now() + Duration::hours(24),
-        pending_email: &email,
-        pending_password_hash: "already-finalized",
-        pending_email_verification_token: &verification_token,
-        pending_encrypted_secret: Some(&keys.secret_key().to_secret_bytes()),
-        state: None,
-        device_code: Some(&device_code),
-        is_headless: true,
-        pin_hash: Some("pin-hash"),
-    })
+    sqlx::query(
+        "INSERT INTO oauth_codes
+             (tenant_id, code, user_pubkey, client_id, redirect_uri, scope, expires_at, created_at,
+              pending_email, pending_password_hash, pending_email_verification_token,
+              pending_encrypted_secret, device_code, is_headless, pin_hash, pin_sent_at)
+         VALUES (1, $1, $2, $3, $4, 'policy:social', $5, NOW(), $6,
+                 'already-finalized', $7, $8, $9, true, 'pin-hash', NOW())",
+    )
+    .bind(&pending_code)
+    .bind(&user_pubkey)
+    .bind(&client_id)
+    .bind(redirect_uri)
+    .bind(Utc::now() + Duration::hours(24))
+    .bind(&email)
+    .bind(&verification_token)
+    .bind(keys.secret_key().to_secret_bytes())
+    .bind(&device_code)
+    .execute(&pool)
     .await
     .unwrap();
     let pending = repo
@@ -303,7 +298,12 @@ async fn oauth_token_issuance_failure_leaves_pending_registration_rearmable() {
     };
 
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    assert!(repo.find_valid(1, &exchange_code).await.unwrap().is_none());
+    let released_code = repo
+        .find_valid(1, &exchange_code)
+        .await
+        .unwrap()
+        .expect("failed issuance must preserve the same exchange code");
+    assert!(released_code.consumed_at.is_none());
     let pending_after_failure = repo
         .find_by_device_code(&device_code, 1)
         .await
@@ -313,28 +313,14 @@ async fn oauth_token_issuance_failure_leaves_pending_registration_rearmable() {
         pending_after_failure.consumed_at.is_none(),
         "failed issuance must not make the pending registration terminal"
     );
-    assert!(
-        repo.store_for_pending_registration(
-            StoreOAuthCodeParams {
-                tenant_id: 1,
-                code: &replacement_code,
-                user_pubkey: &user_pubkey,
-                client_id: &client_id,
-                redirect_uri,
-                scope: "policy:social",
-                code_challenge: None,
-                code_challenge_method: None,
-                expires_at: Utc::now() + Duration::minutes(10),
-                previous_auth_id: None,
-                state: None,
-                is_headless: true,
-            },
-            &pending_after_failure,
-        )
+    assert!(repo
+        .redeem_code(1, &exchange_code, &released_code)
         .await
-        .unwrap(),
-        "the verification flow must be able to mint a replacement exchange code"
-    );
+        .unwrap());
+    assert!(repo
+        .release_redeemed_code(1, &exchange_code, &released_code)
+        .await
+        .unwrap());
 
-    cleanup_user(&pool, &user_pubkey, &replacement_code).await;
+    cleanup_user(&pool, &user_pubkey, &exchange_code).await;
 }

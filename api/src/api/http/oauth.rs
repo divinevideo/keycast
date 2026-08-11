@@ -13,10 +13,10 @@ use bcrypt::verify;
 use chrono::{Duration, Utc};
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
-    CreateOAuthAuthorizationParams, OAuthAuthorizationRepository, OAuthCodeRepository,
-    PersonalKeysRepository, PolicyRepository, RefreshTokenRepository, RepositoryError,
-    StoreOAuthCodeParams, StoreOAuthCodeWithRegistrationParams, StoredPendingRegistration,
-    UserRepository,
+    CreateOAuthAuthorizationParams, OAuthAuthorizationRepository, OAuthCodeData,
+    OAuthCodeRepository, PersonalKeysRepository, PolicyRepository, RefreshTokenRepository,
+    RepositoryError, StoreOAuthCodeParams, StoreOAuthCodeWithRegistrationParams,
+    StoredPendingRegistration, UserRepository,
 };
 use keycast_core::types::refresh_token::{generate_refresh_token, hash_refresh_token};
 use nostr_sdk::{Keys, ToBech32};
@@ -3104,19 +3104,20 @@ async fn handle_authorization_code_grant(
 
         pending_email_val.clone()
     } else {
-        // Normal token exchange (existing user, not registration). Redeem the exchange code now,
-        // but leave the pending registration active until every issuance step succeeds. If a
-        // downstream dependency fails, the verification link/PIN can mint a replacement code.
+        // Resolve the email before claiming the code so a lookup failure leaves it immediately
+        // redeemable.
+        let user_repo = UserRepository::new(pool.clone());
+        let email = user_repo.get_email(&user_pubkey, tenant_id).await?;
+
+        // Claim, but do not delete, the exchange code. Downstream failures release this claim so
+        // the same code can retry.
         if !oauth_code_repo
             .redeem_code(tenant_id, code, &auth_code_for_redeem)
             .await?
         {
             return Err(OAuthError::Unauthorized);
         }
-
-        // Get user's email for UCAN
-        let user_repo = UserRepository::new(pool.clone());
-        user_repo.get_email(&user_pubkey, tenant_id).await?
+        email
     };
 
     tracing::info!(
@@ -3127,7 +3128,7 @@ async fn handle_authorization_code_grant(
     );
 
     // Create OAuth authorization and generate token response
-    let response = create_oauth_authorization_and_token(
+    let issuance = create_oauth_authorization_and_token(
         CreateAuthorizationParams {
             tenant_id,
             user_pubkey: &user_pubkey,
@@ -3138,17 +3139,44 @@ async fn handle_authorization_code_grant(
             nsec_from_verifier,
             previous_auth_id,
             is_headless,
+            exchange_code: pending_email.is_none().then_some(code.as_str()),
+            exchange_code_data: pending_email.is_none().then_some(&auth_code_for_redeem),
         },
         auth_state,
     )
-    .await?;
+    .await;
+    let response = match issuance {
+        Ok(response) => response,
+        Err(error) => {
+            if pending_email.is_none() {
+                match oauth_code_repo
+                    .release_redeemed_code(tenant_id, code, &auth_code_for_redeem)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => tracing::warn!(
+                        tenant_id,
+                        code = %code,
+                        "Token issuance failed after the exchange claim expired or changed"
+                    ),
+                    Err(release_error) => tracing::error!(
+                        tenant_id,
+                        code = %code,
+                        error = %release_error,
+                        "Failed to release OAuth exchange-code claim after issuance error"
+                    ),
+                }
+            }
+            return Err(error);
+        }
+    };
 
     // `consumed_at` is the terminal registration marker. Set it only after the authorization,
     // refresh token, and response have all been created successfully; otherwise recovery remains
     // possible through the still-active pending row.
     if pending_email.is_none()
         && !oauth_code_repo
-            .mark_pending_consumed(tenant_id, &auth_code_for_redeem)
+            .mark_pending_consumed(tenant_id, code, &auth_code_for_redeem)
             .await?
     {
         tracing::error!(
@@ -3178,6 +3206,8 @@ struct CreateAuthorizationParams<'a> {
     previous_auth_id: Option<i32>,
     /// Whether this code was issued via headless flow (for first_party UCAN fact)
     is_headless: bool,
+    exchange_code: Option<&'a str>,
+    exchange_code_data: Option<&'a OAuthCodeData>,
 }
 
 /// Common function to create OAuth authorization and generate TokenResponse
@@ -3197,6 +3227,8 @@ async fn create_oauth_authorization_and_token(
         nsec_from_verifier,
         previous_auth_id,
         is_headless,
+        exchange_code,
+        exchange_code_data,
     } = params;
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
@@ -3340,22 +3372,36 @@ async fn create_oauth_authorization_and_token(
     // Each authorization is a separate "ticket" for one client/device
     // Old authorizations remain valid until explicitly revoked
     let oauth_auth_repo = OAuthAuthorizationRepository::new(pool.clone());
-    let auth_id = oauth_auth_repo
-        .create(CreateOAuthAuthorizationParams {
-            tenant_id,
-            user_pubkey: user_pubkey.to_string(),
-            redirect_origin: redirect_origin.clone(),
-            client_id: client_id.to_string(),
-            bunker_public_key: bunker_public_key.to_hex(),
-            secret_hash,
-            relays: relays_json.clone(),
-            policy_id: Some(policy_id),
-            is_first_party: is_headless,
-            client_pubkey: None,
-            authorization_handle: Some(authorization_handle.clone()),
-            handle_expires_at,
-        })
-        .await?;
+    let authorization_params = CreateOAuthAuthorizationParams {
+        tenant_id,
+        user_pubkey: user_pubkey.to_string(),
+        redirect_origin: redirect_origin.clone(),
+        client_id: client_id.to_string(),
+        bunker_public_key: bunker_public_key.to_hex(),
+        secret_hash,
+        relays: relays_json.clone(),
+        policy_id: Some(policy_id),
+        is_first_party: is_headless,
+        client_pubkey: None,
+        authorization_handle: Some(authorization_handle.clone()),
+        handle_expires_at,
+    };
+    let auth_id = match (exchange_code, exchange_code_data) {
+        (Some(code), Some(auth_code)) => oauth_auth_repo
+            .create_from_redeemed_code(authorization_params, code, auth_code)
+            .await?
+            .ok_or_else(|| {
+                OAuthError::ServerError(
+                    "Authorization code processing claim expired; retry the exchange".to_string(),
+                )
+            })?,
+        (None, None) => oauth_auth_repo.create(authorization_params).await?,
+        _ => {
+            return Err(OAuthError::ServerError(
+                "Incomplete authorization code processing claim".to_string(),
+            ))
+        }
+    };
 
     tracing::info!(
         "Created OAuth authorization {} for user {} app {}",

@@ -11,7 +11,7 @@ use bcrypt::verify;
 use chrono::{Duration, Utc};
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
-    OAuthCodeRepository, PinAttemptReservation, PolicyRepository,
+    OAuthCodeRepository, PinAttemptRelease, PinAttemptReservation, PolicyRepository,
     StoreOAuthCodeWithRegistrationParams, UserRepository,
 };
 use nostr_sdk::Keys;
@@ -1054,17 +1054,11 @@ pub async fn headless_verify_pin(
     // counted as a failed guess on every finalize error, so repeated server-side failures could
     // burn a legitimate user's lifetime budget with the right code in their hand.
     //
-    // Best-effort: this is a counter, not the gate. If it fails the user has at worst one fewer
-    // attempt, and the caps are still exact.
-    if let Err(e) = oauth_code_repo
+    let released = oauth_code_repo
         .reset_pin_attempts(&req.device_code, tenant_id, &expected_generation_token)
-        .await
-    {
-        tracing::warn!(
-            "Failed to release the PIN attempt slot after a correct PIN for {}: {}",
-            pending.user_pubkey,
-            e
-        );
+        .await?;
+    if released != PinAttemptRelease::CurrentGeneration {
+        return Err(HeadlessError::PinInvalid);
     }
 
     // Correct PIN: run the SAME finalize path as the link (idempotent; does not delete the row).

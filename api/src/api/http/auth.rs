@@ -1754,24 +1754,6 @@ pub async fn finalize_pending_registration(
         .as_deref()
         .ok_or_else(|| account_incomplete("Registration is incomplete. Please register again."))?;
     let oauth_code_repo = OAuthCodeRepository::new(pool.clone());
-    let oauth_data = match oauth_code_repo
-        .materialize_pending_registration(tenant_id, verification_token)
-        .await?
-    {
-        MaterializePendingRegistrationOutcome::Materialized(pending) => *pending,
-        MaterializePendingRegistrationOutcome::DuplicateKey => return Err(AuthError::DuplicateKey),
-        MaterializePendingRegistrationOutcome::EmailAlreadyExists => {
-            return Err(AuthError::EmailAlreadyExists)
-        }
-        MaterializePendingRegistrationOutcome::NotFound => {
-            return Err(AuthError::ServiceUnavailable {
-                message: "Registration changed while it was being finalized. Please retry."
-                    .to_string(),
-                retry_after: Some(1),
-            })
-        }
-    };
-
     let headless_retry_error = || AuthError::ServiceUnavailable {
         message: "Email verified, but app sign-in is still finishing. Please retry shortly."
             .to_string(),
@@ -1804,47 +1786,34 @@ pub async fn finalize_pending_registration(
         None
     };
 
-    // Re-arm idempotently (keycast#262): if a still-live exchange code was already minted for this
-    // registration (an earlier re-click or mail prefetch), reuse it instead of minting a
-    // replacement. A re-mint would strand the code the polling app may already hold. Only mint a
-    // fresh code (10 minute exchange window — do not lengthen) when none is live. The consumed_at
-    // terminal guard above already refuses re-mint once a code has been redeemed.
-    // `freshly_minted` records whether THIS call created the code (vs reused an existing live one).
-    // It gates the delivery-failure cleanup below: a reused code is owned by a prior finalize.
     let candidate: String = rand::thread_rng()
         .sample_iter(&rand::distributions::Alphanumeric)
         .take(32)
         .map(char::from)
         .collect();
-    let candidate_expires_at = Utc::now() + Duration::minutes(10);
-    let stored = oauth_code_repo
-        .get_or_store_exchange_code_for_pending(
-            keycast_core::repositories::StoreOAuthCodeParams {
-                tenant_id,
-                code: &candidate,
-                user_pubkey: &oauth_data.user_pubkey,
-                client_id: &oauth_data.client_id,
-                redirect_uri: &oauth_data.redirect_uri,
-                scope: &oauth_data.scope,
-                code_challenge: oauth_data.code_challenge.as_deref(),
-                code_challenge_method: oauth_data.code_challenge_method.as_deref(),
-                expires_at: candidate_expires_at,
-                previous_auth_id: oauth_data.previous_auth_id,
-                state: oauth_data.state.as_deref(),
-                is_headless: oauth_data.is_headless,
-            },
-            &oauth_data,
-        )
+    let finalized = match oauth_code_repo
+        .materialize_pending_registration(tenant_id, verification_token, &candidate)
         .await?
-        .ok_or(AuthError::RegistrationAlreadyCompleted)?;
-    let new_code = stored.code;
-    let code_expires_at = stored.expires_at;
-    let freshly_minted = stored.freshly_minted;
-    let redis_ttl_seconds = if freshly_minted {
-        600
-    } else {
-        (code_expires_at - Utc::now()).num_seconds().max(1) as u64
+    {
+        MaterializePendingRegistrationOutcome::Ready(finalized) => *finalized,
+        MaterializePendingRegistrationOutcome::Processing => return Err(headless_retry_error()),
+        MaterializePendingRegistrationOutcome::DuplicateKey => return Err(AuthError::DuplicateKey),
+        MaterializePendingRegistrationOutcome::EmailAlreadyExists => {
+            return Err(AuthError::EmailAlreadyExists)
+        }
+        MaterializePendingRegistrationOutcome::NotFound => {
+            return Err(AuthError::ServiceUnavailable {
+                message: "Registration changed while it was being finalized. Please retry."
+                    .to_string(),
+                retry_after: Some(1),
+            })
+        }
     };
+    let oauth_data = finalized.pending;
+    let new_code = finalized.exchange_code.code;
+    let redis_ttl_seconds = (finalized.exchange_code.expires_at - Utc::now())
+        .num_seconds()
+        .max(1) as u64;
 
     if let Some((device_code, redis)) = strict_delivery {
         let key = format!("oauth_poll:{}", device_code);
@@ -5928,8 +5897,8 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(
-            user_count.0, 1,
-            "retry should reuse the created user instead of duplicating it"
+            user_count.0, 0,
+            "strict Redis validation must run before user materialization"
         );
 
         cleanup_verify_email_test_data(&pool, &pubkey, &verification_token).await;
