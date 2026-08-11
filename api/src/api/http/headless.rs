@@ -220,7 +220,7 @@ pub async fn headless_register(
     // Store pending registration in oauth_codes (deferred user creation)
     let expires_at = Utc::now() + Duration::hours(EMAIL_VERIFICATION_EXPIRY_HOURS);
     let oauth_code_repo = OAuthCodeRepository::new(pool.clone());
-    oauth_code_repo
+    let stored = oauth_code_repo
         .store_with_pending_registration(StoreOAuthCodeWithRegistrationParams {
             tenant_id,
             code: &placeholder_code,
@@ -241,6 +241,19 @@ pub async fn headless_register(
             pin_hash: Some(&pin_hash),
         })
         .await?;
+
+    // A duplicate register supersedes the earlier pending registration in place and keeps its
+    // device_code (keycast#268). Poll on the row's device_code, not the one we just generated, so
+    // the app polls the registration that actually exists.
+    let device_code = stored.device_code.unwrap_or(device_code);
+    if stored.superseded {
+        tracing::info!(
+            event = "headless_registration_superseded",
+            tenant_id = tenant_id,
+            client_id = %req.client_id,
+            "Duplicate registration re-armed the existing pending registration"
+        );
+    }
 
     // Send verification email. Only start the resend cooldown after confirmed delivery; otherwise
     // the user must be able to request an immediate replacement.
@@ -1375,6 +1388,129 @@ mod tests {
             }
             other => panic!("expected Internal for a DB failure, got {other:?}"),
         }
+    }
+
+    /// A duplicate register for the same email supersedes the first pending registration instead
+    /// of minting a second row, token and email (keycast#268).
+    ///
+    /// Production symptom this covers: divine-mobile called `POST /api/headless/register` twice
+    /// 2.9s apart for one signup. Two pending rows meant two verification emails; opening the
+    /// older link 409'd (deleting the stale row) and opening it again 401'd with "Invalid or
+    /// expired token. Please log in again."
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    #[serial]
+    async fn test_duplicate_headless_register_supersedes_pending_registration() {
+        let auth_state = create_lazy_auth_state();
+        let pool = auth_state.state.db.clone();
+        let email = format!("headless-dup-{}@example.com", uuid::Uuid::new_v4());
+
+        let register = |password: &'static str, challenge: &'static str| {
+            let auth_state = auth_state.clone();
+            let email = email.clone();
+            async move {
+                let response = super::headless_register(
+                    create_unit_test_tenant(),
+                    axum::extract::State(auth_state),
+                    axum::Json(super::HeadlessRegisterRequest {
+                        email,
+                        password: password.to_string(),
+                        client_id: "TestClient".to_string(),
+                        redirect_uri: "https://client.example/callback".to_string(),
+                        nsec: None,
+                        scope: None,
+                        code_challenge: Some(challenge.to_string()),
+                        code_challenge_method: Some("S256".to_string()),
+                        state: None,
+                    }),
+                )
+                .await
+                .map(axum::response::IntoResponse::into_response)
+                .expect("headless_register should succeed");
+                response_json(response).await
+            }
+        };
+
+        let first = register("firstpassword123", "challenge-one").await;
+        let second = register("secondpassword456", "challenge-two").await;
+
+        let first_device_code = first["device_code"]
+            .as_str()
+            .expect("first response carries device_code")
+            .to_string();
+        let second_device_code = second["device_code"]
+            .as_str()
+            .expect("second response carries device_code")
+            .to_string();
+
+        // The app keeps polling the registration it already knows about.
+        assert_eq!(
+            second_device_code, first_device_code,
+            "a duplicate register must return the existing registration's device_code"
+        );
+
+        // Exactly one pending row, one live verification token: only one email is actionable.
+        let rows: Vec<(String, Option<String>, Option<String>, i32)> = sqlx::query_as(
+            "SELECT pending_password_hash, code_challenge, pending_email_verification_token, pin_attempts
+             FROM oauth_codes
+             WHERE pending_email = $1 AND tenant_id = 1 AND consumed_at IS NULL",
+        )
+        .bind(&email)
+        .fetch_all(&pool)
+        .await
+        .expect("query should succeed");
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "a duplicate register must not create a second pending registration"
+        );
+        let (password_hash, code_challenge, token, pin_attempts) = rows.into_iter().next().unwrap();
+
+        // The newest attempt wins: a user who retyped their password must be able to log in with
+        // the password they last submitted, and the stored PKCE challenge must match the verifier
+        // the app is now holding or token exchange would fail PKCE.
+        assert!(
+            bcrypt::verify("secondpassword456", &password_hash)
+                .expect("stored hash should be verifiable"),
+            "the second attempt's password must win"
+        );
+        assert!(
+            !bcrypt::verify("firstpassword123", &password_hash)
+                .expect("stored hash should be verifiable"),
+            "the superseded attempt's password must not survive"
+        );
+        assert_eq!(
+            code_challenge.as_deref(),
+            Some("challenge-two"),
+            "the second attempt's PKCE challenge must win"
+        );
+        assert_eq!(pin_attempts, 0, "superseding re-arms the attempt counter");
+
+        // The first email's token is dead — that link now renders the terminal
+        // superseded page rather than stranding the user on a 401.
+        let token = token.expect("pending row keeps a verification token");
+        let stale_token_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oauth_codes
+             WHERE pending_email_verification_token = $1 AND tenant_id = 1",
+        )
+        .bind(&token)
+        .fetch_one(&pool)
+        .await
+        .expect("query should succeed");
+        assert_eq!(
+            stale_token_rows, 1,
+            "only the surviving registration's token resolves"
+        );
+
+        let _ = sqlx::query("DELETE FROM oauth_codes WHERE pending_email = $1")
+            .bind(&email)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE email = $1")
+            .bind(&email)
+            .execute(&pool)
+            .await;
     }
 
     /// headless_register stores a hashed 6-digit PIN on the pending row (keycast#262).

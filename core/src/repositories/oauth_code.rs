@@ -81,6 +81,16 @@ pub struct StoreOAuthCodeWithRegistrationParams<'a> {
     pub pin_hash: Option<&'a str>,
 }
 
+/// Outcome of storing a pending registration.
+#[derive(Debug, Clone)]
+pub struct StoredPendingRegistration {
+    /// The `device_code` now on the row — the caller's own on a fresh registration, or the
+    /// superseded row's existing one. This is what the client must poll.
+    pub device_code: Option<String>,
+    /// Whether this call re-armed an existing live pending registration instead of creating one.
+    pub superseded: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct OAuthCodeRepository {
     pool: PgPool,
@@ -164,15 +174,62 @@ impl OAuthCodeRepository {
     }
 
     /// Store OAuth code with pending registration data (deferred user creation).
-    /// Used by oauth_register to defer user creation until token exchange.
+    /// Used by oauth_register and headless_register to defer user creation until token exchange.
+    ///
+    /// Registering an email that already has a live pending registration **supersedes** that row
+    /// in place rather than creating a second one. The mobile client can fire
+    /// `POST /api/headless/register` twice for one signup; two rows meant two verification emails
+    /// and two device_codes, and opening the older link produced a 409 that deleted the stale row
+    /// and then a 401 "Invalid or expired token" (keycast#268).
+    ///
+    /// **The newest attempt wins every registration field**: password hash, keypair, PKCE
+    /// challenge, client_id/redirect_uri/scope/state, verification token, PIN, and the expiry
+    /// window. Re-arming must not silently keep the first attempt's password (the user may have
+    /// corrected it), and it must not keep the first attempt's `code_challenge` — the client mints
+    /// a fresh PKCE verifier per register call, so the stored challenge has to be the one matching
+    /// the verifier the app is now holding or token exchange would fail PKCE.
+    ///
+    /// **`device_code` is deliberately preserved**, and the effective one is returned. It is the
+    /// only field where the *first* attempt wins: keeping it makes the outcome independent of the
+    /// order the two responses arrive in, so an app that stored the first response's device_code
+    /// is still polling the right registration.
+    ///
+    /// `expires_at` is refreshed, unlike [`Self::reset_pin_for_resend`], which deliberately never
+    /// extends the window. A resend is free; a re-register is a whole new registration (new
+    /// bcrypt, new keypair), so it earns a fresh window — and without this an expired-but-unconsumed
+    /// row would block its own email from ever registering again, since the unique index has no
+    /// expiry predicate.
+    ///
+    /// Race-proofed by `idx_oauth_codes_live_pending_email`; the insert-or-supersede decision is a
+    /// single statement, so concurrent duplicate registers cannot both create a row.
     pub async fn store_with_pending_registration(
         &self,
         params: StoreOAuthCodeWithRegistrationParams<'_>,
-    ) -> Result<(), RepositoryError> {
-        sqlx::query(
+    ) -> Result<StoredPendingRegistration, RepositoryError> {
+        let row: (Option<String>,) = sqlx::query_as(
             "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at,
              pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret, state, device_code, is_headless, pin_hash, pin_sent_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+             ON CONFLICT (tenant_id, lower(pending_email))
+                 WHERE pending_email IS NOT NULL AND consumed_at IS NULL
+             DO UPDATE SET
+                 user_pubkey = EXCLUDED.user_pubkey,
+                 client_id = EXCLUDED.client_id,
+                 redirect_uri = EXCLUDED.redirect_uri,
+                 scope = EXCLUDED.scope,
+                 code_challenge = EXCLUDED.code_challenge,
+                 code_challenge_method = EXCLUDED.code_challenge_method,
+                 expires_at = EXCLUDED.expires_at,
+                 pending_email = EXCLUDED.pending_email,
+                 pending_password_hash = EXCLUDED.pending_password_hash,
+                 pending_email_verification_token = EXCLUDED.pending_email_verification_token,
+                 pending_encrypted_secret = EXCLUDED.pending_encrypted_secret,
+                 state = EXCLUDED.state,
+                 is_headless = EXCLUDED.is_headless,
+                 pin_hash = EXCLUDED.pin_hash,
+                 pin_attempts = 0,
+                 pin_sent_at = NULL
+             RETURNING device_code",
         )
         .bind(params.tenant_id)
         .bind(params.code)
@@ -194,9 +251,18 @@ impl OAuthCodeRepository {
         .bind(params.pin_hash)
         // pin_sent_at tracks confirmed delivery; callers set it after the email send succeeds.
         .bind(None::<DateTime<Utc>>)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
-        Ok(())
+
+        let device_code = row.0;
+        // The UPDATE branch leaves device_code untouched, so a returned value different from the
+        // one we offered means we superseded an existing pending registration.
+        let superseded = device_code.as_deref() != params.device_code;
+
+        Ok(StoredPendingRegistration {
+            device_code,
+            superseded,
+        })
     }
 
     /// Columns selected for every `OAuthCodeData` lookup (matches the struct's `FromRow` fields).
