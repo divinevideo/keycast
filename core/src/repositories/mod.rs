@@ -32,7 +32,7 @@ pub use oauth_authorization::{CreateOAuthAuthorizationParams, OAuthAuthorization
 pub use oauth_code::{
     MaterializePendingRegistrationOutcome, OAuthCodeData, OAuthCodeRepository,
     PinAttemptReservation, PinResendSnapshot, StoreOAuthCodeParams,
-    StoreOAuthCodeWithRegistrationParams, StoredPendingRegistration,
+    StoreOAuthCodeWithRegistrationParams, StoredExchangeCode, StoredPendingRegistration,
 };
 pub use personal_keys::PersonalKeysRepository;
 pub use policy::PolicyRepository;

@@ -1811,42 +1811,35 @@ pub async fn finalize_pending_registration(
     // terminal guard above already refuses re-mint once a code has been redeemed.
     // `freshly_minted` records whether THIS call created the code (vs reused an existing live one).
     // It gates the delivery-failure cleanup below: a reused code is owned by a prior finalize.
-    let (new_code, code_expires_at, freshly_minted) = if let Some((existing, expires_at)) =
-        oauth_code_repo
-            .find_live_exchange_code_with_expiry_for_pending(tenant_id, &oauth_data)
-            .await?
-    {
-        (existing, expires_at, false)
-    } else {
-        let minted: String = rand::thread_rng()
-            .sample_iter(&rand::distributions::Alphanumeric)
-            .take(32)
-            .map(char::from)
-            .collect();
-
-        let code_expires_at = Utc::now() + Duration::minutes(10);
-        let store_params = keycast_core::repositories::StoreOAuthCodeParams {
-            tenant_id,
-            code: &minted,
-            user_pubkey: &oauth_data.user_pubkey,
-            client_id: &oauth_data.client_id,
-            redirect_uri: &oauth_data.redirect_uri,
-            scope: &oauth_data.scope,
-            code_challenge: oauth_data.code_challenge.as_deref(),
-            code_challenge_method: oauth_data.code_challenge_method.as_deref(),
-            expires_at: code_expires_at,
-            previous_auth_id: oauth_data.previous_auth_id,
-            state: oauth_data.state.as_deref(),
-            is_headless: oauth_data.is_headless, // Inherit from original registration
-        };
-        if !oauth_code_repo
-            .store_for_pending_registration(store_params, &oauth_data)
-            .await?
-        {
-            return Err(AuthError::RegistrationAlreadyCompleted);
-        }
-        (minted, code_expires_at, true)
-    };
+    let candidate: String = rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect();
+    let candidate_expires_at = Utc::now() + Duration::minutes(10);
+    let stored = oauth_code_repo
+        .get_or_store_exchange_code_for_pending(
+            keycast_core::repositories::StoreOAuthCodeParams {
+                tenant_id,
+                code: &candidate,
+                user_pubkey: &oauth_data.user_pubkey,
+                client_id: &oauth_data.client_id,
+                redirect_uri: &oauth_data.redirect_uri,
+                scope: &oauth_data.scope,
+                code_challenge: oauth_data.code_challenge.as_deref(),
+                code_challenge_method: oauth_data.code_challenge_method.as_deref(),
+                expires_at: candidate_expires_at,
+                previous_auth_id: oauth_data.previous_auth_id,
+                state: oauth_data.state.as_deref(),
+                is_headless: oauth_data.is_headless,
+            },
+            &oauth_data,
+        )
+        .await?
+        .ok_or(AuthError::RegistrationAlreadyCompleted)?;
+    let new_code = stored.code;
+    let code_expires_at = stored.expires_at;
+    let freshly_minted = stored.freshly_minted;
     let redis_ttl_seconds = if freshly_minted {
         600
     } else {
@@ -1864,20 +1857,8 @@ pub async fn finalize_pending_registration(
                 error = %e,
                 "Failed to store headless OAuth code in Redis for polling"
             );
-            // Only clean up a code we freshly minted on this call. A reused code is owned by a prior
-            // finalize that already handled its own Redis delivery; deleting it here would strand a
-            // code the polling app may already hold (keycast#262). Retry either way.
-            if freshly_minted {
-                if let Err(cleanup_err) = oauth_code_repo.delete(tenant_id, &new_code).await {
-                    tracing::error!(
-                        tenant_id = tenant_id,
-                        user_pubkey = %oauth_data.user_pubkey,
-                        code = %new_code,
-                        error = %cleanup_err,
-                        "Failed to clean up OAuth code after Redis polling write failed"
-                    );
-                }
-            }
+            // Keep the code for retry. Another concurrent finalizer may already have reused and
+            // delivered it, so even the call that minted it cannot safely delete it here.
             return Err(headless_retry_error());
         }
         tracing::debug!(
@@ -6170,6 +6151,53 @@ mod tests {
         cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
     }
 
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_concurrent_finalizers_return_the_same_exchange_code() {
+        let pool = create_test_db().await;
+        let email = format!("verify-concurrent-{}@example.com", Uuid::new_v4());
+        let (pubkey, token) = insert_oauth_pending_registration(&pool, &email).await;
+        let repo = keycast_core::repositories::OAuthCodeRepository::new(pool.clone());
+        let pending = repo
+            .find_by_verification_token(&token, 1)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (first, second) = tokio::join!(
+            super::finalize_pending_registration(
+                &pool,
+                None,
+                1,
+                &pending,
+                super::HeadlessDelivery::RedisBestEffort,
+            ),
+            super::finalize_pending_registration(
+                &pool,
+                None,
+                1,
+                &pending,
+                super::HeadlessDelivery::RedisBestEffort,
+            ),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.new_code, second.new_code);
+
+        let exchange_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oauth_codes
+             WHERE tenant_id = 1 AND pending_email_verification_token = $1
+               AND pending_email IS NULL",
+        )
+        .bind(&token)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(exchange_count, 1);
+
+        cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
+    }
+
     /// A prefetch (mail scanner / link preview) of the verify link must not strand the user:
     /// the pending row survives, so the user's later real click still completes.
     #[cfg(feature = "integration-tests")]
@@ -6872,11 +6900,10 @@ mod tests {
         cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
     }
 
-    /// A failed strict Redis delivery removes only the exchange code minted by this finalize,
-    /// while preserving the materialized user and pending row so the link can be retried.
+    /// A failed strict Redis delivery preserves the exchange code for a retry.
     #[cfg(feature = "integration-tests")]
     #[tokio::test]
-    async fn test_finalize_pending_registration_fresh_code_redis_failure_cleans_orphan() {
+    async fn test_finalize_pending_registration_fresh_code_redis_failure_preserves_code() {
         let pool = create_test_db().await;
         let auth_state = create_test_auth_state_with_failing_redis(pool.clone()).await;
         let redis = auth_state.state.redis.as_ref().expect("failing Redis");
@@ -6924,8 +6951,8 @@ mod tests {
             repo.find_live_exchange_code_with_expiry_for_pending(1, &pending)
                 .await
                 .unwrap()
-                .is_none(),
-            "the freshly minted undeliverable exchange code must be deleted"
+                .is_some(),
+            "the live code must remain reusable after a retryable Redis failure"
         );
 
         cleanup_verify_email_test_data(&pool, &pubkey, &token).await;

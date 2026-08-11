@@ -918,6 +918,9 @@ pub async fn headless_verify_pin(
         .await;
         return Err(HeadlessError::PinUnavailable);
     }
+    let Some(expected_generation_token) = pending.pending_email_verification_token.clone() else {
+        return Err(HeadlessError::PinUnavailable);
+    };
 
     // Atomically reserve an attempt slot BEFORE the expensive bcrypt compare. The conditional
     // UPDATE increments only while under both caps, so no more comparisons can run for this
@@ -926,6 +929,7 @@ pub async fn headless_verify_pin(
         .reserve_pin_attempt(
             &req.device_code,
             tenant_id,
+            &expected_generation_token,
             MAX_PIN_ATTEMPTS,
             MAX_PIN_ATTEMPTS_LIFETIME,
         )
@@ -992,7 +996,7 @@ pub async fn headless_verify_pin(
             // The queue rejected or abandoned the job before bcrypt produced a comparison result,
             // so this request must not consume the attempt slot reserved above.
             oauth_code_repo
-                .refund_pin_attempt(&req.device_code, tenant_id)
+                .refund_pin_attempt(&req.device_code, tenant_id, &expected_generation_token)
                 .await?;
             return Err(error.into());
         }
@@ -1053,7 +1057,7 @@ pub async fn headless_verify_pin(
     // Best-effort: this is a counter, not the gate. If it fails the user has at worst one fewer
     // attempt, and the caps are still exact.
     if let Err(e) = oauth_code_repo
-        .reset_pin_attempts(&req.device_code, tenant_id)
+        .reset_pin_attempts(&req.device_code, tenant_id, &expected_generation_token)
         .await
     {
         tracing::warn!(
