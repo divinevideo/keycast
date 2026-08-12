@@ -993,6 +993,7 @@ async fn cache_control_middleware(request: Request<Body>, next: Next) -> Respons
         || path.starts_with("/health")
         || path == "/livez"
         || path == "/verify-email"
+        || path == "/email-verification/continue"
     {
         // Dynamic content - no caching
         // (`/health`, `/healthz/startup`, `/healthz/ready` all match `/health`;
@@ -1529,7 +1530,6 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     // Get pure API routes (JSON endpoints only) - pass authorization sender
     let public_verify_email_route = keycast_api::api::http::routes::public_verify_email_route(
         api_state.clone(),
-        public_cors.clone(),
         Some(auth_tx.clone()),
     );
     let api_routes = keycast_api::api::http::routes::api_routes(
@@ -2341,25 +2341,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_public_verify_email_route_is_not_cached() {
-        let app = Router::new()
-            .route("/verify-email", get(|| async { "verification result" }))
-            .layer(middleware::from_fn(cache_control_middleware));
+    async fn test_email_verification_routes_are_not_cached() {
+        for uri in [
+            "/verify-email?token=sensitive",
+            "/email-verification/continue?token=sensitive",
+        ] {
+            let app = Router::new()
+                .route(uri.split('?').next().unwrap(), get(|| async { "ok" }))
+                .layer(middleware::from_fn(cache_control_middleware));
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/verify-email?token=sensitive")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+            let response = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
 
-        assert_eq!(
-            response.headers().get(header::CACHE_CONTROL).unwrap(),
-            "no-store"
-        );
+            assert_eq!(
+                response.headers().get(header::CACHE_CONTROL).unwrap(),
+                "no-store",
+                "{uri} must not be cached"
+            );
+        }
     }
 
     #[tokio::test]

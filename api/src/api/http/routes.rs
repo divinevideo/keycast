@@ -44,12 +44,10 @@ pub struct AuthState {
 /// Build the public email-verification route claimed by the mobile apps.
 pub fn public_verify_email_route(
     state: Arc<KeycastState>,
-    public_cors: tower_http::cors::CorsLayer,
     auth_tx: Option<AuthorizationSender>,
 ) -> Router {
     Router::new()
         .route("/verify-email", get(auth::verify_email_get))
-        .layer(public_cors)
         .with_state(AuthState { state, auth_tx })
 }
 
