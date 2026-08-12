@@ -18,7 +18,7 @@ export default defineConfig({
         proxy: {
             '^/verify-email(?:\\?.*)?$': {
                 target: 'http://localhost:3000',
-                headers: { host: 'login.divine.video' }
+                changeOrigin: true
             },
             '/api': {
                 target: 'http://localhost:3000',

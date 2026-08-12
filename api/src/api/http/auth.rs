@@ -2376,14 +2376,14 @@ pub async fn verify_email_get(
     }
 }
 
-/// `auth_events.endpoint` for both verify-email transports.
+/// Low-cardinality `auth_events.endpoint` label shared by all verify-email entry paths.
 pub(crate) const VERIFY_EMAIL_ENDPOINT: &str = "/api/auth/verify-email";
 
 /// Record one verify-email attempt to the shared auth-event feed.
 ///
-/// Both transports emit this with the same `event_type`, differing only in `metadata_json.method`,
-/// so GET and POST outcomes are directly comparable. That matters most right after the switch to
-/// verifying on GET (keycast#262): the GET is now the primary path, and the
+/// All verify-email entry paths emit this with the same `event_type`, differing only in
+/// `metadata_json.method`, so GET and POST outcomes are directly comparable. That matters most
+/// right after the switch to verifying on GET (keycast#262): the GET is now the primary path, and the
 /// `verification_link_superseded` rate is the signal for whether duplicate signups
 /// (keycast#268 Fix A) actually stopped in production.
 async fn record_verify_email_event(
