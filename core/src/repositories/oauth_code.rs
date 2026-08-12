@@ -1574,16 +1574,22 @@ impl OAuthCodeRepository {
         Ok(updated.rows_affected() == 1)
     }
 
-    /// Delete dead rows: anything past its expiry, plus consumed pending registrations (terminal
-    /// once their exchange code successfully issued tokens). Bounds table growth and enforces the pending row's
-    /// finite lifecycle (keycast#262). Returns the number of rows removed.
+    /// Delete dead rows: anything past expiry plus a grace interval, plus consumed pending
+    /// registrations (terminal once their exchange code successfully issued tokens).
+    ///
+    /// The grace window (10 minutes, matching the sibling users cleanup in `bcrypt_queue`) keeps
+    /// an expired pending registration reachable long enough for `resend-pin` to answer honestly
+    /// instead of falling through to the anti-enumeration uniform success after the reaper runs
+    /// (keycast#362). Bounds table growth and enforces the pending row's finite lifecycle
+    /// (keycast#262). Returns the number of rows removed.
     pub async fn delete_expired_and_consumed(&self) -> Result<u64, RepositoryError> {
         let result = sqlx::query(
             "DELETE FROM oauth_codes
              WHERE expires_at < $1
                 OR (pending_email IS NOT NULL AND consumed_at IS NOT NULL)",
         )
-        .bind(Utc::now())
+        // 10-minute grace past expires_at (keycast#362); same interval as users cleanup.
+        .bind(Utc::now() - chrono::Duration::minutes(10))
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
@@ -4169,13 +4175,23 @@ mod tests {
         )
         .await;
 
-        // Expired row (removed).
+        // Past grace: expired well beyond the 10-minute window (removed).
         let expired_dc = format!("dc_exp_{}", uuid::Uuid::new_v4());
         insert_pending_registration(
             &repo,
             &expired_dc,
             Some("pin"),
             Utc::now() - chrono::Duration::hours(1),
+        )
+        .await;
+
+        // Within grace: past expires_at but not yet reaped (kept for resend-pin honesty, keycast#362).
+        let grace_dc = format!("dc_grace_{}", uuid::Uuid::new_v4());
+        insert_pending_registration(
+            &repo,
+            &grace_dc,
+            Some("pin"),
+            Utc::now() - chrono::Duration::minutes(1),
         )
         .await;
 
@@ -4235,7 +4251,20 @@ mod tests {
                 .fetch_optional(&pool)
                 .await
                 .unwrap();
-        assert!(expired_still_present.is_none(), "expired row removed");
+        assert!(
+            expired_still_present.is_none(),
+            "expired row past grace removed"
+        );
+        let grace_still_present: Option<(String,)> =
+            sqlx::query_as("SELECT device_code FROM oauth_codes WHERE device_code = $1")
+                .bind(&grace_dc)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert!(
+            grace_still_present.is_some(),
+            "row expired within the 10-minute grace must be retained"
+        );
         let consumed_still_present: Option<(String,)> =
             sqlx::query_as("SELECT device_code FROM oauth_codes WHERE device_code = $1")
                 .bind(&consumed_dc)
@@ -4261,8 +4290,9 @@ mod tests {
             "live un-consumed row retained"
         );
 
-        sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+        sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1 OR device_code = $2")
             .bind(&live_dc)
+            .bind(&grace_dc)
             .execute(&pool)
             .await
             .unwrap();

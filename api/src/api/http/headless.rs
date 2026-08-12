@@ -1121,6 +1121,11 @@ pub struct HeadlessResendPinRequest {
 pub struct HeadlessResendPinResponse {
     pub success: bool,
     pub message: String,
+    /// Stable machine-readable reason when `success` is false. Omitted on the uniform
+    /// anti-enumeration success path so presence of a code cannot leak registration existence.
+    /// Screaming-snake vocabulary matches `HeadlessError` codes (`REGISTRATION_EXPIRED`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
 
 /// POST /api/headless/resend-pin
@@ -1141,10 +1146,12 @@ pub async fn headless_resend_pin(
     let tenant_id = tenant.0.id;
 
     // Uniform response regardless of outcome (anti-enumeration / no lockout signal).
+    // Never attach a `code` here: a code on this branch would leak whether a registration existed.
     let success = || {
         Json(HeadlessResendPinResponse {
             success: true,
             message: "If your registration is pending, a new code has been sent.".to_string(),
+            code: None,
         })
     };
 
@@ -1176,6 +1183,10 @@ pub async fn headless_resend_pin(
         return Ok(Json(HeadlessResendPinResponse {
             success: false,
             message: "This registration has expired. Please sign up again.".to_string(),
+            // Additive only: success stays false and the response stays HTTP 200 (keycast#268).
+            // Field name `code` matches HeadlessError; this route never returns an authorization
+            // grant code, so the overload is intentional (keycast#362).
+            code: Some("REGISTRATION_EXPIRED".to_string()),
         }));
     }
 
@@ -2321,10 +2332,14 @@ mod tests {
 
         let response = call_resend_pin(auth_state, &device_code).await;
         assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response_json(response).await;
         assert_eq!(
-            response_json(response).await["success"],
-            false,
+            body["success"], false,
             "a resend that cannot possibly work must not claim it succeeded"
+        );
+        assert_eq!(
+            body["code"], "REGISTRATION_EXPIRED",
+            "expired resend must carry a stable machine-readable code"
         );
 
         let (new_hash,): (Option<String>,) =
@@ -2336,6 +2351,65 @@ mod tests {
         assert_eq!(
             new_hash, old_hash,
             "an expired registration must not be re-armed"
+        );
+
+        let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(&pubkey)
+            .execute(&pool)
+            .await;
+    }
+
+    /// The reaper used to delete expired pending rows on the next cleanup tick, so resend-pin
+    /// fell through to the anti-enumeration uniform success once the row was gone (keycast#362).
+    /// Cleanup must leave a recently-expired row long enough for the honest expired answer.
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    #[serial]
+    async fn test_resend_pin_expired_survives_cleanup_grace_and_reports_code() {
+        let auth_state = create_lazy_auth_state();
+        let pool = auth_state.state.db.clone();
+        let email = format!("resend-pin-grace-{}@example.com", uuid::Uuid::new_v4());
+        let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
+
+        // Within the 10-minute grace: past expires_at but not yet reaped.
+        sqlx::query("UPDATE oauth_codes SET expires_at = $2 WHERE device_code = $1")
+            .bind(&device_code)
+            .bind(Utc::now() - Duration::minutes(1))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let oauth_code_repo = keycast_core::repositories::OAuthCodeRepository::new(pool.clone());
+        oauth_code_repo
+            .delete_expired_and_consumed()
+            .await
+            .expect("cleanup pass must succeed");
+
+        let still_present: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM oauth_codes WHERE device_code = $1)")
+                .bind(&device_code)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            still_present,
+            "a row expired within the grace window must survive cleanup"
+        );
+
+        let response = call_resend_pin(auth_state, &device_code).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(
+            body["success"], false,
+            "after cleanup within grace, resend must still report failure not uniform success"
+        );
+        assert_eq!(
+            body["code"], "REGISTRATION_EXPIRED",
+            "the stable code must remain available after a cleanup pass"
         );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
