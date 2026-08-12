@@ -382,6 +382,23 @@ Authorization: Bearer {ucan_token}
 
 ---
 
+#### `GET /verify-email`
+
+Public verification link target used in email messages and claimed by the iOS
+Universal Link and Android App Link configuration.
+
+**Query parameters:**
+```
+token=verification_token_from_email
+```
+
+Browsers complete supported verification flows server-side. First-party
+interactive browser flows redirect to `/email-verification/continue?token=...`
+so the web app can finish verification and session creation without colliding
+with native app-link handling.
+
+---
+
 #### `POST /api/auth/verify-email`
 
 Verify email address with token from verification email.

@@ -2298,8 +2298,10 @@ pub async fn verify_email_get(
                 Ok(Some(_)) => {
                     // Not an outcome yet: the interactive POST records the terminal one.
                     emit("accepted", Some("interactive_handoff"), 303).await;
-                    let interactive_url =
-                        format!("/verify-email?token={}", urlencoding::encode(&token));
+                    let interactive_url = format!(
+                        "/email-verification/continue?token={}",
+                        urlencoding::encode(&token)
+                    );
                     Redirect::to(&interactive_url).into_response()
                 }
                 Ok(None) => {
@@ -2374,14 +2376,14 @@ pub async fn verify_email_get(
     }
 }
 
-/// `auth_events.endpoint` for both verify-email transports.
+/// Low-cardinality `auth_events.endpoint` label shared by all verify-email entry paths.
 pub(crate) const VERIFY_EMAIL_ENDPOINT: &str = "/api/auth/verify-email";
 
 /// Record one verify-email attempt to the shared auth-event feed.
 ///
-/// Both transports emit this with the same `event_type`, differing only in `metadata_json.method`,
-/// so GET and POST outcomes are directly comparable. That matters most right after the switch to
-/// verifying on GET (keycast#262): the GET is now the primary path, and the
+/// All verify-email entry paths emit this with the same `event_type`, differing only in
+/// `metadata_json.method`, so GET and POST outcomes are directly comparable. That matters most
+/// right after the switch to verifying on GET (keycast#262): the GET is now the primary path, and the
 /// `verification_link_superseded` rate is the signal for whether duplicate signups
 /// (keycast#268 Fix A) actually stopped in production.
 async fn record_verify_email_event(
@@ -2486,7 +2488,7 @@ fn verify_html_retry_page(retry_after_secs: u32) -> Response {
     response
 }
 
-/// Render a minimal, self-contained HTML status page for the GET verify flow.
+/// Render a branded, self-contained HTML status page for the GET verify flow.
 fn verify_html_page(status: StatusCode, heading: &str, message: &str) -> Response {
     verify_html_page_with_refresh(status, heading, message, None)
 }
@@ -2504,13 +2506,20 @@ fn verify_html_page_with_refresh(
     let body = format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">{refresh_tag}\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-         <title>{heading}</title>\
-         <style>body{{font-family:system-ui,-apple-system,sans-serif;background:#0d1117;color:#e6edf3;\
-         display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:1rem}}\
-         .card{{max-width:420px;text-align:center;background:#161b22;border:1px solid #30363d;\
-         border-radius:1rem;padding:2rem}}h1{{font-size:1.4rem;margin:0 0 .5rem}}\
-         p{{color:#9da7b3;margin:0;font-size:.95rem}}</style></head>\
-         <body><div class=\"card\"><h1>{heading}</h1><p>{message}</p></div></body></html>",
+         <meta name=\"theme-color\" content=\"#072218\"><title>{heading} - {brand}</title>\
+         <style>*{{box-sizing:border-box}}body{{font-family:system-ui,-apple-system,sans-serif;\
+         background:#072218;color:#f7fffc;display:flex;min-height:100vh;align-items:center;\
+         justify-content:center;margin:0;padding:1rem}}.card{{width:100%;max-width:420px;text-align:center;\
+         background:#0f2e23;border:1px solid rgba(39,197,139,.25);border-radius:1rem;padding:2rem;\
+         box-shadow:0 18px 60px rgba(0,0,0,.22)}}.brand{{display:inline-flex;flex-direction:column;\
+         align-items:center;gap:2px;margin-bottom:1.5rem;text-decoration:none}}.brand img{{height:28px;\
+         max-width:180px}}.brand span{{color:#27c58b;font-size:11px;font-weight:600;letter-spacing:3px;\
+         text-transform:uppercase}}h1{{font-family:system-ui,-apple-system,sans-serif;\
+         font-size:1.55rem;line-height:1.2;margin:0 0 .75rem}}p{{color:#b8cbc4;margin:0;\
+         font-size:.98rem;line-height:1.55}}</style></head><body><main class=\"card\">\
+         <a class=\"brand\" href=\"/\"><img src=\"/divine-logo.svg\" alt=\"{brand}\">\
+         <span>Login</span></a><h1>{heading}</h1><p>{message}</p></main></body></html>",
+        brand = html_escape(BRAND_NAME),
         heading = html_escape(heading),
         message = html_escape(message),
     );
@@ -5358,11 +5367,34 @@ pub async fn delete_account(
 mod tests {
     use super::generate_server_signed_ucan;
     use super::validate_origin;
+    use super::verify_html_page;
     use super::AccountStatusResponse;
+    use super::BRAND_NAME;
     #[cfg(feature = "integration-tests")]
     use super::{VERIFICATION_LINK_SUPERSEDED_CODE, VERIFICATION_LINK_SUPERSEDED_HEADING};
     use axum::response::IntoResponse;
     use ucan::Ucan;
+
+    #[tokio::test]
+    async fn verification_status_page_uses_divine_login_branding() {
+        let response = verify_html_page(
+            axum::http::StatusCode::OK,
+            "Email verified!",
+            "Return to the app.",
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let body = String::from_utf8(body.to_vec()).expect("status page should be UTF-8");
+
+        assert!(body.contains("/divine-logo.svg"));
+        assert!(body.contains(">Login</span>"));
+        assert!(body.contains("background:#072218"));
+        assert!(body.contains("Email verified!"));
+        assert!(body.contains(&format!("Email verified! - {BRAND_NAME}")));
+        assert!(!body.contains("Bricolage Grotesque"));
+        assert!(!body.contains("font-family:Inter"));
+    }
 
     #[tokio::test]
     async fn server_signed_ucan_includes_first_party_only_when_requested() {
@@ -5601,7 +5633,7 @@ mod tests {
         VerifyEmailQuery, VerifyEmailRequest,
     };
     #[cfg(feature = "integration-tests")]
-    use crate::api::http::routes::AuthState;
+    use crate::api::http::routes::{public_verify_email_route, AuthState};
     #[cfg(feature = "integration-tests")]
     use crate::api::tenant::{Tenant, TenantExtractor};
     #[cfg(feature = "integration-tests")]
@@ -5612,10 +5644,11 @@ mod tests {
     use crate::state::KeycastState;
     #[cfg(feature = "integration-tests")]
     use axum::{
+        body::Body,
         extract::{Query, State},
         http::{
             header::{AUTHORIZATION, ORIGIN},
-            HeaderMap, HeaderValue, StatusCode,
+            HeaderMap, HeaderValue, Request, StatusCode,
         },
         Json,
     };
@@ -5636,6 +5669,8 @@ mod tests {
     use sqlx::PgPool;
     #[cfg(feature = "integration-tests")]
     use std::sync::Arc;
+    #[cfg(feature = "integration-tests")]
+    use tower::ServiceExt;
     #[cfg(feature = "integration-tests")]
     use uuid::Uuid;
     #[cfg(feature = "integration-tests")]
@@ -6521,11 +6556,39 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .unwrap();
         assert!(
-            location.starts_with("/verify-email?token="),
+            location.starts_with("/email-verification/continue?token="),
             "first-party tokens must be handed to the interactive page, got {location}"
         );
 
         cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_public_verify_email_route_is_registered_without_cors() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool);
+        let app = public_verify_email_route(auth_state.state, auth_state.auth_tx);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/verify-email?token=sensitive")
+                    .header(ORIGIN, "https://example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("public verification route response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!response
+            .headers()
+            .contains_key(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("route response body");
+        assert_eq!(&body[..], b"Missing Host header");
     }
 
     /// A token that resolves to nothing - already used, or superseded by a newer verification

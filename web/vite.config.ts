@@ -16,6 +16,10 @@ export default defineConfig({
     },
     server: {
         proxy: {
+            '^/verify-email(?:\\?.*)?$': {
+                target: 'http://localhost:3000',
+                changeOrigin: true
+            },
             '/api': {
                 target: 'http://localhost:3000',
                 changeOrigin: true

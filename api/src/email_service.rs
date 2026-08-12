@@ -90,6 +90,10 @@ fn verification_email_text(verification_url: &str, pin: Option<&str>) -> String 
     )
 }
 
+fn build_verification_url(base_url: &str, verification_token: &str) -> String {
+    format!("{base_url}/verify-email?token={verification_token}")
+}
+
 /// Trait for email sending - allows swapping implementations for testing
 #[async_trait]
 pub trait EmailSender: Send + Sync {
@@ -184,12 +188,9 @@ impl EmailSender for DevEmailSender {
         verification_token: &str,
         pin: Option<&str>,
     ) -> Result<(), String> {
-        // Point at the server-side GET endpoint so verification works without client JS
-        // (sandboxed in-app browsers never run the SPA page's fetch — keycast#262).
-        let verification_url = format!(
-            "{}/api/auth/verify-email?token={}",
-            self.base_url, verification_token
-        );
+        // This public path is claimed by the mobile apps and also verifies server-side when a
+        // browser keeps the link instead of handing it to the app (keycast#360).
+        let verification_url = build_verification_url(&self.base_url, verification_token);
 
         tracing::info!("");
         tracing::info!("==================================================");
@@ -530,12 +531,9 @@ impl EmailSender for SendGridEmailSender {
         verification_token: &str,
         pin: Option<&str>,
     ) -> Result<(), String> {
-        // Point at the server-side GET endpoint so verification works without client JS
-        // (sandboxed in-app browsers never run the SPA page's fetch — keycast#262).
-        let verification_url = format!(
-            "{}/api/auth/verify-email?token={}",
-            self.base_url, verification_token
-        );
+        // This public path is claimed by the mobile apps and also verifies server-side when a
+        // browser keeps the link instead of handing it to the app (keycast#360).
+        let verification_url = build_verification_url(&self.base_url, verification_token);
 
         let subject = format!("Verify your {} email address", BRAND_NAME);
         let html_content = verification_email_html(&verification_url, pin);
@@ -833,8 +831,16 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
+    fn verification_links_use_the_public_app_link_path() {
+        assert_eq!(
+            build_verification_url("https://login.divine.video", "abc"),
+            "https://login.divine.video/verify-email?token=abc"
+        );
+    }
+
+    #[test]
     fn verification_email_bodies_include_pin_when_present() {
-        let url = "https://login.example/api/auth/verify-email?token=abc";
+        let url = "https://login.example/verify-email?token=abc";
         let html = verification_email_html(url, Some("482913"));
         let text = verification_email_text(url, Some("482913"));
         assert!(html.contains("482913"), "HTML body must show the PIN");
@@ -846,7 +852,7 @@ mod tests {
 
     #[test]
     fn verification_email_bodies_omit_pin_when_absent() {
-        let url = "https://login.example/api/auth/verify-email?token=abc";
+        let url = "https://login.example/verify-email?token=abc";
         let html = verification_email_html(url, None);
         let text = verification_email_text(url, None);
         // No 6-digit code block when no PIN was issued (browser/OAuth flows).
@@ -865,6 +871,13 @@ mod tests {
         let captured = sender.get_captured_emails();
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].pin.as_deref(), Some("482913"));
+        assert!(
+            captured[0]
+                .verification_url
+                .as_deref()
+                .is_some_and(|url| url.ends_with("/verify-email?token=tok123")),
+            "verification emails must use the public app-link path"
+        );
     }
 
     // Serial test lock to prevent env var races between tests

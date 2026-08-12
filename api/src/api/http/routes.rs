@@ -41,6 +41,16 @@ pub struct AuthState {
     pub auth_tx: Option<AuthorizationSender>,
 }
 
+/// Build the public email-verification route claimed by the mobile apps.
+pub fn public_verify_email_route(
+    state: Arc<KeycastState>,
+    auth_tx: Option<AuthorizationSender>,
+) -> Router {
+    Router::new()
+        .route("/verify-email", get(auth::verify_email_get))
+        .with_state(AuthState { state, auth_tx })
+}
+
 /// Build API routes - pure JSON endpoints, no HTML
 /// Returns unrooted Router that can be nested at any path (e.g., /api, /v1, etc.)
 pub fn api_routes(
@@ -72,8 +82,8 @@ pub fn api_routes(
 
     // verify_email needs auth_state for key_manager (to decrypt keys and issue UCAN)
     let verify_email_route = Router::new()
-        // GET is the link target in verification emails: it verifies server-side (no client JS),
-        // which is what fixes sandboxed in-app browsers (keycast#262). POST stays for the SPA page.
+        // Keep GET for links sent before keycast#360. New emails use the public /verify-email route,
+        // while POST stays for the SPA page and native clients.
         .route(
             "/auth/verify-email",
             post(auth::verify_email).get(auth::verify_email_get),
