@@ -10,15 +10,16 @@
 //! rather than merely detectable; if that ever lands, delete this file, because
 //! it would be testing something that cannot happen.
 //!
-//! Production runs a bounded SQLx acquire timeout below the HTTP RPC handler
-//! timeout (`core/src/request_bounds.rs`). A code path that holds
-//! an open transaction while independently acquiring a second connection from
-//! the same pool needs TWO connections to serve ONE request. That does not fail
-//! in a quiet test suite -- it fails under concurrency, by stalling every
-//! stalled request for the acquire timeout while it keeps holding its first
-//! connection. One exposed handler can starve login, OAuth and the signer. The
-//! shorter timeout caps how long each stall lasts; it does not stop the second
-//! connection from being demanded.
+//! Production runs `max_connections = 10` per instance and a bounded SQLx
+//! acquire timeout below the HTTP RPC handler timeout
+//! (`core/src/request_bounds.rs`). A code path that holds an open transaction
+//! while independently acquiring a second connection from the same pool needs
+//! TWO connections to serve ONE request. That does not fail in a quiet test
+//! suite -- it fails under concurrency, by stalling every stalled request for
+//! the acquire timeout while it keeps holding its first connection. One exposed
+//! handler can starve login, OAuth and the signer. The shorter timeout caps how
+//! long each stall lasts; it does not stop the second connection from being
+//! demanded.
 //!
 //! Concurrency tests cannot pin this down: whether they trip depends on burst
 //! size versus pool size, which makes them knife edges that pass for the wrong
@@ -127,11 +128,10 @@ where
                  This is nested pool acquisition: the path holds a transaction (or another \
                  connection) while calling something that acquires its own connection from \
                  the same pool. In production that path needs two of the ten connections per \
-                 request and stalls for {stall}s under load, holding its first connection the \
+                 request and stalls for the acquire timeout under load, holding its first connection the \
                  whole time and starving every other endpoint on the instance.\n\n\
                  Fix: thread the open transaction into the inner call (`&mut *tx`) instead of \
                  letting it reach for the pool.",
-                stall = 5,
             );
         }
         Err(error) => panic!("{label} did not reach its expected success path: {error:?}"),

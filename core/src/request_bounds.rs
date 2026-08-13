@@ -68,17 +68,3 @@ const _: () = assert!(
     SQLX_ACQUIRE_TIMEOUT.as_nanos() < HTTP_RPC_HANDLER_TIMEOUT.as_nanos(),
     "SQLx acquire timeout must fit inside the HTTP RPC handler bound"
 );
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sqlx_acquire_timeout_fits_inside_http_rpc_request_bound() {
-        assert!(
-            SQLX_ACQUIRE_TIMEOUT < HTTP_RPC_HANDLER_TIMEOUT,
-            "{SQLX_ACQUIRE_TIMEOUT:?} SQLx acquire timeout must fit inside \
-             {HTTP_RPC_HANDLER_TIMEOUT:?} HTTP RPC handler bound"
-        );
-    }
-}
