@@ -1862,26 +1862,31 @@ mod tests {
                 .await
         });
 
-        // Wait until PostgreSQL confirms materialization is blocked on the users row. At this
-        // point its transaction already owns the pending-row FOR UPDATE lock.
+        // Wait until this materializer owns this pending row's FOR UPDATE lock. A pg_stat_activity
+        // query-pattern probe is too broad when the integration suite runs other materialization
+        // tests concurrently; NOWAIT against this row proves the lock we care about is held.
         let wait_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let waiting: bool = sqlx::query_scalar(
-                "SELECT EXISTS (
-                    SELECT 1 FROM pg_stat_activity activity
-                    WHERE cardinality(pg_blocking_pids(activity.pid)) > 0
-                      AND activity.query LIKE '%SELECT u.email, u.email_verified%'
-                )",
+            let row_lock = sqlx::query(
+                "SELECT 1 FROM oauth_codes
+                 WHERE tenant_id = $1 AND pending_email_verification_token = $2
+                   AND pending_email IS NOT NULL
+                 FOR UPDATE NOWAIT",
             )
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            if waiting {
+            .bind(1_i64)
+            .bind(&token)
+            .fetch_optional(&pool)
+            .await;
+            if matches!(
+                row_lock,
+                Err(sqlx::Error::Database(ref error)) if error.code().as_deref() == Some("55P03")
+            ) {
                 break;
             }
+            row_lock.unwrap();
             assert!(
                 tokio::time::Instant::now() < wait_deadline,
-                "materialization did not reach the users-row lock"
+                "materialization did not lock the pending row"
             );
             sleep(Duration::from_millis(10)).await;
         }
