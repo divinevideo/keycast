@@ -10,7 +10,8 @@
 //! rather than merely detectable; if that ever lands, delete this file, because
 //! it would be testing something that cannot happen.
 //!
-//! Production runs `max_connections = 10` per instance and a bounded SQLx
+//! The application pool defaults to 10 connections per instance, while deployed
+//! environments can override that with `SQLX_POOL_SIZE`, and uses a bounded SQLx
 //! acquire timeout below the HTTP RPC handler timeout
 //! (`core/src/request_bounds.rs`). A code path that holds an open transaction
 //! while independently acquiring a second connection from the same pool needs
@@ -127,8 +128,8 @@ where
                  from a max_connections(1) pool (acquire timeout {PROBE_ACQUIRE_TIMEOUT:?}).\n\n\
                  This is nested pool acquisition: the path holds a transaction (or another \
                  connection) while calling something that acquires its own connection from \
-                 the same pool. In production that path needs two of the ten connections per \
-                 request and stalls for the acquire timeout under load, holding its first connection the \
+                 the same pool. In production that path needs two pool connections per request \
+                 and stalls for the acquire timeout under load, holding its first connection the \
                  whole time and starving every other endpoint on the instance.\n\n\
                  Fix: thread the open transaction into the inner call (`&mut *tx`) instead of \
                  letting it reach for the pool.",
