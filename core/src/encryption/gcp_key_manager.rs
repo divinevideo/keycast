@@ -32,7 +32,10 @@ const KMS_BASE_DELAY_MS: u64 = 100;
 ///
 /// 6.3s reserves the KMS loop alone. A cold handler load does its database work
 /// before it reaches `decrypt`, so more than ~1.7s of database latency ahead of
-/// this still cancels the request mid-loop.
+/// this still cancels the request mid-loop, and the cold path does up to three
+/// pool queries before it gets here. That reservation is real but unenforced: see
+/// [`crate::request_bounds::SQLX_ACQUIRE_TIMEOUT`] for why the per-step budgets
+/// on this path cannot be summed into a guarantee, and what would close it.
 const KMS_ATTEMPT_TIMEOUT_SECS: u64 = 2;
 
 /// Worst-case wall clock for a full [`MAX_KMS_RETRIES`] loop, asserted below so
