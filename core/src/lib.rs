@@ -1,10 +1,12 @@
 pub mod ap_signing;
 pub mod authorization_channel;
 pub mod bunker_key;
+pub mod coalescing_activity;
 pub mod creator_binding;
 pub mod custom_permissions;
 pub mod database;
 pub mod encryption;
+pub mod env_config;
 pub mod instance;
 pub mod metrics;
 pub mod oauth_scopes;

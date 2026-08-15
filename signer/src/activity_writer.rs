@@ -1,13 +1,17 @@
 // ABOUTME: Bounded, coalescing activity writer for relay-based NIP-46 requests
 // ABOUTME: Keeps successful relay operations from spawning unbounded database tasks
 
-use keycast_core::metrics::METRICS;
+use async_trait::async_trait;
+use keycast_core::{
+    coalescing_activity::{
+        CoalescingActivityHooks, CoalescingActivityLogger, CoalescingActivityWorker,
+        CoalescingRecordResult,
+    },
+    metrics::METRICS,
+};
 use sqlx::PgPool;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
-use tokio::{
-    sync::{mpsc, Notify},
-    time::MissedTickBehavior,
-};
+use tokio::sync::Notify;
 
 const DEFAULT_QUEUE_CAPACITY: usize = 4096;
 const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
@@ -18,7 +22,7 @@ type AuthorizationKey = (i64, i64);
 
 #[derive(Debug, Clone)]
 pub struct RelayActivityLogger {
-    sender: mpsc::Sender<AuthorizationKey>,
+    logger: CoalescingActivityLogger<AuthorizationKey, RelayActivityHooks>,
 }
 
 impl RelayActivityLogger {
@@ -37,88 +41,80 @@ impl RelayActivityLogger {
         flush_interval: Duration,
         max_batch_ids: usize,
     ) -> (Self, RelayActivityWorker) {
-        let (sender, receiver) = mpsc::channel(queue_capacity);
-        (
-            Self { sender },
-            RelayActivityWorker {
-                pool,
-                receiver,
-                flush_interval,
-                max_batch_ids,
-            },
-        )
+        let (logger, worker) = CoalescingActivityLogger::new(
+            pool,
+            queue_capacity,
+            flush_interval,
+            max_batch_ids,
+            RelayActivityHooks,
+        );
+        (Self { logger }, RelayActivityWorker { worker })
     }
 
     pub fn record(&self, tenant_id: i64, authorization_id: i64) {
-        match self.sender.try_send((tenant_id, authorization_id)) {
-            Ok(()) => METRICS.inc_nip46_activity_queued(),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                METRICS.inc_nip46_activity_dropped("queue_full")
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                METRICS.inc_nip46_activity_dropped("writer_stopped")
-            }
+        match self.logger.record((tenant_id, authorization_id)) {
+            CoalescingRecordResult::Queued
+            | CoalescingRecordResult::Dropped
+            | CoalescingRecordResult::WriterStopped => {}
         }
     }
 }
 
 pub struct RelayActivityWorker {
-    pool: PgPool,
-    receiver: mpsc::Receiver<AuthorizationKey>,
-    flush_interval: Duration,
-    max_batch_ids: usize,
+    worker: CoalescingActivityWorker<AuthorizationKey, RelayActivityHooks>,
 }
 
 impl RelayActivityWorker {
-    pub async fn run_until_shutdown(mut self, shutdown: Arc<Notify>) {
-        let mut pending = BTreeMap::new();
-        let mut flush_interval = tokio::time::interval(self.flush_interval);
-        flush_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let shutdown_notified = shutdown.notified();
-        tokio::pin!(shutdown_notified);
-        shutdown_notified.as_mut().enable();
-        let mut last_flush_failed = false;
+    pub async fn run_until_shutdown(self, shutdown: Arc<Notify>) {
+        self.worker.run_until_shutdown(shutdown).await;
+    }
+}
 
-        loop {
-            tokio::select! {
-                event = self.receiver.recv() => {
-                    match event {
-                        Some(key) => accumulate(&mut pending, key, 1),
-                        None => break,
-                    }
-                }
-                _ = flush_interval.tick() => {
-                    last_flush_failed = !self.flush(&mut pending).await;
-                }
-                _ = &mut shutdown_notified => break,
-            }
+#[derive(Debug, Clone)]
+struct RelayActivityHooks;
 
-            METRICS.set_nip46_activity_pending(pending.len() as u64);
-            if !last_flush_failed && pending.len() >= self.max_batch_ids {
-                last_flush_failed = !self.flush(&mut pending).await;
-            }
-        }
-
-        while let Ok(key) = self.receiver.try_recv() {
-            accumulate(&mut pending, key, 1);
-        }
-        self.flush(&mut pending).await;
-        if !pending.is_empty() {
-            let lost = total_events(&pending);
-            METRICS.add_nip46_activity_dropped("shutdown_flush_failed", lost);
-            tracing::error!(lost_events = lost, "Lost NIP-46 activity during shutdown");
-        }
-        METRICS.set_nip46_activity_pending(0);
+#[async_trait]
+impl CoalescingActivityHooks<AuthorizationKey> for RelayActivityHooks {
+    fn accumulate(
+        &self,
+        pending: &mut BTreeMap<AuthorizationKey, i64>,
+        key: AuthorizationKey,
+        count: i64,
+    ) {
+        accumulate(pending, key, count);
     }
 
-    async fn flush(&self, pending: &mut BTreeMap<AuthorizationKey, i64>) -> bool {
-        let before = pending.len();
-        let lost = flush_pending(&self.pool, pending).await;
-        if lost > 0 {
-            METRICS.add_nip46_activity_dropped("retention_limit", lost);
-        }
-        METRICS.set_nip46_activity_pending(pending.len() as u64);
-        before == 0 || (pending.is_empty() && lost == 0)
+    fn queued(&self) {
+        METRICS.inc_nip46_activity_queued();
+    }
+
+    fn dropped_full(&self) {
+        METRICS.inc_nip46_activity_dropped("queue_full");
+    }
+
+    fn writer_stopped(&self) {
+        METRICS.inc_nip46_activity_dropped("writer_stopped");
+    }
+
+    fn set_pending(&self, pending: usize) {
+        METRICS.set_nip46_activity_pending(pending as u64);
+    }
+
+    fn final_flush_lost(&self, lost: u64) {
+        METRICS.add_nip46_activity_dropped("shutdown_flush_failed", lost);
+        tracing::error!(lost_events = lost, "Lost NIP-46 activity during shutdown");
+    }
+
+    fn flush_lost(&self, lost: u64) {
+        METRICS.add_nip46_activity_dropped("retention_limit", lost);
+    }
+
+    async fn flush_pending(
+        &self,
+        pool: &PgPool,
+        pending: &mut BTreeMap<AuthorizationKey, i64>,
+    ) -> u64 {
+        flush_pending(pool, pending).await
     }
 }
 
@@ -128,10 +124,6 @@ fn accumulate(pending: &mut BTreeMap<AuthorizationKey, i64>, key: AuthorizationK
         return;
     }
     *pending.entry(key).or_insert(0) += count;
-}
-
-fn total_events(pending: &BTreeMap<AuthorizationKey, i64>) -> u64 {
-    pending.values().map(|count| *count as u64).sum()
 }
 
 async fn flush_pending(pool: &PgPool, pending: &mut BTreeMap<AuthorizationKey, i64>) -> u64 {
@@ -162,13 +154,6 @@ async fn flush_pending(pool: &PgPool, pending: &mut BTreeMap<AuthorizationKey, i
         METRICS.inc_nip46_activity_write_failure();
         for (key, count) in batch {
             accumulate(pending, key, count);
-        }
-
-        if pending.len() > MAX_RETAINED_IDS {
-            let lost = total_events(pending);
-            pending.clear();
-            tracing::error!(error = %error, lost_events = lost, "NIP-46 activity retention limit reached");
-            return lost;
         }
 
         tracing::error!(error = %error, "Failed to flush NIP-46 activity; retaining batch");

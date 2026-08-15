@@ -1,13 +1,17 @@
 // ABOUTME: Bounded OAuth activity logger for HTTP RPC requests
 // ABOUTME: Coalesces authorization activity updates so request handlers never spawn DB work
 
-use keycast_core::metrics::METRICS;
+use async_trait::async_trait;
+use keycast_core::{
+    coalescing_activity::{
+        accumulate_unbounded, total_events, CoalescingActivityHooks, CoalescingActivityLogger,
+        CoalescingActivityWorker, CoalescingRecordResult,
+    },
+    metrics::METRICS,
+};
 use sqlx::PgPool;
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
-use tokio::{
-    sync::{mpsc, Notify},
-    time::MissedTickBehavior,
-};
+use tokio::sync::Notify;
 
 const DEFAULT_QUEUE_CAPACITY: usize = 4096;
 const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
@@ -31,7 +35,7 @@ pub enum ActivityLogResult {
 
 #[derive(Debug, Clone)]
 pub struct ActivityLogger {
-    sender: Option<mpsc::Sender<ActivityLogEvent>>,
+    logger: Option<CoalescingActivityLogger<i64, HttpRpcActivityHooks>>,
 }
 
 impl ActivityLogger {
@@ -50,23 +54,24 @@ impl ActivityLogger {
         flush_interval: Duration,
         max_batch_ids: usize,
     ) -> (Self, ActivityLogWorker) {
-        let (sender, receiver) = mpsc::channel(queue_capacity);
+        let (logger, worker) = CoalescingActivityLogger::new(
+            pool,
+            queue_capacity,
+            flush_interval,
+            max_batch_ids,
+            HttpRpcActivityHooks,
+        );
 
         (
             Self {
-                sender: Some(sender),
+                logger: Some(logger),
             },
-            ActivityLogWorker {
-                pool,
-                receiver,
-                flush_interval,
-                max_batch_ids,
-            },
+            ActivityLogWorker { worker },
         )
     }
 
     pub fn disabled() -> Self {
-        Self { sender: None }
+        Self { logger: None }
     }
 
     pub fn record(&self, is_oauth: bool, authorization_id: i64) -> ActivityLogResult {
@@ -74,115 +79,73 @@ impl ActivityLogger {
             return ActivityLogResult::SkippedNonOauth;
         }
 
-        let Some(sender) = &self.sender else {
+        let Some(logger) = &self.logger else {
             return ActivityLogResult::Disabled;
         };
 
-        match sender.try_send(ActivityLogEvent { authorization_id }) {
-            Ok(()) => ActivityLogResult::Queued,
-            Err(mpsc::error::TrySendError::Full(_)) => ActivityLogResult::Dropped,
-            Err(mpsc::error::TrySendError::Closed(_)) => ActivityLogResult::WriterStopped,
+        match logger.record(authorization_id) {
+            CoalescingRecordResult::Queued => ActivityLogResult::Queued,
+            CoalescingRecordResult::Dropped => ActivityLogResult::Dropped,
+            CoalescingRecordResult::WriterStopped => ActivityLogResult::WriterStopped,
         }
     }
-}
-
-#[derive(Debug)]
-struct ActivityLogEvent {
-    authorization_id: i64,
 }
 
 pub struct ActivityLogWorker {
-    pool: PgPool,
-    receiver: mpsc::Receiver<ActivityLogEvent>,
-    flush_interval: Duration,
-    max_batch_ids: usize,
+    worker: CoalescingActivityWorker<i64, HttpRpcActivityHooks>,
 }
 
 impl ActivityLogWorker {
-    pub async fn run_until_shutdown(mut self, shutdown: Arc<Notify>) {
-        let mut pending: BTreeMap<i64, i64> = BTreeMap::new();
-        let mut flush_interval = tokio::time::interval(self.flush_interval);
-        flush_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
-        // `Notify::notify_waiters` (what graceful shutdown calls) only wakes
-        // waiters already registered when it fires; it stores no permit. A
-        // `notified()` future created fresh on each `select!` iteration is not
-        // registered while the loop is inside `flush_pending`, so a shutdown
-        // landing in that window would be lost forever and this task would
-        // never exit — the sender lives in the process-lifetime `KeycastState`,
-        // so `recv()` never returns `None` either. Register once, up front, and
-        // keep that registration across iterations.
-        let shutdown_notified = shutdown.notified();
-        tokio::pin!(shutdown_notified);
-        shutdown_notified.as_mut().enable();
-
-        // Because a failed flush retains its batch, `pending.len()` stays above
-        // `max_batch_ids` while the database is unhappy. Without this latch the
-        // size trigger below would then fire on every single received event —
-        // one acquire attempt per RPC request, competing for the very pool this
-        // change exists to relieve. While it is set, only the interval tick
-        // retries, which is the pacing the size trigger was never meant to
-        // override.
-        let mut last_flush_failed = false;
-
-        loop {
-            tokio::select! {
-                event = self.receiver.recv() => {
-                    match event {
-                        Some(event) => accumulate(&mut pending, event.authorization_id),
-                        None => break,
-                    }
-                }
-                _ = flush_interval.tick() => {
-                    last_flush_failed = !self.flush(&mut pending).await;
-                }
-                _ = &mut shutdown_notified => {
-                    break;
-                }
-            }
-
-            if !last_flush_failed && pending.len() >= self.max_batch_ids {
-                last_flush_failed = !self.flush(&mut pending).await;
-            }
-        }
-
-        while let Ok(event) = self.receiver.try_recv() {
-            accumulate(&mut pending, event.authorization_id);
-        }
-        self.flush(&mut pending).await;
-
-        // Last chance is gone: the task is about to return and `pending` dies
-        // with it, so anything still retained is lost and has to say so.
-        if !pending.is_empty() {
-            let lost: u64 = pending.values().map(|count| *count as u64).sum();
-            METRICS.add_http_rpc_activity_dropped(lost);
-            tracing::error!(
-                lost_events = lost,
-                "Lost OAuth authorization activity: the final flush before shutdown failed"
-            );
-        }
-    }
-
-    /// Returns whether the write succeeded, so the caller can stop using the
-    /// batch-size trigger while the database is failing.
-    async fn flush(&self, pending: &mut BTreeMap<i64, i64>) -> bool {
-        let before = pending.len();
-        let lost = flush_pending(&self.pool, pending).await;
-        if lost > 0 {
-            METRICS.add_http_rpc_activity_dropped(lost);
-        }
-        // A successful write always empties the map; a failure either retains
-        // the batch or gives it up and reports the loss.
-        before == 0 || (pending.is_empty() && lost == 0)
+    pub async fn run_until_shutdown(self, shutdown: Arc<Notify>) {
+        self.worker.run_until_shutdown(shutdown).await;
     }
 }
 
+#[derive(Debug, Clone)]
+struct HttpRpcActivityHooks;
+
+#[async_trait]
+impl CoalescingActivityHooks<i64> for HttpRpcActivityHooks {
+    fn accumulate(&self, pending: &mut BTreeMap<i64, i64>, authorization_id: i64, count: i64) {
+        accumulate_by(pending, authorization_id, count);
+    }
+
+    fn queued(&self) {}
+
+    fn dropped_full(&self) {
+        METRICS.inc_http_rpc_activity_dropped();
+    }
+
+    fn writer_stopped(&self) {
+        METRICS.inc_http_rpc_activity_dropped();
+    }
+
+    fn set_pending(&self, _pending: usize) {}
+
+    fn final_flush_lost(&self, lost: u64) {
+        METRICS.add_http_rpc_activity_dropped(lost);
+        tracing::error!(
+            lost_events = lost,
+            "Lost OAuth authorization activity: the final flush before shutdown failed"
+        );
+    }
+
+    fn flush_lost(&self, lost: u64) {
+        METRICS.add_http_rpc_activity_dropped(lost);
+    }
+
+    async fn flush_pending(&self, pool: &PgPool, pending: &mut BTreeMap<i64, i64>) -> u64 {
+        flush_pending(pool, pending).await
+    }
+}
+
+#[cfg(test)]
 fn accumulate(pending: &mut BTreeMap<i64, i64>, authorization_id: i64) {
     accumulate_by(pending, authorization_id, 1);
 }
 
 fn accumulate_by(pending: &mut BTreeMap<i64, i64>, authorization_id: i64, count: i64) {
-    *pending.entry(authorization_id).or_insert(0) += count;
+    accumulate_unbounded(pending, authorization_id, count);
 }
 
 /// Writes the coalesced counts and returns the number of events that were lost
@@ -216,7 +179,7 @@ async fn flush_pending(pool: &PgPool, pending: &mut BTreeMap<i64, i64>) -> u64 {
         }
 
         if pending.len() > MAX_RETAINED_IDS {
-            let lost: u64 = pending.values().map(|count| *count as u64).sum();
+            let lost = total_events(pending);
             pending.clear();
             tracing::error!(
                 error = %error,

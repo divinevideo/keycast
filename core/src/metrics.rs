@@ -96,7 +96,9 @@ pub struct Metrics {
     pub nip46_requests_total: AtomicU64,
     /// NIP-46 requests rejected by hashring (not our responsibility)
     pub nip46_requests_rejected_hashring: AtomicU64,
+    /// NIP-46 requests rejected by hashring before relay queue admission
     pub nip46_requests_rejected_hashring_prequeue: AtomicU64,
+    /// NIP-46 requests rejected by hashring after leaving the relay queue
     pub nip46_requests_rejected_hashring_worker: AtomicU64,
     /// NIP-46 requests where handler was not found
     pub nip46_requests_handler_not_found: AtomicU64,
@@ -110,29 +112,53 @@ pub struct Metrics {
     pub nip46_requests_queue_closed: AtomicU64,
     /// NIP-46 tombstone responses sent (revoked/expired authorizations)
     pub nip46_tombstone_responses: AtomicU64,
+    /// Approximate relay queue depth after admission and worker receives
     pub nip46_queue_depth: AtomicU64,
+    /// Configured relay queue capacity
     pub nip46_queue_capacity: AtomicU64,
+    /// Number of observed relay queue wait durations
     pub nip46_queue_wait_count: AtomicU64,
+    /// Sum of observed relay queue wait durations in microseconds
     pub nip46_queue_wait_micros: AtomicU64,
+    /// Current number of relay workers processing a request
     pub nip46_workers_active: AtomicU64,
+    /// Number of observed relay worker processing durations
     pub nip46_worker_duration_count: AtomicU64,
+    /// Sum of observed relay worker processing durations in microseconds
     pub nip46_worker_duration_micros: AtomicU64,
+    /// Relay requests shed because one target pubkey occupied too much queue capacity
     pub nip46_noisy_target_shed: AtomicU64,
+    /// Relay requests shed because one client pubkey occupied too much queue capacity
     pub nip46_noisy_client_shed: AtomicU64,
+    /// Current number of cache-miss authorization lookups in flight
     pub nip46_lookup_in_flight: AtomicU64,
+    /// Configured cache-miss authorization lookup concurrency limit
     pub nip46_lookup_limit: AtomicU64,
+    /// Cache-miss authorization lookups that reached the database/KMS path
     pub nip46_lookup_database_total: AtomicU64,
+    /// Cache-miss authorization lookups that failed on a dependency error
     pub nip46_lookup_errors: AtomicU64,
+    /// Cache-miss authorization lookups shed because lookup admission was full
     pub nip46_lookup_shed: AtomicU64,
+    /// Cache-miss authorization lookup results discarded after invalidation races
     pub nip46_lookup_invalidated: AtomicU64,
+    /// Unknown-bunker requests served from the negative lookup cache
     pub nip46_negative_cache_hits: AtomicU64,
+    /// Current approximate negative lookup cache entry count
     pub nip46_negative_cache_size: AtomicU64,
+    /// Relay activity updates accepted by the coalescing writer
     pub nip46_activity_queued: AtomicU64,
+    /// Relay activity updates dropped because the coalescing writer queue was full
     pub nip46_activity_dropped_queue_full: AtomicU64,
+    /// Relay activity updates dropped because the coalescing writer had stopped
     pub nip46_activity_dropped_writer_stopped: AtomicU64,
+    /// Relay activity updates lost during final shutdown flush
     pub nip46_activity_dropped_shutdown: AtomicU64,
+    /// Relay activity updates dropped to keep retained pending IDs bounded
     pub nip46_activity_dropped_retention: AtomicU64,
+    /// Failed coalesced relay activity database writes
     pub nip46_activity_write_failures: AtomicU64,
+    /// Current retained authorization IDs in the relay activity writer
     pub nip46_activity_pending: AtomicU64,
 
     // === HTTP RPC Metrics ===

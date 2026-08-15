@@ -4,6 +4,7 @@
 use crate::error::{SignerError, SignerResult};
 use crate::signer_daemon::RelayWorkerContext;
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
+use keycast_core::env_config::configured_positive_usize;
 use keycast_core::metrics::METRICS;
 use nostr_sdk::prelude::*;
 use std::collections::HashMap;
@@ -16,11 +17,11 @@ const WORKER_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// NIP-46 request item for the relay queue
 /// Contains all data needed to process a single NIP-46 request
-pub struct Nip46RpcItem {
+pub(crate) struct Nip46RpcItem {
     /// The original NIP-46 event from the relay
     pub event: Box<Event>,
-    /// The bunker pubkey (target of the request, extracted from p-tag)
-    pub bunker_pubkey: String,
+    #[cfg_attr(not(test), allow(dead_code))]
+    bunker_pubkey: String,
     enqueued_at: Instant,
     flow_permit: Option<FlowPermit>,
 }
@@ -40,8 +41,9 @@ pub struct RelayQueue {
 impl RelayQueue {
     /// Create a new relay queue with bounded capacity
     pub fn new() -> Self {
-        let capacity = configured_usize("RELAY_QUEUE_CAPACITY", DEFAULT_QUEUE_CAPACITY);
-        let flow_queue_limit = configured_usize("RELAY_FLOW_QUEUE_LIMIT", DEFAULT_FLOW_QUEUE_LIMIT);
+        let capacity = configured_positive_usize("RELAY_QUEUE_CAPACITY", DEFAULT_QUEUE_CAPACITY);
+        let flow_queue_limit =
+            configured_positive_usize("RELAY_FLOW_QUEUE_LIMIT", DEFAULT_FLOW_QUEUE_LIMIT);
         Self::with_config(capacity, flow_queue_limit)
     }
 
@@ -294,6 +296,7 @@ where
         // continue serving a busy flow.
         drop(item.flow_permit.take());
         METRICS.inc_nip46_workers_active();
+        let _active_worker = ActiveWorkerGuard;
         let processing_started = Instant::now();
 
         // Process the item
@@ -308,19 +311,18 @@ where
                 }
             }
         }
-        METRICS.dec_nip46_workers_active();
         METRICS.observe_nip46_worker_duration(processing_started.elapsed());
     }
 
     tracing::debug!("Relay worker {} exited", worker_id);
 }
 
-fn configured_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default)
+struct ActiveWorkerGuard;
+
+impl Drop for ActiveWorkerGuard {
+    fn drop(&mut self) {
+        METRICS.dec_nip46_workers_active();
+    }
 }
 
 #[derive(Clone)]

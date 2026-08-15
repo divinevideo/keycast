@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use cluster_hashring::{ClusterCoordinator, MembershipEvent};
 use keycast_core::authorization_channel::{AuthorizationCommand, AuthorizationReceiver};
 use keycast_core::encryption::KeyManager;
+use keycast_core::env_config::configured_positive_usize;
 use keycast_core::metrics::METRICS;
 use keycast_core::signing_handler::SigningHandler;
 use keycast_core::signing_session::canonicalize_event_author;
@@ -1065,14 +1066,14 @@ impl Drop for ActiveLookupGuard {
 
 impl AuthorizationLookup {
     fn new() -> Self {
-        let negative_capacity = configured_usize("NIP46_NEGATIVE_CACHE_SIZE", 10_000);
-        let singleflight_capacity = configured_usize(
+        let negative_capacity = configured_positive_usize("NIP46_NEGATIVE_CACHE_SIZE", 10_000);
+        let singleflight_capacity = configured_positive_usize(
             "NIP46_SINGLEFLIGHT_CACHE_SIZE",
             DEFAULT_NIP46_SINGLEFLIGHT_CACHE_SIZE,
         );
-        let ttl_secs = configured_usize("NIP46_NEGATIVE_CACHE_TTL_SECS", 30);
+        let ttl_secs = configured_positive_usize("NIP46_NEGATIVE_CACHE_TTL_SECS", 30);
         let concurrency =
-            configured_usize("NIP46_LOOKUP_CONCURRENCY", DEFAULT_NIP46_LOOKUP_CONCURRENCY);
+            configured_positive_usize("NIP46_LOOKUP_CONCURRENCY", DEFAULT_NIP46_LOOKUP_CONCURRENCY);
         Self::with_capacities(
             negative_capacity,
             singleflight_capacity,
@@ -1243,14 +1244,6 @@ fn invalidate_all_authorization_caches(
 ) {
     lookup.invalidate_all();
     handlers.invalidate_all();
-}
-
-fn configured_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default)
 }
 
 #[derive(Clone, Copy)]
@@ -1531,15 +1524,19 @@ impl UnifiedSigner {
                                 &bunker_pubkey,
                             )
                             .await;
-                            if let Err(error) = coordinator_clone
-                                .publish_authorization_invalidation(&bunker_pubkey)
-                                .await
-                            {
-                                tracing::warn!(
-                                    error = %error,
-                                    "Failed to publish authorization cache invalidation; TTL remains the fallback"
-                                );
-                            }
+                            let coordinator = coordinator_clone.clone();
+                            let invalidated_pubkey = bunker_pubkey.clone();
+                            tokio::spawn(async move {
+                                if let Err(error) = coordinator
+                                    .publish_authorization_invalidation(&invalidated_pubkey)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        error = %error,
+                                        "Failed to publish authorization cache invalidation; TTL remains the fallback"
+                                    );
+                                }
+                            });
                             tracing::debug!(
                                 "Received Upsert command for bunker: {}",
                                 bunker_pubkey
