@@ -1068,7 +1068,7 @@ async fn test_sign_canonical_denied_by_readonly_policy() {
 
 #[tokio::test]
 #[serial]
-async fn test_suspended_user_denied_nostr_rpc_sign_canonical() {
+async fn test_suspended_user_allowed_nostr_rpc_sign_canonical() {
     let pool = setup_db().await;
     let tenant_id = create_test_tenant(&pool).await;
     let (user_keys, pubkey) = create_test_user();
@@ -1109,7 +1109,7 @@ async fn test_suspended_user_denied_nostr_rpc_sign_canonical() {
     .await;
     let auth_state = create_test_auth_state(pool.clone(), key_manager);
 
-    let err = invoke_nostr_rpc(
+    invoke_nostr_rpc(
         create_test_tenant_extractor(tenant_id),
         auth_state,
         &format!("Bearer {}", token),
@@ -1122,14 +1122,7 @@ async fn test_suspended_user_denied_nostr_rpc_sign_canonical() {
         },
     )
     .await
-    .expect_err("suspended user should be denied creator-binding signing");
-
-    match err {
-        RpcError::AccountSuspended(message) => {
-            assert_eq!(message, "Account restricted");
-        }
-        other => panic!("expected AccountSuspended, got {other:?}"),
-    }
+    .expect("suspended user should still be able to sign (keycast#373)");
 }
 
 // ============================================================================
@@ -1582,10 +1575,20 @@ async fn suspend_user(pool: &PgPool, pubkey: &str, tenant_id: i64) {
         .expect("Failed to suspend user");
 }
 
-/// Test: suspended user denied from sign_event HTTP endpoint (covers slow path)
+async fn ban_user(pool: &PgPool, pubkey: &str, tenant_id: i64) {
+    use keycast_core::repositories::UserRepository;
+    use keycast_core::types::user::UserStatus;
+    let user_repo = UserRepository::new(pool.clone());
+    user_repo
+        .set_user_status(pubkey, tenant_id, &UserStatus::Banned, Some("test_ban"))
+        .await
+        .expect("Failed to ban user");
+}
+
+/// Test: suspended user may still sign via the HTTP endpoint (keycast#373, covers slow path)
 #[tokio::test]
 #[serial]
-async fn test_suspended_user_denied_sign_event() {
+async fn test_suspended_user_allowed_sign_event() {
     let pool = setup_db().await;
     let tenant_id = create_test_tenant(&pool).await;
     let (user_keys, pubkey) = create_test_user();
@@ -1636,18 +1639,79 @@ async fn test_suspended_user_denied_sign_event() {
     )
     .await;
 
-    match result {
-        Err(AuthError::Forbidden(msg)) => {
-            assert_eq!(msg, "Account restricted");
-        }
-        other => panic!("expected Forbidden(Account restricted), got: {:?}", other),
-    }
+    assert!(
+        result.is_ok(),
+        "suspended user should still be able to sign (keycast#373), got: {:?}",
+        result.err()
+    );
 }
 
-/// Test: suspended user denied from nostr_rpc sign_event method
+/// Test: banned user may still sign, so a banned account can export and
+/// republish elsewhere (keycast#373).
 #[tokio::test]
 #[serial]
-async fn test_suspended_user_denied_nostr_rpc_sign() {
+async fn test_banned_user_allowed_sign_event() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (user_keys, pubkey) = create_test_user();
+    let key_manager = FileKeyManager::new().expect("Failed to create key manager");
+
+    insert_user(&pool, tenant_id, &pubkey).await;
+    create_personal_key(&pool, tenant_id, &pubkey, &user_keys, &key_manager).await;
+
+    let redirect_origin = format!("https://ban-sign-{}.example.com", Uuid::new_v4());
+    create_test_oauth_authorization(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &redirect_origin,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    // Ban the user
+    ban_user(&pool, &pubkey, tenant_id).await;
+
+    // Build UCAN and call sign_event (no cached handler → slow path)
+    // sign_event extracts user from UCAN audience, doesn't need bunker_pubkey
+    let token = build_self_signed_ucan(&user_keys, tenant_id, &redirect_origin, None).await;
+    let auth_state = create_test_auth_state(
+        pool.clone(),
+        Arc::new(Box::new(key_manager) as Box<dyn KeyManager>),
+    );
+
+    let unsigned = EventBuilder::text_note("should be denied").build(user_keys.public_key());
+    let event_json = serde_json::to_value(&unsigned).expect("Failed to serialize unsigned event");
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "Authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    headers.insert("host", "login.divine.video".parse().unwrap());
+    headers.insert("x-forwarded-proto", "https".parse().unwrap());
+
+    let result = sign_event(
+        create_test_tenant_extractor(tenant_id),
+        State(auth_state),
+        headers,
+        Json(SignEventRequest { event: event_json }),
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "banned user should still be able to sign (keycast#373), got: {:?}",
+        result.err()
+    );
+}
+
+/// Test: suspended user may still sign via nostr_rpc (keycast#373)
+#[tokio::test]
+#[serial]
+async fn test_suspended_user_allowed_nostr_rpc_sign() {
     let pool = setup_db().await;
     let tenant_id = create_test_tenant(&pool).await;
     let (user_keys, pubkey) = create_test_user();
@@ -1687,7 +1751,7 @@ async fn test_suspended_user_denied_nostr_rpc_sign() {
     let unsigned = EventBuilder::text_note("should be denied").build(user_keys.public_key());
     let event_json = serde_json::to_value(&unsigned).expect("Failed to serialize unsigned event");
 
-    let err = invoke_nostr_rpc(
+    invoke_nostr_rpc(
         create_test_tenant_extractor(tenant_id),
         auth_state,
         &format!("Bearer {}", token),
@@ -1698,14 +1762,7 @@ async fn test_suspended_user_denied_nostr_rpc_sign() {
         },
     )
     .await
-    .expect_err("Suspended user should be denied signing via RPC");
-
-    match err {
-        RpcError::AccountSuspended(msg) => {
-            assert_eq!(msg, "Account restricted");
-        }
-        other => panic!("expected AccountSuspended, got: {:?}", other),
-    }
+    .expect("suspended user should still be able to sign via RPC (keycast#373)");
 }
 
 /// Test: suspended user can still call get_public_key via nostr_rpc
