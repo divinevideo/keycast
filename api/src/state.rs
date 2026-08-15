@@ -1,8 +1,8 @@
 use crate::activity_log::ActivityLogger;
 use crate::api::tenant::Tenant;
-use crate::bcrypt_queue::BcryptSender;
 use crate::handlers::http_rpc_handler::HttpHandlerCache;
 use crate::redis::PrefixedRedis;
+use keycast_core::bcrypt_admission::BcryptAdmission;
 use keycast_core::encryption::KeyManager;
 use keycast_core::secret_pool::SecretPoolReceiver;
 use keycast_core::signing_handler::SignerHandlersCache;
@@ -38,9 +38,8 @@ pub struct KeycastState {
     pub server_keys: Keys,
     /// Tenant cache: domain -> Tenant (preloaded at startup for zero-latency lookups)
     pub tenant_cache: TenantCache,
-    /// Bcrypt queue sender for async password hashing during registration
-    /// Workers hash passwords in background; DB tracks pending state via NULL password_hash
-    pub bcrypt_sender: BcryptSender,
+    /// Process-wide bounded admission for every bcrypt operation.
+    pub bcrypt: BcryptAdmission,
     /// Redis connection for OAuth polling (multi-device email verification)
     /// Optional to allow graceful degradation if Redis is unavailable
     pub redis: Option<PrefixedRedis>,

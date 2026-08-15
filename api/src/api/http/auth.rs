@@ -2,26 +2,25 @@
 // ABOUTME: Implements UCAN-based authentication and NIP-46 bunker URL generation
 
 use axum::{
-    extract::{Query, State},
+    extract::{Extension, Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     Json,
 };
-use bcrypt::{hash, verify, DEFAULT_COST};
+use bcrypt::DEFAULT_COST;
 use chrono::{Duration, Utc};
 use secrecy::{ExposeSecret, SecretString};
 
 use super::admin::{is_full_admin, is_support_admin};
 use crate::api::extractors::UcanAuth;
-use crate::bcrypt_queue::{BcryptJob, BcryptQueueError};
 use crate::brand::BRAND_NAME;
 use crate::key_egress_limiter::{
     KeyEgressAdmission, KeyEgressLimiter, KeyEgressReservation, KEY_EGRESS_FINALIZATION_DEADLINE,
     KEY_EGRESS_RESERVED_WORK_DEADLINE,
 };
 use crate::nip98;
-use crate::password_verifier::{
-    PasswordVerificationError, PasswordVerificationPermit, PasswordVerifier,
+use keycast_core::bcrypt_admission::{
+    BcryptAdmission, BcryptAdmissionError, BcryptOperation, BcryptPermit, BcryptWorkload,
 };
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
@@ -82,14 +81,6 @@ pub(crate) const KEY_EGRESS_EVENT_TYPE: &str = "key_egress";
 /// gates that run before it refuse an account that cannot succeed anyway, so counting
 /// them would lock out a user who never guessed at anything.
 pub(crate) const KEY_EGRESS_INVALID_PASSWORD_REASON: &str = "invalid_password";
-/// Maximum wait for CPU verification capacity before load shedding.
-const KEY_EGRESS_VERIFIER_PERMIT_WAIT: StdDuration = StdDuration::from_millis(250);
-
-static KEY_EGRESS_PASSWORD_VERIFIER: once_cell::sync::Lazy<PasswordVerifier> =
-    once_cell::sync::Lazy::new(|| {
-        PasswordVerifier::new(num_cpus::get().max(1), KEY_EGRESS_VERIFIER_PERMIT_WAIT)
-    });
-
 /// Get token expiry in seconds. Uses `TOKEN_EXPIRY_SECONDS` env var if set,
 /// otherwise defaults to 24 hours (86400 seconds).
 pub fn token_expiry_seconds() -> i64 {
@@ -759,6 +750,18 @@ fn retryable_service_unavailable(
     }
 }
 
+fn bcrypt_auth_error(error: BcryptAdmissionError) -> AuthError {
+    match error {
+        BcryptAdmissionError::Bcrypt(error) => AuthError::PasswordHash(error),
+        BcryptAdmissionError::AtCapacity
+        | BcryptAdmissionError::ShuttingDown
+        | BcryptAdmissionError::WorkerFailed => AuthError::ServiceUnavailable {
+            message: "Password service is busy. Please try again shortly.".to_string(),
+            retry_after: Some(1),
+        },
+    }
+}
+
 impl From<sqlx::Error> for AuthError {
     fn from(e: sqlx::Error) -> Self {
         AuthError::Database(e)
@@ -1049,8 +1052,18 @@ pub async fn register(
         "Registration attempt"
     );
 
+    let password_hash = auth_state
+        .state
+        .bcrypt
+        .hash(
+            BcryptWorkload::Signup,
+            SecretString::from(req.password.clone()),
+            DEFAULT_COST,
+        )
+        .await
+        .map_err(bcrypt_auth_error)?;
+
     // Generate email verification token
-    // Note: Password hashing is deferred to background worker via bcrypt queue
     // Email uniqueness is enforced by idx_users_email_tenant constraint
     let verification_token = generate_secure_token();
     let verification_expires = Utc::now() + Duration::hours(EMAIL_VERIFICATION_EXPIRY_HOURS);
@@ -1087,8 +1100,7 @@ pub async fn register(
         .await
         .map_err(|e| AuthError::Encryption(e.to_string()))?;
 
-    // Register user with personal key in a single transaction
-    // Password hash is NULL initially - will be set by bcrypt worker
+    // Register user with personal key in a single transaction.
     // Returns Err(RepositoryError::Duplicate) if email already exists, which maps to AuthError::EmailAlreadyExists
     let user_repo = UserRepository::new(pool.clone());
     user_repo
@@ -1096,46 +1108,12 @@ pub async fn register(
             &public_key.to_hex(),
             tenant_id,
             &req.email,
-            None, // password_hash computed async by bcrypt worker
+            Some(&password_hash),
             &verification_token,
             verification_expires,
             &encrypted_secret,
         )
         .await?;
-
-    // Queue bcrypt job to hash password in background
-    // Worker will UPDATE users SET password_hash = $hash WHERE email_verification_token = $token
-    let bcrypt_result = auth_state.state.bcrypt_sender.try_send(BcryptJob {
-        token: verification_token.clone(),
-        password: SecretString::from(req.password.clone()),
-    });
-
-    if let Err(e) = bcrypt_result {
-        // If queue fails, we have a user row with NULL password_hash
-        // Clean up by deleting the user row (it would fail verification anyway)
-        tracing::error!("Failed to queue bcrypt job: {:?}, cleaning up user row", e);
-        let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1 AND tenant_id = $2")
-            .bind(public_key.to_hex())
-            .bind(tenant_id)
-            .execute(pool)
-            .await;
-        let _ = sqlx::query("DELETE FROM personal_keys WHERE user_pubkey = $1 AND tenant_id = $2")
-            .bind(public_key.to_hex())
-            .bind(tenant_id)
-            .execute(pool)
-            .await;
-
-        return match e {
-            BcryptQueueError::AtCapacity => Err(AuthError::ServiceUnavailable {
-                message: "Server at capacity, please try again".to_string(),
-                retry_after: Some(5),
-            }),
-            BcryptQueueError::ShuttingDown => Err(AuthError::ServiceUnavailable {
-                message: "Server restarting, please try again".to_string(),
-                retry_after: Some(10),
-            }),
-        };
-    }
 
     // Track successful registration
     METRICS.inc_registration();
@@ -1290,12 +1268,16 @@ pub async fn login(
         }
     };
 
-    // Verify password (spawn_blocking to avoid blocking async runtime)
-    let password = req.password.clone();
-    let hash = password_hash.clone();
-    let valid = tokio::task::spawn_blocking(move || verify(&password, &hash))
+    let valid = auth_state
+        .state
+        .bcrypt
+        .verify(
+            BcryptWorkload::Login,
+            SecretString::from(req.password.clone()),
+            password_hash.clone(),
+        )
         .await
-        .map_err(|e| AuthError::Internal(format!("Task join error: {}", e)))??;
+        .map_err(bcrypt_auth_error)?;
     if !valid {
         super::auth_observability::record_auth_event_and_log(
             pool,
@@ -2801,6 +2783,7 @@ pub async fn forgot_password(
 pub async fn reset_password(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
+    Extension(bcrypt): Extension<BcryptAdmission>,
     headers: HeaderMap,
     Json(req): Json<ResetPasswordRequest>,
 ) -> Result<Json<ResetPasswordResponse>, AuthError> {
@@ -2879,11 +2862,14 @@ pub async fn reset_password(
         }
     }
 
-    // Hash new password (spawn_blocking to avoid blocking async runtime)
-    let new_password = req.new_password.clone();
-    let password_hash = tokio::task::spawn_blocking(move || hash(&new_password, DEFAULT_COST))
+    let password_hash = bcrypt
+        .hash(
+            BcryptWorkload::Account,
+            SecretString::from(req.new_password.clone()),
+            DEFAULT_COST,
+        )
         .await
-        .map_err(|e| AuthError::Internal(format!("Task join error: {}", e)))??;
+        .map_err(bcrypt_auth_error)?;
 
     // Update password, clear reset token, and mark email as verified
     // (user proved email ownership by receiving and using the reset link)
@@ -4012,6 +3998,7 @@ pub struct ExportKeyResponse {
 pub async fn verify_password_for_export(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
+    Extension(bcrypt): Extension<BcryptAdmission>,
     headers: HeaderMap,
     Json(req): Json<VerifyPasswordRequest>,
 ) -> Result<Json<VerifyPasswordResponse>, AuthError> {
@@ -4025,13 +4012,14 @@ pub async fn verify_password_for_export(
         .await?
         .ok_or(AuthError::UserNotFound)?;
 
-    // Verify password (spawn_blocking to avoid blocking async runtime)
-    let password = req.password.clone();
-    let hash = password_hash.clone();
-    let valid = tokio::task::spawn_blocking(move || verify(&password, &hash))
+    let valid = bcrypt
+        .verify(
+            BcryptWorkload::Account,
+            SecretString::from(req.password.clone()),
+            password_hash.clone(),
+        )
         .await
-        .map_err(|e| AuthError::Internal(format!("Task join error: {}", e)))?
-        .map_err(|_| AuthError::Internal("Password verification failed".to_string()))?;
+        .map_err(bcrypt_auth_error)?;
 
     if !valid {
         return Err(AuthError::InvalidCredentials);
@@ -4052,6 +4040,7 @@ pub struct ChangePasswordRequest {
 pub async fn change_password(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
+    Extension(bcrypt): Extension<BcryptAdmission>,
     headers: HeaderMap,
     Json(req): Json<ChangePasswordRequest>,
 ) -> Result<Json<serde_json::Value>, AuthError> {
@@ -4072,24 +4061,27 @@ pub async fn change_password(
         .await?
         .ok_or(AuthError::UserNotFound)?;
 
-    // Verify current password
-    let current_password = req.current_password.clone();
-    let hash = password_hash.clone();
-    let valid = tokio::task::spawn_blocking(move || verify(&current_password, &hash))
+    let valid = bcrypt
+        .verify(
+            BcryptWorkload::Account,
+            SecretString::from(req.current_password.clone()),
+            password_hash.clone(),
+        )
         .await
-        .map_err(|e| AuthError::Internal(format!("Task join error: {}", e)))?
-        .map_err(|_| AuthError::Internal("Password verification failed".to_string()))?;
+        .map_err(bcrypt_auth_error)?;
 
     if !valid {
         return Err(AuthError::InvalidCredentials);
     }
 
-    // Hash new password
-    let new_password = req.new_password.clone();
-    let new_hash = tokio::task::spawn_blocking(move || bcrypt::hash(&new_password, DEFAULT_COST))
+    let new_hash = bcrypt
+        .hash(
+            BcryptWorkload::Account,
+            SecretString::from(req.new_password.clone()),
+            DEFAULT_COST,
+        )
         .await
-        .map_err(|e| AuthError::Internal(format!("Task join error: {}", e)))?
-        .map_err(|e| AuthError::Internal(format!("Password hashing failed: {}", e)))?;
+        .map_err(bcrypt_auth_error)?;
 
     // Update password in database
     user_repo
@@ -4166,6 +4158,7 @@ async fn record_email_change_event(
 pub async fn change_email(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
+    Extension(bcrypt): Extension<BcryptAdmission>,
     headers: HeaderMap,
     Json(req): Json<ChangeEmailRequest>,
 ) -> Result<Json<ChangeEmailResponse>, AuthError> {
@@ -4201,12 +4194,14 @@ pub async fn change_email(
         .get_credentials(&user_pubkey, tenant_id)
         .await?
         .ok_or(AuthError::UserNotFound)?;
-    let password = req.password.clone();
-    let hash = password_hash.clone();
-    let valid = tokio::task::spawn_blocking(move || verify(&password, &hash))
+    let valid = bcrypt
+        .verify(
+            BcryptWorkload::Account,
+            SecretString::from(req.password.clone()),
+            password_hash.clone(),
+        )
         .await
-        .map_err(|e| AuthError::Internal(format!("Task join error: {}", e)))?
-        .map_err(|_| AuthError::Internal("Password verification failed".to_string()))?;
+        .map_err(bcrypt_auth_error)?;
     if !valid {
         // Record the failed attempt — this endpoint re-verifies the password, so failures feed
         // the same abuse/brute-force monitoring as login/forgot-password.
@@ -4602,7 +4597,7 @@ fn key_egress_unavailable(message: &str) -> AuthError {
     }
 }
 
-fn password_verification_error(error: PasswordVerificationError) -> AuthError {
+fn password_verification_error(error: BcryptAdmissionError) -> AuthError {
     tracing::error!(
         error = %error,
         "raw-key egress password verification unavailable"
@@ -4659,23 +4654,16 @@ async fn reserve_key_egress_attempt(
 }
 
 async fn begin_key_egress_attempt(
-    verifier: &PasswordVerifier,
+    bcrypt: &BcryptAdmission,
     redis: Option<&crate::PrefixedRedis>,
     tenant_id: i64,
     current_pubkey: &str,
     endpoint: &'static str,
-) -> Result<
-    (
-        PasswordVerificationPermit,
-        KeyEgressReservation,
-        tokio::time::Instant,
-    ),
-    AuthError,
-> {
+) -> Result<(BcryptPermit, KeyEgressReservation, tokio::time::Instant), AuthError> {
     // CPU admission must happen before Redis admission: waiting for scarce
     // bcrypt capacity must never consume one of the account's attempt leases.
-    let verifier = verifier
-        .acquire()
+    let verifier = bcrypt
+        .reserve(BcryptWorkload::Account, BcryptOperation::Verify)
         .await
         .map_err(password_verification_error)?;
     let reserved_work_deadline = tokio::time::Instant::now() + KEY_EGRESS_RESERVED_WORK_DEADLINE;
@@ -4810,7 +4798,7 @@ pub async fn export_key(
     // CPU admission happens before Redis reservation. Waiting for verifier
     // capacity therefore cannot consume an attempt slot.
     let (verifier, reservation, reserved_work_deadline) = begin_key_egress_attempt(
-        &KEY_EGRESS_PASSWORD_VERIFIER,
+        &auth_state.state.bcrypt,
         auth_state.state.redis.as_ref(),
         tenant_id,
         &user_pubkey,
@@ -4833,7 +4821,7 @@ pub async fn export_key(
             return Ok::<PasswordOutcome, AuthError>(PasswordOutcome::EmailNotVerified);
         }
         let valid = verifier
-            .verify(password, password_hash)
+            .verify(SecretString::from(password), password_hash)
             .await
             .map_err(password_verification_error)?;
         Ok(if valid {
@@ -4994,7 +4982,7 @@ pub async fn change_key(
     .await?;
 
     let (verifier, reservation, reserved_work_deadline) = begin_key_egress_attempt(
-        &KEY_EGRESS_PASSWORD_VERIFIER,
+        &auth_state.state.bcrypt,
         auth_state.state.redis.as_ref(),
         tenant_id,
         &old_pubkey,
@@ -5016,7 +5004,7 @@ pub async fn change_key(
             .await?
             .ok_or(AuthError::UserNotFound)?;
         let valid = verifier
-            .verify(password, password_hash.clone())
+            .verify(SecretString::from(password), password_hash.clone())
             .await
             .map_err(password_verification_error)?;
         Ok::<ChangePasswordOutcome, AuthError>(if valid {
@@ -5370,10 +5358,21 @@ mod tests {
     use super::verify_html_page;
     use super::AccountStatusResponse;
     use super::BRAND_NAME;
+    use super::{bcrypt_auth_error, BcryptAdmissionError};
     #[cfg(feature = "integration-tests")]
     use super::{VERIFICATION_LINK_SUPERSEDED_CODE, VERIFICATION_LINK_SUPERSEDED_HEADING};
     use axum::response::IntoResponse;
     use ucan::Ucan;
+
+    #[test]
+    fn bcrypt_capacity_maps_to_retryable_service_unavailable() {
+        let response = bcrypt_auth_error(BcryptAdmissionError::AtCapacity).into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(response.headers()["Retry-After"], "1");
+    }
 
     #[tokio::test]
     async fn verification_status_page_uses_divine_login_branding() {
@@ -5451,8 +5450,8 @@ mod tests {
     #[cfg(feature = "integration-tests")]
     #[tokio::test]
     async fn verifier_capacity_is_acquired_before_a_redis_attempt_lease() {
-        use crate::password_verifier::PasswordVerifier;
         use crate::PrefixedRedis;
+        use keycast_core::bcrypt_admission::{BcryptAdmission, BcryptOperation, BcryptWorkload};
         use redis::aio::ConnectionManager;
         use std::time::Duration as StdDuration;
         use uuid::Uuid;
@@ -5465,8 +5464,11 @@ mod tests {
             .expect("connect to Redis");
         let prefix = format!("keycast-pr326-independent-review:{}", Uuid::new_v4());
         let redis = PrefixedRedis::new(connection, Some(prefix.clone()));
-        let verifier = PasswordVerifier::new(1, StdDuration::from_millis(10));
-        let held = verifier.acquire().await.expect("occupy verifier capacity");
+        let verifier = BcryptAdmission::new(1, StdDuration::from_millis(10));
+        let held = verifier
+            .reserve(BcryptWorkload::Account, BcryptOperation::Verify)
+            .await
+            .expect("occupy verifier capacity");
 
         let error = super::begin_key_egress_attempt(
             &verifier,
@@ -5496,6 +5498,58 @@ mod tests {
             "load shedding before CPU admission must not create an attempt lease: {keys:?}"
         );
         drop(held);
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn registration_waits_for_bcrypt_without_holding_max_one_database_pool() {
+        use keycast_core::bcrypt_admission::{BcryptOperation, BcryptWorkload};
+        use std::time::Duration as StdDuration;
+
+        let bootstrap = create_test_db().await;
+        bootstrap.close().await;
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string());
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(StdDuration::from_millis(200))
+            .connect(&database_url)
+            .await
+            .expect("connect max-one pool");
+        let bcrypt = BcryptAdmission::new(1, StdDuration::from_secs(1));
+        let held = bcrypt
+            .reserve(BcryptWorkload::Account, BcryptOperation::Hash)
+            .await
+            .expect("occupy bcrypt capacity");
+        let mut auth_state = create_test_auth_state(pool.clone());
+        Arc::get_mut(&mut auth_state.state)
+            .expect("test state has one owner")
+            .bcrypt = bcrypt;
+
+        let registration = tokio::spawn(super::register(
+            create_unit_test_tenant(),
+            State(auth_state),
+            HeaderMap::new(),
+            Json(super::RegisterRequest {
+                email: format!("bcrypt-pool-order-{}@example.test", Uuid::new_v4()),
+                password: "test-password".to_string(),
+                nsec: None,
+                relays: None,
+            }),
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+
+        let connection = tokio::time::timeout(StdDuration::from_millis(200), pool.acquire())
+            .await
+            .expect("pool acquisition must not wait behind bcrypt")
+            .expect("acquire sole pool connection");
+        assert!(!registration.is_finished());
+
+        drop(connection);
+        registration.abort();
+        drop(held);
+        pool.close().await;
     }
 
     #[test]
@@ -5637,11 +5691,10 @@ mod tests {
     #[cfg(feature = "integration-tests")]
     use crate::api::tenant::{Tenant, TenantExtractor};
     #[cfg(feature = "integration-tests")]
-    use crate::bcrypt_queue::BcryptQueue;
-    #[cfg(feature = "integration-tests")]
     use crate::handlers::http_rpc_handler::new_http_handler_cache;
     #[cfg(feature = "integration-tests")]
     use crate::state::KeycastState;
+    use crate::BcryptAdmission;
     #[cfg(feature = "integration-tests")]
     use axum::{
         body::Body,
@@ -5702,7 +5755,7 @@ mod tests {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy(&database_url)
             .expect("lazy pool should be created");
-        let bcrypt_queue = crate::bcrypt_queue::BcryptQueue::new();
+        let bcrypt = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
         let secret_pool = keycast_core::secret_pool::SecretPool::new(1);
         let tenant_cache = moka::future::Cache::builder().max_capacity(10).build();
         let key_manager: std::sync::Arc<Box<dyn keycast_core::encryption::KeyManager>> =
@@ -5716,7 +5769,7 @@ mod tests {
                 http_handler_cache: crate::handlers::http_rpc_handler::new_http_handler_cache(),
                 server_keys: Keys::generate(),
                 tenant_cache,
-                bcrypt_sender: bcrypt_queue.sender(),
+                bcrypt,
                 redis: None,
                 secret_pool: secret_pool.receiver(),
                 activity_logger: crate::activity_log::ActivityLogger::disabled(),
@@ -5809,7 +5862,7 @@ mod tests {
 
     #[cfg(feature = "integration-tests")]
     fn create_test_auth_state(pool: PgPool) -> AuthState {
-        let bcrypt_queue = BcryptQueue::new();
+        let bcrypt = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
         let secret_pool = SecretPool::new(1);
         let tenant_cache = Cache::builder().max_capacity(10).build();
         let key_manager: Arc<Box<dyn KeyManager>> = Arc::new(Box::new(TestKeyManager));
@@ -5822,7 +5875,7 @@ mod tests {
                 http_handler_cache: new_http_handler_cache(),
                 server_keys: Keys::generate(),
                 tenant_cache,
-                bcrypt_sender: bcrypt_queue.sender(),
+                bcrypt,
                 redis: None,
                 secret_pool: secret_pool.receiver(),
                 activity_logger: crate::activity_log::ActivityLogger::disabled(),

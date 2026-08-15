@@ -7,8 +7,8 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use bcrypt::verify;
 use chrono::{Duration, Utc};
+use keycast_core::bcrypt_admission::{BcryptAdmissionError, BcryptOperation, BcryptWorkload};
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
     OAuthCodeRepository, PinAttemptRelease, PinAttemptReservation, PolicyRepository,
@@ -16,6 +16,7 @@ use keycast_core::repositories::{
 };
 use nostr_sdk::Keys;
 use rand::Rng;
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
 use super::auth::{
@@ -81,6 +82,20 @@ fn map_policy_lookup_error(
         }
         other => {
             HeadlessError::Internal(format!("Failed to look up policy '{policy_slug}': {other}"))
+        }
+    }
+}
+
+fn bcrypt_headless_error(error: BcryptAdmissionError) -> HeadlessError {
+    match error {
+        BcryptAdmissionError::AtCapacity | BcryptAdmissionError::ShuttingDown => {
+            HeadlessError::ServiceUnavailable {
+                message: "Password service is busy. Please try again shortly.".to_string(),
+                retry_after: Some(1),
+            }
+        }
+        BcryptAdmissionError::WorkerFailed | BcryptAdmissionError::Bcrypt(_) => {
+            HeadlessError::Internal("Password operation failed".to_string())
         }
     }
 }
@@ -191,23 +206,30 @@ pub async fn headless_register(
     // Generate email verification token
     let verification_token = generate_secure_token();
 
-    // Hash password synchronously (headless flow can tolerate latency)
-    let password = req.password.clone();
-    let password_hash =
-        tokio::task::spawn_blocking(move || bcrypt::hash(&password, bcrypt::DEFAULT_COST))
-            .await
-            .map_err(|e| HeadlessError::Internal(format!("Task join error: {}", e)))?
-            .map_err(|e| HeadlessError::Internal(format!("Password hash error: {}", e)))?;
+    let password_hash = auth_state
+        .state
+        .bcrypt
+        .hash(
+            BcryptWorkload::Signup,
+            SecretString::from(req.password.clone()),
+            bcrypt::DEFAULT_COST,
+        )
+        .await
+        .map_err(bcrypt_headless_error)?;
 
     // Generate a 6-digit in-app verification PIN (keycast#262), emailed alongside the link as a
     // second transport for the same proof. Stored hashed; the device_code is the real gate.
     let pin: String = format!("{:06}", rand::thread_rng().gen_range(0..1_000_000));
-    let pin_for_hash = pin.clone();
-    let pin_hash =
-        tokio::task::spawn_blocking(move || bcrypt::hash(&pin_for_hash, bcrypt::DEFAULT_COST))
-            .await
-            .map_err(|e| HeadlessError::Internal(format!("Task join error: {}", e)))?
-            .map_err(|e| HeadlessError::Internal(format!("PIN hash error: {}", e)))?;
+    let pin_hash = auth_state
+        .state
+        .bcrypt
+        .hash(
+            BcryptWorkload::Pin,
+            SecretString::from(pin.clone()),
+            bcrypt::DEFAULT_COST,
+        )
+        .await
+        .map_err(bcrypt_headless_error)?;
 
     // Generate placeholder authorization code (will be replaced after email verification)
     let placeholder_code: String = rand::thread_rng()
@@ -438,13 +460,16 @@ pub async fn headless_login(
         }
     };
 
-    // Verify password
-    let password = req.password.clone();
-    let hash = password_hash.clone();
-    let valid = tokio::task::spawn_blocking(move || verify(&password, &hash))
+    let valid = auth_state
+        .state
+        .bcrypt
+        .verify(
+            BcryptWorkload::Login,
+            SecretString::from(req.password.clone()),
+            password_hash.clone(),
+        )
         .await
-        .map_err(|e| HeadlessError::Internal(format!("Task join error: {}", e)))?
-        .map_err(|_| HeadlessError::Internal("Password verification failed".to_string()))?;
+        .map_err(bcrypt_headless_error)?;
 
     if !valid {
         super::auth_observability::record_auth_event_and_log(
@@ -806,9 +831,12 @@ async fn record_pin_verify_failure(
 /// unknown `device_code`. Every other rejection reports its own status and code, so burning work
 /// on those would buy no secrecy while consuming the bounded bcrypt worker pool.
 async fn burn_dummy_bcrypt(
-    bcrypt_sender: &crate::bcrypt_queue::BcryptSender,
+    bcrypt: &keycast_core::bcrypt_admission::BcryptAdmission,
 ) -> Result<(), HeadlessError> {
-    bcrypt_sender.burn_dummy().await.map_err(Into::into)
+    bcrypt
+        .burn_dummy(BcryptWorkload::Pin, bcrypt::DEFAULT_COST)
+        .await
+        .map_err(bcrypt_headless_error)
 }
 
 /// POST /api/headless/verify-pin
@@ -849,7 +877,7 @@ pub async fn headless_verify_pin(
     let Some(pending) = pending else {
         // The only rejection kept uniform: an unknown or expired device_code must be
         // indistinguishable from a wrong PIN, in latency as well as in status and code.
-        burn_dummy_bcrypt(&auth_state.state.bcrypt_sender).await?;
+        burn_dummy_bcrypt(&auth_state.state.bcrypt).await?;
         record_pin_verify_failure(
             pool,
             &headers,
@@ -926,6 +954,14 @@ pub async fn headless_verify_pin(
         return Err(HeadlessError::PinUnavailable);
     };
 
+    // CPU admission precedes the attempt reservation so waiting cannot consume an attempt.
+    let verifier = auth_state
+        .state
+        .bcrypt
+        .reserve(BcryptWorkload::Pin, BcryptOperation::Verify)
+        .await
+        .map_err(bcrypt_headless_error)?;
+
     // Atomically reserve an attempt slot BEFORE the expensive bcrypt compare. The conditional
     // UPDATE increments only while under both caps, so no more comparisons can run for this
     // device_code than the caps allow, even across concurrent requests.
@@ -989,10 +1025,8 @@ pub async fn headless_verify_pin(
 
     // Constant-time PIN comparison (bcrypt's own compare; work factor dominates). Both this real
     // comparison and the dummy rejection paths share the same bounded worker pool.
-    let valid = match auth_state
-        .state
-        .bcrypt_sender
-        .verify(secrecy::SecretString::from(req.pin.clone()), pin_hash)
+    let valid = match verifier
+        .verify(SecretString::from(req.pin.clone()), pin_hash)
         .await
     {
         Ok(valid) => valid,
@@ -1002,7 +1036,7 @@ pub async fn headless_verify_pin(
             oauth_code_repo
                 .refund_pin_attempt(&req.device_code, tenant_id, &expected_generation_token)
                 .await?;
-            return Err(error.into());
+            return Err(bcrypt_headless_error(error));
         }
     };
 
@@ -1212,12 +1246,16 @@ pub async fn headless_resend_pin(
     // preserved (resend does not extend expires_at) so the pending row stays bounded (keycast#262).
     let new_token = generate_secure_token();
     let new_pin: String = format!("{:06}", rand::thread_rng().gen_range(0..1_000_000));
-    let pin_for_hash = new_pin.clone();
-    let new_pin_hash =
-        tokio::task::spawn_blocking(move || bcrypt::hash(&pin_for_hash, bcrypt::DEFAULT_COST))
-            .await
-            .map_err(|e| HeadlessError::Internal(format!("Task join error: {}", e)))?
-            .map_err(|e| HeadlessError::Internal(format!("PIN hash error: {}", e)))?;
+    let new_pin_hash = auth_state
+        .state
+        .bcrypt
+        .hash(
+            BcryptWorkload::Pin,
+            SecretString::from(new_pin.clone()),
+            bcrypt::DEFAULT_COST,
+        )
+        .await
+        .map_err(bcrypt_headless_error)?;
 
     let old_pin_hash = pending.pin_hash.clone();
     let old_pin_attempts = pending.pin_attempts;
@@ -1453,17 +1491,18 @@ impl From<keycast_core::repositories::RepositoryError> for HeadlessError {
     }
 }
 
-impl From<crate::bcrypt_queue::BcryptQueueError> for HeadlessError {
-    fn from(_error: crate::bcrypt_queue::BcryptQueueError) -> Self {
-        HeadlessError::ServiceUnavailable {
-            message: "Verification service is busy. Please try again shortly.".to_string(),
-            retry_after: Some(1),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::{bcrypt_headless_error, BcryptAdmissionError};
+    use axum::{http::StatusCode, response::IntoResponse};
+
+    #[test]
+    fn bcrypt_capacity_maps_to_retryable_service_unavailable() {
+        let response = bcrypt_headless_error(BcryptAdmissionError::AtCapacity).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["Retry-After"], "1");
+    }
+
     #[cfg(feature = "integration-tests")]
     use super::{MAX_PIN_ATTEMPTS, MAX_PIN_ATTEMPTS_LIFETIME};
     #[cfg(feature = "integration-tests")]
@@ -1498,8 +1537,10 @@ mod tests {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy(&database_url)
             .expect("lazy pool should be created");
-        let bcrypt_queue = crate::bcrypt_queue::BcryptQueue::new();
-        let _bcrypt_workers = bcrypt_queue.spawn_workers(pool.clone());
+        let bcrypt = keycast_core::bcrypt_admission::BcryptAdmission::new(
+            1,
+            std::time::Duration::from_secs(1),
+        );
         let secret_pool = keycast_core::secret_pool::SecretPool::new(1);
         let tenant_cache = moka::future::Cache::builder().max_capacity(10).build();
         let key_manager: std::sync::Arc<Box<dyn keycast_core::encryption::KeyManager>> =
@@ -1513,7 +1554,7 @@ mod tests {
                 http_handler_cache: crate::handlers::http_rpc_handler::new_http_handler_cache(),
                 server_keys: Keys::generate(),
                 tenant_cache,
-                bcrypt_sender: bcrypt_queue.sender(),
+                bcrypt,
                 redis: None,
                 secret_pool: secret_pool.receiver(),
                 activity_logger: crate::activity_log::ActivityLogger::disabled(),
@@ -2598,12 +2639,14 @@ mod tests {
         let email = format!("verify-pin-busy-{}@example.com", uuid::Uuid::new_v4());
         let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
 
-        let disconnected_queue = crate::bcrypt_queue::BcryptQueue::new();
-        let disconnected_sender = disconnected_queue.sender();
-        drop(disconnected_queue);
+        let disconnected = keycast_core::bcrypt_admission::BcryptAdmission::new(
+            1,
+            std::time::Duration::from_secs(1),
+        );
+        disconnected.shutdown().await;
         std::sync::Arc::get_mut(&mut auth_state.state)
             .expect("test auth state should have one owner")
-            .bcrypt_sender = disconnected_sender;
+            .bcrypt = disconnected;
 
         let response = call_verify_pin(auth_state, &device_code, "000000").await;
         assert_eq!(

@@ -1367,6 +1367,15 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     let (relay_activity_logger, relay_activity_worker) =
         keycast_signer::RelayActivityLogger::new(database.pool.clone());
 
+    let bcrypt = keycast_core::bcrypt_admission::BcryptAdmission::new(
+        num_cpus::get().max(1),
+        Duration::from_secs(1),
+    );
+    tracing::info!(
+        "✔︎ Bcrypt admission initialized ({} concurrent operations)",
+        num_cpus::get().max(1)
+    );
+
     // Create signer (relay connections deferred to background task for faster startup)
     let mut signer = UnifiedSigner::new(
         database.pool.clone(),
@@ -1374,6 +1383,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         auth_rx,
         coordinator.clone(),
         relay_activity_logger,
+        bcrypt.clone(),
     )
     .await?;
     signer.load_authorizations().await?;
@@ -1404,23 +1414,14 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         .build();
     tracing::info!("✔︎ Tenant cache initialized (preload deferred)");
 
-    // Create bcrypt queue for async password hashing during registration
-    // Uses email verification latency as natural buffer for CPU-intensive work
-    let bcrypt_queue = keycast_api::bcrypt_queue::BcryptQueue::new();
-    let bcrypt_sender = bcrypt_queue.sender();
-    let _bcrypt_worker_handles = bcrypt_queue.spawn_workers(database.pool.clone());
     let _bcrypt_cleanup_handle =
-        keycast_api::bcrypt_queue::spawn_cleanup_task(database.pool.clone());
-    tracing::info!(
-        "✔︎ Bcrypt queue initialized ({} workers, cleanup every 5min)",
-        num_cpus::get()
-    );
+        keycast_api::auth_cleanup::spawn_cleanup_task(database.pool.clone());
 
     // Create secret pool for instant authorization creation
     // Background producer pre-computes (secret, bcrypt_hash) pairs
     let secret_pool = keycast_core::secret_pool::SecretPool::default();
     let secret_pool_receiver = secret_pool.receiver();
-    let _secret_pool_producer = secret_pool.spawn_producer();
+    let _secret_pool_producer = secret_pool.spawn_producer(bcrypt.clone());
     tracing::info!("✔︎ Secret pool initialized (capacity: 100, bcrypt cost: 10)");
 
     // Setup task tracking before API state so API-owned background workers are
@@ -1455,7 +1456,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         http_handler_cache: new_http_handler_cache(),
         server_keys,
         tenant_cache,
-        bcrypt_sender,
+        bcrypt: bcrypt.clone(),
         redis: Some(prefixed_redis),
         secret_pool: secret_pool_receiver,
         activity_logger,
@@ -1876,6 +1877,10 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     // Phase 2: tell axum to stop accepting new HTTP connections and wait for
     // in-flight requests to finish.
     shutdown_signal.notify_waiters();
+    let bcrypt_shutdown = tokio::spawn({
+        let bcrypt = bcrypt.clone();
+        async move { bcrypt.shutdown().await }
+    });
     // Close task tracker to prevent new tracked tasks from being spawned.
     task_tracker.close();
 
@@ -1901,6 +1906,9 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
                 "API server shutdown timed out; axum accept loop aborted (in-flight connection tasks may still run; bounded DB pool close covers any lingering ones)"
             );
         }
+    }
+    if let Err(error) = bcrypt_shutdown.await {
+        tracing::error!(error = %error, "Bcrypt shutdown task failed");
     }
 
     // Phase 3: publish the cluster `leave` and deregister FIRST (bounded,

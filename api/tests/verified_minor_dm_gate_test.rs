@@ -15,10 +15,10 @@ use keycast_api::api::{
     },
     tenant::{Tenant, TenantExtractor},
 };
-use keycast_api::bcrypt_queue::BcryptQueue;
 use keycast_api::handlers::http_rpc_handler::new_http_handler_cache;
 use keycast_api::state::KeycastState;
 use keycast_api::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
+use keycast_api::BcryptAdmission;
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::KeyManager;
 use keycast_core::secret_pool::SecretPool;
@@ -83,7 +83,7 @@ fn tenant_extractor(tenant_id: i64) -> TenantExtractor {
 }
 
 fn create_test_auth_state(pool: PgPool, key_manager: Arc<Box<dyn KeyManager>>) -> AuthState {
-    let bcrypt_queue = BcryptQueue::new();
+    let bcrypt_queue = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
     let secret_pool = SecretPool::new(1);
     let tenant_cache = Cache::builder().max_capacity(10).build();
 
@@ -95,7 +95,7 @@ fn create_test_auth_state(pool: PgPool, key_manager: Arc<Box<dyn KeyManager>>) -
             http_handler_cache: new_http_handler_cache(),
             server_keys: Keys::generate(),
             tenant_cache,
-            bcrypt_sender: bcrypt_queue.sender(),
+            bcrypt: bcrypt_queue.clone(),
             redis: None,
             secret_pool: secret_pool.receiver(),
             activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),
@@ -1065,7 +1065,7 @@ async fn minor_user_sign_fast_path_denial_is_forbidden_not_503() {
         http_handler_cache: new_http_handler_cache(),
         server_keys: Keys::generate(),
         tenant_cache: Cache::builder().max_capacity(10).build(),
-        bcrypt_sender: BcryptQueue::new().sender(),
+        bcrypt: BcryptAdmission::new(1, std::time::Duration::from_secs(1)),
         redis: None,
         secret_pool: SecretPool::new(1).receiver(),
         activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),

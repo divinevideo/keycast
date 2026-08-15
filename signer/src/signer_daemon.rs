@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cluster_hashring::{ClusterCoordinator, MembershipEvent};
 use keycast_core::authorization_channel::{AuthorizationCommand, AuthorizationReceiver};
+use keycast_core::bcrypt_admission::{BcryptAdmission, BcryptAdmissionError};
 use keycast_core::encryption::KeyManager;
 use keycast_core::env_config::configured_positive_usize;
 use keycast_core::metrics::METRICS;
@@ -69,6 +70,7 @@ pub struct Nip46Handler {
     is_oauth: bool,
     pool: PgPool,
     activity_logger: RelayActivityLogger,
+    bcrypt: BcryptAdmission,
     /// Handler status for tombstone support (Active, Revoked, or Expired)
     ///
     /// This is a snapshot taken when the handler was loaded. Time-based expiry is
@@ -105,6 +107,7 @@ impl Nip46Handler {
             is_oauth,
             pool,
             activity_logger,
+            bcrypt: BcryptAdmission::new(1, Duration::from_secs(1)),
             status: HandlerStatus::Active,
             tombstone_at: None,
             expires_at: None,
@@ -124,6 +127,13 @@ impl Nip46Handler {
     #[doc(hidden)]
     pub fn with_status(mut self, status: HandlerStatus) -> Self {
         self.status = status;
+        self
+    }
+
+    /// Replace bcrypt admission on a test handler.
+    #[doc(hidden)]
+    pub fn with_bcrypt(mut self, bcrypt: BcryptAdmission) -> Self {
+        self.bcrypt = bcrypt;
         self
     }
 
@@ -737,8 +747,21 @@ impl Nip46Handler {
         provided_secret: &str,
     ) -> SignerResult<String> {
         // Validate secret against bcrypt hash (same for both OAuth and team authorizations)
-        let valid =
-            keycast_core::secret_pool::verify_secret(provided_secret, &self.secret_hash).await;
+        let valid = match keycast_core::secret_pool::verify_secret(
+            &self.bcrypt,
+            provided_secret,
+            &self.secret_hash,
+        )
+        .await
+        {
+            Ok(valid) => valid,
+            Err(BcryptAdmissionError::AtCapacity | BcryptAdmissionError::ShuttingDown) => {
+                return Err(SignerError::internal(
+                    "connection-secret verification temporarily unavailable",
+                ));
+            }
+            Err(BcryptAdmissionError::WorkerFailed | BcryptAdmissionError::Bcrypt(_)) => false,
+        };
         if !valid {
             tracing::warn!("Invalid secret for authorization {}", self.authorization_id);
             return Err(SignerError::permission_denied("Invalid secret"));
@@ -1015,6 +1038,7 @@ pub struct UnifiedSigner {
     pool: PgPool,
     key_manager: Arc<Box<dyn KeyManager>>,
     coordinator: Arc<ClusterCoordinator>,
+    bcrypt: BcryptAdmission,
     auth_rx: Option<AuthorizationReceiver>,
     relay_sender: Option<crate::work_queue::RelaySender>,
     authorization_lookup: AuthorizationLookup,
@@ -1054,6 +1078,7 @@ pub(crate) struct RelayWorkerContext {
     coordinator: Arc<ClusterCoordinator>,
     authorization_lookup: AuthorizationLookup,
     activity_logger: RelayActivityLogger,
+    bcrypt: BcryptAdmission,
 }
 
 struct ActiveLookupGuard;
@@ -1298,6 +1323,7 @@ impl UnifiedSigner {
         auth_rx: AuthorizationReceiver,
         coordinator: Arc<ClusterCoordinator>,
         activity_logger: RelayActivityLogger,
+        bcrypt: BcryptAdmission,
     ) -> SignerResult<Self> {
         let client = Client::default();
 
@@ -1317,6 +1343,7 @@ impl UnifiedSigner {
             pool,
             key_manager: Arc::new(key_manager),
             coordinator,
+            bcrypt,
             auth_rx: Some(auth_rx),
             relay_sender: None,
             authorization_lookup: AuthorizationLookup::new(),
@@ -1365,6 +1392,7 @@ impl UnifiedSigner {
             coordinator: self.coordinator(),
             authorization_lookup: self.authorization_lookup.clone(),
             activity_logger: self.activity_logger.clone(),
+            bcrypt: self.bcrypt.clone(),
         }
     }
 
@@ -1477,6 +1505,7 @@ impl UnifiedSigner {
         let lookup_clone = self.authorization_lookup.clone();
         let activity_logger_clone = self.activity_logger.clone();
         let coordinator_clone = self.coordinator.clone();
+        let bcrypt_clone = self.bcrypt.clone();
 
         let mut cluster_events = self.coordinator.subscribe();
         let cluster_lookup = self.authorization_lookup.clone();
@@ -1543,6 +1572,7 @@ impl UnifiedSigner {
                                 &pool_clone,
                                 &key_manager_clone,
                                 &handlers_clone,
+                                &bcrypt_clone,
                                 &bunker_pubkey,
                                 tenant_id,
                                 is_oauth,
@@ -1615,6 +1645,7 @@ impl UnifiedSigner {
         let pool = self.pool.clone();
         let key_manager = self.key_manager.clone();
         let coordinator = self.coordinator.clone();
+        let bcrypt = self.bcrypt.clone();
         let relay_sender = self.relay_sender.clone();
         let authorization_lookup = self.authorization_lookup.clone();
         let activity_logger = self.activity_logger.clone();
@@ -1653,6 +1684,7 @@ impl UnifiedSigner {
                                     coordinator: coordinator.clone(),
                                     authorization_lookup: authorization_lookup.clone(),
                                     activity_logger: activity_logger.clone(),
+                                    bcrypt: bcrypt.clone(),
                                 };
                                 tokio::spawn(async move {
                                     if let Err(e) =
@@ -1691,10 +1723,12 @@ impl UnifiedSigner {
     }
 
     /// Load a single authorization into cache (called via channel for new authorizations)
+    #[allow(clippy::too_many_arguments)]
     async fn load_single_authorization(
         pool: &PgPool,
         key_manager: &Arc<Box<dyn KeyManager>>,
         handlers: &Cache<String, Nip46Handler>,
+        bcrypt: &BcryptAdmission,
         bunker_pubkey: &str,
         tenant_id: i64,
         is_oauth: bool,
@@ -1750,6 +1784,7 @@ impl UnifiedSigner {
                     is_oauth: true,
                     pool: pool.clone(),
                     activity_logger: activity_logger.clone(),
+                    bcrypt: bcrypt.clone(),
                     status,
                     tombstone_at,
                     expires_at: auth.expires_at,
@@ -1809,6 +1844,7 @@ impl UnifiedSigner {
                     is_oauth: false,
                     pool: pool.clone(),
                     activity_logger: activity_logger.clone(),
+                    bcrypt: bcrypt.clone(),
                     status,
                     tombstone_at,
                     expires_at,
@@ -1828,16 +1864,24 @@ impl UnifiedSigner {
         pool: &PgPool,
         key_manager: &Arc<Box<dyn KeyManager>>,
         activity_logger: &RelayActivityLogger,
+        bcrypt: &BcryptAdmission,
         bunker_pubkey: &str,
     ) -> SignerResult<Option<Nip46Handler>> {
         let pool = pool.clone();
         let key_manager = key_manager.clone();
         let activity_logger = activity_logger.clone();
+        let bcrypt = bcrypt.clone();
         let key = bunker_pubkey.to_string();
         lookup
             .resolve_with(bunker_pubkey, handlers, async move {
-                Self::load_authorization_from_database(&pool, &key_manager, &activity_logger, &key)
-                    .await
+                Self::load_authorization_from_database(
+                    &pool,
+                    &key_manager,
+                    &activity_logger,
+                    &bcrypt,
+                    &key,
+                )
+                .await
             })
             .await
     }
@@ -1846,6 +1890,7 @@ impl UnifiedSigner {
         pool: &PgPool,
         key_manager: &Arc<Box<dyn KeyManager>>,
         activity_logger: &RelayActivityLogger,
+        bcrypt: &BcryptAdmission,
         bunker_pubkey: &str,
     ) -> SignerResult<Option<Nip46Handler>> {
         if let Some(auth) =
@@ -1876,6 +1921,7 @@ impl UnifiedSigner {
                 is_oauth: true,
                 pool: pool.clone(),
                 activity_logger: activity_logger.clone(),
+                bcrypt: bcrypt.clone(),
                 status,
                 tombstone_at,
                 expires_at: auth.expires_at,
@@ -1920,6 +1966,7 @@ impl UnifiedSigner {
             is_oauth: false,
             pool: pool.clone(),
             activity_logger: activity_logger.clone(),
+            bcrypt: bcrypt.clone(),
             status,
             tombstone_at,
             expires_at,
@@ -1939,6 +1986,7 @@ impl UnifiedSigner {
             coordinator,
             authorization_lookup,
             activity_logger,
+            bcrypt,
         } = context;
         // SINGLE SUBSCRIPTION ARCHITECTURE:
         // We receive ALL kind 24133 events from the relay (no pubkey filter)
@@ -1979,6 +2027,7 @@ impl UnifiedSigner {
                     pool,
                     key_manager,
                     activity_logger,
+                    bcrypt,
                     bunker_pubkey,
                 )
                 .await?
@@ -2822,6 +2871,31 @@ mod tombstone_cleanup_tests {
         assert!(old_expiry.tombstone_is_older_than(cutoff));
         assert!(!recent_expiry.tombstone_is_older_than(cutoff));
     }
+
+    #[tokio::test]
+    async fn connection_secret_capacity_failure_is_not_reported_as_bad_credentials() {
+        let bcrypt = BcryptAdmission::new(1, Duration::from_secs(1));
+        bcrypt.shutdown().await;
+        let handler =
+            cached_handler_expiring_at(Utc::now() + chrono::Duration::hours(1)).with_bcrypt(bcrypt);
+
+        let error = handler
+            .process_connect("client", "secret")
+            .await
+            .expect_err("closed admission must reject connect");
+        assert!(matches!(error, SignerError::Internal(_)));
+    }
+
+    #[tokio::test]
+    async fn malformed_connection_secret_hash_preserves_invalid_secret_semantics() {
+        let handler = cached_handler_expiring_at(Utc::now() + chrono::Duration::hours(1));
+
+        let error = handler
+            .process_connect("client", "secret")
+            .await
+            .expect_err("malformed stored hash must reject connect");
+        assert!(matches!(error, SignerError::PermissionDenied(_)));
+    }
 }
 
 #[cfg(all(test, feature = "integration-tests"))]
@@ -2907,6 +2981,7 @@ mod tests {
             is_oauth: true,
             pool,
             activity_logger,
+            bcrypt: BcryptAdmission::new(1, Duration::from_secs(1)),
             status: HandlerStatus::Active,
             tombstone_at: None,
             expires_at: None,
@@ -3023,9 +3098,16 @@ mod tests {
             std::env::var("TEST_REDIS_URL").expect("TEST_REDIS_URL must be set to run Redis tests");
         let coordinator = Arc::new(ClusterCoordinator::start(&redis_url).await.unwrap());
         let (activity_logger, _worker) = RelayActivityLogger::new(pool.clone());
-        let signer = UnifiedSigner::new(pool, key_manager, rx, coordinator, activity_logger)
-            .await
-            .unwrap();
+        let signer = UnifiedSigner::new(
+            pool,
+            key_manager,
+            rx,
+            coordinator,
+            activity_logger,
+            BcryptAdmission::new(1, Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
 
         let user_pubkey = Keys::generate().public_key().to_hex();
 
@@ -3059,6 +3141,7 @@ mod tests {
             rx,
             coordinator,
             activity_logger.clone(),
+            BcryptAdmission::new(1, Duration::from_secs(1)),
         )
         .await
         .unwrap();
@@ -3077,6 +3160,7 @@ mod tests {
             is_oauth: true,
             pool: pool.clone(),
             activity_logger,
+            bcrypt: BcryptAdmission::new(1, Duration::from_secs(1)),
             status: HandlerStatus::Active,
             tombstone_at: None,
             expires_at: None,

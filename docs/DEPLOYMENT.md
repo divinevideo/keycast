@@ -471,6 +471,9 @@ The endpoint is unauthenticated and reads only in-process state, so a scrape doe
 | `keycast_auth_request_duration_seconds` | histogram | Auth request latency, labelled `endpoint` and `outcome`; exposed as `_bucket`/`_sum`/`_count` series |
 | `keycast_auth_audit_write_failures_total` | counter | Auth audit writes that failed without failing the user request, labelled `endpoint` |
 | `keycast_auth_email_send_failures_total` | counter | Auth email send failures, labelled `template` |
+| `keycast_bcrypt_active_work` | gauge | Running bcrypt work, labelled by bounded `workload` and `operation` values |
+| `keycast_bcrypt_waiting_work` | gauge | Request bcrypt work waiting for CPU admission, labelled by bounded `workload` and `operation` values |
+| `keycast_bcrypt_admission_rejections_total` | counter | Bcrypt work rejected before execution, labelled by bounded `workload`, `operation`, and `reason` values |
 
 High `keycast_cache_misses_total` relative to hits usually points at session affinity or cold-cache behavior. Increasing `keycast_nip46_queue_dropped_total` means the signer path is overloaded.
 
@@ -492,8 +495,8 @@ CPU-bound work:
 
 - secp256k1 signing
 - NIP-44/NIP-04 encrypt/decrypt
-- login bcrypt verification through `spawn_blocking`
-- registration bcrypt hashing in the background queue
+- password, PIN, claim, OAuth-secret, and NIP-46 connection-secret bcrypt work through one bounded blocking-work admission service
+- background OAuth-secret precomputation only when that shared service has idle capacity
 
 I/O-bound work:
 

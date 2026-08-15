@@ -20,10 +20,10 @@ use keycast_api::api::{
     },
     tenant::{Tenant, TenantExtractor},
 };
-use keycast_api::bcrypt_queue::BcryptQueue;
 use keycast_api::handlers::http_rpc_handler::new_http_handler_cache;
 use keycast_api::state::KeycastState;
 use keycast_api::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
+use keycast_api::BcryptAdmission;
 use keycast_api::PrefixedRedis;
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::KeyManager;
@@ -97,7 +97,7 @@ fn create_test_auth_state_with_redis(
     key_manager: Arc<Box<dyn KeyManager>>,
     redis: Option<PrefixedRedis>,
 ) -> AuthState {
-    let bcrypt_queue = BcryptQueue::new();
+    let bcrypt_queue = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
     let secret_pool = SecretPool::new(1);
     let tenant_cache = Cache::builder().max_capacity(10).build();
     AuthState {
@@ -108,7 +108,7 @@ fn create_test_auth_state_with_redis(
             http_handler_cache: new_http_handler_cache(),
             server_keys: Keys::generate(),
             tenant_cache,
-            bcrypt_sender: bcrypt_queue.sender(),
+            bcrypt: bcrypt_queue.clone(),
             redis,
             secret_pool: secret_pool.receiver(),
             activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),
@@ -737,7 +737,7 @@ async fn export_locks_out_after_the_attempt_budget_is_spent() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[serial]
-async fn concurrent_wrong_password_burst_spends_only_the_attempt_budget() {
+async fn concurrent_wrong_password_burst_never_overspends_the_attempt_budget() {
     let pool = setup_pool().await;
     let km = FileKeyManager::new().expect("key manager");
     let keys = Keys::generate();
@@ -775,14 +775,18 @@ async fn concurrent_wrong_password_burst_spends_only_the_attempt_budget() {
         .iter()
         .filter(|result| matches!(result, Err(AuthError::TooManyRequests { .. })))
         .count();
-    assert_eq!(
-        invalid_credentials, MAX_ATTEMPTS,
-        "only the configured budget should reach password verification: {results:?}"
+    let unavailable = results
+        .iter()
+        .filter(|result| matches!(result, Err(AuthError::ServiceUnavailable { .. })))
+        .count();
+    assert!(
+        invalid_credentials <= MAX_ATTEMPTS,
+        "admitted password failures must not exceed the configured budget: {results:?}"
     );
     assert_eq!(
-        rate_limited,
-        results.len() - MAX_ATTEMPTS,
-        "the rest of the burst should be locked out: {results:?}"
+        invalid_credentials + rate_limited + unavailable,
+        results.len(),
+        "every burst result must be a credential failure, lockout, or pre-reservation overload: {results:?}"
     );
 
     let events = egress_events(&pool, &pubkey).await;
@@ -791,8 +795,8 @@ async fn concurrent_wrong_password_burst_spends_only_the_attempt_budget() {
         .filter(|event| event.reason_code.as_deref() == Some("invalid_password"))
         .count();
     assert_eq!(
-        counted_failures, MAX_ATTEMPTS,
-        "the audit-backed counter must not overspend under concurrency: {events:?}"
+        counted_failures, invalid_credentials,
+        "only admitted wrong passwords may consume the audit-backed budget: {events:?}"
     );
 }
 

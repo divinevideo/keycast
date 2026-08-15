@@ -30,7 +30,7 @@ async fn cleanup_test_data(pool: &PgPool, pubkeys: &[&str]) {
     }
 }
 
-/// The cleanup query that should be tested - mirrors bcrypt_queue.rs
+/// The cleanup query that should be tested.
 /// This version is scoped to specific pubkeys for safe testing
 const CLEANUP_QUERY_SCOPED: &str = "DELETE FROM users WHERE password_hash IS NULL
                                     AND vine_id IS NULL
@@ -392,11 +392,11 @@ async fn test_cleanup_mixed_scenario() {
     );
 }
 
-/// Test that verifies the actual cleanup query in bcrypt_queue.rs matches our expectations
+/// Test that verifies the actual cleanup query matches our expectations.
 /// This is a documentation test that ensures the query includes the vine_id check
 #[tokio::test]
 async fn test_cleanup_query_includes_vine_id_check() {
-    // The cleanup query in bcrypt_queue.rs should contain these conditions
+    // The cleanup query should contain these conditions.
     let expected_conditions = vec![
         "password_hash IS NULL", // Must have no password
         "vine_id IS NULL",       // Must NOT be a preloaded user
@@ -404,17 +404,17 @@ async fn test_cleanup_query_includes_vine_id_check() {
         "created_at < NOW()",    // Must be older than threshold
     ];
 
-    let source = include_str!("../src/bcrypt_queue.rs");
+    let source = include_str!("../src/auth_cleanup.rs");
 
     for condition in expected_conditions {
         assert!(
             source.contains(condition),
-            "bcrypt_queue.rs cleanup query should contain: {}",
+            "auth_cleanup.rs cleanup query should contain: {}",
             condition
         );
     }
 
-    println!("✅ Cleanup query in bcrypt_queue.rs contains all required conditions");
+    println!("Cleanup query contains all required conditions");
 }
 
 // ---------------------------------------------------------------------------

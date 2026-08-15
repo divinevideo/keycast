@@ -8,9 +8,9 @@ use keycast_api::{
         http::admin::{get_auth_debug, AuthDebugQuery},
         tenant::{Tenant, TenantExtractor},
     },
-    bcrypt_queue::BcryptQueue,
     handlers::http_rpc_handler::new_http_handler_cache,
     state::KeycastState,
+    BcryptAdmission,
 };
 use keycast_core::{
     encryption::{KeyManager, KeyManagerError},
@@ -59,7 +59,7 @@ impl KeyManager for TestKeyManager {
 }
 
 fn create_test_auth_state(pool: PgPool) -> keycast_api::api::http::routes::AuthState {
-    let bcrypt_queue = BcryptQueue::new();
+    let bcrypt_queue = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
     let secret_pool = SecretPool::new(1);
     let tenant_cache = Cache::builder().max_capacity(10).build();
     let key_manager: Arc<Box<dyn KeyManager>> = Arc::new(Box::new(TestKeyManager));
@@ -72,7 +72,7 @@ fn create_test_auth_state(pool: PgPool) -> keycast_api::api::http::routes::AuthS
             http_handler_cache: new_http_handler_cache(),
             server_keys: Keys::generate(),
             tenant_cache,
-            bcrypt_sender: bcrypt_queue.sender(),
+            bcrypt: bcrypt_queue.clone(),
             redis: None,
             secret_pool: secret_pool.receiver(),
             activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),
