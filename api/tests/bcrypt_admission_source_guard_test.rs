@@ -2,7 +2,7 @@ use std::{fs, path::Path};
 use syn::{
     punctuated::Punctuated,
     visit::{self, Visit},
-    Attribute, Expr, ExprCall, Item, ItemExternCrate, ItemUse, Meta, Token, UseTree,
+    Attribute, Item, ItemExternCrate, ItemUse, Meta, Path as SynPath, Token, UseTree,
 };
 
 fn rust_files(root: &Path, files: &mut Vec<std::path::PathBuf>) {
@@ -63,15 +63,35 @@ fn item_attributes(item: &Item) -> &[Attribute] {
     }
 }
 
-fn imports_bcrypt_work(tree: &UseTree) -> bool {
+fn allowed_bcrypt_member(ident: &syn::Ident) -> bool {
+    ident == "DEFAULT_COST" || ident == "BcryptError"
+}
+
+fn imports_disallowed_bcrypt(tree: &UseTree, within_bcrypt: bool) -> bool {
     match tree {
-        UseTree::Name(name) => name.ident == "hash" || name.ident == "verify",
-        UseTree::Rename(rename) => {
-            rename.ident == "hash" || rename.ident == "verify" || rename.ident == "self"
+        UseTree::Name(name) => {
+            if within_bcrypt {
+                !allowed_bcrypt_member(&name.ident)
+            } else {
+                name.ident == "bcrypt"
+            }
         }
-        UseTree::Path(path) => imports_bcrypt_work(&path.tree),
-        UseTree::Group(group) => group.items.iter().any(imports_bcrypt_work),
-        UseTree::Glob(_) => true,
+        UseTree::Rename(rename) => {
+            if within_bcrypt {
+                !allowed_bcrypt_member(&rename.ident)
+            } else {
+                rename.ident == "bcrypt"
+            }
+        }
+        UseTree::Path(path) => {
+            let within_bcrypt = within_bcrypt || path.ident == "bcrypt";
+            imports_disallowed_bcrypt(&path.tree, within_bcrypt)
+        }
+        UseTree::Group(group) => group
+            .items
+            .iter()
+            .any(|tree| imports_disallowed_bcrypt(tree, within_bcrypt)),
+        UseTree::Glob(_) => within_bcrypt,
     }
 }
 
@@ -87,29 +107,23 @@ impl<'ast> Visit<'ast> for DirectBcryptVisitor {
         }
     }
 
-    fn visit_expr_call(&mut self, call: &'ast ExprCall) {
-        if let Expr::Path(function) = call.func.as_ref() {
-            let mut segments = function.path.segments.iter();
-            if segments
+    fn visit_path(&mut self, path: &'ast SynPath) {
+        let mut segments = path.segments.iter();
+        if segments
+            .next()
+            .is_some_and(|segment| segment.ident == "bcrypt")
+            && segments
                 .next()
-                .is_some_and(|segment| segment.ident == "bcrypt")
-                && segments
-                    .last()
-                    .is_some_and(|segment| segment.ident == "hash" || segment.ident == "verify")
-            {
-                self.found = true;
-            }
+                .is_some_and(|segment| !allowed_bcrypt_member(&segment.ident))
+        {
+            self.found = true;
         }
-        visit::visit_expr_call(self, call);
+        visit::visit_path(self, path);
     }
 
     fn visit_item_use(&mut self, item: &'ast ItemUse) {
-        match &item.tree {
-            UseTree::Path(path) if path.ident == "bcrypt" && imports_bcrypt_work(&path.tree) => {
-                self.found = true;
-            }
-            UseTree::Rename(rename) if rename.ident == "bcrypt" => self.found = true,
-            _ => {}
+        if imports_disallowed_bcrypt(&item.tree, false) {
+            self.found = true;
         }
         visit::visit_item_use(self, item);
     }
@@ -200,6 +214,29 @@ fn imported_or_aliased_bcrypt_calls_are_rejected() {
     assert!(directly_uses_bcrypt("use bcrypt as password_hash;"));
     assert!(directly_uses_bcrypt(
         "extern crate bcrypt as password_hash;"
+    ));
+    assert!(directly_uses_bcrypt("use {bcrypt as password_hash};"));
+    assert!(directly_uses_bcrypt("use {bcrypt::*};"));
+    assert!(directly_uses_bcrypt(
+        "use {bcrypt::{DEFAULT_COST, hash as password_hash}};"
+    ));
+}
+
+#[test]
+fn every_non_allowlisted_bcrypt_member_is_rejected() {
+    assert!(directly_uses_bcrypt(
+        "fn production() { bcrypt::non_truncating_verify(\"candidate\", \"hash\"); }"
+    ));
+    assert!(directly_uses_bcrypt(
+        "fn production() { let password_hash = bcrypt::hash; }"
+    ));
+    assert!(directly_uses_bcrypt("use bcrypt::hash_with_result;"));
+}
+
+#[test]
+fn bcrypt_cost_and_error_types_remain_available_to_callers() {
+    assert!(!directly_uses_bcrypt(
+        "use bcrypt::{BcryptError, DEFAULT_COST}; fn classify(_: bcrypt::BcryptError) { let _ = bcrypt::DEFAULT_COST; }"
     ));
 }
 
