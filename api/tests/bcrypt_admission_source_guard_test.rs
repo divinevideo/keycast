@@ -67,6 +67,29 @@ fn allowed_bcrypt_member(ident: &syn::Ident) -> bool {
     ident == "DEFAULT_COST" || ident == "BcryptError"
 }
 
+fn macro_uses_disallowed_bcrypt(macro_: &syn::Macro) -> bool {
+    let compact: String = macro_
+        .tokens
+        .to_string()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let mut remaining = compact.as_str();
+
+    while let Some(start) = remaining.find("bcrypt::") {
+        let member = &remaining[start + "bcrypt::".len()..];
+        let end = member
+            .find(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+            .unwrap_or(member.len());
+        if !matches!(&member[..end], "DEFAULT_COST" | "BcryptError") {
+            return true;
+        }
+        remaining = &member[end..];
+    }
+
+    false
+}
+
 fn imports_disallowed_bcrypt(tree: &UseTree, within_bcrypt: bool) -> bool {
     match tree {
         UseTree::Name(name) => {
@@ -133,6 +156,13 @@ impl<'ast> Visit<'ast> for DirectBcryptVisitor {
             self.found = true;
         }
         visit::visit_item_extern_crate(self, item);
+    }
+
+    fn visit_macro(&mut self, macro_: &'ast syn::Macro) {
+        if macro_uses_disallowed_bcrypt(macro_) {
+            self.found = true;
+        }
+        visit::visit_macro(self, macro_);
     }
 }
 
@@ -231,12 +261,18 @@ fn every_non_allowlisted_bcrypt_member_is_rejected() {
         "fn production() { let password_hash = bcrypt::hash; }"
     ));
     assert!(directly_uses_bcrypt("use bcrypt::hash_with_result;"));
+    assert!(directly_uses_bcrypt(
+        "macro_rules! hash_password { () => { bcrypt::hash(\"secret\", 4) }; }"
+    ));
 }
 
 #[test]
 fn bcrypt_cost_and_error_types_remain_available_to_callers() {
     assert!(!directly_uses_bcrypt(
         "use bcrypt::{BcryptError, DEFAULT_COST}; fn classify(_: bcrypt::BcryptError) { let _ = bcrypt::DEFAULT_COST; }"
+    ));
+    assert!(!directly_uses_bcrypt(
+        "fn cost() { format!(\"{}\", bcrypt::DEFAULT_COST); }"
     ));
 }
 
