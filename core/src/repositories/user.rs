@@ -741,11 +741,6 @@ impl UserRepository {
     /// Creates both the user record and personal key in a single transaction,
     /// ensuring consistency if either operation fails.
     ///
-    /// # Arguments
-    ///
-    /// * `password_hash` - Optional password hash. Pass `None` for async bcrypt flow where
-    ///   the hash is computed in background and updated later via `UPDATE users SET password_hash`.
-    ///
     /// # Errors
     ///
     /// Returns [`RepositoryError::Duplicate`] if email already exists.
@@ -756,7 +751,7 @@ impl UserRepository {
         pubkey: &str,
         tenant_id: i64,
         email: &str,
-        password_hash: Option<&str>,
+        password_hash: &str,
         verification_token: &str,
         verification_expires_at: DateTime<Utc>,
         encrypted_secret: &[u8],
@@ -764,8 +759,7 @@ impl UserRepository {
         let mut tx = self.pool.begin().await?;
         let now = Utc::now();
 
-        // Insert user with email verification token
-        // password_hash may be NULL for async bcrypt flow (computed in background)
+        // Insert user with email verification token.
         sqlx::query(
             "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, email_verification_token, email_verification_expires_at, created_at, updated_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",

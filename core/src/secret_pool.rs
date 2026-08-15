@@ -193,34 +193,6 @@ pub enum SecretPoolError {
     Closed,
 }
 
-/// Utility function to generate a secret and hash it inline (for fallback/migration)
-///
-/// This is slower than using the pool but useful for:
-/// - Fallback when pool is empty
-/// - Migration scripts that need to hash existing secrets
-/// - Tests
-pub async fn generate_secret_hash_inline(
-    bcrypt: &BcryptAdmission,
-) -> Result<SecretPair, BcryptAdmissionError> {
-    let secret: String = rand::thread_rng()
-        .sample_iter(&rand::distributions::Alphanumeric)
-        .take(SECRET_LENGTH)
-        .map(char::from)
-        .collect();
-
-    let hash = bcrypt
-        .hash(
-            BcryptWorkload::OAuth,
-            SecretString::from(secret.clone()),
-            BCRYPT_COST,
-        )
-        .await?;
-    Ok(SecretPair {
-        secret: SecretString::from(secret),
-        hash,
-    })
-}
-
 /// Verify a provided secret against a stored hash
 ///
 /// Uses bcrypt::verify which is constant-time internally.
@@ -263,33 +235,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_generate_secret_hash_inline() {
-        let bcrypt = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
-        let pair = generate_secret_hash_inline(&bcrypt).await.unwrap();
-
-        // Secret should be the expected length
-        assert_eq!(pair.secret.expose_secret().len(), SECRET_LENGTH);
-
-        // Hash should be a valid bcrypt hash (starts with $2b$ or similar)
-        assert!(pair.hash.starts_with("$2"));
-
-        // Verify should succeed
-        assert!(
-            verify_secret(&bcrypt, pair.secret.expose_secret(), &pair.hash)
-                .await
-                .unwrap()
-        );
-    }
-
-    #[tokio::test]
     async fn test_verify_secret_wrong_secret() {
         let bcrypt = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
-        let pair = generate_secret_hash_inline(&bcrypt).await.unwrap();
+        let pool = SecretPool::new(1);
+        let receiver = pool.receiver();
+        let producer_handle = pool.spawn_producer(bcrypt.clone());
+        let pair = receiver.get().await.unwrap();
 
         // Wrong secret should fail
         assert!(!verify_secret(&bcrypt, "wrong_secret", &pair.hash)
             .await
             .unwrap());
+
+        drop(receiver);
+        drop(pool);
+        tokio::time::timeout(std::time::Duration::from_secs(5), producer_handle)
+            .await
+            .expect("Producer should exit within timeout")
+            .expect("Producer should not panic");
     }
 
     #[tokio::test]

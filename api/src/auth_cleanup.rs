@@ -10,6 +10,8 @@ pub fn spawn_cleanup_task(pool: PgPool) -> tokio::task::JoinHandle<()> {
         loop {
             interval.tick().await;
 
+            // TODO(#377): Remove this DELETE after the bounded-bcrypt rollout no longer has
+            // pre-migration first-party registration rows with password_hash IS NULL.
             let result = sqlx::query(
                 "DELETE FROM users WHERE password_hash IS NULL
                  AND vine_id IS NULL

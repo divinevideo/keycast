@@ -222,6 +222,8 @@ impl BcryptAdmission {
 
         loop {
             let idle = self.inner.idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
             if self
                 .inner
                 .lifecycle

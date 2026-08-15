@@ -305,7 +305,7 @@ async fn register_with_personal_key_uses_one_connection() {
                     &probe_pubkey,
                     TENANT_ID,
                     &unique_email(),
-                    Some("hash"),
+                    "hash",
                     &Uuid::new_v4().to_string(),
                     Utc::now() + ChronoDuration::hours(1),
                     b"encrypted",

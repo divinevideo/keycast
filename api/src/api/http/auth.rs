@@ -1116,7 +1116,7 @@ pub async fn register(
             &public_key.to_hex(),
             tenant_id,
             &req.email,
-            Some(&password_hash),
+            &password_hash,
             &verification_token,
             verification_expires,
             &encrypted_secret,
@@ -1991,6 +1991,8 @@ async fn perform_email_verification(
             return Ok(VerifyOutcome::Expired);
         }
 
+        // TODO(#377): Remove after the bounded-bcrypt rollout no longer has pre-migration
+        // first-party registration rows with password_hash IS NULL.
         // Compatibility for registrations persisted by the pre-#366 asynchronous bcrypt flow.
         // New registrations hash before insertion, but rollout can leave older pending rows.
         if token_data.password_hash.is_none() {
@@ -6385,7 +6387,7 @@ mod tests {
                 &first_party_pubkey,
                 1,
                 &first_party_email,
-                Some(&first_party_password_hash),
+                &first_party_password_hash,
                 &first_party_token,
                 first_party_expires_at,
                 &first_party_secret,
