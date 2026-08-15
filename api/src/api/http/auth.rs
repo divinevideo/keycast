@@ -1052,6 +1052,15 @@ pub async fn register(
         "Registration attempt"
     );
 
+    let user_repo = UserRepository::new(pool.clone());
+    if user_repo
+        .find_pubkey_by_email(&req.email, tenant_id)
+        .await?
+        .is_some()
+    {
+        return Err(AuthError::EmailAlreadyExists);
+    }
+
     let password_hash = auth_state
         .state
         .bcrypt
@@ -1102,7 +1111,6 @@ pub async fn register(
 
     // Register user with personal key in a single transaction.
     // Returns Err(RepositoryError::Duplicate) if email already exists, which maps to AuthError::EmailAlreadyExists
-    let user_repo = UserRepository::new(pool.clone());
     user_repo
         .register_with_personal_key(
             &public_key.to_hex(),
@@ -1983,7 +1991,8 @@ async fn perform_email_verification(
             return Ok(VerifyOutcome::Expired);
         }
 
-        // Check async bcrypt state: password_hash IS NULL means still processing
+        // Compatibility for registrations persisted by the pre-#366 asynchronous bcrypt flow.
+        // New registrations hash before insertion, but rollout can leave older pending rows.
         if token_data.password_hash.is_none() {
             let age = Utc::now().signed_duration_since(token_data.created_at);
             if age.num_seconds() > 120 {
@@ -5550,6 +5559,53 @@ mod tests {
         registration.abort();
         drop(held);
         pool.close().await;
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn registration_rejects_duplicate_email_before_bcrypt_admission() {
+        use keycast_core::bcrypt_admission::BcryptAdmission;
+        use std::time::Duration as StdDuration;
+
+        let pool = create_test_db().await;
+        let email = format!("bcrypt-duplicate-{}@example.test", Uuid::new_v4());
+        let pubkey = Keys::generate().public_key().to_hex();
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, created_at, updated_at)
+             VALUES ($1, 1, $2, NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .bind(&email)
+        .execute(&pool)
+        .await
+        .expect("insert existing user");
+
+        let bcrypt = BcryptAdmission::new(1, StdDuration::from_secs(1));
+        bcrypt.shutdown().await;
+        let mut auth_state = create_test_auth_state(pool.clone());
+        Arc::get_mut(&mut auth_state.state)
+            .expect("test state has one owner")
+            .bcrypt = bcrypt;
+
+        let result = super::register(
+            create_unit_test_tenant(),
+            State(auth_state),
+            HeaderMap::new(),
+            Json(super::RegisterRequest {
+                email: email.clone(),
+                password: "test-password".to_string(),
+                nsec: None,
+                relays: None,
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(super::AuthError::EmailAlreadyExists)));
+
+        sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(&pubkey)
+            .execute(&pool)
+            .await
+            .expect("delete existing user");
     }
 
     #[test]

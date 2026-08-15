@@ -1,8 +1,8 @@
-//! Periodic cleanup for abandoned authentication state.
+//! Periodic cleanup for abandoned and legacy authentication state.
 
 use sqlx::PgPool;
 
-/// Remove abandoned signup and OAuth rows on a fixed interval.
+/// Remove legacy pre-#366 asynchronous-signup rows and expired OAuth rows.
 pub fn spawn_cleanup_task(pool: PgPool) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
@@ -22,7 +22,7 @@ pub fn spawn_cleanup_task(pool: PgPool) -> tokio::task::JoinHandle<()> {
             match result {
                 Ok(result) if result.rows_affected() > 0 => {
                     tracing::info!(
-                        "Cleanup task: deleted {} stale signup rows",
+                        "Cleanup task: deleted {} legacy stale signup rows",
                         result.rows_affected()
                     );
                 }

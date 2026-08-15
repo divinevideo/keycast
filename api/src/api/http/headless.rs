@@ -1030,6 +1030,9 @@ pub async fn headless_verify_pin(
         .await
     {
         Ok(valid) => valid,
+        // A malformed stored hash is still a failed PIN comparison. Preserve the attempt and
+        // lockout semantics instead of turning corrupt persisted state into a refundable 500.
+        Err(BcryptAdmissionError::Bcrypt(_)) => false,
         Err(error) => {
             // The queue rejected or abandoned the job before bcrypt produced a comparison result,
             // so this request must not consume the attempt slot reserved above.
@@ -2214,6 +2217,44 @@ mod tests {
             "correct PIN after lockout must not finalize, and must report lockout"
         );
         assert_eq!(response_json(locked).await["code"], "PIN_LOCKED");
+
+        let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(&pubkey)
+            .execute(&pool)
+            .await;
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_malformed_pin_hash_consumes_attempt_and_returns_invalid_pin() {
+        let auth_state = create_lazy_auth_state();
+        let pool = auth_state.state.db.clone();
+        let email = format!("verify-pin-malformed-{}@example.com", uuid::Uuid::new_v4());
+        let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
+        sqlx::query("UPDATE oauth_codes SET pin_hash = 'not-a-bcrypt-hash' WHERE device_code = $1")
+            .bind(&device_code)
+            .execute(&pool)
+            .await
+            .expect("corrupt stored PIN hash");
+
+        let response = call_verify_pin(auth_state, &device_code, "123456").await;
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(response_json(response).await["code"], "PIN_INVALID");
+
+        let (attempts,): (i32,) =
+            sqlx::query_as("SELECT pin_attempts FROM oauth_codes WHERE device_code = $1")
+                .bind(&device_code)
+                .fetch_one(&pool)
+                .await
+                .expect("read consumed PIN attempt");
+        assert_eq!(
+            attempts, 1,
+            "malformed hashes must consume the reserved attempt"
+        );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
             .bind(&device_code)

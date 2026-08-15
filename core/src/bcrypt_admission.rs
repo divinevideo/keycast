@@ -200,8 +200,8 @@ impl BcryptAdmission {
         self.acquire(workload, operation).await
     }
 
-    /// Reject new and queued work, then wait for accepted blocking work to finish.
-    pub async fn shutdown(&self) {
+    /// Reject new and queued work without waiting for accepted work to finish.
+    pub fn close(&self) {
         {
             let mut lifecycle = self
                 .inner
@@ -214,6 +214,11 @@ impl BcryptAdmission {
         for wait_slot in &self.inner.wait_slots {
             wait_slot.close();
         }
+    }
+
+    /// Reject new and queued work, then wait for all accepted work to release admission.
+    pub async fn shutdown(&self) {
+        self.close();
 
         loop {
             let idle = self.inner.idle.notified();

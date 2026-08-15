@@ -420,6 +420,24 @@ enum PoolCloseOutcome {
     TimedOut,
 }
 
+/// Result of waiting for admitted bcrypt work within the shared teardown budget.
+#[derive(Debug)]
+enum BcryptDrainOutcome {
+    Completed,
+    TimedOut,
+}
+
+async fn drain_bcrypt_within_margin(
+    bcrypt: &keycast_core::bcrypt_admission::BcryptAdmission,
+    margin: Duration,
+) -> BcryptDrainOutcome {
+    bcrypt.close();
+    match tokio::time::timeout(margin, bcrypt.shutdown()).await {
+        Ok(()) => BcryptDrainOutcome::Completed,
+        Err(_) => BcryptDrainOutcome::TimedOut,
+    }
+}
+
 /// Await `close_fut` for up to `margin`. If it finishes in time, return
 /// `Completed`; otherwise return `TimedOut`. The close future is dropped on
 /// timeout — sqlx's `Pool::close()` is cancellation-safe, and we would not
@@ -1877,10 +1895,6 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     // Phase 2: tell axum to stop accepting new HTTP connections and wait for
     // in-flight requests to finish.
     shutdown_signal.notify_waiters();
-    let bcrypt_shutdown = tokio::spawn({
-        let bcrypt = bcrypt.clone();
-        async move { bcrypt.shutdown().await }
-    });
     // Close task tracker to prevent new tracked tasks from being spawned.
     task_tracker.close();
 
@@ -1907,10 +1921,6 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
             );
         }
     }
-    if let Err(error) = bcrypt_shutdown.await {
-        tracing::error!(error = %error, "Bcrypt shutdown task failed");
-    }
-
     // Phase 3: publish the cluster `leave` and deregister FIRST (bounded,
     // carved out of the signer_drain budget — see
     // `deregister_within_signer_budget`), so peers rebuild the hashring and
@@ -1988,15 +1998,29 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         }
     }
 
-    // Phase 4: close database pool. Bounded by the teardown margin less
-    // POOL_CLOSE_LOG_HEADROOM so a connection stuck in a long-running query
+    // Phase 4: stop bcrypt admission after all normal request and signer producers have drained,
+    // then close the database pool. Both share the teardown margin less
+    // POOL_CLOSE_LOG_HEADROOM so admitted blocking work or a connection stuck in a long-running query
     // (e.g. a tenant-cache preload task mid-query when task_tracker.wait()
     // timed out and signer_handle.abort() was called but not awaited) cannot
     // block past the platform SIGKILL. The reserved headroom guarantees the
     // final "Graceful shutdown complete" log (and tracing flush) lands before
     // the SIGKILL even on the timeout path. sqlx's Pool::close is
     // cancellation-safe, so dropping the future on timeout is safe.
-    let pool_close_budget = teardown_margin.saturating_sub(POOL_CLOSE_LOG_HEADROOM);
+    let teardown_budget = teardown_margin.saturating_sub(POOL_CLOSE_LOG_HEADROOM);
+    let teardown_started_at = std::time::Instant::now();
+    match drain_bcrypt_within_margin(&bcrypt, teardown_budget).await {
+        BcryptDrainOutcome::Completed => {
+            tracing::info!("All admitted bcrypt work completed");
+        }
+        BcryptDrainOutcome::TimedOut => {
+            tracing::warn!(
+                bcrypt_drain_budget_secs = teardown_budget.as_secs(),
+                "Bcrypt drain exceeded the teardown budget; proceeding to bounded DB pool close"
+            );
+        }
+    }
+    let pool_close_budget = teardown_budget.saturating_sub(teardown_started_at.elapsed());
     match close_within_margin(pool_for_shutdown.close(), pool_close_budget).await {
         PoolCloseOutcome::Completed => {
             tracing::info!(
@@ -2838,6 +2862,41 @@ mod tests {
             cancel_flag.load(Ordering::Relaxed),
             "drain_http_or_abort must abort the spawned task — task drop guard did not fire, meaning the task is still running past the HTTP drain budget"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_bcrypt_drain_closes_admission_and_respects_teardown_budget() {
+        use keycast_core::bcrypt_admission::{
+            BcryptAdmission, BcryptAdmissionError, BcryptOperation, BcryptWorkload,
+        };
+
+        let bcrypt = BcryptAdmission::new(1, Duration::from_secs(1));
+        let held = bcrypt
+            .reserve(BcryptWorkload::Account, BcryptOperation::Hash)
+            .await
+            .expect("hold admitted work open");
+
+        let outcome = drain_bcrypt_within_margin(&bcrypt, Duration::from_secs(5)).await;
+        assert!(matches!(outcome, BcryptDrainOutcome::TimedOut));
+        assert!(matches!(
+            bcrypt
+                .reserve(BcryptWorkload::Login, BcryptOperation::Verify)
+                .await,
+            Err(BcryptAdmissionError::ShuttingDown)
+        ));
+
+        drop(held);
+        bcrypt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_bcrypt_drain_completes_when_admission_is_idle() {
+        let bcrypt =
+            keycast_core::bcrypt_admission::BcryptAdmission::new(1, Duration::from_secs(1));
+
+        let outcome = drain_bcrypt_within_margin(&bcrypt, Duration::from_secs(1)).await;
+
+        assert!(matches!(outcome, BcryptDrainOutcome::Completed));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 #![cfg(feature = "integration-tests")]
 
-// ABOUTME: Integration tests for bcrypt cleanup task
-// ABOUTME: Verifies that cleanup only removes stale signups, not preloaded users
+// ABOUTME: Integration tests for cleanup of legacy pre-#366 async signup rows
+// ABOUTME: Verifies that cleanup only removes stale legacy rows, not preloaded users
 
 use chrono::Utc;
 use sqlx::PgPool;
