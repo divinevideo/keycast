@@ -126,7 +126,7 @@ used when these variables are unset or invalid:
 | `RELAY_WORKER_COUNT` | `max(CPUs, 4) * 2` | Concurrent relay request workers |
 | `RELAY_QUEUE_CAPACITY` | `4096` | Total queued relay requests |
 | `RELAY_FLOW_QUEUE_LIMIT` | `64` | Maximum queued requests for one target or client pubkey |
-| `NIP46_LOOKUP_CONCURRENCY` | `16` | Concurrent cache-miss authorization lookups |
+| `NIP46_LOOKUP_CONCURRENCY` | `4` | Concurrent cache-miss authorization lookups; excess misses shed without occupying workers |
 | `NIP46_NEGATIVE_CACHE_SIZE` | `10000` | Maximum cached unknown bunker pubkeys |
 | `NIP46_NEGATIVE_CACHE_TTL_SECS` | `30` | Unknown-bunker cache lifetime |
 
@@ -431,6 +431,7 @@ The endpoint is unauthenticated and reads only in-process state, so a scrape doe
 | `keycast_nip46_requests_total` | counter | NIP-46 requests received |
 | `keycast_nip46_rejected_hashring_total` | counter | Requests assigned to another instance |
 | `keycast_nip46_rejected_hashring_prequeue_total` | counter | Peer-owned requests rejected before local queue admission |
+| `keycast_nip46_rejected_hashring_worker_total` | counter | Queued requests rejected after ownership changed |
 | `keycast_nip46_handler_not_found_total` | counter | Requests whose authorization was not found |
 | `keycast_nip46_processed_total` | counter | Requests processed successfully |
 | `keycast_nip46_queue_dropped_total` | counter | Requests dropped under backpressure |
@@ -443,6 +444,7 @@ The endpoint is unauthenticated and reads only in-process state, so a scrape doe
 | `keycast_nip46_noisy_flow_shed_total` | counter | Requests shed at target/client flow limits, labelled `flow` |
 | `keycast_nip46_lookup_in_flight` / `keycast_nip46_lookup_limit` | gauge | Current and configured authorization lookup concurrency |
 | `keycast_nip46_lookup_database_total` / `keycast_nip46_lookup_errors_total` | counter | Coalesced authorization DB lookups and failures |
+| `keycast_nip46_lookup_shed_total` | counter | Cache misses shed because lookup admission was full |
 | `keycast_nip46_negative_cache_hits_total` / `keycast_nip46_negative_cache_size` | counter / gauge | Unknown-target cache use and occupancy |
 | `keycast_nip46_activity_queued_total` | counter | Relay activity updates accepted by the coalescing writer |
 | `keycast_nip46_activity_dropped_total` | counter | Activity updates lost at bounded writer boundaries, labelled `reason` |

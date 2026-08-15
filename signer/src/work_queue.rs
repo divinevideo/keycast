@@ -427,6 +427,7 @@ impl Default for VerifyQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::signer_daemon::{admits_owned_request, OwnershipStage};
 
     async fn test_event() -> Box<Event> {
         let keys = Keys::generate();
@@ -565,6 +566,49 @@ mod tests {
             Err(RelayQueueError::NoisyClient)
         ));
         assert_eq!(sender.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn mixed_overload_keeps_resources_bounded_and_unrelated_headroom_available() {
+        let queue = RelayQueue::with_config(8, 2);
+        let sender = queue.sender();
+        let noisy_target = "noisy-target".to_string();
+        let unrelated_target = "unrelated-valid".to_string();
+
+        assert!(!admits_owned_request(false, OwnershipStage::Prequeue));
+        assert_eq!(sender.len(), 0, "peer-owned work must not enter the queue");
+
+        assert!(sender
+            .try_send(test_event().await, noisy_target.clone())
+            .is_ok());
+        assert!(sender
+            .try_send(test_event().await, noisy_target.clone())
+            .is_ok());
+        assert!(matches!(
+            sender.try_send(test_event().await, noisy_target),
+            Err(RelayQueueError::NoisyTarget)
+        ));
+
+        for index in 0..3 {
+            assert!(sender
+                .try_send(test_event().await, format!("unknown-{index}"))
+                .is_ok());
+        }
+        assert!(sender
+            .try_send(test_event().await, unrelated_target.clone())
+            .is_ok());
+        assert!(sender.len() <= queue.capacity());
+
+        let mut unrelated_progressed = false;
+        while let Ok(item) = queue.rx.try_recv() {
+            if item.bunker_pubkey == unrelated_target {
+                unrelated_progressed = true;
+            }
+        }
+        assert!(
+            unrelated_progressed,
+            "unrelated valid work retained queue headroom"
+        );
     }
 
     #[test]

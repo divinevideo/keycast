@@ -1945,7 +1945,6 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     )
     .await;
     activity_log_shutdown.notify_waiters();
-    relay_activity_shutdown.notify_waiters();
     let signer_handle_for_abort = signer_handle;
     let close_relay_queue = move || relay_queue.close();
     // Factory (not a single future) so the relay close can be re-attempted on
@@ -1953,7 +1952,13 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     // returns an owning ('static) future. `Client::shutdown` is idempotent.
     let client_shutdown = move || {
         let client = client_for_shutdown.clone();
-        async move { client.shutdown().await }
+        let relay_activity_shutdown = relay_activity_shutdown.clone();
+        async move {
+            // Relay workers are drained before this factory is called, so no
+            // producer can enqueue activity after the writer's final flush.
+            relay_activity_shutdown.notify_waiters();
+            client.shutdown().await;
+        }
     };
     match drain_signer_or_abort(
         client_shutdown,

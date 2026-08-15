@@ -97,6 +97,7 @@ pub struct Metrics {
     /// NIP-46 requests rejected by hashring (not our responsibility)
     pub nip46_requests_rejected_hashring: AtomicU64,
     pub nip46_requests_rejected_hashring_prequeue: AtomicU64,
+    pub nip46_requests_rejected_hashring_worker: AtomicU64,
     /// NIP-46 requests where handler was not found
     pub nip46_requests_handler_not_found: AtomicU64,
     /// NIP-46 requests successfully processed
@@ -122,6 +123,7 @@ pub struct Metrics {
     pub nip46_lookup_limit: AtomicU64,
     pub nip46_lookup_database_total: AtomicU64,
     pub nip46_lookup_errors: AtomicU64,
+    pub nip46_lookup_shed: AtomicU64,
     pub nip46_negative_cache_hits: AtomicU64,
     pub nip46_negative_cache_size: AtomicU64,
     pub nip46_activity_queued: AtomicU64,
@@ -189,6 +191,7 @@ impl Metrics {
             nip46_requests_total: AtomicU64::new(0),
             nip46_requests_rejected_hashring: AtomicU64::new(0),
             nip46_requests_rejected_hashring_prequeue: AtomicU64::new(0),
+            nip46_requests_rejected_hashring_worker: AtomicU64::new(0),
             nip46_requests_handler_not_found: AtomicU64::new(0),
             nip46_requests_processed: AtomicU64::new(0),
             nip46_requests_queue_dropped: AtomicU64::new(0),
@@ -207,6 +210,7 @@ impl Metrics {
             nip46_lookup_limit: AtomicU64::new(0),
             nip46_lookup_database_total: AtomicU64::new(0),
             nip46_lookup_errors: AtomicU64::new(0),
+            nip46_lookup_shed: AtomicU64::new(0),
             nip46_negative_cache_hits: AtomicU64::new(0),
             nip46_negative_cache_size: AtomicU64::new(0),
             nip46_activity_queued: AtomicU64::new(0),
@@ -269,6 +273,12 @@ impl Metrics {
     pub fn inc_nip46_rejected_hashring_prequeue(&self) {
         self.inc_nip46_rejected_hashring();
         self.nip46_requests_rejected_hashring_prequeue
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_nip46_rejected_hashring_worker(&self) {
+        self.inc_nip46_rejected_hashring();
+        self.nip46_requests_rejected_hashring_worker
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -354,6 +364,10 @@ impl Metrics {
 
     pub fn inc_nip46_lookup_error(&self) {
         self.nip46_lookup_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_nip46_lookup_shed(&self) {
+        self.nip46_lookup_shed.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_nip46_negative_cache_hit(&self) {
@@ -610,6 +624,13 @@ impl Metrics {
             self.nip46_requests_rejected_hashring_prequeue
                 .load(Ordering::Relaxed)
         ));
+        output.push_str("# HELP keycast_nip46_rejected_hashring_worker_total Queued NIP-46 requests rejected after ownership changed\n");
+        output.push_str("# TYPE keycast_nip46_rejected_hashring_worker_total counter\n");
+        output.push_str(&format!(
+            "keycast_nip46_rejected_hashring_worker_total {}\n",
+            self.nip46_requests_rejected_hashring_worker
+                .load(Ordering::Relaxed)
+        ));
 
         output.push_str("\n# HELP keycast_nip46_handler_not_found_total NIP-46 requests where authorization was not found\n");
         output.push_str("# TYPE keycast_nip46_handler_not_found_total counter\n");
@@ -693,6 +714,11 @@ impl Metrics {
         output.push_str(&format!(
             "keycast_nip46_lookup_errors_total {}\n",
             self.nip46_lookup_errors.load(Ordering::Relaxed)
+        ));
+        output.push_str("# HELP keycast_nip46_lookup_shed_total NIP-46 cache misses shed because lookup admission was full\n# TYPE keycast_nip46_lookup_shed_total counter\n");
+        output.push_str(&format!(
+            "keycast_nip46_lookup_shed_total {}\n",
+            self.nip46_lookup_shed.load(Ordering::Relaxed)
         ));
         output.push_str("# HELP keycast_nip46_negative_cache_hits_total NIP-46 unknown-target requests answered by the negative cache\n# TYPE keycast_nip46_negative_cache_hits_total counter\n");
         output.push_str(&format!(
@@ -1229,6 +1255,14 @@ mod tests {
         let metrics = Metrics::new();
         metrics.inc_nip46_noisy_flow_shed("target");
         metrics.inc_nip46_noisy_flow_shed("client");
+        metrics.inc_nip46_rejected_hashring_prequeue();
+        metrics.inc_nip46_rejected_hashring_worker();
+        metrics.inc_queue_dropped();
+        metrics.inc_queue_closed();
+        metrics.inc_nip46_lookup_database();
+        metrics.inc_nip46_lookup_error();
+        metrics.inc_nip46_lookup_shed();
+        metrics.inc_nip46_negative_cache_hit();
         metrics.inc_nip46_activity_dropped("queue_full");
         metrics.inc_nip46_activity_dropped("writer_stopped");
         metrics.add_nip46_activity_dropped("shutdown_flush_failed", 2);
@@ -1239,6 +1273,14 @@ mod tests {
         let output = metrics.to_prometheus();
         assert!(output.contains("keycast_nip46_noisy_flow_shed_total{flow=\"target\"} 1"));
         assert!(output.contains("keycast_nip46_noisy_flow_shed_total{flow=\"client\"} 1"));
+        assert!(output.contains("keycast_nip46_rejected_hashring_prequeue_total 1"));
+        assert!(output.contains("keycast_nip46_rejected_hashring_worker_total 1"));
+        assert!(output.contains("keycast_nip46_queue_dropped_total 1"));
+        assert!(output.contains("keycast_nip46_queue_closed_total 1"));
+        assert!(output.contains("keycast_nip46_lookup_database_total 1"));
+        assert!(output.contains("keycast_nip46_lookup_errors_total 1"));
+        assert!(output.contains("keycast_nip46_lookup_shed_total 1"));
+        assert!(output.contains("keycast_nip46_negative_cache_hits_total 1"));
         assert!(output.contains("keycast_nip46_activity_dropped_total{reason=\"queue_full\"} 1"));
         assert!(
             output.contains("keycast_nip46_activity_dropped_total{reason=\"writer_stopped\"} 1")
