@@ -241,6 +241,18 @@ struct RelayWorkerQueue {
 
 /// Worker loop that processes NIP-46 items from the relay queue
 async fn relay_worker_loop(worker_id: usize, queue: RelayWorkerQueue, context: RelayWorkerContext) {
+    relay_worker_loop_with(worker_id, queue, move |item| {
+        let context = context.clone();
+        async move { process_nip46_item(&item, &context).await }
+    })
+    .await;
+}
+
+async fn relay_worker_loop_with<P, F>(worker_id: usize, queue: RelayWorkerQueue, process: P)
+where
+    P: Fn(Nip46RpcItem) -> F,
+    F: std::future::Future<Output = SignerResult<()>>,
+{
     tracing::debug!("Relay worker {} started", worker_id);
 
     loop {
@@ -285,7 +297,7 @@ async fn relay_worker_loop(worker_id: usize, queue: RelayWorkerQueue, context: R
         let processing_started = Instant::now();
 
         // Process the item
-        if let Err(e) = process_nip46_item(&item, &context).await {
+        if let Err(e) = process(item).await {
             // Filter out expected noise
             match &e {
                 SignerError::MissingParameter("p-tag") => {
@@ -427,7 +439,7 @@ impl Default for VerifyQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::signer_daemon::{admits_owned_request, OwnershipStage};
+    use crate::signer_daemon::{admits_owned_request, enqueue_owned_relay_event, OwnershipStage};
 
     async fn test_event() -> Box<Event> {
         let keys = Keys::generate();
@@ -575,7 +587,12 @@ mod tests {
         let noisy_target = "noisy-target".to_string();
         let unrelated_target = "unrelated-valid".to_string();
 
-        assert!(!admits_owned_request(false, OwnershipStage::Prequeue));
+        assert!(!enqueue_owned_relay_event(
+            &sender,
+            test_event().await,
+            "peer-owned".to_string(),
+            false,
+        ));
         assert_eq!(sender.len(), 0, "peer-owned work must not enter the queue");
 
         assert!(sender
@@ -595,20 +612,78 @@ mod tests {
                 .is_ok());
         }
         assert!(sender
+            .try_send(test_event().await, "peer-after-rebalance".to_string())
+            .is_ok());
+        assert!(sender
             .try_send(test_event().await, unrelated_target.clone())
             .is_ok());
         assert!(sender.len() <= queue.capacity());
 
-        let mut unrelated_progressed = false;
-        while let Ok(item) = queue.rx.try_recv() {
-            if item.bunker_pubkey == unrelated_target {
-                unrelated_progressed = true;
+        let lookup_permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let active_lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak_lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shed_lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let make_processor = || {
+            let lookup_permits = lookup_permits.clone();
+            let active_lookups = active_lookups.clone();
+            let peak_lookups = peak_lookups.clone();
+            let shed_lookups = shed_lookups.clone();
+            let progress_tx = progress_tx.clone();
+            move |item: Nip46RpcItem| {
+                let lookup_permits = lookup_permits.clone();
+                let active_lookups = active_lookups.clone();
+                let peak_lookups = peak_lookups.clone();
+                let shed_lookups = shed_lookups.clone();
+                let progress_tx = progress_tx.clone();
+                async move {
+                    match item.bunker_pubkey.as_str() {
+                        "noisy-target" => tokio::time::sleep(Duration::from_millis(20)).await,
+                        "peer-after-rebalance" => {
+                            assert!(!admits_owned_request(false, OwnershipStage::Worker));
+                        }
+                        target if target.starts_with("unknown-") => {
+                            if let Ok(_permit) = lookup_permits.try_acquire_owned() {
+                                let active = active_lookups
+                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                                    + 1;
+                                peak_lookups.fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+                                tokio::time::sleep(Duration::from_millis(30)).await;
+                                active_lookups.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            } else {
+                                shed_lookups.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                        }
+                        "unrelated-valid" => {
+                            progress_tx.send(()).expect("record valid progress");
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                }
             }
+        };
+
+        queue.close();
+        let worker_queue = || RelayWorkerQueue {
+            rx: queue.rx.clone(),
+            closed: queue.closed.clone(),
+        };
+        let workers = [
+            tokio::spawn(relay_worker_loop_with(0, worker_queue(), make_processor())),
+            tokio::spawn(relay_worker_loop_with(1, worker_queue(), make_processor())),
+        ];
+
+        tokio::time::timeout(Duration::from_secs(1), progress_rx.recv())
+            .await
+            .expect("unrelated valid work must progress")
+            .expect("progress channel closed");
+        for worker in workers {
+            worker.await.expect("worker task");
         }
-        assert!(
-            unrelated_progressed,
-            "unrelated valid work retained queue headroom"
-        );
+        assert!(peak_lookups.load(std::sync::atomic::Ordering::SeqCst) <= 1);
+        assert!(shed_lookups.load(std::sync::atomic::Ordering::SeqCst) > 0);
+        assert_eq!(sender.len(), 0);
     }
 
     #[test]

@@ -12,6 +12,8 @@ use tokio_util::sync::CancellationToken;
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 5;
 const FULL_SYNC_INTERVAL_SECS: u64 = 30;
 const CLEANUP_PROBABILITY_PERCENT: u32 = 10;
+const CLUSTER_EVENT_BUFFER_SIZE: usize = 1_024;
+const AUTHORIZATION_INVALIDATION_PUBLISH_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Cluster coordination event.
 #[derive(Debug, Clone, PartialEq)]
@@ -92,8 +94,8 @@ impl ClusterCoordinator {
         let ring = Arc::new(ArcSwap::from_pointee(initial_ring));
         let cancel_token = CancellationToken::new();
 
-        // Broadcast channel for membership events
-        let (event_tx, _) = broadcast::channel(16);
+        // Authorization invalidations can burst during signup or approval traffic.
+        let (event_tx, _) = broadcast::channel(CLUSTER_EVENT_BUFFER_SIZE);
 
         // Establish Pub/Sub subscription BEFORE publishing join event.
         // This guarantees we're listening before other coordinators can see our join.
@@ -486,15 +488,21 @@ impl ClusterCoordinator {
         &self,
         bunker_pubkey: &str,
     ) -> Result<(), Error> {
-        let mut registry = self.registry.lock().await;
-        let instance_id = registry.instance_id().to_string();
-        Self::publish_event(
-            &mut registry,
-            "authorization_invalidated",
-            &instance_id,
-            Some(bunker_pubkey),
-        )
+        tokio::time::timeout(AUTHORIZATION_INVALIDATION_PUBLISH_TIMEOUT, async {
+            let mut registry = self.registry.lock().await;
+            let instance_id = registry.instance_id().to_string();
+            Self::publish_event(
+                &mut registry,
+                "authorization_invalidated",
+                &instance_id,
+                Some(bunker_pubkey),
+            )
+            .await
+        })
         .await
+        .map_err(|_| {
+            Error::Connection("authorization invalidation publish timed out".to_string())
+        })?
     }
 
     /// Get the connection factory (for creating additional connections).

@@ -126,8 +126,9 @@ used when these variables are unset or invalid:
 | `RELAY_WORKER_COUNT` | `max(CPUs, 4) * 2` | Concurrent relay request workers |
 | `RELAY_QUEUE_CAPACITY` | `4096` | Total queued relay requests |
 | `RELAY_FLOW_QUEUE_LIMIT` | `64` | Maximum queued requests for one target or client pubkey |
-| `NIP46_LOOKUP_CONCURRENCY` | `4` | Concurrent cache-miss authorization lookups; excess misses shed without occupying workers |
+| `NIP46_LOOKUP_CONCURRENCY` | `16` | Concurrent cache-miss authorization lookups; excess misses shed without occupying workers |
 | `NIP46_NEGATIVE_CACHE_SIZE` | `10000` | Maximum cached unknown bunker pubkeys |
+| `NIP46_SINGLEFLIGHT_CACHE_SIZE` | `1024` | Maximum short-lived lookup results retained to coalesce concurrent misses |
 | `NIP46_NEGATIVE_CACHE_TTL_SECS` | `30` | Unknown-bunker cache lifetime |
 
 ### Production GCP resources
