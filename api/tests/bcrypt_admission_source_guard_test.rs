@@ -1,4 +1,9 @@
 use std::{fs, path::Path};
+use syn::{
+    punctuated::Punctuated,
+    visit::{self, Visit},
+    Attribute, Expr, ExprCall, Item, ItemExternCrate, ItemUse, Meta, Token, UseTree,
+};
 
 fn rust_files(root: &Path, files: &mut Vec<std::path::PathBuf>) {
     for entry in fs::read_dir(root).expect("read source directory") {
@@ -11,58 +16,117 @@ fn rust_files(root: &Path, files: &mut Vec<std::path::PathBuf>) {
     }
 }
 
-fn production_source(source: &str) -> &str {
-    let mut offset = 0;
-    let mut previous_nonempty = None;
+fn parse_nested_meta(list: &syn::MetaList) -> Option<Punctuated<Meta, Token![,]>> {
+    list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+        .ok()
+}
 
-    for line in source.split_inclusive('\n') {
-        let trimmed = line.trim();
-        if trimmed == "mod tests {"
-            && previous_nonempty.is_some_and(|attribute: &str| {
-                attribute.starts_with("#[cfg(") && attribute.contains("test")
-            })
-        {
-            return &source[..offset];
+fn meta_requires_test(meta: &Meta) -> bool {
+    match meta {
+        Meta::Path(path) => path.is_ident("test"),
+        Meta::List(list) if list.path.is_ident("cfg") => parse_nested_meta(list)
+            .is_some_and(|nested| nested.len() == 1 && nested.iter().all(meta_requires_test)),
+        // `all(test, ...)` requires tests, while `any(test, ...)` and `not(test)` can compile
+        // outside tests and must remain visible to the guard.
+        Meta::List(list) if list.path.is_ident("all") => {
+            parse_nested_meta(list).is_some_and(|nested| nested.iter().any(meta_requires_test))
         }
-        if !trimmed.is_empty() {
-            previous_nonempty = Some(trimmed);
+        Meta::List(_) => false,
+        Meta::NameValue(_) => false,
+    }
+}
+
+fn is_test_only(attributes: &[Attribute]) -> bool {
+    attributes
+        .iter()
+        .any(|attribute| attribute.path().is_ident("cfg") && meta_requires_test(&attribute.meta))
+}
+
+fn item_attributes(item: &Item) -> &[Attribute] {
+    match item {
+        Item::Const(item) => &item.attrs,
+        Item::Enum(item) => &item.attrs,
+        Item::ExternCrate(item) => &item.attrs,
+        Item::Fn(item) => &item.attrs,
+        Item::ForeignMod(item) => &item.attrs,
+        Item::Impl(item) => &item.attrs,
+        Item::Macro(item) => &item.attrs,
+        Item::Mod(item) => &item.attrs,
+        Item::Static(item) => &item.attrs,
+        Item::Struct(item) => &item.attrs,
+        Item::Trait(item) => &item.attrs,
+        Item::TraitAlias(item) => &item.attrs,
+        Item::Type(item) => &item.attrs,
+        Item::Union(item) => &item.attrs,
+        Item::Use(item) => &item.attrs,
+        _ => &[],
+    }
+}
+
+fn imports_bcrypt_work(tree: &UseTree) -> bool {
+    match tree {
+        UseTree::Name(name) => name.ident == "hash" || name.ident == "verify",
+        UseTree::Rename(rename) => {
+            rename.ident == "hash" || rename.ident == "verify" || rename.ident == "self"
         }
-        offset += line.len();
+        UseTree::Path(path) => imports_bcrypt_work(&path.tree),
+        UseTree::Group(group) => group.items.iter().any(imports_bcrypt_work),
+        UseTree::Glob(_) => true,
+    }
+}
+
+#[derive(Default)]
+struct DirectBcryptVisitor {
+    found: bool,
+}
+
+impl<'ast> Visit<'ast> for DirectBcryptVisitor {
+    fn visit_item(&mut self, item: &'ast Item) {
+        if !is_test_only(item_attributes(item)) {
+            visit::visit_item(self, item);
+        }
     }
 
-    source
+    fn visit_expr_call(&mut self, call: &'ast ExprCall) {
+        if let Expr::Path(function) = call.func.as_ref() {
+            let mut segments = function.path.segments.iter();
+            if segments
+                .next()
+                .is_some_and(|segment| segment.ident == "bcrypt")
+                && segments
+                    .last()
+                    .is_some_and(|segment| segment.ident == "hash" || segment.ident == "verify")
+            {
+                self.found = true;
+            }
+        }
+        visit::visit_expr_call(self, call);
+    }
+
+    fn visit_item_use(&mut self, item: &'ast ItemUse) {
+        match &item.tree {
+            UseTree::Path(path) if path.ident == "bcrypt" && imports_bcrypt_work(&path.tree) => {
+                self.found = true;
+            }
+            UseTree::Rename(rename) if rename.ident == "bcrypt" => self.found = true,
+            _ => {}
+        }
+        visit::visit_item_use(self, item);
+    }
+
+    fn visit_item_extern_crate(&mut self, item: &'ast ItemExternCrate) {
+        if item.ident == "bcrypt" && item.rename.is_some() {
+            self.found = true;
+        }
+        visit::visit_item_extern_crate(self, item);
+    }
 }
 
 fn directly_uses_bcrypt(source: &str) -> bool {
-    let compact: String = source
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect();
-    if compact.contains("bcrypt::hash(")
-        || compact.contains("bcrypt::verify(")
-        || compact.contains("usebcrypt::hash")
-        || compact.contains("usebcrypt::verify")
-        || compact.contains("bcryptas")
-    {
-        return true;
-    }
-
-    let mut imports = compact.as_str();
-    while let Some(start) = imports.find("usebcrypt::{") {
-        let items = &imports[start + "usebcrypt::{".len()..];
-        let Some(end) = items.find("};") else {
-            return true;
-        };
-        if items[..end]
-            .split(',')
-            .any(|item| item.starts_with("hash") || item.starts_with("verify"))
-        {
-            return true;
-        }
-        imports = &items[end + 2..];
-    }
-
-    false
+    let syntax = syn::parse_file(source).expect("parse Rust source");
+    let mut visitor = DirectBcryptVisitor::default();
+    visitor.visit_file(&syntax);
+    visitor.found
 }
 
 #[test]
@@ -81,7 +145,7 @@ fn production_bcrypt_calls_stay_inside_the_admission_service() {
                 continue;
             }
             let source = fs::read_to_string(&file).expect("read Rust source");
-            if directly_uses_bcrypt(production_source(&source)) {
+            if directly_uses_bcrypt(&source) {
                 violations.push(file);
             }
         }
@@ -107,7 +171,25 @@ fn production() {
 mod tests {}
 "#;
 
-    assert!(directly_uses_bcrypt(production_source(source)));
+    assert!(directly_uses_bcrypt(source));
+}
+
+#[test]
+fn early_test_modules_do_not_hide_later_production_calls() {
+    let source = r#"
+#[cfg(test)]
+mod tests {
+    fn test_helper() {
+        bcrypt::hash("test", 4);
+    }
+}
+
+fn production() {
+    bcrypt::hash("secret", 4);
+}
+"#;
+
+    assert!(directly_uses_bcrypt(source));
 }
 
 #[test]
@@ -116,4 +198,27 @@ fn imported_or_aliased_bcrypt_calls_are_rejected() {
         "use bcrypt::{DEFAULT_COST, hash as password_hash};"
     ));
     assert!(directly_uses_bcrypt("use bcrypt as password_hash;"));
+    assert!(directly_uses_bcrypt(
+        "extern crate bcrypt as password_hash;"
+    ));
+}
+
+#[test]
+fn comments_about_bcrypt_are_not_calls() {
+    assert!(!directly_uses_bcrypt(
+        "fn work() { /* bcrypt assumes expensive work */ }"
+    ));
+}
+
+#[test]
+fn production_cfg_expressions_are_not_mistaken_for_test_only_code() {
+    assert!(directly_uses_bcrypt(
+        "#[cfg(not(test))] fn production() { bcrypt::hash(\"secret\", 4); }"
+    ));
+    assert!(directly_uses_bcrypt(
+        "#[cfg(any(test, feature = \"integration-tests\"))] fn production() { bcrypt::hash(\"secret\", 4); }"
+    ));
+    assert!(!directly_uses_bcrypt(
+        "#[cfg(all(test, feature = \"integration-tests\"))] fn helper() { bcrypt::hash(\"test\", 4); }"
+    ));
 }

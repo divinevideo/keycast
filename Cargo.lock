@@ -3482,6 +3482,7 @@ dependencies = [
  "sha256",
  "sqlx",
  "subtle",
+ "syn 2.0.117",
  "thiserror 2.0.18",
  "tokio",
  "tower 0.5.3",
