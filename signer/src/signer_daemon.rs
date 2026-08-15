@@ -1228,6 +1228,23 @@ fn invalidation_shard(bunker_pubkey: &str) -> usize {
     hasher.finish() as usize % LOOKUP_INVALIDATION_SHARDS
 }
 
+async fn invalidate_authorization_caches(
+    lookup: &AuthorizationLookup,
+    handlers: &Cache<String, Nip46Handler>,
+    bunker_pubkey: &str,
+) {
+    lookup.invalidate(bunker_pubkey).await;
+    handlers.invalidate(bunker_pubkey).await;
+}
+
+fn invalidate_all_authorization_caches(
+    lookup: &AuthorizationLookup,
+    handlers: &Cache<String, Nip46Handler>,
+) {
+    lookup.invalidate_all();
+    handlers.invalidate_all();
+}
+
 fn configured_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -1472,15 +1489,21 @@ impl UnifiedSigner {
 
         let mut cluster_events = self.coordinator.subscribe();
         let cluster_lookup = self.authorization_lookup.clone();
+        let cluster_handlers = self.handlers.clone();
         tokio::spawn(async move {
             loop {
                 match cluster_events.recv().await {
                     Ok(MembershipEvent::AuthorizationInvalidated(bunker_pubkey)) => {
-                        cluster_lookup.invalidate(&bunker_pubkey).await;
+                        invalidate_authorization_caches(
+                            &cluster_lookup,
+                            &cluster_handlers,
+                            &bunker_pubkey,
+                        )
+                        .await;
                     }
                     Ok(MembershipEvent::Joined(_) | MembershipEvent::Left(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        cluster_lookup.invalidate_all();
+                        invalidate_all_authorization_caches(&cluster_lookup, &cluster_handlers);
                         tracing::warn!(
                             skipped,
                             "Authorization invalidation listener lagged; cleared lookup caches conservatively"
@@ -1502,7 +1525,12 @@ impl UnifiedSigner {
                             tenant_id,
                             is_oauth,
                         } => {
-                            lookup_clone.invalidate(&bunker_pubkey).await;
+                            invalidate_authorization_caches(
+                                &lookup_clone,
+                                &handlers_clone,
+                                &bunker_pubkey,
+                            )
+                            .await;
                             if let Err(error) = coordinator_clone
                                 .publish_authorization_invalidation(&bunker_pubkey)
                                 .await
@@ -2401,6 +2429,21 @@ mod authorization_lookup_tests {
         assert_eq!(lookup.singleflight.policy().max_capacity(), Some(7));
         assert_eq!(DEFAULT_NIP46_SINGLEFLIGHT_CACHE_SIZE, 1_024);
         assert_eq!(DEFAULT_NIP46_LOOKUP_CONCURRENCY, 16);
+    }
+
+    #[tokio::test]
+    async fn upsert_and_lag_invalidation_evict_positive_handlers() {
+        let lookup = AuthorizationLookup::with_config(4, Duration::from_secs(30), 1);
+        let handlers: Cache<String, Nip46Handler> = Cache::new(4);
+        handlers.insert("updated".to_string(), test_handler()).await;
+        handlers.insert("lagged".to_string(), test_handler()).await;
+
+        invalidate_authorization_caches(&lookup, &handlers, "updated").await;
+        assert!(handlers.get("updated").await.is_none());
+        assert!(handlers.get("lagged").await.is_some());
+
+        invalidate_all_authorization_caches(&lookup, &handlers);
+        assert!(handlers.get("lagged").await.is_none());
     }
 
     #[tokio::test]

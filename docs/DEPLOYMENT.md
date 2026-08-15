@@ -445,8 +445,8 @@ The endpoint is unauthenticated and reads only in-process state, so a scrape doe
 | `keycast_nip46_noisy_flow_shed_total` | counter | Requests shed at target/client flow limits, labelled `flow` |
 | `keycast_nip46_lookup_in_flight` / `keycast_nip46_lookup_limit` | gauge | Current and configured authorization lookup concurrency |
 | `keycast_nip46_lookup_database_total` / `keycast_nip46_lookup_errors_total` | counter | Coalesced authorization DB lookups and failures |
-| `keycast_nip46_lookup_shed_total` | counter | Cache misses shed because lookup admission was full |
-| `keycast_nip46_lookup_invalidated_total` | counter | In-flight lookup results discarded after an authorization changed |
+| `keycast_nip46_lookup_shed_total` | counter | Cache misses dropped without a response because lookup admission was full; clients time out and retry |
+| `keycast_nip46_lookup_invalidated_total` | counter | In-flight lookup results dropped without a response after an authorization changed; clients time out and retry |
 | `keycast_nip46_negative_cache_hits_total` / `keycast_nip46_negative_cache_size` | counter / gauge | Unknown-target cache use and occupancy |
 | `keycast_nip46_activity_queued_total` | counter | Relay activity updates accepted by the coalescing writer |
 | `keycast_nip46_activity_dropped_total` | counter | Activity updates lost at bounded writer boundaries, labelled `reason` |
