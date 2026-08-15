@@ -1068,7 +1068,7 @@ async fn test_sign_canonical_denied_by_readonly_policy() {
 
 #[tokio::test]
 #[serial]
-async fn test_suspended_user_allowed_nostr_rpc_sign_canonical() {
+async fn test_suspended_user_denied_nostr_rpc_sign_canonical() {
     let pool = setup_db().await;
     let tenant_id = create_test_tenant(&pool).await;
     let (user_keys, pubkey) = create_test_user();
@@ -1109,7 +1109,10 @@ async fn test_suspended_user_allowed_nostr_rpc_sign_canonical() {
     .await;
     let auth_state = create_test_auth_state(pool.clone(), key_manager);
 
-    invoke_nostr_rpc(
+    // sign_canonical stays gated (keycast#373). It signs a creator-binding
+    // payload, which is a Divine-hosted capability rather than the generic
+    // event signing an account needs to export itself or republish elsewhere.
+    let err = invoke_nostr_rpc(
         create_test_tenant_extractor(tenant_id),
         auth_state,
         &format!("Bearer {}", token),
@@ -1122,7 +1125,14 @@ async fn test_suspended_user_allowed_nostr_rpc_sign_canonical() {
         },
     )
     .await
-    .expect("suspended user should still be able to sign (keycast#373)");
+    .expect_err("suspended user should be denied creator-binding signing");
+
+    match err {
+        RpcError::AccountSuspended(message) => {
+            assert_eq!(message, "Account restricted");
+        }
+        other => panic!("expected AccountSuspended, got {other:?}"),
+    }
 }
 
 // ============================================================================
