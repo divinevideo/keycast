@@ -1362,12 +1362,17 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         authorization_channel::CHANNEL_BUFFER_SIZE
     );
 
+    let relay_activity_shutdown = Arc::new(Notify::new());
+    let (relay_activity_logger, relay_activity_worker) =
+        keycast_signer::RelayActivityLogger::new(database.pool.clone());
+
     // Create signer (relay connections deferred to background task for faster startup)
     let mut signer = UnifiedSigner::new(
         database.pool.clone(),
         signer_key_manager,
         auth_rx,
         coordinator.clone(),
+        relay_activity_logger,
     )
     .await?;
     signer.load_authorizations().await?;
@@ -1386,18 +1391,12 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| num_cpus::get().max(4) * 2);
-    let relay_worker_handles = relay_queue.spawn_workers(
-        num_workers,
-        signer.handlers(),
-        signer.client(),
-        signer.pool(),
-        signer.key_manager(),
-        signer.coordinator(),
-    );
+    let relay_worker_handles = signer.spawn_relay_workers(&relay_queue, num_workers);
     tracing::info!(
-        "✔︎ Signer daemon initialized (Tokio workers: {}, relay workers: {}, queue: 4096)",
+        "✔︎ Signer daemon initialized (Tokio workers: {}, relay workers: {}, queue: {})",
         worker_threads,
-        num_workers
+        num_workers,
+        relay_queue.capacity()
     );
 
     // Create tenant cache (preload deferred to background task for faster startup)
@@ -1431,6 +1430,13 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     let task_tracker = TaskTracker::new();
     let shutdown_signal = Arc::new(Notify::new());
     let activity_log_shutdown = Arc::new(Notify::new());
+
+    let relay_activity_shutdown_for_task = relay_activity_shutdown.clone();
+    task_tracker.spawn(async move {
+        relay_activity_worker
+            .run_until_shutdown(relay_activity_shutdown_for_task)
+            .await;
+    });
 
     let (activity_logger, activity_log_worker) =
         keycast_api::activity_log::ActivityLogger::new(database.pool.clone());
@@ -1939,6 +1945,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     )
     .await;
     activity_log_shutdown.notify_waiters();
+    relay_activity_shutdown.notify_waiters();
     let signer_handle_for_abort = signer_handle;
     let close_relay_queue = move || relay_queue.close();
     // Factory (not a single future) so the relay close can be re-attempted on

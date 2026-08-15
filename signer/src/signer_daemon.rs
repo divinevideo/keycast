@@ -1,6 +1,7 @@
 // ABOUTME: Unified signer daemon that handles multiple NIP-46 bunker connections in a single process
 // ABOUTME: Listens for NIP-46 requests and routes them to the appropriate authorization/key
 
+use crate::activity_writer::RelayActivityLogger;
 use crate::error::{SignerError, SignerResult};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -18,6 +19,7 @@ use secrecy::{ExposeSecret, SecretString};
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 /// Default timeout for relay connection operations
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -56,6 +58,7 @@ pub struct Nip46Handler {
     tenant_id: i64,
     is_oauth: bool,
     pool: PgPool,
+    activity_logger: RelayActivityLogger,
     /// Handler status for tombstone support (Active, Revoked, or Expired)
     ///
     /// This is a snapshot taken when the handler was loaded. Time-based expiry is
@@ -82,6 +85,7 @@ impl Nip46Handler {
         is_oauth: bool,
         pool: PgPool,
     ) -> Self {
+        let (activity_logger, _worker) = RelayActivityLogger::new(pool.clone());
         Self {
             bunker_keys,
             user_keys,
@@ -90,6 +94,7 @@ impl Nip46Handler {
             tenant_id,
             is_oauth,
             pool,
+            activity_logger,
             status: HandlerStatus::Active,
             tombstone_at: None,
             expires_at: None,
@@ -1002,6 +1007,116 @@ pub struct UnifiedSigner {
     coordinator: Arc<ClusterCoordinator>,
     auth_rx: Option<AuthorizationReceiver>,
     relay_sender: Option<crate::work_queue::RelaySender>,
+    authorization_lookup: AuthorizationLookup,
+    activity_logger: RelayActivityLogger,
+}
+
+#[derive(Clone)]
+pub(crate) struct AuthorizationLookup {
+    negative: Cache<String, ()>,
+    locks: Cache<String, Arc<tokio::sync::Mutex<()>>>,
+    permits: Arc<Semaphore>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RelayWorkerContext {
+    handlers: Cache<String, Nip46Handler>,
+    client: Client,
+    pool: PgPool,
+    key_manager: Arc<Box<dyn KeyManager>>,
+    coordinator: Arc<ClusterCoordinator>,
+    authorization_lookup: AuthorizationLookup,
+    activity_logger: RelayActivityLogger,
+}
+
+struct ActiveLookupGuard;
+
+impl Drop for ActiveLookupGuard {
+    fn drop(&mut self) {
+        METRICS.dec_nip46_lookup_in_flight();
+    }
+}
+
+impl AuthorizationLookup {
+    fn new() -> Self {
+        let capacity = configured_usize("NIP46_NEGATIVE_CACHE_SIZE", 10_000);
+        let ttl_secs = configured_usize("NIP46_NEGATIVE_CACHE_TTL_SECS", 30);
+        let concurrency = configured_usize("NIP46_LOOKUP_CONCURRENCY", 16);
+        Self::with_config(capacity, Duration::from_secs(ttl_secs as u64), concurrency)
+    }
+
+    fn with_config(capacity: usize, ttl: Duration, concurrency: usize) -> Self {
+        METRICS.set_nip46_lookup_limit(concurrency as u64);
+        Self {
+            negative: Cache::builder()
+                .max_capacity(capacity as u64)
+                .time_to_live(ttl)
+                .build(),
+            locks: Cache::builder().max_capacity(capacity as u64).build(),
+            permits: Arc::new(Semaphore::new(concurrency)),
+        }
+    }
+
+    async fn invalidate(&self, bunker_pubkey: &str) {
+        self.negative.invalidate(bunker_pubkey).await;
+        METRICS.set_nip46_negative_cache_size(self.negative.entry_count());
+    }
+
+    async fn resolve_with<F>(
+        &self,
+        bunker_pubkey: &str,
+        load: F,
+    ) -> SignerResult<Option<Nip46Handler>>
+    where
+        F: std::future::Future<Output = SignerResult<Option<Nip46Handler>>> + Send + 'static,
+    {
+        if self.negative.get(bunker_pubkey).await.is_some() {
+            METRICS.inc_nip46_negative_cache_hit();
+            METRICS.inc_nip46_handler_not_found();
+            return Ok(None);
+        }
+
+        let lock = self
+            .locks
+            .get_with(bunker_pubkey.to_string(), async {
+                Arc::new(tokio::sync::Mutex::new(()))
+            })
+            .await;
+        let _key_guard = lock.lock().await;
+        if self.negative.get(bunker_pubkey).await.is_some() {
+            METRICS.inc_nip46_negative_cache_hit();
+            METRICS.inc_nip46_handler_not_found();
+            return Ok(None);
+        }
+
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .map_err(|_| SignerError::internal("authorization lookup admission closed"))?;
+        METRICS.inc_nip46_lookup_in_flight();
+        let _active_lookup = ActiveLookupGuard;
+        METRICS.inc_nip46_lookup_database();
+        let result = load.await;
+        if result.is_err() {
+            METRICS.inc_nip46_lookup_error();
+        }
+        let handler = result?;
+        if handler.is_none() {
+            self.negative.insert(bunker_pubkey.to_string(), ()).await;
+            METRICS.inc_nip46_handler_not_found();
+            METRICS.set_nip46_negative_cache_size(self.negative.entry_count());
+        }
+        Ok(handler)
+    }
+}
+
+fn configured_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
 impl UnifiedSigner {
@@ -1011,6 +1126,7 @@ impl UnifiedSigner {
         key_manager: Box<dyn KeyManager>,
         auth_rx: AuthorizationReceiver,
         coordinator: Arc<ClusterCoordinator>,
+        activity_logger: RelayActivityLogger,
     ) -> SignerResult<Self> {
         let client = Client::default();
 
@@ -1032,6 +1148,8 @@ impl UnifiedSigner {
             coordinator,
             auth_rx: Some(auth_rx),
             relay_sender: None,
+            authorization_lookup: AuthorizationLookup::new(),
+            activity_logger,
         })
     }
 
@@ -1057,6 +1175,30 @@ impl UnifiedSigner {
     /// Get the cluster coordinator
     pub fn coordinator(&self) -> Arc<ClusterCoordinator> {
         self.coordinator.clone()
+    }
+
+    pub fn activity_logger(&self) -> RelayActivityLogger {
+        self.activity_logger.clone()
+    }
+
+    pub fn spawn_relay_workers(
+        &self,
+        queue: &crate::work_queue::RelayQueue,
+        num_workers: usize,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        queue.spawn_workers(num_workers, self.relay_worker_context())
+    }
+
+    fn relay_worker_context(&self) -> RelayWorkerContext {
+        RelayWorkerContext {
+            handlers: self.handlers(),
+            client: self.client(),
+            pool: self.pool(),
+            key_manager: self.key_manager(),
+            coordinator: self.coordinator(),
+            authorization_lookup: self.authorization_lookup.clone(),
+            activity_logger: self.activity_logger.clone(),
+        }
     }
 
     /// Set the relay sender for queue-based processing
@@ -1165,6 +1307,8 @@ impl UnifiedSigner {
         let pool_clone = self.pool.clone();
         let key_manager_clone = self.key_manager.clone();
         let handlers_clone = self.handlers.clone();
+        let lookup_clone = self.authorization_lookup.clone();
+        let activity_logger_clone = self.activity_logger.clone();
 
         // Take ownership of the receiver (we only spawn this once)
         if let Some(mut auth_rx) = self.auth_rx.take() {
@@ -1177,6 +1321,7 @@ impl UnifiedSigner {
                             tenant_id,
                             is_oauth,
                         } => {
+                            lookup_clone.invalidate(&bunker_pubkey).await;
                             tracing::debug!(
                                 "Received Upsert command for bunker: {}",
                                 bunker_pubkey
@@ -1188,6 +1333,7 @@ impl UnifiedSigner {
                                 &bunker_pubkey,
                                 tenant_id,
                                 is_oauth,
+                                &activity_logger_clone,
                             )
                             .await
                             {
@@ -1256,6 +1402,8 @@ impl UnifiedSigner {
         let key_manager = self.key_manager.clone();
         let coordinator = self.coordinator.clone();
         let relay_sender = self.relay_sender.clone();
+        let authorization_lookup = self.authorization_lookup.clone();
+        let activity_logger = self.activity_logger.clone();
 
         self.client
             .handle_notifications(|notification| async {
@@ -1272,11 +1420,14 @@ impl UnifiedSigner {
                         if let Some(ref sender) = relay_sender {
                             // QUEUE-BASED PROCESSING: Send to relay queue for bounded concurrency
                             if let Some(bunker_pubkey) = bunker_pubkey {
-                                let item = crate::work_queue::Nip46RpcItem {
-                                    event,
-                                    bunker_pubkey,
-                                };
-                                if let Err(e) = sender.try_send(item) {
+                                // Reject peer-owned work before it can consume local queue
+                                // or per-flow capacity. Workers repeat this check because
+                                // hashring ownership can change while an item waits.
+                                if !coordinator.should_handle(&bunker_pubkey) {
+                                    METRICS.inc_nip46_rejected_hashring_prequeue();
+                                    return Ok(false);
+                                }
+                                if let Err(e) = sender.try_send(event, bunker_pubkey) {
                                     tracing::warn!("Failed to enqueue NIP-46 request: {}", e);
                                 }
                             } else {
@@ -1284,22 +1435,17 @@ impl UnifiedSigner {
                             }
                         } else {
                             // LEGACY: Direct spawning (for backwards compatibility / testing)
-                            let handlers_lock = handlers.clone();
-                            let client_clone = client.clone();
-                            let pool_clone = pool.clone();
-                            let key_manager_clone = key_manager.clone();
-                            let coordinator_clone = coordinator.clone();
+                            let context = RelayWorkerContext {
+                                handlers: handlers.clone(),
+                                client: client.clone(),
+                                pool: pool.clone(),
+                                key_manager: key_manager.clone(),
+                                coordinator: coordinator.clone(),
+                                authorization_lookup: authorization_lookup.clone(),
+                                activity_logger: activity_logger.clone(),
+                            };
                             tokio::spawn(async move {
-                                if let Err(e) = Self::handle_nip46_request(
-                                    handlers_lock,
-                                    client_clone,
-                                    event,
-                                    &pool_clone,
-                                    &key_manager_clone,
-                                    &coordinator_clone,
-                                )
-                                .await
-                                {
+                                if let Err(e) = Self::handle_nip46_request(&context, event).await {
                                     // Filter out expected noise from malformed external requests
                                     match &e {
                                         SignerError::MissingParameter("p-tag") => {
@@ -1333,6 +1479,7 @@ impl UnifiedSigner {
         bunker_pubkey: &str,
         tenant_id: i64,
         is_oauth: bool,
+        activity_logger: &RelayActivityLogger,
     ) -> SignerResult<()> {
         if is_oauth {
             // Load active OAuth authorization (filter out revoked/expired)
@@ -1383,6 +1530,7 @@ impl UnifiedSigner {
                     tenant_id,
                     is_oauth: true,
                     pool: pool.clone(),
+                    activity_logger: activity_logger.clone(),
                     status,
                     tombstone_at,
                     expires_at: auth.expires_at,
@@ -1441,6 +1589,7 @@ impl UnifiedSigner {
                     tenant_id,
                     is_oauth: false,
                     pool: pool.clone(),
+                    activity_logger: activity_logger.clone(),
                     status,
                     tombstone_at,
                     expires_at,
@@ -1454,14 +1603,122 @@ impl UnifiedSigner {
         Ok(())
     }
 
-    pub async fn handle_nip46_request(
-        handlers: Cache<String, Nip46Handler>,
-        client: Client,
-        event: Box<Event>,
+    async fn lookup_authorization(
+        lookup: &AuthorizationLookup,
         pool: &PgPool,
         key_manager: &Arc<Box<dyn KeyManager>>,
-        coordinator: &Arc<ClusterCoordinator>,
+        activity_logger: &RelayActivityLogger,
+        bunker_pubkey: &str,
+    ) -> SignerResult<Option<Nip46Handler>> {
+        let pool = pool.clone();
+        let key_manager = key_manager.clone();
+        let activity_logger = activity_logger.clone();
+        let key = bunker_pubkey.to_string();
+        lookup
+            .resolve_with(bunker_pubkey, async move {
+                Self::load_authorization_from_database(&pool, &key_manager, &activity_logger, &key)
+                    .await
+            })
+            .await
+    }
+
+    async fn load_authorization_from_database(
+        pool: &PgPool,
+        key_manager: &Arc<Box<dyn KeyManager>>,
+        activity_logger: &RelayActivityLogger,
+        bunker_pubkey: &str,
+    ) -> SignerResult<Option<Nip46Handler>> {
+        if let Some(auth) =
+            OAuthAuthorization::find_by_bunker_pubkey_for_signer(pool, bunker_pubkey).await?
+        {
+            let (status, tombstone_at) = Nip46Handler::compute_status_from_oauth(&auth);
+            let encrypted_user_key: Vec<u8> = sqlx::query_scalar(
+                "SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1 AND tenant_id = $2",
+            )
+            .bind(&auth.user_pubkey)
+            .bind(auth.tenant_id)
+            .fetch_one(pool)
+            .await?;
+            let decrypted_user_secret = key_manager
+                .decrypt(&encrypted_user_key)
+                .await
+                .map_err(|error| SignerError::encryption(error.to_string()))?;
+            let user_secret_key = SecretKey::from_slice(&decrypted_user_secret)
+                .map_err(|error| SignerError::invalid_key(error.to_string()))?;
+            let bunker_keys =
+                keycast_core::bunker_key::derive_bunker_keys(&user_secret_key, &auth.secret_hash);
+            return Ok(Some(Nip46Handler {
+                bunker_keys,
+                user_keys: Keys::new(user_secret_key),
+                secret_hash: auth.secret_hash,
+                authorization_id: auth.id,
+                tenant_id: auth.tenant_id,
+                is_oauth: true,
+                pool: pool.clone(),
+                activity_logger: activity_logger.clone(),
+                status,
+                tombstone_at,
+                expires_at: auth.expires_at,
+            }));
+        }
+
+        #[allow(clippy::type_complexity)]
+        let auth_data: Option<(i32, String, i32, i64, Option<DateTime<Utc>>)> = sqlx::query_as(
+            "SELECT id, secret_hash, stored_key_id, tenant_id, expires_at
+             FROM authorizations WHERE bunker_public_key = $1",
+        )
+        .bind(bunker_pubkey)
+        .fetch_optional(pool)
+        .await?;
+
+        let Some((authorization_id, secret_hash, stored_key_id, tenant_id, expires_at)) = auth_data
+        else {
+            return Ok(None);
+        };
+        let stored_key_secret: Vec<u8> = sqlx::query_scalar(
+            "SELECT secret_key FROM stored_keys WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(stored_key_id)
+        .bind(tenant_id)
+        .fetch_one(pool)
+        .await?;
+        let decrypted_user_secret = key_manager
+            .decrypt(&stored_key_secret)
+            .await
+            .map_err(|error| SignerError::encryption(error.to_string()))?;
+        let user_secret_key = SecretKey::from_slice(&decrypted_user_secret)
+            .map_err(|error| SignerError::invalid_key(error.to_string()))?;
+        let bunker_keys =
+            keycast_core::bunker_key::derive_bunker_keys(&user_secret_key, &secret_hash);
+        let (status, tombstone_at) = Nip46Handler::compute_status_from_expiry(expires_at);
+        Ok(Some(Nip46Handler {
+            bunker_keys,
+            user_keys: Keys::new(user_secret_key),
+            secret_hash,
+            authorization_id,
+            tenant_id,
+            is_oauth: false,
+            pool: pool.clone(),
+            activity_logger: activity_logger.clone(),
+            status,
+            tombstone_at,
+            expires_at,
+        }))
+    }
+
+    pub(crate) async fn handle_nip46_request(
+        context: &RelayWorkerContext,
+        event: Box<Event>,
     ) -> SignerResult<()> {
+        let RelayWorkerContext {
+            handlers,
+            client,
+            pool,
+            key_manager,
+            coordinator,
+            authorization_lookup,
+            activity_logger,
+        } = context;
         // SINGLE SUBSCRIPTION ARCHITECTURE:
         // We receive ALL kind 24133 events from the relay (no pubkey filter)
         // Now we check if the target bunker pubkey (in #p tag) is one we manage
@@ -1501,182 +1758,22 @@ impl UnifiedSigner {
             }
             None => {
                 METRICS.inc_cache_miss();
-                // Not in cache - check database (on-demand loading)
-                tracing::trace!("Bunker {} not in cache, checking database", bunker_pubkey);
-
-                // Query database for OAuth authorization with this bunker pubkey
-                // Include revoked/expired to support tombstone error responses
-                let auth_opt =
-                    OAuthAuthorization::find_by_bunker_pubkey_for_signer(pool, bunker_pubkey)
-                        .await?;
-
-                match auth_opt {
-                    Some(auth) => {
-                        // Compute status from database fields (revoked/expired/active)
-                        let (status, tombstone_at) = Nip46Handler::compute_status_from_oauth(&auth);
-
-                        if status == HandlerStatus::Active {
-                            tracing::debug!("Loading authorization on-demand: {}", bunker_pubkey);
-                        } else {
-                            tracing::debug!(
-                                "Loading tombstone authorization on-demand: {} (status: {:?})",
-                                bunker_pubkey,
-                                status
-                            );
-                        }
-
-                        // Get user's key from personal_keys table (single source of truth)
-                        // Must load this first - needed for HKDF bunker key derivation
-                        let encrypted_user_key: Vec<u8> = sqlx::query_scalar(
-                            "SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1 AND tenant_id = $2"
-                        )
-                        .bind(&auth.user_pubkey)
-                        .bind(auth.tenant_id)
-                        .fetch_one(pool)
-                        .await?;
-
-                        let decrypted_user_secret = key_manager
-                            .decrypt(&encrypted_user_key)
-                            .await
-                            .map_err(|e| SignerError::encryption(e.to_string()))?;
-                        let user_secret_key = SecretKey::from_slice(&decrypted_user_secret)
-                            .map_err(|e| {
-                                SignerError::invalid_key(format!("Invalid user key: {}", e))
-                            })?;
-                        let user_keys = Keys::new(user_secret_key.clone());
-
-                        // Derive bunker keys using HKDF with secret_hash as entropy
-                        // This avoids an extra KMS call - user_secret is already decrypted
-                        let bunker_keys = keycast_core::bunker_key::derive_bunker_keys(
-                            &user_secret_key,
-                            &auth.secret_hash,
-                        );
-
-                        let handler = Nip46Handler {
-                            bunker_keys,
-                            user_keys,
-                            secret_hash: auth.secret_hash.clone(),
-                            authorization_id: auth.id,
-                            tenant_id: auth.tenant_id,
-                            is_oauth: true,
-                            pool: pool.clone(),
-                            status,
-                            tombstone_at,
-                            expires_at: auth.expires_at,
-                        };
-
-                        // Cache it for future requests (LRU will evict old entries automatically)
+                match Self::lookup_authorization(
+                    authorization_lookup,
+                    pool,
+                    key_manager,
+                    activity_logger,
+                    bunker_pubkey,
+                )
+                .await?
+                {
+                    Some(handler) => {
                         handlers
                             .insert(bunker_pubkey.to_string(), handler.clone())
                             .await;
-
                         handler
                     }
-                    None => {
-                        // Not in oauth_authorizations - check regular authorizations table
-                        tracing::trace!(
-                            "Bunker {} not in oauth_authorizations, checking authorizations table",
-                            bunker_pubkey
-                        );
-
-                        // Query regular authorizations table (team bunkers)
-                        // Include expired to support tombstone error responses
-                        // Note: Team authorizations use hard-delete (no revoked_at), only expires_at
-                        #[allow(clippy::type_complexity)]
-                        let auth_data: Option<(
-                            i32,
-                            String,
-                            i32,
-                            i64,
-                            Option<DateTime<Utc>>,
-                        )> = sqlx::query_as(
-                            r#"SELECT id, secret_hash, stored_key_id, tenant_id, expires_at
-                               FROM authorizations
-                               WHERE bunker_public_key = $1"#,
-                        )
-                        .bind(bunker_pubkey)
-                        .fetch_optional(pool)
-                        .await?;
-
-                        match auth_data {
-                            Some((auth_id, secret_hash, stored_key_id, tenant_id, expires_at)) => {
-                                // Compute status from expires_at (team auths don't have revoked_at)
-                                let (status, tombstone_at) =
-                                    Nip46Handler::compute_status_from_expiry(expires_at);
-
-                                if status == HandlerStatus::Active {
-                                    tracing::debug!(
-                                        "Loading team authorization on-demand: {}",
-                                        bunker_pubkey
-                                    );
-                                } else {
-                                    tracing::debug!(
-                                        "Loading tombstone team authorization on-demand: {} (status: {:?})",
-                                        bunker_pubkey,
-                                        status
-                                    );
-                                }
-
-                                // Load stored_key (team's signing key) first - needed for HKDF derivation
-                                let stored_key_secret: Vec<u8> = sqlx::query_scalar(
-                                    "SELECT secret_key FROM stored_keys WHERE id = $1 AND tenant_id = $2",
-                                )
-                                .bind(stored_key_id)
-                                .bind(tenant_id)
-                                .fetch_one(pool)
-                                .await?;
-
-                                let decrypted_user_secret = key_manager
-                                    .decrypt(&stored_key_secret)
-                                    .await
-                                    .map_err(|e| SignerError::encryption(e.to_string()))?;
-                                let user_secret_key = SecretKey::from_slice(&decrypted_user_secret)
-                                    .map_err(|e| {
-                                        SignerError::invalid_key(format!(
-                                            "Invalid user secret key: {}",
-                                            e
-                                        ))
-                                    })?;
-                                let user_keys = Keys::new(user_secret_key.clone());
-
-                                // Derive bunker keys using HKDF with secret_hash as entropy
-                                // This avoids an extra KMS call - user_secret is already decrypted
-                                let bunker_keys = keycast_core::bunker_key::derive_bunker_keys(
-                                    &user_secret_key,
-                                    &secret_hash,
-                                );
-
-                                let handler = Nip46Handler {
-                                    bunker_keys,
-                                    user_keys,
-                                    secret_hash,
-                                    authorization_id: auth_id,
-                                    tenant_id,
-                                    is_oauth: false,
-                                    pool: pool.clone(),
-                                    status,
-                                    tombstone_at,
-                                    expires_at,
-                                };
-
-                                // Cache it for future requests
-                                handlers
-                                    .insert(bunker_pubkey.to_string(), handler.clone())
-                                    .await;
-
-                                handler
-                            }
-                            None => {
-                                // Not in any database table - not our bunker
-                                METRICS.inc_nip46_handler_not_found();
-                                tracing::trace!(
-                                    "Bunker {} not found in any database, ignoring",
-                                    bunker_pubkey
-                                );
-                                return Ok(());
-                            }
-                        }
-                    }
+                    None => return Ok(()),
                 }
             }
         };
@@ -2054,30 +2151,13 @@ impl Nip46Handler {
         }))
     }
 
-    /// Spawn activity stats update in background (non-blocking)
+    /// Queue activity for the bounded, coalescing relay writer.
     fn spawn_update_activity(&self) {
         if !self.is_oauth {
             return;
         }
-
-        let pool = self.pool.clone();
-        let tenant_id = self.tenant_id;
-        let authorization_id = self.authorization_id as i64;
-
-        tokio::spawn(async move {
-            if let Err(e) = sqlx::query(
-                "UPDATE oauth_authorizations
-                 SET last_activity = NOW(), activity_count = activity_count + 1
-                 WHERE id = $1 AND tenant_id = $2",
-            )
-            .bind(authorization_id)
-            .bind(tenant_id)
-            .execute(&pool)
-            .await
-            {
-                tracing::error!("Failed to update oauth_authorizations activity: {}", e);
-            }
-        });
+        self.activity_logger
+            .record(self.tenant_id, self.authorization_id as i64);
     }
 }
 
@@ -2106,6 +2186,132 @@ impl UnifiedSigner {
         } else {
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod authorization_lookup_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn concurrent_unknown_target_is_coalesced() {
+        let lookup = AuthorizationLookup::with_config(16, Duration::from_secs(1), 4);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+
+        for _ in 0..12 {
+            let lookup = lookup.clone();
+            let calls = calls.clone();
+            tasks.push(tokio::spawn(async move {
+                lookup
+                    .resolve_with("unknown", async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        Ok(None)
+                    })
+                    .await
+                    .expect("lookup")
+            }));
+        }
+
+        for task in tasks {
+            assert!(task.await.expect("task").is_none());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn varied_unknown_targets_obey_lookup_concurrency() {
+        let lookup = AuthorizationLookup::with_config(4, Duration::from_secs(1), 2);
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+
+        for index in 0..16 {
+            let lookup = lookup.clone();
+            let active = active.clone();
+            let peak = peak.clone();
+            tasks.push(tokio::spawn(async move {
+                lookup
+                    .resolve_with(&format!("unknown-{index}"), async move {
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(current, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok(None)
+                    })
+                    .await
+            }));
+        }
+
+        for task in tasks {
+            assert!(task.await.expect("task").expect("lookup").is_none());
+        }
+        assert!(peak.load(Ordering::SeqCst) <= 2);
+    }
+
+    #[tokio::test]
+    async fn negative_cache_expires_and_creation_invalidation_clears_it() {
+        let lookup = AuthorizationLookup::with_config(4, Duration::from_millis(20), 1);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..2 {
+            let calls = calls.clone();
+            assert!(lookup
+                .resolve_with("created-later", async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(None)
+                })
+                .await
+                .expect("lookup")
+                .is_none());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        lookup.invalidate("created-later").await;
+        let calls_after_invalidation = calls.clone();
+        lookup
+            .resolve_with("created-later", async move {
+                calls_after_invalidation.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            })
+            .await
+            .expect("lookup");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let calls_after_expiry = calls.clone();
+        lookup
+            .resolve_with("created-later", async move {
+                calls_after_expiry.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            })
+            .await
+            .expect("lookup");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn dependency_failure_is_not_negative_cached() {
+        let lookup = AuthorizationLookup::with_config(4, Duration::from_secs(1), 1);
+        assert!(lookup
+            .resolve_with("dependency-error", async {
+                Err(SignerError::internal("database unavailable"))
+            })
+            .await
+            .is_err());
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_retry = calls.clone();
+        lookup
+            .resolve_with("dependency-error", async move {
+                calls_for_retry.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            })
+            .await
+            .expect("retry must run");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
 
@@ -2216,6 +2422,8 @@ mod tests {
         .await
         .unwrap();
 
+        let (activity_logger, _worker) = RelayActivityLogger::new(pool.clone());
+
         Nip46Handler {
             bunker_keys,
             user_keys,
@@ -2224,6 +2432,7 @@ mod tests {
             tenant_id: 1,
             is_oauth: true,
             pool,
+            activity_logger,
             status: HandlerStatus::Active,
             tombstone_at: None,
             expires_at: None,
@@ -2339,7 +2548,8 @@ mod tests {
         let redis_url =
             std::env::var("TEST_REDIS_URL").expect("TEST_REDIS_URL must be set to run Redis tests");
         let coordinator = Arc::new(ClusterCoordinator::start(&redis_url).await.unwrap());
-        let signer = UnifiedSigner::new(pool, key_manager, rx, coordinator)
+        let (activity_logger, _worker) = RelayActivityLogger::new(pool.clone());
+        let signer = UnifiedSigner::new(pool, key_manager, rx, coordinator, activity_logger)
             .await
             .unwrap();
 
@@ -2368,9 +2578,16 @@ mod tests {
         let redis_url =
             std::env::var("TEST_REDIS_URL").expect("TEST_REDIS_URL must be set to run Redis tests");
         let coordinator = Arc::new(ClusterCoordinator::start(&redis_url).await.unwrap());
-        let signer = UnifiedSigner::new(pool.clone(), key_manager, rx, coordinator)
-            .await
-            .unwrap();
+        let (activity_logger, _worker) = RelayActivityLogger::new(pool.clone());
+        let signer = UnifiedSigner::new(
+            pool.clone(),
+            key_manager,
+            rx,
+            coordinator,
+            activity_logger.clone(),
+        )
+        .await
+        .unwrap();
 
         // Act - clone handlers (moka Cache uses internal Arc, clones are cheap and share data)
         let handlers1 = signer.handlers.clone();
@@ -2385,6 +2602,7 @@ mod tests {
             tenant_id: 1,
             is_oauth: true,
             pool: pool.clone(),
+            activity_logger,
             status: HandlerStatus::Active,
             tombstone_at: None,
             expires_at: None,

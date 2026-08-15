@@ -118,6 +118,18 @@ These are set by `cloudbuild.yaml --set-env-vars`:
 | `SHUTDOWN_SIGNER_DRAIN_SECS` | `3` |
 | `SHUTDOWN_TEARDOWN_MARGIN_SECS` | `4` |
 
+Relay NIP-46 admission has optional per-instance tuning controls. Defaults are
+used when these variables are unset or invalid:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `RELAY_WORKER_COUNT` | `max(CPUs, 4) * 2` | Concurrent relay request workers |
+| `RELAY_QUEUE_CAPACITY` | `4096` | Total queued relay requests |
+| `RELAY_FLOW_QUEUE_LIMIT` | `64` | Maximum queued requests for one target or client pubkey |
+| `NIP46_LOOKUP_CONCURRENCY` | `16` | Concurrent cache-miss authorization lookups |
+| `NIP46_NEGATIVE_CACHE_SIZE` | `10000` | Maximum cached unknown bunker pubkeys |
+| `NIP46_NEGATIVE_CACHE_TTL_SECS` | `30` | Unknown-bunker cache lifetime |
+
 ### Production GCP resources
 
 | Resource | Name |
@@ -418,11 +430,23 @@ The endpoint is unauthenticated and reads only in-process state, so a scrape doe
 | `keycast_cache_size` | gauge | Current handlers in cache |
 | `keycast_nip46_requests_total` | counter | NIP-46 requests received |
 | `keycast_nip46_rejected_hashring_total` | counter | Requests assigned to another instance |
+| `keycast_nip46_rejected_hashring_prequeue_total` | counter | Peer-owned requests rejected before local queue admission |
 | `keycast_nip46_handler_not_found_total` | counter | Requests whose authorization was not found |
 | `keycast_nip46_processed_total` | counter | Requests processed successfully |
 | `keycast_nip46_queue_dropped_total` | counter | Requests dropped under backpressure |
 | `keycast_nip46_queue_closed_total` | counter | Requests rejected because the queue is closed during graceful shutdown |
 | `keycast_nip46_tombstone_responses_total` | counter | Error responses sent for revoked or expired authorizations |
+| `keycast_nip46_queue_depth` / `keycast_nip46_queue_capacity` | gauge | Current and configured relay queue occupancy |
+| `keycast_nip46_queue_wait_seconds` | summary | Relay queue wait time |
+| `keycast_nip46_workers_active` | gauge | Relay workers currently processing requests |
+| `keycast_nip46_worker_duration_seconds` | summary | Relay worker processing time |
+| `keycast_nip46_noisy_flow_shed_total` | counter | Requests shed at target/client flow limits, labelled `flow` |
+| `keycast_nip46_lookup_in_flight` / `keycast_nip46_lookup_limit` | gauge | Current and configured authorization lookup concurrency |
+| `keycast_nip46_lookup_database_total` / `keycast_nip46_lookup_errors_total` | counter | Coalesced authorization DB lookups and failures |
+| `keycast_nip46_negative_cache_hits_total` / `keycast_nip46_negative_cache_size` | counter / gauge | Unknown-target cache use and occupancy |
+| `keycast_nip46_activity_queued_total` | counter | Relay activity updates accepted by the coalescing writer |
+| `keycast_nip46_activity_dropped_total` | counter | Activity updates lost at bounded writer boundaries, labelled `reason` |
+| `keycast_nip46_activity_write_failures_total` / `keycast_nip46_activity_pending` | counter / gauge | Activity writer failures and retained authorization IDs |
 | `keycast_http_rpc_requests_total` | counter | HTTP RPC requests to `/api/nostr` |
 | `keycast_http_rpc_auth_errors_total` | counter | HTTP RPC auth failures |
 | `keycast_http_rpc_cache_hits_total` | counter | HTTP RPC handler found in memory cache |
@@ -441,6 +465,16 @@ The endpoint is unauthenticated and reads only in-process state, so a scrape doe
 | `keycast_auth_email_send_failures_total` | counter | Auth email send failures, labelled `template` |
 
 High `keycast_cache_misses_total` relative to hits usually points at session affinity or cold-cache behavior. Increasing `keycast_nip46_queue_dropped_total` means the signer path is overloaded.
+
+Relay NIP-46 traffic arrives over WebSockets and does not pass through Keycast's
+HTTP ingress controls. Diagnose it separately from HTTP pressure. Queue depth and
+wait show backlog; noisy-flow shedding shows isolated target/client bursts;
+lookup concurrency, errors, and negative-cache metrics show unknown-target
+pressure; activity metrics show whether best-effort usage accounting is being
+coalesced or lost. During launch, high CPU or sustained relay shedding should be
+handled first by dashboard-level CPU inspection and manual instance scaling.
+Change the tuning controls only after measurements show which bounded stage is
+the bottleneck.
 
 ---
 
@@ -474,6 +508,9 @@ Cloud Run currently targets 50 concurrent requests per instance and `SQLX_POOL_S
 | ArgoCD sync state | ArgoCD app for the relevant keycast overlay in `divine-iac-coreconfig` |
 | High latency, low CPU | cache misses, Redis, relay health, KMS latency |
 | `keycast_nip46_queue_dropped_total` increasing | signer path overloaded; scale or reduce load |
+| Noisy-flow shedding increasing with low queue depth | one target or client is being isolated; unrelated work retains headroom |
+| Lookup errors increasing | Postgres/KMS cache-miss path is failing; misses are not cached as absence |
+| Relay activity drops increasing | activity accounting is shedding or shutdown flush failed; signing remains bounded |
 | Cache misses high vs hits | session affinity or cold-cache problem |
 | Config or secret changed | roll Cloud Run revision or GKE pods |
 | Before production GKE cutover | fix/verify 75s shutdown budget, session affinity, probe paths, ATProto entryway multi-replica behavior, production overlay tag |

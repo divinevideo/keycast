@@ -2,18 +2,16 @@
 // ABOUTME: Two-queue architecture: VerifyQueue (stub for batching) + RelayQueue (bounded workers)
 
 use crate::error::{SignerError, SignerResult};
-use crate::signer_daemon::Nip46Handler;
-use cluster_hashring::ClusterCoordinator;
+use crate::signer_daemon::RelayWorkerContext;
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TrySendError};
-use keycast_core::encryption::KeyManager;
 use keycast_core::metrics::METRICS;
-use moka::future::Cache;
 use nostr_sdk::prelude::*;
-use sqlx::PgPool;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-const QUEUE_CAPACITY: usize = 4096;
+const DEFAULT_QUEUE_CAPACITY: usize = 4096;
+const DEFAULT_FLOW_QUEUE_LIMIT: usize = 64;
 const WORKER_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// NIP-46 request item for the relay queue
@@ -23,6 +21,8 @@ pub struct Nip46RpcItem {
     pub event: Box<Event>,
     /// The bunker pubkey (target of the request, extracted from p-tag)
     pub bunker_pubkey: String,
+    enqueued_at: Instant,
+    flow_permit: Option<FlowPermit>,
 }
 
 /// Relay queue for bounded concurrency on NIP-46 sign/encrypt/decrypt operations
@@ -33,16 +33,28 @@ pub struct RelayQueue {
     tx: Sender<Nip46RpcItem>,
     rx: Receiver<Nip46RpcItem>,
     closed: Arc<Mutex<bool>>,
+    admission: FlowAdmission,
+    capacity: usize,
 }
 
 impl RelayQueue {
     /// Create a new relay queue with bounded capacity
     pub fn new() -> Self {
-        let (tx, rx) = bounded(QUEUE_CAPACITY);
+        let capacity = configured_usize("RELAY_QUEUE_CAPACITY", DEFAULT_QUEUE_CAPACITY);
+        let flow_queue_limit = configured_usize("RELAY_FLOW_QUEUE_LIMIT", DEFAULT_FLOW_QUEUE_LIMIT);
+        Self::with_config(capacity, flow_queue_limit)
+    }
+
+    fn with_config(capacity: usize, flow_queue_limit: usize) -> Self {
+        assert!(capacity > 0, "relay queue capacity must be positive");
+        assert!(flow_queue_limit > 0, "relay flow limit must be positive");
+        let (tx, rx) = bounded(capacity);
         Self {
             tx,
             rx,
             closed: Arc::new(Mutex::new(false)),
+            admission: FlowAdmission::new(flow_queue_limit),
+            capacity,
         }
     }
 
@@ -62,11 +74,16 @@ impl RelayQueue {
             .expect("relay queue close state mutex poisoned")
     }
 
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     /// Get a sender handle for enqueueing items
     pub fn sender(&self) -> RelaySender {
         RelaySender {
             tx: self.tx.clone(),
             closed: self.closed.clone(),
+            admission: self.admission.clone(),
         }
     }
 
@@ -74,43 +91,27 @@ impl RelayQueue {
     ///
     /// Worker count balances throughput vs CPU contention with HTTP RPC.
     /// Workers block on the channel and process items sequentially.
-    pub fn spawn_workers(
+    pub(crate) fn spawn_workers(
         &self,
         num_workers: usize,
-        handlers: Cache<String, Nip46Handler>,
-        client: Client,
-        pool: PgPool,
-        key_manager: Arc<Box<dyn KeyManager>>,
-        coordinator: Arc<ClusterCoordinator>,
+        context: RelayWorkerContext,
     ) -> Vec<tokio::task::JoinHandle<()>> {
         tracing::info!(
             "Spawning {} relay workers (queue capacity: {})",
             num_workers,
-            QUEUE_CAPACITY
+            self.capacity
         );
+        METRICS.set_nip46_queue_capacity(self.capacity as u64);
 
         (0..num_workers)
             .map(|worker_id| {
                 let rx = self.rx.clone();
                 let closed = self.closed.clone();
-                let handlers = handlers.clone();
-                let client = client.clone();
-                let pool = pool.clone();
-                let key_manager = key_manager.clone();
-                let coordinator = coordinator.clone();
+                let context = context.clone();
 
                 tokio::spawn(async move {
                     let worker_queue = RelayWorkerQueue { rx, closed };
-                    relay_worker_loop(
-                        worker_id,
-                        worker_queue,
-                        handlers,
-                        client,
-                        pool,
-                        key_manager,
-                        coordinator,
-                    )
-                    .await
+                    relay_worker_loop(worker_id, worker_queue, context).await
                 })
             })
             .collect()
@@ -128,18 +129,24 @@ impl Default for RelayQueue {
 pub struct RelaySender {
     tx: Sender<Nip46RpcItem>,
     closed: Arc<Mutex<bool>>,
+    admission: FlowAdmission,
 }
 
 impl RelaySender {
     /// Try to send an item to the queue
     /// Returns error if queue is full (backpressure)
-    pub fn try_send(&self, item: Nip46RpcItem) -> Result<(), RelayQueueError> {
-        self.try_send_with_open_queue_probe(item, || {})
+    pub fn try_send(
+        &self,
+        event: Box<Event>,
+        bunker_pubkey: String,
+    ) -> Result<(), RelayQueueError> {
+        self.try_send_with_open_queue_probe(event, bunker_pubkey, || {})
     }
 
     fn try_send_with_open_queue_probe<F>(
         &self,
-        item: Nip46RpcItem,
+        event: Box<Event>,
+        bunker_pubkey: String,
         after_open_check: F,
     ) -> Result<(), RelayQueueError>
     where
@@ -159,8 +166,30 @@ impl RelaySender {
 
         after_open_check();
 
+        let client_pubkey = event.pubkey.to_hex();
+        let flow_permit = match self.admission.try_acquire(&bunker_pubkey, &client_pubkey) {
+            Ok(permit) => permit,
+            Err(FlowLimit::Target) => {
+                METRICS.inc_nip46_noisy_flow_shed("target");
+                return Err(RelayQueueError::NoisyTarget);
+            }
+            Err(FlowLimit::Client) => {
+                METRICS.inc_nip46_noisy_flow_shed("client");
+                return Err(RelayQueueError::NoisyClient);
+            }
+        };
+        let item = Nip46RpcItem {
+            event,
+            bunker_pubkey,
+            enqueued_at: Instant::now(),
+            flow_permit: Some(flow_permit),
+        };
+
         let result = match self.tx.try_send(item) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                METRICS.set_nip46_queue_depth(self.tx.len() as u64);
+                Ok(())
+            }
             Err(TrySendError::Full(_)) => {
                 METRICS.inc_queue_dropped();
                 Err(RelayQueueError::QueueFull)
@@ -197,6 +226,10 @@ pub enum RelayQueueError {
     QueueFull,
     #[error("Relay queue is closed")]
     Closed,
+    #[error("Relay target flow has too much work in flight")]
+    NoisyTarget,
+    #[error("Relay client flow has too much work in flight")]
+    NoisyClient,
     #[error("Relay queue disconnected")]
     Disconnected,
 }
@@ -207,15 +240,7 @@ struct RelayWorkerQueue {
 }
 
 /// Worker loop that processes NIP-46 items from the relay queue
-async fn relay_worker_loop(
-    worker_id: usize,
-    queue: RelayWorkerQueue,
-    handlers: Cache<String, Nip46Handler>,
-    client: Client,
-    pool: PgPool,
-    key_manager: Arc<Box<dyn KeyManager>>,
-    coordinator: Arc<ClusterCoordinator>,
-) {
+async fn relay_worker_loop(worker_id: usize, queue: RelayWorkerQueue, context: RelayWorkerContext) {
     tracing::debug!("Relay worker {} started", worker_id);
 
     loop {
@@ -233,7 +258,7 @@ async fn relay_worker_loop(
         }
 
         // Block on receiving next item (in spawn_blocking to not block async runtime)
-        let item = {
+        let mut item = {
             let rx = queue.rx.clone();
             match tokio::task::spawn_blocking(move || rx.recv_timeout(WORKER_RECV_TIMEOUT)).await {
                 Ok(Ok(item)) => item,
@@ -250,10 +275,17 @@ async fn relay_worker_loop(
             }
         };
 
+        METRICS.set_nip46_queue_depth(queue.rx.len() as u64);
+        METRICS.observe_nip46_queue_wait(item.enqueued_at.elapsed());
+        // The limit protects queue headroom, not worker utilization. Release it
+        // as soon as work leaves the queue so an otherwise idle worker can
+        // continue serving a busy flow.
+        drop(item.flow_permit.take());
+        METRICS.inc_nip46_workers_active();
+        let processing_started = Instant::now();
+
         // Process the item
-        if let Err(e) =
-            process_nip46_item(&item, &handlers, &client, &pool, &key_manager, &coordinator).await
-        {
+        if let Err(e) = process_nip46_item(&item, &context).await {
             // Filter out expected noise
             match &e {
                 SignerError::MissingParameter("p-tag") => {
@@ -264,35 +296,100 @@ async fn relay_worker_loop(
                 }
             }
         }
+        METRICS.dec_nip46_workers_active();
+        METRICS.observe_nip46_worker_duration(processing_started.elapsed());
     }
 
     tracing::debug!("Relay worker {} exited", worker_id);
+}
+
+fn configured_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+#[derive(Clone)]
+struct FlowAdmission {
+    state: Arc<Mutex<FlowState>>,
+    queue_limit: usize,
+}
+
+#[derive(Default)]
+struct FlowState {
+    targets: HashMap<String, usize>,
+    clients: HashMap<String, usize>,
+}
+
+enum FlowLimit {
+    Target,
+    Client,
+}
+
+impl FlowAdmission {
+    fn new(queue_limit: usize) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(FlowState::default())),
+            queue_limit,
+        }
+    }
+
+    fn try_acquire(&self, target: &str, client: &str) -> Result<FlowPermit, FlowLimit> {
+        let mut state = self.state.lock().expect("relay flow state mutex poisoned");
+        if state.targets.get(target).copied().unwrap_or_default() >= self.queue_limit {
+            return Err(FlowLimit::Target);
+        }
+        if state.clients.get(client).copied().unwrap_or_default() >= self.queue_limit {
+            return Err(FlowLimit::Client);
+        }
+        *state.targets.entry(target.to_string()).or_default() += 1;
+        *state.clients.entry(client.to_string()).or_default() += 1;
+        Ok(FlowPermit {
+            admission: self.clone(),
+            target: target.to_string(),
+            client: client.to_string(),
+        })
+    }
+}
+
+struct FlowPermit {
+    admission: FlowAdmission,
+    target: String,
+    client: String,
+}
+
+impl Drop for FlowPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .admission
+            .state
+            .lock()
+            .expect("relay flow state mutex poisoned");
+        decrement_flow(&mut state.targets, &self.target);
+        decrement_flow(&mut state.clients, &self.client);
+    }
+}
+
+fn decrement_flow(flows: &mut HashMap<String, usize>, key: &str) {
+    if let Some(count) = flows.get_mut(key) {
+        *count -= 1;
+        if *count == 0 {
+            flows.remove(key);
+        }
+    }
 }
 
 /// Process a single NIP-46 RPC item
 ///
 /// This is extracted from UnifiedSigner::handle_nip46_request to be called from workers.
 /// CPU-bound crypto operations (decrypt, sign, encrypt) use spawn_blocking.
-async fn process_nip46_item(
-    item: &Nip46RpcItem,
-    handlers: &Cache<String, Nip46Handler>,
-    client: &Client,
-    pool: &PgPool,
-    key_manager: &Arc<Box<dyn KeyManager>>,
-    coordinator: &Arc<ClusterCoordinator>,
-) -> SignerResult<()> {
+async fn process_nip46_item(item: &Nip46RpcItem, context: &RelayWorkerContext) -> SignerResult<()> {
     use crate::signer_daemon::UnifiedSigner;
 
     // Delegate to the existing handler which has all the complex logic
-    UnifiedSigner::handle_nip46_request(
-        handlers.clone(),
-        client.clone(),
-        item.event.clone(),
-        pool,
-        key_manager,
-        coordinator,
-    )
-    .await
+    UnifiedSigner::handle_nip46_request(context, item.event.clone()).await
 }
 
 // ============================================================================
@@ -331,17 +428,14 @@ impl Default for VerifyQueue {
 mod tests {
     use super::*;
 
-    async fn test_item() -> Nip46RpcItem {
+    async fn test_event() -> Box<Event> {
         let keys = Keys::generate();
         let unsigned = EventBuilder::text_note("test").build(keys.public_key());
         let event = keys
             .sign_event(unsigned)
             .await
             .expect("test event should sign");
-        Nip46RpcItem {
-            event: Box::new(event),
-            bunker_pubkey: keys.public_key().to_hex(),
-        }
+        Box::new(event)
     }
 
     #[test]
@@ -382,7 +476,7 @@ mod tests {
 
         queue.close();
 
-        let result = sender.try_send(test_item().await);
+        let result = sender.try_send(test_event().await, Keys::generate().public_key().to_hex());
         assert!(
             matches!(result, Err(RelayQueueError::Closed)),
             "expected closed queue error, got {:?}",
@@ -402,7 +496,7 @@ mod tests {
         // Global process metrics: other tests may run concurrently, so assert a
         // strict increase (monotonic counter) rather than an exact value.
         let before = METRICS.nip46_requests_queue_closed.load(Ordering::Relaxed);
-        let result = sender.try_send(test_item().await);
+        let result = sender.try_send(test_event().await, Keys::generate().public_key().to_hex());
         assert!(matches!(result, Err(RelayQueueError::Closed)));
         let after = METRICS.nip46_requests_queue_closed.load(Ordering::Relaxed);
         assert!(
@@ -416,20 +510,61 @@ mod tests {
         let queue = RelayQueue::new();
         let sender = queue.sender();
 
-        let result = sender.try_send_with_open_queue_probe(test_item().await, || {
-            assert!(
-                matches!(
-                    sender.closed.try_lock(),
-                    Err(std::sync::TryLockError::WouldBlock)
-                ),
-                "close state mutex must stay locked until the enqueue attempt finishes"
-            );
-        });
+        let result = sender.try_send_with_open_queue_probe(
+            test_event().await,
+            Keys::generate().public_key().to_hex(),
+            || {
+                assert!(
+                    matches!(
+                        sender.closed.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ),
+                    "close state mutex must stay locked until the enqueue attempt finishes"
+                );
+            },
+        );
 
         assert!(result.is_ok(), "send should complete before close wins");
         queue.close();
         assert!(queue.is_closed());
         assert_eq!(sender.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn noisy_target_cannot_consume_unrelated_headroom() {
+        let queue = RelayQueue::with_config(4, 2);
+        let sender = queue.sender();
+        let target = Keys::generate().public_key().to_hex();
+
+        assert!(sender.try_send(test_event().await, target.clone()).is_ok());
+        assert!(sender.try_send(test_event().await, target.clone()).is_ok());
+        assert!(matches!(
+            sender.try_send(test_event().await, target),
+            Err(RelayQueueError::NoisyTarget)
+        ));
+        assert!(sender
+            .try_send(test_event().await, Keys::generate().public_key().to_hex())
+            .is_ok());
+        assert_eq!(sender.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn noisy_client_cannot_fill_queue_with_varied_targets() {
+        let queue = RelayQueue::with_config(4, 2);
+        let sender = queue.sender();
+        let event = test_event().await;
+
+        assert!(sender
+            .try_send(event.clone(), Keys::generate().public_key().to_hex())
+            .is_ok());
+        assert!(sender
+            .try_send(event.clone(), Keys::generate().public_key().to_hex())
+            .is_ok());
+        assert!(matches!(
+            sender.try_send(event, Keys::generate().public_key().to_hex()),
+            Err(RelayQueueError::NoisyClient)
+        ));
+        assert_eq!(sender.len(), 2);
     }
 
     #[test]
