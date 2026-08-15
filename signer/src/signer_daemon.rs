@@ -28,8 +28,10 @@ use tokio::sync::Semaphore;
 /// Default timeout for relay connection operations
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 // Fixed shards prevent unbounded per-key generation state. A hash collision only
-// causes a conservative retry on the next request; it cannot admit stale data.
+// sheds the current request and is counted; it cannot admit stale data.
 const LOOKUP_INVALIDATION_SHARDS: usize = 1_024;
+const DEFAULT_NIP46_LOOKUP_CONCURRENCY: usize = 16;
+const DEFAULT_NIP46_SINGLEFLIGHT_CACHE_SIZE: usize = 1_024;
 
 /// Status of a NIP-46 handler for tombstone support
 ///
@@ -1020,10 +1022,16 @@ pub struct UnifiedSigner {
 
 #[derive(Clone)]
 pub(crate) struct AuthorizationLookup {
-    negative: Cache<String, ()>,
-    singleflight: Cache<String, Option<Nip46Handler>>,
+    negative: Cache<String, u64>,
+    singleflight: Cache<String, VersionedLookupResult>,
     permits: Arc<Semaphore>,
     invalidation_generations: Arc<[AtomicU64]>,
+}
+
+#[derive(Clone)]
+struct VersionedLookupResult {
+    generation: u64,
+    handler: Option<Nip46Handler>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1058,9 +1066,13 @@ impl Drop for ActiveLookupGuard {
 impl AuthorizationLookup {
     fn new() -> Self {
         let negative_capacity = configured_usize("NIP46_NEGATIVE_CACHE_SIZE", 10_000);
-        let singleflight_capacity = configured_usize("NIP46_SINGLEFLIGHT_CACHE_SIZE", 1_024);
+        let singleflight_capacity = configured_usize(
+            "NIP46_SINGLEFLIGHT_CACHE_SIZE",
+            DEFAULT_NIP46_SINGLEFLIGHT_CACHE_SIZE,
+        );
         let ttl_secs = configured_usize("NIP46_NEGATIVE_CACHE_TTL_SECS", 30);
-        let concurrency = configured_usize("NIP46_LOOKUP_CONCURRENCY", 16);
+        let concurrency =
+            configured_usize("NIP46_LOOKUP_CONCURRENCY", DEFAULT_NIP46_LOOKUP_CONCURRENCY);
         Self::with_capacities(
             negative_capacity,
             singleflight_capacity,
@@ -1070,7 +1082,7 @@ impl AuthorizationLookup {
     }
 
     #[cfg(test)]
-    fn with_config(capacity: usize, ttl: Duration, concurrency: usize) -> Self {
+    pub(crate) fn with_config(capacity: usize, ttl: Duration, concurrency: usize) -> Self {
         Self::with_capacities(capacity, capacity, ttl, concurrency)
     }
 
@@ -1106,7 +1118,16 @@ impl AuthorizationLookup {
         METRICS.set_nip46_negative_cache_size(self.negative.entry_count());
     }
 
-    async fn resolve_with<F>(
+    fn invalidate_all(&self) {
+        for generation in self.invalidation_generations.iter() {
+            generation.fetch_add(1, Ordering::SeqCst);
+        }
+        self.negative.invalidate_all();
+        self.singleflight.invalidate_all();
+        METRICS.set_nip46_negative_cache_size(0);
+    }
+
+    pub(crate) async fn resolve_with<F>(
         &self,
         bunker_pubkey: &str,
         handlers: &Cache<String, Nip46Handler>,
@@ -1115,20 +1136,25 @@ impl AuthorizationLookup {
     where
         F: std::future::Future<Output = SignerResult<Option<Nip46Handler>>> + Send + 'static,
     {
-        if self.negative.get(bunker_pubkey).await.is_some() {
-            METRICS.inc_nip46_negative_cache_hit();
-            METRICS.inc_nip46_handler_not_found();
-            return Ok(None);
+        let invalidation_shard = invalidation_shard(bunker_pubkey);
+        if let Some(cached_generation) = self.negative.get(bunker_pubkey).await {
+            let current_generation =
+                self.invalidation_generations[invalidation_shard].load(Ordering::SeqCst);
+            if cached_generation == current_generation {
+                METRICS.inc_nip46_negative_cache_hit();
+                METRICS.inc_nip46_handler_not_found();
+                return Ok(None);
+            }
+            self.negative.invalidate(bunker_pubkey).await;
         }
 
         let permits = self.permits.clone();
         let negative = self.negative.clone();
-        let handlers = handlers.clone();
+        let loader_handlers = handlers.clone();
         let invalidation_generations = self.invalidation_generations.clone();
-        let invalidation_shard = invalidation_shard(bunker_pubkey);
         let lookup_generation = invalidation_generations[invalidation_shard].load(Ordering::SeqCst);
         let key = bunker_pubkey.to_string();
-        let handler = match self
+        let result = match self
             .singleflight
             .try_get_with(key.clone(), async move {
                 let _permit = permits
@@ -1146,11 +1172,14 @@ impl AuthorizationLookup {
                     return Err(LookupFailure::Invalidated);
                 }
                 if let Some(handler) = &handler {
-                    handlers.insert(key.clone(), handler.clone()).await;
+                    loader_handlers.insert(key.clone(), handler.clone()).await;
                 } else {
-                    negative.insert(key.clone(), ()).await;
+                    negative.insert(key.clone(), lookup_generation).await;
                 }
-                Ok::<Option<Nip46Handler>, LookupFailure>(handler)
+                Ok::<VersionedLookupResult, LookupFailure>(VersionedLookupResult {
+                    generation: lookup_generation,
+                    handler,
+                })
             })
             .await
         {
@@ -1168,9 +1197,23 @@ impl AuthorizationLookup {
                 }
                 // The result raced an authorization change and was not cached.
                 // The client can retry without waiting for the negative TTL.
-                LookupFailure::Invalidated => return Ok(None),
+                LookupFailure::Invalidated => {
+                    METRICS.inc_nip46_lookup_invalidated();
+                    return Ok(None);
+                }
             },
         };
+        let current_generation =
+            self.invalidation_generations[invalidation_shard].load(Ordering::SeqCst);
+        if result.generation != current_generation {
+            self.negative.invalidate(bunker_pubkey).await;
+            self.singleflight.invalidate(bunker_pubkey).await;
+            handlers.invalidate(bunker_pubkey).await;
+            METRICS.inc_nip46_lookup_invalidated();
+            METRICS.set_nip46_negative_cache_size(self.negative.entry_count());
+            return Ok(None);
+        }
+        let handler = result.handler;
         if handler.is_none() {
             METRICS.inc_nip46_handler_not_found();
             METRICS.set_nip46_negative_cache_size(self.negative.entry_count());
@@ -1429,19 +1472,18 @@ impl UnifiedSigner {
 
         let mut cluster_events = self.coordinator.subscribe();
         let cluster_lookup = self.authorization_lookup.clone();
-        let cluster_handlers = self.handlers.clone();
         tokio::spawn(async move {
             loop {
                 match cluster_events.recv().await {
                     Ok(MembershipEvent::AuthorizationInvalidated(bunker_pubkey)) => {
                         cluster_lookup.invalidate(&bunker_pubkey).await;
-                        cluster_handlers.invalidate(&bunker_pubkey).await;
                     }
                     Ok(MembershipEvent::Joined(_) | MembershipEvent::Left(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        cluster_lookup.invalidate_all();
                         tracing::warn!(
                             skipped,
-                            "Authorization invalidation listener lagged; negative-cache TTL remains the fallback"
+                            "Authorization invalidation listener lagged; cleared lookup caches conservatively"
                         );
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -1461,7 +1503,6 @@ impl UnifiedSigner {
                             is_oauth,
                         } => {
                             lookup_clone.invalidate(&bunker_pubkey).await;
-                            handlers_clone.invalidate(&bunker_pubkey).await;
                             if let Err(error) = coordinator_clone
                                 .publish_authorization_invalidation(&bunker_pubkey)
                                 .await
@@ -2353,6 +2394,15 @@ mod authorization_lookup_tests {
         )
     }
 
+    #[test]
+    fn singleflight_capacity_is_independent_from_negative_cache() {
+        let lookup = AuthorizationLookup::with_capacities(3, 7, Duration::from_secs(1), 2);
+        assert_eq!(lookup.negative.policy().max_capacity(), Some(3));
+        assert_eq!(lookup.singleflight.policy().max_capacity(), Some(7));
+        assert_eq!(DEFAULT_NIP46_SINGLEFLIGHT_CACHE_SIZE, 1_024);
+        assert_eq!(DEFAULT_NIP46_LOOKUP_CONCURRENCY, 16);
+    }
+
     #[tokio::test]
     async fn concurrent_unknown_target_is_coalesced() {
         let lookup = AuthorizationLookup::with_config(16, Duration::from_secs(1), 4);
@@ -2557,6 +2607,40 @@ mod authorization_lookup_tests {
             .get("created-during-lookup")
             .await
             .is_none());
+
+        // Model the remaining interleaving: invalidation completed after the
+        // loader's first check but stale values were inserted afterward.
+        handlers
+            .insert("created-during-lookup".to_string(), test_handler())
+            .await;
+        lookup
+            .negative
+            .insert("created-during-lookup".to_string(), 0)
+            .await;
+        lookup
+            .singleflight
+            .insert(
+                "created-during-lookup".to_string(),
+                VersionedLookupResult {
+                    generation: 0,
+                    handler: None,
+                },
+            )
+            .await;
+        assert!(lookup
+            .resolve_with("created-during-lookup", &handlers, async {
+                panic!("stale singleflight value should be rejected before loading")
+            })
+            .await
+            .expect("stale cached result")
+            .is_none());
+        assert!(lookup.negative.get("created-during-lookup").await.is_none());
+        assert!(lookup
+            .singleflight
+            .get("created-during-lookup")
+            .await
+            .is_none());
+        assert!(handlers.get("created-during-lookup").await.is_none());
 
         let loaded = lookup
             .resolve_with("created-during-lookup", &handlers, async {

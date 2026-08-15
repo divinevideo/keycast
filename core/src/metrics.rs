@@ -124,6 +124,7 @@ pub struct Metrics {
     pub nip46_lookup_database_total: AtomicU64,
     pub nip46_lookup_errors: AtomicU64,
     pub nip46_lookup_shed: AtomicU64,
+    pub nip46_lookup_invalidated: AtomicU64,
     pub nip46_negative_cache_hits: AtomicU64,
     pub nip46_negative_cache_size: AtomicU64,
     pub nip46_activity_queued: AtomicU64,
@@ -211,6 +212,7 @@ impl Metrics {
             nip46_lookup_database_total: AtomicU64::new(0),
             nip46_lookup_errors: AtomicU64::new(0),
             nip46_lookup_shed: AtomicU64::new(0),
+            nip46_lookup_invalidated: AtomicU64::new(0),
             nip46_negative_cache_hits: AtomicU64::new(0),
             nip46_negative_cache_size: AtomicU64::new(0),
             nip46_activity_queued: AtomicU64::new(0),
@@ -368,6 +370,11 @@ impl Metrics {
 
     pub fn inc_nip46_lookup_shed(&self) {
         self.nip46_lookup_shed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_nip46_lookup_invalidated(&self) {
+        self.nip46_lookup_invalidated
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_nip46_negative_cache_hit(&self) {
@@ -719,6 +726,11 @@ impl Metrics {
         output.push_str(&format!(
             "keycast_nip46_lookup_shed_total {}\n",
             self.nip46_lookup_shed.load(Ordering::Relaxed)
+        ));
+        output.push_str("# HELP keycast_nip46_lookup_invalidated_total NIP-46 lookup results discarded after concurrent authorization changes\n# TYPE keycast_nip46_lookup_invalidated_total counter\n");
+        output.push_str(&format!(
+            "keycast_nip46_lookup_invalidated_total {}\n",
+            self.nip46_lookup_invalidated.load(Ordering::Relaxed)
         ));
         output.push_str("# HELP keycast_nip46_negative_cache_hits_total NIP-46 unknown-target requests answered by the negative cache\n# TYPE keycast_nip46_negative_cache_hits_total counter\n");
         output.push_str(&format!(
@@ -1262,6 +1274,7 @@ mod tests {
         metrics.inc_nip46_lookup_database();
         metrics.inc_nip46_lookup_error();
         metrics.inc_nip46_lookup_shed();
+        metrics.inc_nip46_lookup_invalidated();
         metrics.inc_nip46_negative_cache_hit();
         metrics.inc_nip46_activity_dropped("queue_full");
         metrics.inc_nip46_activity_dropped("writer_stopped");
@@ -1280,6 +1293,7 @@ mod tests {
         assert!(output.contains("keycast_nip46_lookup_database_total 1"));
         assert!(output.contains("keycast_nip46_lookup_errors_total 1"));
         assert!(output.contains("keycast_nip46_lookup_shed_total 1"));
+        assert!(output.contains("keycast_nip46_lookup_invalidated_total 1"));
         assert!(output.contains("keycast_nip46_negative_cache_hits_total 1"));
         assert!(output.contains("keycast_nip46_activity_dropped_total{reason=\"queue_full\"} 1"));
         assert!(

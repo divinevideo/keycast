@@ -439,7 +439,11 @@ impl Default for VerifyQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::signer_daemon::{admits_owned_request, enqueue_owned_relay_event, OwnershipStage};
+    use crate::signer_daemon::{
+        admits_owned_request, enqueue_owned_relay_event, AuthorizationLookup, Nip46Handler,
+        OwnershipStage,
+    };
+    use moka::future::Cache;
 
     async fn test_event() -> Box<Event> {
         let keys = Keys::generate();
@@ -619,22 +623,25 @@ mod tests {
             .is_ok());
         assert!(sender.len() <= queue.capacity());
 
-        let lookup_permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let lookup = AuthorizationLookup::with_config(8, Duration::from_secs(30), 1);
+        let handlers: Cache<String, Nip46Handler> = Cache::new(8);
         let active_lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let peak_lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let shed_lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let lookup_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
         let make_processor = || {
-            let lookup_permits = lookup_permits.clone();
+            let lookup = lookup.clone();
+            let handlers = handlers.clone();
             let active_lookups = active_lookups.clone();
             let peak_lookups = peak_lookups.clone();
-            let shed_lookups = shed_lookups.clone();
+            let lookup_attempts = lookup_attempts.clone();
             let progress_tx = progress_tx.clone();
             move |item: Nip46RpcItem| {
-                let lookup_permits = lookup_permits.clone();
+                let lookup = lookup.clone();
+                let handlers = handlers.clone();
                 let active_lookups = active_lookups.clone();
                 let peak_lookups = peak_lookups.clone();
-                let shed_lookups = shed_lookups.clone();
+                let lookup_attempts = lookup_attempts.clone();
                 let progress_tx = progress_tx.clone();
                 async move {
                     match item.bunker_pubkey.as_str() {
@@ -643,16 +650,22 @@ mod tests {
                             assert!(!admits_owned_request(false, OwnershipStage::Worker));
                         }
                         target if target.starts_with("unknown-") => {
-                            if let Ok(_permit) = lookup_permits.try_acquire_owned() {
-                                let active = active_lookups
-                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                                    + 1;
-                                peak_lookups.fetch_max(active, std::sync::atomic::Ordering::SeqCst);
-                                tokio::time::sleep(Duration::from_millis(30)).await;
-                                active_lookups.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                            } else {
-                                shed_lookups.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            }
+                            let target = target.to_string();
+                            lookup
+                                .resolve_with(&target, &handlers, async move {
+                                    lookup_attempts
+                                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    let active = active_lookups
+                                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                                        + 1;
+                                    peak_lookups
+                                        .fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                                    active_lookups
+                                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                    Ok(None)
+                                })
+                                .await?;
                         }
                         "unrelated-valid" => {
                             progress_tx.send(()).expect("record valid progress");
@@ -682,7 +695,7 @@ mod tests {
             worker.await.expect("worker task");
         }
         assert!(peak_lookups.load(std::sync::atomic::Ordering::SeqCst) <= 1);
-        assert!(shed_lookups.load(std::sync::atomic::Ordering::SeqCst) > 0);
+        assert!(lookup_attempts.load(std::sync::atomic::Ordering::SeqCst) < 3);
         assert_eq!(sender.len(), 0);
     }
 
