@@ -1188,8 +1188,10 @@ impl AuthorizationLookup {
             Err(error) => match error.as_ref() {
                 LookupFailure::Saturated => {
                     METRICS.inc_nip46_lookup_shed();
-                    // Saturation is a deliberate shed, not authoritative absence.
-                    // The request can retry and no negative entry is written.
+                    // Intended operational behavior: fail-fast shed, no NIP-46
+                    // response. A reply needs the bunker key, which exists only
+                    // after this lookup. Clients time out and retry. No negative
+                    // cache entry is written. Do not park the worker.
                     return Ok(None);
                 }
                 LookupFailure::Dependency(message) => {
@@ -1982,6 +1984,9 @@ impl UnifiedSigner {
                 .await?
                 {
                     Some(handler) => handler,
+                    // Unknown bunker, saturated lookup, or raced invalidation.
+                    // Saturated and invalidated misses are counted and rely on
+                    // client timeout/retry rather than a NIP-46 error event.
                     None => return Ok(()),
                 }
             }
