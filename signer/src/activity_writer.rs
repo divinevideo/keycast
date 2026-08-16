@@ -5,7 +5,6 @@ use async_trait::async_trait;
 use keycast_core::{
     coalescing_activity::{
         CoalescingActivityHooks, CoalescingActivityLogger, CoalescingActivityWorker,
-        CoalescingRecordResult,
     },
     metrics::METRICS,
 };
@@ -52,11 +51,7 @@ impl RelayActivityLogger {
     }
 
     pub fn record(&self, tenant_id: i64, authorization_id: i64) {
-        match self.logger.record((tenant_id, authorization_id)) {
-            CoalescingRecordResult::Queued
-            | CoalescingRecordResult::Dropped
-            | CoalescingRecordResult::WriterStopped => {}
-        }
+        let _ = self.logger.record((tenant_id, authorization_id));
     }
 }
 
@@ -105,9 +100,7 @@ impl CoalescingActivityHooks<AuthorizationKey> for RelayActivityHooks {
         tracing::error!(lost_events = lost, "Lost NIP-46 activity during shutdown");
     }
 
-    fn flush_lost(&self, lost: u64) {
-        METRICS.add_nip46_activity_dropped("retention_limit", lost);
-    }
+    fn flush_lost(&self, _lost: u64) {}
 
     async fn flush_pending(
         &self,

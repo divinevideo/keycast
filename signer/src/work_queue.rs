@@ -20,7 +20,6 @@ const WORKER_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 pub(crate) struct Nip46RpcItem {
     /// The original NIP-46 event from the relay
     pub event: Box<Event>,
-    #[cfg_attr(not(test), allow(dead_code))]
     bunker_pubkey: String,
     enqueued_at: Instant,
     flow_permit: Option<FlowPermit>,
@@ -402,8 +401,8 @@ fn decrement_flow(flows: &mut HashMap<String, usize>, key: &str) {
 async fn process_nip46_item(item: &Nip46RpcItem, context: &RelayWorkerContext) -> SignerResult<()> {
     use crate::signer_daemon::UnifiedSigner;
 
-    // Delegate to the existing handler which has all the complex logic
-    UnifiedSigner::handle_nip46_request(context, item.event.clone()).await
+    // Delegate to the existing handler which has all the complex logic.
+    UnifiedSigner::handle_nip46_request(context, item.event.clone(), &item.bunker_pubkey).await
 }
 
 // ============================================================================

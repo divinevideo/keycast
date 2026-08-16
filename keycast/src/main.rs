@@ -21,6 +21,7 @@ use keycast_core::encryption::aws_key_manager::AwsKeyManager;
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::gcp_key_manager::GcpKeyManager;
 use keycast_core::encryption::KeyManager;
+use keycast_core::env_config::configured_positive_usize;
 use keycast_signer::{RelayQueue, UnifiedSigner};
 use moka::future::Cache;
 use nostr_sdk::Keys;
@@ -1387,10 +1388,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     // Spawn relay workers for NIP-46 request processing
     // Worker count balances throughput vs CPU contention with HTTP RPC
     // Can override with RELAY_WORKER_COUNT env var
-    let num_workers = std::env::var("RELAY_WORKER_COUNT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| num_cpus::get().max(4) * 2);
+    let num_workers = configured_positive_usize("RELAY_WORKER_COUNT", num_cpus::get().max(4) * 2);
     let relay_worker_handles = signer.spawn_relay_workers(&relay_queue, num_workers);
     tracing::info!(
         "✔︎ Signer daemon initialized (Tokio workers: {}, relay workers: {}, queue: {})",

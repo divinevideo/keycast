@@ -1348,10 +1348,6 @@ impl UnifiedSigner {
         self.coordinator.clone()
     }
 
-    pub fn activity_logger(&self) -> RelayActivityLogger {
-        self.activity_logger.clone()
-    }
-
     pub fn spawn_relay_workers(
         &self,
         queue: &crate::work_queue::RelayQueue,
@@ -1563,6 +1559,7 @@ impl UnifiedSigner {
                         }
                         AuthorizationCommand::Remove { bunker_pubkey } => {
                             tracing::debug!("Marking authorization as revoked: {}", bunker_pubkey);
+                            lookup_clone.invalidate(&bunker_pubkey).await;
                             if let Some(handler) = handlers_clone.get(&bunker_pubkey).await {
                                 let mut updated = handler.clone();
                                 updated.status = HandlerStatus::Revoked;
@@ -1647,31 +1644,41 @@ impl UnifiedSigner {
                             }
                         } else {
                             // LEGACY: Direct spawning (for backwards compatibility / testing)
-                            let context = RelayWorkerContext {
-                                handlers: handlers.clone(),
-                                client: client.clone(),
-                                pool: pool.clone(),
-                                key_manager: key_manager.clone(),
-                                coordinator: coordinator.clone(),
-                                authorization_lookup: authorization_lookup.clone(),
-                                activity_logger: activity_logger.clone(),
-                            };
-                            tokio::spawn(async move {
-                                if let Err(e) = Self::handle_nip46_request(&context, event).await {
-                                    // Filter out expected noise from malformed external requests
-                                    match &e {
-                                        SignerError::MissingParameter("p-tag") => {
-                                            tracing::trace!(
-                                                "Ignoring malformed NIP-46 request: {}",
-                                                e
-                                            );
-                                        }
-                                        _ => {
-                                            tracing::error!("Error handling NIP-46 request: {}", e);
+                            if let Some(bunker_pubkey) = bunker_pubkey {
+                                let context = RelayWorkerContext {
+                                    handlers: handlers.clone(),
+                                    client: client.clone(),
+                                    pool: pool.clone(),
+                                    key_manager: key_manager.clone(),
+                                    coordinator: coordinator.clone(),
+                                    authorization_lookup: authorization_lookup.clone(),
+                                    activity_logger: activity_logger.clone(),
+                                };
+                                tokio::spawn(async move {
+                                    if let Err(e) =
+                                        Self::handle_nip46_request(&context, event, &bunker_pubkey)
+                                            .await
+                                    {
+                                        // Filter out expected noise from malformed external requests
+                                        match &e {
+                                            SignerError::MissingParameter("p-tag") => {
+                                                tracing::trace!(
+                                                    "Ignoring malformed NIP-46 request: {}",
+                                                    e
+                                                );
+                                            }
+                                            _ => {
+                                                tracing::error!(
+                                                    "Error handling NIP-46 request: {}",
+                                                    e
+                                                );
+                                            }
                                         }
                                     }
-                                }
-                            });
+                                });
+                            } else {
+                                tracing::trace!("Ignoring NIP-46 event without p-tag");
+                            }
                         }
                     }
                 }
@@ -1922,6 +1929,7 @@ impl UnifiedSigner {
     pub(crate) async fn handle_nip46_request(
         context: &RelayWorkerContext,
         event: Box<Event>,
+        bunker_pubkey: &str,
     ) -> SignerResult<()> {
         let RelayWorkerContext {
             handlers,
@@ -1937,14 +1945,6 @@ impl UnifiedSigner {
         // Now we check if the target bunker pubkey (in #p tag) is one we manage
         // If yes: decrypt and handle. If no: silently ignore
         // This scales to millions of users with just ONE relay connection!
-
-        // Get the bunker pubkey from p-tag (target of the signing request)
-        let bunker_pubkey = event
-            .tags
-            .iter()
-            .find(|tag| tag.kind() == TagKind::p())
-            .and_then(|tag| tag.content())
-            .ok_or(SignerError::MissingParameter("p-tag"))?;
 
         // HASHRING CHECK: Only process if this instance owns this pubkey
         // Note: should_handle() is lock-free (uses arc_swap)
@@ -2545,6 +2545,39 @@ mod authorization_lookup_tests {
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(handlers.get("known").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn invalidation_evicts_positive_singleflight_result() {
+        let lookup = AuthorizationLookup::with_config(16, Duration::from_secs(1), 4);
+        let handlers: Cache<String, Nip46Handler> = Cache::new(16);
+
+        lookup
+            .singleflight
+            .insert(
+                "revoked".to_string(),
+                VersionedLookupResult {
+                    generation: 0,
+                    handler: Some(test_handler()),
+                },
+            )
+            .await;
+
+        lookup.invalidate("revoked").await;
+        assert!(lookup.singleflight.get("revoked").await.is_none());
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_reload = calls.clone();
+        let loaded = lookup
+            .resolve_with("revoked", &handlers, async move {
+                calls_for_reload.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(test_handler()))
+            })
+            .await
+            .expect("lookup after invalidation");
+
+        assert!(loaded.is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

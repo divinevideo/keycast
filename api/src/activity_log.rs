@@ -112,13 +112,9 @@ impl CoalescingActivityHooks<i64> for HttpRpcActivityHooks {
 
     fn queued(&self) {}
 
-    fn dropped_full(&self) {
-        METRICS.inc_http_rpc_activity_dropped();
-    }
+    fn dropped_full(&self) {}
 
-    fn writer_stopped(&self) {
-        METRICS.inc_http_rpc_activity_dropped();
-    }
+    fn writer_stopped(&self) {}
 
     fn set_pending(&self, _pending: usize) {}
 
@@ -226,6 +222,24 @@ mod tests {
 
         assert_eq!(logger.record(true, 10), ActivityLogResult::Queued);
         assert_eq!(logger.record(true, 11), ActivityLogResult::Dropped);
+    }
+
+    #[tokio::test]
+    async fn queue_full_drop_does_not_increment_metric_inside_logger() {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://postgres:postgres@localhost/keycast_test")
+            .expect("lazy pool");
+        let (logger, _worker) =
+            ActivityLogger::with_config(pool, 1, Duration::from_secs(60), DEFAULT_MAX_BATCH_IDS);
+
+        assert_eq!(logger.record(true, 10), ActivityLogResult::Queued);
+        let before = METRICS.http_rpc_activity_dropped.load(Ordering::Relaxed);
+        assert_eq!(logger.record(true, 11), ActivityLogResult::Dropped);
+        assert_eq!(
+            METRICS.http_rpc_activity_dropped.load(Ordering::Relaxed),
+            before
+        );
     }
 
     #[tokio::test]

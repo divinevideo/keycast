@@ -133,6 +133,8 @@ used when these variables are unset or invalid:
 
 Authorizations load on demand. After a rollout the handler cache is empty, so a burst of distinct bunkers can hit `NIP46_LOOKUP_CONCURRENCY` immediately. Saturated lookups do not wait and do not publish a NIP-46 error. The client times out and retries. That is the accepted shed, not an accident of the default.
 
+`RELAY_FLOW_QUEUE_LIMIT` is a queue-occupancy limit, not a worker-occupancy limit. A noisy target or client can still occupy multiple workers after its queued requests are dequeued, but it cannot keep adding more than the configured number of waiting items.
+
 ### Production GCP resources
 
 | Resource | Name |
