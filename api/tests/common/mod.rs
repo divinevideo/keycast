@@ -16,7 +16,7 @@ use keycast_core::{
     secret_pool::SecretPool,
 };
 use moka::future::Cache;
-use nostr_sdk::Keys;
+use nostr_sdk::{Keys, ToBech32};
 use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
@@ -157,14 +157,28 @@ pub async fn setup_oauth_test_db() -> PgPool {
 
 #[allow(dead_code)]
 pub fn create_test_auth_state(pool: PgPool) -> (AuthState, JoinHandle<()>) {
+    let (state, producer_handle) = create_test_keycast_state(pool, None);
+    (
+        AuthState {
+            state,
+            auth_tx: None,
+        },
+        producer_handle,
+    )
+}
+
+fn create_test_keycast_state(
+    pool: PgPool,
+    redis: Option<keycast_api::redis::PrefixedRedis>,
+) -> (Arc<KeycastState>, JoinHandle<()>) {
     let bcrypt = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
     let secret_pool = SecretPool::new(1);
     let producer_handle = secret_pool.spawn_producer(bcrypt.clone());
     let tenant_cache = Cache::builder().max_capacity(10).build();
     let key_manager: Arc<Box<dyn KeyManager>> = Arc::new(Box::new(TestKeyManager));
 
-    let auth_state = AuthState {
-        state: Arc::new(KeycastState {
+    (
+        Arc::new(KeycastState {
             db: pool,
             key_manager,
             signer_handlers: None,
@@ -172,14 +186,125 @@ pub fn create_test_auth_state(pool: PgPool) -> (AuthState, JoinHandle<()>) {
             server_keys: Keys::generate(),
             tenant_cache,
             bcrypt: bcrypt.clone(),
-            redis: None,
+            redis,
             secret_pool: secret_pool.receiver(),
             activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),
         }),
-        auth_tx: None,
-    };
+        producer_handle,
+    )
+}
 
-    (auth_state, producer_handle)
+/// Build the shared test Redis handle on a dedicated runtime.
+///
+/// The global `KEYCAST_STATE` outlives every `#[tokio::test]` runtime in the
+/// same process, and a `ConnectionManager` created on a runtime that has shut
+/// down breaks intermittently for later tests. This thread's runtime never
+/// shuts down, so the shared connection stays healthy for the whole process.
+fn build_shared_store_redis(prefix: String, failing: bool) -> keycast_api::redis::PrefixedRedis {
+    let redis_url =
+        std::env::var("TEST_REDIS_URL").unwrap_or_else(|_| "redis://localhost:16379".into());
+    let (sender, receiver) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build dedicated test Redis runtime");
+        let manager = runtime.block_on(async {
+            let client = redis::Client::open(redis_url.as_str()).expect("valid test Redis URL");
+            redis::aio::ConnectionManager::new(client)
+                .await
+                .expect("connect to test Redis")
+        });
+        #[cfg(feature = "integration-tests")]
+        let redis = if failing {
+            keycast_api::redis::PrefixedRedis::new_failing(manager, Some(prefix))
+        } else {
+            keycast_api::redis::PrefixedRedis::new(manager, Some(prefix))
+        };
+        #[cfg(not(feature = "integration-tests"))]
+        let redis = {
+            let _ = failing;
+            keycast_api::redis::PrefixedRedis::new(manager, Some(prefix))
+        };
+        sender
+            .send(redis)
+            .expect("deliver shared test Redis handle");
+        runtime.block_on(std::future::pending::<()>());
+    });
+
+    receiver
+        .recv()
+        .expect("receive shared test Redis handle from dedicated runtime")
+}
+
+/// Install the process-global `KEYCAST_STATE` backed by the dedicated test
+/// Redis, so handlers that resolve shared state (for example the ATProto
+/// OAuth replay-reservation store) exercise the real shared-store path in
+/// tests. Idempotent: the first installation wins for the process.
+#[allow(dead_code)]
+pub fn install_global_test_state_with_redis(pool: PgPool) {
+    use keycast_api::state::KEYCAST_STATE;
+
+    if KEYCAST_STATE.get().is_some() {
+        return;
+    }
+
+    let prefix = format!("test-atproto-replay:{}", uuid::Uuid::new_v4());
+    let redis = build_shared_store_redis(prefix, false);
+    let (state, _producer_handle) = create_test_keycast_state(pool, Some(redis));
+    let _ = KEYCAST_STATE.set(state);
+}
+
+/// Install the process-global `KEYCAST_STATE` whose Redis wrapper fails every
+/// write, so shared-store outage behavior (fail-closed responses) can be
+/// exercised end to end.
+#[cfg(feature = "integration-tests")]
+#[allow(dead_code)]
+pub fn install_global_test_state_with_failing_redis(pool: PgPool) {
+    use keycast_api::state::KEYCAST_STATE;
+
+    if KEYCAST_STATE.get().is_some() {
+        return;
+    }
+
+    let prefix = format!("test-atproto-replay-fail:{}", uuid::Uuid::new_v4());
+    let redis = build_shared_store_redis(prefix, true);
+    let (state, _producer_handle) = create_test_keycast_state(pool, Some(redis));
+    let _ = KEYCAST_STATE.set(state);
+}
+
+/// Shared ATProto OAuth endpoint environment for integration tests.
+///
+/// # Panics
+/// Panics when the test signing key cannot be parsed.
+#[allow(dead_code)]
+pub fn configure_atproto_env() -> Keys {
+    const TEST_ATPROTO_JWT_KEY_HEX: &str =
+        "8f2a55949068468ad5d670dfd0c0a33d5b9e7e1a2c0d2059f0f8f8779d4d078d";
+    const TEST_ATPROTO_PDS_DID: &str = "did:web:pds.divine.test";
+    const TEST_SERVER_SECRET_HEX: &str =
+        "7a1f55949068468ad5d670dfd0c0a33d5b9e7e1a2c0d2059f0f8f8779d4d0123";
+
+    unsafe {
+        std::env::set_var("APP_URL", "https://login.divine.video");
+        std::env::set_var("ALLOWED_TENANT_DOMAINS", "login.divine.video");
+        std::env::remove_var("ENABLE_TENANT_AUTO_PROVISIONING");
+        std::env::set_var(
+            "ATPROTO_OAUTH_JWT_PRIVATE_KEY_HEX",
+            TEST_ATPROTO_JWT_KEY_HEX,
+        );
+        std::env::set_var("ATPROTO_OAUTH_PDS_DID", TEST_ATPROTO_PDS_DID);
+        std::env::set_var("BUNKER_RELAYS", "wss://relay.test.example");
+        std::env::remove_var("ATPROTO_OAUTH_REPLAY_FAIL_OPEN");
+    }
+
+    let server_keys = Keys::parse(TEST_SERVER_SECRET_HEX).unwrap();
+    unsafe {
+        std::env::set_var("SERVER_NSEC", server_keys.secret_key().to_bech32().unwrap());
+    }
+
+    server_keys
 }
 
 #[allow(dead_code)]

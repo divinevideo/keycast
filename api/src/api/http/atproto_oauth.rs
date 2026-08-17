@@ -6,7 +6,6 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{Duration, Utc};
-use dashmap::DashMap;
 use jwt_simple::algorithms::ECDSAP256kKeyPairLike;
 use jwt_simple::prelude::{Claims, Duration as JwtDuration, ES256kKeyPair};
 use keycast_core::repositories::{
@@ -14,7 +13,6 @@ use keycast_core::repositories::{
     IssueAtprotoTokensParams,
 };
 use keycast_core::types::refresh_token::hash_refresh_token;
-use once_cell::sync::Lazy;
 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,21 +23,20 @@ use std::time::Duration as StdDuration;
 use crate::api::tenant::{get_or_create_tenant, TenantError};
 
 use super::atproto_oauth_metadata::authorization_server_origin;
+use super::atproto_oauth_replay::{
+    reserve_client_assertion_jti, reserve_dpop_proof_jti, ReplayReservationError,
+    CLIENT_ASSERTION_MAX_EXP_SKEW_SECONDS, DPOP_MAX_IAT_SKEW_SECONDS,
+};
 use super::auth::{extract_user_from_token, generate_secure_token, AuthError};
 
 const PAR_EXPIRY_MINUTES: i64 = 10;
 const AUTH_CODE_EXPIRY_MINUTES: i64 = 5;
 const ACCESS_TOKEN_EXPIRY_MINUTES: i64 = 15;
 const REFRESH_TOKEN_EXPIRY_DAYS: i64 = 30;
-const DPOP_MAX_IAT_SKEW_SECONDS: i64 = 300;
-const CLIENT_ASSERTION_MAX_EXP_SKEW_SECONDS: i64 = 300;
 const CLIENT_ASSERTION_TYPE_JWT_BEARER: &str =
     "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 const PAR_PATH_SUFFIX: &str = "/atproto/oauth/par";
 const TOKEN_PATH_SUFFIX: &str = "/atproto/oauth/token";
-
-static DPOP_REPLAY_CACHE: Lazy<DashMap<String, i64>> = Lazy::new(DashMap::new);
-static CLIENT_ASSERTION_REPLAY_CACHE: Lazy<DashMap<String, i64>> = Lazy::new(DashMap::new);
 
 #[derive(Debug, Deserialize)]
 pub struct ParRequest {
@@ -294,12 +291,26 @@ fn dpop_htu_matches_expected(htu: &str, expected_path_suffix: &str) -> bool {
     htu.ends_with(expected_path_suffix)
 }
 
-fn validate_dpop_proof(
+fn replay_reservation_error(error: ReplayReservationError, replay_message: &str) -> AuthError {
+    match error {
+        ReplayReservationError::Replay => AuthError::BadRequest(replay_message.to_string()),
+        ReplayReservationError::StorageUnavailable => AuthError::OAuthProtocol {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            error: "temporarily_unavailable",
+            description:
+                "Authorization server is temporarily unable to complete replay protection. Please retry."
+                    .to_string(),
+        },
+    }
+}
+
+async fn validate_dpop_proof(
     headers: &HeaderMap,
     expected_method: &str,
     expected_path_suffix: &str,
     expected_nonce: Option<&str>,
     expected_ath: Option<&str>,
+    expected_jkt: Option<&str>,
 ) -> Result<String, AuthError> {
     let proof = headers
         .get("DPoP")
@@ -415,15 +426,16 @@ fn validate_dpop_proof(
     }
 
     let jkt = dpop_jwk_thumbprint(&header.jwk);
-    let replay_key = format!("{jkt}:{}", claims.jti);
-    if let Some(previous) = DPOP_REPLAY_CACHE.get(&replay_key) {
-        if now - *previous < DPOP_MAX_IAT_SKEW_SECONDS {
+    if let Some(expected) = expected_jkt {
+        if jkt != expected {
             return Err(AuthError::BadRequest(
-                "DPoP proof jti has already been used".to_string(),
+                "DPoP proof key does not match the session binding".to_string(),
             ));
         }
     }
-    DPOP_REPLAY_CACHE.insert(replay_key, now);
+    reserve_dpop_proof_jti(&jkt, &claims.jti, claims.iat, now)
+        .await
+        .map_err(|error| replay_reservation_error(error, "DPoP proof jti has already been used"))?;
 
     Ok(jkt)
 }
@@ -705,7 +717,7 @@ fn unexpected_client_assertion(
     }
 }
 
-fn verify_client_assertion(
+async fn verify_client_assertion(
     client_id: &str,
     client_assertion_type: &Option<String>,
     client_assertion: &Option<String>,
@@ -806,15 +818,11 @@ fn verify_client_assertion(
                 ));
             }
         }
-        let replay_key = format!("{client_id}:{}", claims.jti);
-        if let Some(previous_exp) = CLIENT_ASSERTION_REPLAY_CACHE.get(&replay_key) {
-            if now <= *previous_exp {
-                return Err(AuthError::BadRequest(
-                    "client_assertion jti has already been used".to_string(),
-                ));
-            }
-        }
-        CLIENT_ASSERTION_REPLAY_CACHE.insert(replay_key, claims.exp);
+        reserve_client_assertion_jti(client_id, &claims.jti, claims.exp, now)
+            .await
+            .map_err(|error| {
+                replay_reservation_error(error, "client_assertion jti has already been used")
+            })?;
         return Ok(ClientAuthBinding::PrivateKeyJwt {
             alg: header.alg.clone(),
             kid: header.kid.clone(),
@@ -852,6 +860,7 @@ async fn validate_par_client_binding(request: &ParRequest) -> Result<ClientAuthB
                 &keys,
                 None,
             )
+            .await
         }
         _ => Err(AuthError::BadRequest(
             "Unsupported token_endpoint_auth_method in client metadata".to_string(),
@@ -889,7 +898,8 @@ async fn enforce_session_client_binding(
                 &expected_client_assertion_audiences(),
                 &keys,
                 session.client_auth_jkt.as_deref(),
-            )?;
+            )
+            .await?;
             let expected_binding = ClientAuthBinding::PrivateKeyJwt {
                 alg: session.client_auth_alg.clone().ok_or_else(|| {
                     AuthError::BadRequest(
@@ -981,7 +991,7 @@ pub async fn par(
         ));
     }
 
-    let dpop_jkt = validate_dpop_proof(&headers, "POST", PAR_PATH_SUFFIX, None, None)?;
+    let dpop_jkt = validate_dpop_proof(&headers, "POST", PAR_PATH_SUFFIX, None, None, None).await?;
     let client_binding = validate_par_client_binding(&request).await?;
     let request_uri = format!(
         "urn:ietf:params:oauth:request_uri:{}",
@@ -1162,21 +1172,18 @@ pub async fn token(
             let session_nonce = session.dpop_nonce.clone().ok_or_else(|| {
                 AuthError::BadRequest("Missing DPoP nonce for authorization code".to_string())
             })?;
+            let expected_jkt = session.dpop_jkt.clone().ok_or_else(|| {
+                AuthError::BadRequest("Authorization code session is not DPoP-bound".to_string())
+            })?;
             let proof_jkt = validate_dpop_proof(
                 &headers,
                 "POST",
                 TOKEN_PATH_SUFFIX,
                 Some(&session_nonce),
                 None,
-            )?;
-            let expected_jkt = session.dpop_jkt.clone().ok_or_else(|| {
-                AuthError::BadRequest("Authorization code session is not DPoP-bound".to_string())
-            })?;
-            if proof_jkt != expected_jkt {
-                return Err(AuthError::BadRequest(
-                    "DPoP proof key does not match the session binding".to_string(),
-                ));
-            }
+                Some(&expected_jkt),
+            )
+            .await?;
             repo.consume_authorization_code(code)
                 .await?
                 .ok_or_else(|| {
@@ -1260,21 +1267,18 @@ pub async fn token(
             let session_nonce = session.dpop_nonce.clone().ok_or_else(|| {
                 AuthError::BadRequest("Missing DPoP nonce for refresh token".to_string())
             })?;
+            let expected_jkt = session.dpop_jkt.clone().ok_or_else(|| {
+                AuthError::BadRequest("Refresh token session is not DPoP-bound".to_string())
+            })?;
             let proof_jkt = validate_dpop_proof(
                 &headers,
                 "POST",
                 TOKEN_PATH_SUFFIX,
                 Some(&session_nonce),
                 None,
-            )?;
-            let expected_jkt = session.dpop_jkt.clone().ok_or_else(|| {
-                AuthError::BadRequest("Refresh token session is not DPoP-bound".to_string())
-            })?;
-            if proof_jkt != expected_jkt {
-                return Err(AuthError::BadRequest(
-                    "DPoP proof key does not match the session binding".to_string(),
-                ));
-            }
+                Some(&expected_jkt),
+            )
+            .await?;
 
             let subject_did = session.atproto_did.clone().ok_or_else(|| {
                 AuthError::BadRequest(

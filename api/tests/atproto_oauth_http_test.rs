@@ -11,7 +11,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use http_body_util::BodyExt;
 use keycast_api::api::http::atproto_oauth::{authorize, par, token};
 use keycast_api::api::http::auth::generate_server_signed_ucan;
-use nostr_sdk::{Keys, ToBech32};
+use nostr_sdk::Keys;
 use p256::{
     ecdsa::{signature::Signer, Signature, SigningKey},
     elliptic_curve::rand_core::OsRng,
@@ -21,12 +21,6 @@ use serial_test::serial;
 use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 use uuid::Uuid;
-
-const TEST_ATPROTO_JWT_KEY_HEX: &str =
-    "8f2a55949068468ad5d670dfd0c0a33d5b9e7e1a2c0d2059f0f8f8779d4d078d";
-const TEST_ATPROTO_PDS_DID: &str = "did:web:pds.divine.test";
-const TEST_SERVER_SECRET_HEX: &str =
-    "7a1f55949068468ad5d670dfd0c0a33d5b9e7e1a2c0d2059f0f8f8779d4d0123";
 
 struct DpopKeyMaterial {
     signing_key: SigningKey,
@@ -117,13 +111,31 @@ fn dpop_proof(
     nonce: Option<&str>,
     ath: Option<&str>,
 ) -> String {
+    dpop_proof_with_jti(
+        key_material,
+        method,
+        htu,
+        nonce,
+        ath,
+        &format!("dpop-{}", Uuid::new_v4()),
+    )
+}
+
+fn dpop_proof_with_jti(
+    key_material: &DpopKeyMaterial,
+    method: &str,
+    htu: &str,
+    nonce: Option<&str>,
+    ath: Option<&str>,
+    jti: &str,
+) -> String {
     let header = serde_json::json!({
         "typ": "dpop+jwt",
         "alg": "ES256",
         "jwk": key_material.jwk,
     });
     let mut claims = serde_json::json!({
-        "jti": format!("dpop-{}", Uuid::new_v4()),
+        "jti": jti,
         "htm": method,
         "htu": htu,
         "iat": chrono::Utc::now().timestamp(),
@@ -153,6 +165,22 @@ fn private_key_jwt_assertion(
     client_id: &str,
     aud: &str,
 ) -> String {
+    private_key_jwt_assertion_with_jti(
+        key_material,
+        client_id,
+        aud,
+        &format!("client-assertion-{}", Uuid::new_v4()),
+        chrono::Utc::now().timestamp() + 240,
+    )
+}
+
+fn private_key_jwt_assertion_with_jti(
+    key_material: &ClientAuthKeyMaterial,
+    client_id: &str,
+    aud: &str,
+    jti: &str,
+    exp: i64,
+) -> String {
     let header = serde_json::json!({
         "typ": "JWT",
         "alg": "ES256",
@@ -163,9 +191,9 @@ fn private_key_jwt_assertion(
         "iss": client_id,
         "sub": client_id,
         "aud": aud,
-        "exp": now + 240,
+        "exp": exp,
         "iat": now,
-        "jti": format!("client-assertion-{}", Uuid::new_v4()),
+        "jti": jti,
     });
     let signing_input = format!(
         "{}.{}",
@@ -221,7 +249,11 @@ async fn start_confidential_client_metadata_server(
     client_id
 }
 
-fn app(pool: sqlx::PgPool) -> Router {
+/// Independently constructed app instance sharing the process's replay store.
+/// Each call builds a fresh router; the shared replay-reservation store is
+/// installed process-globally once and backs every instance.
+async fn app(pool: sqlx::PgPool) -> Router {
+    common::install_global_test_state_with_redis(pool.clone());
     Router::new()
         .route("/atproto/oauth/par", post(par))
         .route("/atproto/oauth/authorize", get(authorize))
@@ -243,24 +275,7 @@ async fn create_test_tenant(pool: &sqlx::PgPool, domain: &str) -> i64 {
 }
 
 fn configure_atproto_env() -> Keys {
-    unsafe {
-        std::env::set_var("APP_URL", "https://login.divine.video");
-        std::env::set_var("ALLOWED_TENANT_DOMAINS", "login.divine.video");
-        std::env::remove_var("ENABLE_TENANT_AUTO_PROVISIONING");
-        std::env::set_var(
-            "ATPROTO_OAUTH_JWT_PRIVATE_KEY_HEX",
-            TEST_ATPROTO_JWT_KEY_HEX,
-        );
-        std::env::set_var("ATPROTO_OAUTH_PDS_DID", TEST_ATPROTO_PDS_DID);
-        std::env::set_var("BUNKER_RELAYS", "wss://relay.test.example");
-    }
-
-    let server_keys = Keys::parse(TEST_SERVER_SECRET_HEX).unwrap();
-    unsafe {
-        std::env::set_var("SERVER_NSEC", server_keys.secret_key().to_bech32().unwrap());
-    }
-
-    server_keys
+    common::configure_atproto_env()
 }
 
 #[tokio::test]
@@ -269,7 +284,7 @@ async fn par_authorize_and_token_exchange_with_existing_login_session() {
     let server_keys = configure_atproto_env();
 
     let pool = common::setup_test_db().await;
-    let app = app(pool.clone());
+    let app = app(pool.clone()).await;
 
     let user_keys = Keys::generate();
     let user_pubkey = user_keys.public_key().to_hex();
@@ -460,7 +475,7 @@ async fn atproto_token_exchange_rejects_mismatched_pkce_verifier_with_invalid_gr
     let server_keys = configure_atproto_env();
 
     let pool = common::setup_test_db().await;
-    let app = app(pool.clone());
+    let app = app(pool.clone()).await;
 
     let user_keys = Keys::generate();
     let user_pubkey = user_keys.public_key().to_hex();
@@ -607,7 +622,7 @@ async fn authorize_rejects_when_atproto_link_is_not_ready() {
     let server_keys = configure_atproto_env();
 
     let pool = common::setup_test_db().await;
-    let app = app(pool.clone());
+    let app = app(pool.clone()).await;
 
     let user_keys = Keys::generate();
     let user_pubkey = user_keys.public_key().to_hex();
@@ -689,7 +704,7 @@ async fn par_uses_request_host_tenant_for_authorize_flow() {
     let server_keys = configure_atproto_env();
 
     let pool = common::setup_test_db().await;
-    let app = app(pool.clone());
+    let app = app(pool.clone()).await;
 
     let tenant_domain = format!("tenant-{}.example.com", Uuid::new_v4());
     unsafe {
@@ -792,7 +807,7 @@ async fn authorize_rejects_revoked_request_uri_before_redirecting() {
     let server_keys = configure_atproto_env();
 
     let pool = common::setup_test_db().await;
-    let app = app(pool.clone());
+    let app = app(pool.clone()).await;
 
     let user_keys = Keys::generate();
     let user_pubkey = user_keys.public_key().to_hex();
@@ -892,7 +907,7 @@ async fn par_rejects_requests_without_dpop_proof() {
     configure_atproto_env();
 
     let pool = common::setup_test_db().await;
-    let app = app(pool);
+    let app = app(pool).await;
 
     let response = app
         .oneshot(
@@ -917,7 +932,7 @@ async fn refresh_token_rotation_requires_the_bound_dpop_key() {
     let server_keys = configure_atproto_env();
 
     let pool = common::setup_test_db().await;
-    let app = app(pool.clone());
+    let app = app(pool.clone()).await;
 
     let user_keys = Keys::generate();
     let user_pubkey = user_keys.public_key().to_hex();
@@ -1179,7 +1194,7 @@ async fn confidential_client_requires_private_key_jwt_at_par_and_keeps_key_bindi
     let server_keys = configure_atproto_env();
 
     let pool = common::setup_test_db().await;
-    let app = app(pool.clone());
+    let app = app(pool.clone()).await;
 
     let user_keys = Keys::generate();
     let user_pubkey = user_keys.public_key().to_hex();
@@ -1422,7 +1437,7 @@ async fn confidential_client_par_rejects_when_dpop_bound_access_tokens_is_false(
     configure_atproto_env();
 
     let pool = common::setup_test_db().await;
-    let app = app(pool);
+    let app = app(pool).await;
 
     let code_verifier = "confidential-dpop-flag-verifier";
     let code_challenge = pkce_challenge(code_verifier);
@@ -1458,4 +1473,192 @@ async fn confidential_client_par_rejects_when_dpop_bound_access_tokens_is_false(
         .unwrap();
 
     assert_eq!(par_response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+#[serial]
+async fn replayed_dpop_proof_is_rejected_across_independent_app_instances() {
+    configure_atproto_env();
+
+    let pool = common::setup_test_db().await;
+    let instance_a = app(pool.clone()).await;
+    let instance_b = app(pool).await;
+
+    let dpop_key = dpop_key_material();
+    let fixed_jti = format!("dpop-cross-instance-{}", Uuid::new_v4());
+    let reused_proof = dpop_proof_with_jti(
+        &dpop_key,
+        "POST",
+        &http_uri("/atproto/oauth/par"),
+        None,
+        None,
+        &fixed_jti,
+    );
+    let body = "client_id=https%3A%2F%2Fclient.example&redirect_uri=https%3A%2F%2Fclient.example%2Fcallback&scope=atproto&code_challenge=cross-instance-challenge&code_challenge_method=S256";
+
+    let first = instance_a
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/atproto/oauth/par")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("DPoP", reused_proof.clone())
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let replay = instance_b
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/atproto/oauth/par")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("DPoP", reused_proof)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+    let replay_body = replay.into_body().collect().await.unwrap().to_bytes();
+    let replay_payload: Value = serde_json::from_slice(&replay_body).unwrap();
+    assert!(
+        replay_payload["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("already been used")),
+        "unexpected replay rejection body: {replay_payload}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn same_dpop_jti_under_different_keys_is_allowed_across_instances() {
+    configure_atproto_env();
+
+    let pool = common::setup_test_db().await;
+    let instance_a = app(pool.clone()).await;
+    let instance_b = app(pool).await;
+
+    let key_a = dpop_key_material();
+    let key_b = dpop_key_material();
+    let shared_jti = format!("dpop-shared-jti-{}", Uuid::new_v4());
+    let body = "client_id=https%3A%2F%2Fclient.example&redirect_uri=https%3A%2F%2Fclient.example%2Fcallback&scope=atproto&code_challenge=shared-jti-challenge&code_challenge_method=S256";
+
+    for (instance, key) in [(instance_a.clone(), &key_a), (instance_b, &key_b)] {
+        let response = instance
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/atproto/oauth/par")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(
+                        "DPoP",
+                        dpop_proof_with_jti(
+                            key,
+                            "POST",
+                            &http_uri("/atproto/oauth/par"),
+                            None,
+                            None,
+                            &shared_jti,
+                        ),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "same jti under a different DPoP key is legitimate and must be accepted"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn replayed_client_assertion_is_rejected_across_independent_app_instances() {
+    configure_atproto_env();
+
+    let pool = common::setup_test_db().await;
+    let instance_a = app(pool.clone()).await;
+    let instance_b = app(pool).await;
+
+    let redirect_uri = "https://client.example/confidential/callback";
+    let dpop_key_a = dpop_key_material();
+    let dpop_key_b = dpop_key_material();
+    let client_auth_key = client_auth_key_material();
+    let client_id =
+        start_confidential_client_metadata_server(redirect_uri, &client_auth_key, true).await;
+
+    let fixed_jti = format!("assertion-cross-instance-{}", Uuid::new_v4());
+    let reused_assertion = private_key_jwt_assertion_with_jti(
+        &client_auth_key,
+        &client_id,
+        "https://login.divine.video",
+        &fixed_jti,
+        chrono::Utc::now().timestamp() + 240,
+    );
+
+    async fn send_par(
+        instance: Router,
+        dpop_key: &DpopKeyMaterial,
+        client_id: &str,
+        redirect_uri: &str,
+        assertion: String,
+    ) -> axum::response::Response {
+        instance
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/atproto/oauth/par")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(
+                        "DPoP",
+                        dpop_proof(dpop_key, "POST", &http_uri("/atproto/oauth/par"), None, None),
+                    )
+                    .body(Body::from(format!(
+                        "client_id={}&redirect_uri={}&scope=atproto&code_challenge=assertion-replay-challenge&code_challenge_method=S256&client_assertion_type={}&client_assertion={}",
+                        urlencoding::encode(client_id),
+                        urlencoding::encode(redirect_uri),
+                        urlencoding::encode("urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+                        urlencoding::encode(&assertion),
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    let first = send_par(
+        instance_a,
+        &dpop_key_a,
+        &client_id,
+        redirect_uri,
+        reused_assertion.clone(),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let replay = send_par(
+        instance_b,
+        &dpop_key_b,
+        &client_id,
+        redirect_uri,
+        reused_assertion,
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+    let replay_body = replay.into_body().collect().await.unwrap().to_bytes();
+    let replay_payload: Value = serde_json::from_slice(&replay_body).unwrap();
+    assert!(
+        replay_payload["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("already been used")),
+        "unexpected replay rejection body: {replay_payload}"
+    );
 }

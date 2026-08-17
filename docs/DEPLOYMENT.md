@@ -386,7 +386,7 @@ Live updates that do not require a process restart:
 
 | Dependency | Startup behavior | Runtime behavior |
 |------------|------------------|------------------|
-| Redis unavailable | Hard failure, app exits | Heartbeat and Pub/Sub reconnect loops retry; stale hashring data can misroute NIP-46 requests while HTTP may continue. |
+| Redis unavailable | Hard failure, app exits | Heartbeat and Pub/Sub reconnect loops retry; stale hashring data can misroute NIP-46 requests while HTTP may continue. ATProto OAuth PAR and token requests fail closed with a retryable `temporarily_unavailable` response while replay-reservation storage is unreachable (see ATProto entryway below). |
 | KMS unavailable | Hard failure when using `gcp` or `aws` provider | Cached keys still work; cache misses retry and then fail. |
 | Postgres unavailable | startup retries then exits | Requests needing DB return errors; pool reconnects when the database recovers. |
 | ATProto control plane unavailable | invalid/missing URL logs a warning and Keycast still starts | ATProto enablement endpoints fail closed with 503; other routes continue. |
@@ -401,7 +401,9 @@ Current IaC also sets `ATPROTO_ENTRYWAY_ENABLED` and `ATPROTO_ENTRYWAY_HOSTS`, b
 
 PAR state is stored in shared Postgres in `atproto_oauth_sessions` with a unique `request_uri`, so PAR lookup is replica-safe.
 
-The current per-replica safety gap is replay protection: DPoP and client assertion replay caches are in-memory `DashMap`s. A replay that reaches a different pod inside the replay window may not be caught. Before production GKE cutover, decide whether that risk is acceptable or move those replay caches to shared storage.
+Replay protection for DPoP proofs and `private_key_jwt` client assertions is also shared: every serving instance atomically reserves the validated replay identity (key thumbprint plus `jti`, or client id plus `jti`) in Redis with `SET ... EX ... NX`, so a replay that reaches any other instance inside the replay window is rejected. Reservations are retained for the complete period in which the validator can still accept the proof or assertion: until `iat + 300s` for DPoP proofs and until `exp` (at most `now + 300s`) for client assertions, plus a small clock-skew margin. Reservation keys are namespaced (`atproto:oauth:replay:dpop-proof:` / `atproto:oauth:replay:client-assertion:`) and digest-derived, so their size and count stay bounded; because they carry TTLs, the deployment Redis eviction policy (`volatile-lru` on Memorystore by default) applies to them under memory pressure.
+
+Fail-closed behavior: when replay-reservation storage is unavailable or its answer is inconclusive, protected ATProto OAuth endpoints reject the request with HTTP 503 and the OAuth error `temporarily_unavailable` (retryable, no internal details). Setting `ATPROTO_OAUTH_REPLAY_FAIL_OPEN=true` degrades to per-instance replay protection instead of rejecting — a development-only escape hatch; cross-instance replay is possible while it is active. Monitor `keycast_atproto_oauth_replay_reservations_total{outcome="storage_unavailable"}` (see `docs/MONITORING.md`) to detect degraded replay storage.
 
 ---
 

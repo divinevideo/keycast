@@ -19,7 +19,7 @@ pub struct PrefixedRedis {
     factory: Option<Arc<ValkeyConnectionFactory>>,
     prefix: Option<String>,
     #[cfg(any(test, feature = "integration-tests"))]
-    fail_setex: bool,
+    fail_writes: bool,
 }
 
 impl std::fmt::Debug for PrefixedRedis {
@@ -45,16 +45,16 @@ impl PrefixedRedis {
             factory: None,
             prefix,
             #[cfg(any(test, feature = "integration-tests"))]
-            fail_setex: false,
+            fail_writes: false,
         }
     }
 
-    /// Create a test Redis wrapper that rejects every SETEX operation.
+    /// Create a test Redis wrapper that rejects every SETEX and SET NX EX operation.
     #[cfg(any(test, feature = "integration-tests"))]
     #[must_use]
     pub fn new_failing(conn: ConnectionManager, prefix: Option<String>) -> Self {
         let mut redis = Self::new(conn, prefix);
-        redis.fail_setex = true;
+        redis.fail_writes = true;
         redis
     }
 
@@ -75,7 +75,7 @@ impl PrefixedRedis {
             factory: Some(factory),
             prefix,
             #[cfg(any(test, feature = "integration-tests"))]
-            fail_setex: false,
+            fail_writes: false,
         }
     }
 
@@ -224,7 +224,7 @@ impl PrefixedRedis {
     /// Returns error if Redis operation fails or connection refresh fails.
     pub async fn setex(&self, key: &str, seconds: u64, value: &str) -> RedisResult<()> {
         #[cfg(any(test, feature = "integration-tests"))]
-        if self.fail_setex {
+        if self.fail_writes {
             return Err(redis::RedisError::from((
                 redis::ErrorKind::IoError,
                 "injected SETEX failure",
@@ -249,6 +249,14 @@ impl PrefixedRedis {
     ///
     /// Returns error if Redis operation fails or connection refresh fails.
     pub async fn set_nx_ex(&self, key: &str, seconds: u64, value: &str) -> RedisResult<bool> {
+        #[cfg(any(test, feature = "integration-tests"))]
+        if self.fail_writes {
+            return Err(redis::RedisError::from((
+                redis::ErrorKind::IoError,
+                "injected SET NX EX failure",
+            )));
+        }
+
         let prefixed = self.prefixed_key(key).into_owned();
         let value = value.to_string();
         self.with_refresh(|mut conn| {
