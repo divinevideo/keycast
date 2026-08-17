@@ -106,3 +106,195 @@ async fn replay_storage_outage_fails_closed_with_retryable_temporarily_unavailab
         "retry guidance must be present and non-sensitive: {payload}"
     );
 }
+
+/// A replay-storage outage during a confidential-client code exchange must not
+/// revoke the grant: the 503 response promises a retry, and that retry has to
+/// be able to succeed once storage recovers (keycast#367).
+#[tokio::test]
+#[serial]
+async fn replay_storage_outage_does_not_revoke_confidential_client_grant() {
+    use keycast_core::repositories::{
+        AtprotoOAuthSessionRepository, CreateAtprotoOAuthSessionParams,
+    };
+
+    common::configure_atproto_env();
+
+    let pool = common::setup_test_db().await;
+    let app = app_with_failing_replay_store(pool.clone()).await;
+
+    let redirect_uri = "https://client.example/confidential/callback";
+    let client_auth_key = common::client_auth_key_material();
+    let client_id =
+        common::start_confidential_client_metadata_server(redirect_uri, &client_auth_key, true)
+            .await;
+
+    let request_uri = format!("urn:ietf:params:oauth:request_uri:{}", uuid::Uuid::new_v4());
+    let repo = AtprotoOAuthSessionRepository::new(pool.clone());
+    repo.create_par(CreateAtprotoOAuthSessionParams {
+        tenant_id: 1,
+        client_id: client_id.clone(),
+        redirect_uri: redirect_uri.to_string(),
+        scope: "atproto".to_string(),
+        state: None,
+        code_challenge: Some("challenge".to_string()),
+        code_challenge_method: Some("S256".to_string()),
+        request_uri: request_uri.clone(),
+        par_expires_at: chrono::Utc::now() + chrono::Duration::minutes(10),
+        dpop_jkt: Some("a".repeat(43)),
+        dpop_nonce: Some("nonce".to_string()),
+        client_auth_method: "private_key_jwt".to_string(),
+        client_auth_alg: Some("ES256".to_string()),
+        client_auth_kid: Some(client_auth_key.kid.clone()),
+        client_auth_jkt: Some(client_auth_key.jkt.clone()),
+    })
+    .await
+    .unwrap();
+    let code = format!("code-{}", uuid::Uuid::new_v4());
+    repo.store_authorization_code(
+        &request_uri,
+        &code,
+        chrono::Utc::now() + chrono::Duration::minutes(5),
+    )
+    .await
+    .unwrap();
+
+    let assertion = common::private_key_jwt_assertion(
+        &client_auth_key,
+        &client_id,
+        "https://login.divine.video",
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/atproto/oauth/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "grant_type=authorization_code&code={}&client_id={}&redirect_uri={}&code_verifier=verifier&client_assertion_type={}&client_assertion={}",
+                    urlencoding::encode(&code),
+                    urlencoding::encode(&client_id),
+                    urlencoding::encode(redirect_uri),
+                    urlencoding::encode("urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+                    urlencoding::encode(&assertion),
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["error"], "temporarily_unavailable");
+
+    let revoked_at: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT revoked_at FROM atproto_oauth_sessions WHERE request_uri = $1")
+            .bind(&request_uri)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        revoked_at.is_none(),
+        "a replay-storage outage must not revoke the grant the 503 says to retry"
+    );
+}
+
+/// The refresh-token grant must keep its refresh token through a replay-storage
+/// outage for the same reason: the retryable response must stay retryable.
+#[tokio::test]
+#[serial]
+async fn replay_storage_outage_does_not_revoke_confidential_client_refresh_token() {
+    use keycast_core::repositories::{
+        AtprotoOAuthSessionRepository, CreateAtprotoOAuthSessionParams,
+    };
+    use keycast_core::types::refresh_token::hash_refresh_token;
+
+    common::configure_atproto_env();
+
+    let pool = common::setup_test_db().await;
+    let app = app_with_failing_replay_store(pool.clone()).await;
+
+    let redirect_uri = "https://client.example/confidential/callback";
+    let client_auth_key = common::client_auth_key_material();
+    let client_id =
+        common::start_confidential_client_metadata_server(redirect_uri, &client_auth_key, true)
+            .await;
+
+    let request_uri = format!("urn:ietf:params:oauth:request_uri:{}", uuid::Uuid::new_v4());
+    let repo = AtprotoOAuthSessionRepository::new(pool.clone());
+    repo.create_par(CreateAtprotoOAuthSessionParams {
+        tenant_id: 1,
+        client_id: client_id.clone(),
+        redirect_uri: redirect_uri.to_string(),
+        scope: "atproto".to_string(),
+        state: None,
+        code_challenge: Some("challenge".to_string()),
+        code_challenge_method: Some("S256".to_string()),
+        request_uri: request_uri.clone(),
+        par_expires_at: chrono::Utc::now() + chrono::Duration::minutes(10),
+        dpop_jkt: Some("a".repeat(43)),
+        dpop_nonce: Some("nonce".to_string()),
+        client_auth_method: "private_key_jwt".to_string(),
+        client_auth_alg: Some("ES256".to_string()),
+        client_auth_kid: Some(client_auth_key.kid.clone()),
+        client_auth_jkt: Some(client_auth_key.jkt.clone()),
+    })
+    .await
+    .unwrap();
+
+    let refresh_token = format!("refresh-{}", uuid::Uuid::new_v4());
+    sqlx::query(
+        "UPDATE atproto_oauth_sessions
+         SET refresh_token_hash = $2,
+             refresh_token_expires_at = NOW() + INTERVAL '30 days'
+         WHERE request_uri = $1",
+    )
+    .bind(&request_uri)
+    .bind(hash_refresh_token(&refresh_token))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let assertion = common::private_key_jwt_assertion(
+        &client_auth_key,
+        &client_id,
+        "https://login.divine.video",
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/atproto/oauth/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "grant_type=refresh_token&refresh_token={}&client_id={}&client_assertion_type={}&client_assertion={}",
+                    urlencoding::encode(&refresh_token),
+                    urlencoding::encode(&client_id),
+                    urlencoding::encode("urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+                    urlencoding::encode(&assertion),
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let payload: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["error"], "temporarily_unavailable");
+
+    let (revoked_at, refresh_revoked_at): (
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ) = sqlx::query_as(
+        "SELECT revoked_at, refresh_token_revoked_at FROM atproto_oauth_sessions WHERE request_uri = $1",
+    )
+    .bind(&request_uri)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        revoked_at.is_none() && refresh_revoked_at.is_none(),
+        "a replay-storage outage must not destroy the refresh token the 503 says to retry with"
+    );
+}

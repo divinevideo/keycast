@@ -76,6 +76,8 @@ gcloud error-reporting events list --project=openvine-co
    - `outcome="reserved"` — healthy shared-store reservations
    - `outcome="replay_rejected"` — confirmed replays rejected across instances
    - `outcome="storage_unavailable"` — shared replay storage unreachable or inconclusive; protected ATProto OAuth requests fail closed with 503 `temporarily_unavailable` (or degrade to per-instance protection when `ATPROTO_OAUTH_REPLAY_FAIL_OPEN=true`)
+   - `outcome="fallback_reserved"` / `fallback_rejected"` — per-instance fallback activity in fail-open mode
+   - Note: outcomes do not partition attempts — in fail-open degraded mode one attempt may be counted under both `storage_unavailable` and a fallback outcome. Read `storage_unavailable` as the storage-failure signal, not a terminal outcome
    - Alert when `storage_unavailable` grows: ATProto OAuth availability depends on Redis while it does
    - Labels are allowlisted and carry no identifiers or token material
 

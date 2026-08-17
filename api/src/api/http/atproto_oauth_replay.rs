@@ -24,9 +24,14 @@ pub const DPOP_MAX_IAT_SKEW_SECONDS: i64 = 300;
 pub const CLIENT_ASSERTION_MAX_EXP_SKEW_SECONDS: i64 = 300;
 
 /// Extra retention beyond the exact acceptance-window end, so a reservation
-/// made on one instance cannot expire a second before a validator on another
-/// instance (with slightly skewed clock) stops accepting the proof.
-const REPLAY_RESERVATION_SKEW_MARGIN_SECONDS: i64 = 1;
+/// made on one instance cannot expire before a validator on another instance
+/// (with a lagging clock) stops accepting the proof. This margin is the entire
+/// cross-instance clock-disagreement budget; 30s gives an NTP-synced fleet an
+/// order of magnitude of headroom without a written skew measurement. Over-
+/// retention is functionally harmless: RFC 9449 requires unique `jti`s, so a
+/// reservation outliving its window can only reject proofs that are already
+/// nonconformant.
+const REPLAY_RESERVATION_SKEW_MARGIN_SECONDS: i64 = 30;
 
 /// Explicit override for development-only degraded mode. Default is
 /// fail-closed: when shared replay storage is unavailable or inconclusive,
@@ -128,8 +133,8 @@ pub fn client_assertion_replay_key(client_id: &str, jti: &str) -> String {
 /// validator can still accept the proof. A proof with `iat` is accepted while
 /// `iat >= now - DPOP_MAX_IAT_SKEW_SECONDS`, so the last acceptance instant
 /// is `iat + DPOP_MAX_IAT_SKEW_SECONDS`. The TTL is measured from the
-/// reservation time (`now`), clamped for defense in depth, plus a small
-/// cross-instance clock-skew margin. Maximum: 601 seconds.
+/// reservation time (`now`), clamped for defense in depth, plus a cross-
+/// instance clock-skew margin. Maximum: 630 seconds.
 #[must_use]
 pub fn dpop_reservation_ttl_seconds(iat: i64, now: i64) -> u64 {
     let acceptance_end = iat + DPOP_MAX_IAT_SKEW_SECONDS;
@@ -142,8 +147,8 @@ pub fn dpop_reservation_ttl_seconds(iat: i64, now: i64) -> u64 {
 /// Client-assertion reservation retention: must cover the complete period in
 /// which any validator can still accept the assertion, which ends at its
 /// `exp`. The TTL is measured from the reservation time (`now`), clamped for
-/// defense in depth, plus a small cross-instance clock-skew margin. Maximum:
-/// 301 seconds.
+/// defense in depth, plus a cross-instance clock-skew margin. Maximum:
+/// 330 seconds.
 #[must_use]
 pub fn client_assertion_reservation_ttl_seconds(exp: i64, now: i64) -> u64 {
     let ttl = exp
@@ -393,15 +398,15 @@ mod tests {
         let now = 10_000_i64;
 
         // Fresh proof: acceptable until iat + 300.
-        assert_eq!(dpop_reservation_ttl_seconds(now, now), 301);
+        assert_eq!(dpop_reservation_ttl_seconds(now, now), 330);
         // Future-dated proof at the window edge: acceptable until now + 600.
-        assert_eq!(dpop_reservation_ttl_seconds(now + 300, now), 601);
+        assert_eq!(dpop_reservation_ttl_seconds(now + 300, now), 630);
         // Proof at the old edge of the window: acceptance ends now; keep the
         // minimum bounded reservation.
-        assert_eq!(dpop_reservation_ttl_seconds(now - 300, now), 2);
+        assert_eq!(dpop_reservation_ttl_seconds(now - 300, now), 31);
         // Out-of-window inputs are clamped rather than panicking or exploding.
-        assert_eq!(dpop_reservation_ttl_seconds(now - 5_000, now), 2);
-        assert_eq!(dpop_reservation_ttl_seconds(now + 5_000, now), 601);
+        assert_eq!(dpop_reservation_ttl_seconds(now - 5_000, now), 31);
+        assert_eq!(dpop_reservation_ttl_seconds(now + 5_000, now), 630);
     }
 
     #[test]
@@ -410,13 +415,13 @@ mod tests {
 
         assert_eq!(
             client_assertion_reservation_ttl_seconds(now + 300, now),
-            301
+            330
         );
-        assert_eq!(client_assertion_reservation_ttl_seconds(now + 1, now), 2);
-        assert_eq!(client_assertion_reservation_ttl_seconds(now - 50, now), 2);
+        assert_eq!(client_assertion_reservation_ttl_seconds(now + 1, now), 31);
+        assert_eq!(client_assertion_reservation_ttl_seconds(now - 50, now), 31);
         assert_eq!(
             client_assertion_reservation_ttl_seconds(now + 5_000, now),
-            301
+            330
         );
     }
 

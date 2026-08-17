@@ -307,6 +307,156 @@ pub fn configure_atproto_env() -> Keys {
     server_keys
 }
 
+/// Signing material for a confidential client's private_key_jwt key.
+#[allow(dead_code)] // individual test binaries use different subsets of the fields
+pub struct ClientAuthKeyMaterial {
+    pub signing_key: p256::ecdsa::SigningKey,
+    pub jwk: serde_json::Value,
+    pub jkt: String,
+    pub kid: String,
+}
+
+/// Generate fresh private_key_jwt signing material.
+///
+/// # Panics
+/// Panics only on key-generation failure, which does not happen with `OsRng`.
+#[allow(dead_code)]
+pub fn client_auth_key_material() -> ClientAuthKeyMaterial {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use p256::elliptic_curve::rand_core::OsRng;
+    use sha2::{Digest, Sha256};
+
+    let signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let verifying_key = signing_key.verifying_key();
+    let encoded_point = verifying_key.to_encoded_point(false);
+    let x = URL_SAFE_NO_PAD.encode(encoded_point.x().unwrap());
+    let y = URL_SAFE_NO_PAD.encode(encoded_point.y().unwrap());
+    let kid = format!("kid-{}", uuid::Uuid::new_v4());
+    let jwk = serde_json::json!({
+        "kty": "EC",
+        "crv": "P-256",
+        "x": x,
+        "y": y,
+        "kid": kid,
+        "use": "sig",
+        "alg": "ES256",
+    });
+    let thumbprint_input = format!(r#"{{"crv":"P-256","kty":"EC","x":"{x}","y":"{y}"}}"#);
+    let jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(thumbprint_input.as_bytes()));
+
+    ClientAuthKeyMaterial {
+        signing_key,
+        jwk,
+        jkt,
+        kid,
+    }
+}
+
+/// Start a local confidential-client metadata server and return its client_id
+/// (the metadata URL).
+///
+/// # Panics
+/// Panics when the local listener cannot be bound.
+#[allow(dead_code)]
+pub async fn start_confidential_client_metadata_server(
+    redirect_uri: &str,
+    key_material: &ClientAuthKeyMaterial,
+    dpop_bound_access_tokens: bool,
+) -> String {
+    use axum::{routing::get, Json, Router};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client_id = format!("http://{addr}/client-metadata.json");
+    let metadata = serde_json::json!({
+        "client_id": client_id,
+        "redirect_uris": [redirect_uri],
+        "token_endpoint_auth_method": "private_key_jwt",
+        "token_endpoint_auth_signing_alg": "ES256",
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "dpop_bound_access_tokens": dpop_bound_access_tokens,
+        "jwks": {
+            "keys": [key_material.jwk.clone()]
+        }
+    });
+
+    async fn confidential_metadata_handler(
+        axum::extract::State(state): axum::extract::State<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        Json(state)
+    }
+
+    let app = Router::new()
+        .route("/client-metadata.json", get(confidential_metadata_handler))
+        .with_state(metadata);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    client_id
+}
+
+/// Build a signed private_key_jwt client assertion with a fresh jti.
+///
+/// # Panics
+/// Panics only on serialization or signing failure.
+#[allow(dead_code)]
+pub fn private_key_jwt_assertion(
+    key_material: &ClientAuthKeyMaterial,
+    client_id: &str,
+    aud: &str,
+) -> String {
+    private_key_jwt_assertion_with_jti(
+        key_material,
+        client_id,
+        aud,
+        &format!("client-assertion-{}", uuid::Uuid::new_v4()),
+        chrono::Utc::now().timestamp() + 240,
+    )
+}
+
+/// Build a signed private_key_jwt client assertion with a chosen jti and exp.
+///
+/// # Panics
+/// Panics only on serialization or signing failure.
+#[allow(dead_code)]
+pub fn private_key_jwt_assertion_with_jti(
+    key_material: &ClientAuthKeyMaterial,
+    client_id: &str,
+    aud: &str,
+    jti: &str,
+    exp: i64,
+) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use p256::ecdsa::signature::Signer;
+
+    let header = serde_json::json!({
+        "typ": "JWT",
+        "alg": "ES256",
+        "kid": key_material.kid,
+    });
+    let now = chrono::Utc::now().timestamp();
+    let claims = serde_json::json!({
+        "iss": client_id,
+        "sub": client_id,
+        "aud": aud,
+        "exp": exp,
+        "iat": now,
+        "jti": jti,
+    });
+    let signing_input = format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap()),
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+    );
+    let signature: p256::ecdsa::Signature = key_material.signing_key.sign(signing_input.as_bytes());
+    format!(
+        "{signing_input}.{}",
+        URL_SAFE_NO_PAD.encode(signature.to_bytes())
+    )
+}
+
 #[allow(dead_code)]
 pub fn test_tenant() -> TenantExtractor {
     TenantExtractor(Arc::new(Tenant {

@@ -2,10 +2,9 @@ mod common;
 
 use axum::{
     body::Body,
-    extract::State,
     http::{header, Request, StatusCode},
     routing::{get, post},
-    Json, Router,
+    Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use http_body_util::BodyExt;
@@ -28,12 +27,7 @@ struct DpopKeyMaterial {
     jkt: String,
 }
 
-struct ClientAuthKeyMaterial {
-    signing_key: SigningKey,
-    jwk: Value,
-    jkt: String,
-    kid: String,
-}
+use common::ClientAuthKeyMaterial;
 
 fn pkce_challenge(verifier: &str) -> String {
     let digest = Sha256::digest(verifier.as_bytes());
@@ -78,30 +72,7 @@ fn dpop_key_material() -> DpopKeyMaterial {
 }
 
 fn client_auth_key_material() -> ClientAuthKeyMaterial {
-    let signing_key = SigningKey::random(&mut OsRng);
-    let verifying_key = signing_key.verifying_key();
-    let encoded_point = verifying_key.to_encoded_point(false);
-    let x = URL_SAFE_NO_PAD.encode(encoded_point.x().unwrap());
-    let y = URL_SAFE_NO_PAD.encode(encoded_point.y().unwrap());
-    let kid = format!("kid-{}", Uuid::new_v4());
-    let jwk = serde_json::json!({
-        "kty": "EC",
-        "crv": "P-256",
-        "x": x,
-        "y": y,
-        "kid": kid,
-        "use": "sig",
-        "alg": "ES256",
-    });
-    let thumbprint_input = format!(r#"{{"crv":"P-256","kty":"EC","x":"{x}","y":"{y}"}}"#);
-    let jkt = URL_SAFE_NO_PAD.encode(Sha256::digest(thumbprint_input.as_bytes()));
-
-    ClientAuthKeyMaterial {
-        signing_key,
-        jwk,
-        jkt,
-        kid,
-    }
+    common::client_auth_key_material()
 }
 
 fn dpop_proof(
@@ -165,13 +136,7 @@ fn private_key_jwt_assertion(
     client_id: &str,
     aud: &str,
 ) -> String {
-    private_key_jwt_assertion_with_jti(
-        key_material,
-        client_id,
-        aud,
-        &format!("client-assertion-{}", Uuid::new_v4()),
-        chrono::Utc::now().timestamp() + 240,
-    )
+    common::private_key_jwt_assertion(key_material, client_id, aud)
 }
 
 fn private_key_jwt_assertion_with_jti(
@@ -181,41 +146,7 @@ fn private_key_jwt_assertion_with_jti(
     jti: &str,
     exp: i64,
 ) -> String {
-    let header = serde_json::json!({
-        "typ": "JWT",
-        "alg": "ES256",
-        "kid": key_material.kid,
-    });
-    let now = chrono::Utc::now().timestamp();
-    let claims = serde_json::json!({
-        "iss": client_id,
-        "sub": client_id,
-        "aud": aud,
-        "exp": exp,
-        "iat": now,
-        "jti": jti,
-    });
-    let signing_input = format!(
-        "{}.{}",
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap()),
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
-    );
-    let signature: Signature = key_material.signing_key.sign(signing_input.as_bytes());
-    format!(
-        "{signing_input}.{}",
-        URL_SAFE_NO_PAD.encode(signature.to_bytes())
-    )
-}
-
-#[derive(Clone)]
-struct ConfidentialClientMetadata {
-    metadata: Value,
-}
-
-async fn confidential_metadata_handler(
-    State(state): State<ConfidentialClientMetadata>,
-) -> Json<Value> {
-    Json(state.metadata)
+    common::private_key_jwt_assertion_with_jti(key_material, client_id, aud, jti, exp)
 }
 
 async fn start_confidential_client_metadata_server(
@@ -223,30 +154,12 @@ async fn start_confidential_client_metadata_server(
     key_material: &ClientAuthKeyMaterial,
     dpop_bound_access_tokens: bool,
 ) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let client_id = format!("http://{addr}/client-metadata.json");
-    let metadata = serde_json::json!({
-        "client_id": client_id,
-        "redirect_uris": [redirect_uri],
-        "token_endpoint_auth_method": "private_key_jwt",
-        "token_endpoint_auth_signing_alg": "ES256",
-        "grant_types": ["authorization_code", "refresh_token"],
-        "response_types": ["code"],
-        "dpop_bound_access_tokens": dpop_bound_access_tokens,
-        "jwks": {
-            "keys": [key_material.jwk.clone()]
-        }
-    });
-
-    let app = Router::new()
-        .route("/client-metadata.json", get(confidential_metadata_handler))
-        .with_state(ConfidentialClientMetadata { metadata });
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-
-    client_id
+    common::start_confidential_client_metadata_server(
+        redirect_uri,
+        key_material,
+        dpop_bound_access_tokens,
+    )
+    .await
 }
 
 /// Independently constructed app instance sharing the process's replay store.

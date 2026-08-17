@@ -667,6 +667,12 @@ impl Metrics {
     /// Count one ATProto OAuth replay-reservation attempt. Labels are
     /// normalized through allowlists so the exported series stay low
     /// cardinality and never carry identifiers or token material.
+    ///
+    /// In fail-open degraded mode the outcomes do not partition attempts: a
+    /// single attempt whose shared storage failed is counted under
+    /// `storage_unavailable` and then under `fallback_reserved` or
+    /// `fallback_rejected`. Read `storage_unavailable` as the storage-failure
+    /// signal, not as a terminal outcome.
     pub fn inc_atproto_oauth_replay_reservation(&self, namespace: &str, outcome: &str) {
         let key = ReplayReservationKey {
             namespace: normalize_replay_namespace(namespace).to_string(),
@@ -1196,7 +1202,7 @@ impl Metrics {
         }
 
         output.push_str(
-            "\n# HELP keycast_atproto_oauth_replay_reservations_total ATProto OAuth replay-reservation attempts by namespace and outcome\n",
+            "\n# HELP keycast_atproto_oauth_replay_reservations_total ATProto OAuth replay-reservation outcomes by namespace; in fail-open degraded mode one attempt may count under storage_unavailable and a fallback outcome\n",
         );
         output.push_str("# TYPE keycast_atproto_oauth_replay_reservations_total counter\n");
         for (key, count) in self

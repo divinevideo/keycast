@@ -529,6 +529,12 @@ pub enum AuthError {
         message: String,
         retry_after: Option<u32>,
     },
+    /// Shared replay-reservation storage is unavailable or inconclusive, so the
+    /// request fails closed with a retryable `temporarily_unavailable` response
+    /// (keycast#367). Distinct from [`AuthError::OAuthProtocol`] so handlers can
+    /// tell an infrastructure outage from an authentication or binding failure
+    /// and skip destructive side effects such as session revocation.
+    ReplayProtectionUnavailable,
     TooManyRequests {
         // Caller is locked out after repeated failures
         message: String,
@@ -720,6 +726,17 @@ impl IntoResponse for AuthError {
                     ).into_response();
                 }
                 return response.into_response();
+            }
+            AuthError::ReplayProtectionUnavailable => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": "temporarily_unavailable",
+                        "error_description":
+                            "Authorization server is temporarily unable to complete replay protection. Please retry.",
+                    })),
+                )
+                    .into_response();
             }
             AuthError::TooManyRequests { message, retry_after } => {
                 return (

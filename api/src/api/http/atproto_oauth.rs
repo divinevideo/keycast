@@ -294,13 +294,7 @@ fn dpop_htu_matches_expected(htu: &str, expected_path_suffix: &str) -> bool {
 fn replay_reservation_error(error: ReplayReservationError, replay_message: &str) -> AuthError {
     match error {
         ReplayReservationError::Replay => AuthError::BadRequest(replay_message.to_string()),
-        ReplayReservationError::StorageUnavailable => AuthError::OAuthProtocol {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            error: "temporarily_unavailable",
-            description:
-                "Authorization server is temporarily unable to complete replay protection. Please retry."
-                    .to_string(),
-        },
+        ReplayReservationError::StorageUnavailable => AuthError::ReplayProtectionUnavailable,
     }
 }
 
@@ -1144,7 +1138,12 @@ pub async fn token(
             )
             .await
             {
-                let _ = repo.revoke_session(&session.request_uri).await;
+                // A replay-storage outage is an infrastructure failure, not a
+                // binding failure: keep the grant so the retryable response can
+                // actually be retried once storage recovers (keycast#367).
+                if !matches!(error, AuthError::ReplayProtectionUnavailable) {
+                    let _ = repo.revoke_session(&session.request_uri).await;
+                }
                 return Err(error);
             }
 
@@ -1260,7 +1259,12 @@ pub async fn token(
             )
             .await
             {
-                let _ = repo.revoke_refresh_session(&refresh_token_hash).await;
+                // Same distinction as the authorization-code arm: a
+                // replay-storage outage must not destroy the refresh token the
+                // response tells the client to retry with (keycast#367).
+                if !matches!(error, AuthError::ReplayProtectionUnavailable) {
+                    let _ = repo.revoke_refresh_session(&refresh_token_hash).await;
+                }
                 return Err(error);
             }
 
