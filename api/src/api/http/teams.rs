@@ -17,6 +17,7 @@ use keycast_core::custom_permissions::{allowed_kinds::AllowedKindsConfig, AVAILA
 use keycast_core::repositories::{
     AuthorizationRepository, PolicyRepository, StoredKeyRepository, TeamRepository, UserRepository,
 };
+use keycast_core::secret_pool::SecretPoolError;
 use keycast_core::types::authorization::{Authorization, AuthorizationWithRelations};
 use keycast_core::types::policy::PolicyWithPermissions;
 use keycast_core::types::stored_key::PublicStoredKey;
@@ -380,12 +381,13 @@ pub async fn add_authorization(
         return Err(ApiError::not_found("Policy not found"));
     }
 
-    // Get pre-computed (secret, hash) from pool - instant, no waiting for bcrypt
+    // Precomputed pair, or a bounded wait that becomes retryable overload.
     let secret_pool = get_secret_pool().map_err(|e| ApiError::internal(e.to_string()))?;
-    let secret_pair = secret_pool
-        .get()
-        .await
-        .ok_or_else(|| ApiError::internal("Secret pool exhausted".to_string()))?;
+    let secret_pair = secret_pool.get().await.map_err(|error| match error {
+        SecretPoolError::Exhausted | SecretPoolError::Closed => {
+            ApiError::service_unavailable("Secret pool exhausted")
+        }
+    })?;
     let connection_secret = secret_pair.secret;
     let secret_hash = secret_pair.hash;
 

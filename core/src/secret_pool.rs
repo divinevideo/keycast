@@ -1,7 +1,9 @@
 // ABOUTME: Pre-computed secret pool for zero-latency authorization creation
 // ABOUTME: Background producer generates (secret, bcrypt_hash) pairs ahead of time
 
-use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
+use std::time::Duration;
+
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use rand::Rng;
 use secrecy::SecretString;
 
@@ -16,6 +18,15 @@ const BCRYPT_COST: u32 = 10;
 
 /// Length of generated secrets (48 alphanumeric chars = ~284 bits entropy)
 const SECRET_LENGTH: usize = 48;
+
+/// How long [`SecretPoolReceiver::get`] waits for a produced secret pair.
+///
+/// Background hashing yields to request work, so an empty pool during a login
+/// storm may never refill. One second matches bcrypt admission's permit wait:
+/// long enough for one cost-10 hash if a CPU slot frees, then a retryable
+/// overload instead of an unbounded recv. Do not reserve a background CPU
+/// slot; that would cut request hashing capacity on the serving instances.
+pub const SECRET_POOL_GET_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Pre-computed (secret, hash) pair
 pub struct SecretPair {
@@ -149,16 +160,21 @@ pub struct SecretPoolReceiver {
 }
 
 impl SecretPoolReceiver {
-    /// Get a pre-computed (secret, hash) pair from the pool
+    /// Get a pre-computed (secret, hash) pair from the pool.
     ///
-    /// Blocks if pool is empty (waits for producer to generate more).
-    /// Returns None if the pool is closed (shutdown).
-    pub async fn get(&self) -> Option<SecretPair> {
+    /// Waits up to [`SECRET_POOL_GET_TIMEOUT`] when the pool is empty.
+    /// Times out as [`SecretPoolError::Exhausted`] so callers can return a
+    /// retryable overload instead of parking the request. A closed pool
+    /// returns [`SecretPoolError::Closed`].
+    pub async fn get(&self) -> Result<SecretPair, SecretPoolError> {
         let rx = self.rx.clone();
-        tokio::task::spawn_blocking(move || rx.recv().ok())
-            .await
-            .ok()
-            .flatten()
+        tokio::task::spawn_blocking(move || match rx.recv_timeout(SECRET_POOL_GET_TIMEOUT) {
+            Ok(pair) => Ok(pair),
+            Err(RecvTimeoutError::Timeout) => Err(SecretPoolError::Exhausted),
+            Err(RecvTimeoutError::Disconnected) => Err(SecretPoolError::Closed),
+        })
+        .await
+        .unwrap_or(Err(SecretPoolError::Closed))
     }
 
     /// Try to get a pair without blocking
@@ -291,5 +307,33 @@ mod tests {
             .await
             .expect("Producer should exit within timeout")
             .expect("Producer should not panic");
+    }
+
+    #[tokio::test]
+    async fn get_times_out_when_the_producer_never_refills() {
+        let pool = SecretPool::new(1);
+        let receiver = pool.receiver();
+        let started = std::time::Instant::now();
+
+        let error = match receiver.get().await {
+            Ok(_) => panic!("an empty live pool must not return a pair"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SecretPoolError::Exhausted));
+        assert!(started.elapsed() >= SECRET_POOL_GET_TIMEOUT);
+        assert!(started.elapsed() < SECRET_POOL_GET_TIMEOUT + Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn get_reports_closed_when_the_pool_is_dropped() {
+        let pool = SecretPool::new(1);
+        let receiver = pool.receiver();
+        drop(pool);
+
+        let error = match receiver.get().await {
+            Ok(_) => panic!("a disconnected pool must not return a pair"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SecretPoolError::Closed));
     }
 }

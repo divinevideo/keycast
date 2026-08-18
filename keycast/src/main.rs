@@ -1390,8 +1390,9 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         Duration::from_secs(1),
     );
     tracing::info!(
-        "✔︎ Bcrypt admission initialized ({} concurrent operations)",
-        num_cpus::get().max(1)
+        "✔︎ Bcrypt admission initialized ({} concurrent operations, {} same-class waiters)",
+        num_cpus::get().max(1),
+        keycast_core::bcrypt_admission::PER_CLASS_WAIT_DEPTH
     );
 
     // Create signer (relay connections deferred to background task for faster startup)

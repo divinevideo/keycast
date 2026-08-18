@@ -122,6 +122,14 @@ struct Inner {
     idle: Notify,
 }
 
+/// Same-class waiters allowed after the shared CPU slots are full.
+///
+/// Two waiters absorb a double-submit plus one sibling without letting one
+/// class dominate the FIFO permit queue. Depth 1 sheds that sibling
+/// immediately. A much larger depth would let login starve PIN, signup, and
+/// claim once those waiters share the same semaphore.
+pub const PER_CLASS_WAIT_DEPTH: usize = 2;
+
 /// One process-wide concurrency and waiting boundary for bcrypt.
 #[derive(Clone)]
 pub struct BcryptAdmission {
@@ -145,7 +153,7 @@ impl BcryptAdmission {
         Self {
             inner: Arc::new(Inner {
                 permits: Arc::new(Semaphore::new(max_concurrency.max(1))),
-                wait_slots: std::array::from_fn(|_| Arc::new(Semaphore::new(1))),
+                wait_slots: std::array::from_fn(|_| Arc::new(Semaphore::new(PER_CLASS_WAIT_DEPTH))),
                 permit_wait,
                 lifecycle: Mutex::new(LifecycleState::default()),
                 idle: Notify::new(),
@@ -542,6 +550,45 @@ mod tests {
             completed += 1;
         }
         assert_eq!(completed, 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_class_wait_depth_admits_the_bound_and_sheds_the_rest() {
+        let admission = BcryptAdmission::new(1, Duration::from_secs(5));
+        let held = admission
+            .acquire(BcryptWorkload::Login, BcryptOperation::Hash)
+            .await
+            .expect("occupy capacity");
+
+        let mut waiters = tokio::task::JoinSet::new();
+        for _ in 0..PER_CLASS_WAIT_DEPTH {
+            let admission = admission.clone();
+            waiters.spawn(async move {
+                admission
+                    .acquire(BcryptWorkload::Login, BcryptOperation::Verify)
+                    .await
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let started = std::time::Instant::now();
+        let shed = admission
+            .acquire(BcryptWorkload::Login, BcryptOperation::Dummy)
+            .await
+            .expect_err("same-class burst beyond the wait depth must shed");
+        assert!(matches!(shed, BcryptAdmissionError::AtCapacity));
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "excess same-class work must shed without waiting for a permit"
+        );
+
+        drop(held);
+        let mut admitted = 0;
+        while let Some(result) = waiters.join_next().await {
+            result.expect("waiter task").expect("waiter admitted");
+            admitted += 1;
+        }
+        assert_eq!(admitted, PER_CLASS_WAIT_DEPTH);
     }
 
     #[tokio::test]

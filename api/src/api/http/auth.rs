@@ -29,6 +29,7 @@ use keycast_core::repositories::{
     OAuthCodeRepository, PersonalKeysRepository, PolicyRepository, UserRepository,
     VerifiedMinorRow,
 };
+use keycast_core::secret_pool::SecretPoolError;
 use keycast_core::traits::CustomPermission;
 use nostr_sdk::{Keys, PublicKey, ToBech32, UnsignedEvent};
 use rand::Rng;
@@ -1528,13 +1529,18 @@ pub async fn create_bunker(
         .await?
         .ok_or_else(|| account_incomplete("Account setup is incomplete. Please register again."))?;
 
-    // Get pre-computed (secret, hash) from pool - instant, no waiting for bcrypt
-    let secret_pair = auth_state.state.secret_pool.get().await.ok_or_else(|| {
-        retryable_service_unavailable(
-            "Service temporarily unavailable. Please try again in a few minutes.",
-            Some(5),
-        )
-    })?;
+    // Precomputed pair, or a bounded wait that becomes retryable overload.
+    let secret_pair = auth_state
+        .state
+        .secret_pool
+        .get()
+        .await
+        .map_err(|error| match error {
+            SecretPoolError::Exhausted | SecretPoolError::Closed => retryable_service_unavailable(
+                "Service temporarily unavailable. Please try again in a few minutes.",
+                Some(5),
+            ),
+        })?;
     let connection_secret = secret_pair.secret;
     let secret_hash = secret_pair.hash;
 

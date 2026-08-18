@@ -18,6 +18,7 @@ use keycast_core::repositories::{
     RepositoryError, StoreOAuthCodeParams, StoreOAuthCodeWithRegistrationParams,
     StoredPendingRegistration, UserRepository,
 };
+use keycast_core::secret_pool::SecretPoolError;
 use keycast_core::types::refresh_token::{generate_refresh_token, hash_refresh_token};
 use nostr_sdk::{Keys, ToBech32};
 use rand::Rng;
@@ -3333,13 +3334,15 @@ async fn create_oauth_authorization_and_token(
     // Extract origin from redirect_uri - this is the primary identifier
     let redirect_origin = extract_origin(redirect_uri)?;
 
-    // Get pre-computed (secret, hash) from pool - instant, no waiting for bcrypt
+    // Precomputed pair, or a bounded wait that becomes retryable overload.
     let secret_pair = auth_state
         .state
         .secret_pool
         .get()
         .await
-        .ok_or_else(|| OAuthError::ServerError("Secret pool exhausted".to_string()))?;
+        .map_err(|error| match error {
+            SecretPoolError::Exhausted | SecretPoolError::Closed => OAuthError::ServiceUnavailable,
+        })?;
     let connection_secret = secret_pair.secret;
     let secret_hash = secret_pair.hash;
 
