@@ -327,7 +327,7 @@ async fn oauth_token_issuance_failure_leaves_pending_registration_rearmable() {
         Err(error) => error.into_response(),
     };
 
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let released_code = repo
         .find_valid(1, &exchange_code)
         .await
