@@ -21,6 +21,7 @@ use keycast_core::encryption::aws_key_manager::AwsKeyManager;
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::gcp_key_manager::GcpKeyManager;
 use keycast_core::encryption::KeyManager;
+use keycast_core::env_config::configured_positive_usize;
 use keycast_signer::{RelayQueue, UnifiedSigner};
 use moka::future::Cache;
 use nostr_sdk::Keys;
@@ -1362,12 +1363,17 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         authorization_channel::CHANNEL_BUFFER_SIZE
     );
 
+    let relay_activity_shutdown = Arc::new(Notify::new());
+    let (relay_activity_logger, relay_activity_worker) =
+        keycast_signer::RelayActivityLogger::new(database.pool.clone());
+
     // Create signer (relay connections deferred to background task for faster startup)
     let mut signer = UnifiedSigner::new(
         database.pool.clone(),
         signer_key_manager,
         auth_rx,
         coordinator.clone(),
+        relay_activity_logger,
     )
     .await?;
     signer.load_authorizations().await?;
@@ -1382,22 +1388,13 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     // Spawn relay workers for NIP-46 request processing
     // Worker count balances throughput vs CPU contention with HTTP RPC
     // Can override with RELAY_WORKER_COUNT env var
-    let num_workers = std::env::var("RELAY_WORKER_COUNT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| num_cpus::get().max(4) * 2);
-    let relay_worker_handles = relay_queue.spawn_workers(
-        num_workers,
-        signer.handlers(),
-        signer.client(),
-        signer.pool(),
-        signer.key_manager(),
-        signer.coordinator(),
-    );
+    let num_workers = configured_positive_usize("RELAY_WORKER_COUNT", num_cpus::get().max(4) * 2);
+    let relay_worker_handles = signer.spawn_relay_workers(&relay_queue, num_workers);
     tracing::info!(
-        "✔︎ Signer daemon initialized (Tokio workers: {}, relay workers: {}, queue: 4096)",
+        "✔︎ Signer daemon initialized (Tokio workers: {}, relay workers: {}, queue: {})",
         worker_threads,
-        num_workers
+        num_workers,
+        relay_queue.capacity()
     );
 
     // Create tenant cache (preload deferred to background task for faster startup)
@@ -1431,6 +1428,13 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     let task_tracker = TaskTracker::new();
     let shutdown_signal = Arc::new(Notify::new());
     let activity_log_shutdown = Arc::new(Notify::new());
+
+    let relay_activity_shutdown_for_task = relay_activity_shutdown.clone();
+    task_tracker.spawn(async move {
+        relay_activity_worker
+            .run_until_shutdown(relay_activity_shutdown_for_task)
+            .await;
+    });
 
     let (activity_logger, activity_log_worker) =
         keycast_api::activity_log::ActivityLogger::new(database.pool.clone());
@@ -1946,7 +1950,13 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     // returns an owning ('static) future. `Client::shutdown` is idempotent.
     let client_shutdown = move || {
         let client = client_for_shutdown.clone();
-        async move { client.shutdown().await }
+        let relay_activity_shutdown = relay_activity_shutdown.clone();
+        async move {
+            // Relay workers are drained before this factory is called, so no
+            // producer can enqueue activity after the writer's final flush.
+            relay_activity_shutdown.notify_waiters();
+            client.shutdown().await;
+        }
     };
     match drain_signer_or_abort(
         client_shutdown,

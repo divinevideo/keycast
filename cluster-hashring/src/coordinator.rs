@@ -12,19 +12,24 @@ use tokio_util::sync::CancellationToken;
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 5;
 const FULL_SYNC_INTERVAL_SECS: u64 = 30;
 const CLEANUP_PROBABILITY_PERCENT: u32 = 10;
+const CLUSTER_EVENT_BUFFER_SIZE: usize = 1_024;
+const AUTHORIZATION_INVALIDATION_PUBLISH_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Membership change event.
+/// Cluster coordination event.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MembershipEvent {
     Joined(String),
     Left(String),
+    AuthorizationInvalidated(String),
 }
 
 /// JSON message format for Pub/Sub
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 struct PubSubMessage {
-    event: String, // "join" or "leave"
+    event: String,
     instance_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bunker_pubkey: Option<String>,
 }
 
 /// Orchestrates HashRing + Redis membership with Pub/Sub.
@@ -89,8 +94,8 @@ impl ClusterCoordinator {
         let ring = Arc::new(ArcSwap::from_pointee(initial_ring));
         let cancel_token = CancellationToken::new();
 
-        // Broadcast channel for membership events
-        let (event_tx, _) = broadcast::channel(16);
+        // Authorization invalidations can burst during signup or approval traffic.
+        let (event_tx, _) = broadcast::channel(CLUSTER_EVENT_BUFFER_SIZE);
 
         // Establish Pub/Sub subscription BEFORE publishing join event.
         // This guarantees we're listening before other coordinators can see our join.
@@ -99,7 +104,7 @@ impl ClusterCoordinator {
         tracing::debug!(channel = %channel, "Pub/Sub subscription established");
 
         // NOW publish join event (other instances will receive it)
-        Self::publish_event(&mut registry, "join", &instance_id).await?;
+        Self::publish_event(&mut registry, "join", &instance_id, None).await?;
 
         let registry = Arc::new(tokio::sync::Mutex::new(registry));
 
@@ -138,10 +143,12 @@ impl ClusterCoordinator {
         registry: &mut RedisRegistry,
         event: &str,
         instance_id: &str,
+        bunker_pubkey: Option<&str>,
     ) -> Result<(), Error> {
         let msg = PubSubMessage {
             event: event.to_string(),
             instance_id: instance_id.to_string(),
+            bunker_pubkey: bunker_pubkey.map(str::to_string),
         };
         let payload = serde_json::to_string(&msg).map_err(|e| Error::Config(e.to_string()))?;
 
@@ -422,6 +429,17 @@ impl ClusterCoordinator {
                                     ring.store(Arc::new(new_ring));
                                     let _ = event_tx.send(MembershipEvent::Left(parsed.instance_id));
                                 }
+                                "authorization_invalidated" => {
+                                    if let Some(bunker_pubkey) = parsed.bunker_pubkey {
+                                        let _ = event_tx.send(
+                                            MembershipEvent::AuthorizationInvalidated(bunker_pubkey),
+                                        );
+                                    } else {
+                                        tracing::warn!(
+                                            "Authorization invalidation event missing bunker pubkey"
+                                        );
+                                    }
+                                }
                                 other => {
                                     tracing::warn!("Unknown Pub/Sub event: {}", other);
                                 }
@@ -458,11 +476,33 @@ impl ClusterCoordinator {
         self.ring.load().instance_count()
     }
 
-    /// Subscribe to membership change events.
+    /// Subscribe to cluster coordination events.
     ///
     /// Events are broadcast AFTER the ring has been updated.
     pub fn subscribe(&self) -> broadcast::Receiver<MembershipEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Publish an authorization cache invalidation to peer signer instances.
+    pub async fn publish_authorization_invalidation(
+        &self,
+        bunker_pubkey: &str,
+    ) -> Result<(), Error> {
+        tokio::time::timeout(AUTHORIZATION_INVALIDATION_PUBLISH_TIMEOUT, async {
+            let mut registry = self.registry.lock().await;
+            let instance_id = registry.instance_id().to_string();
+            Self::publish_event(
+                &mut registry,
+                "authorization_invalidated",
+                &instance_id,
+                Some(bunker_pubkey),
+            )
+            .await
+        })
+        .await
+        .map_err(|_| {
+            Error::Connection("authorization invalidation publish timed out".to_string())
+        })?
     }
 
     /// Get the connection factory (for creating additional connections).
@@ -517,7 +557,7 @@ impl ClusterCoordinator {
         //    against any in-flight heartbeat ZADD — see the method docs).
         let mut reg = self.registry.lock().await;
         let instance_id = reg.instance_id().to_string();
-        if let Err(e) = Self::publish_event(&mut reg, "leave", &instance_id).await {
+        if let Err(e) = Self::publish_event(&mut reg, "leave", &instance_id, None).await {
             tracing::warn!("Failed to publish leave event: {}", e);
         }
         reg.deregister().await
@@ -543,7 +583,7 @@ impl ClusterCoordinator {
         {
             let mut reg = self.registry.lock().await;
             let instance_id = reg.instance_id().to_string();
-            if let Err(e) = Self::publish_event(&mut reg, "leave", &instance_id).await {
+            if let Err(e) = Self::publish_event(&mut reg, "leave", &instance_id, None).await {
                 tracing::warn!("Failed to publish leave event: {}", e);
             }
             reg.deregister().await?;
@@ -609,8 +649,13 @@ mod tests {
     fn test_membership_event_variants() {
         let joined = MembershipEvent::Joined("abc-123".to_string());
         let left = MembershipEvent::Left("xyz-789".to_string());
+        let invalidated = MembershipEvent::AuthorizationInvalidated("bunker-key".to_string());
         assert_eq!(joined, MembershipEvent::Joined("abc-123".to_string()));
         assert_eq!(left, MembershipEvent::Left("xyz-789".to_string()));
+        assert_eq!(
+            invalidated,
+            MembershipEvent::AuthorizationInvalidated("bunker-key".to_string())
+        );
     }
 
     #[tokio::test]
@@ -816,7 +861,46 @@ mod tests {
                 assert_eq!(id, coord2.instance_id());
             }
             MembershipEvent::Left(_) => panic!("Expected join, got leave"),
+            MembershipEvent::AuthorizationInvalidated(_) => {
+                panic!("Expected join, got authorization invalidation")
+            }
         }
+
+        coord1.shutdown().await.unwrap();
+        coord2.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Redis via TEST_REDIS_URL or local Redis on localhost:16379"]
+    async fn test_pubsub_delivers_authorization_invalidation_to_peer() {
+        let redis_url = get_redis_url();
+        let prefix = test_prefix();
+        let coord1 = ClusterCoordinator::start_with_prefix(&redis_url, Some(&prefix))
+            .await
+            .unwrap();
+        let coord2 = ClusterCoordinator::start_with_prefix(&redis_url, Some(&prefix))
+            .await
+            .unwrap();
+        let mut rx = coord1.subscribe();
+
+        coord2
+            .publish_authorization_invalidation("bunker-key")
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = rx.recv().await.expect("channel closed");
+                if matches!(event, MembershipEvent::AuthorizationInvalidated(_)) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("timeout waiting for invalidation");
+        assert_eq!(
+            event,
+            MembershipEvent::AuthorizationInvalidated("bunker-key".to_string())
+        );
 
         coord1.shutdown().await.unwrap();
         coord2.shutdown().await.unwrap();

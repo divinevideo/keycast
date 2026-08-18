@@ -96,6 +96,10 @@ pub struct Metrics {
     pub nip46_requests_total: AtomicU64,
     /// NIP-46 requests rejected by hashring (not our responsibility)
     pub nip46_requests_rejected_hashring: AtomicU64,
+    /// NIP-46 requests rejected by hashring before relay queue admission
+    pub nip46_requests_rejected_hashring_prequeue: AtomicU64,
+    /// NIP-46 requests rejected by hashring after leaving the relay queue
+    pub nip46_requests_rejected_hashring_worker: AtomicU64,
     /// NIP-46 requests where handler was not found
     pub nip46_requests_handler_not_found: AtomicU64,
     /// NIP-46 requests successfully processed
@@ -108,6 +112,54 @@ pub struct Metrics {
     pub nip46_requests_queue_closed: AtomicU64,
     /// NIP-46 tombstone responses sent (revoked/expired authorizations)
     pub nip46_tombstone_responses: AtomicU64,
+    /// Approximate relay queue depth after admission and worker receives
+    pub nip46_queue_depth: AtomicU64,
+    /// Configured relay queue capacity
+    pub nip46_queue_capacity: AtomicU64,
+    /// Number of observed relay queue wait durations
+    pub nip46_queue_wait_count: AtomicU64,
+    /// Sum of observed relay queue wait durations in microseconds
+    pub nip46_queue_wait_micros: AtomicU64,
+    /// Current number of relay workers processing a request
+    pub nip46_workers_active: AtomicU64,
+    /// Number of observed relay worker processing durations
+    pub nip46_worker_duration_count: AtomicU64,
+    /// Sum of observed relay worker processing durations in microseconds
+    pub nip46_worker_duration_micros: AtomicU64,
+    /// Relay requests shed because one target pubkey occupied too much queue capacity
+    pub nip46_noisy_target_shed: AtomicU64,
+    /// Relay requests shed because one client pubkey occupied too much queue capacity
+    pub nip46_noisy_client_shed: AtomicU64,
+    /// Current number of cache-miss authorization lookups in flight
+    pub nip46_lookup_in_flight: AtomicU64,
+    /// Configured cache-miss authorization lookup concurrency limit
+    pub nip46_lookup_limit: AtomicU64,
+    /// Cache-miss authorization lookups that reached the database/KMS path
+    pub nip46_lookup_database_total: AtomicU64,
+    /// Cache-miss authorization lookups that failed on a dependency error
+    pub nip46_lookup_errors: AtomicU64,
+    /// Cache-miss authorization lookups shed because lookup admission was full
+    pub nip46_lookup_shed: AtomicU64,
+    /// Cache-miss authorization lookup results discarded after invalidation races
+    pub nip46_lookup_invalidated: AtomicU64,
+    /// Unknown-bunker requests served from the negative lookup cache
+    pub nip46_negative_cache_hits: AtomicU64,
+    /// Current approximate negative lookup cache entry count
+    pub nip46_negative_cache_size: AtomicU64,
+    /// Relay activity updates accepted by the coalescing writer
+    pub nip46_activity_queued: AtomicU64,
+    /// Relay activity updates dropped because the coalescing writer queue was full
+    pub nip46_activity_dropped_queue_full: AtomicU64,
+    /// Relay activity updates dropped because the coalescing writer had stopped
+    pub nip46_activity_dropped_writer_stopped: AtomicU64,
+    /// Relay activity updates lost during final shutdown flush
+    pub nip46_activity_dropped_shutdown: AtomicU64,
+    /// Relay activity updates dropped to keep retained pending IDs bounded
+    pub nip46_activity_dropped_retention: AtomicU64,
+    /// Failed coalesced relay activity database writes
+    pub nip46_activity_write_failures: AtomicU64,
+    /// Current retained authorization IDs in the relay activity writer
+    pub nip46_activity_pending: AtomicU64,
 
     // === HTTP RPC Metrics ===
     /// Total HTTP RPC requests
@@ -165,11 +217,37 @@ impl Metrics {
             cache_size: AtomicU64::new(0),
             nip46_requests_total: AtomicU64::new(0),
             nip46_requests_rejected_hashring: AtomicU64::new(0),
+            nip46_requests_rejected_hashring_prequeue: AtomicU64::new(0),
+            nip46_requests_rejected_hashring_worker: AtomicU64::new(0),
             nip46_requests_handler_not_found: AtomicU64::new(0),
             nip46_requests_processed: AtomicU64::new(0),
             nip46_requests_queue_dropped: AtomicU64::new(0),
             nip46_requests_queue_closed: AtomicU64::new(0),
             nip46_tombstone_responses: AtomicU64::new(0),
+            nip46_queue_depth: AtomicU64::new(0),
+            nip46_queue_capacity: AtomicU64::new(0),
+            nip46_queue_wait_count: AtomicU64::new(0),
+            nip46_queue_wait_micros: AtomicU64::new(0),
+            nip46_workers_active: AtomicU64::new(0),
+            nip46_worker_duration_count: AtomicU64::new(0),
+            nip46_worker_duration_micros: AtomicU64::new(0),
+            nip46_noisy_target_shed: AtomicU64::new(0),
+            nip46_noisy_client_shed: AtomicU64::new(0),
+            nip46_lookup_in_flight: AtomicU64::new(0),
+            nip46_lookup_limit: AtomicU64::new(0),
+            nip46_lookup_database_total: AtomicU64::new(0),
+            nip46_lookup_errors: AtomicU64::new(0),
+            nip46_lookup_shed: AtomicU64::new(0),
+            nip46_lookup_invalidated: AtomicU64::new(0),
+            nip46_negative_cache_hits: AtomicU64::new(0),
+            nip46_negative_cache_size: AtomicU64::new(0),
+            nip46_activity_queued: AtomicU64::new(0),
+            nip46_activity_dropped_queue_full: AtomicU64::new(0),
+            nip46_activity_dropped_writer_stopped: AtomicU64::new(0),
+            nip46_activity_dropped_shutdown: AtomicU64::new(0),
+            nip46_activity_dropped_retention: AtomicU64::new(0),
+            nip46_activity_write_failures: AtomicU64::new(0),
+            nip46_activity_pending: AtomicU64::new(0),
             // HTTP RPC metrics
             http_rpc_requests_total: AtomicU64::new(0),
             http_rpc_cache_hits: AtomicU64::new(0),
@@ -220,6 +298,18 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn inc_nip46_rejected_hashring_prequeue(&self) {
+        self.inc_nip46_rejected_hashring();
+        self.nip46_requests_rejected_hashring_prequeue
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_nip46_rejected_hashring_worker(&self) {
+        self.inc_nip46_rejected_hashring();
+        self.nip46_requests_rejected_hashring_worker
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn inc_nip46_handler_not_found(&self) {
         self.nip46_requests_handler_not_found
             .fetch_add(1, Ordering::Relaxed);
@@ -243,6 +333,113 @@ impl Metrics {
     pub fn inc_nip46_tombstone_response(&self) {
         self.nip46_tombstone_responses
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_nip46_queue_depth(&self, depth: u64) {
+        self.nip46_queue_depth.store(depth, Ordering::Relaxed);
+    }
+
+    pub fn set_nip46_queue_capacity(&self, capacity: u64) {
+        self.nip46_queue_capacity.store(capacity, Ordering::Relaxed);
+    }
+
+    pub fn observe_nip46_queue_wait(&self, duration: Duration) {
+        self.nip46_queue_wait_count.fetch_add(1, Ordering::Relaxed);
+        self.nip46_queue_wait_micros
+            .fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    pub fn inc_nip46_workers_active(&self) {
+        self.nip46_workers_active.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn dec_nip46_workers_active(&self) {
+        self.nip46_workers_active.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn observe_nip46_worker_duration(&self, duration: Duration) {
+        self.nip46_worker_duration_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.nip46_worker_duration_micros
+            .fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    pub fn inc_nip46_noisy_flow_shed(&self, flow: &str) {
+        match flow {
+            "target" => &self.nip46_noisy_target_shed,
+            "client" => &self.nip46_noisy_client_shed,
+            _ => return,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_nip46_lookup_limit(&self, limit: u64) {
+        self.nip46_lookup_limit.store(limit, Ordering::Relaxed);
+    }
+
+    pub fn inc_nip46_lookup_in_flight(&self) {
+        self.nip46_lookup_in_flight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn dec_nip46_lookup_in_flight(&self) {
+        self.nip46_lookup_in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_nip46_lookup_database(&self) {
+        self.nip46_lookup_database_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_nip46_lookup_error(&self) {
+        self.nip46_lookup_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_nip46_lookup_shed(&self) {
+        self.nip46_lookup_shed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_nip46_lookup_invalidated(&self) {
+        self.nip46_lookup_invalidated
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_nip46_negative_cache_hit(&self) {
+        self.nip46_negative_cache_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_nip46_negative_cache_size(&self, size: u64) {
+        self.nip46_negative_cache_size
+            .store(size, Ordering::Relaxed);
+    }
+
+    pub fn inc_nip46_activity_queued(&self) {
+        self.nip46_activity_queued.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_nip46_activity_dropped(&self, reason: &str) {
+        self.add_nip46_activity_dropped(reason, 1);
+    }
+
+    pub fn add_nip46_activity_dropped(&self, reason: &str, count: u64) {
+        match reason {
+            "queue_full" => &self.nip46_activity_dropped_queue_full,
+            "writer_stopped" => &self.nip46_activity_dropped_writer_stopped,
+            "shutdown_flush_failed" => &self.nip46_activity_dropped_shutdown,
+            "retention_limit" => &self.nip46_activity_dropped_retention,
+            _ => return,
+        }
+        .fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn inc_nip46_activity_write_failure(&self) {
+        self.nip46_activity_write_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_nip46_activity_pending(&self, pending: u64) {
+        self.nip46_activity_pending
+            .store(pending, Ordering::Relaxed);
     }
 
     // === HTTP RPC metric methods ===
@@ -453,6 +650,20 @@ impl Metrics {
             self.nip46_requests_rejected_hashring
                 .load(Ordering::Relaxed)
         ));
+        output.push_str("# HELP keycast_nip46_rejected_hashring_prequeue_total Peer-owned NIP-46 requests rejected before local queue admission\n");
+        output.push_str("# TYPE keycast_nip46_rejected_hashring_prequeue_total counter\n");
+        output.push_str(&format!(
+            "keycast_nip46_rejected_hashring_prequeue_total {}\n",
+            self.nip46_requests_rejected_hashring_prequeue
+                .load(Ordering::Relaxed)
+        ));
+        output.push_str("# HELP keycast_nip46_rejected_hashring_worker_total Queued NIP-46 requests rejected after ownership changed\n");
+        output.push_str("# TYPE keycast_nip46_rejected_hashring_worker_total counter\n");
+        output.push_str(&format!(
+            "keycast_nip46_rejected_hashring_worker_total {}\n",
+            self.nip46_requests_rejected_hashring_worker
+                .load(Ordering::Relaxed)
+        ));
 
         output.push_str("\n# HELP keycast_nip46_handler_not_found_total NIP-46 requests where authorization was not found\n");
         output.push_str("# TYPE keycast_nip46_handler_not_found_total counter\n");
@@ -490,6 +701,89 @@ impl Metrics {
         output.push_str(&format!(
             "keycast_nip46_tombstone_responses_total {}\n",
             self.nip46_tombstone_responses.load(Ordering::Relaxed)
+        ));
+
+        output.push_str("\n# HELP keycast_nip46_queue_depth Current queued NIP-46 requests\n# TYPE keycast_nip46_queue_depth gauge\n");
+        output.push_str(&format!(
+            "keycast_nip46_queue_depth {}\n",
+            self.nip46_queue_depth.load(Ordering::Relaxed)
+        ));
+        output.push_str("# HELP keycast_nip46_queue_capacity Configured NIP-46 queue capacity\n# TYPE keycast_nip46_queue_capacity gauge\n");
+        output.push_str(&format!(
+            "keycast_nip46_queue_capacity {}\n",
+            self.nip46_queue_capacity.load(Ordering::Relaxed)
+        ));
+        output.push_str("# HELP keycast_nip46_queue_wait_seconds Time NIP-46 requests spent waiting in the relay queue\n# TYPE keycast_nip46_queue_wait_seconds summary\n");
+        output.push_str(&format!(
+            "keycast_nip46_queue_wait_seconds_count {}\nkeycast_nip46_queue_wait_seconds_sum {}\n",
+            self.nip46_queue_wait_count.load(Ordering::Relaxed),
+            self.nip46_queue_wait_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0
+        ));
+        output.push_str("# HELP keycast_nip46_workers_active NIP-46 workers currently processing requests\n# TYPE keycast_nip46_workers_active gauge\n");
+        output.push_str(&format!(
+            "keycast_nip46_workers_active {}\n",
+            self.nip46_workers_active.load(Ordering::Relaxed)
+        ));
+        output.push_str("# HELP keycast_nip46_worker_duration_seconds NIP-46 worker processing time\n# TYPE keycast_nip46_worker_duration_seconds summary\n");
+        output.push_str(&format!("keycast_nip46_worker_duration_seconds_count {}\nkeycast_nip46_worker_duration_seconds_sum {}\n", self.nip46_worker_duration_count.load(Ordering::Relaxed), self.nip46_worker_duration_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0));
+        output.push_str("# HELP keycast_nip46_noisy_flow_shed_total NIP-46 requests shed by bounded flow admission\n# TYPE keycast_nip46_noisy_flow_shed_total counter\n");
+        output.push_str(&format!("keycast_nip46_noisy_flow_shed_total{{flow=\"target\"}} {}\nkeycast_nip46_noisy_flow_shed_total{{flow=\"client\"}} {}\n", self.nip46_noisy_target_shed.load(Ordering::Relaxed), self.nip46_noisy_client_shed.load(Ordering::Relaxed)));
+        output.push_str("# HELP keycast_nip46_lookup_in_flight Authorization lookups currently using a database admission permit\n# TYPE keycast_nip46_lookup_in_flight gauge\n");
+        output.push_str(&format!(
+            "keycast_nip46_lookup_in_flight {}\n",
+            self.nip46_lookup_in_flight.load(Ordering::Relaxed)
+        ));
+        output.push_str("# HELP keycast_nip46_lookup_limit Configured concurrent NIP-46 authorization lookup limit\n# TYPE keycast_nip46_lookup_limit gauge\n");
+        output.push_str(&format!(
+            "keycast_nip46_lookup_limit {}\n",
+            self.nip46_lookup_limit.load(Ordering::Relaxed)
+        ));
+        output.push_str("# HELP keycast_nip46_lookup_database_total Coalesced NIP-46 authorization database lookups\n# TYPE keycast_nip46_lookup_database_total counter\n");
+        output.push_str(&format!(
+            "keycast_nip46_lookup_database_total {}\n",
+            self.nip46_lookup_database_total.load(Ordering::Relaxed)
+        ));
+        output.push_str("# HELP keycast_nip46_lookup_errors_total NIP-46 authorization lookup dependency failures\n# TYPE keycast_nip46_lookup_errors_total counter\n");
+        output.push_str(&format!(
+            "keycast_nip46_lookup_errors_total {}\n",
+            self.nip46_lookup_errors.load(Ordering::Relaxed)
+        ));
+        output.push_str("# HELP keycast_nip46_lookup_shed_total NIP-46 cache misses shed because lookup admission was full\n# TYPE keycast_nip46_lookup_shed_total counter\n");
+        output.push_str(&format!(
+            "keycast_nip46_lookup_shed_total {}\n",
+            self.nip46_lookup_shed.load(Ordering::Relaxed)
+        ));
+        output.push_str("# HELP keycast_nip46_lookup_invalidated_total NIP-46 lookup results discarded after concurrent authorization changes\n# TYPE keycast_nip46_lookup_invalidated_total counter\n");
+        output.push_str(&format!(
+            "keycast_nip46_lookup_invalidated_total {}\n",
+            self.nip46_lookup_invalidated.load(Ordering::Relaxed)
+        ));
+        output.push_str("# HELP keycast_nip46_negative_cache_hits_total NIP-46 unknown-target requests answered by the negative cache\n# TYPE keycast_nip46_negative_cache_hits_total counter\n");
+        output.push_str(&format!(
+            "keycast_nip46_negative_cache_hits_total {}\n",
+            self.nip46_negative_cache_hits.load(Ordering::Relaxed)
+        ));
+        output.push_str("# HELP keycast_nip46_negative_cache_size Current cached unknown NIP-46 targets\n# TYPE keycast_nip46_negative_cache_size gauge\n");
+        output.push_str(&format!(
+            "keycast_nip46_negative_cache_size {}\n",
+            self.nip46_negative_cache_size.load(Ordering::Relaxed)
+        ));
+        output.push_str("# HELP keycast_nip46_activity_queued_total NIP-46 activity events accepted by the coalescing writer\n# TYPE keycast_nip46_activity_queued_total counter\n");
+        output.push_str(&format!(
+            "keycast_nip46_activity_queued_total {}\n",
+            self.nip46_activity_queued.load(Ordering::Relaxed)
+        ));
+        output.push_str("# HELP keycast_nip46_activity_dropped_total NIP-46 activity events lost at a bounded writer boundary\n# TYPE keycast_nip46_activity_dropped_total counter\n");
+        output.push_str(&format!("keycast_nip46_activity_dropped_total{{reason=\"queue_full\"}} {}\nkeycast_nip46_activity_dropped_total{{reason=\"writer_stopped\"}} {}\nkeycast_nip46_activity_dropped_total{{reason=\"shutdown_flush_failed\"}} {}\nkeycast_nip46_activity_dropped_total{{reason=\"retention_limit\"}} {}\n", self.nip46_activity_dropped_queue_full.load(Ordering::Relaxed), self.nip46_activity_dropped_writer_stopped.load(Ordering::Relaxed), self.nip46_activity_dropped_shutdown.load(Ordering::Relaxed), self.nip46_activity_dropped_retention.load(Ordering::Relaxed)));
+        output.push_str("# HELP keycast_nip46_activity_write_failures_total Failed coalesced NIP-46 activity database writes\n# TYPE keycast_nip46_activity_write_failures_total counter\n");
+        output.push_str(&format!(
+            "keycast_nip46_activity_write_failures_total {}\n",
+            self.nip46_activity_write_failures.load(Ordering::Relaxed)
+        ));
+        output.push_str("# HELP keycast_nip46_activity_pending Authorization IDs retained by the NIP-46 activity writer\n# TYPE keycast_nip46_activity_pending gauge\n");
+        output.push_str(&format!(
+            "keycast_nip46_activity_pending {}\n",
+            self.nip46_activity_pending.load(Ordering::Relaxed)
         ));
 
         // HTTP RPC metrics
@@ -992,5 +1286,51 @@ mod tests {
         assert!(output.contains("keycast_http_rpc_db_pool_size 50"));
         assert!(output.contains("keycast_http_rpc_db_pool_idle 2"));
         assert!(output.contains("keycast_http_rpc_activity_dropped_total 1"));
+    }
+
+    #[test]
+    fn nip46_overload_metrics_render_each_shedding_reason() {
+        let metrics = Metrics::new();
+        metrics.inc_nip46_noisy_flow_shed("target");
+        metrics.inc_nip46_noisy_flow_shed("client");
+        metrics.inc_nip46_rejected_hashring_prequeue();
+        metrics.inc_nip46_rejected_hashring_worker();
+        metrics.inc_queue_dropped();
+        metrics.inc_queue_closed();
+        metrics.inc_nip46_lookup_database();
+        metrics.inc_nip46_lookup_error();
+        metrics.inc_nip46_lookup_shed();
+        metrics.inc_nip46_lookup_invalidated();
+        metrics.inc_nip46_negative_cache_hit();
+        metrics.inc_nip46_activity_dropped("queue_full");
+        metrics.inc_nip46_activity_dropped("writer_stopped");
+        metrics.add_nip46_activity_dropped("shutdown_flush_failed", 2);
+        metrics.add_nip46_activity_dropped("retention_limit", 3);
+        metrics.observe_nip46_queue_wait(Duration::from_millis(5));
+        metrics.observe_nip46_worker_duration(Duration::from_millis(7));
+
+        let output = metrics.to_prometheus();
+        assert!(output.contains("keycast_nip46_noisy_flow_shed_total{flow=\"target\"} 1"));
+        assert!(output.contains("keycast_nip46_noisy_flow_shed_total{flow=\"client\"} 1"));
+        assert!(output.contains("keycast_nip46_rejected_hashring_prequeue_total 1"));
+        assert!(output.contains("keycast_nip46_rejected_hashring_worker_total 1"));
+        assert!(output.contains("keycast_nip46_queue_dropped_total 1"));
+        assert!(output.contains("keycast_nip46_queue_closed_total 1"));
+        assert!(output.contains("keycast_nip46_lookup_database_total 1"));
+        assert!(output.contains("keycast_nip46_lookup_errors_total 1"));
+        assert!(output.contains("keycast_nip46_lookup_shed_total 1"));
+        assert!(output.contains("keycast_nip46_lookup_invalidated_total 1"));
+        assert!(output.contains("keycast_nip46_negative_cache_hits_total 1"));
+        assert!(output.contains("keycast_nip46_activity_dropped_total{reason=\"queue_full\"} 1"));
+        assert!(
+            output.contains("keycast_nip46_activity_dropped_total{reason=\"writer_stopped\"} 1")
+        );
+        assert!(output
+            .contains("keycast_nip46_activity_dropped_total{reason=\"shutdown_flush_failed\"} 2"));
+        assert!(
+            output.contains("keycast_nip46_activity_dropped_total{reason=\"retention_limit\"} 3")
+        );
+        assert!(output.contains("keycast_nip46_queue_wait_seconds_count 1"));
+        assert!(output.contains("keycast_nip46_worker_duration_seconds_count 1"));
     }
 }
