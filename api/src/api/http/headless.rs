@@ -48,6 +48,9 @@ pub struct HeadlessRegisterRequest {
     pub code_challenge_method: Option<String>,
     /// OAuth state parameter for CSRF protection
     pub state: Option<String>,
+    /// Marketing-communications opt-in chosen on the create-account screen. Absent for older
+    /// clients and non-consent flows, which default to no consent.
+    pub marketing_consent: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -234,6 +237,7 @@ pub async fn headless_register(
             pending_password_hash: &password_hash,
             pending_email_verification_token: &verification_token,
             pending_encrypted_secret: Some(&encrypted_secret),
+            pending_marketing_consent: req.marketing_consent.unwrap_or(false),
             state: req.state.as_deref(),
             device_code: Some(&device_code),
             is_headless: true,
@@ -1597,6 +1601,7 @@ mod tests {
                 code_challenge: None,
                 code_challenge_method: None,
                 state: None,
+                marketing_consent: None,
             }),
         )
         .await
@@ -1683,6 +1688,7 @@ mod tests {
                         code_challenge: Some(challenge.to_string()),
                         code_challenge_method: Some("S256".to_string()),
                         state: None,
+                        marketing_consent: None,
                     }),
                 )
                 .await
@@ -1876,6 +1882,7 @@ mod tests {
                 code_challenge: Some("challenge".to_string()),
                 code_challenge_method: Some("S256".to_string()),
                 state: None,
+                marketing_consent: None,
             }),
         )
         .await;
@@ -1919,6 +1926,7 @@ mod tests {
                 code_challenge: None,
                 code_challenge_method: None,
                 state: None,
+                marketing_consent: None,
             }),
         )
         .await
@@ -1979,6 +1987,7 @@ mod tests {
                 code_challenge: None,
                 code_challenge_method: None,
                 state: None,
+                marketing_consent: None,
             }),
         )
         .await
