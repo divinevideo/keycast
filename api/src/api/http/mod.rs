@@ -14,6 +14,7 @@ pub mod oauth;
 pub mod openid_configuration;
 pub mod policies;
 pub mod routes;
+pub mod service_deletion;
 pub mod teams;
 
 pub use routes::*;

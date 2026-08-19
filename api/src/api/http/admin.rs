@@ -2462,7 +2462,11 @@ pub async fn test_registered_client_pattern(
 
 // --- Service-token-authenticated admin endpoints (for relay-manager, COOP) ---
 
-fn authorize_service_token(headers: &HeaderMap) -> Result<(), ApiError> {
+/// Constant-time bearer check against `KEYCAST_SERVICE_TOKEN`.
+///
+/// `pub(crate)` so the service-deletion endpoint authenticates through this
+/// exact check rather than growing a third copy of it.
+pub(crate) fn authorize_service_token(headers: &HeaderMap) -> Result<(), ApiError> {
     use subtle::ConstantTimeEq;
 
     let expected = std::env::var("KEYCAST_SERVICE_TOKEN")

@@ -12,7 +12,7 @@ use tower::{timeout::error::Elapsed, ServiceBuilder};
 
 use crate::api::http::{
     admin, ap, atproto, atproto_oauth, auth, claim, headless, metrics, nostr_rpc, oauth, policies,
-    teams,
+    service_deletion, teams,
 };
 use crate::state::KeycastState;
 use axum::response::Json as AxumJson;
@@ -295,6 +295,10 @@ pub fn api_routes(
         .route(
             "/admin/users/:pubkey/verified-minor",
             delete(admin::clear_verified_minor_admin),
+        )
+        .route(
+            "/admin/users/:pubkey/deletion",
+            post(service_deletion::delete_account_service),
         )
         .route("/admin/users/batch-lookup", post(admin::batch_lookup_users))
         .route(
