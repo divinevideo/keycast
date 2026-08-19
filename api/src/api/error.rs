@@ -32,8 +32,11 @@ pub enum ApiError {
     #[error("Internal server error: {0}")]
     Internal(String),
 
-    #[error("Service unavailable: {0}")]
-    ServiceUnavailable(String),
+    #[error("Service unavailable: {message}")]
+    ServiceUnavailable {
+        message: String,
+        retry_after: Option<u64>,
+    },
 
     #[error("User error: {0}")]
     User(#[from] UserError),
@@ -49,7 +52,10 @@ impl From<RepositoryError> for ApiError {
             RepositoryError::Duplicate => ApiError::BadRequest("Already exists".to_string()),
             RepositoryError::Integrity(msg) => ApiError::BadRequest(msg),
             RepositoryError::Database(msg) => ApiError::Internal(msg),
-            RepositoryError::Unavailable(msg) => ApiError::ServiceUnavailable(msg),
+            RepositoryError::Unavailable(message) => ApiError::ServiceUnavailable {
+                message,
+                retry_after: None,
+            },
         }
     }
 }
@@ -76,7 +82,17 @@ impl ApiError {
     }
 
     pub fn service_unavailable(msg: impl Into<String>) -> Self {
-        Self::ServiceUnavailable(msg.into())
+        Self::ServiceUnavailable {
+            message: msg.into(),
+            retry_after: None,
+        }
+    }
+
+    pub fn retryable_service_unavailable(msg: impl Into<String>, retry_after: u64) -> Self {
+        Self::ServiceUnavailable {
+            message: msg.into(),
+            retry_after: Some(retry_after),
+        }
     }
 
     pub fn conflict(msg: impl Into<String>) -> Self {
@@ -106,8 +122,8 @@ impl IntoResponse for ApiError {
                     "Something went wrong. Please try again.".to_string(),
                 )
             }
-            ApiError::ServiceUnavailable(msg) => {
-                tracing::warn!("Service unavailable: {}", msg);
+            ApiError::ServiceUnavailable { message, .. } => {
+                tracing::warn!("Service unavailable: {}", message);
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Service temporarily unavailable. Please try again.".to_string(),
@@ -133,7 +149,21 @@ impl IntoResponse for ApiError {
             "error": message
         }));
 
-        (status, body).into_response()
+        let mut response = (status, body).into_response();
+        if let ApiError::ServiceUnavailable {
+            retry_after: Some(retry_after),
+            ..
+        } = self
+        {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                retry_after
+                    .to_string()
+                    .parse()
+                    .expect("integer Retry-After is a valid header value"),
+            );
+        }
+        response
     }
 }
 
@@ -149,5 +179,13 @@ mod tests {
             ApiError::from(RepositoryError::Unavailable("pool timed out".into())).into_response();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn retryable_service_unavailable_includes_retry_after() {
+        let response = ApiError::retryable_service_unavailable("busy", 1).into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
     }
 }

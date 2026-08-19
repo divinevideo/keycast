@@ -74,7 +74,7 @@ fn create_exhausted_auth_state(pool: PgPool) -> AuthState {
 fn build_auth_state(
     pool: PgPool,
     secret_pool: SecretPoolReceiver,
-    bcrypt_queue: BcryptAdmission,
+    bcrypt: BcryptAdmission,
 ) -> AuthState {
     let tenant_cache = Cache::builder().max_capacity(10).build();
     let key_manager: Arc<Box<dyn KeyManager>> = Arc::new(Box::new(TestKeyManager));
@@ -87,7 +87,7 @@ fn build_auth_state(
             http_handler_cache: new_http_handler_cache(),
             server_keys: Keys::generate(),
             tenant_cache,
-            bcrypt: bcrypt_queue.clone(),
+            bcrypt: bcrypt.clone(),
             redis: None,
             secret_pool,
             activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),

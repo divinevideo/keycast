@@ -90,7 +90,7 @@ async fn create_test_auth_state(pool: PgPool, key_manager: Arc<Box<dyn KeyManage
         .await
         .expect("connect to dedicated Redis");
     let prefix = format!("keycast-pr326-independent-review:{}", Uuid::new_v4());
-    let bcrypt_queue = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
+    let bcrypt = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
     let secret_pool = SecretPool::new(1);
     let tenant_cache = Cache::builder().max_capacity(10).build();
     AuthState {
@@ -101,7 +101,7 @@ async fn create_test_auth_state(pool: PgPool, key_manager: Arc<Box<dyn KeyManage
             http_handler_cache: new_http_handler_cache(),
             server_keys: Keys::generate(),
             tenant_cache,
-            bcrypt: bcrypt_queue.clone(),
+            bcrypt: bcrypt.clone(),
             redis: Some(PrefixedRedis::new(connection, Some(prefix))),
             secret_pool: secret_pool.receiver(),
             activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),

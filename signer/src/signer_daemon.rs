@@ -1499,13 +1499,10 @@ impl UnifiedSigner {
             .map_err(|e| SignerError::relay(format!("Failed to subscribe: {}", e)))?;
 
         // Spawn background task to handle authorization commands via channel
-        let pool_clone = self.pool.clone();
-        let key_manager_clone = self.key_manager.clone();
-        let handlers_clone = self.handlers.clone();
-        let lookup_clone = self.authorization_lookup.clone();
-        let activity_logger_clone = self.activity_logger.clone();
-        let coordinator_clone = self.coordinator.clone();
-        let bcrypt_clone = self.bcrypt.clone();
+        let authorization_context = self.relay_worker_context();
+        let handlers_clone = authorization_context.handlers.clone();
+        let lookup_clone = authorization_context.authorization_lookup.clone();
+        let coordinator_clone = authorization_context.coordinator.clone();
 
         let mut cluster_events = self.coordinator.subscribe();
         let cluster_lookup = self.authorization_lookup.clone();
@@ -1569,14 +1566,10 @@ impl UnifiedSigner {
                                 bunker_pubkey
                             );
                             if let Err(e) = Self::load_single_authorization(
-                                &pool_clone,
-                                &key_manager_clone,
-                                &handlers_clone,
-                                &bcrypt_clone,
+                                &authorization_context,
                                 &bunker_pubkey,
                                 tenant_id,
                                 is_oauth,
-                                &activity_logger_clone,
                             )
                             .await
                             {
@@ -1723,17 +1716,20 @@ impl UnifiedSigner {
     }
 
     /// Load a single authorization into cache (called via channel for new authorizations)
-    #[allow(clippy::too_many_arguments)]
     async fn load_single_authorization(
-        pool: &PgPool,
-        key_manager: &Arc<Box<dyn KeyManager>>,
-        handlers: &Cache<String, Nip46Handler>,
-        bcrypt: &BcryptAdmission,
+        context: &RelayWorkerContext,
         bunker_pubkey: &str,
         tenant_id: i64,
         is_oauth: bool,
-        activity_logger: &RelayActivityLogger,
     ) -> SignerResult<()> {
+        let RelayWorkerContext {
+            pool,
+            key_manager,
+            handlers,
+            activity_logger,
+            bcrypt,
+            ..
+        } = context;
         if is_oauth {
             // Load active OAuth authorization (filter out revoked/expired)
             let auth = OAuthAuthorization::find_active_by_bunker_pubkey_for_tenant(

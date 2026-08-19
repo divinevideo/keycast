@@ -150,7 +150,7 @@ fn create_test_auth_state_with_activity_logger(
     key_manager: Arc<Box<dyn KeyManager>>,
     activity_logger: ActivityLogger,
 ) -> AuthState {
-    let bcrypt_queue = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
+    let bcrypt = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
     let secret_pool = SecretPool::new(1);
     let tenant_cache = Cache::builder().max_capacity(10).build();
 
@@ -162,7 +162,7 @@ fn create_test_auth_state_with_activity_logger(
             http_handler_cache: new_http_handler_cache(),
             server_keys: Keys::generate(),
             tenant_cache,
-            bcrypt: bcrypt_queue.clone(),
+            bcrypt: bcrypt.clone(),
             redis: None,
             secret_pool: secret_pool.receiver(),
             activity_logger,
@@ -1401,7 +1401,7 @@ async fn test_warm_cache_preload_handler_rejected_after_ucan_expiry() {
     // Build AuthState whose state.server_keys matches SERVER_NSEC so behavior is
     // consistent across the request lifecycle.
     let auth_state = {
-        let bcrypt_queue = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
+        let bcrypt = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
         let secret_pool = SecretPool::new(1);
         let tenant_cache = Cache::builder().max_capacity(10).build();
         AuthState {
@@ -1412,7 +1412,7 @@ async fn test_warm_cache_preload_handler_rejected_after_ucan_expiry() {
                 http_handler_cache: new_http_handler_cache(),
                 server_keys: server_keys.clone(),
                 tenant_cache,
-                bcrypt: bcrypt_queue.clone(),
+                bcrypt: bcrypt.clone(),
                 redis: None,
                 secret_pool: secret_pool.receiver(),
                 activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),
@@ -1519,7 +1519,7 @@ async fn test_server_signed_non_preload_redirect_origin_rejected() {
     create_personal_key(&pool, tenant_id, &pubkey_hex, &user_keys, &**key_manager).await;
 
     let auth_state = {
-        let bcrypt_queue = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
+        let bcrypt = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
         let secret_pool = SecretPool::new(1);
         let tenant_cache = Cache::builder().max_capacity(10).build();
         AuthState {
@@ -1530,7 +1530,7 @@ async fn test_server_signed_non_preload_redirect_origin_rejected() {
                 http_handler_cache: new_http_handler_cache(),
                 server_keys: server_keys.clone(),
                 tenant_cache,
-                bcrypt: bcrypt_queue.clone(),
+                bcrypt: bcrypt.clone(),
                 redis: None,
                 secret_pool: secret_pool.receiver(),
                 activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),

@@ -385,7 +385,7 @@ pub async fn add_authorization(
     let secret_pool = get_secret_pool().map_err(|e| ApiError::internal(e.to_string()))?;
     let secret_pair = secret_pool.get().await.map_err(|error| match error {
         SecretPoolError::Exhausted | SecretPoolError::Closed => {
-            ApiError::service_unavailable("Secret pool exhausted")
+            ApiError::retryable_service_unavailable("Secret pool exhausted", 1)
         }
     })?;
     let connection_secret = secret_pair.secret;

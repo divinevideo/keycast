@@ -79,9 +79,9 @@ impl KeyManager for TestKeyManager {
 }
 
 fn create_test_auth_state(pool: PgPool) -> keycast_api::api::http::routes::AuthState {
-    let bcrypt_queue = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
+    let bcrypt = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
     let secret_pool = SecretPool::new(1);
-    let _producer_handle = secret_pool.spawn_producer(bcrypt_queue.clone());
+    let _producer_handle = secret_pool.spawn_producer(bcrypt.clone());
     let tenant_cache = Cache::builder().max_capacity(10).build();
     let key_manager: Arc<Box<dyn KeyManager>> = Arc::new(Box::new(TestKeyManager));
 
@@ -93,7 +93,7 @@ fn create_test_auth_state(pool: PgPool) -> keycast_api::api::http::routes::AuthS
             http_handler_cache: new_http_handler_cache(),
             server_keys: Keys::generate(),
             tenant_cache,
-            bcrypt: bcrypt_queue.clone(),
+            bcrypt: bcrypt.clone(),
             redis: None,
             secret_pool: secret_pool.receiver(),
             activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),
