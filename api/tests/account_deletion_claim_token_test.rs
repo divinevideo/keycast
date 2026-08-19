@@ -11,11 +11,12 @@ mod common;
 
 const TENANT_ID: i64 = 1;
 
-/// Foreign keys to `users` that intentionally use NO ACTION because
+/// Foreign keys to `users` that intentionally do not cascade because
 /// `UserRepository::delete_account` removes the rows itself before deleting the
 /// user. Anything else must cascade, or account deletion breaks the way #296
 /// broke it.
-const NO_ACTION_FKS_HANDLED_IN_DELETE_ACCOUNT: &[&str] = &["team_users"];
+const NON_CASCADE_FKS_HANDLED_IN_DELETE_ACCOUNT: &[&str] =
+    &["team_users_user_pubkey_fkey (team_users)"];
 
 async fn create_test_user(pool: &PgPool, pubkey: &str) {
     sqlx::query(
@@ -97,19 +98,21 @@ async fn account_claim_tokens_user_fk_cascades_on_delete() {
     );
 }
 
-/// #296 happened because a table added later referenced `users` with the
-/// default NO ACTION. This fails the next time that happens, instead of waiting
-/// for a production account deletion to roll back.
+/// #296 happened because a table added later referenced `users` with a
+/// non-cascading delete action. This audits direct references to `users` and
+/// fails the next time that happens, instead of waiting for a production
+/// account deletion to roll back. It deliberately does not audit foreign keys
+/// on tables reached transitively through a cascade.
 #[tokio::test]
-async fn no_unhandled_no_action_foreign_keys_reference_users() {
+async fn no_unhandled_non_cascade_foreign_keys_reference_users() {
     let pool = common::setup_test_db().await;
 
     let offenders: Vec<String> = sqlx::query_scalar(
-        "SELECT conrelid::regclass::text
+        "SELECT conname || ' (' || conrelid::regclass::text || ')'
          FROM pg_constraint
          WHERE contype = 'f'
            AND confrelid = 'public.users'::regclass
-           AND confdeltype = 'a'
+           AND confdeltype <> 'c'
          ORDER BY 1",
     )
     .fetch_all(&pool)
@@ -118,14 +121,17 @@ async fn no_unhandled_no_action_foreign_keys_reference_users() {
 
     let unhandled: Vec<&String> = offenders
         .iter()
-        .filter(|table| !NO_ACTION_FKS_HANDLED_IN_DELETE_ACCOUNT.contains(&table.as_str()))
+        .filter(|constraint| {
+            !NON_CASCADE_FKS_HANDLED_IN_DELETE_ACCOUNT.contains(&constraint.as_str())
+        })
         .collect();
 
     assert!(
         unhandled.is_empty(),
-        "these tables reference users with ON DELETE NO ACTION and will block \
-         account deletion: {unhandled:?}. Either add ON DELETE CASCADE, or delete \
-         the rows in UserRepository::delete_account and add the table to \
-         NO_ACTION_FKS_HANDLED_IN_DELETE_ACCOUNT."
+        "these foreign keys reference users without ON DELETE CASCADE and are not \
+         handled explicitly during account deletion: {unhandled:?}. Either add \
+         ON DELETE CASCADE, or delete the rows in UserRepository::delete_account \
+         and add the exact constraint to \
+         NON_CASCADE_FKS_HANDLED_IN_DELETE_ACCOUNT."
     );
 }

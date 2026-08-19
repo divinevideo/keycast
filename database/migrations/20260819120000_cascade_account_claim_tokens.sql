@@ -12,9 +12,13 @@
 -- is gone the token can never be redeemed, so it is owned by the account and
 -- goes with it.
 
-ALTER TABLE ONLY public.account_claim_tokens
-    DROP CONSTRAINT IF EXISTS account_claim_tokens_user_pubkey_fkey;
+-- This is the first of three atomic migrations. Adding the replacement as NOT
+-- VALID installs enforcement for new writes without scanning existing rows.
+-- Validation and the final constraint swap happen in later transactions so
+-- this migration does not retain its stronger locks during the validation scan.
+SET LOCAL lock_timeout = '5s';
 
 ALTER TABLE ONLY public.account_claim_tokens
-    ADD CONSTRAINT account_claim_tokens_user_pubkey_fkey
-    FOREIGN KEY (user_pubkey) REFERENCES public.users(pubkey) ON DELETE CASCADE;
+    ADD CONSTRAINT account_claim_tokens_user_pubkey_cascade_fkey
+    FOREIGN KEY (user_pubkey) REFERENCES public.users(pubkey)
+    ON DELETE CASCADE NOT VALID;

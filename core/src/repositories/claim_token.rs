@@ -36,12 +36,13 @@ impl ClaimTokenRepository {
         let now = Utc::now();
         let expires_at = now + Duration::days(CLAIM_TOKEN_EXPIRY_DAYS);
 
-        sqlx::query_as::<_, ClaimToken>(
+        sqlx::query_as::<_, ClaimToken>(concat!(
             "INSERT INTO account_claim_tokens
              (token, user_pubkey, expires_at, created_at, created_by_pubkey, tenant_id)
              VALUES ($1, $2, $3, $4, $5, $6)
-             RETURNING *",
-        )
+             RETURNING ",
+            claim_token_columns!()
+        ))
         .bind(token)
         .bind(user_pubkey)
         .bind(expires_at)
@@ -87,13 +88,14 @@ impl ClaimTokenRepository {
     /// tokens via `UserRepository::claim_account_consuming_token`, which is
     /// atomic with full validity (#280 review). Kept for tests/fixtures.
     pub async fn mark_used(&self, token: &str) -> Result<Option<ClaimToken>, RepositoryError> {
-        sqlx::query_as::<_, ClaimToken>(
+        sqlx::query_as::<_, ClaimToken>(concat!(
             "UPDATE account_claim_tokens
              SET used_at = NOW()
              WHERE token = $1
                AND used_at IS NULL
-             RETURNING *",
-        )
+             RETURNING ",
+            claim_token_columns!()
+        ))
         .bind(token)
         .fetch_optional(&self.pool)
         .await
@@ -227,12 +229,13 @@ impl ClaimTokenRepository {
         .await?
         .rows_affected();
 
-        let new_token = sqlx::query_as::<_, ClaimToken>(
+        let new_token = sqlx::query_as::<_, ClaimToken>(concat!(
             "INSERT INTO account_claim_tokens
              (token, user_pubkey, expires_at, created_at, created_by_pubkey, tenant_id)
              VALUES ($1, $2, $3, $4, $5, $6)
-             RETURNING *",
-        )
+             RETURNING ",
+            claim_token_columns!()
+        ))
         .bind(token)
         .bind(user_pubkey)
         .bind(expires_at)
