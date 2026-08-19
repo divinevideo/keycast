@@ -21,6 +21,9 @@ pub struct OAuthCodeData {
     pub pending_password_hash: Option<String>,
     pub pending_email_verification_token: Option<String>,
     pub pending_encrypted_secret: Option<Vec<u8>>,
+    /// Marketing-communications opt-in the user chose on the create-account screen. Carried on the
+    /// pending row and written onto the materialized user; FALSE for every non-registration code.
+    pub pending_marketing_consent: bool,
     pub previous_auth_id: Option<i32>,
     pub state: Option<String>,
     /// RFC 8628 device_code for secure polling (returned in response body, never in URLs)
@@ -97,6 +100,9 @@ pub struct StoreOAuthCodeWithRegistrationParams<'a> {
     pub pending_password_hash: &'a str,
     pub pending_email_verification_token: &'a str,
     pub pending_encrypted_secret: Option<&'a [u8]>,
+    /// Marketing-communications opt-in from the create-account screen; defaults false when the
+    /// client omits it (older apps, non-consent flows).
+    pub pending_marketing_consent: bool,
     pub state: Option<&'a str>,
     /// RFC 8628 device_code for secure polling (returned in response body, never in URLs)
     pub device_code: Option<&'a str>,
@@ -306,8 +312,8 @@ impl OAuthCodeRepository {
         let mut tx = self.pool.begin().await?;
         let row: Option<(Option<String>,)> = sqlx::query_as(
             "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at,
-             pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret, state, device_code, is_headless, pin_hash, pin_sent_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+             pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret, state, device_code, is_headless, pin_hash, pin_sent_at, pending_marketing_consent)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
              ON CONFLICT (tenant_id, lower(pending_email))
                  WHERE pending_email IS NOT NULL AND consumed_at IS NULL
              DO UPDATE SET
@@ -322,6 +328,7 @@ impl OAuthCodeRepository {
                  pending_password_hash = EXCLUDED.pending_password_hash,
                  pending_email_verification_token = EXCLUDED.pending_email_verification_token,
                  pending_encrypted_secret = EXCLUDED.pending_encrypted_secret,
+                 pending_marketing_consent = EXCLUDED.pending_marketing_consent,
                  state = EXCLUDED.state,
                  is_headless = EXCLUDED.is_headless,
                  pin_hash = EXCLUDED.pin_hash,
@@ -355,6 +362,7 @@ impl OAuthCodeRepository {
         .bind(params.pin_hash)
         // pin_sent_at tracks confirmed delivery; callers set it after the email send succeeds.
         .bind(None::<DateTime<Utc>>)
+        .bind(params.pending_marketing_consent)
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -430,6 +438,10 @@ impl OAuthCodeRepository {
             RepositoryError::Integrity("pending registration has no password hash".to_string())
         })?;
         let now = Utc::now();
+        // Consent is the choice made on the create-account screen, carried on the pending row.
+        // Stamp the timestamp only when the user opted in, so a NULL means "never opted in".
+        let marketing_consent = pending.pending_marketing_consent;
+        let marketing_consent_at = marketing_consent.then_some(now);
 
         let existing: Option<(Option<String>, bool, bool)> = sqlx::query_as(
             "SELECT u.email, u.email_verified,
@@ -470,7 +482,8 @@ impl OAuthCodeRepository {
                                 "UPDATE users
                                  SET email = $1, password_hash = COALESCE(password_hash, $2),
                                      email_verified = true, email_verification_token = $3,
-                                     updated_at = $4
+                                     updated_at = $4,
+                                     marketing_consent = $7, marketing_consent_at = $8
                                  WHERE pubkey = $5 AND tenant_id = $6",
                             )
                             .bind(email)
@@ -479,6 +492,8 @@ impl OAuthCodeRepository {
                             .bind(now)
                             .bind(&pending.user_pubkey)
                             .bind(tenant_id)
+                            .bind(marketing_consent)
+                            .bind(marketing_consent_at)
                             .execute(&mut *tx)
                             .await?;
                         }
@@ -492,8 +507,9 @@ impl OAuthCodeRepository {
             let inserted: Option<(String,)> = sqlx::query_as(
                 "INSERT INTO users
                      (pubkey, tenant_id, email, password_hash, email_verified,
-                      email_verification_token, created_at, updated_at)
-                 VALUES ($1, $2, $3, $4, true, $5, $6, $6)
+                      email_verification_token, created_at, updated_at,
+                      marketing_consent, marketing_consent_at)
+                 VALUES ($1, $2, $3, $4, true, $5, $6, $6, $7, $8)
                  ON CONFLICT DO NOTHING
                  RETURNING pubkey",
             )
@@ -503,6 +519,8 @@ impl OAuthCodeRepository {
             .bind(password_hash)
             .bind(verification_token)
             .bind(now)
+            .bind(marketing_consent)
+            .bind(marketing_consent_at)
             .fetch_optional(&mut *tx)
             .await?;
 
@@ -733,6 +751,7 @@ impl OAuthCodeRepository {
     const SELECT_COLUMNS: &'static str =
         "user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method, \
          pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret, \
+         pending_marketing_consent, \
          previous_auth_id, state, device_code, is_headless, pin_hash, pin_attempts, \
          pin_failed_total, pin_sent_at, pin_resend_at, consumed_at, expires_at";
 
@@ -1726,6 +1745,7 @@ mod tests {
             pending_password_hash: "hashed",
             pending_email_verification_token: &token,
             pending_encrypted_secret: Some(b"secret"),
+            pending_marketing_consent: false,
             state: None,
             device_code: Some(device_code),
             is_headless: true,
@@ -1757,6 +1777,114 @@ mod tests {
             panic!("test registration must finalize");
         };
         *finalized
+    }
+
+    /// Marketing consent chosen at register time must ride the pending row through
+    /// materialization onto the users row, and marketing_consent_at must be stamped only when the
+    /// user actually opted in (NULL otherwise). Guards the create-account opt-in capture.
+    #[tokio::test]
+    async fn test_marketing_consent_threads_from_pending_to_materialized_user() {
+        async fn register_and_materialize(
+            repo: &OAuthCodeRepository,
+            marketing_consent: bool,
+        ) -> String {
+            let user_pubkey = nostr_sdk::Keys::generate().public_key().to_hex();
+            let code = format!("consent_{}", uuid::Uuid::new_v4());
+            let token = format!("consent_verif_{}", uuid::Uuid::new_v4());
+            let device_code = format!("consent_dc_{}", uuid::Uuid::new_v4());
+            let email = format!("consent-test-{}@example.com", uuid::Uuid::new_v4());
+
+            repo.store_with_pending_registration(StoreOAuthCodeWithRegistrationParams {
+                tenant_id: 1,
+                code: &code,
+                user_pubkey: &user_pubkey,
+                client_id: "test_client",
+                redirect_uri: "http://localhost:3000/callback",
+                scope: "policy:social",
+                code_challenge: None,
+                code_challenge_method: None,
+                expires_at: Utc::now() + chrono::Duration::hours(1),
+                pending_email: &email,
+                pending_password_hash: "hashed",
+                pending_email_verification_token: &token,
+                pending_encrypted_secret: Some(b"secret"),
+                pending_marketing_consent: marketing_consent,
+                state: None,
+                device_code: Some(&device_code),
+                is_headless: true,
+                pin_hash: Some("pin"),
+            })
+            .await
+            .unwrap();
+
+            let candidate = format!("consent_exchange_{}", uuid::Uuid::new_v4());
+            let outcome = repo
+                .materialize_pending_registration(1, &token, &candidate)
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, MaterializePendingRegistrationOutcome::Ready(_)),
+                "registration must materialize",
+            );
+            user_pubkey
+        }
+
+        let pool = setup_pool().await;
+        let repo = OAuthCodeRepository::new(pool.clone());
+
+        // Opted in: consent true and marketing_consent_at is stamped.
+        let opted_in_pubkey = register_and_materialize(&repo, true).await;
+        let (consent, consent_at): (bool, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT marketing_consent, marketing_consent_at FROM users WHERE pubkey = $1",
+        )
+        .bind(&opted_in_pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            consent,
+            "opted-in user should have marketing_consent = true"
+        );
+        assert!(
+            consent_at.is_some(),
+            "opted-in user should have marketing_consent_at stamped",
+        );
+
+        // Declined: consent false and marketing_consent_at stays NULL.
+        let declined_pubkey = register_and_materialize(&repo, false).await;
+        let (consent, consent_at): (bool, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT marketing_consent, marketing_consent_at FROM users WHERE pubkey = $1",
+        )
+        .bind(&declined_pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            !consent,
+            "declined user should have marketing_consent = false"
+        );
+        assert!(
+            consent_at.is_none(),
+            "declined user should have NULL marketing_consent_at",
+        );
+
+        for pubkey in [opted_in_pubkey, declined_pubkey] {
+            sqlx::query("DELETE FROM oauth_codes WHERE user_pubkey = $1")
+                .bind(&pubkey)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM personal_keys WHERE user_pubkey = $1")
+                .bind(&pubkey)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("DELETE FROM users WHERE pubkey = $1")
+                .bind(&pubkey)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1911,6 +2039,7 @@ mod tests {
                     pending_password_hash: "replacement-hash",
                     pending_email_verification_token: "replacement-token",
                     pending_encrypted_secret: Some(b"replacement-secret"),
+                    pending_marketing_consent: false,
                     state: None,
                     device_code: Some(&replacement_device),
                     is_headless: true,
@@ -2334,6 +2463,7 @@ mod tests {
             pending_password_hash: "replacement-hash",
             pending_email_verification_token: &replacement_token,
             pending_encrypted_secret: Some(b"replacement-secret"),
+            pending_marketing_consent: false,
             state: None,
             device_code: Some(&replacement_device),
             is_headless: true,
@@ -2405,6 +2535,7 @@ mod tests {
             pending_password_hash: "replacement-hash",
             pending_email_verification_token: &replacement_token,
             pending_encrypted_secret: Some(b"replacement-secret"),
+            pending_marketing_consent: false,
             state: None,
             device_code: Some(&replacement_device),
             is_headless: true,
@@ -2783,6 +2914,7 @@ mod tests {
             pending_password_hash: "replacement-hash",
             pending_email_verification_token: &replacement_token,
             pending_encrypted_secret: Some(b"replacement-secret"),
+            pending_marketing_consent: false,
             state: None,
             device_code: Some(&replacement_device),
             is_headless: true,
@@ -3252,6 +3384,7 @@ mod tests {
             pending_password_hash: "hashed",
             pending_email_verification_token: &token_a,
             pending_encrypted_secret: Some(b"secret-a"),
+            pending_marketing_consent: false,
             state: Some("state-a"),
             device_code: Some(&device_a),
             is_headless: true,
@@ -3273,6 +3406,7 @@ mod tests {
             pending_password_hash: "hashed",
             pending_email_verification_token: &token_b,
             pending_encrypted_secret: Some(b"secret-b"),
+            pending_marketing_consent: false,
             state: Some("state-b"),
             device_code: Some(&device_b),
             is_headless: true,
@@ -4072,6 +4206,7 @@ mod tests {
             pending_password_hash: "hashed",
             pending_email_verification_token: &token_a,
             pending_encrypted_secret: Some(b"secret-a"),
+            pending_marketing_consent: false,
             state: Some("state-a"),
             device_code: Some(&device_a),
             is_headless: true,
@@ -4093,6 +4228,7 @@ mod tests {
             pending_password_hash: "hashed",
             pending_email_verification_token: &token_b,
             pending_encrypted_secret: Some(b"secret-b"),
+            pending_marketing_consent: false,
             state: Some("state-b"),
             device_code: Some(&device_b),
             is_headless: true,
