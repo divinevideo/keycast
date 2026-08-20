@@ -2830,7 +2830,9 @@ impl UserRepository {
     /// This performs a complete account deletion:
     /// 1. Removes user from all teams (team_users)
     /// 2. Clears pending OAuth codes
-    /// 3. Deletes the user (cascades to personal_keys, oauth_authorizations, etc.)
+    /// 3. Deletes AP RSA key material (ap_actor_keys)
+    /// 4. Deletes account claim tokens (account_claim_tokens)
+    /// 5. Deletes the user (cascades to personal_keys, oauth_authorizations, etc.)
     ///
     /// Returns information about what was deleted for logging.
     pub async fn delete_account(
@@ -2884,7 +2886,17 @@ impl UserRepository {
             .execute(&mut *tx)
             .await?;
 
-        // 4. Delete user (cascades to personal_keys, oauth_authorizations -> refresh_tokens,
+        // 4. Delete claim tokens. A token only exists to hand this account to its
+        // owner, so it cannot outlive the account. The FK cascade also handles this,
+        // but the explicit delete keeps deletion working on a database that has not
+        // applied the cascade migration yet, where the old NO ACTION constraint
+        // rejects the user delete outright (#296).
+        sqlx::query("DELETE FROM account_claim_tokens WHERE user_pubkey = $1")
+            .bind(pubkey)
+            .execute(&mut *tx)
+            .await?;
+
+        // 5. Delete user (cascades to personal_keys, oauth_authorizations -> refresh_tokens,
         //    email_verification_tokens, password_reset_tokens, user_profiles,
         //    account_claim_tokens)
         let result = sqlx::query("DELETE FROM users WHERE pubkey = $1 AND tenant_id = $2")
