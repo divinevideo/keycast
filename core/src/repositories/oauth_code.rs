@@ -564,7 +564,8 @@ impl OAuthCodeRepository {
                                     "UPDATE users
                                      SET email = $1, password_hash = COALESCE(password_hash, $2),
                                          email_verified = true, email_verification_token = $3,
-                                         updated_at = $4
+                                         updated_at = $4,
+                                         marketing_consent = $7, marketing_consent_at = $8
                                      WHERE pubkey = $5 AND tenant_id = $6",
                                 )
                                 .bind(email)
@@ -573,6 +574,8 @@ impl OAuthCodeRepository {
                                 .bind(now)
                                 .bind(&pending.user_pubkey)
                                 .bind(tenant_id)
+                                .bind(marketing_consent)
+                                .bind(marketing_consent_at)
                                 .execute(&mut *tx)
                                 .await?;
                             }
@@ -1885,6 +1888,94 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    /// The UPDATE branch of materialization (a pre-existing incomplete user —
+    /// e.g. an anonymous account being upgraded) must also carry marketing
+    /// consent onto the users row, not just the fresh-INSERT branch.
+    #[tokio::test]
+    async fn test_marketing_consent_written_when_materializing_existing_pubkey() {
+        let pool = setup_pool().await;
+        let repo = OAuthCodeRepository::new(pool.clone());
+
+        let user_pubkey = nostr_sdk::Keys::generate().public_key().to_hex();
+        // Seed an incomplete (email-less) users row so materialization takes the
+        // UPDATE branch instead of the fresh INSERT.
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
+             VALUES ($1, 1, NOW(), NOW())",
+        )
+        .bind(&user_pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let code = format!("consent_upd_{}", uuid::Uuid::new_v4());
+        let token = format!("consent_upd_verif_{}", uuid::Uuid::new_v4());
+        let device_code = format!("consent_upd_dc_{}", uuid::Uuid::new_v4());
+        let email = format!("consent-upd-{}@example.com", uuid::Uuid::new_v4());
+
+        repo.store_with_pending_registration(StoreOAuthCodeWithRegistrationParams {
+            tenant_id: 1,
+            code: &code,
+            user_pubkey: &user_pubkey,
+            client_id: "test_client",
+            redirect_uri: "http://localhost:3000/callback",
+            scope: "policy:social",
+            code_challenge: None,
+            code_challenge_method: None,
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            pending_email: &email,
+            pending_password_hash: "hashed",
+            pending_email_verification_token: &token,
+            pending_encrypted_secret: Some(b"secret"),
+            pending_marketing_consent: true,
+            state: None,
+            device_code: Some(&device_code),
+            is_headless: true,
+            pin_hash: Some("pin"),
+        })
+        .await
+        .unwrap();
+
+        let candidate = format!("consent_upd_exchange_{}", uuid::Uuid::new_v4());
+        let outcome = repo
+            .materialize_pending_registration(1, &token, &candidate)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, MaterializePendingRegistrationOutcome::Ready(_)),
+            "existing-pubkey registration must materialize via the UPDATE branch",
+        );
+
+        let (consent, consent_at): (bool, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT marketing_consent, marketing_consent_at FROM users WHERE pubkey = $1",
+        )
+        .bind(&user_pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(consent, "UPDATE branch must write marketing_consent = true");
+        assert!(
+            consent_at.is_some(),
+            "UPDATE branch must stamp marketing_consent_at",
+        );
+
+        sqlx::query("DELETE FROM oauth_codes WHERE user_pubkey = $1")
+            .bind(&user_pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM personal_keys WHERE user_pubkey = $1")
+            .bind(&user_pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(&user_pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
