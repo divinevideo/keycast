@@ -1,6 +1,7 @@
 // ABOUTME: Global metrics counters for Prometheus endpoint
 // ABOUTME: Uses atomic counters that can be incremented from signer and read from API
 
+use crate::bcrypt_admission::{BcryptOperation, BcryptWorkload};
 use once_cell::sync::Lazy;
 use std::{
     collections::BTreeMap,
@@ -16,6 +17,8 @@ const HTTP_RPC_DURATION_BUCKETS: [f64; 12] = [
     0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
 const HTTP_RPC_ACQUIRE_BUCKETS: [f64; 9] = [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1.0, 5.0];
+const BCRYPT_WORKLOADS: usize = BcryptWorkload::ALL.len();
+const BCRYPT_OPERATIONS: usize = BcryptOperation::ALL.len();
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct AuthRequestKey {
@@ -198,6 +201,12 @@ pub struct Metrics {
     /// Total OAuth authorizations revoked
     pub oauth_authorizations_revoked: AtomicU64,
 
+    // === Bcrypt admission metrics ===
+    bcrypt_active: [[AtomicU64; BCRYPT_OPERATIONS]; BCRYPT_WORKLOADS],
+    bcrypt_waiting: [[AtomicU64; BCRYPT_OPERATIONS]; BCRYPT_WORKLOADS],
+    bcrypt_rejected_capacity: [[AtomicU64; BCRYPT_OPERATIONS]; BCRYPT_WORKLOADS],
+    bcrypt_rejected_shutdown: [[AtomicU64; BCRYPT_OPERATIONS]; BCRYPT_WORKLOADS],
+
     // === Labeled Auth Metrics ===
     auth_requests_total: Mutex<BTreeMap<AuthRequestKey, u64>>,
     auth_request_durations: Mutex<BTreeMap<AuthDurationKey, AuthDurationMetric>>,
@@ -266,6 +275,14 @@ impl Metrics {
             // OAuth metrics
             oauth_authorizations_created: AtomicU64::new(0),
             oauth_authorizations_revoked: AtomicU64::new(0),
+            bcrypt_active: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+            bcrypt_waiting: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+            bcrypt_rejected_capacity: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicU64::new(0))
+            }),
+            bcrypt_rejected_shutdown: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicU64::new(0))
+            }),
             // Labeled auth metrics
             auth_requests_total: Mutex::new(BTreeMap::new()),
             auth_request_durations: Mutex::new(BTreeMap::new()),
@@ -607,6 +624,36 @@ impl Metrics {
             .lock()
             .expect("auth email failures lock poisoned");
         *failures.entry(template).or_insert(0) += 1;
+    }
+
+    pub fn inc_bcrypt_active(&self, workload: BcryptWorkload, operation: BcryptOperation) {
+        self.bcrypt_active[workload.index()][operation.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn dec_bcrypt_active(&self, workload: BcryptWorkload, operation: BcryptOperation) {
+        self.bcrypt_active[workload.index()][operation.index()].fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_bcrypt_waiting(&self, workload: BcryptWorkload, operation: BcryptOperation) {
+        self.bcrypt_waiting[workload.index()][operation.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn dec_bcrypt_waiting(&self, workload: BcryptWorkload, operation: BcryptOperation) {
+        self.bcrypt_waiting[workload.index()][operation.index()].fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_bcrypt_rejection(
+        &self,
+        workload: BcryptWorkload,
+        operation: BcryptOperation,
+        shutting_down: bool,
+    ) {
+        let metrics = if shutting_down {
+            &self.bcrypt_rejected_shutdown
+        } else {
+            &self.bcrypt_rejected_capacity
+        };
+        metrics[workload.index()][operation.index()].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Format all metrics as Prometheus text
@@ -1005,6 +1052,49 @@ impl Metrics {
         ));
 
         output.push_str(
+            "\n# HELP keycast_bcrypt_active_work Current bcrypt operations running on blocking workers\n",
+        );
+        output.push_str("# TYPE keycast_bcrypt_active_work gauge\n");
+        output.push_str(
+            "# HELP keycast_bcrypt_waiting_work Current bcrypt operations waiting for CPU admission\n",
+        );
+        output.push_str("# TYPE keycast_bcrypt_waiting_work gauge\n");
+        output.push_str(
+            "# HELP keycast_bcrypt_admission_rejections_total Bcrypt operations rejected before blocking execution\n",
+        );
+        output.push_str("# TYPE keycast_bcrypt_admission_rejections_total counter\n");
+        for workload in BcryptWorkload::ALL {
+            for operation in BcryptOperation::ALL {
+                let workload_index = workload.index();
+                let operation_index = operation.index();
+                output.push_str(&format!(
+                    "keycast_bcrypt_active_work{{workload=\"{}\",operation=\"{}\"}} {}\n",
+                    workload.as_str(),
+                    operation.as_str(),
+                    self.bcrypt_active[workload_index][operation_index].load(Ordering::Relaxed)
+                ));
+                output.push_str(&format!(
+                    "keycast_bcrypt_waiting_work{{workload=\"{}\",operation=\"{}\"}} {}\n",
+                    workload.as_str(),
+                    operation.as_str(),
+                    self.bcrypt_waiting[workload_index][operation_index].load(Ordering::Relaxed)
+                ));
+                for (reason, metrics) in [
+                    ("capacity", &self.bcrypt_rejected_capacity),
+                    ("shutdown", &self.bcrypt_rejected_shutdown),
+                ] {
+                    output.push_str(&format!(
+                        "keycast_bcrypt_admission_rejections_total{{workload=\"{}\",operation=\"{}\",reason=\"{}\"}} {}\n",
+                        workload.as_str(),
+                        operation.as_str(),
+                        reason,
+                        metrics[workload_index][operation_index].load(Ordering::Relaxed)
+                    ));
+                }
+            }
+        }
+
+        output.push_str(
             "\n# HELP keycast_auth_requests_total Auth request outcomes by endpoint and reason\n",
         );
         output.push_str("# TYPE keycast_auth_requests_total counter\n");
@@ -1222,6 +1312,7 @@ pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::new);
 #[cfg(test)]
 mod tests {
     use super::Metrics;
+    use crate::bcrypt_admission::{BcryptOperation, BcryptWorkload};
     use std::time::Duration;
 
     #[test]
@@ -1332,5 +1423,23 @@ mod tests {
         );
         assert!(output.contains("keycast_nip46_queue_wait_seconds_count 1"));
         assert!(output.contains("keycast_nip46_worker_duration_seconds_count 1"));
+    }
+
+    #[test]
+    fn bcrypt_admission_metrics_use_bounded_labels() {
+        let metrics = Metrics::new();
+        metrics.inc_bcrypt_active(BcryptWorkload::Login, BcryptOperation::Verify);
+        metrics.inc_bcrypt_waiting(BcryptWorkload::Pin, BcryptOperation::Verify);
+        metrics.inc_bcrypt_rejection(BcryptWorkload::Background, BcryptOperation::Hash, false);
+
+        let output = metrics.to_prometheus();
+        assert!(output
+            .contains("keycast_bcrypt_active_work{workload=\"login\",operation=\"verify\"} 1"));
+        assert!(
+            output.contains("keycast_bcrypt_waiting_work{workload=\"pin\",operation=\"verify\"} 1")
+        );
+        assert!(output.contains(
+            "keycast_bcrypt_admission_rejections_total{workload=\"background\",operation=\"hash\",reason=\"capacity\"} 1"
+        ));
     }
 }

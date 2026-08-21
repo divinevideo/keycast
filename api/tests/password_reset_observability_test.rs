@@ -170,8 +170,17 @@ async fn test_reset_password_records_success_event_and_updates_hash() {
                     move |headers: HeaderMap, Json(req): Json<ResetPasswordRequest>| {
                         let pool = pool.clone();
                         async move {
-                            reset_password(create_test_tenant(), State(pool), headers, Json(req))
-                                .await
+                            reset_password(
+                                create_test_tenant(),
+                                State(pool),
+                                axum::Extension(keycast_api::BcryptAdmission::new(
+                                    1,
+                                    std::time::Duration::from_secs(1),
+                                )),
+                                headers,
+                                Json(req),
+                            )
+                            .await
                         }
                     },
                 ),

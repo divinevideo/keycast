@@ -9,8 +9,8 @@ use axum::{
     Form, Json, RequestExt,
 };
 use base64::Engine;
-use bcrypt::verify;
 use chrono::{Duration, Utc};
+use keycast_core::bcrypt_admission::{BcryptAdmissionError, BcryptWorkload};
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
     CreateOAuthAuthorizationParams, OAuthAuthorizationRepository, OAuthCodeData,
@@ -18,10 +18,11 @@ use keycast_core::repositories::{
     RepositoryError, StoreOAuthCodeParams, StoreOAuthCodeWithRegistrationParams,
     StoredPendingRegistration, UserRepository,
 };
+use keycast_core::secret_pool::SecretPoolError;
 use keycast_core::types::refresh_token::{generate_refresh_token, hash_refresh_token};
 use nostr_sdk::{Keys, ToBech32};
 use rand::Rng;
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
 // Import constants and helpers from auth module
@@ -401,6 +402,7 @@ pub enum OAuthError {
     Database(String),
     Encryption(String),
     ServerError(String),
+    ServiceUnavailable,
 }
 
 impl OAuthError {
@@ -410,7 +412,9 @@ impl OAuthError {
             Self::InvalidEmail | Self::InvalidRequest(_) | Self::InvalidGrant(_) => {
                 StatusCode::BAD_REQUEST
             }
-            Self::Database(_) | Self::Encryption(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Database(_) | Self::Encryption(_) | Self::ServiceUnavailable => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Self::ServerError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -470,9 +474,30 @@ impl IntoResponse for OAuthError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Server error: {}", msg),
             ),
+            OAuthError::ServiceUnavailable => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [("Retry-After", "1")],
+                    Json(serde_json::json!({
+                        "error": "Password service is busy. Please try again shortly."
+                    })),
+                )
+                    .into_response();
+            }
         };
 
         (status, Json(serde_json::json!({ "error": message }))).into_response()
+    }
+}
+
+fn bcrypt_oauth_error(error: BcryptAdmissionError) -> OAuthError {
+    match error {
+        BcryptAdmissionError::AtCapacity | BcryptAdmissionError::ShuttingDown => {
+            OAuthError::ServiceUnavailable
+        }
+        BcryptAdmissionError::WorkerFailed | BcryptAdmissionError::Bcrypt(_) => {
+            OAuthError::InvalidRequest("Password operation failed".to_string())
+        }
     }
 }
 
@@ -3309,13 +3334,15 @@ async fn create_oauth_authorization_and_token(
     // Extract origin from redirect_uri - this is the primary identifier
     let redirect_origin = extract_origin(redirect_uri)?;
 
-    // Get pre-computed (secret, hash) from pool - instant, no waiting for bcrypt
+    // Precomputed pair, or a bounded wait that becomes retryable overload.
     let secret_pair = auth_state
         .state
         .secret_pool
         .get()
         .await
-        .ok_or_else(|| OAuthError::ServerError("Secret pool exhausted".to_string()))?;
+        .map_err(|error| match error {
+            SecretPoolError::Exhausted | SecretPoolError::Closed => OAuthError::ServiceUnavailable,
+        })?;
     let connection_secret = secret_pair.secret;
     let secret_hash = secret_pair.hash;
 
@@ -3590,13 +3617,16 @@ pub async fn oauth_login(
             }
         };
 
-    // Verify password (spawn_blocking to avoid blocking async runtime)
-    let password = req.password.clone();
-    let hash = password_hash.clone();
-    let valid = tokio::task::spawn_blocking(move || verify(&password, &hash))
+    let valid = auth_state
+        .state
+        .bcrypt
+        .verify(
+            BcryptWorkload::Login,
+            SecretString::from(req.password.clone()),
+            password_hash.clone(),
+        )
         .await
-        .map_err(|e| OAuthError::InvalidRequest(format!("Task join error: {}", e)))?
-        .map_err(|_| OAuthError::InvalidRequest("Password verification failed".to_string()))?;
+        .map_err(bcrypt_oauth_error)?;
 
     if !valid {
         super::auth_observability::record_auth_event_and_log(
@@ -3802,13 +3832,16 @@ pub async fn oauth_register(
         ));
     }
 
-    // Hash password (spawn_blocking to avoid blocking async runtime)
-    let password = req.password.clone();
-    let password_hash =
-        tokio::task::spawn_blocking(move || bcrypt::hash(&password, bcrypt::DEFAULT_COST))
-            .await
-            .map_err(|e| OAuthError::InvalidRequest(format!("Task join error: {}", e)))?
-            .map_err(|_| OAuthError::InvalidRequest("Password hashing failed".to_string()))?;
+    let password_hash = auth_state
+        .state
+        .bcrypt
+        .hash(
+            BcryptWorkload::Signup,
+            SecretString::from(req.password.clone()),
+            bcrypt::DEFAULT_COST,
+        )
+        .await
+        .map_err(bcrypt_oauth_error)?;
 
     // Priority: nsec (direct input) → pubkey (BYOK via code_verifier) → auto-generate
     let (public_key, generated_keys) = if let Some(ref nsec_str) = req.nsec {
@@ -4516,12 +4549,24 @@ pub async fn connect_post(
     // For nostr-login, redirect_origin is "nostrconnect://{client_pubkey}" (the secure identifier)
     let redirect_origin = format!("nostrconnect://{}", &form.client_pubkey);
 
-    // Hash the client-provided secret with bcrypt for storage
-    let client_secret = form.secret.clone();
-    let secret_hash = tokio::task::spawn_blocking(move || bcrypt::hash(&client_secret, 10))
+    // Hash the client-provided secret with bcrypt for storage.
+    let secret_hash = auth_state
+        .state
+        .bcrypt
+        .hash(
+            BcryptWorkload::OAuth,
+            SecretString::from(form.secret.clone()),
+            10,
+        )
         .await
-        .map_err(|e| OAuthError::ServerError(format!("Hash task failed: {}", e)))?
-        .map_err(|e| OAuthError::ServerError(format!("Failed to hash secret: {}", e)))?;
+        .map_err(|error| match error {
+            BcryptAdmissionError::AtCapacity | BcryptAdmissionError::ShuttingDown => {
+                OAuthError::ServiceUnavailable
+            }
+            BcryptAdmissionError::WorkerFailed | BcryptAdmissionError::Bcrypt(_) => {
+                OAuthError::ServerError("Failed to hash secret".to_string())
+            }
+        })?;
 
     // Derive bunker keys from user secret using HKDF with secret_hash as entropy
     // (privacy: bunker_pubkey ≠ user_pubkey, zero extra KMS calls at runtime)
@@ -4715,6 +4760,13 @@ mod tests {
     use std::io::Write;
     use std::sync::{Arc, Mutex};
 
+    #[test]
+    fn bcrypt_capacity_maps_to_retryable_service_unavailable() {
+        let response = bcrypt_oauth_error(BcryptAdmissionError::AtCapacity).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["Retry-After"], "1");
+    }
+
     #[derive(Clone, Default)]
     struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -4780,7 +4832,10 @@ mod tests {
             .acquire_timeout(std::time::Duration::from_millis(100))
             .connect_lazy(database_url)
             .expect("lazy pool should be created");
-        let bcrypt_queue = crate::bcrypt_queue::BcryptQueue::new();
+        let bcrypt = keycast_core::bcrypt_admission::BcryptAdmission::new(
+            1,
+            std::time::Duration::from_secs(1),
+        );
         let secret_pool = keycast_core::secret_pool::SecretPool::new(1);
         let tenant_cache = moka::future::Cache::builder().max_capacity(10).build();
         let key_manager: std::sync::Arc<Box<dyn keycast_core::encryption::KeyManager>> =
@@ -4794,7 +4849,7 @@ mod tests {
                 http_handler_cache: crate::handlers::http_rpc_handler::new_http_handler_cache(),
                 server_keys: Keys::generate(),
                 tenant_cache,
-                bcrypt_sender: bcrypt_queue.sender(),
+                bcrypt,
                 redis: None,
                 secret_pool: secret_pool.receiver(),
                 activity_logger: crate::activity_log::ActivityLogger::disabled(),

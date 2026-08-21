@@ -420,6 +420,24 @@ enum PoolCloseOutcome {
     TimedOut,
 }
 
+/// Result of waiting for admitted bcrypt work within the shared teardown budget.
+#[derive(Debug)]
+enum BcryptDrainOutcome {
+    Completed,
+    TimedOut,
+}
+
+async fn drain_bcrypt_within_margin(
+    bcrypt: &keycast_core::bcrypt_admission::BcryptAdmission,
+    margin: Duration,
+) -> BcryptDrainOutcome {
+    bcrypt.close();
+    match tokio::time::timeout(margin, bcrypt.shutdown()).await {
+        Ok(()) => BcryptDrainOutcome::Completed,
+        Err(_) => BcryptDrainOutcome::TimedOut,
+    }
+}
+
 /// Await `close_fut` for up to `margin`. If it finishes in time, return
 /// `Completed`; otherwise return `TimedOut`. The close future is dropped on
 /// timeout — sqlx's `Pool::close()` is cancellation-safe, and we would not
@@ -1367,6 +1385,16 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     let (relay_activity_logger, relay_activity_worker) =
         keycast_signer::RelayActivityLogger::new(database.pool.clone());
 
+    let bcrypt = keycast_core::bcrypt_admission::BcryptAdmission::new(
+        num_cpus::get().max(1),
+        Duration::from_secs(1),
+    );
+    tracing::info!(
+        "✔︎ Bcrypt admission initialized ({} concurrent operations, {} same-class waiters)",
+        num_cpus::get().max(1),
+        keycast_core::bcrypt_admission::PER_CLASS_WAIT_DEPTH
+    );
+
     // Create signer (relay connections deferred to background task for faster startup)
     let mut signer = UnifiedSigner::new(
         database.pool.clone(),
@@ -1374,6 +1402,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         auth_rx,
         coordinator.clone(),
         relay_activity_logger,
+        bcrypt.clone(),
     )
     .await?;
     signer.load_authorizations().await?;
@@ -1404,23 +1433,14 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         .build();
     tracing::info!("✔︎ Tenant cache initialized (preload deferred)");
 
-    // Create bcrypt queue for async password hashing during registration
-    // Uses email verification latency as natural buffer for CPU-intensive work
-    let bcrypt_queue = keycast_api::bcrypt_queue::BcryptQueue::new();
-    let bcrypt_sender = bcrypt_queue.sender();
-    let _bcrypt_worker_handles = bcrypt_queue.spawn_workers(database.pool.clone());
     let _bcrypt_cleanup_handle =
-        keycast_api::bcrypt_queue::spawn_cleanup_task(database.pool.clone());
-    tracing::info!(
-        "✔︎ Bcrypt queue initialized ({} workers, cleanup every 5min)",
-        num_cpus::get()
-    );
+        keycast_api::auth_cleanup::spawn_cleanup_task(database.pool.clone());
 
     // Create secret pool for instant authorization creation
     // Background producer pre-computes (secret, bcrypt_hash) pairs
     let secret_pool = keycast_core::secret_pool::SecretPool::default();
     let secret_pool_receiver = secret_pool.receiver();
-    let _secret_pool_producer = secret_pool.spawn_producer();
+    let _secret_pool_producer = secret_pool.spawn_producer(bcrypt.clone());
     tracing::info!("✔︎ Secret pool initialized (capacity: 100, bcrypt cost: 10)");
 
     // Setup task tracking before API state so API-owned background workers are
@@ -1455,7 +1475,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         http_handler_cache: new_http_handler_cache(),
         server_keys,
         tenant_cache,
-        bcrypt_sender,
+        bcrypt: bcrypt.clone(),
         redis: Some(prefixed_redis),
         secret_pool: secret_pool_receiver,
         activity_logger,
@@ -1902,7 +1922,6 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
             );
         }
     }
-
     // Phase 3: publish the cluster `leave` and deregister FIRST (bounded,
     // carved out of the signer_drain budget — see
     // `deregister_within_signer_budget`), so peers rebuild the hashring and
@@ -1980,15 +1999,29 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         }
     }
 
-    // Phase 4: close database pool. Bounded by the teardown margin less
-    // POOL_CLOSE_LOG_HEADROOM so a connection stuck in a long-running query
+    // Phase 4: stop bcrypt admission after all normal request and signer producers have drained,
+    // then close the database pool. Both share the teardown margin less
+    // POOL_CLOSE_LOG_HEADROOM so admitted blocking work or a connection stuck in a long-running query
     // (e.g. a tenant-cache preload task mid-query when task_tracker.wait()
     // timed out and signer_handle.abort() was called but not awaited) cannot
     // block past the platform SIGKILL. The reserved headroom guarantees the
     // final "Graceful shutdown complete" log (and tracing flush) lands before
     // the SIGKILL even on the timeout path. sqlx's Pool::close is
     // cancellation-safe, so dropping the future on timeout is safe.
-    let pool_close_budget = teardown_margin.saturating_sub(POOL_CLOSE_LOG_HEADROOM);
+    let teardown_budget = teardown_margin.saturating_sub(POOL_CLOSE_LOG_HEADROOM);
+    let teardown_started_at = std::time::Instant::now();
+    match drain_bcrypt_within_margin(&bcrypt, teardown_budget).await {
+        BcryptDrainOutcome::Completed => {
+            tracing::info!("All admitted bcrypt work completed");
+        }
+        BcryptDrainOutcome::TimedOut => {
+            tracing::warn!(
+                bcrypt_drain_budget_secs = teardown_budget.as_secs(),
+                "Bcrypt drain exceeded the teardown budget; proceeding to bounded DB pool close"
+            );
+        }
+    }
+    let pool_close_budget = teardown_budget.saturating_sub(teardown_started_at.elapsed());
     match close_within_margin(pool_for_shutdown.close(), pool_close_budget).await {
         PoolCloseOutcome::Completed => {
             tracing::info!(
@@ -2830,6 +2863,41 @@ mod tests {
             cancel_flag.load(Ordering::Relaxed),
             "drain_http_or_abort must abort the spawned task — task drop guard did not fire, meaning the task is still running past the HTTP drain budget"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_bcrypt_drain_closes_admission_and_respects_teardown_budget() {
+        use keycast_core::bcrypt_admission::{
+            BcryptAdmission, BcryptAdmissionError, BcryptOperation, BcryptWorkload,
+        };
+
+        let bcrypt = BcryptAdmission::new(1, Duration::from_secs(1));
+        let held = bcrypt
+            .reserve(BcryptWorkload::Account, BcryptOperation::Hash)
+            .await
+            .expect("hold admitted work open");
+
+        let outcome = drain_bcrypt_within_margin(&bcrypt, Duration::from_secs(5)).await;
+        assert!(matches!(outcome, BcryptDrainOutcome::TimedOut));
+        assert!(matches!(
+            bcrypt
+                .reserve(BcryptWorkload::Login, BcryptOperation::Verify)
+                .await,
+            Err(BcryptAdmissionError::ShuttingDown)
+        ));
+
+        drop(held);
+        bcrypt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_bcrypt_drain_completes_when_admission_is_idle() {
+        let bcrypt =
+            keycast_core::bcrypt_admission::BcryptAdmission::new(1, Duration::from_secs(1));
+
+        let outcome = drain_bcrypt_within_margin(&bcrypt, Duration::from_secs(1)).await;
+
+        assert!(matches!(outcome, BcryptDrainOutcome::Completed));
     }
 
     #[test]

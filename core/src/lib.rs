@@ -1,5 +1,6 @@
 pub mod ap_signing;
 pub mod authorization_channel;
+pub mod bcrypt_admission;
 pub mod bunker_key;
 pub mod coalescing_activity;
 pub mod creator_binding;

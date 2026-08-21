@@ -10,10 +10,10 @@ use axum::{
 use http_body_util::BodyExt;
 use keycast_api::api::http::{auth, routes::AuthState};
 use keycast_api::api::tenant::{Tenant, TenantExtractor};
-use keycast_api::bcrypt_queue::BcryptQueue;
 use keycast_api::handlers::http_rpc_handler::new_http_handler_cache;
 use keycast_api::state::KeycastState;
 use keycast_api::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
+use keycast_api::BcryptAdmission;
 use keycast_core::encryption::{KeyManager, KeyManagerError};
 use keycast_core::repositories::UserRepository;
 use keycast_core::secret_pool::SecretPool;
@@ -45,7 +45,7 @@ impl KeyManager for TestKeyManager {
 }
 
 fn create_test_auth_state(pool: PgPool) -> AuthState {
-    let bcrypt_queue = BcryptQueue::new();
+    let bcrypt = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
     let secret_pool = SecretPool::new(1);
     let tenant_cache = Cache::builder().max_capacity(10).build();
     let key_manager: Arc<Box<dyn KeyManager>> = Arc::new(Box::new(TestKeyManager));
@@ -58,7 +58,7 @@ fn create_test_auth_state(pool: PgPool) -> AuthState {
             http_handler_cache: new_http_handler_cache(),
             server_keys: Keys::generate(),
             tenant_cache,
-            bcrypt_sender: bcrypt_queue.sender(),
+            bcrypt: bcrypt.clone(),
             redis: None,
             secret_pool: secret_pool.receiver(),
             activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),

@@ -7,9 +7,9 @@ use keycast_api::{
         http::routes::AuthState,
         tenant::{Tenant, TenantExtractor},
     },
-    bcrypt_queue::BcryptQueue,
     handlers::http_rpc_handler::new_http_handler_cache,
     state::KeycastState,
+    BcryptAdmission,
 };
 use keycast_core::{
     encryption::{KeyManager, KeyManagerError},
@@ -157,9 +157,9 @@ pub async fn setup_oauth_test_db() -> PgPool {
 
 #[allow(dead_code)]
 pub fn create_test_auth_state(pool: PgPool) -> (AuthState, JoinHandle<()>) {
-    let bcrypt_queue = BcryptQueue::new();
+    let bcrypt = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
     let secret_pool = SecretPool::new(1);
-    let producer_handle = secret_pool.spawn_producer();
+    let producer_handle = secret_pool.spawn_producer(bcrypt.clone());
     let tenant_cache = Cache::builder().max_capacity(10).build();
     let key_manager: Arc<Box<dyn KeyManager>> = Arc::new(Box::new(TestKeyManager));
 
@@ -171,7 +171,7 @@ pub fn create_test_auth_state(pool: PgPool) -> (AuthState, JoinHandle<()>) {
             http_handler_cache: new_http_handler_cache(),
             server_keys: Keys::generate(),
             tenant_cache,
-            bcrypt_sender: bcrypt_queue.sender(),
+            bcrypt: bcrypt.clone(),
             redis: None,
             secret_pool: secret_pool.receiver(),
             activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),

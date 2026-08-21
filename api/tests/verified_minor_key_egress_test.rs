@@ -14,10 +14,10 @@ use keycast_api::api::{
     },
     tenant::{Tenant, TenantExtractor},
 };
-use keycast_api::bcrypt_queue::BcryptQueue;
 use keycast_api::handlers::http_rpc_handler::new_http_handler_cache;
 use keycast_api::state::KeycastState;
 use keycast_api::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
+use keycast_api::BcryptAdmission;
 use keycast_api::PrefixedRedis;
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::KeyManager;
@@ -90,7 +90,7 @@ async fn create_test_auth_state(pool: PgPool, key_manager: Arc<Box<dyn KeyManage
         .await
         .expect("connect to dedicated Redis");
     let prefix = format!("keycast-pr326-independent-review:{}", Uuid::new_v4());
-    let bcrypt_queue = BcryptQueue::new();
+    let bcrypt = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
     let secret_pool = SecretPool::new(1);
     let tenant_cache = Cache::builder().max_capacity(10).build();
     AuthState {
@@ -101,7 +101,7 @@ async fn create_test_auth_state(pool: PgPool, key_manager: Arc<Box<dyn KeyManage
             http_handler_cache: new_http_handler_cache(),
             server_keys: Keys::generate(),
             tenant_cache,
-            bcrypt_sender: bcrypt_queue.sender(),
+            bcrypt: bcrypt.clone(),
             redis: Some(PrefixedRedis::new(connection, Some(prefix))),
             secret_pool: secret_pool.receiver(),
             activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),

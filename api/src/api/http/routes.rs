@@ -99,6 +99,7 @@ pub fn api_routes(
             post(auth::confirm_email_change),
         )
         .route("/auth/cancel-email-change", post(auth::cancel_email_change))
+        .layer(axum::Extension(auth_state.state.bcrypt.clone()))
         .with_state(pool.clone());
 
     // OAuth routes (no authentication required for initial authorize request)
@@ -175,6 +176,7 @@ pub fn api_routes(
         )
         .route("/user/change-password", post(auth::change_password))
         .route("/user/change-email", post(auth::change_email))
+        .layer(axum::Extension(auth_state.state.bcrypt.clone()))
         .layer(auth_cors.clone())
         .with_state(pool.clone());
 
