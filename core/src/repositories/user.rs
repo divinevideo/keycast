@@ -2835,6 +2835,11 @@ impl UserRepository {
     /// 5. Deletes the user (cascades to personal_keys, oauth_authorizations, etc.)
     ///
     /// Returns information about what was deleted for logging.
+    ///
+    /// Returns [`RepositoryError::NotFound`] when no such account exists. A
+    /// caller that needs to treat an absent account as success should use
+    /// [`Self::delete_account_in_tx`], which reports it as
+    /// [`AccountDeletionOutcome::AlreadyAbsent`] rather than as an error.
     pub async fn delete_account(
         &self,
         pubkey: &str,
@@ -2842,18 +2847,63 @@ impl UserRepository {
     ) -> Result<DeleteAccountResult, RepositoryError> {
         let mut tx = self.pool.begin().await?;
 
+        match Self::delete_account_in_tx(&mut tx, pubkey, tenant_id).await? {
+            AccountDeletionOutcome::Deleted(result) => {
+                tx.commit().await?;
+                Ok(result)
+            }
+            AccountDeletionOutcome::AlreadyAbsent => {
+                Err(RepositoryError::NotFound("User not found".to_string()))
+            }
+        }
+    }
+
+    /// The account deletion itself, running inside a caller-owned transaction.
+    ///
+    /// Split out so a caller can commit deletion together with its own record of
+    /// having done it. The service deletion path needs that: its idempotency row
+    /// and the deletion have to land in the same commit, or a crash between them
+    /// leaves a deleted account whose completion nobody can prove.
+    ///
+    /// Reports an absent account as [`AccountDeletionOutcome::AlreadyAbsent`]
+    /// instead of erroring, so the caller can still commit work in the same
+    /// transaction. An error here aborts the transaction and cannot be
+    /// distinguished from any other failure by the caller.
+    pub async fn delete_account_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<AccountDeletionOutcome, RepositoryError> {
+        // Confirm the account exists in this tenant before deleting anything.
+        // Several of the deletes below are keyed on user_pubkey alone, so
+        // running them for an account this tenant does not own would destroy
+        // another tenant's rows and then report AlreadyAbsent -- which the
+        // caller would commit. Locking the row also serializes two concurrent
+        // deletions of the same account instead of letting both proceed.
+        let owned: Option<i64> = sqlx::query_scalar(
+            "SELECT tenant_id FROM users WHERE pubkey = $1 AND tenant_id = $2 FOR UPDATE",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        if owned.is_none() {
+            return Ok(AccountDeletionOutcome::AlreadyAbsent);
+        }
+
         // Count teams for logging
         let teams_removed: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM team_users WHERE user_pubkey = $1")
                 .bind(pubkey)
-                .fetch_one(&mut *tx)
+                .fetch_one(&mut **tx)
                 .await?;
 
         // Count OAuth authorizations for logging
         let oauth_authorizations_deleted: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM oauth_authorizations WHERE user_pubkey = $1")
                 .bind(pubkey)
-                .fetch_one(&mut *tx)
+                .fetch_one(&mut **tx)
                 .await?;
 
         // Get bunker pubkeys for signer daemon notification (before deletion)
@@ -2861,20 +2911,20 @@ impl UserRepository {
             "SELECT bunker_public_key FROM oauth_authorizations WHERE user_pubkey = $1",
         )
         .bind(pubkey)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut **tx)
         .await?;
 
         // 1. Remove from all teams (no CASCADE, would block user delete)
         sqlx::query("DELETE FROM team_users WHERE user_pubkey = $1")
             .bind(pubkey)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
 
         // 2. Clear pending OAuth codes
         sqlx::query("DELETE FROM oauth_codes WHERE user_pubkey = $1 AND tenant_id = $2")
             .bind(pubkey)
             .bind(tenant_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
 
         // 3. Delete AP RSA key material. The FK cascade also handles this, but
@@ -2883,7 +2933,7 @@ impl UserRepository {
         sqlx::query("DELETE FROM ap_actor_keys WHERE user_pubkey = $1 AND tenant_id = $2")
             .bind(pubkey)
             .bind(tenant_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
 
         // 4. Delete claim tokens. A token only exists to hand this account to its
@@ -2893,7 +2943,7 @@ impl UserRepository {
         // rejects the user delete outright (#296).
         sqlx::query("DELETE FROM account_claim_tokens WHERE user_pubkey = $1")
             .bind(pubkey)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
 
         // 5. Delete user (cascades to personal_keys, oauth_authorizations -> refresh_tokens,
@@ -2902,20 +2952,18 @@ impl UserRepository {
         let result = sqlx::query("DELETE FROM users WHERE pubkey = $1 AND tenant_id = $2")
             .bind(pubkey)
             .bind(tenant_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
 
         if result.rows_affected() == 0 {
-            return Err(RepositoryError::NotFound("User not found".to_string()));
+            return Ok(AccountDeletionOutcome::AlreadyAbsent);
         }
 
-        tx.commit().await?;
-
-        Ok(DeleteAccountResult {
+        Ok(AccountDeletionOutcome::Deleted(DeleteAccountResult {
             teams_removed,
             oauth_authorizations_deleted,
             bunker_pubkeys,
-        })
+        }))
     }
 }
 
@@ -2928,6 +2976,19 @@ pub struct DeleteAccountResult {
     pub oauth_authorizations_deleted: i64,
     /// Bunker public keys for signer daemon notification
     pub bunker_pubkeys: Vec<String>,
+}
+
+/// What a deletion attempt found when it ran.
+///
+/// An idempotent caller needs to tell "I deleted it" apart from "it was already
+/// gone" while treating both as success, and needs the second case to stay
+/// committable rather than aborting the transaction.
+#[derive(Debug, Clone)]
+pub enum AccountDeletionOutcome {
+    /// The account existed in this tenant and every owned row was removed.
+    Deleted(DeleteAccountResult),
+    /// No such account in this tenant. Nothing was changed.
+    AlreadyAbsent,
 }
 
 #[cfg(all(test, feature = "integration-tests"))]

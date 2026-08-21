@@ -14,6 +14,7 @@ mod personal_keys;
 mod policy;
 mod refresh_token;
 mod registered_client;
+mod service_account_deletion;
 mod stored_key;
 mod team;
 mod user;
@@ -41,11 +42,15 @@ pub use refresh_token::{RefreshTokenBinding, RefreshTokenRepository};
 pub use registered_client::{
     test_redirect_pattern, RegisteredClient, RegisteredClientRepository, RegisteredClientUpdate,
 };
+pub use service_account_deletion::{
+    ServiceAccountDeletionOutcome, ServiceAccountDeletionRecord, ServiceAccountDeletionRepository,
+    ServiceAccountDeletionRow,
+};
 pub use stored_key::StoredKeyRepository;
 pub use team::TeamRepository;
 pub use user::{
-    AccountStatusRow, AccountStatusWithMinorRow, AdminUserDetails, AdminUserLookup,
-    AdminUserMatchKind, ClaimConsumeOutcome, ConditionalWrite, DeleteAccountResult,
-    FinalizeEmailOutcome, FullAdminStatusRow, PendingEmailChange, PendingEmailSide, UserRepository,
-    VerificationTokenData, VerifiedMinorRow,
+    AccountDeletionOutcome, AccountStatusRow, AccountStatusWithMinorRow, AdminUserDetails,
+    AdminUserLookup, AdminUserMatchKind, ClaimConsumeOutcome, ConditionalWrite,
+    DeleteAccountResult, FinalizeEmailOutcome, FullAdminStatusRow, PendingEmailChange,
+    PendingEmailSide, UserRepository, VerificationTokenData, VerifiedMinorRow,
 };
