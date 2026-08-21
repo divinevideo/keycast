@@ -2943,7 +2943,7 @@ impl UserRepository {
         // rejects the user delete outright (#296).
         sqlx::query("DELETE FROM account_claim_tokens WHERE user_pubkey = $1")
             .bind(pubkey)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
 
         // 5. Delete user (cascades to personal_keys, oauth_authorizations -> refresh_tokens,
