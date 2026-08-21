@@ -222,9 +222,18 @@ async fn nostr_rpc_inner(
     // The same per-request row also carries verified_minor, which drives the DM
     // containment gate below (support-trust-safety#183); reading it here (not
     // from the cached handler) means protection flips apply immediately.
+    // `sign_event` still reads the row, because the verified_minor gate below
+    // depends on it, but is not refused on account status (keycast#373).
     let needs_status_check = !matches!(req.method.as_str(), "get_public_key");
     let verified_minor = if needs_status_check {
-        check_user_status_active(pool, &handler.user_pubkey_hex(), tenant_id).await?
+        let deny_when_restricted = req.method.as_str() != "sign_event";
+        check_user_status_active(
+            pool,
+            &handler.user_pubkey_hex(),
+            tenant_id,
+            deny_when_restricted,
+        )
+        .await?
     } else {
         false
     };
@@ -455,14 +464,22 @@ fn http_rpc_outcome(response: &Result<Json<NostrRpcResponse>, RpcError>) -> &'st
     }
 }
 
-/// Check that the user's account is active before allowing mutating operations.
+/// Read the account gate state before a mutating operation.
 /// This runs a DB query per request (not cached) so status changes take effect immediately.
 /// Returns the account's `verified_minor` flag (same row, no extra query) for
 /// the DM containment gate; a missing user row is a refusal, never a default.
+///
+/// `deny_when_restricted` decides whether a non-active status refuses the call.
+/// It is false for `sign_event` (keycast#373): the row is still read, because the
+/// verified_minor gate depends on it, but a suspended or banned account may still
+/// sign. Signing is how an account proves it is itself and how its holder exports
+/// and republishes elsewhere. Enforcement governs what Divine hosts — the relay
+/// rejects banned authors on write — not whether the identity can act off Divine.
 async fn check_user_status_active(
     pool: &sqlx::PgPool,
     user_pubkey_hex: &str,
     tenant_id: i64,
+    deny_when_restricted: bool,
 ) -> Result<bool, RpcError> {
     let status_started = Instant::now();
     METRICS.set_http_rpc_db_pool_state(pool.size(), pool.num_idle() as u32);
@@ -509,6 +526,14 @@ async fn check_user_status_active(
 
     let result = match status {
         Some((s, verified_minor)) if s == "active" => Ok(verified_minor),
+        Some((s, verified_minor)) if !deny_when_restricted => {
+            tracing::info!(
+                event = "rpc.sign_allowed_for_restricted_account",
+                status = %s,
+                "Signing allowed for a restricted account (keycast#373)"
+            );
+            Ok(verified_minor)
+        }
         Some(_) => Err(RpcError::AccountSuspended("Account restricted".to_string())),
         None => Err(RpcError::Auth(AuthError::InvalidToken)),
     };

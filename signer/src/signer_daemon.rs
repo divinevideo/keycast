@@ -523,6 +523,21 @@ impl Nip46Handler {
     /// Returns the account's `verified_minor` flag (same row, no extra query)
     /// so callers can apply the DM containment gate (support-trust-safety#183).
     async fn check_user_active(&self) -> SignerResult<bool> {
+        self.user_gate_state(true).await
+    }
+
+    /// Read the account gate state.
+    ///
+    /// `deny_when_restricted` decides whether a non-active status refuses the
+    /// call. It is false for signing (keycast#373): the row is still read,
+    /// because the `verified_minor` gate depends on it, but a suspended or
+    /// banned account may still sign. Signing is how an account proves it is
+    /// itself and how its holder exports and republishes elsewhere. Enforcement
+    /// governs what Divine hosts — the relay rejects banned authors on write —
+    /// not whether the identity can act off Divine. Encrypt and decrypt keep
+    /// denying: those are communication capabilities, and re-enabling them for
+    /// restricted accounts is a separate decision.
+    async fn user_gate_state(&self, deny_when_restricted: bool) -> SignerResult<bool> {
         if !self.is_oauth {
             return Ok(false);
         }
@@ -537,6 +552,14 @@ impl Nip46Handler {
 
         match status {
             Some((s, verified_minor)) if s == "active" => Ok(verified_minor),
+            Some((s, verified_minor)) if !deny_when_restricted => {
+                tracing::info!(
+                    event = "signer.sign_allowed_for_restricted_account",
+                    status = %s,
+                    "Signing allowed for a restricted account (keycast#373)"
+                );
+                Ok(verified_minor)
+            }
             Some(_) => Err(SignerError::permission_denied("Account restricted")),
             None => Err(SignerError::permission_denied("User not found")),
         }
@@ -547,7 +570,9 @@ impl Nip46Handler {
     /// Both relay-dispatched (`handle_sign_event`) and direct
     /// (`sign_event_direct`) signing must pass through here.
     async fn check_user_sign_gates(&self, unsigned_event: &UnsignedEvent) -> SignerResult<()> {
-        let verified_minor = self.check_user_active().await?;
+        // Not denied on account status (keycast#373); the row is still read so
+        // the verified_minor gate below keeps applying in every status.
+        let verified_minor = self.user_gate_state(false).await?;
         if verified_minor {
             keycast_core::verified_minor_dm::validate_minor_sign(&self.user_keys, unsigned_event)
                 .map_err(|denied| {

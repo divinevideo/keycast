@@ -3821,13 +3821,14 @@ pub async fn sign_event(
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
 
-    // Check account status before either signing path (fast or slow)
     let user_repo = UserRepository::new(pool.clone());
-    if let Some((status, _, _)) = user_repo.get_user_status(&user_pubkey, tenant_id).await? {
-        if !status.is_active() {
-            return Err(AuthError::Forbidden("Account restricted".to_string()));
-        }
-    }
+
+    // Account status deliberately does not gate signing (keycast#373). Signing is
+    // how an account proves it is itself and how its holder exports and republishes
+    // elsewhere; enforcement governs what Divine hosts — the relay rejects banned
+    // authors on write — not whether the identity can act off Divine. The
+    // verified_minor DM containment gate below is fetched separately and still
+    // applies in every account status.
 
     // Parse unsigned event first for validation
     let unsigned_event: UnsignedEvent = serde_json::from_value(req.event.clone())
