@@ -22,7 +22,8 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 const TENANT_ID: i64 = 1;
-const SERVICE_TOKEN: &str = "test-service-deletion-token";
+const DELETION_SERVICE_TOKEN: &str = "test-service-deletion-token";
+const BROAD_SERVICE_TOKEN: &str = "test-broad-service-token";
 
 fn build_app(pool: PgPool) -> Router {
     use keycast_api::api::tenant::{Tenant, TenantExtractor};
@@ -138,7 +139,10 @@ async fn user_exists(pool: &PgPool, pubkey: &str) -> bool {
 }
 
 fn setup_env() {
-    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+    unsafe {
+        std::env::set_var("KEYCAST_DELETION_SERVICE_TOKEN", DELETION_SERVICE_TOKEN);
+        std::env::set_var("KEYCAST_SERVICE_TOKEN", BROAD_SERVICE_TOKEN);
+    }
 }
 
 #[tokio::test]
@@ -151,7 +155,11 @@ async fn deletes_the_account_and_records_the_request() {
 
     let app = build_app(pool.clone());
     let resp = app
-        .oneshot(deletion_request(&pubkey, &request_id, Some(SERVICE_TOKEN)))
+        .oneshot(deletion_request(
+            &pubkey,
+            &request_id,
+            Some(DELETION_SERVICE_TOKEN),
+        ))
         .await
         .unwrap();
 
@@ -191,7 +199,11 @@ async fn absent_account_is_reported_as_success() {
 
     let app = build_app(pool.clone());
     let resp = app
-        .oneshot(deletion_request(&pubkey, &request_id, Some(SERVICE_TOKEN)))
+        .oneshot(deletion_request(
+            &pubkey,
+            &request_id,
+            Some(DELETION_SERVICE_TOKEN),
+        ))
         .await
         .unwrap();
 
@@ -213,7 +225,11 @@ async fn replaying_a_request_id_returns_the_first_outcome_without_deleting_again
     let request_id = format!("req-replay-{pubkey}");
 
     let first = build_app(pool.clone())
-        .oneshot(deletion_request(&pubkey, &request_id, Some(SERVICE_TOKEN)))
+        .oneshot(deletion_request(
+            &pubkey,
+            &request_id,
+            Some(DELETION_SERVICE_TOKEN),
+        ))
         .await
         .unwrap();
     assert_eq!(first.status(), StatusCode::OK);
@@ -222,7 +238,11 @@ async fn replaying_a_request_id_returns_the_first_outcome_without_deleting_again
     assert_eq!(first_body["replayed"], false);
 
     let second = build_app(pool.clone())
-        .oneshot(deletion_request(&pubkey, &request_id, Some(SERVICE_TOKEN)))
+        .oneshot(deletion_request(
+            &pubkey,
+            &request_id,
+            Some(DELETION_SERVICE_TOKEN),
+        ))
         .await
         .unwrap();
     assert_eq!(second.status(), StatusCode::OK);
@@ -258,7 +278,7 @@ async fn a_request_id_cannot_be_reused_for_a_different_account() {
         .oneshot(deletion_request(
             &first_pubkey,
             &request_id,
-            Some(SERVICE_TOKEN),
+            Some(DELETION_SERVICE_TOKEN),
         ))
         .await
         .unwrap();
@@ -268,7 +288,7 @@ async fn a_request_id_cannot_be_reused_for_a_different_account() {
         .oneshot(deletion_request(
             &second_pubkey,
             &request_id,
-            Some(SERVICE_TOKEN),
+            Some(DELETION_SERVICE_TOKEN),
         ))
         .await
         .unwrap();
@@ -305,7 +325,11 @@ async fn does_not_touch_an_account_owned_by_another_tenant() {
 
     // The harness authenticates as TENANT_ID, which does not own this account.
     let resp = build_app(pool.clone())
-        .oneshot(deletion_request(&pubkey, &request_id, Some(SERVICE_TOKEN)))
+        .oneshot(deletion_request(
+            &pubkey,
+            &request_id,
+            Some(DELETION_SERVICE_TOKEN),
+        ))
         .await
         .unwrap();
 
@@ -343,7 +367,11 @@ async fn writes_an_audit_row_carrying_no_secrets() {
     let request_id = format!("req-audit-{pubkey}");
 
     let resp = build_app(pool.clone())
-        .oneshot(deletion_request(&pubkey, &request_id, Some(SERVICE_TOKEN)))
+        .oneshot(deletion_request(
+            &pubkey,
+            &request_id,
+            Some(DELETION_SERVICE_TOKEN),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -369,7 +397,14 @@ async fn writes_an_audit_row_carrying_no_secrets() {
     assert_eq!(metadata["outcome"], "deleted");
 
     let serialized = metadata.to_string();
-    for forbidden in ["nsec", "secret", "token", "password", SERVICE_TOKEN] {
+    for forbidden in [
+        "nsec",
+        "secret",
+        "token",
+        "password",
+        DELETION_SERVICE_TOKEN,
+        BROAD_SERVICE_TOKEN,
+    ] {
         assert!(
             !serialized.contains(forbidden),
             "audit metadata must not contain {forbidden}"
@@ -378,13 +413,13 @@ async fn writes_an_audit_row_carrying_no_secrets() {
 }
 
 #[tokio::test]
-async fn rejects_a_missing_or_wrong_service_token() {
+async fn rejects_missing_wrong_and_broad_service_tokens() {
     common::assert_test_database_url();
     setup_env();
     let pool = common::setup_test_db().await;
     let pubkey = create_user(&pool, TENANT_ID).await;
 
-    for token in [None, Some("wrong-token")] {
+    for token in [None, Some("wrong-token"), Some(BROAD_SERVICE_TOKEN)] {
         let resp = build_app(pool.clone())
             .oneshot(deletion_request(&pubkey, "req-unauthorized", token))
             .await
@@ -419,7 +454,11 @@ async fn rejects_malformed_input_as_terminal() {
 
     for (pubkey, request_id, expected_code) in cases {
         let resp = build_app(pool.clone())
-            .oneshot(deletion_request(pubkey, request_id, Some(SERVICE_TOKEN)))
+            .oneshot(deletion_request(
+                pubkey,
+                request_id,
+                Some(DELETION_SERVICE_TOKEN),
+            ))
             .await
             .unwrap();
         assert_eq!(
@@ -450,7 +489,7 @@ async fn a_database_failure_is_reported_as_retryable() {
         .oneshot(deletion_request(
             &pubkey,
             "req-db-down",
-            Some(SERVICE_TOKEN),
+            Some(DELETION_SERVICE_TOKEN),
         ))
         .await
         .unwrap();
