@@ -68,7 +68,7 @@ steps:
       - '--network=default'
       - '--subnet=default'
       - '--vpc-egress=private-ranges-only'
-      - '--set-secrets=DATABASE_URL=keycast-database-url:latest,SERVER_NSEC=keycast-ucan-secret:latest,SENDGRID_API_KEY=keycast-sendgrid-api-key:latest,REDIS_URL=keycast-redis-url:latest,KEYCAST_SERVICE_TOKEN=keycast-service-token:latest'
+      - '--set-secrets=DATABASE_URL=keycast-database-url:latest,SERVER_NSEC=keycast-ucan-secret:latest,SENDGRID_API_KEY=keycast-sendgrid-api-key:latest,REDIS_URL=keycast-redis-url:latest,KEYCAST_SERVICE_TOKEN=keycast-service-token:latest,KEYCAST_DELETION_SERVICE_TOKEN=account-deletion-service-token-production:latest'
       # SHUTDOWN_* vars size the graceful-drain phases to Cloud Run's ~10s
       # SIGTERM->SIGKILL grace (CEILING=10). PRE_DRAIN=0 because Cloud Run has
       # no readiness-probe-driven endpoint removal; peer rebalancing comes from
