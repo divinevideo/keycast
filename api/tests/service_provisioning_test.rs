@@ -410,6 +410,36 @@ async fn transaction_path_completes_with_one_pool_connection() {
 }
 
 #[tokio::test]
+async fn operation_lock_timeout_is_retryable_and_releases_the_connection() {
+    let (pool, state) = setup().await;
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let username = format!("lock-timeout-{}", uuid::Uuid::new_v4().simple());
+    cleanup(&pool, &operation_id, &[&username]).await;
+
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(&operation_id)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        build_app(state, 1).oneshot(request(Some(&operation_id), &username, None)),
+    )
+    .await
+    .expect("provisioning lock wait must be bounded")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response_json(response).await;
+    assert_eq!(body["code"], "database_unavailable");
+    assert_eq!(body["retryable"], true);
+
+    blocker.rollback().await.unwrap();
+    cleanup(&pool, &operation_id, &[&username]).await;
+}
+
+#[tokio::test]
 async fn invalid_operation_id_and_service_token_are_terminal() {
     let (_pool, state) = setup().await;
     let invalid = build_app(state.clone(), 1)
