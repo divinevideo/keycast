@@ -117,6 +117,16 @@ fn map_service_token_error(error: ApiError) -> ProvisioningError {
     }
 }
 
+fn map_account_create_error(error: RepositoryError, username: &str) -> ProvisioningError {
+    match error {
+        RepositoryError::Duplicate => ProvisioningError::Conflict(
+            "username_conflict",
+            format!("User with username {username} already exists"),
+        ),
+        other => map_repo_error(other),
+    }
+}
+
 fn normalize_username(raw: &str) -> Result<String, ProvisioningError> {
     let username = raw.trim().to_lowercase();
     if username.is_empty()
@@ -387,7 +397,7 @@ async fn provision_with_operation(
         &encrypted_secret,
     )
     .await
-    .map_err(map_repo_error)?;
+    .map_err(|error| map_account_create_error(error, &username))?;
     let token =
         ClaimTokenRepository::create_in_tx(&mut tx, &replacement_token, &pubkey, None, tenant_id)
             .await
@@ -474,7 +484,7 @@ mod tests {
     use http_body_util::BodyExt;
     use keycast_core::repositories::RepositoryError;
 
-    use super::{map_repo_error, request_fingerprint};
+    use super::{map_account_create_error, map_repo_error, request_fingerprint};
 
     #[test]
     fn fingerprint_is_length_delimited_and_presence_sensitive() {
@@ -504,5 +514,18 @@ mod tests {
         assert_eq!(body["code"], "database_error");
         assert_eq!(body["error"], "Something went wrong. Please try again.");
         assert!(!body.to_string().contains("service_provisioning_operations"));
+    }
+
+    #[tokio::test]
+    async fn account_create_duplicate_is_a_terminal_username_conflict() {
+        let response =
+            map_account_create_error(RepositoryError::Duplicate, "existing-user").into_response();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(body["code"], "username_conflict");
+        assert_eq!(body["retryable"], false);
     }
 }
