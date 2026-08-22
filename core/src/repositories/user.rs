@@ -2285,6 +2285,38 @@ impl UserRepository {
         Ok(result)
     }
 
+    pub async fn find_user_minor_status_by_username_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        username: &str,
+        tenant_id: i64,
+    ) -> Result<Option<(String, bool, bool)>, RepositoryError> {
+        sqlx::query_as(
+            "SELECT pubkey, verified_minor,
+                    (verified_minor = TRUE AND email IS NULL AND password_hash IS NULL) AS is_unclaimed
+             FROM users
+             WHERE LOWER(username) = LOWER($1) AND tenant_id = $2",
+        )
+        .bind(username)
+        .bind(tenant_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Serialize distinct provisioning operation ids that target one username.
+    pub async fn lock_minor_username_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        username: &str,
+        tenant_id: i64,
+    ) -> Result<(), RepositoryError> {
+        let key = format!("service-provisioning-username:{tenant_id}:{username}");
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(key)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
     /// Create an approved minor account with personal key atomically.
     /// Like create_preloaded_user but without vine_id and with verified_minor=true.
     pub async fn create_minor_account(
@@ -2324,6 +2356,61 @@ impl UserRepository {
 
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Create the protected account and hosted key inside a caller-owned
+    /// transaction so provisioning idempotency can commit with them.
+    pub async fn create_minor_account_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        pubkey: &str,
+        tenant_id: i64,
+        username: &str,
+        display_name: Option<&str>,
+        encrypted_secret: &[u8],
+    ) -> Result<(), RepositoryError> {
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, username, display_name, verified_minor, verified_minor_at, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, TRUE, $5, $5, $5)",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .bind(username)
+        .bind(display_name)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $4)",
+        )
+        .bind(pubkey)
+        .bind(encrypted_secret)
+        .bind(tenant_id)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    /// Whether a recorded provisioning account still exists and is claimable.
+    /// Missing or claimed rows both return `Some(false)`/`None` and must never
+    /// trigger recreation from an old operation id.
+    pub async fn is_unclaimed_minor_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<Option<bool>, RepositoryError> {
+        sqlx::query_scalar(
+            "SELECT (verified_minor = TRUE AND email IS NULL AND password_hash IS NULL)
+             FROM users WHERE pubkey = $1 AND tenant_id = $2",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(Into::into)
     }
 
     // =========================================================================

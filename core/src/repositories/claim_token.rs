@@ -1,5 +1,5 @@
 use chrono::{Duration, Utc};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::repositories::RepositoryError;
 use crate::types::claim_token::{
@@ -125,6 +125,122 @@ impl ClaimTokenRepository {
         .bind(user_pubkey)
         .bind(tenant_id)
         .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn find_valid_by_user_pubkey_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        user_pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<Option<ClaimToken>, RepositoryError> {
+        sqlx::query_as::<_, ClaimToken>(concat!(
+            "SELECT ",
+            claim_token_columns!(),
+            " FROM account_claim_tokens
+             WHERE user_pubkey = $1
+               AND tenant_id = $2
+               AND expires_at > NOW()
+               AND used_at IS NULL
+               AND invalidated_at IS NULL
+             ORDER BY created_at DESC
+             LIMIT 1"
+        ))
+        .bind(user_pubkey)
+        .bind(tenant_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Lock this account's claim-token rows before checking account state.
+    /// The claim flow consumes a token before updating the user, so replay uses
+    /// the same lock order to avoid minting across a concurrent claim.
+    pub async fn lock_for_user_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        user_pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "SELECT id FROM account_claim_tokens
+             WHERE user_pubkey = $1 AND tenant_id = $2
+             FOR UPDATE",
+        )
+        .bind(user_pubkey)
+        .bind(tenant_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn create_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        token: &str,
+        user_pubkey: &str,
+        created_by_pubkey: Option<&str>,
+        tenant_id: i64,
+    ) -> Result<ClaimToken, RepositoryError> {
+        let now = Utc::now();
+        let expires_at = now + Duration::days(CLAIM_TOKEN_EXPIRY_DAYS);
+        sqlx::query_as::<_, ClaimToken>(concat!(
+            "INSERT INTO account_claim_tokens
+             (token, user_pubkey, expires_at, created_at, created_by_pubkey, tenant_id)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             RETURNING ",
+            claim_token_columns!()
+        ))
+        .bind(token)
+        .bind(user_pubkey)
+        .bind(expires_at)
+        .bind(now)
+        .bind(created_by_pubkey)
+        .bind(tenant_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Return the current token or mint one replacement while the caller holds
+    /// the provisioning operation lock in this same transaction.
+    pub async fn find_or_replace_for_provisioning_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        user_pubkey: &str,
+        tenant_id: i64,
+        replacement_token: &str,
+    ) -> Result<ClaimToken, RepositoryError> {
+        if let Some(existing) =
+            Self::find_valid_by_user_pubkey_in_tx(tx, user_pubkey, tenant_id).await?
+        {
+            return Ok(existing);
+        }
+
+        let now = Utc::now();
+        sqlx::query(
+            "UPDATE account_claim_tokens
+             SET expires_at = NOW(), invalidated_at = NOW(),
+                 invalidation_reason = 'replaced_by_provisioning_replay'
+             WHERE user_pubkey = $1 AND tenant_id = $2
+               AND used_at IS NULL AND invalidated_at IS NULL",
+        )
+        .bind(user_pubkey)
+        .bind(tenant_id)
+        .execute(&mut **tx)
+        .await?;
+
+        let expires_at = now + Duration::days(CLAIM_TOKEN_EXPIRY_DAYS);
+        sqlx::query_as::<_, ClaimToken>(concat!(
+            "INSERT INTO account_claim_tokens
+             (token, user_pubkey, expires_at, created_at, tenant_id)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING ",
+            claim_token_columns!()
+        ))
+        .bind(replacement_token)
+        .bind(user_pubkey)
+        .bind(expires_at)
+        .bind(now)
+        .bind(tenant_id)
+        .fetch_one(&mut **tx)
         .await
         .map_err(Into::into)
     }

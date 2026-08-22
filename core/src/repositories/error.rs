@@ -38,6 +38,8 @@ impl From<sqlx::Error> for RepositoryError {
             sqlx::Error::Database(db_err) => {
                 // PostgreSQL error codes
                 match db_err.code().as_deref() {
+                    // 55P03 = lock_not_available (including lock_timeout)
+                    Some("55P03") => Self::Unavailable(db_err.message().to_string()),
                     // 23505 = unique_violation
                     Some("23505") => Self::Duplicate,
                     // 23503 = foreign_key_violation

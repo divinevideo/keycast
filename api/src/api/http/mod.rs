@@ -15,6 +15,7 @@ pub mod openid_configuration;
 pub mod policies;
 pub mod routes;
 pub mod service_deletion;
+pub mod service_provisioning;
 pub mod teams;
 
 pub use routes::*;

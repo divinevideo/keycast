@@ -12,7 +12,7 @@ use tower::{timeout::error::Elapsed, ServiceBuilder};
 
 use crate::api::http::{
     admin, ap, atproto, atproto_oauth, auth, claim, headless, metrics, nostr_rpc, oauth, policies,
-    service_deletion, teams,
+    service_deletion, service_provisioning, teams,
 };
 use crate::state::KeycastState;
 use axum::response::Json as AxumJson;
@@ -305,7 +305,7 @@ pub fn api_routes(
         .route("/admin/users/batch-lookup", post(admin::batch_lookup_users))
         .route(
             "/admin/create-minor-account",
-            post(admin::create_minor_account),
+            post(service_provisioning::create_minor_account),
         )
         .with_state(auth_state.clone());
 
