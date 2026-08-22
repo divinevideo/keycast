@@ -23,6 +23,8 @@ use crate::api::{
     http::{admin, routes::AuthState},
 };
 
+const PROVISIONING_LOCK_TIMEOUT: &str = "3s";
+
 #[derive(Debug, Deserialize)]
 pub struct CreateMinorAccountRequest {
     pub provisioning_operation_id: Option<String>,
@@ -125,6 +127,17 @@ fn map_account_create_error(error: RepositoryError, username: &str) -> Provision
         ),
         other => map_repo_error(other),
     }
+}
+
+async fn set_provisioning_lock_timeout(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), ProvisioningError> {
+    sqlx::query("SELECT set_config('lock_timeout', $1, true)")
+        .bind(PROVISIONING_LOCK_TIMEOUT)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| map_repo_error(error.into()))?;
+    Ok(())
 }
 
 fn normalize_username(raw: &str) -> Result<String, ProvisioningError> {
@@ -292,6 +305,7 @@ async fn provision_with_operation(
         .is_some()
     {
         let mut tx = pool.begin().await.map_err(|e| map_repo_error(e.into()))?;
+        set_provisioning_lock_timeout(&mut tx).await?;
         ServiceProvisioningOperationRepository::lock_in_tx(&mut tx, &operation_id)
             .await
             .map_err(map_repo_error)?;
@@ -328,6 +342,7 @@ async fn provision_with_operation(
     let replacement_token = generate_claim_token();
 
     let mut tx = pool.begin().await.map_err(|e| map_repo_error(e.into()))?;
+    set_provisioning_lock_timeout(&mut tx).await?;
     ServiceProvisioningOperationRepository::lock_in_tx(&mut tx, &operation_id)
         .await
         .map_err(map_repo_error)?;
