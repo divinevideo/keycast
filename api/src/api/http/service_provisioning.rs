@@ -81,19 +81,39 @@ impl IntoResponse for ProvisioningError {
 fn map_repo_error(error: RepositoryError) -> ProvisioningError {
     match error {
         RepositoryError::Unavailable(message) => {
-            ProvisioningError::Unavailable("database_unavailable", message)
+            tracing::warn!(error = %message, "Provisioning database unavailable");
+            ProvisioningError::Unavailable(
+                "database_unavailable",
+                "Service temporarily unavailable. Please try again.".to_string(),
+            )
         }
         RepositoryError::Integrity(message) => {
-            ProvisioningError::Internal("integrity_violation", message)
+            tracing::error!(error = %message, "Provisioning integrity violation");
+            ProvisioningError::Internal(
+                "integrity_violation",
+                "Something went wrong. Please try again.".to_string(),
+            )
         }
-        other => ProvisioningError::Internal("database_error", other.to_string()),
+        other => {
+            tracing::error!(error = %other, "Provisioning database error");
+            ProvisioningError::Internal(
+                "database_error",
+                "Something went wrong. Please try again.".to_string(),
+            )
+        }
     }
 }
 
 fn map_service_token_error(error: ApiError) -> ProvisioningError {
     match error {
         ApiError::Auth(message) => ProvisioningError::Unauthorized("unauthorized", message),
-        other => ProvisioningError::Unavailable("service_auth_unavailable", other.to_string()),
+        other => {
+            tracing::error!(error = %other, "Provisioning service authentication unavailable");
+            ProvisioningError::Unavailable(
+                "service_auth_unavailable",
+                "Service temporarily unavailable. Please try again.".to_string(),
+            )
+        }
     }
 }
 
@@ -289,7 +309,11 @@ async fn provision_with_operation(
         .encrypt(&secret)
         .await
         .map_err(|error| {
-            ProvisioningError::Unavailable("key_encryption_unavailable", error.to_string())
+            tracing::error!(error = %error, "Provisioning key encryption unavailable");
+            ProvisioningError::Unavailable(
+                "key_encryption_unavailable",
+                "Service temporarily unavailable. Please try again.".to_string(),
+            )
         })?;
     let replacement_token = generate_claim_token();
 
@@ -446,7 +470,11 @@ pub async fn create_minor_account(
 
 #[cfg(test)]
 mod tests {
-    use super::request_fingerprint;
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+    use keycast_core::repositories::RepositoryError;
+
+    use super::{map_repo_error, request_fingerprint};
 
     #[test]
     fn fingerprint_is_length_delimited_and_presence_sensitive() {
@@ -462,5 +490,19 @@ mod tests {
             request_fingerprint(1, "name", Some("a")),
             request_fingerprint(1, "name", Some("b"))
         );
+    }
+
+    #[tokio::test]
+    async fn repository_errors_do_not_expose_internal_details() {
+        let response = map_repo_error(RepositoryError::Database(
+            "relation service_provisioning_operations does not exist".to_string(),
+        ))
+        .into_response();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(body["code"], "database_error");
+        assert_eq!(body["error"], "Something went wrong. Please try again.");
+        assert!(!body.to_string().contains("service_provisioning_operations"));
     }
 }
