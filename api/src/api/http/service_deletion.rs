@@ -414,6 +414,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn missing_and_empty_deletion_credentials_fail_closed() {
+        unsafe { std::env::remove_var("KEYCAST_DELETION_SERVICE_TOKEN") };
+        let missing = authorize_deletion_service_token(&HeaderMap::new()).unwrap_err();
+        assert!(matches!(
+            missing,
+            ApiError::Internal(ref message)
+                if message == "Deletion service credential not configured"
+        ));
+
+        unsafe { std::env::set_var("KEYCAST_DELETION_SERVICE_TOKEN", "   ") };
+        let empty = authorize_deletion_service_token(&HeaderMap::new()).unwrap_err();
+        unsafe { std::env::remove_var("KEYCAST_DELETION_SERVICE_TOKEN") };
+        assert!(matches!(
+            empty,
+            ApiError::Internal(ref message)
+                if message == "Deletion service credential not configured"
+        ));
+    }
+
+    #[test]
     fn request_id_rejects_empty_oversized_and_unprintable() {
         assert!(validate_request_id("   ").is_err());
         assert!(validate_request_id(&"a".repeat(MAX_DELETION_REQUEST_ID_LEN + 1)).is_err());

@@ -2475,8 +2475,8 @@ pub(crate) fn authorize_service_token(headers: &HeaderMap) -> Result<(), ApiErro
 }
 
 /// Constant-time bearer check for a service credential held in an environment
-/// variable. Callers supply a sanitized missing-configuration message so the
-/// response never exposes credential names unintentionally.
+/// variable. Callers supply the missing-configuration message so each endpoint
+/// controls whether its response names the credential.
 pub(crate) fn authorize_configured_service_token(
     headers: &HeaderMap,
     env_var: &str,
