@@ -14,66 +14,19 @@ use axum::{
 };
 use chrono::Utc;
 use http_body_util::BodyExt;
-use keycast_api::{
-    api::http::{routes::AuthState, service_deletion::delete_account_service},
-    bcrypt_queue::BcryptQueue,
-    handlers::http_rpc_handler::new_http_handler_cache,
-    state::KeycastState,
-};
-use keycast_core::{
-    encryption::{KeyManager, KeyManagerError},
-    secret_pool::SecretPool,
-};
-use moka::future::Cache;
+use keycast_api::api::http::service_deletion::delete_account_service;
 use nostr_sdk::Keys;
 use serde_json::Value;
 use sqlx::PgPool;
 use std::sync::Arc;
 use tower::ServiceExt;
-use zeroize::Zeroizing;
 
 const TENANT_ID: i64 = 1;
 const SERVICE_TOKEN: &str = "test-service-deletion-token";
 
-struct TestKeyManager;
-
-#[async_trait::async_trait]
-impl KeyManager for TestKeyManager {
-    async fn encrypt(&self, plaintext_bytes: &[u8]) -> Result<Vec<u8>, KeyManagerError> {
-        Ok(plaintext_bytes.to_vec())
-    }
-    async fn decrypt(
-        &self,
-        ciphertext_bytes: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>, KeyManagerError> {
-        Ok(Zeroizing::new(ciphertext_bytes.to_vec()))
-    }
-}
-
-fn create_test_auth_state(pool: PgPool) -> AuthState {
-    let bcrypt_queue = BcryptQueue::new();
-    let secret_pool = SecretPool::new(1);
-    let tenant_cache = Cache::builder().max_capacity(10).build();
-    let key_manager: Arc<Box<dyn KeyManager>> = Arc::new(Box::new(TestKeyManager));
-    AuthState {
-        state: Arc::new(KeycastState {
-            db: pool,
-            key_manager,
-            signer_handlers: None,
-            http_handler_cache: new_http_handler_cache(),
-            server_keys: Keys::generate(),
-            tenant_cache,
-            bcrypt_sender: bcrypt_queue.sender(),
-            redis: None,
-            secret_pool: secret_pool.receiver(),
-            activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),
-        }),
-        auth_tx: None,
-    }
-}
-
-fn build_app(auth_state: AuthState) -> Router {
+fn build_app(pool: PgPool) -> Router {
     use keycast_api::api::tenant::{Tenant, TenantExtractor};
+    let (auth_state, _producer) = common::create_test_auth_state(pool);
     Router::new().route(
         "/admin/users/:pubkey/deletion",
         post(
@@ -196,7 +149,7 @@ async fn deletes_the_account_and_records_the_request() {
     let pubkey = create_user(&pool, TENANT_ID).await;
     let request_id = format!("req-delete-{pubkey}");
 
-    let app = build_app(create_test_auth_state(pool.clone()));
+    let app = build_app(pool.clone());
     let resp = app
         .oneshot(deletion_request(&pubkey, &request_id, Some(SERVICE_TOKEN)))
         .await
@@ -236,7 +189,7 @@ async fn absent_account_is_reported_as_success() {
     let pubkey = Keys::generate().public_key().to_hex();
     let request_id = format!("req-absent-{pubkey}");
 
-    let app = build_app(create_test_auth_state(pool.clone()));
+    let app = build_app(pool.clone());
     let resp = app
         .oneshot(deletion_request(&pubkey, &request_id, Some(SERVICE_TOKEN)))
         .await
@@ -259,7 +212,7 @@ async fn replaying_a_request_id_returns_the_first_outcome_without_deleting_again
     let pubkey = create_user(&pool, TENANT_ID).await;
     let request_id = format!("req-replay-{pubkey}");
 
-    let first = build_app(create_test_auth_state(pool.clone()))
+    let first = build_app(pool.clone())
         .oneshot(deletion_request(&pubkey, &request_id, Some(SERVICE_TOKEN)))
         .await
         .unwrap();
@@ -268,7 +221,7 @@ async fn replaying_a_request_id_returns_the_first_outcome_without_deleting_again
     assert_eq!(first_body["outcome"], "deleted");
     assert_eq!(first_body["replayed"], false);
 
-    let second = build_app(create_test_auth_state(pool.clone()))
+    let second = build_app(pool.clone())
         .oneshot(deletion_request(&pubkey, &request_id, Some(SERVICE_TOKEN)))
         .await
         .unwrap();
@@ -301,7 +254,7 @@ async fn a_request_id_cannot_be_reused_for_a_different_account() {
     let second_pubkey = create_user(&pool, TENANT_ID).await;
     let request_id = format!("req-rebind-{first_pubkey}");
 
-    let resp = build_app(create_test_auth_state(pool.clone()))
+    let resp = build_app(pool.clone())
         .oneshot(deletion_request(
             &first_pubkey,
             &request_id,
@@ -311,7 +264,7 @@ async fn a_request_id_cannot_be_reused_for_a_different_account() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let resp = build_app(create_test_auth_state(pool.clone()))
+    let resp = build_app(pool.clone())
         .oneshot(deletion_request(
             &second_pubkey,
             &request_id,
@@ -351,7 +304,7 @@ async fn does_not_touch_an_account_owned_by_another_tenant() {
     let request_id = format!("req-tenant-{pubkey}");
 
     // The harness authenticates as TENANT_ID, which does not own this account.
-    let resp = build_app(create_test_auth_state(pool.clone()))
+    let resp = build_app(pool.clone())
         .oneshot(deletion_request(&pubkey, &request_id, Some(SERVICE_TOKEN)))
         .await
         .unwrap();
@@ -389,7 +342,7 @@ async fn writes_an_audit_row_carrying_no_secrets() {
     let pubkey = create_user(&pool, TENANT_ID).await;
     let request_id = format!("req-audit-{pubkey}");
 
-    let resp = build_app(create_test_auth_state(pool.clone()))
+    let resp = build_app(pool.clone())
         .oneshot(deletion_request(&pubkey, &request_id, Some(SERVICE_TOKEN)))
         .await
         .unwrap();
@@ -432,7 +385,7 @@ async fn rejects_a_missing_or_wrong_service_token() {
     let pubkey = create_user(&pool, TENANT_ID).await;
 
     for token in [None, Some("wrong-token")] {
-        let resp = build_app(create_test_auth_state(pool.clone()))
+        let resp = build_app(pool.clone())
             .oneshot(deletion_request(&pubkey, "req-unauthorized", token))
             .await
             .unwrap();
@@ -465,7 +418,7 @@ async fn rejects_malformed_input_as_terminal() {
     ];
 
     for (pubkey, request_id, expected_code) in cases {
-        let resp = build_app(create_test_auth_state(pool.clone()))
+        let resp = build_app(pool.clone())
             .oneshot(deletion_request(pubkey, request_id, Some(SERVICE_TOKEN)))
             .await
             .unwrap();
@@ -493,7 +446,7 @@ async fn a_database_failure_is_reported_as_retryable() {
     let broken = pool.clone();
     broken.close().await;
 
-    let resp = build_app(create_test_auth_state(broken))
+    let resp = build_app(broken)
         .oneshot(deletion_request(
             &pubkey,
             "req-db-down",
