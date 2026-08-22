@@ -88,13 +88,16 @@ Cloud Run does not have readiness-probe-driven endpoint removal during shutdown.
 | `keycast-sendgrid-api-key` | `SENDGRID_API_KEY` |
 | `keycast-redis-url` | `REDIS_URL` |
 | `keycast-service-token` | `KEYCAST_SERVICE_TOKEN` |
+| `account-deletion-service-token-production` | `KEYCAST_DELETION_SERVICE_TOKEN` |
 
-The trusted account-deletion endpoint additionally requires
-`KEYCAST_DELETION_SERVICE_TOKEN`. It is intentionally not mapped to
-`keycast-service-token`: rollout must provision a deletion-specific Secret
-Manager value and add the Cloud Run secret mapping before enabling the external
-deletion coordinator. Until then, the endpoint fails closed while unrelated
-service-token routes remain available.
+The trusted account-deletion endpoint uses a dedicated credential rather than
+`keycast-service-token`. The production coordinator reads the Terraform-managed
+value from `dv-platform-prod`, while Cloud Run resolves the unqualified secret
+name above in `openvine-co`. Before deploying this mapping, an operator must copy
+the same value into `openvine-co` and grant the Cloud Run runtime service account
+Secret Manager access. Until the mirrored secret exists and a new revision is
+deployed, the endpoint fails closed while unrelated service-token routes remain
+available.
 
 There is no Cloud Run Sentry secret or `sentry-cli` release step in the current Cloud Build file.
 
@@ -370,6 +373,7 @@ Configuration is read at startup. There is no hot reload.
 
 - Cloud Run: update Secret Manager or env config, then run `bun run deploy` so a new revision starts with the new values.
 - GKE: update the source secret/config in the platform, wait for External Secrets where applicable, then roll the Deployment if the pods do not restart automatically.
+- Production deletion credential: pause production deletion requests before adding new secret versions because Cloud Run resolves `:latest` when each instance starts and autoscaling can temporarily mix versions. Update the Terraform-managed `dv-platform-prod` value and its `openvine-co` mirror to the same value, wait for both GKE ExternalSecrets to report `Ready`, deploy Cloud Run, roll the production Funnelcake API, and wait for old instances to drain before resuming deletion requests.
 
 Live updates that do not require a process restart:
 
