@@ -15,6 +15,7 @@ mod policy;
 mod refresh_token;
 mod registered_client;
 mod service_account_deletion;
+mod service_provisioning_operation;
 mod stored_key;
 mod team;
 mod user;
@@ -45,6 +46,10 @@ pub use registered_client::{
 pub use service_account_deletion::{
     ServiceAccountDeletionOutcome, ServiceAccountDeletionRecord, ServiceAccountDeletionRepository,
     ServiceAccountDeletionRow,
+};
+pub use service_provisioning_operation::{
+    ServiceProvisioningOperationRecord, ServiceProvisioningOperationRepository,
+    ServiceProvisioningOperationRow, PROVISIONING_OPERATION_RETENTION_DAYS,
 };
 pub use stored_key::StoredKeyRepository;
 pub use team::TeamRepository;
