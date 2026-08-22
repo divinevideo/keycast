@@ -21,7 +21,7 @@ relay visibility. Those belong to the coordinator.
 
 ```
 POST /api/admin/users/{pubkey}/deletion
-Authorization: Bearer $KEYCAST_SERVICE_TOKEN
+Authorization: Bearer $KEYCAST_DELETION_SERVICE_TOKEN
 Content-Type: application/json
 
 { "deletion_request_id": "<opaque, stable, caller-chosen>" }
@@ -32,11 +32,12 @@ keys are rejected; a prefix is never resolved to an account.
 
 ### Authentication
 
-The `KEYCAST_SERVICE_TOKEN` bearer, compared in constant time. This is
-deliberately separate from user UCAN/OAuth: by the time the coordinator calls
-this, the user's signer has been destroyed, so no user credential exists to
-present. The check is the same one the other service-authenticated admin
-endpoints use.
+The `KEYCAST_DELETION_SERVICE_TOKEN` bearer, compared in constant time. This is
+deliberately separate from both user UCAN/OAuth and the broader
+`KEYCAST_SERVICE_TOKEN`: by the time the coordinator calls this, the user's
+signer has been destroyed, so no user credential exists to present. The
+deletion credential cannot authorize unrelated service-admin routes, and the
+broader service credential cannot authorize deletion.
 
 ### `deletion_request_id`
 
@@ -110,7 +111,7 @@ retryable, every 4xx is terminal.
 | 500 | `integrity_violation` | yes | Constraint violation. Retry, then escalate if it persists. |
 | 500 | `idempotency_record_missing` | yes | A conflict was detected but the record could not be read back. |
 | 503 | `database_unavailable` | yes | Pool exhausted, timed out, or closed. |
-| 503 | `service_auth_unavailable` | yes | `KEYCAST_SERVICE_TOKEN` is not configured on the server. An operator fix; retry after deployment. |
+| 503 | `service_auth_unavailable` | yes | `KEYCAST_DELETION_SERVICE_TOKEN` is not configured on the server. An operator fix; retry after deployment. |
 
 `deletion_request_id_reused` is terminal on purpose. Answering it as success
 would let a coordinator bug report an account deleted while it is still live;
@@ -154,9 +155,9 @@ audit row or in logs.
 
 ## Operational notes
 
-- `KEYCAST_SERVICE_TOKEN` must be configured, or every call returns
-  `service_auth_unavailable`. It is the same token the other service-admin
-  endpoints use; rotating it affects them too.
+- `KEYCAST_DELETION_SERVICE_TOKEN` must be configured, or every call returns
+  `service_auth_unavailable`. It must not reuse `KEYCAST_SERVICE_TOKEN`;
+  rotating either credential does not grant the other credential's authority.
 - `service_account_deletions` grows one row per deletion request and is never
   pruned automatically. It is the audit and idempotency trail — do not add a
   retention job without deciding how long replayed requests must stay

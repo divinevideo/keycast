@@ -288,7 +288,7 @@ pub fn api_routes(
         .with_state(auth_state.clone());
 
     // Service-authenticated admin routes (for relay-manager, COOP)
-    // Uses KEYCAST_SERVICE_TOKEN Bearer auth, not UCAN
+    // Uses service-scoped Bearer auth, not UCAN. Account deletion has its own token.
     let service_admin_routes = Router::new()
         .route(
             "/admin/users/:pubkey/status",

@@ -89,6 +89,13 @@ Cloud Run does not have readiness-probe-driven endpoint removal during shutdown.
 | `keycast-redis-url` | `REDIS_URL` |
 | `keycast-service-token` | `KEYCAST_SERVICE_TOKEN` |
 
+The trusted account-deletion endpoint additionally requires
+`KEYCAST_DELETION_SERVICE_TOKEN`. It is intentionally not mapped to
+`keycast-service-token`: rollout must provision a deletion-specific Secret
+Manager value and add the Cloud Run secret mapping before enabling the external
+deletion coordinator. Until then, the endpoint fails closed while unrelated
+service-token routes remain available.
+
 There is no Cloud Run Sentry secret or `sentry-cli` release step in the current Cloud Build file.
 
 ### Production plain env
@@ -273,6 +280,10 @@ The base deployment reads these secrets:
 | `keycast-server-nsec` | `SERVER_NSEC` |
 | `keycast-sendgrid-api-key` | `SENDGRID_API_KEY` |
 | `keycast-atproto-runtime` | `KEYCAST_ATPROTO_TOKEN` |
+
+The trusted account-deletion endpoint additionally requires
+`KEYCAST_DELETION_SERVICE_TOKEN`. Each environment must inject it from a
+deletion-specific Kubernetes Secret; do not reuse `KEYCAST_SERVICE_TOKEN`.
 
 The migration job also reads:
 

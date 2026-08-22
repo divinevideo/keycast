@@ -1,5 +1,5 @@
 // ABOUTME: Trusted service-to-service terminal account deletion (keycast#297)
-// ABOUTME: Authenticated by KEYCAST_SERVICE_TOKEN; idempotent on a caller-supplied request id
+// ABOUTME: Authenticated by a deletion-scoped service token; idempotent on a caller-supplied request id
 // ABOUTME: Errors are classified retryable vs terminal so the coordinator can retry safely
 
 use axum::{
@@ -19,7 +19,7 @@ use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 
 use crate::api::error::ApiError;
-use crate::api::http::admin::authorize_service_token;
+use crate::api::http::admin::authorize_configured_service_token;
 use crate::api::http::routes::AuthState;
 
 /// Upper bound on the caller-supplied request id.
@@ -137,6 +137,20 @@ fn map_service_token_error(err: ApiError) -> ServiceDeletionError {
     }
 }
 
+/// Constant-time bearer check against the deletion-only service credential.
+///
+/// This deliberately does not fall back to `KEYCAST_SERVICE_TOKEN`: that
+/// broader credential also authorizes unrelated administration and signing
+/// operations, while the coordinator needs authority only to complete an
+/// already-committed account deletion.
+fn authorize_deletion_service_token(headers: &HeaderMap) -> Result<(), ApiError> {
+    authorize_configured_service_token(
+        headers,
+        "KEYCAST_DELETION_SERVICE_TOKEN",
+        "Deletion service credential not configured",
+    )
+}
+
 /// Canonicalize the path pubkey, rejecting anything that is not a valid
 /// 64-character hex Nostr public key.
 fn validate_pubkey(raw: &str) -> Result<String, ServiceDeletionError> {
@@ -214,10 +228,10 @@ fn replay(
 ///
 /// Permanently delete a hosted account on behalf of the deletion coordinator.
 ///
-/// Authorization is the `KEYCAST_SERVICE_TOKEN` bearer, deliberately separate
-/// from user UCAN/OAuth: by the time this runs the user's signer is gone, so
-/// there is no user credential left to present. This is not a general
-/// third-party account-deletion API.
+/// Authorization is the deletion-scoped service bearer, deliberately separate
+/// from both user UCAN/OAuth and Keycast's broader service credential: by the
+/// time this runs the user's signer is gone, so there is no user credential
+/// left to present. This is not a general third-party account-deletion API.
 pub async fn delete_account_service(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
@@ -225,7 +239,7 @@ pub async fn delete_account_service(
     Path(pubkey): Path<String>,
     Json(req): Json<ServiceAccountDeletionRequest>,
 ) -> Result<Json<ServiceAccountDeletionResponse>, ServiceDeletionError> {
-    authorize_service_token(&headers).map_err(map_service_token_error)?;
+    authorize_deletion_service_token(&headers).map_err(map_service_token_error)?;
 
     let tenant_id = tenant.0.id;
     let pubkey = validate_pubkey(&pubkey)?;
@@ -398,6 +412,26 @@ async fn record_audit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_and_empty_deletion_credentials_fail_closed() {
+        unsafe { std::env::remove_var("KEYCAST_DELETION_SERVICE_TOKEN") };
+        let missing = authorize_deletion_service_token(&HeaderMap::new()).unwrap_err();
+        assert!(matches!(
+            missing,
+            ApiError::Internal(ref message)
+                if message == "Deletion service credential not configured"
+        ));
+
+        unsafe { std::env::set_var("KEYCAST_DELETION_SERVICE_TOKEN", "   ") };
+        let empty = authorize_deletion_service_token(&HeaderMap::new()).unwrap_err();
+        unsafe { std::env::remove_var("KEYCAST_DELETION_SERVICE_TOKEN") };
+        assert!(matches!(
+            empty,
+            ApiError::Internal(ref message)
+                if message == "Deletion service credential not configured"
+        ));
+    }
 
     #[test]
     fn request_id_rejects_empty_oversized_and_unprintable() {

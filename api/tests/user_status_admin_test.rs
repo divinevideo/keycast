@@ -39,6 +39,7 @@ use zeroize::Zeroizing;
 
 const TENANT_ID: i64 = 1;
 const SERVICE_TOKEN: &str = "test-service-token-secret";
+const DELETION_SERVICE_TOKEN: &str = "test-deletion-service-token-secret";
 
 struct TestKeyManager;
 
@@ -177,6 +178,29 @@ async fn test_get_user_status_returns_active_by_default() {
     assert_eq!(status.status, "active");
     assert!(status.suspended_reason.is_none());
     assert!(status.suspended_at.is_none());
+}
+
+#[tokio::test]
+async fn deletion_service_token_cannot_read_admin_user_status() {
+    common::assert_test_database_url();
+    unsafe {
+        std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN);
+        std::env::set_var("KEYCAST_DELETION_SERVICE_TOKEN", DELETION_SERVICE_TOKEN);
+    }
+    let pool = common::setup_test_db().await;
+    let pubkey = create_test_user(&pool).await;
+
+    let response = build_app(create_test_auth_state(pool))
+        .oneshot(
+            Request::get(format!("/admin/users/{pubkey}/status"))
+                .header("authorization", format!("Bearer {DELETION_SERVICE_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
