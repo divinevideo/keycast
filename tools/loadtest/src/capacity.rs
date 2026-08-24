@@ -106,6 +106,8 @@ struct PhaseEvidence {
     kind: PhaseKind,
     passed: bool,
     checks: Vec<EvidenceCheck>,
+    stop_breached: bool,
+    stop_checks: Vec<EvidenceCheck>,
     results: TestResults,
 }
 
@@ -168,11 +170,11 @@ pub async fn run_capacity(args: CapacityArgs) -> Result<()> {
                 passed: results.summary.total_requests > 0,
             },
             EvidenceCheck {
-                metric: "error_rate",
+                metric: "unintentional_error_rate",
                 comparison: "at-most",
-                observed: results.summary.error_rate,
+                observed: results.summary.unintentional_error_rate,
                 limit: phase.max_error_rate,
-                passed: results.summary.error_rate <= phase.max_error_rate,
+                passed: results.summary.unintentional_error_rate <= phase.max_error_rate,
             },
             EvidenceCheck {
                 metric: "latency_p95_ms",
@@ -189,29 +191,15 @@ pub async fn run_capacity(args: CapacityArgs) -> Result<()> {
                 passed: results.summary.intentional_rejection_rate
                     >= phase.min_intentional_rejection_rate,
             },
-            EvidenceCheck {
-                metric: "stop_error_rate",
-                comparison: "at-most",
-                observed: results.summary.error_rate,
-                limit: plan.stop_conditions.max_error_rate,
-                passed: results.summary.error_rate <= plan.stop_conditions.max_error_rate,
-            },
-            EvidenceCheck {
-                metric: "stop_latency_p95_ms",
-                comparison: "at-most",
-                observed: results.summary.latency_p95_ms,
-                limit: plan.stop_conditions.max_latency_p95_ms,
-                passed: results.summary.latency_p95_ms <= plan.stop_conditions.max_latency_p95_ms,
-            },
         ];
         if phase.slo_applies {
             checks.extend([
                 EvidenceCheck {
                     metric: "availability_percent",
                     comparison: "at-least",
-                    observed: (1.0 - results.summary.error_rate) * 100.0,
+                    observed: (1.0 - results.summary.unintentional_error_rate) * 100.0,
                     limit: plan.objectives.availability_percent,
-                    passed: (1.0 - results.summary.error_rate) * 100.0
+                    passed: (1.0 - results.summary.unintentional_error_rate) * 100.0
                         >= plan.objectives.availability_percent,
                 },
                 EvidenceCheck {
@@ -223,15 +211,35 @@ pub async fn run_capacity(args: CapacityArgs) -> Result<()> {
                 },
             ]);
         }
-        let phase_passed = checks.iter().all(|check| check.passed);
+        let stop_checks = vec![
+            EvidenceCheck {
+                metric: "stop_unintentional_error_rate",
+                comparison: "at-most",
+                observed: results.summary.unintentional_error_rate,
+                limit: plan.stop_conditions.max_error_rate,
+                passed: results.summary.unintentional_error_rate
+                    <= plan.stop_conditions.max_error_rate,
+            },
+            EvidenceCheck {
+                metric: "stop_latency_p95_ms",
+                comparison: "at-most",
+                observed: results.summary.latency_p95_ms,
+                limit: plan.stop_conditions.max_latency_p95_ms,
+                passed: results.summary.latency_p95_ms <= plan.stop_conditions.max_latency_p95_ms,
+            },
+        ];
+        let stop_breached = stop_checks.iter().any(|check| !check.passed);
+        let phase_passed = checks.iter().all(|check| check.passed) && !stop_breached;
         phase_evidence.push(PhaseEvidence {
             name: phase.name.clone(),
             kind: phase.kind,
             passed: phase_passed,
             checks,
+            stop_breached,
+            stop_checks,
             results,
         });
-        if !phase_passed {
+        if stop_breached {
             stopped_after_phase = Some(phase.name.clone());
             break;
         }
@@ -337,14 +345,6 @@ fn validate_plan(plan: &CapacityPlan, allowed_host: Option<&str>) -> Result<Exec
         }
         if phase.kind == PhaseKind::Spike && phase.min_intentional_rejection_rate <= 0.0 {
             anyhow::bail!("the spike phase must declare a non-zero intentional rejection rate");
-        }
-        if phase.max_error_rate > plan.stop_conditions.max_error_rate
-            || phase.max_latency_p95_ms > plan.stop_conditions.max_latency_p95_ms
-        {
-            anyhow::bail!(
-                "phase {:?} limits exceed the profile stop conditions",
-                phase.name
-            );
         }
     }
     Ok(execution_environment)
@@ -497,14 +497,11 @@ mod tests {
     }
 
     #[test]
-    fn phase_limits_cannot_exceed_stop_conditions() {
+    fn absolute_stop_limits_are_independent_from_phase_limits() {
         let mut plan = plan();
         plan.phases[0].max_error_rate = 0.1;
 
-        let error = validate_plan(&plan, None).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("exceed the profile stop conditions"));
+        validate_plan(&plan, None).unwrap();
     }
 
     #[test]

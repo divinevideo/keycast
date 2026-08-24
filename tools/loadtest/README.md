@@ -171,12 +171,13 @@ keycast-loadtest capacity \
 
 Each plan must include ramp, spike, soak, recovery, rollout, and scale-down
 phases. Every phase declares its method, cache scenario, concurrency, duration,
-client-side error and p95 latency limits, whether the profile SLO applies, and
+client-side unintentional-error and p95 latency limits, whether the profile SLO applies, and
 the minimum expected HTTP 429 rejection rate. The plan seed deterministically
 offsets the user-selection schedule and is recorded in every phase. Registration
 is excluded because its generated identities are not seed-reproducible. The
-command stops after the first failed phase or profile stop-condition breach,
-writes `evidence.json`, and exits unsuccessfully.
+command records ordinary phase or SLO misses and continues so later recovery can
+still be measured. It stops after an absolute profile stop-condition breach,
+writes `evidence.json`, and exits unsuccessfully when any check failed.
 
 Localhost targets run without an additional flag. A non-local test environment
 requires an exact host authorization so a stale plan cannot silently target a

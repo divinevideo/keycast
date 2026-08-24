@@ -148,6 +148,15 @@ impl Metrics {
             } else {
                 0.0
             },
+            unintentional_error_rate: if total > 0 {
+                self.requests_error
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(self.rejected_requests.load(Ordering::Relaxed))
+                    as f64
+                    / total as f64
+            } else {
+                0.0
+            },
             errors_auth: self.errors_auth.load(Ordering::Relaxed),
             errors_server: self.errors_server.load(Ordering::Relaxed),
             errors_client: self.errors_client.load(Ordering::Relaxed),
@@ -201,6 +210,8 @@ pub struct MetricsSummary {
     pub latency_max_ms: f64,
     pub cache_hit_ratio: f64,
     pub error_rate: f64,
+    #[serde(default)]
+    pub unintentional_error_rate: f64,
     pub errors_auth: u64,
     pub errors_server: u64,
     pub errors_client: u64,
@@ -351,6 +362,7 @@ mod tests {
 
         let summary = metrics.summary();
         assert_eq!(summary.intentional_rejection_rate, 1.0);
+        assert_eq!(summary.unintentional_error_rate, 0.0);
         assert_eq!(summary.errors_client, 0);
         assert_eq!(summary.error_rate, 1.0);
     }
