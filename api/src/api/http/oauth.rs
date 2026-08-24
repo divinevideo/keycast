@@ -4547,7 +4547,7 @@ pub async fn connect_post(
         .ok_or(OAuthError::Unauthorized)?;
 
     // For nostr-login, redirect_origin is "nostrconnect://{client_pubkey}" (the secure identifier)
-    let redirect_origin = format!("nostrconnect://{}", form.client_pubkey);
+    let redirect_origin = format!("nostrconnect://{}", &form.client_pubkey);
 
     // Hash the client-provided secret with bcrypt for storage.
     let secret_hash = auth_state
@@ -4847,6 +4847,7 @@ mod tests {
                 key_manager,
                 signer_handlers: None,
                 http_handler_cache: crate::handlers::http_rpc_handler::new_http_handler_cache(),
+                account_status_cache: crate::state::new_account_status_cache(),
                 server_keys: Keys::generate(),
                 tenant_cache,
                 bcrypt,

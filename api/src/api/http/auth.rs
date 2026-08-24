@@ -5335,6 +5335,13 @@ pub async fn delete_account(
             AuthError::Database(sqlx::Error::Protocol(e.to_string()))
         })?;
 
+    super::nostr_rpc::invalidate_account_status_cache(
+        &auth_state.state.account_status_cache,
+        &user_pubkey,
+        tenant_id,
+    )
+    .await;
+
     // Signal signer daemon to remove bunker connections
     if let Some(tx) = &auth_state.auth_tx {
         use keycast_core::authorization_channel::AuthorizationCommand;
@@ -5832,6 +5839,7 @@ mod tests {
                 key_manager,
                 signer_handlers: None,
                 http_handler_cache: crate::handlers::http_rpc_handler::new_http_handler_cache(),
+                account_status_cache: crate::state::new_account_status_cache(),
                 server_keys: Keys::generate(),
                 tenant_cache,
                 bcrypt,
@@ -5938,6 +5946,7 @@ mod tests {
                 key_manager,
                 signer_handlers: None,
                 http_handler_cache: new_http_handler_cache(),
+                account_status_cache: crate::state::new_account_status_cache(),
                 server_keys: Keys::generate(),
                 tenant_cache,
                 bcrypt,

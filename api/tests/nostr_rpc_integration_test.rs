@@ -23,6 +23,7 @@ use keycast_api::api::{
         auth::{sign_event, AuthError, SignEventRequest},
         nostr_rpc::{nostr_rpc, NostrRpcRequest, NostrRpcResponse, RpcError},
         routes::AuthState,
+        service_deletion::{delete_account_service, ServiceAccountDeletionRequest},
     },
     tenant::{Tenant, TenantExtractor},
 };
@@ -161,6 +162,7 @@ fn create_test_auth_state_with_activity_logger(
             key_manager,
             signer_handlers: None,
             http_handler_cache: new_http_handler_cache(),
+            account_status_cache: keycast_api::state::new_account_status_cache(),
             server_keys: Keys::generate(),
             tenant_cache,
             bcrypt: bcrypt.clone(),
@@ -1414,6 +1416,7 @@ async fn test_warm_cache_preload_handler_rejected_after_ucan_expiry() {
                 key_manager: key_manager.clone(),
                 signer_handlers: None,
                 http_handler_cache: new_http_handler_cache(),
+                account_status_cache: keycast_api::state::new_account_status_cache(),
                 server_keys: server_keys.clone(),
                 tenant_cache,
                 bcrypt: bcrypt.clone(),
@@ -1532,6 +1535,7 @@ async fn test_server_signed_non_preload_redirect_origin_rejected() {
                 key_manager: key_manager.clone(),
                 signer_handlers: None,
                 http_handler_cache: new_http_handler_cache(),
+                account_status_cache: keycast_api::state::new_account_status_cache(),
                 server_keys: server_keys.clone(),
                 tenant_cache,
                 bcrypt: bcrypt.clone(),
@@ -1807,7 +1811,11 @@ async fn test_suspended_user_allowed_nostr_rpc_sign() {
 #[serial]
 async fn account_status_cache_removes_the_warm_pool_dependency() {
     const SERVICE_TOKEN: &str = "status-cache-invalidation-test-token";
-    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+    const DELETION_SERVICE_TOKEN: &str = "status-cache-deletion-test-token";
+    unsafe {
+        std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN);
+        std::env::set_var("KEYCAST_DELETION_SERVICE_TOKEN", DELETION_SERVICE_TOKEN);
+    };
 
     let pool = setup_single_connection_db().await;
     let tenant_id = create_test_tenant(&pool).await;
@@ -1876,6 +1884,8 @@ async fn account_status_cache_removes_the_warm_pool_dependency() {
         elapsed < HTTP_RPC_HANDLER_TIMEOUT,
         "pool acquire must fail before the handler timeout, took {elapsed:?}"
     );
+    // The lower bound proves this was the configured pool-acquire timeout,
+    // rather than an unrelated path that happened to return 503 immediately.
     assert!(
         elapsed >= SQLX_ACQUIRE_TIMEOUT,
         "uncached status check did not wait for the configured acquire timeout"
@@ -1977,7 +1987,7 @@ async fn account_status_cache_removes_the_warm_pool_dependency() {
     )
     .expect("sender-side encryption");
 
-    let _held_connection = pool
+    let held_connection = pool
         .acquire()
         .await
         .expect("single connection should be available before warm RPCs start");
@@ -2020,6 +2030,44 @@ async fn account_status_cache_removes_the_warm_pool_dependency() {
             "warm {method} waited long enough to attempt a pool checkout"
         );
     }
+
+    drop(held_connection);
+    let mut deletion_headers = HeaderMap::new();
+    deletion_headers.insert(
+        "Authorization",
+        format!("Bearer {DELETION_SERVICE_TOKEN}")
+            .parse()
+            .expect("valid deletion authorization header"),
+    );
+    let _deletion = delete_account_service(
+        create_test_tenant_extractor(tenant_id),
+        State(auth_state.clone()),
+        deletion_headers,
+        Path(pubkey),
+        Json(ServiceAccountDeletionRequest {
+            deletion_request_id: format!("status-cache-delete-{}", Uuid::new_v4()),
+        }),
+    )
+    .await
+    .expect("account deletion should commit and invalidate local status state");
+
+    let err = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state,
+        &auth_header,
+        None,
+        NostrRpcRequest {
+            method: "sign_event".to_string(),
+            params: vec![serde_json::to_value(
+                EventBuilder::text_note("must not sign after deletion")
+                    .build(user_keys.public_key()),
+            )
+            .expect("serialize unsigned event")],
+        },
+    )
+    .await
+    .expect_err("a warm RPC must refuse immediately after account deletion");
+    assert!(matches!(err, RpcError::Auth(AuthError::InvalidToken)));
 }
 
 /// Test: suspended user can still call get_public_key via nostr_rpc

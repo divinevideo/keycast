@@ -3,6 +3,7 @@
 
 use crate::activity_log::ActivityLogResult;
 use crate::handlers::http_rpc_handler::{HandlerError, HttpRpcHandler};
+use crate::state::{AccountGateState, AccountStatusCache};
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
@@ -18,9 +19,7 @@ use keycast_core::repositories::{
 };
 use keycast_core::signing_session::{parse_cache_key, CacheKey, SigningSession};
 use keycast_core::traits::CustomPermission;
-use moka::future::Cache;
 use nostr_sdk::{Event, JsonUtil, Keys, PublicKey, UnsignedEvent};
-use once_cell::sync::Lazy;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -49,36 +48,11 @@ const MAX_UNWRAP_BATCH: usize = 100;
 /// per-request seal and gift-wrap crypto.
 const MAX_WRAP_BATCH: usize = 100;
 
-/// Account restrictions and the minor-safety gate may be stale for at most this
-/// long when another instance changes them. Local admin writes invalidate the
-/// entry immediately. Misses still query Postgres and errors are never cached.
-const ACCOUNT_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
-const ACCOUNT_STATUS_CACHE_CAPACITY: u64 = 100_000;
-
-type AccountStatusCacheKey = (i64, String);
-
-#[derive(Clone, Debug)]
-enum AccountGateState {
-    Present {
-        status: String,
-        verified_minor: bool,
-    },
-    Missing,
-}
-
 #[derive(Debug)]
 enum AccountGateLoadError {
     Unavailable,
     Query,
 }
-
-static ACCOUNT_STATUS_CACHE: Lazy<Cache<AccountStatusCacheKey, AccountGateState>> =
-    Lazy::new(|| {
-        Cache::builder()
-            .max_capacity(ACCOUNT_STATUS_CACHE_CAPACITY)
-            .time_to_live(ACCOUNT_STATUS_CACHE_TTL)
-            .build()
-    });
 
 /// RPC request format (mirrors NIP-46)
 #[derive(Debug, Deserialize)]
@@ -262,6 +236,7 @@ async fn nostr_rpc_inner(
     let verified_minor = if needs_status_check {
         let deny_when_restricted = req.method.as_str() != "sign_event";
         check_user_status_active(
+            &auth_state.state.account_status_cache,
             pool,
             &handler.user_pubkey_hex(),
             tenant_id,
@@ -503,7 +478,7 @@ fn http_rpc_outcome(response: &Result<Json<NostrRpcResponse>, RpcError>) -> &'st
 /// Cache misses query Postgres and fail closed. Concurrent misses for one account
 /// are coalesced, backend errors are not cached, and local admin writes invalidate
 /// immediately. Changes made on another instance take effect within
-/// [`ACCOUNT_STATUS_CACHE_TTL`].
+/// [`crate::state::ACCOUNT_STATUS_CACHE_TTL`].
 /// Returns the account's `verified_minor` flag (same row, no extra query) for
 /// the DM containment gate; a missing user row is a refusal, never a default.
 ///
@@ -514,6 +489,7 @@ fn http_rpc_outcome(response: &Result<Json<NostrRpcResponse>, RpcError>) -> &'st
 /// and republishes elsewhere. Enforcement governs what Divine hosts — the relay
 /// rejects banned authors on write — not whether the identity can act off Divine.
 async fn check_user_status_active(
+    cache: &AccountStatusCache,
     pool: &sqlx::PgPool,
     user_pubkey_hex: &str,
     tenant_id: i64,
@@ -525,7 +501,14 @@ async fn check_user_status_active(
     let pool = pool.clone();
     let pubkey = user_pubkey_hex.to_string();
 
-    let status = match ACCOUNT_STATUS_CACHE
+    let cache_hit = cache.get(&cache_key).await.is_some();
+    if cache_hit {
+        METRICS.inc_http_rpc_account_status_cache_hit();
+    } else {
+        METRICS.inc_http_rpc_account_status_cache_miss();
+    }
+
+    let status = match cache
         .try_get_with(cache_key, async move {
             load_account_gate_state(&pool, &pubkey, tenant_id).await
         })
@@ -549,6 +532,8 @@ async fn check_user_status_active(
         }
     };
 
+    METRICS.set_http_rpc_account_status_cache_size(cache.entry_count());
+
     let result = match status {
         AccountGateState::Present {
             status,
@@ -571,10 +556,12 @@ async fn check_user_status_active(
         AccountGateState::Missing => Err(RpcError::Auth(AuthError::InvalidToken)),
     };
 
-    METRICS.observe_http_rpc_status_check(
-        http_rpc_outcome_for_status_check(&result),
-        status_started.elapsed(),
-    );
+    if !cache_hit {
+        METRICS.observe_http_rpc_status_check(
+            http_rpc_outcome_for_status_check(&result),
+            status_started.elapsed(),
+        );
+    }
     result
 }
 
@@ -628,10 +615,15 @@ async fn load_account_gate_state(
     })
 }
 
-pub(crate) async fn invalidate_account_status_cache(user_pubkey_hex: &str, tenant_id: i64) {
-    ACCOUNT_STATUS_CACHE
+pub(crate) async fn invalidate_account_status_cache(
+    cache: &AccountStatusCache,
+    user_pubkey_hex: &str,
+    tenant_id: i64,
+) {
+    cache
         .invalidate(&(tenant_id, user_pubkey_hex.to_string()))
         .await;
+    METRICS.set_http_rpc_account_status_cache_size(cache.entry_count());
 }
 
 fn http_rpc_outcome_for_status_check(result: &Result<bool, RpcError>) -> &'static str {
