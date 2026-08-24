@@ -1390,7 +1390,7 @@ async fn confidential_client_par_rejects_when_dpop_bound_access_tokens_is_false(
 
 #[tokio::test]
 #[serial]
-async fn replayed_dpop_proof_is_rejected_across_independent_app_instances() {
+async fn replayed_dpop_proof_is_rejected_across_routers_sharing_global_store() {
     configure_atproto_env();
 
     let pool = common::setup_test_db().await;
@@ -1449,7 +1449,7 @@ async fn replayed_dpop_proof_is_rejected_across_independent_app_instances() {
 
 #[tokio::test]
 #[serial]
-async fn same_dpop_jti_under_different_keys_is_allowed_across_instances() {
+async fn same_dpop_jti_under_different_keys_is_allowed_across_shared_store_routers() {
     configure_atproto_env();
 
     let pool = common::setup_test_db().await;
@@ -1494,7 +1494,7 @@ async fn same_dpop_jti_under_different_keys_is_allowed_across_instances() {
 
 #[tokio::test]
 #[serial]
-async fn replayed_client_assertion_is_rejected_across_independent_app_instances() {
+async fn replayed_client_assertion_is_rejected_across_routers_sharing_global_store() {
     configure_atproto_env();
 
     let pool = common::setup_test_db().await;

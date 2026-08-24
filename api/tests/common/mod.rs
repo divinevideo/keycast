@@ -252,7 +252,7 @@ pub fn install_global_test_state_with_redis(pool: PgPool) {
 
     let prefix = format!("test-atproto-replay:{}", uuid::Uuid::new_v4());
     let redis = build_shared_store_redis(prefix, false);
-    let (state, _producer_handle) = create_test_keycast_state(pool, Some(redis));
+    let state = create_global_test_keycast_state(pool, redis);
     let _ = KEYCAST_STATE.set(state);
 }
 
@@ -270,8 +270,35 @@ pub fn install_global_test_state_with_failing_redis(pool: PgPool) {
 
     let prefix = format!("test-atproto-replay-fail:{}", uuid::Uuid::new_v4());
     let redis = build_shared_store_redis(prefix, true);
-    let (state, _producer_handle) = create_test_keycast_state(pool, Some(redis));
+    let state = create_global_test_keycast_state(pool, redis);
     let _ = KEYCAST_STATE.set(state);
+}
+
+/// Build process-global state without attaching background work to a
+/// short-lived `#[tokio::test]` runtime. These replay tests never consume the
+/// secret pool; an intentionally closed receiver fails explicitly if a future
+/// test starts exercising a handler that does.
+fn create_global_test_keycast_state(
+    pool: PgPool,
+    redis: keycast_api::redis::PrefixedRedis,
+) -> Arc<KeycastState> {
+    let bcrypt = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
+    let secret_pool = SecretPool::new(1);
+    let secret_pool_receiver = secret_pool.receiver();
+    drop(secret_pool);
+
+    Arc::new(KeycastState {
+        db: pool,
+        key_manager: Arc::new(Box::new(TestKeyManager)),
+        signer_handlers: None,
+        http_handler_cache: new_http_handler_cache(),
+        server_keys: Keys::generate(),
+        tenant_cache: Cache::builder().max_capacity(10).build(),
+        bcrypt,
+        redis: Some(redis),
+        secret_pool: secret_pool_receiver,
+        activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),
+    })
 }
 
 /// Shared ATProto OAuth endpoint environment for integration tests.

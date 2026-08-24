@@ -276,6 +276,7 @@ If neither is set, requests from unknown domains are rejected.
 | `APP_URL` | `https://login.divine.video` | Fallback URL for OAuth callbacks / frontend runtime config |
 | `ALLOWED_PUBKEYS` | *(none)* | Comma-separated admin pubkey allowlist |
 | `DPOP_REPLAY_FAIL_OPEN` | `false` | DPoP replay-cache outage mode (`false` = fail-closed) |
+| `ATPROTO_OAUTH_REPLAY_FAIL_OPEN` | `false` | ATProto OAuth replay-store outage mode (`false` = fail-closed) |
 | `DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL` | *(none)* | ATProto provisioning control plane; endpoints fail closed if unset |
 | `SHOW_TEAMS_FUNCTIONALITY` | `false` | Show the team-management UI in the frontend |
 | `RUST_LOG` | `info` | Log filter |

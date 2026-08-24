@@ -4547,7 +4547,7 @@ pub async fn connect_post(
         .ok_or(OAuthError::Unauthorized)?;
 
     // For nostr-login, redirect_origin is "nostrconnect://{client_pubkey}" (the secure identifier)
-    let redirect_origin = format!("nostrconnect://{}", form.client_pubkey);
+    let redirect_origin = format!("nostrconnect://{}", &form.client_pubkey);
 
     // Hash the client-provided secret with bcrypt for storage.
     let secret_hash = auth_state

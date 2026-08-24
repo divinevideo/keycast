@@ -2,15 +2,17 @@
 // ABOUTME: Replaces per-instance DPoP and private_key_jwt replay maps (keycast#367)
 
 use chrono::Utc;
-use dashmap::mapref::entry::Entry;
-use dashmap::DashMap;
 use keycast_core::metrics::METRICS;
 use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use thiserror::Error;
 
 use crate::redis::PrefixedRedis;
+use crate::replay_reservation::{
+    reservation_ttl_seconds, reserve_shared, truthy_env_value, LocalReplayCache,
+    SharedReservationOutcome,
+};
 
 /// DPoP proof `iat` acceptance window: a proof is acceptable while
 /// `iat` is within `now ± DPOP_MAX_IAT_SKEW_SECONDS`. Shared with the
@@ -138,10 +140,12 @@ pub fn client_assertion_replay_key(client_id: &str, jti: &str) -> String {
 #[must_use]
 pub fn dpop_reservation_ttl_seconds(iat: i64, now: i64) -> u64 {
     let acceptance_end = iat + DPOP_MAX_IAT_SKEW_SECONDS;
-    let ttl = acceptance_end
-        .saturating_sub(now)
-        .clamp(1, 2 * DPOP_MAX_IAT_SKEW_SECONDS);
-    (ttl + REPLAY_RESERVATION_SKEW_MARGIN_SECONDS) as u64
+    reservation_ttl_seconds(
+        acceptance_end,
+        now,
+        2 * DPOP_MAX_IAT_SKEW_SECONDS,
+        REPLAY_RESERVATION_SKEW_MARGIN_SECONDS,
+    )
 }
 
 /// Client-assertion reservation retention: must cover the complete period in
@@ -151,73 +155,35 @@ pub fn dpop_reservation_ttl_seconds(iat: i64, now: i64) -> u64 {
 /// 330 seconds.
 #[must_use]
 pub fn client_assertion_reservation_ttl_seconds(exp: i64, now: i64) -> u64 {
-    let ttl = exp
-        .saturating_sub(now)
-        .clamp(1, CLIENT_ASSERTION_MAX_EXP_SKEW_SECONDS);
-    (ttl + REPLAY_RESERVATION_SKEW_MARGIN_SECONDS) as u64
+    reservation_ttl_seconds(
+        exp,
+        now,
+        CLIENT_ASSERTION_MAX_EXP_SKEW_SECONDS,
+        REPLAY_RESERVATION_SKEW_MARGIN_SECONDS,
+    )
 }
 
 /// Per-instance fallback, used only in explicit fail-open degraded mode when
 /// shared storage is unavailable. Provides atomic same-instance protection;
 /// cross-instance replay is possible in that mode by definition.
-static LOCAL_REPLAY_FALLBACK: Lazy<DashMap<String, Instant>> = Lazy::new(DashMap::new);
-
-/// Track when fallback cleanup last ran to avoid doing it on every request.
-static LAST_FALLBACK_CLEANUP: Lazy<std::sync::Mutex<Instant>> =
-    Lazy::new(|| std::sync::Mutex::new(Instant::now()));
-
-fn maybe_cleanup_fallback() {
-    let should_cleanup = LAST_FALLBACK_CLEANUP
-        .lock()
-        .ok()
-        .map(|last| last.elapsed() > Duration::from_secs(FALLBACK_CLEANUP_INTERVAL_SECS))
-        .unwrap_or(false);
-
-    if should_cleanup {
-        let now = Instant::now();
-        LOCAL_REPLAY_FALLBACK.retain(|_, expiry| *expiry > now);
-        if let Ok(mut last) = LAST_FALLBACK_CLEANUP.lock() {
-            *last = now;
-        }
-    }
-}
+static LOCAL_REPLAY_FALLBACK: Lazy<LocalReplayCache> =
+    Lazy::new(|| LocalReplayCache::new(Duration::from_secs(FALLBACK_CLEANUP_INTERVAL_SECS)));
 
 fn fallback_reserve(
     namespace: ReplayNamespace,
     replay_key: &str,
     ttl_seconds: u64,
 ) -> Result<ReservationOutcome, ReplayReservationError> {
-    maybe_cleanup_fallback();
-    let now = Instant::now();
-    let expiry = now + Duration::from_secs(ttl_seconds);
-    match LOCAL_REPLAY_FALLBACK.entry(replay_key.to_string()) {
-        Entry::Occupied(mut existing) => {
-            if *existing.get() > now {
-                METRICS.inc_atproto_oauth_replay_reservation(
-                    namespace.metric_label(),
-                    "fallback_rejected",
-                );
-                return Err(ReplayReservationError::Replay);
-            }
-            existing.insert(expiry);
-        }
-        Entry::Vacant(vacant) => {
-            vacant.insert(expiry);
-        }
+    if !LOCAL_REPLAY_FALLBACK.reserve(replay_key, ttl_seconds) {
+        METRICS.inc_atproto_oauth_replay_reservation(namespace.metric_label(), "fallback_rejected");
+        return Err(ReplayReservationError::Replay);
     }
     METRICS.inc_atproto_oauth_replay_reservation(namespace.metric_label(), "fallback_reserved");
     Ok(ReservationOutcome::FallbackReserved)
 }
 
-fn parse_truthy_env(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
-
 fn replay_fail_open_from_env_value(value: Option<&str>) -> bool {
-    value.map(parse_truthy_env).unwrap_or(false)
+    truthy_env_value(value)
 }
 
 fn replay_fail_open_enabled() -> bool {
@@ -243,61 +209,44 @@ pub async fn reserve_replay_identity(
     ttl_seconds: u64,
     fail_open: bool,
 ) -> Result<ReservationOutcome, ReplayReservationError> {
-    if let Some(redis) = redis {
-        match redis
-            .set_nx_ex(replay_key, ttl_seconds, &Utc::now().timestamp().to_string())
-            .await
-        {
-            Ok(true) => {
-                METRICS.inc_atproto_oauth_replay_reservation(namespace.metric_label(), "reserved");
-                return Ok(ReservationOutcome::Reserved);
-            }
-            Ok(false) => {
-                METRICS.inc_atproto_oauth_replay_reservation(
-                    namespace.metric_label(),
-                    "replay_rejected",
-                );
-                return Err(ReplayReservationError::Replay);
-            }
-            Err(error) => {
-                METRICS.inc_atproto_oauth_replay_reservation(
-                    namespace.metric_label(),
-                    "storage_unavailable",
-                );
-                if fail_open {
-                    tracing::error!(
-                        error = %error,
-                        namespace = namespace.metric_label(),
-                        fail_open = true,
-                        "ATProto OAuth replay reservation degraded: shared store unavailable, using per-instance fallback"
-                    );
-                } else {
-                    tracing::error!(
-                        error = %error,
-                        namespace = namespace.metric_label(),
-                        fail_open = false,
-                        "ATProto OAuth replay reservation unavailable: rejecting request to avoid cross-instance replay risk"
-                    );
-                    return Err(ReplayReservationError::StorageUnavailable);
-                }
-            }
+    match reserve_shared(
+        redis,
+        replay_key,
+        ttl_seconds,
+        &Utc::now().timestamp().to_string(),
+    )
+    .await
+    {
+        SharedReservationOutcome::Reserved => {
+            METRICS.inc_atproto_oauth_replay_reservation(namespace.metric_label(), "reserved");
+            return Ok(ReservationOutcome::Reserved);
         }
-    } else {
-        METRICS
-            .inc_atproto_oauth_replay_reservation(namespace.metric_label(), "storage_unavailable");
-        if fail_open {
-            tracing::error!(
-                namespace = namespace.metric_label(),
-                fail_open = true,
-                "ATProto OAuth replay reservation degraded: shared store not configured, using per-instance fallback"
+        SharedReservationOutcome::Replay => {
+            METRICS
+                .inc_atproto_oauth_replay_reservation(namespace.metric_label(), "replay_rejected");
+            return Err(ReplayReservationError::Replay);
+        }
+        SharedReservationOutcome::Unavailable(error) => {
+            METRICS.inc_atproto_oauth_replay_reservation(
+                namespace.metric_label(),
+                "storage_unavailable",
             );
-        } else {
-            tracing::error!(
-                namespace = namespace.metric_label(),
-                fail_open = false,
-                "ATProto OAuth replay reservation unavailable: shared store not configured, rejecting request to avoid cross-instance replay risk"
-            );
-            return Err(ReplayReservationError::StorageUnavailable);
+            if fail_open {
+                tracing::error!(
+                    error = error.as_ref().map(ToString::to_string),
+                    namespace = namespace.metric_label(),
+                    fail_open = true,
+                    "ATProto OAuth replay reservation degraded: shared store unavailable, using per-instance fallback"
+                );
+            } else {
+                tracing::error!(
+                    error = error.as_ref().map(ToString::to_string),
+                    namespace = namespace.metric_label(),
+                    fail_open = false,
+                    "ATProto OAuth replay reservation unavailable: rejecting request to avoid cross-instance replay risk"
+                );
+                return Err(ReplayReservationError::StorageUnavailable);
+            }
         }
     }
 
@@ -726,7 +675,6 @@ mod shared_store_tests {
         }
     }
 
-    #[cfg(feature = "integration-tests")]
     #[tokio::test]
     async fn failing_shared_store_fails_closed_without_fail_open() {
         let client = redis::Client::open(test_redis_url().as_str()).unwrap();
