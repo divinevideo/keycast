@@ -27,6 +27,7 @@ pub enum ApError {
     Forbidden(String),
     BadRequest(String),
     NotFound(String),
+    ServiceUnavailable(String),
     Internal(String),
 }
 
@@ -37,6 +38,7 @@ impl IntoResponse for ApError {
             ApError::Forbidden(m) => (StatusCode::FORBIDDEN, m),
             ApError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             ApError::NotFound(m) => (StatusCode::NOT_FOUND, m),
+            ApError::ServiceUnavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
             ApError::Internal(m) => {
                 tracing::error!("AP signing internal error: {}", m);
                 (
@@ -45,7 +47,13 @@ impl IntoResponse for ApError {
                 )
             }
         };
-        (status, Json(serde_json::json!({ "error": message }))).into_response()
+        let mut response = (status, Json(serde_json::json!({ "error": message }))).into_response();
+        if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, "1".parse().unwrap());
+        }
+        response
     }
 }
 
@@ -247,6 +255,17 @@ fn validate_signing_string(signing_string: &str) -> Result<(), ApError> {
     }
 }
 
+fn map_cpu_error(error: super::expensive_work::CpuWorkError) -> ApError {
+    match error {
+        super::expensive_work::CpuWorkError::AtCapacity => {
+            ApError::ServiceUnavailable("Server is busy. Please retry.".to_string())
+        }
+        super::expensive_work::CpuWorkError::Join(error) => {
+            ApError::Internal(format!("join error: {error}"))
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct SignResponse {
     pub pubkey: String,
@@ -263,7 +282,7 @@ async fn create_actor_key(
     // Generate (CPU-bound) off the async runtime.
     let material = super::expensive_work::spawn_cpu(ap_signing::generate_rsa_2048)
         .await
-        .map_err(|e| ApError::Internal(format!("join error: {e}")))?
+        .map_err(map_cpu_error)?
         .map_err(|e| ApError::Internal(e.to_string()))?;
 
     let encrypted = auth_state
@@ -426,7 +445,7 @@ pub async fn sign(
     let signature =
         super::expensive_work::spawn_cpu(move || ap_signing::sign_base64(&der, &message))
             .await
-            .map_err(|e| ApError::Internal(format!("join error: {e}")))?
+            .map_err(map_cpu_error)?
             .map_err(|e| ApError::Internal(e.to_string()))?;
 
     Ok(Json(SignResponse {
@@ -447,5 +466,13 @@ mod tests {
             validate_signing_string(&"x".repeat(MAX_SIGNING_STRING_BYTES + 1)),
             Err(ApError::BadRequest(_))
         ));
+    }
+
+    #[test]
+    fn cpu_capacity_error_is_retryable() {
+        let response =
+            map_cpu_error(super::super::expensive_work::CpuWorkError::AtCapacity).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
     }
 }

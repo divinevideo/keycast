@@ -495,6 +495,18 @@ fn validate_signing_key_count(count: usize, label: &str) -> Result<(), AuthError
     }
 }
 
+fn append_remote_json_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    label: &str,
+) -> Result<(), AuthError> {
+    if chunk.len() > MAX_REMOTE_JSON_BYTES.saturating_sub(body.len()) {
+        return Err(AuthError::BadRequest(format!("{label} is too large")));
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
 async fn fetch_json(url: &reqwest::Url, label: &str) -> Result<Value, AuthError> {
     ensure_secure_or_loopback_url(url, label)?;
     let client = reqwest::Client::builder()
@@ -508,7 +520,7 @@ async fn fetch_json(url: &reqwest::Url, label: &str) -> Result<Value, AuthError>
         )
         .build()
         .map_err(|error| AuthError::Internal(format!("Failed to build HTTP client: {error}")))?;
-    let response = client
+    let mut response = client
         .get(url.clone())
         .send()
         .await
@@ -522,12 +534,18 @@ async fn fetch_json(url: &reqwest::Url, label: &str) -> Result<Value, AuthError>
     if response.content_length().unwrap_or(0) > MAX_REMOTE_JSON_BYTES as u64 {
         return Err(AuthError::BadRequest(format!("{label} is too large")));
     }
-    let bytes = response
-        .bytes()
+    let mut bytes = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or(0)
+            .min(MAX_REMOTE_JSON_BYTES as u64) as usize,
+    );
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|error| AuthError::BadRequest(format!("Failed to read {label}: {error}")))?;
-    if bytes.len() > MAX_REMOTE_JSON_BYTES {
-        return Err(AuthError::BadRequest(format!("{label} is too large")));
+        .map_err(|error| AuthError::BadRequest(format!("Failed to read {label}: {error}")))?
+    {
+        append_remote_json_chunk(&mut bytes, &chunk, label)?;
     }
     serde_json::from_slice(&bytes)
         .map_err(|error| AuthError::BadRequest(format!("Invalid {label} JSON: {error}")))
@@ -1388,5 +1406,13 @@ mod resource_bound_tests {
             validate_signing_key_count(MAX_CLIENT_SIGNING_KEYS + 1, "JWKS"),
             Err(AuthError::BadRequest(message)) if message.contains("too many keys")
         ));
+    }
+
+    #[test]
+    fn chunked_remote_json_is_rejected_before_exceeding_the_cap() {
+        let mut body = vec![0; MAX_REMOTE_JSON_BYTES - 1];
+        let error = append_remote_json_chunk(&mut body, &[1, 2], "metadata").unwrap_err();
+        assert!(matches!(error, AuthError::BadRequest(message) if message.contains("too large")));
+        assert_eq!(body.len(), MAX_REMOTE_JSON_BYTES - 1);
     }
 }

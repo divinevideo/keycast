@@ -98,6 +98,13 @@ fn route_spec(method: &Method, path: &str) -> Option<RouteSpec> {
     Some(RouteSpec { name, resources })
 }
 
+fn matched_route_spec(method: &Method, path: &str) -> Option<RouteSpec> {
+    route_spec(method, path).or_else(|| {
+        path.strip_prefix("/api")
+            .and_then(|relative_path| route_spec(method, relative_path))
+    })
+}
+
 #[derive(Clone)]
 pub struct ResourceAdmission {
     permits: [Arc<Semaphore>; Resource::ALL.len()],
@@ -266,7 +273,7 @@ pub async fn enforce(
         .get::<MatchedPath>()
         .map(MatchedPath::as_str)
         .unwrap_or_default();
-    let Some(spec) = route_spec(request.method(), path) else {
+    let Some(spec) = matched_route_spec(request.method(), path) else {
         return next.run(request).await;
     };
 
@@ -386,6 +393,31 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        assert!(!entered.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn nested_api_route_sheds_before_handler_work() {
+        let admission = ResourceAdmission::new([0, 1, 1, 1]);
+        let entered = Arc::new(AtomicBool::new(false));
+        let handler_entered = entered.clone();
+        let api = Router::new()
+            .route(
+                "/ap/sign",
+                post(move || async move {
+                    handler_entered.store(true, Ordering::Relaxed);
+                    StatusCode::OK
+                }),
+            )
+            .route_layer(from_fn_with_state(admission, enforce));
+        let app = Router::new().nest("/api", api);
+
+        let response = app
+            .oneshot(Request::post("/api/ap/sign").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(!entered.load(Ordering::Relaxed));
     }
 
@@ -544,5 +576,7 @@ mod tests {
             );
         }
         assert!(route_spec(&Method::POST, "/nostr").is_none());
+        assert!(matched_route_spec(&Method::POST, "/api/ap/sign").is_some());
+        assert!(matched_route_spec(&Method::POST, "/api/nostr").is_none());
     }
 }
