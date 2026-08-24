@@ -197,10 +197,9 @@ pub async fn run_capacity(args: CapacityArgs) -> Result<()> {
                 EvidenceCheck {
                     metric: "availability_percent",
                     comparison: "at-least",
-                    observed: (1.0 - results.summary.unintentional_error_rate) * 100.0,
+                    observed: availability_percent(&results),
                     limit: plan.objectives.availability_percent,
-                    passed: (1.0 - results.summary.unintentional_error_rate) * 100.0
-                        >= plan.objectives.availability_percent,
+                    passed: availability_percent(&results) >= plan.objectives.availability_percent,
                 },
                 EvidenceCheck {
                     metric: "slo_latency_p95_ms",
@@ -228,8 +227,7 @@ pub async fn run_capacity(args: CapacityArgs) -> Result<()> {
                 passed: results.summary.latency_p95_ms <= plan.stop_conditions.max_latency_p95_ms,
             },
         ];
-        let stop_breached = stop_checks.iter().any(|check| !check.passed);
-        let phase_passed = checks.iter().all(|check| check.passed) && !stop_breached;
+        let (phase_passed, stop_breached) = phase_outcome(&checks, &stop_checks);
         phase_evidence.push(PhaseEvidence {
             name: phase.name.clone(),
             kind: phase.kind,
@@ -265,6 +263,18 @@ pub async fn run_capacity(args: CapacityArgs) -> Result<()> {
         anyhow::bail!("one or more capacity phases exceeded their predeclared limits");
     }
     Ok(())
+}
+
+fn availability_percent(results: &TestResults) -> f64 {
+    (1.0 - results.summary.error_rate) * 100.0
+}
+
+fn phase_outcome(checks: &[EvidenceCheck], stop_checks: &[EvidenceCheck]) -> (bool, bool) {
+    let stop_breached = stop_checks.iter().any(|check| !check.passed);
+    (
+        checks.iter().all(|check| check.passed) && !stop_breached,
+        stop_breached,
+    )
 }
 
 fn validate_plan(plan: &CapacityPlan, allowed_host: Option<&str>) -> Result<ExecutionEnvironment> {
@@ -399,6 +409,54 @@ fn safe_file_component(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::{MetricsSummary, TestMetadata};
+
+    fn results(error_rate: f64) -> TestResults {
+        TestResults {
+            metadata: TestMetadata {
+                url: "http://localhost:3000".to_owned(),
+                scenario: "Mixed".to_owned(),
+                method: "GetPublicKey".to_owned(),
+                concurrency: 1,
+                duration_secs: 1,
+                user_count: 1,
+                timestamp: chrono::Utc::now(),
+                seed: 371,
+            },
+            summary: MetricsSummary {
+                duration_secs: 1.0,
+                requests_per_second: 1.0,
+                total_requests: 1,
+                successful_requests: 0,
+                failed_requests: 1,
+                latency_min_ms: 1.0,
+                latency_p50_ms: 1.0,
+                latency_p95_ms: 1.0,
+                latency_p99_ms: 1.0,
+                latency_max_ms: 1.0,
+                cache_hit_ratio: 0.0,
+                error_rate,
+                unintentional_error_rate: 0.0,
+                errors_auth: 0,
+                errors_server: 0,
+                errors_client: 0,
+                errors_network: 0,
+                intentional_rejection_rate: error_rate,
+            },
+            timeline: Vec::new(),
+            server_metrics: None,
+        }
+    }
+
+    fn check(passed: bool) -> EvidenceCheck {
+        EvidenceCheck {
+            metric: "test",
+            comparison: "at-most",
+            observed: 0.0,
+            limit: 0.0,
+            passed,
+        }
+    }
 
     fn plan() -> CapacityPlan {
         CapacityPlan {
@@ -447,6 +505,23 @@ mod tests {
     #[test]
     fn local_complete_plan_is_valid() {
         validate_plan(&plan(), None).unwrap();
+    }
+
+    #[test]
+    fn intentional_rejections_reduce_healthy_phase_availability() {
+        assert_eq!(availability_percent(&results(1.0)), 0.0);
+    }
+
+    #[test]
+    fn ordinary_miss_continues_but_absolute_breach_stops() {
+        assert_eq!(
+            phase_outcome(&[check(false)], &[check(true)]),
+            (false, false)
+        );
+        assert_eq!(
+            phase_outcome(&[check(true)], &[check(false)]),
+            (false, true)
+        );
     }
 
     #[test]
