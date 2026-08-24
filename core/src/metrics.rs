@@ -1494,6 +1494,7 @@ fn normalize_email_admission_decision(decision: &str) -> &'static str {
     match decision {
         "admitted" => "admitted",
         "suppressed" => "suppressed",
+        "fallback" => "fallback",
         _ => "other",
     }
 }
@@ -1508,6 +1509,7 @@ fn normalize_email_admission_reason(reason: &str) -> &'static str {
         "global_volume" => "global_volume",
         "provider_capacity" => "provider_capacity",
         "admission_unavailable" => "admission_unavailable",
+        "local_fallback" => "local_fallback",
         _ => "other",
     }
 }
@@ -1545,6 +1547,12 @@ mod tests {
         metrics.inc_auth_audit_write_failure("/api/headless/login");
         metrics.inc_auth_email_send_failure("password_reset");
         metrics.observe_email_delivery_admission("email_change", "suppressed", "account_volume");
+        metrics.observe_email_delivery_admission(
+            "password_reset",
+            "fallback",
+            "admission_unavailable",
+        );
+        metrics.observe_email_delivery_admission("password_reset", "admitted", "local_fallback");
         metrics.observe_email_delivery_source_subject(true);
         metrics.inc_email_provider_in_flight();
         metrics.observe_email_provider_outcome(
@@ -1572,6 +1580,12 @@ mod tests {
             .contains("keycast_auth_email_send_failures_total{template=\"password_reset\"} 1"));
         assert!(output.contains(
             "keycast_email_delivery_admissions_total{purpose=\"email_change\",decision=\"suppressed\",reason=\"account_volume\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_email_delivery_admissions_total{purpose=\"password_reset\",decision=\"fallback\",reason=\"admission_unavailable\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_email_delivery_admissions_total{purpose=\"password_reset\",decision=\"admitted\",reason=\"local_fallback\"} 1"
         ));
         assert!(
             output.contains("keycast_email_delivery_source_subjects_total{outcome=\"derived\"} 1")

@@ -18,6 +18,11 @@ bun run dev              # Start API + Web with hot reload
 - API: http://localhost:3000
 - Web: http://localhost:5173
 
+Development email is captured in memory so verification and recovery tokens never enter logs.
+While `bun run dev` is running, inspect the local inbox at
+`http://localhost:3000/api/dev/emails`. The route is enabled explicitly by the development
+script and is never mounted when `NODE_ENV` or `RUST_ENV` is `production`.
+
 ### Integration Testing
 ```bash
 docker-compose -f docker-compose.dev.yml up -d --build  # Build & run full stack

@@ -2587,22 +2587,33 @@ pub async fn resend_verification(
                 destinations: &[email],
                 account: None,
                 source: source.as_deref(),
+                delivery_slots: 1,
             })
             .await
         {
             Ok(reservation) => Some(reservation),
             Err(denied) => {
-                record_email_delivery_event(
-                    &pool,
-                    &headers,
-                    tenant_id,
-                    "/api/auth/resend-verification",
-                    EmailDeliveryPurpose::Verification,
-                    "suppressed",
-                    Some(denied.reason.as_str()),
-                    None,
-                )
-                .await;
+                if email_delivery
+                    .should_record_anonymous_suppression(
+                        tenant_id,
+                        EmailDeliveryPurpose::Verification,
+                        email,
+                        denied.reason,
+                    )
+                    .await
+                {
+                    record_email_delivery_event(
+                        &pool,
+                        &headers,
+                        tenant_id,
+                        "/api/auth/resend-verification",
+                        EmailDeliveryPurpose::Verification,
+                        "suppressed",
+                        Some(denied.reason.as_str()),
+                        None,
+                    )
+                    .await;
+                }
                 return Json(ResendVerificationResponse {
                     success: true,
                     message: "If this email is registered, you will receive a verification email shortly."
@@ -2683,6 +2694,7 @@ pub async fn resend_verification(
                 destinations: &[&email],
                 account: None,
                 source: source.as_deref(),
+                delivery_slots: 1,
             })
             .await
         {
@@ -2782,22 +2794,33 @@ pub async fn forgot_password(
             destinations: &[&req.email],
             account: None,
             source: source.as_deref(),
+            delivery_slots: 1,
         })
         .await
     {
         Ok(reservation) => reservation,
         Err(denied) => {
-            record_email_delivery_event(
-                &pool,
-                &headers,
-                tenant_id,
-                endpoint,
-                EmailDeliveryPurpose::PasswordReset,
-                "suppressed",
-                Some(denied.reason.as_str()),
-                None,
-            )
-            .await;
+            if email_delivery
+                .should_record_anonymous_suppression(
+                    tenant_id,
+                    EmailDeliveryPurpose::PasswordReset,
+                    &req.email,
+                    denied.reason,
+                )
+                .await
+            {
+                record_email_delivery_event(
+                    &pool,
+                    &headers,
+                    tenant_id,
+                    endpoint,
+                    EmailDeliveryPurpose::PasswordReset,
+                    "suppressed",
+                    Some(denied.reason.as_str()),
+                    None,
+                )
+                .await;
+            }
             return Ok(Json(ForgotPasswordResponse {
                 success: true,
                 message:
@@ -4474,9 +4497,12 @@ pub async fn change_email(
         .admit(EmailAdmissionRequest {
             tenant_id,
             purpose: EmailDeliveryPurpose::EmailChange,
-            destinations: &[&current_email, &new_email],
+            // The current address is a required notification, not the caller-selected target.
+            // Charging its destination cooldown would prevent correcting a typo in the new address.
+            destinations: &[&new_email],
             account: Some(&user_pubkey),
             source: source.as_deref(),
+            delivery_slots: 2,
         })
         .await
     {

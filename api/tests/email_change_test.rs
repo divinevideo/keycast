@@ -24,10 +24,12 @@ use keycast_api::api::{
     tenant::{Tenant, TenantExtractor},
 };
 use keycast_api::{
-    email_delivery::{EmailAdmissionRefusal, EmailDeliveryService},
+    email_delivery::{EmailAdmissionRefusal, EmailDeliveryConfig, EmailDeliveryService},
     email_service::{DevEmailSender, EmailSender},
+    PrefixedRedis,
 };
 use nostr_sdk::Keys;
+use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -180,6 +182,23 @@ fn build_app_with_delivery(pool: PgPool, email_delivery: EmailDeliveryService) -
             ),
         )
         .layer(middleware::from_fn(request_id_middleware))
+}
+
+async fn redis_delivery(sender: Arc<dyn EmailSender>) -> EmailDeliveryService {
+    let redis_url =
+        std::env::var("TEST_REDIS_URL").expect("TEST_REDIS_URL must name the dedicated test Redis");
+    let client = redis::Client::open(redis_url).expect("valid Redis URL");
+    let connection = ConnectionManager::new(client)
+        .await
+        .expect("Redis connection for email-change test");
+    EmailDeliveryService::new(
+        PrefixedRedis::new(
+            connection,
+            Some(format!("email-change-test:{}", Uuid::new_v4())),
+        ),
+        sender,
+        EmailDeliveryConfig::default(),
+    )
 }
 
 async fn post_json(
@@ -682,7 +701,8 @@ async fn test_new_change_cancels_prior() {
     let email_b = format!("b-{}@example.com", Uuid::new_v4());
     create_user(&pool, &pubkey, &old_email, "pw-rotate-test").await;
 
-    let app = build_app(pool.clone());
+    let sender: Arc<dyn EmailSender> = Arc::new(DevEmailSender::new());
+    let app = build_app_with_delivery(pool.clone(), redis_delivery(sender).await);
     let auth = mint_session_token(&keys).await;
 
     post_json(

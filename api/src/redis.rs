@@ -20,6 +20,8 @@ pub struct PrefixedRedis {
     prefix: Option<String>,
     #[cfg(any(test, feature = "integration-tests"))]
     fail_setex: bool,
+    #[cfg(any(test, feature = "integration-tests"))]
+    fail_scripts: bool,
 }
 
 impl std::fmt::Debug for PrefixedRedis {
@@ -46,6 +48,8 @@ impl PrefixedRedis {
             prefix,
             #[cfg(any(test, feature = "integration-tests"))]
             fail_setex: false,
+            #[cfg(any(test, feature = "integration-tests"))]
+            fail_scripts: false,
         }
     }
 
@@ -55,6 +59,15 @@ impl PrefixedRedis {
     pub fn new_failing(conn: ConnectionManager, prefix: Option<String>) -> Self {
         let mut redis = Self::new(conn, prefix);
         redis.fail_setex = true;
+        redis
+    }
+
+    /// Create a test Redis wrapper that rejects every Lua script invocation.
+    #[cfg(any(test, feature = "integration-tests"))]
+    #[must_use]
+    pub fn new_failing_scripts(conn: ConnectionManager, prefix: Option<String>) -> Self {
+        let mut redis = Self::new(conn, prefix);
+        redis.fail_scripts = true;
         redis
     }
 
@@ -76,6 +89,8 @@ impl PrefixedRedis {
             prefix,
             #[cfg(any(test, feature = "integration-tests"))]
             fail_setex: false,
+            #[cfg(any(test, feature = "integration-tests"))]
+            fail_scripts: false,
         }
     }
 
@@ -120,6 +135,14 @@ impl PrefixedRedis {
         F: Fn(ConnectionManager) -> Fut,
         Fut: std::future::Future<Output = RedisResult<T>>,
     {
+        #[cfg(any(test, feature = "integration-tests"))]
+        if self.fail_scripts {
+            return Err(redis::RedisError::from((
+                redis::ErrorKind::IoError,
+                "injected script failure",
+            )));
+        }
+
         let conn = self.conn.read().await.clone();
         match op(conn).await {
             Ok(result) => Ok(result),

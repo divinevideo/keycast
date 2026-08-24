@@ -35,6 +35,12 @@ async fn nostr_rpc_timeout_error(error: BoxError) -> axum::response::Response {
     }
 }
 
+async fn development_emails(
+    axum::Extension(email_delivery): axum::Extension<EmailDeliveryService>,
+) -> AxumJson<Vec<crate::email_service::CapturedEmail>> {
+    AxumJson(email_delivery.captured_emails())
+}
+
 // State wrapper to pass state to auth handlers
 #[derive(Clone)]
 pub struct AuthState {
@@ -63,6 +69,18 @@ pub fn api_routes(
     auth_tx: Option<AuthorizationSender>,
 ) -> Router {
     tracing::debug!("Building routes");
+
+    let development_email_routes = if std::env::var("ENABLE_DEV_EMAIL_INBOX").as_deref()
+        == Ok("true")
+        && std::env::var("NODE_ENV").as_deref() != Ok("production")
+        && std::env::var("RUST_ENV").as_deref() != Ok("production")
+    {
+        Router::new()
+            .route("/dev/emails", get(development_emails))
+            .layer(axum::Extension(email_delivery.clone()))
+    } else {
+        Router::new()
+    };
 
     let auth_state = AuthState { state, auth_tx };
 
@@ -383,6 +401,7 @@ pub fn api_routes(
         .merge(claim_routes.layer(public_cors.clone())) // Public - claim preloaded accounts
         .merge(metrics_route.layer(public_cors.clone())) // Public - Prometheus metrics
         .merge(docs_route.layer(public_cors))
+        .merge(development_email_routes)
         .fallback(api_not_found) // Return 404 for unmatched API routes
 }
 

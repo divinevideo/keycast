@@ -9,11 +9,11 @@ use keycast_core::metrics::METRICS;
 use redis::RedisResult;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap, VecDeque},
     env,
     future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio::sync::Semaphore;
@@ -69,10 +69,11 @@ if account_enabled == 1 then
     end
 end
 
+local source_exceeded = 0
 if source_enabled == 1 then
     trim_window(source_key, source_window_ms)
     if redis.call('ZCARD', source_key) + slots > source_limit then
-        return {0, 4}
+        source_exceeded = 1
     end
 end
 
@@ -103,7 +104,14 @@ if account_enabled == 1 then redis.call('PEXPIRE', account_key, account_window_m
 if source_enabled == 1 then redis.call('PEXPIRE', source_key, source_window_ms) end
 redis.call('PEXPIRE', global_key, global_window_ms)
 redis.call('PEXPIRE', in_flight_key, reservation_ttl_ms)
-return {1, 0}
+return {1, source_exceeded == 1 and 4 or 0}
+"#;
+
+const AUDIT_ONCE_SCRIPT: &str = r#"
+if redis.call('SET', KEYS[1], '1', 'PX', ARGV[1], 'NX') then
+    return 1
+end
+return 0
 "#;
 
 const RELEASE_SCRIPT: &str = r#"
@@ -129,6 +137,7 @@ pub struct EmailDeliveryConfig {
     pub global_window: Duration,
     pub provider_in_flight_limit: usize,
     pub provider_request_timeout: Duration,
+    pub fallback_instance_divisor: usize,
 }
 
 impl Default for EmailDeliveryConfig {
@@ -147,6 +156,7 @@ impl Default for EmailDeliveryConfig {
             global_window: Duration::from_secs(60),
             provider_in_flight_limit: 20,
             provider_request_timeout: Duration::from_secs(10),
+            fallback_instance_divisor: 3,
         }
     }
 }
@@ -177,7 +187,10 @@ impl EmailDeliveryConfig {
                 "EMAIL_DELIVERY_ACCOUNT_WINDOW_SECONDS",
                 defaults.account_window,
             )?,
-            source_limit: env_usize("EMAIL_DELIVERY_SOURCE_LIMIT", defaults.source_limit)?,
+            source_limit: env_nonnegative_usize(
+                "EMAIL_DELIVERY_SOURCE_LIMIT",
+                defaults.source_limit,
+            )?,
             source_window: env_duration(
                 "EMAIL_DELIVERY_SOURCE_WINDOW_SECONDS",
                 defaults.source_window,
@@ -198,6 +211,10 @@ impl EmailDeliveryConfig {
             provider_request_timeout: env_duration_millis(
                 "EMAIL_PROVIDER_REQUEST_TIMEOUT_MS",
                 defaults.provider_request_timeout,
+            )?,
+            fallback_instance_divisor: env_usize(
+                "EMAIL_DELIVERY_FALLBACK_INSTANCE_DIVISOR",
+                defaults.fallback_instance_divisor,
             )?,
         })
     }
@@ -267,6 +284,8 @@ pub struct EmailAdmissionRequest<'a> {
     pub destinations: &'a [&'a str],
     pub account: Option<&'a str>,
     pub source: Option<&'a str>,
+    /// Number of provider deliveries charged to account/global capacity.
+    pub delivery_slots: usize,
 }
 
 /// Stable refusal reason safe for audit and metrics.
@@ -308,6 +327,10 @@ enum ReservationBackend {
         id: String,
         slots: usize,
     },
+    Local {
+        state: Arc<Mutex<LocalAdmissionState>>,
+        slots: usize,
+    },
     Unrestricted,
 }
 
@@ -319,6 +342,11 @@ pub struct EmailDeliveryReservation {
 impl EmailDeliveryReservation {
     /// Release global provider capacity while retaining spent rolling budgets.
     pub async fn release(self) {
+        if let ReservationBackend::Local { state, slots } = &self.backend {
+            let mut state = state.lock().expect("local email admission lock poisoned");
+            state.in_flight = state.in_flight.saturating_sub(*slots);
+            return;
+        }
         let ReservationBackend::Redis {
             redis,
             in_flight_key,
@@ -338,6 +366,15 @@ impl EmailDeliveryReservation {
     }
 }
 
+#[derive(Default)]
+struct LocalAdmissionState {
+    destinations: HashMap<String, VecDeque<Instant>>,
+    accounts: HashMap<String, VecDeque<Instant>>,
+    suppression_audits: HashMap<String, Instant>,
+    global: VecDeque<Instant>,
+    in_flight: usize,
+}
+
 #[derive(Clone)]
 enum AdmissionBackend {
     Redis(PrefixedRedis),
@@ -352,6 +389,7 @@ pub struct EmailDeliveryService {
     sender: Arc<dyn EmailSender>,
     provider_semaphore: Arc<Semaphore>,
     config: EmailDeliveryConfig,
+    local_fallback: Arc<Mutex<LocalAdmissionState>>,
 }
 
 impl EmailDeliveryService {
@@ -373,6 +411,7 @@ impl EmailDeliveryService {
             sender,
             provider_semaphore: Arc::new(Semaphore::new(config.provider_in_flight_limit)),
             config,
+            local_fallback: Arc::new(Mutex::new(LocalAdmissionState::default())),
         }
     }
 
@@ -385,6 +424,7 @@ impl EmailDeliveryService {
             sender,
             provider_semaphore: Arc::new(Semaphore::new(config.provider_in_flight_limit)),
             config,
+            local_fallback: Arc::new(Mutex::new(LocalAdmissionState::default())),
         }
     }
 
@@ -397,6 +437,7 @@ impl EmailDeliveryService {
             sender,
             provider_semaphore: Arc::new(Semaphore::new(config.provider_in_flight_limit)),
             config,
+            local_fallback: Arc::new(Mutex::new(LocalAdmissionState::default())),
         }
     }
 
@@ -433,8 +474,8 @@ impl EmailDeliveryService {
             .iter()
             .map(|destination| subject_hash(request.tenant_id, destination))
             .collect::<BTreeSet<_>>();
-        let slots = destinations.len();
-        let provider_slots = 1;
+        let slots = request.delivery_slots;
+        let provider_slots = slots;
         if slots == 0 {
             let denied = EmailAdmissionDenied {
                 reason: EmailAdmissionRefusal::Unavailable,
@@ -474,7 +515,7 @@ impl EmailDeliveryService {
             usize::from(request.account.is_some()).to_string(),
             self.config.account_limit.to_string(),
             self.config.account_window.as_millis().to_string(),
-            usize::from(request.source.is_some()).to_string(),
+            usize::from(request.source.is_some() && self.config.source_limit > 0).to_string(),
             self.config.source_limit.to_string(),
             self.config.source_window.as_millis().to_string(),
             self.config.global_limit.to_string(),
@@ -490,16 +531,18 @@ impl EmailDeliveryService {
                 tracing::warn!(error = %error, "Email delivery admission unavailable");
                 METRICS.observe_email_delivery_admission(
                     purpose,
-                    "suppressed",
+                    "fallback",
                     EmailAdmissionRefusal::Unavailable.as_str(),
                 );
-                return Err(EmailAdmissionDenied {
-                    reason: EmailAdmissionRefusal::Unavailable,
-                });
+                return self.admit_local(request, destinations, purpose);
             }
         };
         if admitted == 1 {
-            METRICS.observe_email_delivery_admission(purpose, "admitted", "none");
+            METRICS.observe_email_delivery_admission(
+                purpose,
+                "admitted",
+                if reason == 4 { "source_volume" } else { "none" },
+            );
             return Ok(EmailDeliveryReservation {
                 backend: ReservationBackend::Redis {
                     redis: redis.clone(),
@@ -521,6 +564,144 @@ impl EmailDeliveryService {
         };
         METRICS.observe_email_delivery_admission(purpose, "suppressed", reason.as_str());
         Err(EmailAdmissionDenied { reason })
+    }
+
+    fn admit_local(
+        &self,
+        request: EmailAdmissionRequest<'_>,
+        destinations: BTreeSet<String>,
+        purpose: &str,
+    ) -> Result<EmailDeliveryReservation, EmailAdmissionDenied> {
+        let now = Instant::now();
+        let divisor = self.config.fallback_instance_divisor;
+        let divided = |limit: usize| limit.div_ceil(divisor).max(1);
+        let mut state = self
+            .local_fallback
+            .lock()
+            .expect("local email admission lock poisoned");
+
+        state.destinations.retain(|_, events| {
+            trim_local(events, now, self.config.destination_window);
+            !events.is_empty()
+        });
+        state.accounts.retain(|_, events| {
+            trim_local(events, now, self.config.account_window);
+            !events.is_empty()
+        });
+
+        for destination in &destinations {
+            let key = format!("{purpose}:{destination}");
+            let events = state.destinations.entry(key).or_default();
+            trim_local(events, now, self.config.destination_window);
+            if events
+                .back()
+                .is_some_and(|last| now.duration_since(*last) < self.config.destination_cooldown)
+            {
+                return local_denial(purpose, EmailAdmissionRefusal::DestinationCooldown);
+            }
+            if events.len() >= divided(self.config.destination_limit) {
+                return local_denial(purpose, EmailAdmissionRefusal::DestinationVolume);
+            }
+        }
+        if let Some(account) = request.account {
+            let account = subject_hash(request.tenant_id, account);
+            let events = state.accounts.entry(account).or_default();
+            trim_local(events, now, self.config.account_window);
+            if events.len() + request.delivery_slots > divided(self.config.account_limit) {
+                return local_denial(purpose, EmailAdmissionRefusal::AccountVolume);
+            }
+        }
+        trim_local(&mut state.global, now, self.config.global_window);
+        if state.global.len() + request.delivery_slots > divided(self.config.global_limit) {
+            return local_denial(purpose, EmailAdmissionRefusal::GlobalVolume);
+        }
+        if state.in_flight + request.delivery_slots > divided(self.config.provider_in_flight_limit)
+        {
+            return local_denial(purpose, EmailAdmissionRefusal::ProviderCapacity);
+        }
+
+        for destination in destinations {
+            state
+                .destinations
+                .entry(format!("{purpose}:{destination}"))
+                .or_default()
+                .push_back(now);
+        }
+        if let Some(account) = request.account {
+            let events = state
+                .accounts
+                .entry(subject_hash(request.tenant_id, account))
+                .or_default();
+            events.extend(std::iter::repeat_n(now, request.delivery_slots));
+        }
+        state
+            .global
+            .extend(std::iter::repeat_n(now, request.delivery_slots));
+        state.in_flight += request.delivery_slots;
+        METRICS.observe_email_delivery_admission(purpose, "admitted", "local_fallback");
+        drop(state);
+        Ok(EmailDeliveryReservation {
+            backend: ReservationBackend::Local {
+                state: self.local_fallback.clone(),
+                slots: request.delivery_slots,
+            },
+        })
+    }
+
+    /// Return true only for the first suppressed anonymous request in one destination window.
+    pub async fn should_record_anonymous_suppression(
+        &self,
+        tenant_id: i64,
+        purpose: EmailDeliveryPurpose,
+        destination: &str,
+        reason: EmailAdmissionRefusal,
+    ) -> bool {
+        let key = format!(
+            "email_delivery:{{shared}}:audit:{}:{}:{}",
+            purpose.as_str(),
+            reason.as_str(),
+            subject_hash(tenant_id, destination)
+        );
+        let redis = match &self.backend {
+            AdmissionBackend::Redis(redis) => redis,
+            AdmissionBackend::Deny(EmailAdmissionRefusal::Unavailable) => {
+                return self.reserve_local_suppression_audit(key);
+            }
+            AdmissionBackend::Deny(_) => return true,
+            AdmissionBackend::Unrestricted => return false,
+        };
+        let args = vec![self.config.destination_window.as_millis().to_string()];
+        match redis
+            .invoke_script::<i64>(AUDIT_ONCE_SCRIPT, std::slice::from_ref(&key), &args)
+            .await
+        {
+            Ok(created) => created == 1,
+            Err(_) => self.reserve_local_suppression_audit(key),
+        }
+    }
+
+    fn reserve_local_suppression_audit(&self, key: String) -> bool {
+        let now = Instant::now();
+        let mut state = self
+            .local_fallback
+            .lock()
+            .expect("local email admission lock poisoned");
+        state
+            .suppression_audits
+            .retain(|_, recorded| now.duration_since(*recorded) < self.config.destination_window);
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            state.suppression_audits.entry(key)
+        {
+            entry.insert(now);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[must_use]
+    pub fn captured_emails(&self) -> Vec<crate::email_service::CapturedEmail> {
+        self.sender.get_captured_emails()
     }
 
     pub async fn send_verification(
@@ -609,6 +790,23 @@ impl EmailDeliveryService {
         );
         result.map(|()| EmailProviderOutcome::Accepted)
     }
+}
+
+fn trim_local(events: &mut VecDeque<Instant>, now: Instant, window: Duration) {
+    while events
+        .front()
+        .is_some_and(|event| now.duration_since(*event) >= window)
+    {
+        events.pop_front();
+    }
+}
+
+fn local_denial(
+    purpose: &str,
+    reason: EmailAdmissionRefusal,
+) -> Result<EmailDeliveryReservation, EmailAdmissionDenied> {
+    METRICS.observe_email_delivery_admission(purpose, "suppressed", reason.as_str());
+    Err(EmailAdmissionDenied { reason })
 }
 
 struct ProviderInFlightMetric;
@@ -793,6 +991,7 @@ mod tests {
             sender: sender.clone(),
             provider_semaphore: Arc::new(Semaphore::new(1)),
             config,
+            local_fallback: Arc::new(Mutex::new(LocalAdmissionState::default())),
         };
 
         let first_service = service.clone();
@@ -820,6 +1019,87 @@ mod tests {
         ));
         assert_eq!(sender.maximum.load(Ordering::SeqCst), 1);
         assert_eq!(sender.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn local_fallback_is_bounded_and_releases_capacity() {
+        let sender: Arc<dyn EmailSender> = Arc::new(SlowSender::new(Duration::ZERO));
+        let config = EmailDeliveryConfig {
+            destination_cooldown: Duration::ZERO,
+            destination_limit: 30,
+            account_limit: 6,
+            global_limit: 30,
+            provider_in_flight_limit: 6,
+            fallback_instance_divisor: 3,
+            ..EmailDeliveryConfig::default()
+        };
+        let service = EmailDeliveryService {
+            backend: AdmissionBackend::Unrestricted,
+            sender,
+            provider_semaphore: Arc::new(Semaphore::new(6)),
+            config,
+            local_fallback: Arc::new(Mutex::new(LocalAdmissionState::default())),
+        };
+        let request = || EmailAdmissionRequest {
+            tenant_id: 1,
+            purpose: EmailDeliveryPurpose::EmailChange,
+            destinations: &["corrected@example.com"],
+            account: Some("account"),
+            source: Some("192.0.2.0"),
+            delivery_slots: 2,
+        };
+
+        let reservation = service
+            .admit_local(
+                request(),
+                BTreeSet::from([subject_hash(1, "corrected@example.com")]),
+                "email_change",
+            )
+            .expect("two fallback slots fit the divided per-instance budget");
+        let denied = match service.admit_local(
+            request(),
+            BTreeSet::from([subject_hash(1, "another@example.com")]),
+            "email_change",
+        ) {
+            Ok(_) => panic!("a second two-message change must exceed the local account budget"),
+            Err(denied) => denied,
+        };
+        assert_eq!(denied.reason, EmailAdmissionRefusal::AccountVolume);
+        reservation.release().await;
+        assert_eq!(service.local_fallback.lock().unwrap().in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn unavailable_redis_aggregates_anonymous_suppression_audits_locally() {
+        let sender: Arc<dyn EmailSender> = Arc::new(SlowSender::new(Duration::ZERO));
+        let service = EmailDeliveryService {
+            backend: AdmissionBackend::Deny(EmailAdmissionRefusal::Unavailable),
+            sender,
+            provider_semaphore: Arc::new(Semaphore::new(1)),
+            config: EmailDeliveryConfig::default(),
+            local_fallback: Arc::new(Mutex::new(LocalAdmissionState::default())),
+        };
+
+        assert!(
+            service
+                .should_record_anonymous_suppression(
+                    1,
+                    EmailDeliveryPurpose::PasswordReset,
+                    "fallback-audit@example.com",
+                    EmailAdmissionRefusal::DestinationCooldown,
+                )
+                .await
+        );
+        assert!(
+            !service
+                .should_record_anonymous_suppression(
+                    1,
+                    EmailDeliveryPurpose::PasswordReset,
+                    "fallback-audit@example.com",
+                    EmailAdmissionRefusal::DestinationCooldown,
+                )
+                .await
+        );
     }
 }
 
@@ -860,6 +1140,75 @@ mod integration_tests {
         )
     }
 
+    async fn failing_redis_service(config: EmailDeliveryConfig) -> EmailDeliveryService {
+        let redis_url =
+            env::var("TEST_REDIS_URL").expect("TEST_REDIS_URL must name the dedicated test Redis");
+        let client = redis::Client::open(redis_url).expect("valid Redis URL");
+        let connection = ConnectionManager::new(client)
+            .await
+            .expect("fallback test Redis connection");
+        EmailDeliveryService::new(
+            PrefixedRedis::new_failing_scripts(
+                connection,
+                Some(format!("keycast-email-fallback-test:{}", Uuid::new_v4())),
+            ),
+            Arc::new(DevEmailSender::new()),
+            config,
+        )
+    }
+
+    #[tokio::test]
+    async fn redis_failure_uses_bounded_local_admission() {
+        let service = failing_redis_service(EmailDeliveryConfig {
+            destination_cooldown: Duration::ZERO,
+            destination_limit: 3,
+            fallback_instance_divisor: 3,
+            ..EmailDeliveryConfig::default()
+        })
+        .await;
+        let request = |destination| EmailAdmissionRequest {
+            tenant_id: 1,
+            purpose: EmailDeliveryPurpose::PasswordReset,
+            destinations: destination,
+            account: None,
+            source: Some("192.0.2.0"),
+            delivery_slots: 1,
+        };
+        let first_destination = ["fallback@example.com"];
+        let first = service
+            .admit(request(&first_destination))
+            .await
+            .expect("Redis failure degrades to one bounded local delivery");
+        first.release().await;
+        let denied = service.admit(request(&first_destination)).await;
+        assert_eq!(refusal(denied), EmailAdmissionRefusal::DestinationVolume);
+    }
+
+    #[tokio::test]
+    async fn anonymous_suppression_audit_is_reserved_once_per_window() {
+        let (service, _) = services(EmailDeliveryConfig::default()).await;
+        assert!(
+            service
+                .should_record_anonymous_suppression(
+                    1,
+                    EmailDeliveryPurpose::PasswordReset,
+                    "audit@example.com",
+                    EmailAdmissionRefusal::DestinationCooldown,
+                )
+                .await
+        );
+        assert!(
+            !service
+                .should_record_anonymous_suppression(
+                    1,
+                    EmailDeliveryPurpose::PasswordReset,
+                    "audit@example.com",
+                    EmailAdmissionRefusal::DestinationCooldown,
+                )
+                .await
+        );
+    }
+
     #[tokio::test]
     async fn independent_instances_admit_one_destination_cooldown_winner() {
         let (first, second) = services(EmailDeliveryConfig::default()).await;
@@ -871,6 +1220,7 @@ mod integration_tests {
                     destinations: &["same@example.com"],
                     account: None,
                     source: Some("192.0.2.0"),
+                    delivery_slots: 1,
                 })
                 .await
         });
@@ -882,6 +1232,7 @@ mod integration_tests {
                     destinations: &["same@example.com"],
                     account: None,
                     source: Some("192.0.2.0"),
+                    delivery_slots: 1,
                 })
                 .await
         });
@@ -910,6 +1261,7 @@ mod integration_tests {
                 destinations: &["same@example.com"],
                 account: None,
                 source: Some("192.0.2.0"),
+                delivery_slots: 1,
             })
             .await
             .expect("password reset reservation");
@@ -920,6 +1272,7 @@ mod integration_tests {
                 destinations: &["same@example.com"],
                 account: None,
                 source: Some("192.0.2.0"),
+                delivery_slots: 1,
             })
             .await
             .expect("verification has an independent destination budget");
@@ -929,7 +1282,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn account_source_and_global_budgets_are_independent() {
+    async fn account_source_signal_and_global_budgets_are_independent() {
         let base = EmailDeliveryConfig {
             destination_cooldown: Duration::ZERO,
             destination_limit: 100,
@@ -951,6 +1304,7 @@ mod integration_tests {
                 destinations: &["destination-volume@example.com"],
                 account: None,
                 source: Some("192.0.2.0"),
+                delivery_slots: 1,
             })
             .await
             .expect("first destination delivery");
@@ -963,6 +1317,7 @@ mod integration_tests {
                         destinations: &["destination-volume@example.com"],
                         account: None,
                         source: Some("192.0.3.0"),
+                        delivery_slots: 1,
                     })
                     .await
             ),
@@ -978,6 +1333,7 @@ mod integration_tests {
                 destinations: &["one@example.com"],
                 account: Some("account-a"),
                 source: Some("192.0.2.0"),
+                delivery_slots: 1,
             })
             .await
             .expect("first account delivery");
@@ -990,6 +1346,7 @@ mod integration_tests {
                         destinations: &["two@example.com"],
                         account: Some("account-a"),
                         source: Some("192.0.2.0"),
+                        delivery_slots: 1,
                     })
                     .await
             ),
@@ -1010,6 +1367,7 @@ mod integration_tests {
                 destinations: &["three@example.com"],
                 account: Some("account-b"),
                 source: Some("198.51.100.0"),
+                delivery_slots: 1,
             })
             .await
             .expect("first source delivery");
@@ -1020,25 +1378,24 @@ mod integration_tests {
                 destinations: &["four@example.com"],
                 account: Some("account-c"),
                 source: Some("198.51.100.0"),
+                delivery_slots: 1,
             })
             .await
             .expect("second user behind shared source");
-        assert_eq!(
-            refusal(
-                source_service
-                    .admit(EmailAdmissionRequest {
-                        tenant_id: 1,
-                        purpose: EmailDeliveryPurpose::Verification,
-                        destinations: &["shared-source-cap@example.com"],
-                        account: Some("account-d"),
-                        source: Some("198.51.100.0"),
-                    })
-                    .await
-            ),
-            EmailAdmissionRefusal::SourceVolume
-        );
+        let third = source_service
+            .admit(EmailAdmissionRequest {
+                tenant_id: 1,
+                purpose: EmailDeliveryPurpose::Verification,
+                destinations: &["shared-source-cap@example.com"],
+                account: Some("account-d"),
+                source: Some("198.51.100.0"),
+                delivery_slots: 1,
+            })
+            .await
+            .expect("a shared source is an observation signal, not a recovery denial");
         first.release().await;
         second.release().await;
+        third.release().await;
 
         let global_config = EmailDeliveryConfig {
             source_limit: 100,
@@ -1053,6 +1410,7 @@ mod integration_tests {
                 destinations: &["five@example.com"],
                 account: None,
                 source: Some("203.0.113.0"),
+                delivery_slots: 1,
             })
             .await
             .expect("first global delivery");
@@ -1065,6 +1423,7 @@ mod integration_tests {
                         destinations: &["six@example.com"],
                         account: None,
                         source: Some("203.0.114.0"),
+                        delivery_slots: 1,
                     })
                     .await
             ),
@@ -1086,6 +1445,7 @@ mod integration_tests {
                 destinations: &["provider-one@example.com"],
                 account: None,
                 source: Some("203.0.115.0"),
+                delivery_slots: 1,
             })
             .await
             .expect("first provider reservation");
@@ -1098,6 +1458,7 @@ mod integration_tests {
                         destinations: &["provider-two@example.com"],
                         account: None,
                         source: Some("203.0.116.0"),
+                        delivery_slots: 1,
                     })
                     .await
             ),
