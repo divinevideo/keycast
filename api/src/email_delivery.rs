@@ -46,10 +46,6 @@ local source_key = KEYS[destination_count + 2]
 local global_key = KEYS[destination_count + 3]
 local in_flight_key = KEYS[destination_count + 4]
 
-local function retry_seconds(next_ms)
-    return math.max(1, math.floor((math.max(1, next_ms - now_ms) + 999) / 1000))
-end
-
 local function trim_window(key, window_ms)
     redis.call('ZREMRANGEBYSCORE', key, '-inf', now_ms - window_ms)
 end
@@ -59,40 +55,35 @@ for index = 1, destination_count do
     trim_window(key, destination_window_ms)
     local latest = redis.call('ZREVRANGE', key, 0, 0, 'WITHSCORES')
     if #latest > 0 and now_ms - tonumber(latest[2]) < destination_cooldown_ms then
-        return {0, 1, retry_seconds(tonumber(latest[2]) + destination_cooldown_ms)}
+        return {0, 1}
     end
     if redis.call('ZCARD', key) >= destination_limit then
-        local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
-        return {0, 2, retry_seconds(tonumber(oldest[2]) + destination_window_ms)}
+        return {0, 2}
     end
 end
 
 if account_enabled == 1 then
     trim_window(account_key, account_window_ms)
     if redis.call('ZCARD', account_key) + slots > account_limit then
-        local oldest = redis.call('ZRANGE', account_key, 0, 0, 'WITHSCORES')
-        return {0, 3, retry_seconds(tonumber(oldest[2]) + account_window_ms)}
+        return {0, 3}
     end
 end
 
 if source_enabled == 1 then
     trim_window(source_key, source_window_ms)
     if redis.call('ZCARD', source_key) + slots > source_limit then
-        local oldest = redis.call('ZRANGE', source_key, 0, 0, 'WITHSCORES')
-        return {0, 4, retry_seconds(tonumber(oldest[2]) + source_window_ms)}
+        return {0, 4}
     end
 end
 
 trim_window(global_key, global_window_ms)
 if redis.call('ZCARD', global_key) + slots > global_limit then
-    local oldest = redis.call('ZRANGE', global_key, 0, 0, 'WITHSCORES')
-    return {0, 5, retry_seconds(tonumber(oldest[2]) + global_window_ms)}
+    return {0, 5}
 end
 
 redis.call('ZREMRANGEBYSCORE', in_flight_key, '-inf', now_ms)
 if redis.call('ZCARD', in_flight_key) + provider_slots > in_flight_limit then
-    local oldest = redis.call('ZRANGE', in_flight_key, 0, 0, 'WITHSCORES')
-    return {0, 6, retry_seconds(tonumber(oldest[2]))}
+    return {0, 6}
 end
 
 for index = 1, destination_count do
@@ -112,7 +103,7 @@ if account_enabled == 1 then redis.call('PEXPIRE', account_key, account_window_m
 if source_enabled == 1 then redis.call('PEXPIRE', source_key, source_window_ms) end
 redis.call('PEXPIRE', global_key, global_window_ms)
 redis.call('PEXPIRE', in_flight_key, reservation_ttl_ms)
-return {1, 0, 0}
+return {1, 0}
 "#;
 
 const RELEASE_SCRIPT: &str = r#"
@@ -144,7 +135,7 @@ impl Default for EmailDeliveryConfig {
         Self {
             destination_cooldown: Duration::from_secs(5 * 60),
             destination_limit: 5,
-            destination_window: Duration::from_secs(24 * 60 * 60),
+            destination_window: Duration::from_secs(60 * 60),
             account_limit: 6,
             account_window: Duration::from_secs(60 * 60),
             source_limit: 50,
@@ -292,7 +283,6 @@ impl EmailAdmissionRefusal {
 #[derive(Debug)]
 pub struct EmailAdmissionDenied {
     pub reason: EmailAdmissionRefusal,
-    pub retry_after: Option<u32>,
 }
 
 enum ReservationBackend {
@@ -410,10 +400,7 @@ impl EmailDeliveryService {
             }
             AdmissionBackend::Deny(reason) => {
                 METRICS.observe_email_delivery_admission(purpose, "suppressed", reason.as_str());
-                return Err(EmailAdmissionDenied {
-                    reason: *reason,
-                    retry_after: Some(60),
-                });
+                return Err(EmailAdmissionDenied { reason: *reason });
             }
         };
 
@@ -427,7 +414,6 @@ impl EmailDeliveryService {
         if slots == 0 {
             let denied = EmailAdmissionDenied {
                 reason: EmailAdmissionRefusal::Unavailable,
-                retry_after: None,
             };
             METRICS.observe_email_delivery_admission(purpose, "suppressed", denied.reason.as_str());
             return Err(denied);
@@ -436,7 +422,7 @@ impl EmailDeliveryService {
         let tag = "email_delivery:{shared}";
         let mut keys = destinations
             .iter()
-            .map(|hash| format!("{tag}:destination:{hash}"))
+            .map(|hash| format!("{tag}:destination:{purpose}:{hash}"))
             .collect::<Vec<_>>();
         let account_hash = request
             .account
@@ -472,9 +458,9 @@ impl EmailDeliveryService {
             self.config.provider_in_flight_limit.to_string(),
             self.config.reservation_ttl(slots).as_millis().to_string(),
         ];
-        let decision: RedisResult<(i64, i64, i64)> =
+        let decision: RedisResult<(i64, i64)> =
             redis.invoke_script(ADMIT_SCRIPT, &keys, &arguments).await;
-        let (admitted, reason, retry_after) = match decision {
+        let (admitted, reason) = match decision {
             Ok(decision) => decision,
             Err(error) => {
                 tracing::warn!(error = %error, "Email delivery admission unavailable");
@@ -485,7 +471,6 @@ impl EmailDeliveryService {
                 );
                 return Err(EmailAdmissionDenied {
                     reason: EmailAdmissionRefusal::Unavailable,
-                    retry_after: None,
                 });
             }
         };
@@ -511,11 +496,7 @@ impl EmailDeliveryService {
             _ => EmailAdmissionRefusal::Unavailable,
         };
         METRICS.observe_email_delivery_admission(purpose, "suppressed", reason.as_str());
-        Err(EmailAdmissionDenied {
-            reason,
-            retry_after: (retry_after > 0)
-                .then_some(retry_after.clamp(1, i64::from(u32::MAX)) as u32),
-        })
+        Err(EmailAdmissionDenied { reason })
     }
 
     pub async fn send_verification(
@@ -633,7 +614,9 @@ pub fn coarse_source(headers: &HeaderMap) -> Option<String> {
     let value = headers
         .get("x-forwarded-for")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
+        // The trusted ingress appends the socket peer to the right side. Earlier values may have
+        // been supplied by the caller and are not suitable for an abuse-control subject.
+        .and_then(|value| value.split(',').next_back())
         .or_else(|| {
             headers
                 .get("x-real-ip")
@@ -665,13 +648,25 @@ mod tests {
     fn source_addresses_are_grouped_into_subnets() {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", "192.0.2.91, 10.0.0.1".parse().unwrap());
-        assert_eq!(coarse_source(&headers).as_deref(), Some("192.0.2.0"));
+        assert_eq!(coarse_source(&headers).as_deref(), Some("10.0.0.0"));
 
         headers.insert("x-forwarded-for", "2001:db8:1234:5678::1".parse().unwrap());
         assert_eq!(
             coarse_source(&headers).as_deref(),
             Some("2001:db8:1234:5600::")
         );
+    }
+
+    #[test]
+    fn source_ignores_caller_supplied_forwarded_prefix() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.9, 203.0.113.77".parse().unwrap(),
+        );
+        headers.insert("x-real-ip", "192.0.2.44".parse().unwrap());
+
+        assert_eq!(coarse_source(&headers).as_deref(), Some("203.0.113.0"));
     }
 
     struct SlowSender {
@@ -869,6 +864,34 @@ mod integration_tests {
         for reservation in decisions.into_iter().flatten() {
             reservation.release().await;
         }
+    }
+
+    #[tokio::test]
+    async fn destination_budgets_are_isolated_by_delivery_purpose() {
+        let (service, _) = services(EmailDeliveryConfig::default()).await;
+        let reset = service
+            .admit(EmailAdmissionRequest {
+                tenant_id: 1,
+                purpose: EmailDeliveryPurpose::PasswordReset,
+                destinations: &["same@example.com"],
+                account: None,
+                source: Some("192.0.2.0"),
+            })
+            .await
+            .expect("password reset reservation");
+        let verification = service
+            .admit(EmailAdmissionRequest {
+                tenant_id: 1,
+                purpose: EmailDeliveryPurpose::Verification,
+                destinations: &["same@example.com"],
+                account: None,
+                source: Some("192.0.2.0"),
+            })
+            .await
+            .expect("verification has an independent destination budget");
+
+        reset.release().await;
+        verification.release().await;
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 #![cfg(feature = "integration-tests")]
 
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     extract::{Extension, State},
     http::{HeaderMap, Request, StatusCode},
     middleware,
@@ -59,6 +59,74 @@ fn create_test_tenant() -> TenantExtractor {
     }))
 }
 
+fn public_recovery_app(pool: PgPool, delivery: EmailDeliveryService) -> Router {
+    let reset_pool = pool.clone();
+    let resend_pool = pool;
+    let reset_delivery = delivery.clone();
+    Router::new()
+        .route(
+            "/auth/forgot-password",
+            post(
+                move |headers: HeaderMap, Json(req): Json<ForgotPasswordRequest>| {
+                    let pool = reset_pool.clone();
+                    let delivery = reset_delivery.clone();
+                    async move {
+                        forgot_password(
+                            create_test_tenant(),
+                            State(pool),
+                            Extension(delivery),
+                            headers,
+                            Json(req),
+                        )
+                        .await
+                    }
+                },
+            ),
+        )
+        .route(
+            "/auth/resend-verification",
+            post(
+                move |headers: HeaderMap, Json(req): Json<ResendVerificationRequest>| {
+                    let pool = resend_pool.clone();
+                    let delivery = delivery.clone();
+                    async move {
+                        resend_verification(
+                            create_test_tenant(),
+                            State(pool),
+                            Extension(delivery),
+                            headers,
+                            Json(req),
+                        )
+                        .await
+                    }
+                },
+            ),
+        )
+}
+
+async fn public_recovery_response(app: &Router, uri: &str, email: &str) -> (StatusCode, Vec<u8>) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "email": email }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, body)
+}
+
 async fn cleanup_by_email(pool: &PgPool, email: &str) {
     let _ = sqlx::query("DELETE FROM auth_events WHERE email = $1")
         .bind(email)
@@ -68,6 +136,53 @@ async fn cleanup_by_email(pool: &PgPool, email: &str) {
         .bind(email)
         .execute(pool)
         .await;
+}
+
+#[tokio::test]
+async fn public_recovery_responses_match_for_existing_missing_admitted_and_suppressed() {
+    let pool = setup_pool().await;
+    let existing = format!("public-recovery-existing-{}@example.com", Uuid::new_v4());
+    let missing = format!("public-recovery-missing-{}@example.com", Uuid::new_v4());
+    let pubkey = Keys::generate().public_key().to_hex();
+    cleanup_by_email(&pool, &existing).await;
+    cleanup_by_email(&pool, &missing).await;
+    sqlx::query(
+        "INSERT INTO users (
+            pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at
+         ) VALUES ($1, 1, $2, $3, true, NOW(), NOW())",
+    )
+    .bind(&pubkey)
+    .bind(&existing)
+    .bind(hash("old-password", 4).unwrap())
+    .execute(&pool)
+    .await
+    .expect("create existing recovery account");
+
+    let sender = Arc::new(DevEmailSender::new());
+    let admitted = public_recovery_app(
+        pool.clone(),
+        EmailDeliveryService::unrestricted_for_tests(sender.clone()),
+    );
+    let suppressed = public_recovery_app(
+        pool.clone(),
+        EmailDeliveryService::denying_for_tests(sender, EmailAdmissionRefusal::DestinationCooldown),
+    );
+
+    for uri in ["/auth/forgot-password", "/auth/resend-verification"] {
+        let responses = [
+            public_recovery_response(&admitted, uri, &existing).await,
+            public_recovery_response(&admitted, uri, &missing).await,
+            public_recovery_response(&suppressed, uri, &existing).await,
+            public_recovery_response(&suppressed, uri, &missing).await,
+        ];
+        assert!(responses
+            .iter()
+            .all(|(status, _)| *status == StatusCode::OK));
+        assert!(responses.windows(2).all(|pair| pair[0].1 == pair[1].1));
+    }
+
+    cleanup_by_email(&pool, &existing).await;
+    cleanup_by_email(&pool, &missing).await;
 }
 
 #[tokio::test]
