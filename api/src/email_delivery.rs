@@ -141,8 +141,8 @@ impl Default for EmailDeliveryConfig {
             account_window: Duration::from_secs(60 * 60),
             source_limit: 50,
             source_window: Duration::from_secs(60 * 60),
-            // External Google load balancers append `<client-ip>,<load-balancer-ip>`.
-            source_trusted_proxy_hops: 1,
+            // Cloud Run domain mapping supplies the client as the rightmost address.
+            source_trusted_proxy_hops: 0,
             global_limit: 1_000,
             global_window: Duration::from_secs(60),
             provider_in_flight_limit: 20,
@@ -636,14 +636,9 @@ fn subject_hash(tenant_id: i64, subject: &str) -> String {
 #[must_use]
 fn coarse_source(headers: &HeaderMap, trusted_proxy_hops: usize) -> Option<String> {
     let forwarded = headers.get("x-forwarded-for")?.to_str().ok()?;
-    let addresses = forwarded.split(',').collect::<Vec<_>>();
-    // Domain mapping can provide only the client value; multi-hop ingress addresses form a
-    // trusted suffix. Values before the selected hop may have been supplied by the caller.
-    let candidate = if addresses.len() == 1 {
-        addresses[0]
-    } else {
-        addresses.iter().rev().nth(trusted_proxy_hops)?
-    };
+    // Trusted ingress addresses form a suffix. Values before the selected hop may have been
+    // supplied by the caller, so selection must never depend on caller-controlled chain length.
+    let candidate = forwarded.split(',').rev().nth(trusted_proxy_hops)?;
     // An unusable trusted suffix disables this secondary control rather than falling back to a
     // potentially caller-controlled header.
     let value = candidate.trim().parse::<IpAddr>().ok()?;
@@ -669,12 +664,12 @@ mod tests {
     #[test]
     fn source_addresses_are_grouped_into_subnets() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "192.0.2.91, 10.0.0.1".parse().unwrap());
-        assert_eq!(coarse_source(&headers, 1).as_deref(), Some("192.0.2.0"));
+        headers.insert("x-forwarded-for", "192.0.2.91".parse().unwrap());
+        assert_eq!(coarse_source(&headers, 0).as_deref(), Some("192.0.2.0"));
 
         headers.insert("x-forwarded-for", "2001:db8:1234:5678::1".parse().unwrap());
         assert_eq!(
-            coarse_source(&headers, 1).as_deref(),
+            coarse_source(&headers, 0).as_deref(),
             Some("2001:db8:1234:5600::")
         );
     }
@@ -684,11 +679,11 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-forwarded-for",
-            "198.51.100.9, 203.0.113.77, 192.0.2.10".parse().unwrap(),
+            "198.51.100.9, 203.0.113.77".parse().unwrap(),
         );
         headers.insert("x-real-ip", "192.0.2.44".parse().unwrap());
 
-        assert_eq!(coarse_source(&headers, 1).as_deref(), Some("203.0.113.0"));
+        assert_eq!(coarse_source(&headers, 0).as_deref(), Some("203.0.113.0"));
     }
 
     #[test]
