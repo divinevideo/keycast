@@ -250,7 +250,8 @@ async fn nostr_rpc_inner(
             }
 
             // Handler validates expiration, revocation, and permissions (all cached)
-            let signed = handler.sign_event(unsigned_event).await?;
+            let signed =
+                observe_handler_operation(&req.method, handler.sign_event(unsigned_event)).await?;
 
             tracing::info!(
                 "RPC: Signed event {} kind={}",
@@ -270,7 +271,8 @@ async fn nostr_rpc_inner(
             // Creator-binding payloads are not DMs, so the verified_minor DM
             // containment gate does not apply. Handler validity and custom
             // signing permissions still apply before signing.
-            let signature = handler.sign_canonical(payload).await?;
+            let signature =
+                observe_handler_operation(&req.method, handler.sign_canonical(payload)).await?;
 
             tracing::info!(
                 "RPC: Signed creator-binding payload authorization_id={}",
@@ -291,7 +293,11 @@ async fn nostr_rpc_inner(
 
             // Handler validates expiration, revocation, and permissions (all cached)
             // Crypto runs on spawn_blocking to avoid blocking async workers
-            let ciphertext = handler.nip44_encrypt(&recipient_pubkey, &plaintext).await?;
+            let ciphertext = observe_handler_operation(
+                &req.method,
+                handler.nip44_encrypt(&recipient_pubkey, &plaintext),
+            )
+            .await?;
 
             log_activity(&auth_state, handler.is_oauth(), handler.authorization_id());
 
@@ -303,7 +309,11 @@ async fn nostr_rpc_inner(
 
             // Handler validates expiration, revocation, and permissions (all cached)
             // Crypto runs on spawn_blocking to avoid blocking async workers
-            let plaintext = handler.nip44_decrypt(&sender_pubkey, &ciphertext).await?;
+            let plaintext = observe_handler_operation(
+                &req.method,
+                handler.nip44_decrypt(&sender_pubkey, &ciphertext),
+            )
+            .await?;
 
             log_activity(&auth_state, handler.is_oauth(), handler.authorization_id());
 
@@ -395,7 +405,11 @@ async fn nostr_rpc_inner(
 
             // Handler validates expiration, revocation, and permissions (all cached)
             // Crypto runs on spawn_blocking to avoid blocking async workers
-            let ciphertext = handler.nip04_encrypt(&recipient_pubkey, &plaintext).await?;
+            let ciphertext = observe_handler_operation(
+                &req.method,
+                handler.nip04_encrypt(&recipient_pubkey, &plaintext),
+            )
+            .await?;
 
             log_activity(&auth_state, handler.is_oauth(), handler.authorization_id());
 
@@ -407,7 +421,11 @@ async fn nostr_rpc_inner(
 
             // Handler validates expiration, revocation, and permissions (all cached)
             // Crypto runs on spawn_blocking to avoid blocking async workers
-            let plaintext = handler.nip04_decrypt(&sender_pubkey, &ciphertext).await?;
+            let plaintext = observe_handler_operation(
+                &req.method,
+                handler.nip04_decrypt(&sender_pubkey, &ciphertext),
+            )
+            .await?;
 
             log_activity(&auth_state, handler.is_oauth(), handler.authorization_id());
 
@@ -462,6 +480,25 @@ fn http_rpc_outcome(response: &Result<Json<NostrRpcResponse>, RpcError>) -> &'st
         Err(RpcError::Timeout(_)) => "timeout",
         Err(RpcError::Internal(_)) => "error",
     }
+}
+
+async fn observe_handler_operation<T>(
+    method: &str,
+    operation: impl std::future::Future<Output = Result<T, HandlerError>>,
+) -> Result<T, HandlerError> {
+    let started = Instant::now();
+    let result = operation.await;
+    let outcome = match &result {
+        Ok(_) => "success",
+        Err(HandlerError::AuthorizationInvalid | HandlerError::PermissionDenied) => "auth_error",
+        Err(
+            HandlerError::InvalidRequest(_)
+            | HandlerError::Signing(_)
+            | HandlerError::Encryption(_),
+        ) => "client_error",
+    };
+    METRICS.observe_http_rpc_operation(method, outcome, started.elapsed());
+    result
 }
 
 /// Read the account gate state before a mutating operation.

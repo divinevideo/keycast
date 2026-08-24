@@ -213,6 +213,7 @@ pub struct Metrics {
     auth_audit_write_failures_total: Mutex<BTreeMap<String, u64>>,
     auth_email_send_failures_total: Mutex<BTreeMap<String, u64>>,
     http_rpc_request_durations: Mutex<BTreeMap<HttpRpcDurationKey, HttpRpcDurationMetric>>,
+    http_rpc_operation_durations: Mutex<BTreeMap<HttpRpcDurationKey, HttpRpcDurationMetric>>,
     http_rpc_status_check_durations: Mutex<BTreeMap<String, HttpRpcDurationMetric>>,
     http_rpc_db_acquire_durations: Mutex<BTreeMap<HttpRpcAcquireKey, HttpRpcAcquireMetric>>,
 }
@@ -289,6 +290,7 @@ impl Metrics {
             auth_audit_write_failures_total: Mutex::new(BTreeMap::new()),
             auth_email_send_failures_total: Mutex::new(BTreeMap::new()),
             http_rpc_request_durations: Mutex::new(BTreeMap::new()),
+            http_rpc_operation_durations: Mutex::new(BTreeMap::new()),
             http_rpc_status_check_durations: Mutex::new(BTreeMap::new()),
             http_rpc_db_acquire_durations: Mutex::new(BTreeMap::new()),
         }
@@ -492,6 +494,19 @@ impl Metrics {
             .http_rpc_request_durations
             .lock()
             .expect("http rpc duration metrics lock poisoned");
+        let metric = duration_metrics
+            .entry(HttpRpcDurationKey { method, outcome })
+            .or_default();
+        observe_http_rpc_duration(metric, duration);
+    }
+
+    pub fn observe_http_rpc_operation(&self, method: &str, outcome: &str, duration: Duration) {
+        let method = normalize_http_rpc_method(method).to_string();
+        let outcome = normalize_http_rpc_outcome(outcome).to_string();
+        let mut duration_metrics = self
+            .http_rpc_operation_durations
+            .lock()
+            .expect("http rpc operation duration metrics lock poisoned");
         let metric = duration_metrics
             .entry(HttpRpcDurationKey { method, outcome })
             .or_default();
@@ -916,6 +931,36 @@ impl Metrics {
         }
 
         output.push_str(
+            "\n# HELP keycast_http_rpc_operation_duration_seconds HTTP RPC operation latency excluding authentication and account status checks\n",
+        );
+        output.push_str("# TYPE keycast_http_rpc_operation_duration_seconds histogram\n");
+        for (key, metric) in self
+            .http_rpc_operation_durations
+            .lock()
+            .expect("http rpc operation duration metrics lock poisoned")
+            .iter()
+        {
+            for (index, bucket) in HTTP_RPC_DURATION_BUCKETS.iter().enumerate() {
+                output.push_str(&format!(
+                    "keycast_http_rpc_operation_duration_seconds_bucket{{method=\"{}\",outcome=\"{}\",le=\"{}\"}} {}\n",
+                    key.method, key.outcome, bucket, metric.buckets[index]
+                ));
+            }
+            output.push_str(&format!(
+                "keycast_http_rpc_operation_duration_seconds_bucket{{method=\"{}\",outcome=\"{}\",le=\"+Inf\"}} {}\n",
+                key.method, key.outcome, metric.count
+            ));
+            output.push_str(&format!(
+                "keycast_http_rpc_operation_duration_seconds_sum{{method=\"{}\",outcome=\"{}\"}} {}\n",
+                key.method, key.outcome, metric.sum
+            ));
+            output.push_str(&format!(
+                "keycast_http_rpc_operation_duration_seconds_count{{method=\"{}\",outcome=\"{}\"}} {}\n",
+                key.method, key.outcome, metric.count
+            ));
+        }
+
+        output.push_str(
             "\n# HELP keycast_http_rpc_status_check_duration_seconds HTTP RPC live user status check latency by outcome\n",
         );
         output.push_str("# TYPE keycast_http_rpc_status_check_duration_seconds histogram\n");
@@ -1202,6 +1247,7 @@ fn normalize_http_rpc_method(method: &str) -> &'static str {
     match method {
         "get_public_key" => "get_public_key",
         "sign_event" => "sign_event",
+        "sign_canonical" => "sign_canonical",
         "nip04_encrypt" => "nip04_encrypt",
         "nip04_decrypt" => "nip04_decrypt",
         "nip44_encrypt" => "nip44_encrypt",
@@ -1351,6 +1397,14 @@ mod tests {
         let metrics = Metrics::new();
 
         metrics.observe_http_rpc_request("nip44_encrypt", "success", Duration::from_secs(23));
+        metrics.observe_http_rpc_operation("sign_event", "success", Duration::from_millis(8));
+        metrics.observe_http_rpc_operation("nip44_encrypt", "success", Duration::from_millis(9));
+        metrics.observe_http_rpc_operation(
+            "nip44_decrypt",
+            "client_error",
+            Duration::from_millis(10),
+        );
+        metrics.observe_http_rpc_operation("nip04_decrypt", "success", Duration::from_millis(11));
         metrics.observe_http_rpc_status_check("success", Duration::from_millis(25));
         metrics.observe_http_rpc_db_acquire(
             "check_user_status_active",
@@ -1367,6 +1421,18 @@ mod tests {
         ));
         assert!(output.contains(
             "keycast_http_rpc_request_duration_seconds_bucket{method=\"nip44_encrypt\",outcome=\"success\",le=\"10\"} 0"
+        ));
+        assert!(output.contains(
+            "keycast_http_rpc_operation_duration_seconds_count{method=\"sign_event\",outcome=\"success\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_http_rpc_operation_duration_seconds_count{method=\"nip44_encrypt\",outcome=\"success\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_http_rpc_operation_duration_seconds_count{method=\"nip44_decrypt\",outcome=\"client_error\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_http_rpc_operation_duration_seconds_count{method=\"nip04_decrypt\",outcome=\"success\"} 1"
         ));
         assert!(output.contains(
             "keycast_http_rpc_status_check_duration_seconds_count{outcome=\"success\"} 1"
