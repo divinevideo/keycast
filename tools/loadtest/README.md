@@ -178,6 +178,8 @@ is excluded because its generated identities are not seed-reproducible. The
 command records ordinary phase or SLO misses and continues so later recovery can
 still be measured. It stops after an absolute profile stop-condition breach,
 writes `evidence.json`, and exits unsuccessfully when any check failed.
+Healthy-phase availability counts every failed request, including unexpected
+HTTP 429 responses; phase error limits exclude intentional shedding.
 
 Localhost targets run without an additional flag. A non-local test environment
 requires an exact host authorization so a stale plan cannot silently target a
