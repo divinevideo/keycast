@@ -132,6 +132,7 @@ impl From<HandlerError> for RpcError {
             HandlerError::InvalidRequest(msg) => RpcError::InvalidParams(msg),
             HandlerError::Signing(msg) => RpcError::SigningFailed(msg),
             HandlerError::Encryption(msg) => RpcError::EncryptionFailed(msg),
+            HandlerError::Internal(msg) => RpcError::Internal(msg),
         }
     }
 }
@@ -345,7 +346,7 @@ async fn nostr_rpc_inner(
             // makes one call per page instead of 2 sequential RPCs per message.
             let operation_timer = HttpRpcOperationTimer::start(&req.method);
             let results = unwrap_gift_wrap_batch(&handler, &req.params).await;
-            operation_timer.finish("success");
+            operation_timer.finish(batch_operation_outcome(&results));
 
             // One coalesced activity log for the whole batch (per-request semantics).
             log_activity(&auth_state, handler.is_oauth(), handler.authorization_id());
@@ -392,7 +393,7 @@ async fn nostr_rpc_inner(
             // preserves duplicate and positional recipient semantics.
             let operation_timer = HttpRpcOperationTimer::start(&req.method);
             let results = wrap_gift_wrap_batch(&handler, &batch.rumor, &batch.recipients).await;
-            operation_timer.finish("success");
+            operation_timer.finish(batch_operation_outcome(&results));
 
             // One coalesced activity update for the whole RPC request.
             log_activity(&auth_state, handler.is_oauth(), handler.authorization_id());
@@ -482,7 +483,7 @@ fn http_rpc_outcome(response: &Result<Json<NostrRpcResponse>, RpcError>) -> &'st
         Err(RpcError::AccountSuspended(_)) => "account_restricted",
         Err(RpcError::Unavailable(_)) => "unavailable",
         Err(RpcError::Timeout(_)) => "timeout",
-        Err(RpcError::Internal(_)) => "error",
+        Err(RpcError::Internal(_)) => "server_error",
     }
 }
 
@@ -492,7 +493,12 @@ async fn observe_handler_operation<T>(
 ) -> Result<T, HandlerError> {
     let timer = HttpRpcOperationTimer::start(method);
     let result = operation.await;
-    let outcome = match &result {
+    timer.finish(handler_operation_outcome(&result));
+    result
+}
+
+fn handler_operation_outcome<T>(result: &Result<T, HandlerError>) -> &'static str {
+    match result {
         Ok(_) => "success",
         Err(HandlerError::AuthorizationInvalid | HandlerError::PermissionDenied) => "auth_error",
         Err(
@@ -500,9 +506,8 @@ async fn observe_handler_operation<T>(
             | HandlerError::Signing(_)
             | HandlerError::Encryption(_),
         ) => "client_error",
-    };
-    timer.finish(outcome);
-    result
+        Err(HandlerError::Internal(_)) => "server_error",
+    }
 }
 
 struct HttpRpcOperationTimer<'a> {
@@ -529,8 +534,25 @@ impl<'a> HttpRpcOperationTimer<'a> {
 impl Drop for HttpRpcOperationTimer<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            METRICS.observe_http_rpc_operation(self.method, "cancelled", self.started.elapsed());
+            METRICS.try_observe_http_rpc_operation(
+                self.method,
+                "cancelled",
+                self.started.elapsed(),
+            );
         }
+    }
+}
+
+fn batch_operation_outcome(results: &[JsonValue]) -> &'static str {
+    let error_count = results
+        .iter()
+        .filter(|slot| slot.get("error").is_some())
+        .count();
+
+    match error_count {
+        0 => "success",
+        count if count == results.len() => "error",
+        _ => "partial_error",
     }
 }
 
@@ -1380,7 +1402,7 @@ mod tests {
             "loading authorization",
             RepositoryError::Database("relation does not exist".into()),
         );
-        assert_eq!(http_rpc_outcome(&Err(internal)), "error");
+        assert_eq!(http_rpc_outcome(&Err(internal)), "server_error");
     }
 
     #[test]
@@ -1399,18 +1421,65 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_operation_records_its_elapsed_time() {
+        let sample = "keycast_http_rpc_operation_duration_seconds_sum{method=\"sign_canonical\",outcome=\"cancelled\"}";
+        let before = prometheus_sample(&METRICS.to_prometheus(), sample).unwrap_or_default();
         let operation = observe_handler_operation(
-            "sign_event",
+            "sign_canonical",
             std::future::pending::<Result<(), HandlerError>>(),
         );
 
-        tokio::time::timeout(Duration::from_millis(1), operation)
+        tokio::time::timeout(Duration::from_millis(10), operation)
             .await
             .expect_err("pending operation should be cancelled by the deadline");
 
-        assert!(METRICS.to_prometheus().contains(
-            "keycast_http_rpc_operation_duration_seconds_count{method=\"sign_event\",outcome=\"cancelled\"}"
-        ));
+        let after = prometheus_sample(&METRICS.to_prometheus(), sample)
+            .expect("cancelled operation should emit a sum sample");
+        assert!(
+            after > before,
+            "cancellation must record non-zero elapsed time"
+        );
+    }
+
+    #[test]
+    fn operation_outcomes_distinguish_server_failures() {
+        assert_eq!(
+            handler_operation_outcome(&Err::<(), _>(HandlerError::Internal("panic".into()))),
+            "server_error"
+        );
+        assert_eq!(
+            http_rpc_outcome(&Err(RpcError::Internal("panic".into()))),
+            "server_error"
+        );
+    }
+
+    #[test]
+    fn batch_outcomes_distinguish_complete_and_partial_failures() {
+        assert_eq!(
+            batch_operation_outcome(&[serde_json::json!({"value": 1})]),
+            "success"
+        );
+        assert_eq!(
+            batch_operation_outcome(&[
+                serde_json::json!({"value": 1}),
+                serde_json::json!({"error": "invalid_event"}),
+            ]),
+            "partial_error"
+        );
+        assert_eq!(
+            batch_operation_outcome(&[
+                serde_json::json!({"error": "invalid_event"}),
+                serde_json::json!({"error": "internal"}),
+            ]),
+            "error"
+        );
+    }
+
+    fn prometheus_sample(output: &str, sample: &str) -> Option<f64> {
+        output
+            .lines()
+            .find(|line| line.starts_with(sample))
+            .and_then(|line| line.split_whitespace().last())
+            .and_then(|value| value.parse().ok())
     }
 
     fn create_test_handler_with_dpop(expected_jkt: Option<String>) -> HttpRpcHandler {
