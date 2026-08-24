@@ -15,8 +15,7 @@ use super::admin::{is_full_admin, is_support_admin};
 use crate::api::extractors::UcanAuth;
 use crate::brand::BRAND_NAME;
 use crate::email_delivery::{
-    coarse_source, EmailAdmissionRequest, EmailDeliveryPurpose, EmailDeliveryReservation,
-    EmailDeliveryService,
+    EmailAdmissionRequest, EmailDeliveryPurpose, EmailDeliveryReservation, EmailDeliveryService,
 };
 use crate::email_service::EmailProviderOutcome;
 use crate::key_egress_limiter::{
@@ -2570,7 +2569,7 @@ pub async fn resend_verification(
             .unwrap_or_else(|_| email.trim().to_ascii_lowercase());
     }
 
-    let source = coarse_source(&headers);
+    let source = email_delivery.coarse_source(&headers);
     let authenticated_pubkey = extract_user_from_token(&headers, tenant_id).await.ok();
     let mut reservation = if authenticated_pubkey.is_none() {
         let Some(email) = req.email.as_deref() else {
@@ -2775,7 +2774,7 @@ pub async fn forgot_password(
     let endpoint = "/api/auth/forgot-password";
     req.email = normalize_registration_email(&req.email)
         .unwrap_or_else(|_| req.email.trim().to_ascii_lowercase());
-    let source = coarse_source(&headers);
+    let source = email_delivery.coarse_source(&headers);
     let reservation = match email_delivery
         .admit(EmailAdmissionRequest {
             tenant_id,
@@ -4470,7 +4469,7 @@ pub async fn change_email(
         }
     }
 
-    let source = coarse_source(&headers);
+    let source = email_delivery.coarse_source(&headers);
     let reservation = match email_delivery
         .admit(EmailAdmissionRequest {
             tenant_id,

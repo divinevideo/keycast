@@ -275,6 +275,7 @@ If neither is set, requests from unknown domains are rejected.
 | `EMAIL_DELIVERY_ACCOUNT_WINDOW_SECONDS` | `3600` | Authenticated-account rolling-window length |
 | `EMAIL_DELIVERY_SOURCE_LIMIT` | `50` | Secondary coarse-source delivery budget |
 | `EMAIL_DELIVERY_SOURCE_WINDOW_SECONDS` | `3600` | Coarse-source rolling-window length |
+| `EMAIL_DELIVERY_SOURCE_TRUSTED_PROXY_HOPS` | `1` | Trusted `X-Forwarded-For` addresses after the client address; set from the deployed ingress chain |
 | `EMAIL_DELIVERY_GLOBAL_LIMIT` | `1000` | Process-cluster delivery budget per global window |
 | `EMAIL_DELIVERY_GLOBAL_WINDOW_SECONDS` | `60` | Global rolling-window length |
 | `EMAIL_PROVIDER_MAX_IN_FLIGHT` | `20` | Cluster and per-instance provider concurrency bound |

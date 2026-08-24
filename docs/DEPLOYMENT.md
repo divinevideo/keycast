@@ -307,6 +307,7 @@ The Deployment sets or patches these runtime env vars:
 | `ALLOWED_ORIGINS` | patched per environment |
 | `BUNKER_RELAYS` | patched per environment |
 | `FROM_EMAIL`, `FROM_NAME`, `BASE_URL`, `APP_URL` | patched per environment |
+| `EMAIL_DELIVERY_SOURCE_TRUSTED_PROXY_HOPS` | must match the trusted addresses appended after the client in each ingress's `X-Forwarded-For` chain; Cloud Run domain mapping uses `1` |
 | `VITE_DOMAIN`, `VITE_NDK_EXPLICIT_RELAYS`, `VITE_NDK_BUNKER_RELAYS` | frontend runtime injection |
 | `ALLOWED_PUBKEYS` | patched per environment |
 | `ALLOWED_TENANT_DOMAINS` | base value is `login.divine.video`; POC and staging patch it |
