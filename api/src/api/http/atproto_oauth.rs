@@ -509,15 +509,13 @@ fn append_remote_json_chunk(
 
 async fn fetch_json(url: &reqwest::Url, label: &str) -> Result<Value, AuthError> {
     ensure_secure_or_loopback_url(url, label)?;
+    let _remote_permit =
+        super::expensive_work::admit_remote_fetch().map_err(|_| AuthError::ServiceUnavailable {
+            message: "Remote client metadata capacity is busy".to_string(),
+            retry_after: Some(1),
+        })?;
     let client = reqwest::Client::builder()
-        .timeout(
-            super::expensive_work::remaining_timeout(StdDuration::from_secs(3)).map_err(|_| {
-                AuthError::ServiceUnavailable {
-                    message: "Insufficient request budget for remote client metadata".to_string(),
-                    retry_after: Some(1),
-                }
-            })?,
-        )
+        .timeout(StdDuration::from_secs(3))
         .build()
         .map_err(|error| AuthError::Internal(format!("Failed to build HTTP client: {error}")))?;
     let mut response = client

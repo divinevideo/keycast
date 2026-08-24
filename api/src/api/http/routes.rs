@@ -48,10 +48,6 @@ pub fn public_verify_email_route(
 ) -> Router {
     Router::new()
         .route("/verify-email", get(auth::verify_email_get))
-        .route_layer(axum::middleware::from_fn_with_state(
-            expensive_work::ADMISSION.clone(),
-            expensive_work::enforce,
-        ))
         .layer(axum::extract::DefaultBodyLimit::max(
             expensive_work::HTTP_BODY_LIMIT,
         ))
@@ -309,11 +305,19 @@ pub fn api_routes(
             "/admin/users/:pubkey/deletion",
             post(service_deletion::delete_account_service),
         )
-        .route("/admin/users/batch-lookup", post(admin::batch_lookup_users))
         .route(
             "/admin/create-minor-account",
             post(service_provisioning::create_minor_account),
         )
+        .with_state(auth_state.clone());
+
+    // The endpoint's documented contract accepts up to 1,000 RFC-sized email
+    // addresses, which cannot fit inside the general 64 KiB JSON ceiling.
+    let batch_lookup_route = Router::new()
+        .route("/admin/users/batch-lookup", post(admin::batch_lookup_users))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            expensive_work::BATCH_LOOKUP_BODY_LIMIT,
+        ))
         .with_state(auth_state.clone());
 
     // Claim routes (public, accessed via email link)
@@ -382,13 +386,10 @@ pub fn api_routes(
         .merge(headless_routes.layer(public_cors.clone())) // Public CORS - embedded flow for web + mobile (PKCE protects token exchange)
         .merge(admin_routes) // Admin routes for preloaded accounts (has auth_cors)
         .merge(service_admin_routes) // Service-token admin routes (no CORS, server-to-server)
+        .merge(batch_lookup_route) // Service-token route with a documented 1,000-email contract
         .merge(claim_routes.layer(public_cors.clone())) // Public - claim preloaded accounts
         .merge(metrics_route.layer(public_cors.clone())) // Public - Prometheus metrics
         .merge(docs_route.layer(public_cors.clone()))
-        .route_layer(axum::middleware::from_fn_with_state(
-            expensive_work::ADMISSION.clone(),
-            expensive_work::enforce,
-        ))
         .layer(axum::extract::DefaultBodyLimit::max(
             expensive_work::HTTP_BODY_LIMIT,
         ));
@@ -537,5 +538,14 @@ mod tests {
             .expect("body bytes");
         let body: serde_json::Value = serde_json::from_slice(&body).expect("json body");
         assert_eq!(body["error"], "RPC request timed out");
+    }
+
+    #[test]
+    fn batch_lookup_limit_fits_documented_email_count() {
+        let request = admin::BatchLookupRequest {
+            emails: vec!["a".repeat(254); 1_000],
+        };
+        let encoded = serde_json::to_vec(&request).expect("serialize batch lookup");
+        assert!(encoded.len() <= expensive_work::BATCH_LOOKUP_BODY_LIMIT);
     }
 }

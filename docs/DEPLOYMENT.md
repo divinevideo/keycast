@@ -127,6 +127,8 @@ These are set by `cloudbuild.yaml --set-env-vars`:
 | `SHUTDOWN_HTTP_DRAIN_SECS` | `3` |
 | `SHUTDOWN_SIGNER_DRAIN_SECS` | `3` |
 | `SHUTDOWN_TEARDOWN_MARGIN_SECS` | `4` |
+| `CPU_WORK_CONCURRENCY` | detected CPU count |
+| `KMS_CONCURRENCY` | `16` |
 
 Relay NIP-46 admission has optional per-instance tuning controls. Defaults are
 used when these variables are unset or invalid:

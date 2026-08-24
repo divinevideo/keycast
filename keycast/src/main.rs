@@ -1357,8 +1357,16 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         kms_provider_label(kms_provider)
     );
 
-    let signer_key_manager: Box<dyn KeyManager> = build_key_manager(kms_provider).await?;
-    let api_key_manager: Box<dyn KeyManager> = build_key_manager(kms_provider).await?;
+    let signer_key_manager: Box<dyn KeyManager> = Box::new(
+        keycast_core::encryption::bounded_key_manager::BoundedKeyManager::new(
+            build_key_manager(kms_provider).await?,
+        ),
+    );
+    let api_key_manager: Box<dyn KeyManager> = Box::new(
+        keycast_core::encryption::bounded_key_manager::BoundedKeyManager::new(
+            build_key_manager(kms_provider).await?,
+        ),
+    );
 
     // Load server keys for signing UCANs (wrap in Zeroizing for auto-zeroization)
     let server_nsec = Zeroizing::new(env::var("SERVER_NSEC")?); // Validated above
@@ -1385,13 +1393,15 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     let (relay_activity_logger, relay_activity_worker) =
         keycast_signer::RelayActivityLogger::new(database.pool.clone());
 
+    let cpu_work_concurrency =
+        configured_positive_usize("CPU_WORK_CONCURRENCY", num_cpus::get().max(1));
     let bcrypt = keycast_core::bcrypt_admission::BcryptAdmission::new(
-        num_cpus::get().max(1),
+        cpu_work_concurrency,
         Duration::from_secs(1),
     );
     tracing::info!(
         "✔︎ Bcrypt admission initialized ({} concurrent operations, {} same-class waiters)",
-        num_cpus::get().max(1),
+        cpu_work_concurrency,
         keycast_core::bcrypt_admission::PER_CLASS_WAIT_DEPTH
     );
 
@@ -1529,6 +1539,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
             axum::http::header::CONTENT_TYPE,
             axum::http::header::AUTHORIZATION,
         ])
+        .expose_headers([axum::http::header::RETRY_AFTER])
         .allow_credentials(true)
         .max_age(std::time::Duration::from_secs(86400));
 
@@ -1539,6 +1550,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
             axum::http::header::CONTENT_TYPE,
             axum::http::header::AUTHORIZATION,
         ])
+        .expose_headers([axum::http::header::RETRY_AFTER])
         .allow_credentials(false)
         .max_age(std::time::Duration::from_secs(86400));
 

@@ -247,6 +247,8 @@ Configuration is read from the environment (a `.env` file works locally). The bi
 | `AWS_KMS_KEY_ID` | *(none)* | Required when `KMS_PROVIDER=aws` (key ID, ARN, or alias) |
 | `AWS_REGION` | `us-east-1` | AWS KMS region when `KMS_PROVIDER=aws` |
 | `USE_GCP_KMS` | *(legacy)* | Backward compatibility only; if `KMS_PROVIDER` is also set, `KMS_PROVIDER` wins |
+| `KMS_CONCURRENCY` | `16` | Process-wide concurrent key-manager operations across the API and signer |
+| `CPU_WORK_CONCURRENCY` | detected CPU count | Shared process CPU limit for bcrypt and other blocking crypto |
 
 Build with AWS support when using `KMS_PROVIDER=aws`: `cargo build --release --bin keycast --features aws`. The key needs `kms:Encrypt`, `kms:Decrypt`, and `kms:DescribeKey`.
 
