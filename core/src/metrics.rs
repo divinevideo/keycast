@@ -232,6 +232,7 @@ pub struct Metrics {
     auth_audit_write_failures_total: Mutex<BTreeMap<String, u64>>,
     auth_email_send_failures_total: Mutex<BTreeMap<String, u64>>,
     email_delivery_admissions_total: Mutex<BTreeMap<EmailDeliveryKey, u64>>,
+    email_delivery_source_subjects: [AtomicU64; 2],
     email_provider_outcomes_total: Mutex<BTreeMap<EmailProviderKey, u64>>,
     email_provider_durations: Mutex<BTreeMap<EmailProviderKey, EmailProviderDurationMetric>>,
     email_provider_in_flight: AtomicU64,
@@ -312,6 +313,7 @@ impl Metrics {
             auth_audit_write_failures_total: Mutex::new(BTreeMap::new()),
             auth_email_send_failures_total: Mutex::new(BTreeMap::new()),
             email_delivery_admissions_total: Mutex::new(BTreeMap::new()),
+            email_delivery_source_subjects: std::array::from_fn(|_| AtomicU64::new(0)),
             email_provider_outcomes_total: Mutex::new(BTreeMap::new()),
             email_provider_durations: Mutex::new(BTreeMap::new()),
             email_provider_in_flight: AtomicU64::new(0),
@@ -664,6 +666,10 @@ impl Metrics {
             .lock()
             .expect("email delivery admission metrics lock poisoned");
         *totals.entry(key).or_insert(0) += 1;
+    }
+
+    pub fn observe_email_delivery_source_subject(&self, derived: bool) {
+        self.email_delivery_source_subjects[usize::from(derived)].fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_email_provider_in_flight(&self) {
@@ -1182,6 +1188,18 @@ impl Metrics {
         }
 
         output.push_str(
+            "\n# HELP keycast_email_delivery_source_subjects_total Email delivery requests with a derived or unavailable coarse source subject\n",
+        );
+        output.push_str("# TYPE keycast_email_delivery_source_subjects_total counter\n");
+        for (index, outcome) in ["unavailable", "derived"].iter().enumerate() {
+            output.push_str(&format!(
+                "keycast_email_delivery_source_subjects_total{{outcome=\"{}\"}} {}\n",
+                outcome,
+                self.email_delivery_source_subjects[index].load(Ordering::Relaxed)
+            ));
+        }
+
+        output.push_str(
             "\n# HELP keycast_auth_request_duration_seconds Auth request latency by endpoint and outcome\n",
         );
         output.push_str("# TYPE keycast_auth_request_duration_seconds histogram\n");
@@ -1527,6 +1545,7 @@ mod tests {
         metrics.inc_auth_audit_write_failure("/api/headless/login");
         metrics.inc_auth_email_send_failure("password_reset");
         metrics.observe_email_delivery_admission("email_change", "suppressed", "account_volume");
+        metrics.observe_email_delivery_source_subject(true);
         metrics.inc_email_provider_in_flight();
         metrics.observe_email_provider_outcome(
             "email_change_new",
@@ -1554,6 +1573,9 @@ mod tests {
         assert!(output.contains(
             "keycast_email_delivery_admissions_total{purpose=\"email_change\",decision=\"suppressed\",reason=\"account_volume\"} 1"
         ));
+        assert!(
+            output.contains("keycast_email_delivery_source_subjects_total{outcome=\"derived\"} 1")
+        );
         assert!(output.contains("keycast_email_provider_in_flight 0"));
         assert!(output.contains(
             "keycast_email_provider_outcomes_total{purpose=\"email_change_new\",outcome=\"timed_out\"} 1"

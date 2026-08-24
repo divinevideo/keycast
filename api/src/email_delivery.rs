@@ -141,7 +141,7 @@ impl Default for EmailDeliveryConfig {
             account_window: Duration::from_secs(60 * 60),
             source_limit: 50,
             source_window: Duration::from_secs(60 * 60),
-            // Google frontends append `<client-ip>,<load-balancer-ip>`.
+            // External Google load balancers append `<client-ip>,<load-balancer-ip>`.
             source_trusted_proxy_hops: 1,
             global_limit: 1_000,
             global_window: Duration::from_secs(60),
@@ -403,7 +403,9 @@ impl EmailDeliveryService {
     /// Derive a coarse source from the trusted suffix of `X-Forwarded-For`.
     #[must_use]
     pub fn coarse_source(&self, headers: &HeaderMap) -> Option<String> {
-        coarse_source(headers, self.config.source_trusted_proxy_hops)
+        let source = coarse_source(headers, self.config.source_trusted_proxy_hops);
+        METRICS.observe_email_delivery_source_subject(source.is_some());
+        source
     }
 
     /// Atomically reserve all rolling budgets and provider slots for one flow.
@@ -633,28 +635,18 @@ fn subject_hash(tenant_id: i64, subject: &str) -> String {
 /// Return a coarse source subnet without retaining the request address.
 #[must_use]
 fn coarse_source(headers: &HeaderMap, trusted_proxy_hops: usize) -> Option<String> {
-    let value = if let Some(forwarded) = headers.get("x-forwarded-for") {
-        // Trusted ingress addresses form a suffix. Values before the selected hop may have been
-        // supplied by the caller. An unusable trusted suffix disables this secondary control
-        // rather than falling back to a potentially caller-controlled header.
-        forwarded
-            .to_str()
-            .ok()?
-            .split(',')
-            .rev()
-            .nth(trusted_proxy_hops)?
-            .trim()
-            .parse::<IpAddr>()
-            .ok()?
+    let forwarded = headers.get("x-forwarded-for")?.to_str().ok()?;
+    let addresses = forwarded.split(',').collect::<Vec<_>>();
+    // Domain mapping can provide only the client value; multi-hop ingress addresses form a
+    // trusted suffix. Values before the selected hop may have been supplied by the caller.
+    let candidate = if addresses.len() == 1 {
+        addresses[0]
     } else {
-        headers
-            .get("x-real-ip")?
-            .to_str()
-            .ok()?
-            .trim()
-            .parse::<IpAddr>()
-            .ok()?
+        addresses.iter().rev().nth(trusted_proxy_hops)?
     };
+    // An unusable trusted suffix disables this secondary control rather than falling back to a
+    // potentially caller-controlled header.
+    let value = candidate.trim().parse::<IpAddr>().ok()?;
     Some(match value {
         IpAddr::V4(address) => {
             let octets = address.octets();
@@ -682,7 +674,7 @@ mod tests {
 
         headers.insert("x-forwarded-for", "2001:db8:1234:5678::1".parse().unwrap());
         assert_eq!(
-            coarse_source(&headers, 0).as_deref(),
+            coarse_source(&headers, 1).as_deref(),
             Some("2001:db8:1234:5600::")
         );
     }
@@ -703,6 +695,14 @@ mod tests {
     fn unusable_trusted_forwarded_hop_does_not_fall_back() {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", "198.51.100.9, unknown".parse().unwrap());
+        headers.insert("x-real-ip", "192.0.2.44".parse().unwrap());
+
+        assert_eq!(coarse_source(&headers, 0), None);
+    }
+
+    #[test]
+    fn source_requires_forwarded_header() {
+        let mut headers = HeaderMap::new();
         headers.insert("x-real-ip", "192.0.2.44".parse().unwrap());
 
         assert_eq!(coarse_source(&headers, 0), None);
