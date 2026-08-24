@@ -343,7 +343,9 @@ async fn nostr_rpc_inner(
 
             // Server does BOTH gift-wrap decrypt layers internally, so the client
             // makes one call per page instead of 2 sequential RPCs per message.
+            let operation_timer = HttpRpcOperationTimer::start(&req.method);
             let results = unwrap_gift_wrap_batch(&handler, &req.params).await;
+            operation_timer.finish("success");
 
             // One coalesced activity log for the whole batch (per-request semantics).
             log_activity(&auth_state, handler.is_oauth(), handler.authorization_id());
@@ -388,7 +390,9 @@ async fn nostr_rpc_inner(
 
             // Sequential construction bounds blocking crypto and naturally
             // preserves duplicate and positional recipient semantics.
+            let operation_timer = HttpRpcOperationTimer::start(&req.method);
             let results = wrap_gift_wrap_batch(&handler, &batch.rumor, &batch.recipients).await;
+            operation_timer.finish("success");
 
             // One coalesced activity update for the whole RPC request.
             log_activity(&auth_state, handler.is_oauth(), handler.authorization_id());
@@ -486,7 +490,7 @@ async fn observe_handler_operation<T>(
     method: &str,
     operation: impl std::future::Future<Output = Result<T, HandlerError>>,
 ) -> Result<T, HandlerError> {
-    let started = Instant::now();
+    let timer = HttpRpcOperationTimer::start(method);
     let result = operation.await;
     let outcome = match &result {
         Ok(_) => "success",
@@ -497,8 +501,37 @@ async fn observe_handler_operation<T>(
             | HandlerError::Encryption(_),
         ) => "client_error",
     };
-    METRICS.observe_http_rpc_operation(method, outcome, started.elapsed());
+    timer.finish(outcome);
     result
+}
+
+struct HttpRpcOperationTimer<'a> {
+    method: &'a str,
+    started: Instant,
+    finished: bool,
+}
+
+impl<'a> HttpRpcOperationTimer<'a> {
+    fn start(method: &'a str) -> Self {
+        Self {
+            method,
+            started: Instant::now(),
+            finished: false,
+        }
+    }
+
+    fn finish(mut self, outcome: &str) {
+        self.finished = true;
+        METRICS.observe_http_rpc_operation(self.method, outcome, self.started.elapsed());
+    }
+}
+
+impl Drop for HttpRpcOperationTimer<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            METRICS.observe_http_rpc_operation(self.method, "cancelled", self.started.elapsed());
+        }
+    }
 }
 
 /// Read the account gate state before a mutating operation.
@@ -1362,6 +1395,22 @@ mod tests {
                 .status(),
             StatusCode::GATEWAY_TIMEOUT
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_operation_records_its_elapsed_time() {
+        let operation = observe_handler_operation(
+            "sign_event",
+            std::future::pending::<Result<(), HandlerError>>(),
+        );
+
+        tokio::time::timeout(Duration::from_millis(1), operation)
+            .await
+            .expect_err("pending operation should be cancelled by the deadline");
+
+        assert!(METRICS.to_prometheus().contains(
+            "keycast_http_rpc_operation_duration_seconds_count{method=\"sign_event\",outcome=\"cancelled\"}"
+        ));
     }
 
     fn create_test_handler_with_dpop(expected_jkt: Option<String>) -> HttpRpcHandler {

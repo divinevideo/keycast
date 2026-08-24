@@ -16,6 +16,9 @@ const AUTH_DURATION_BUCKETS: [f64; 8] = [0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10
 const HTTP_RPC_DURATION_BUCKETS: [f64; 12] = [
     0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
+const HTTP_RPC_OPERATION_DURATION_BUCKETS: [f64; 14] = [
+    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
 const HTTP_RPC_ACQUIRE_BUCKETS: [f64; 9] = [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1.0, 5.0];
 const BCRYPT_WORKLOADS: usize = BcryptWorkload::ALL.len();
 const BCRYPT_OPERATIONS: usize = BcryptOperation::ALL.len();
@@ -57,6 +60,23 @@ impl Default for HttpRpcDurationMetric {
     fn default() -> Self {
         Self {
             buckets: [0; HTTP_RPC_DURATION_BUCKETS.len()],
+            count: 0,
+            sum: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct HttpRpcOperationDurationMetric {
+    buckets: [u64; HTTP_RPC_OPERATION_DURATION_BUCKETS.len()],
+    count: u64,
+    sum: f64,
+}
+
+impl Default for HttpRpcOperationDurationMetric {
+    fn default() -> Self {
+        Self {
+            buckets: [0; HTTP_RPC_OPERATION_DURATION_BUCKETS.len()],
             count: 0,
             sum: 0.0,
         }
@@ -213,7 +233,8 @@ pub struct Metrics {
     auth_audit_write_failures_total: Mutex<BTreeMap<String, u64>>,
     auth_email_send_failures_total: Mutex<BTreeMap<String, u64>>,
     http_rpc_request_durations: Mutex<BTreeMap<HttpRpcDurationKey, HttpRpcDurationMetric>>,
-    http_rpc_operation_durations: Mutex<BTreeMap<HttpRpcDurationKey, HttpRpcDurationMetric>>,
+    http_rpc_operation_durations:
+        Mutex<BTreeMap<HttpRpcDurationKey, HttpRpcOperationDurationMetric>>,
     http_rpc_status_check_durations: Mutex<BTreeMap<String, HttpRpcDurationMetric>>,
     http_rpc_db_acquire_durations: Mutex<BTreeMap<HttpRpcAcquireKey, HttpRpcAcquireMetric>>,
 }
@@ -510,7 +531,7 @@ impl Metrics {
         let metric = duration_metrics
             .entry(HttpRpcDurationKey { method, outcome })
             .or_default();
-        observe_http_rpc_duration(metric, duration);
+        observe_http_rpc_operation_duration(metric, duration);
     }
 
     pub fn observe_http_rpc_status_check(&self, outcome: &str, duration: Duration) {
@@ -940,7 +961,7 @@ impl Metrics {
             .expect("http rpc operation duration metrics lock poisoned")
             .iter()
         {
-            for (index, bucket) in HTTP_RPC_DURATION_BUCKETS.iter().enumerate() {
+            for (index, bucket) in HTTP_RPC_OPERATION_DURATION_BUCKETS.iter().enumerate() {
                 output.push_str(&format!(
                     "keycast_http_rpc_operation_duration_seconds_bucket{{method=\"{}\",outcome=\"{}\",le=\"{}\"}} {}\n",
                     key.method, key.outcome, bucket, metric.buckets[index]
@@ -1232,6 +1253,20 @@ fn observe_http_rpc_duration(metric: &mut HttpRpcDurationMetric, duration: Durat
     }
 }
 
+fn observe_http_rpc_operation_duration(
+    metric: &mut HttpRpcOperationDurationMetric,
+    duration: Duration,
+) {
+    let seconds = duration.as_secs_f64();
+    metric.count += 1;
+    metric.sum += seconds;
+    for (index, bucket) in HTTP_RPC_OPERATION_DURATION_BUCKETS.iter().enumerate() {
+        if seconds <= *bucket {
+            metric.buckets[index] += 1;
+        }
+    }
+}
+
 fn observe_http_rpc_acquire_duration(metric: &mut HttpRpcAcquireMetric, duration: Duration) {
     let seconds = duration.as_secs_f64();
     metric.count += 1;
@@ -1266,6 +1301,7 @@ fn normalize_http_rpc_outcome(outcome: &str) -> &'static str {
         "account_restricted" => "account_restricted",
         "unavailable" => "unavailable",
         "timeout" => "timeout",
+        "cancelled" => "cancelled",
         "error" => "error",
         _ => "other",
     }
@@ -1405,6 +1441,11 @@ mod tests {
             Duration::from_millis(10),
         );
         metrics.observe_http_rpc_operation("nip04_decrypt", "success", Duration::from_millis(11));
+        metrics.observe_http_rpc_operation(
+            "nip17_unwrap_batch",
+            "cancelled",
+            Duration::from_secs(8),
+        );
         metrics.observe_http_rpc_status_check("success", Duration::from_millis(25));
         metrics.observe_http_rpc_db_acquire(
             "check_user_status_active",
@@ -1433,6 +1474,12 @@ mod tests {
         ));
         assert!(output.contains(
             "keycast_http_rpc_operation_duration_seconds_count{method=\"nip04_decrypt\",outcome=\"success\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_http_rpc_operation_duration_seconds_bucket{method=\"sign_event\",outcome=\"success\",le=\"0.01\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_http_rpc_operation_duration_seconds_count{method=\"nip17_unwrap_batch\",outcome=\"cancelled\"} 1"
         ));
         assert!(output.contains(
             "keycast_http_rpc_status_check_duration_seconds_count{outcome=\"success\"} 1"
