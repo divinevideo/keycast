@@ -14,6 +14,7 @@ use crate::api::http::{
     admin, ap, atproto, atproto_oauth, auth, claim, headless, metrics, nostr_rpc, oauth, policies,
     service_deletion, service_provisioning, teams,
 };
+use crate::email_delivery::EmailDeliveryService;
 use crate::state::KeycastState;
 use axum::response::Json as AxumJson;
 use serde_json::Value as JsonValue;
@@ -56,6 +57,7 @@ pub fn public_verify_email_route(
 pub fn api_routes(
     pool: PgPool,
     state: Arc<KeycastState>,
+    email_delivery: EmailDeliveryService,
     auth_cors: tower_http::cors::CorsLayer,
     public_cors: tower_http::cors::CorsLayer,
     auth_tx: Option<AuthorizationSender>,
@@ -100,6 +102,7 @@ pub fn api_routes(
         )
         .route("/auth/cancel-email-change", post(auth::cancel_email_change))
         .layer(axum::Extension(auth_state.state.bcrypt.clone()))
+        .layer(axum::Extension(email_delivery.clone()))
         .with_state(pool.clone());
 
     // OAuth routes (no authentication required for initial authorize request)
@@ -177,6 +180,7 @@ pub fn api_routes(
         .route("/user/change-password", post(auth::change_password))
         .route("/user/change-email", post(auth::change_email))
         .layer(axum::Extension(auth_state.state.bcrypt.clone()))
+        .layer(axum::Extension(email_delivery))
         .layer(auth_cors.clone())
         .with_state(pool.clone());
 

@@ -14,6 +14,11 @@ use secrecy::{ExposeSecret, SecretString};
 use super::admin::{is_full_admin, is_support_admin};
 use crate::api::extractors::UcanAuth;
 use crate::brand::BRAND_NAME;
+use crate::email_delivery::{
+    coarse_source, EmailAdmissionRequest, EmailDeliveryPurpose, EmailDeliveryReservation,
+    EmailDeliveryService,
+};
+use crate::email_service::EmailProviderOutcome;
 use crate::key_egress_limiter::{
     KeyEgressAdmission, KeyEgressLimiter, KeyEgressReservation, KEY_EGRESS_FINALIZATION_DEADLINE,
     KEY_EGRESS_RESERVED_WORK_DEADLINE,
@@ -2555,17 +2560,64 @@ pub struct ResendVerificationResponse {
 pub async fn resend_verification(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
+    Extension(email_delivery): Extension<EmailDeliveryService>,
     headers: HeaderMap,
     Json(mut req): Json<ResendVerificationRequest>,
 ) -> Json<ResendVerificationResponse> {
     let tenant_id = tenant.0.id;
     if let Some(ref mut email) = req.email {
-        *email = email.to_lowercase();
+        *email = normalize_registration_email(email)
+            .unwrap_or_else(|_| email.trim().to_ascii_lowercase());
     }
 
-    // Try to get user identity from token first, then fall back to email
+    let source = coarse_source(&headers);
+    let authenticated_pubkey = extract_user_from_token(&headers, tenant_id).await.ok();
+    let mut reservation = if authenticated_pubkey.is_none() {
+        let Some(email) = req.email.as_deref() else {
+            return Json(ResendVerificationResponse {
+                success: true,
+                message:
+                    "If this email is registered, you will receive a verification email shortly."
+                        .to_string(),
+            });
+        };
+        match email_delivery
+            .admit(EmailAdmissionRequest {
+                tenant_id,
+                purpose: EmailDeliveryPurpose::Verification,
+                destinations: &[email],
+                account: None,
+                source: source.as_deref(),
+            })
+            .await
+        {
+            Ok(reservation) => Some(reservation),
+            Err(denied) => {
+                record_email_delivery_event(
+                    &pool,
+                    &headers,
+                    tenant_id,
+                    "/api/auth/resend-verification",
+                    EmailDeliveryPurpose::Verification,
+                    "suppressed",
+                    Some(denied.reason.as_str()),
+                    None,
+                )
+                .await;
+                return Json(ResendVerificationResponse {
+                    success: true,
+                    message: "If this email is registered, you will receive a verification email shortly."
+                        .to_string(),
+                });
+            }
+        }
+    } else {
+        None
+    };
+
+    // Try to get user identity from token first, then fall back to email.
     let lookup_result: Option<(String, String, bool, Option<chrono::DateTime<chrono::Utc>>)> =
-        if let Ok(user_pubkey) = extract_user_from_token(&headers, tenant_id).await {
+        if let Some(user_pubkey) = authenticated_pubkey {
             // Authenticated: look up by pubkey
             let user_repo = UserRepository::new(pool.clone());
             match user_repo
@@ -2601,14 +2653,65 @@ pub async fn resend_verification(
     });
 
     let Some((pubkey, email, email_verified, last_sent)) = lookup_result else {
-        // User not found - return success anyway to prevent enumeration
-        tracing::debug!("Resend verification: user not found (not leaking this to client)");
+        release_email_reservation(reservation.take()).await;
+        record_email_delivery_event(
+            &pool,
+            &headers,
+            tenant_id,
+            "/api/auth/resend-verification",
+            EmailDeliveryPurpose::Verification,
+            "admitted",
+            Some("user_not_found"),
+            None,
+        )
+        .await;
         return success_response;
     };
 
+    if reservation.is_none() {
+        reservation = match email_delivery
+            .admit(EmailAdmissionRequest {
+                tenant_id,
+                purpose: EmailDeliveryPurpose::Verification,
+                destinations: &[&email],
+                account: None,
+                source: source.as_deref(),
+            })
+            .await
+        {
+            Ok(reservation) => Some(reservation),
+            Err(denied) => {
+                record_email_delivery_event(
+                    &pool,
+                    &headers,
+                    tenant_id,
+                    "/api/auth/resend-verification",
+                    EmailDeliveryPurpose::Verification,
+                    "suppressed",
+                    Some(denied.reason.as_str()),
+                    Some(&pubkey),
+                )
+                .await;
+                return success_response;
+            }
+        };
+    }
+
+    record_email_delivery_event(
+        &pool,
+        &headers,
+        tenant_id,
+        "/api/auth/resend-verification",
+        EmailDeliveryPurpose::Verification,
+        "admitted",
+        None,
+        Some(&pubkey),
+    )
+    .await;
+
     // Already verified - return success (don't leak verification status)
     if email_verified {
-        tracing::debug!("Resend verification: email already verified for {}", email);
+        release_email_reservation(reservation).await;
         return success_response;
     }
 
@@ -2616,11 +2719,7 @@ pub async fn resend_verification(
     if let Some(sent_at) = last_sent {
         let minutes_since = (Utc::now() - sent_at).num_minutes();
         if minutes_since < 5 {
-            tracing::debug!(
-                "Resend verification: rate limited for {} ({} minutes since last send)",
-                email,
-                minutes_since
-            );
+            release_email_reservation(reservation).await;
             // Return success anyway - don't reveal rate limiting to potential attackers
             return success_response;
         }
@@ -2641,33 +2740,24 @@ pub async fn resend_verification(
         .await
     {
         tracing::error!("Failed to set verification token: {}", e);
+        release_email_reservation(reservation).await;
         return success_response;
     }
 
-    // Send verification email (don't await to prevent timing attacks)
-    let email_clone = email.clone();
-    let token_clone = verification_token.clone();
-    tokio::spawn(async move {
-        match crate::email_service::EmailService::new() {
-            Ok(email_service) => {
-                if let Err(e) = email_service
-                    .send_verification_email(&email_clone, &token_clone, None)
-                    .await
-                {
-                    tracing::error!(
-                        "Failed to send verification email to {}: {}",
-                        email_clone,
-                        e
-                    );
-                } else {
-                    tracing::info!("Sent verification email to {}", email_clone);
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Email service unavailable: {}", e);
-            }
-        }
-    });
+    let provider_outcome = email_delivery
+        .send_verification(&email, &verification_token)
+        .await;
+    release_email_reservation(reservation).await;
+    record_provider_event(
+        &pool,
+        &headers,
+        tenant_id,
+        "/api/auth/resend-verification",
+        EmailDeliveryPurpose::Verification,
+        &provider_outcome,
+        Some(&pubkey),
+    )
+    .await;
 
     success_response
 }
@@ -2676,28 +2766,72 @@ pub async fn resend_verification(
 pub async fn forgot_password(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
+    Extension(email_delivery): Extension<EmailDeliveryService>,
     headers: HeaderMap,
     Json(mut req): Json<ForgotPasswordRequest>,
 ) -> Result<Json<ForgotPasswordResponse>, AuthError> {
     let tenant_id = tenant.0.id;
     let endpoint = "/api/auth/forgot-password";
-    req.email = req.email.to_lowercase();
-    tracing::info!(
-        "Password reset requested for email: {} in tenant: {}",
-        req.email,
-        tenant_id
-    );
+    req.email = normalize_registration_email(&req.email)
+        .unwrap_or_else(|_| req.email.trim().to_ascii_lowercase());
+    let source = coarse_source(&headers);
+    let reservation = match email_delivery
+        .admit(EmailAdmissionRequest {
+            tenant_id,
+            purpose: EmailDeliveryPurpose::PasswordReset,
+            destinations: &[&req.email],
+            account: None,
+            source: source.as_deref(),
+        })
+        .await
+    {
+        Ok(reservation) => reservation,
+        Err(denied) => {
+            record_email_delivery_event(
+                &pool,
+                &headers,
+                tenant_id,
+                endpoint,
+                EmailDeliveryPurpose::PasswordReset,
+                "suppressed",
+                Some(denied.reason.as_str()),
+                None,
+            )
+            .await;
+            return Ok(Json(ForgotPasswordResponse {
+                success: true,
+                message:
+                    "If an account exists with that email, a password reset link has been sent."
+                        .to_string(),
+            }));
+        }
+    };
 
     // Check if user exists in this tenant
     let user_repo = UserRepository::new(pool.clone());
-    let user_pubkey = user_repo
-        .find_pubkey_by_email(&req.email, tenant_id)
-        .await?;
+    let user_pubkey = match user_repo.find_pubkey_by_email(&req.email, tenant_id).await {
+        Ok(user_pubkey) => user_pubkey,
+        Err(error) => {
+            reservation.release().await;
+            return Err(error.into());
+        }
+    };
 
     // Always return success even if email doesn't exist (security best practice)
     let public_key = match user_pubkey {
         Some(pubkey) => pubkey,
         None => {
+            record_email_delivery_event(
+                &pool,
+                &headers,
+                tenant_id,
+                endpoint,
+                EmailDeliveryPurpose::PasswordReset,
+                "admitted",
+                Some("user_not_found"),
+                None,
+            )
+            .await;
             super::auth_observability::record_auth_event_and_log(
                 &pool,
                 &headers,
@@ -2717,10 +2851,7 @@ pub async fn forgot_password(
                 },
             )
             .await;
-            tracing::info!(
-                "Password reset requested for non-existent email: {}",
-                req.email
-            );
+            reservation.release().await;
             return Ok(Json(ForgotPasswordResponse {
                 success: true,
                 message:
@@ -2731,43 +2862,50 @@ pub async fn forgot_password(
     };
 
     let mut reason_code = None;
+    record_email_delivery_event(
+        &pool,
+        &headers,
+        tenant_id,
+        endpoint,
+        EmailDeliveryPurpose::PasswordReset,
+        "admitted",
+        None,
+        Some(&public_key),
+    )
+    .await;
 
     // Generate reset token
     let reset_token = generate_secure_token();
     let reset_expires = Utc::now() + Duration::hours(PASSWORD_RESET_EXPIRY_HOURS);
 
     // Store reset token (reusing user_repo from above)
-    user_repo
+    if let Err(error) = user_repo
         .set_password_reset_token(&public_key, tenant_id, &reset_token, reset_expires)
-        .await?;
+        .await
+    {
+        reservation.release().await;
+        return Err(error.into());
+    }
 
     // Send password reset email (optional - don't fail if email service unavailable)
-    match crate::email_service::EmailService::new() {
-        Ok(email_service) => {
-            if let Err(e) = email_service
-                .send_password_reset_email(&req.email, &reset_token)
-                .await
-            {
-                METRICS.inc_auth_email_send_failure("password_reset");
-                reason_code = Some("email_send_failed");
-                tracing::error!(
-                    "Failed to send password reset email to {}: {}",
-                    req.email,
-                    e
-                );
-            } else {
-                tracing::info!("Sent password reset email to {}", req.email);
-            }
-        }
-        Err(e) => {
-            METRICS.inc_auth_email_send_failure("password_reset");
-            reason_code = Some("email_send_failed");
-            tracing::warn!(
-                "Email service unavailable, skipping password reset email: {}",
-                e
-            );
-        }
+    let provider_outcome = email_delivery
+        .send_password_reset(&req.email, &reset_token)
+        .await;
+    if provider_outcome.is_err() {
+        METRICS.inc_auth_email_send_failure("password_reset");
+        reason_code = Some("email_send_failed");
     }
+    reservation.release().await;
+    record_provider_event(
+        &pool,
+        &headers,
+        tenant_id,
+        endpoint,
+        EmailDeliveryPurpose::PasswordReset,
+        &provider_outcome,
+        Some(&public_key),
+    )
+    .await;
 
     super::auth_observability::record_auth_event_and_log(
         &pool,
@@ -2806,11 +2944,7 @@ pub async fn reset_password(
 ) -> Result<Json<ResetPasswordResponse>, AuthError> {
     let tenant_id = tenant.0.id;
     let endpoint = "/api/auth/reset-password";
-    tracing::info!(
-        "Password reset attempt with token: {}... for tenant: {}",
-        &req.token[..10],
-        tenant_id
-    );
+    tracing::info!(tenant_id, "Password reset attempt received");
 
     // Find user with this reset token in this tenant
     let user_repo = UserRepository::new(pool.clone());
@@ -4168,6 +4302,70 @@ async fn record_email_change_event(
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn record_email_delivery_event(
+    pool: &PgPool,
+    headers: &HeaderMap,
+    tenant_id: i64,
+    endpoint: &'static str,
+    purpose: EmailDeliveryPurpose,
+    outcome: &'static str,
+    reason_code: Option<&str>,
+    pubkey: Option<&str>,
+) {
+    super::auth_observability::record_auth_event_and_log(
+        pool,
+        headers,
+        None,
+        super::auth_observability::AuthEvent {
+            tenant_id,
+            endpoint,
+            event_type: "email_delivery",
+            outcome,
+            reason_code,
+            http_status: 200,
+            email: None,
+            pubkey,
+            client_id: None,
+            redirect_origin: None,
+            metadata_json: serde_json::json!({ "purpose": purpose.as_str() }),
+        },
+    )
+    .await;
+}
+
+async fn record_provider_event(
+    pool: &PgPool,
+    headers: &HeaderMap,
+    tenant_id: i64,
+    endpoint: &'static str,
+    purpose: EmailDeliveryPurpose,
+    result: &Result<EmailProviderOutcome, crate::email_service::EmailSendError>,
+    pubkey: Option<&str>,
+) {
+    let provider_outcome = result
+        .as_ref()
+        .copied()
+        .unwrap_or_else(|error| error.outcome());
+    record_email_delivery_event(
+        pool,
+        headers,
+        tenant_id,
+        endpoint,
+        purpose,
+        if result.is_ok() { "success" } else { "failure" },
+        Some(provider_outcome.as_str()),
+        pubkey,
+    )
+    .await;
+}
+
+async fn release_email_reservation(reservation: Option<EmailDeliveryReservation>) {
+    if let Some(reservation) = reservation {
+        reservation.release().await;
+    }
+}
+
 /// Initiate a self-serve email change.
 ///
 /// Authenticated (UCAN) with current-password re-verification. Generates per-address tokens,
@@ -4177,6 +4375,7 @@ pub async fn change_email(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
     Extension(bcrypt): Extension<BcryptAdmission>,
+    Extension(email_delivery): Extension<EmailDeliveryService>,
     headers: HeaderMap,
     Json(req): Json<ChangeEmailRequest>,
 ) -> Result<Json<ChangeEmailResponse>, AuthError> {
@@ -4252,19 +4451,68 @@ pub async fn change_email(
         message: "Check both your current and new email to confirm the change.".to_string(),
     });
 
-    // Resend cooldown: rate-limit re-initiations of the *same* target. The prior emails are still
-    // valid, so we just tell the user to check their inbox. A change to a *different* address is a
-    // new request that supersedes the prior one, so it bypasses the cooldown (otherwise correcting
-    // a typo'd address within the window would silently fail). The endpoint is password-gated on
-    // every call, so the residual "send to alternating targets" rate is bounded by request auth.
-    if let Ok(Some((Some(existing_target), Some(last_sent)))) = user_repo
+    let source = coarse_source(&headers);
+    let reservation = match email_delivery
+        .admit(EmailAdmissionRequest {
+            tenant_id,
+            purpose: EmailDeliveryPurpose::EmailChange,
+            destinations: &[&current_email, &new_email],
+            account: Some(&user_pubkey),
+            source: source.as_deref(),
+        })
+        .await
+    {
+        Ok(reservation) => reservation,
+        Err(denied) => {
+            record_email_delivery_event(
+                &pool,
+                &headers,
+                tenant_id,
+                "/api/user/change-email",
+                EmailDeliveryPurpose::EmailChange,
+                "suppressed",
+                Some(denied.reason.as_str()),
+                Some(&user_pubkey),
+            )
+            .await;
+            return Ok(Json(ChangeEmailResponse {
+                success: true,
+                message:
+                    "Too many confirmation emails were requested recently. Please try again later."
+                        .to_string(),
+            }));
+        }
+    };
+    record_email_delivery_event(
+        &pool,
+        &headers,
+        tenant_id,
+        "/api/user/change-email",
+        EmailDeliveryPurpose::EmailChange,
+        "admitted",
+        None,
+        Some(&user_pubkey),
+    )
+    .await;
+
+    // Preserve the persisted same-target cooldown for links issued before shared admission was
+    // deployed. New requests have already spent the atomic destination and account budgets above.
+    let pending_send_state = match user_repo
         .pending_email_send_state(&user_pubkey, tenant_id)
         .await
     {
+        Ok(state) => state,
+        Err(error) => {
+            reservation.release().await;
+            return Err(error.into());
+        }
+    };
+    if let Some((Some(existing_target), Some(last_sent))) = pending_send_state {
         if existing_target == new_email
             && Utc::now() - last_sent < Duration::minutes(EMAIL_CHANGE_RESEND_COOLDOWN_MINUTES)
         {
             // Honest message: nothing fresh was sent, the earlier links are still valid.
+            reservation.release().await;
             return Ok(Json(ChangeEmailResponse {
                 success: true,
                 message:
@@ -4276,11 +4524,14 @@ pub async fn change_email(
 
     // Anti-enumeration: if the new email is already registered, return success without sending
     // or storing anything, so the endpoint can't be used to probe for registered addresses.
-    if user_repo
-        .find_pubkey_by_email(&new_email, tenant_id)
-        .await?
-        .is_some()
-    {
+    let target_pubkey = match user_repo.find_pubkey_by_email(&new_email, tenant_id).await {
+        Ok(target_pubkey) => target_pubkey,
+        Err(error) => {
+            reservation.release().await;
+            return Err(error.into());
+        }
+    };
+    if target_pubkey.is_some() {
         record_email_change_event(
             &pool,
             &headers,
@@ -4294,6 +4545,7 @@ pub async fn change_email(
             Some(&user_pubkey),
         )
         .await;
+        reservation.release().await;
         return Ok(ok_response);
     }
 
@@ -4302,7 +4554,7 @@ pub async fn change_email(
     let old_token = generate_secure_token();
     let new_token = generate_secure_token();
     let expires = Utc::now() + Duration::hours(EMAIL_CHANGE_EXPIRY_HOURS);
-    user_repo
+    if let Err(error) = user_repo
         .set_pending_email_change(
             &user_pubkey,
             tenant_id,
@@ -4311,28 +4563,41 @@ pub async fn change_email(
             &new_token,
             expires,
         )
-        .await?;
-
-    // Best-effort sends; don't fail the flow if email delivery is unavailable.
-    match crate::email_service::EmailService::new() {
-        Ok(svc) => {
-            if let Err(e) = svc
-                .send_email_change_confirmation(&new_email, &new_token)
-                .await
-            {
-                tracing::error!("Failed to send email-change confirmation: {}", e);
-            }
-            // The old-address token serves both confirm and cancel; the action is distinguished
-            // by endpoint (/confirm-email-change vs /cancel-email-change), not by a separate token.
-            if let Err(e) = svc
-                .send_email_change_notification(&current_email, &new_email, &old_token, &old_token)
-                .await
-            {
-                tracing::error!("Failed to send email-change notification: {}", e);
-            }
-        }
-        Err(e) => tracing::warn!("Email service unavailable: {}", e),
+        .await
+    {
+        reservation.release().await;
+        return Err(error.into());
     }
+
+    // The old-address token serves both confirm and cancel; the action is distinguished by
+    // endpoint (/confirm-email-change vs /cancel-email-change), not by a separate token.
+    let new_outcome = email_delivery
+        .send_email_change_new(&new_email, &new_token)
+        .await;
+    let old_outcome = email_delivery
+        .send_email_change_old(&current_email, &new_email, &old_token)
+        .await;
+    reservation.release().await;
+    record_provider_event(
+        &pool,
+        &headers,
+        tenant_id,
+        "/api/user/change-email",
+        EmailDeliveryPurpose::EmailChangeNew,
+        &new_outcome,
+        Some(&user_pubkey),
+    )
+    .await;
+    record_provider_event(
+        &pool,
+        &headers,
+        tenant_id,
+        "/api/user/change-email",
+        EmailDeliveryPurpose::EmailChangeOld,
+        &old_outcome,
+        Some(&user_pubkey),
+    )
+    .await;
 
     record_email_change_event(
         &pool,

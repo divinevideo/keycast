@@ -1114,7 +1114,7 @@ fn validate_environment() -> Result<(), String> {
     }
 
     // Validate email configuration (fail-closed in production)
-    if let Err(e) = keycast_api::email_service::create_email_sender() {
+    if let Err(e) = keycast_api::email_service::validate_email_configuration() {
         errors.push(Box::leak(e.into_boxed_str()));
     }
 
@@ -1348,6 +1348,10 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
             ""
         }
     );
+    let email_delivery =
+        keycast_api::email_delivery::EmailDeliveryService::from_env(prefixed_redis.clone())
+            .map_err(|error| format!("Invalid email delivery configuration: {error}"))?;
+    tracing::info!("✔︎ Shared email delivery admission initialized");
 
     // Setup key managers (one for signer, one for API - they're cheap to create)
     let kms_provider =
@@ -1559,6 +1563,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     let api_routes = keycast_api::api::http::routes::api_routes(
         database.pool.clone(),
         api_state.clone(),
+        email_delivery,
         auth_cors,
         public_cors,
         Some(auth_tx),

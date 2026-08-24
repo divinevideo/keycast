@@ -1,10 +1,12 @@
 // ABOUTME: Email service abstraction for sending verification and password reset emails
-// ABOUTME: Supports SendGrid for production and DevEmailSender for local development/testing
+// ABOUTME: Supports SendGrid for production and captured email in development/testing
 
 use async_trait::async_trait;
 use serde::Serialize;
 use std::env;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use thiserror::Error;
 
 use crate::brand::BRAND_NAME;
 
@@ -104,15 +106,16 @@ pub trait EmailSender: Send + Sync {
         to_email: &str,
         verification_token: &str,
         pin: Option<&str>,
-    ) -> Result<(), String>;
+    ) -> Result<(), EmailSendError>;
     async fn send_password_reset_email(
         &self,
         to_email: &str,
         reset_token: &str,
-    ) -> Result<(), String>;
+    ) -> Result<(), EmailSendError>;
 
     /// Send a claim link email for a preloaded Vine account.
-    async fn send_claim_email(&self, to_email: &str, claim_url: &str) -> Result<(), String>;
+    async fn send_claim_email(&self, to_email: &str, claim_url: &str)
+        -> Result<(), EmailSendError>;
 
     /// Send a confirmation link to the proposed NEW address during an email change.
     /// The implementation builds the URL from its configured base URL (mirrors
@@ -121,17 +124,17 @@ pub trait EmailSender: Send + Sync {
         &self,
         to_new_email: &str,
         confirm_token: &str,
-    ) -> Result<(), String>;
+    ) -> Result<(), EmailSendError>;
 
     /// Send a security notification to the user's CURRENT (old) address during an email change.
     /// Includes both a confirm link (approve the change) and a cancel link (reject it).
     async fn send_email_change_notification(
         &self,
         to_old_email: &str,
-        new_email: &str,
+        _new_email: &str,
         confirm_token: &str,
         cancel_token: &str,
-    ) -> Result<(), String>;
+    ) -> Result<(), EmailSendError>;
 
     /// Get captured emails (only available in dev/test mode)
     fn get_captured_emails(&self) -> Vec<CapturedEmail> {
@@ -144,7 +147,55 @@ pub trait EmailSender: Send + Sync {
     }
 }
 
-/// Development email sender - logs URLs to console and captures emails for testing
+/// Stable terminal categories for email-provider calls.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmailProviderOutcome {
+    Accepted,
+    Rejected,
+    RateLimited,
+    TimedOut,
+    Unavailable,
+}
+
+impl EmailProviderOutcome {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::RateLimited => "rate_limited",
+            Self::TimedOut => "timed_out",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Redacted email-provider error suitable for logs and audit reason codes.
+#[derive(Debug, Error)]
+pub enum EmailSendError {
+    #[error("email provider rejected the request")]
+    Rejected,
+    #[error("email provider rate limited the request")]
+    RateLimited,
+    #[error("email provider request timed out")]
+    TimedOut,
+    #[error("email provider is unavailable")]
+    Unavailable,
+}
+
+impl EmailSendError {
+    #[must_use]
+    pub const fn outcome(&self) -> EmailProviderOutcome {
+        match self {
+            Self::Rejected => EmailProviderOutcome::Rejected,
+            Self::RateLimited => EmailProviderOutcome::RateLimited,
+            Self::TimedOut => EmailProviderOutcome::TimedOut,
+            Self::Unavailable => EmailProviderOutcome::Unavailable,
+        }
+    }
+}
+
+/// Development email sender that captures messages for testing.
 pub struct DevEmailSender {
     base_url: String,
     captured: Arc<Mutex<Vec<CapturedEmail>>>,
@@ -158,7 +209,7 @@ impl DevEmailSender {
 
         tracing::info!("===========================================");
         tracing::info!("  EMAIL SERVICE: Development Mode");
-        tracing::info!("  Emails will be logged to console");
+        tracing::info!("  Emails will be captured in memory");
         tracing::info!("  Base URL: {}", base_url);
         tracing::info!("===========================================");
 
@@ -187,7 +238,7 @@ impl EmailSender for DevEmailSender {
         to_email: &str,
         verification_token: &str,
         pin: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<(), EmailSendError> {
         // This public path is claimed by the mobile apps and also verifies server-side when a
         // browser keeps the link instead of handing it to the app (keycast#360).
         let verification_url = build_verification_url(&self.base_url, verification_token);
@@ -196,22 +247,9 @@ impl EmailSender for DevEmailSender {
         tracing::info!("==================================================");
         tracing::info!("  VERIFICATION EMAIL");
         tracing::info!("==================================================");
-        tracing::info!("  To: {}", to_email);
         tracing::info!("  Subject: Verify your {} email address", BRAND_NAME);
-        tracing::info!("");
-        tracing::info!("  Click to verify:");
-        tracing::info!("  {}", verification_url);
-        if let Some(pin) = pin {
-            tracing::info!("  Or enter code in app: {}", pin);
-        }
         tracing::info!("==================================================");
         tracing::info!("");
-
-        // Also print to stderr so it's visible even with log filtering
-        eprintln!(
-            "\n\x1b[32m[DEV EMAIL]\x1b[0m Verification link for {}: \x1b[4m{}\x1b[0m\n",
-            to_email, verification_url
-        );
 
         // Capture for testing
         if let Ok(mut captured) = self.captured.lock() {
@@ -231,7 +269,7 @@ impl EmailSender for DevEmailSender {
         &self,
         to_email: &str,
         reset_token: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), EmailSendError> {
         let reset_url = format!(
             "{}/reset-password?token={}&email={}",
             self.base_url,
@@ -243,19 +281,9 @@ impl EmailSender for DevEmailSender {
         tracing::info!("==================================================");
         tracing::info!("  PASSWORD RESET EMAIL");
         tracing::info!("==================================================");
-        tracing::info!("  To: {}", to_email);
         tracing::info!("  Subject: Reset your {} password", BRAND_NAME);
-        tracing::info!("");
-        tracing::info!("  Click to reset password:");
-        tracing::info!("  {}", reset_url);
         tracing::info!("==================================================");
         tracing::info!("");
-
-        // Also print to stderr so it's visible even with log filtering
-        eprintln!(
-            "\n\x1b[33m[DEV EMAIL]\x1b[0m Password reset link for {}: \x1b[4m{}\x1b[0m\n",
-            to_email, reset_url
-        );
 
         // Capture for testing
         if let Ok(mut captured) = self.captured.lock() {
@@ -271,26 +299,22 @@ impl EmailSender for DevEmailSender {
         Ok(())
     }
 
-    async fn send_claim_email(&self, to_email: &str, claim_url: &str) -> Result<(), String> {
+    async fn send_claim_email(
+        &self,
+        to_email: &str,
+        claim_url: &str,
+    ) -> Result<(), EmailSendError> {
         tracing::info!("");
         tracing::info!("==================================================");
         tracing::info!("  VINE CLAIM EMAIL");
         tracing::info!("==================================================");
-        tracing::info!("  To: {}", to_email);
         tracing::info!(
             "  Subject: Your Vine account on {} is ready to claim",
             BRAND_NAME
         );
         tracing::info!("");
-        tracing::info!("  Claim link:");
-        tracing::info!("  {}", claim_url);
         tracing::info!("==================================================");
         tracing::info!("");
-
-        eprintln!(
-            "\n\x1b[36m[DEV EMAIL]\x1b[0m Vine claim link for {}: \x1b[4m{}\x1b[0m\n",
-            to_email, claim_url
-        );
 
         if let Ok(mut captured) = self.captured.lock() {
             captured.push(CapturedEmail {
@@ -309,16 +333,11 @@ impl EmailSender for DevEmailSender {
         &self,
         to_new_email: &str,
         confirm_token: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), EmailSendError> {
         let confirm_url = format!(
             "{}/confirm-email-change?token={}",
             self.base_url, confirm_token
         );
-        eprintln!(
-            "\n\x1b[34m[DEV EMAIL]\x1b[0m Email-change confirm (new address) for {}: \x1b[4m{}\x1b[0m\n",
-            to_new_email, confirm_url
-        );
-
         if let Ok(mut captured) = self.captured.lock() {
             captured.push(CapturedEmail {
                 to: to_new_email.to_string(),
@@ -335,10 +354,10 @@ impl EmailSender for DevEmailSender {
     async fn send_email_change_notification(
         &self,
         to_old_email: &str,
-        new_email: &str,
+        _new_email: &str,
         confirm_token: &str,
         cancel_token: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), EmailSendError> {
         let confirm_url = format!(
             "{}/confirm-email-change?token={}",
             self.base_url, confirm_token
@@ -347,11 +366,6 @@ impl EmailSender for DevEmailSender {
             "{}/cancel-email-change?token={}",
             self.base_url, cancel_token
         );
-        eprintln!(
-            "\n\x1b[34m[DEV EMAIL]\x1b[0m Email-change notice (old address) for {} -> {}: confirm \x1b[4m{}\x1b[0m cancel \x1b[4m{}\x1b[0m\n",
-            to_old_email, new_email, confirm_url, cancel_url
-        );
-
         if let Ok(mut captured) = self.captured.lock() {
             captured.push(CapturedEmail {
                 to: to_old_email.to_string(),
@@ -431,10 +445,11 @@ pub struct SendGridEmailSender {
     from_email: String,
     from_name: String,
     base_url: String,
+    client: reqwest::Client,
 }
 
 impl SendGridEmailSender {
-    pub fn new(api_key: String) -> Self {
+    pub fn new(api_key: String) -> Result<Self, String> {
         let from_email =
             env::var("FROM_EMAIL").unwrap_or_else(|_| "noreply@divine.video".to_string());
         let from_name = env::var("FROM_NAME").unwrap_or_else(|_| BRAND_NAME.to_string());
@@ -444,12 +459,21 @@ impl SendGridEmailSender {
 
         tracing::info!("Email service initialized with SendGrid");
 
-        Self {
+        let connect_timeout = duration_from_env("EMAIL_PROVIDER_CONNECT_TIMEOUT_MS", 3_000);
+        let request_timeout = duration_from_env("EMAIL_PROVIDER_REQUEST_TIMEOUT_MS", 10_000);
+        let client = reqwest::Client::builder()
+            .connect_timeout(connect_timeout)
+            .timeout(request_timeout)
+            .build()
+            .map_err(|error| format!("failed to build email HTTP client: {error}"))?;
+
+        Ok(Self {
             api_key,
             from_email,
             from_name,
             base_url,
-        }
+            client,
+        })
     }
 
     async fn send_email(
@@ -458,13 +482,10 @@ impl SendGridEmailSender {
         subject: &str,
         html_content: &str,
         text_content: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), EmailSendError> {
         // Check if emails are disabled (useful for load testing)
         if env::var("DISABLE_EMAILS").is_ok() {
-            tracing::info!(
-                "Emails disabled via DISABLE_EMAILS env var, skipping email to {}",
-                to_email
-            );
+            tracing::info!("Emails disabled via DISABLE_EMAILS env var, skipping provider call");
             return Ok(());
         }
 
@@ -498,29 +519,47 @@ impl SendGridEmailSender {
             },
         };
 
-        let client = reqwest::Client::new();
-        let response = client
+        let response = self
+            .client
             .post("https://api.sendgrid.com/v3/mail/send")
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
             .json(&email)
             .send()
             .await
-            .map_err(|e| format!("Failed to send email: {}", e))?;
+            .map_err(|error| {
+                if error.is_timeout() {
+                    EmailSendError::TimedOut
+                } else {
+                    EmailSendError::Unavailable
+                }
+            })?;
 
         if response.status().is_success() {
-            tracing::info!("Email sent successfully to {}", to_email);
+            tracing::info!("Email provider accepted request");
             Ok(())
         } else {
             let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Could not read response body".to_string());
-            tracing::error!("SendGrid API error: {} - {}", status, body);
-            Err(format!("Failed to send email: {} - {}", status, body))
+            tracing::warn!(status = status.as_u16(), "Email provider rejected request");
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                Err(EmailSendError::RateLimited)
+            } else if status.is_client_error() {
+                Err(EmailSendError::Rejected)
+            } else {
+                Err(EmailSendError::Unavailable)
+            }
         }
     }
+}
+
+fn duration_from_env(name: &str, default_ms: u64) -> Duration {
+    Duration::from_millis(
+        env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default_ms),
+    )
 }
 
 #[async_trait]
@@ -530,7 +569,7 @@ impl EmailSender for SendGridEmailSender {
         to_email: &str,
         verification_token: &str,
         pin: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<(), EmailSendError> {
         // This public path is claimed by the mobile apps and also verifies server-side when a
         // browser keeps the link instead of handing it to the app (keycast#360).
         let verification_url = build_verification_url(&self.base_url, verification_token);
@@ -547,7 +586,7 @@ impl EmailSender for SendGridEmailSender {
         &self,
         to_email: &str,
         reset_token: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), EmailSendError> {
         let reset_url = format!(
             "{}/reset-password?token={}&email={}",
             self.base_url,
@@ -591,7 +630,11 @@ impl EmailSender for SendGridEmailSender {
             .await
     }
 
-    async fn send_claim_email(&self, to_email: &str, claim_url: &str) -> Result<(), String> {
+    async fn send_claim_email(
+        &self,
+        to_email: &str,
+        claim_url: &str,
+    ) -> Result<(), EmailSendError> {
         let subject = format!("Your Vine account on {} is ready to claim", BRAND_NAME);
         let html_content = format!(
             r#"
@@ -632,7 +675,7 @@ impl EmailSender for SendGridEmailSender {
         &self,
         to_new_email: &str,
         confirm_token: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), EmailSendError> {
         let confirm_url = format!(
             "{}/confirm-email-change?token={}",
             self.base_url, confirm_token
@@ -679,7 +722,7 @@ impl EmailSender for SendGridEmailSender {
         new_email: &str,
         confirm_token: &str,
         cancel_token: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), EmailSendError> {
         let confirm_url = format!(
             "{}/confirm-email-change?token={}",
             self.base_url, confirm_token
@@ -741,7 +784,7 @@ impl EmailSender for SendGridEmailSender {
 pub fn create_email_sender() -> Result<Arc<dyn EmailSender>, String> {
     if let Ok(api_key) = env::var("SENDGRID_API_KEY") {
         if !api_key.is_empty() {
-            return Ok(Arc::new(SendGridEmailSender::new(api_key)));
+            return Ok(Arc::new(SendGridEmailSender::new(api_key)?));
         }
     }
 
@@ -764,6 +807,31 @@ pub fn create_email_sender() -> Result<Arc<dyn EmailSender>, String> {
     Ok(Arc::new(DevEmailSender::new()))
 }
 
+/// Validate production email configuration without constructing a provider client.
+pub fn validate_email_configuration() -> Result<(), String> {
+    if env::var("SENDGRID_API_KEY")
+        .ok()
+        .is_some_and(|value| !value.is_empty())
+    {
+        return Ok(());
+    }
+    let env_mode = env::var("RUST_ENV")
+        .or_else(|_| env::var("NODE_ENV"))
+        .unwrap_or_else(|_| "development".to_string());
+    if env_mode == "production"
+        && env::var("DISABLE_EMAILS")
+            .ok()
+            .filter(|value| value == "true")
+            .is_none()
+    {
+        return Err(
+            "SENDGRID_API_KEY required in production (set DISABLE_EMAILS=true to override)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Legacy EmailService for backward compatibility during migration
 /// TODO: Remove once all usages are migrated to the trait
 pub struct EmailService {
@@ -782,7 +850,7 @@ impl EmailService {
         to_email: &str,
         verification_token: &str,
         pin: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<(), EmailSendError> {
         self.inner
             .send_verification_email(to_email, verification_token, pin)
             .await
@@ -792,13 +860,17 @@ impl EmailService {
         &self,
         to_email: &str,
         reset_token: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), EmailSendError> {
         self.inner
             .send_password_reset_email(to_email, reset_token)
             .await
     }
 
-    pub async fn send_claim_email(&self, to_email: &str, claim_url: &str) -> Result<(), String> {
+    pub async fn send_claim_email(
+        &self,
+        to_email: &str,
+        claim_url: &str,
+    ) -> Result<(), EmailSendError> {
         self.inner.send_claim_email(to_email, claim_url).await
     }
 
@@ -806,7 +878,7 @@ impl EmailService {
         &self,
         to_new_email: &str,
         confirm_token: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), EmailSendError> {
         self.inner
             .send_email_change_confirmation(to_new_email, confirm_token)
             .await
@@ -818,7 +890,7 @@ impl EmailService {
         new_email: &str,
         confirm_token: &str,
         cancel_token: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), EmailSendError> {
         self.inner
             .send_email_change_notification(to_old_email, new_email, confirm_token, cancel_token)
             .await
