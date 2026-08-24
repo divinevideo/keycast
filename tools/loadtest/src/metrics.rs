@@ -167,6 +167,8 @@ pub struct TestMetadata {
     pub duration_secs: u64,
     pub user_count: usize,
     pub timestamp: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub seed: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

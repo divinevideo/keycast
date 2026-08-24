@@ -1,5 +1,5 @@
 use crate::client::{RegistrationClient, RpcClient};
-use crate::metrics::{Metrics, TestMetadata};
+use crate::metrics::{Metrics, TestMetadata, TestResults};
 use crate::setup::{TestUser, TestUsersFile};
 use crate::{RpcMethod, RunArgs, TestScenario};
 use anyhow::Result;
@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
-pub async fn run_loadtest(args: RunArgs) -> Result<()> {
+pub async fn run_loadtest(args: RunArgs) -> Result<TestResults> {
     // For registration mode, we don't need existing users
     let is_registration_mode = matches!(args.method, RpcMethod::Register);
 
@@ -143,6 +143,7 @@ pub async fn run_loadtest(args: RunArgs) -> Result<()> {
         let method = args.method;
         let max_requests = args.requests;
         let run_id = run_id.clone();
+        let seed = args.seed;
 
         // Calculate ramp-up delay for this worker
         let worker_delay = if args.concurrency > 1 {
@@ -196,7 +197,8 @@ pub async fn run_loadtest(args: RunArgs) -> Result<()> {
                     user_client.register_timed(&email, &password).await
                 } else {
                     // RPC mode: select existing user and their dedicated client
-                    let user_index = select_user_index(&users, scenario, request_num, hot_count);
+                    let user_index =
+                        select_user_index(&users, scenario, request_num, hot_count, seed);
                     let user = &users[user_index];
                     let client = user_clients.get(&user_index).expect("user client exists");
                     execute_request(client, user, method).await
@@ -277,6 +279,7 @@ pub async fn run_loadtest(args: RunArgs) -> Result<()> {
         duration_secs: args.duration,
         user_count: users.len(),
         timestamp: chrono::Utc::now(),
+        seed: args.seed,
     };
 
     let results = metrics.to_results(metadata);
@@ -289,7 +292,7 @@ pub async fn run_loadtest(args: RunArgs) -> Result<()> {
     std::fs::write(&args.output, &json)?;
     tracing::info!("Results saved to {:?}", args.output);
 
-    Ok(())
+    Ok(results)
 }
 
 fn select_user_index(
@@ -297,7 +300,9 @@ fn select_user_index(
     scenario: TestScenario,
     request_num: usize,
     hot_count: usize,
+    seed: u64,
 ) -> usize {
+    let request_num = request_num.wrapping_add(seed as usize);
     match scenario {
         TestScenario::WarmCache => {
             // Always use first user
@@ -364,4 +369,34 @@ fn generate_password() -> String {
         .take(32)
         .map(char::from)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn users(count: usize) -> Vec<TestUser> {
+        (0..count)
+            .map(|index| TestUser {
+                email: format!("user-{index}@bench.local"),
+                pubkey: format!("pubkey-{index}"),
+                ucan_token: format!("token-{index}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn seed_offsets_the_deterministic_user_schedule() {
+        let users = users(20);
+
+        assert_eq!(
+            select_user_index(&users, TestScenario::ColdStart, 0, 2, 0),
+            0
+        );
+        assert_eq!(
+            select_user_index(&users, TestScenario::ColdStart, 0, 2, 7),
+            7
+        );
+        assert_eq!(select_user_index(&users, TestScenario::Mixed, 0, 2, 7), 1);
+    }
 }

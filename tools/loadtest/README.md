@@ -20,6 +20,7 @@ cargo build --release -p keycast-loadtest
   --users-file ./test-users.json \
   --concurrency 50 \
   --duration 60 \
+  --seed 371 \
   --scenario warm-cache \
   --method get-public-key \
   --output ./results.json
@@ -64,7 +65,7 @@ keycast-loadtest run \
 **Scenarios:**
 | Scenario | Behavior | Use Case |
 |----------|----------|----------|
-| `warm-cache` | Cycles through users (cache gets warm) | Steady-state performance |
+| `warm-cache` | Reuses the first user | Steady-state performance |
 | `cold-start` | Each request uses different user | Cache miss impact |
 | `mixed` | 80% repeat / 20% new users | Realistic traffic |
 
@@ -155,28 +156,47 @@ Key metrics:
 - `keycast_http_rpc_success_total` - Successful requests
 - `keycast_http_rpc_auth_errors_total` - Auth failures
 
-## Production Testing
+## Capacity Readiness Profiles
 
-### Against Cloud Run
+The `capacity` command runs a predeclared sequence and writes a versioned,
+aggregate-only evidence bundle. Copy `capacity-plan.json.example`, replace its
+illustrative objectives and revision placeholders with values approved for the
+specific run, and keep separate plans and outputs for Cloud Run and GKE.
 
 ```bash
-# Create users (takes ~1 min per 1000 users at 200 concurrency)
-./target/release/keycast-loadtest setup \
-  --url https://login.divine.video \
-  --users 1000 \
-  --concurrency 200 \
-  --output ./prod-users.json
-
-# Run test
-./target/release/keycast-loadtest run \
-  --url https://login.divine.video \
-  --users-file ./prod-users.json \
-  --concurrency 500 \
-  --duration 60 \
-  --scenario warm-cache \
-  --method get-public-key \
-  --output ./prod-results.json
+keycast-loadtest capacity \
+  --plan ./capacity-plan.json \
+  --output ./capacity-evidence
 ```
+
+Each plan must include ramp, spike, soak, recovery, rollout, and scale-down
+phases. Every phase declares its method, cache scenario, concurrency, duration,
+and client-side error and p95 latency limits. The plan seed deterministically
+offsets the user-selection schedule and is recorded in every phase. The command exits unsuccessfully
+when a phase exceeds a declared limit, while still writing `evidence.json` and
+the individual phase results.
+
+Localhost targets run without an additional flag. A non-local test environment
+requires an exact host authorization so a stale plan cannot silently target a
+different service:
+
+```bash
+keycast-loadtest capacity \
+  --plan ./capacity-plan.json \
+  --allow-host keycast.staging.example \
+  --output ./capacity-evidence
+```
+
+The capacity command rejects the production Keycast host even when passed via
+`--allow-host`. Production exercises require a separately approved operational
+procedure, monitoring, stop authority, and rollback plan.
+
+`evidence.json` records the plan, revision identifiers, environment-parity
+statement, phase summaries, threshold checks, and an overall result. It does
+not contain the credential file's tokens, generated passwords, request bodies,
+or raw server errors. The bundle is client evidence only: dashboards, dependency
+headroom, autoscaling timelines, notification receipts, and rollback drill
+records must be gathered by the platform runbook before certifying a platform.
 
 ### Session Affinity Behavior Under Load
 

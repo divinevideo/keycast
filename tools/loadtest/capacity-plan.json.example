@@ -1,0 +1,90 @@
+{
+  "profile_name": "local-cloud-run-rehearsal",
+  "platform": "cloud-run",
+  "target_url": "http://localhost:3000",
+  "users_file": "./loadtest-users.json",
+  "seed": 371,
+  "revisions": {
+    "code": "replace-with-tested-commit",
+    "image": "replace-with-tested-image-digest",
+    "infrastructure": "tools/loadtest/docker-compose.scale.yml@replace-with-commit"
+  },
+  "environment_parity": "Local rehearsal only; not Cloud Run or GKE capacity evidence.",
+  "objectives": {
+    "availability_percent": 99.0,
+    "latency_p95_ms": 1000.0,
+    "recovery_seconds": 60
+  },
+  "stop_conditions": {
+    "max_error_rate": 0.05,
+    "max_latency_p95_ms": 2000.0
+  },
+  "phases": [
+    {
+      "name": "gradual-ramp",
+      "kind": "ramp",
+      "method": "get-public-key",
+      "scenario": "mixed",
+      "concurrency": 10,
+      "duration_seconds": 60,
+      "ramp_up_seconds": 30,
+      "max_error_rate": 0.01,
+      "max_latency_p95_ms": 1000.0
+    },
+    {
+      "name": "sudden-spike",
+      "kind": "spike",
+      "method": "sign-event",
+      "scenario": "mixed",
+      "concurrency": 50,
+      "duration_seconds": 30,
+      "ramp_up_seconds": 0,
+      "max_error_rate": 0.05,
+      "max_latency_p95_ms": 2000.0
+    },
+    {
+      "name": "sustained-soak",
+      "kind": "soak",
+      "method": "nip44-encrypt",
+      "scenario": "mixed",
+      "concurrency": 20,
+      "duration_seconds": 300,
+      "ramp_up_seconds": 10,
+      "max_error_rate": 0.01,
+      "max_latency_p95_ms": 1000.0
+    },
+    {
+      "name": "traffic-recovery",
+      "kind": "recovery",
+      "method": "get-public-key",
+      "scenario": "warm-cache",
+      "concurrency": 5,
+      "duration_seconds": 60,
+      "ramp_up_seconds": 0,
+      "max_error_rate": 0.01,
+      "max_latency_p95_ms": 1000.0
+    },
+    {
+      "name": "rollout-observation",
+      "kind": "rollout",
+      "method": "sign-event",
+      "scenario": "cold-start",
+      "concurrency": 10,
+      "duration_seconds": 60,
+      "ramp_up_seconds": 10,
+      "max_error_rate": 0.01,
+      "max_latency_p95_ms": 1000.0
+    },
+    {
+      "name": "scale-down-observation",
+      "kind": "scale-down",
+      "method": "get-public-key",
+      "scenario": "mixed",
+      "concurrency": 2,
+      "duration_seconds": 60,
+      "ramp_up_seconds": 0,
+      "max_error_rate": 0.01,
+      "max_latency_p95_ms": 1000.0
+    }
+  ]
+}
