@@ -307,6 +307,7 @@ The Deployment sets or patches these runtime env vars:
 | `ALLOWED_ORIGINS` | patched per environment |
 | `BUNKER_RELAYS` | patched per environment |
 | `FROM_EMAIL`, `FROM_NAME`, `BASE_URL`, `APP_URL` | patched per environment |
+| `EMAIL_DELIVERY_SOURCE_TRUSTED_PROXY_HOPS` | must match trusted addresses after the client in each `X-Forwarded-For` chain; Cloud Run domain mapping pins `0`, and GKE must set its observed Gateway/NGINX suffix depth before cutover |
 | `VITE_DOMAIN`, `VITE_NDK_EXPLICIT_RELAYS`, `VITE_NDK_BUNKER_RELAYS` | frontend runtime injection |
 | `ALLOWED_PUBKEYS` | patched per environment |
 | `ALLOWED_TENANT_DOMAINS` | base value is `login.divine.video`; POC and staging patch it |

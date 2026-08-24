@@ -291,11 +291,11 @@ pub async fn headless_register(
                 .send_verification_email(&req.email, &verification_token, Some(&pin))
                 .await
             {
-                tracing::error!("Failed to send verification email to {}: {}", req.email, e);
+                tracing::error!("Failed to send verification email: {}", e);
                 // Continue - user can request resend later
             } else {
                 email_delivered = true;
-                tracing::info!("Sent verification email to {}", req.email);
+                tracing::info!("Sent verification email");
             }
         }
         Err(e) => {
@@ -1297,12 +1297,12 @@ pub async fn headless_resend_pin(
                 "Email service unavailable, skipping PIN resend email: {}",
                 e
             );
-            Err(e)
+            Err(crate::email_service::EmailSendError::Unavailable)
         }
     };
 
     if let Err(e) = send_result {
-        tracing::error!("Failed to resend verification email to {}: {}", email, e);
+        tracing::error!("Failed to resend verification email: {}", e);
         // Guarded on the token and hash this call wrote, and serialized with redemption, so neither
         // a later resend nor an in-progress token exchange is rolled back out from under the user.
         let restored = oauth_code_repo

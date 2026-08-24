@@ -41,6 +41,25 @@ struct AuthDurationMetric {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct EmailDeliveryKey {
+    purpose: String,
+    decision: String,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct EmailProviderKey {
+    purpose: String,
+    outcome: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct EmailProviderDurationMetric {
+    count: u64,
+    sum: f64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct HttpRpcDurationKey {
     method: String,
     outcome: String,
@@ -212,6 +231,11 @@ pub struct Metrics {
     auth_request_durations: Mutex<BTreeMap<AuthDurationKey, AuthDurationMetric>>,
     auth_audit_write_failures_total: Mutex<BTreeMap<String, u64>>,
     auth_email_send_failures_total: Mutex<BTreeMap<String, u64>>,
+    email_delivery_admissions_total: Mutex<BTreeMap<EmailDeliveryKey, u64>>,
+    email_delivery_source_subjects: [AtomicU64; 2],
+    email_provider_outcomes_total: Mutex<BTreeMap<EmailProviderKey, u64>>,
+    email_provider_durations: Mutex<BTreeMap<EmailProviderKey, EmailProviderDurationMetric>>,
+    email_provider_in_flight: AtomicU64,
     http_rpc_request_durations: Mutex<BTreeMap<HttpRpcDurationKey, HttpRpcDurationMetric>>,
     http_rpc_status_check_durations: Mutex<BTreeMap<String, HttpRpcDurationMetric>>,
     http_rpc_db_acquire_durations: Mutex<BTreeMap<HttpRpcAcquireKey, HttpRpcAcquireMetric>>,
@@ -288,6 +312,11 @@ impl Metrics {
             auth_request_durations: Mutex::new(BTreeMap::new()),
             auth_audit_write_failures_total: Mutex::new(BTreeMap::new()),
             auth_email_send_failures_total: Mutex::new(BTreeMap::new()),
+            email_delivery_admissions_total: Mutex::new(BTreeMap::new()),
+            email_delivery_source_subjects: std::array::from_fn(|_| AtomicU64::new(0)),
+            email_provider_outcomes_total: Mutex::new(BTreeMap::new()),
+            email_provider_durations: Mutex::new(BTreeMap::new()),
+            email_provider_in_flight: AtomicU64::new(0),
             http_rpc_request_durations: Mutex::new(BTreeMap::new()),
             http_rpc_status_check_durations: Mutex::new(BTreeMap::new()),
             http_rpc_db_acquire_durations: Mutex::new(BTreeMap::new()),
@@ -624,6 +653,54 @@ impl Metrics {
             .lock()
             .expect("auth email failures lock poisoned");
         *failures.entry(template).or_insert(0) += 1;
+    }
+
+    pub fn observe_email_delivery_admission(&self, purpose: &str, decision: &str, reason: &str) {
+        let key = EmailDeliveryKey {
+            purpose: normalize_email_delivery_purpose(purpose).to_string(),
+            decision: normalize_email_admission_decision(decision).to_string(),
+            reason: normalize_email_admission_reason(reason).to_string(),
+        };
+        let mut totals = self
+            .email_delivery_admissions_total
+            .lock()
+            .expect("email delivery admission metrics lock poisoned");
+        *totals.entry(key).or_insert(0) += 1;
+    }
+
+    pub fn observe_email_delivery_source_subject(&self, derived: bool) {
+        self.email_delivery_source_subjects[usize::from(derived)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_email_provider_in_flight(&self) {
+        self.email_provider_in_flight
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn dec_email_provider_in_flight(&self) {
+        self.email_provider_in_flight
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn observe_email_provider_outcome(&self, purpose: &str, outcome: &str, duration: Duration) {
+        let key = EmailProviderKey {
+            purpose: normalize_email_delivery_purpose(purpose).to_string(),
+            outcome: normalize_email_provider_outcome(outcome).to_string(),
+        };
+        let mut outcomes = self
+            .email_provider_outcomes_total
+            .lock()
+            .expect("email provider outcome metrics lock poisoned");
+        *outcomes.entry(key.clone()).or_insert(0) += 1;
+        drop(outcomes);
+
+        let mut durations = self
+            .email_provider_durations
+            .lock()
+            .expect("email provider duration metrics lock poisoned");
+        let metric = durations.entry(key).or_default();
+        metric.count += 1;
+        metric.sum += duration.as_secs_f64();
     }
 
     pub fn inc_bcrypt_active(&self, workload: BcryptWorkload, operation: BcryptOperation) {
@@ -1111,6 +1188,18 @@ impl Metrics {
         }
 
         output.push_str(
+            "\n# HELP keycast_email_delivery_source_subjects_total Email delivery requests with a derived or unavailable coarse source subject\n",
+        );
+        output.push_str("# TYPE keycast_email_delivery_source_subjects_total counter\n");
+        for (index, outcome) in ["unavailable", "derived"].iter().enumerate() {
+            output.push_str(&format!(
+                "keycast_email_delivery_source_subjects_total{{outcome=\"{}\"}} {}\n",
+                outcome,
+                self.email_delivery_source_subjects[index].load(Ordering::Relaxed)
+            ));
+        }
+
+        output.push_str(
             "\n# HELP keycast_auth_request_duration_seconds Auth request latency by endpoint and outcome\n",
         );
         output.push_str("# TYPE keycast_auth_request_duration_seconds histogram\n");
@@ -1169,6 +1258,67 @@ impl Metrics {
             output.push_str(&format!(
                 "keycast_auth_email_send_failures_total{{template=\"{}\"}} {}\n",
                 template, count
+            ));
+        }
+
+        output.push_str(
+            "\n# HELP keycast_email_delivery_admissions_total Email delivery admission decisions\n",
+        );
+        output.push_str("# TYPE keycast_email_delivery_admissions_total counter\n");
+        for (key, count) in self
+            .email_delivery_admissions_total
+            .lock()
+            .expect("email delivery admission metrics lock poisoned")
+            .iter()
+        {
+            output.push_str(&format!(
+                "keycast_email_delivery_admissions_total{{purpose=\"{}\",decision=\"{}\",reason=\"{}\"}} {}\n",
+                key.purpose, key.decision, key.reason, count
+            ));
+        }
+
+        output.push_str(
+            "\n# HELP keycast_email_provider_in_flight Email provider calls currently in flight\n",
+        );
+        output.push_str("# TYPE keycast_email_provider_in_flight gauge\n");
+        output.push_str(&format!(
+            "keycast_email_provider_in_flight {}\n",
+            self.email_provider_in_flight.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(
+            "\n# HELP keycast_email_provider_outcomes_total Terminal email provider outcomes\n",
+        );
+        output.push_str("# TYPE keycast_email_provider_outcomes_total counter\n");
+        for (key, count) in self
+            .email_provider_outcomes_total
+            .lock()
+            .expect("email provider outcome metrics lock poisoned")
+            .iter()
+        {
+            output.push_str(&format!(
+                "keycast_email_provider_outcomes_total{{purpose=\"{}\",outcome=\"{}\"}} {}\n",
+                key.purpose, key.outcome, count
+            ));
+        }
+
+        output.push_str(
+            "\n# HELP keycast_email_provider_duration_seconds Email provider call latency\n",
+        );
+        output.push_str("# TYPE keycast_email_provider_duration_seconds summary\n");
+        for (key, metric) in self
+            .email_provider_durations
+            .lock()
+            .expect("email provider duration metrics lock poisoned")
+            .iter()
+        {
+            output.push_str(&format!(
+                "keycast_email_provider_duration_seconds_sum{{purpose=\"{}\",outcome=\"{}\"}} {}\n",
+                key.purpose, key.outcome, metric.sum
+            ));
+            output.push_str(&format!(
+                "keycast_email_provider_duration_seconds_count{{purpose=\"{}\",outcome=\"{}\"}} {}\n",
+                key.purpose, key.outcome, metric.count
             ));
         }
 
@@ -1240,6 +1390,9 @@ fn normalize_auth_endpoint(endpoint: &str) -> &'static str {
         "/api/auth/forgot-password" => "/api/auth/forgot-password",
         "/api/auth/reset-password" => "/api/auth/reset-password",
         "/api/auth/resend-verification" => "/api/auth/resend-verification",
+        "/api/user/change-email" => "/api/user/change-email",
+        "/api/auth/confirm-email-change" => "/api/auth/confirm-email-change",
+        "/api/auth/cancel-email-change" => "/api/auth/cancel-email-change",
         "/api/oauth/login" => "/api/oauth/login",
         "/api/oauth/register" => "/api/oauth/register",
         "/api/oauth/authorize" => "/api/oauth/authorize",
@@ -1262,6 +1415,8 @@ fn normalize_auth_outcome(outcome: &str) -> &'static str {
         "success" => "success",
         "failure" => "failure",
         "accepted" => "accepted",
+        "admitted" => "admitted",
+        "suppressed" => "suppressed",
         "error" => "error",
         _ => "other",
     }
@@ -1293,6 +1448,22 @@ fn normalize_auth_reason(reason_code: Option<&str>) -> &'static str {
         "duplicate_key" => "duplicate_key",
         "encryption_failed" => "encryption_failed",
         "change_key_failed" => "change_key_failed",
+        "destination_cooldown" => "destination_cooldown",
+        "destination_volume" => "destination_volume",
+        "account_volume" => "account_volume",
+        "source_volume" => "source_volume",
+        "global_volume" => "global_volume",
+        "provider_capacity" => "provider_capacity",
+        "admission_unavailable" => "admission_unavailable",
+        "accepted" => "accepted",
+        "rejected" => "rejected",
+        "timed_out" => "timed_out",
+        "unavailable" => "unavailable",
+        "wrong_password" => "wrong_password",
+        "invalid_email" => "invalid_email",
+        "email_already_registered" => "email_already_registered",
+        "finalized" => "finalized",
+        "cancelled" => "cancelled",
         _ => "other",
     }
 }
@@ -1302,6 +1473,54 @@ fn normalize_email_template(template: &str) -> &'static str {
         "verification" => "verification",
         "password_reset" => "password_reset",
         "resend_verification" => "resend_verification",
+        "email_change_new" => "email_change_new",
+        "email_change_old" => "email_change_old",
+        _ => "other",
+    }
+}
+
+fn normalize_email_delivery_purpose(purpose: &str) -> &'static str {
+    match purpose {
+        "password_reset" => "password_reset",
+        "verification" => "verification",
+        "email_change" => "email_change",
+        "email_change_new" => "email_change_new",
+        "email_change_old" => "email_change_old",
+        _ => "other",
+    }
+}
+
+fn normalize_email_admission_decision(decision: &str) -> &'static str {
+    match decision {
+        "admitted" => "admitted",
+        "suppressed" => "suppressed",
+        "fallback" => "fallback",
+        _ => "other",
+    }
+}
+
+fn normalize_email_admission_reason(reason: &str) -> &'static str {
+    match reason {
+        "none" => "none",
+        "destination_cooldown" => "destination_cooldown",
+        "destination_volume" => "destination_volume",
+        "account_volume" => "account_volume",
+        "source_volume" => "source_volume",
+        "global_volume" => "global_volume",
+        "provider_capacity" => "provider_capacity",
+        "admission_unavailable" => "admission_unavailable",
+        "local_fallback" => "local_fallback",
+        _ => "other",
+    }
+}
+
+fn normalize_email_provider_outcome(outcome: &str) -> &'static str {
+    match outcome {
+        "accepted" => "accepted",
+        "rejected" => "rejected",
+        "rate_limited" => "rate_limited",
+        "timed_out" => "timed_out",
+        "unavailable" => "unavailable",
         _ => "other",
     }
 }
@@ -1327,6 +1546,21 @@ mod tests {
         );
         metrics.inc_auth_audit_write_failure("/api/headless/login");
         metrics.inc_auth_email_send_failure("password_reset");
+        metrics.observe_email_delivery_admission("email_change", "suppressed", "account_volume");
+        metrics.observe_email_delivery_admission(
+            "password_reset",
+            "fallback",
+            "admission_unavailable",
+        );
+        metrics.observe_email_delivery_admission("password_reset", "admitted", "local_fallback");
+        metrics.observe_email_delivery_source_subject(true);
+        metrics.inc_email_provider_in_flight();
+        metrics.observe_email_provider_outcome(
+            "email_change_new",
+            "timed_out",
+            Duration::from_millis(250),
+        );
+        metrics.dec_email_provider_in_flight();
 
         let output = metrics.to_prometheus();
 
@@ -1344,6 +1578,25 @@ mod tests {
         ));
         assert!(output
             .contains("keycast_auth_email_send_failures_total{template=\"password_reset\"} 1"));
+        assert!(output.contains(
+            "keycast_email_delivery_admissions_total{purpose=\"email_change\",decision=\"suppressed\",reason=\"account_volume\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_email_delivery_admissions_total{purpose=\"password_reset\",decision=\"fallback\",reason=\"admission_unavailable\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_email_delivery_admissions_total{purpose=\"password_reset\",decision=\"admitted\",reason=\"local_fallback\"} 1"
+        ));
+        assert!(
+            output.contains("keycast_email_delivery_source_subjects_total{outcome=\"derived\"} 1")
+        );
+        assert!(output.contains("keycast_email_provider_in_flight 0"));
+        assert!(output.contains(
+            "keycast_email_provider_outcomes_total{purpose=\"email_change_new\",outcome=\"timed_out\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_email_provider_duration_seconds_count{purpose=\"email_change_new\",outcome=\"timed_out\"} 1"
+        ));
     }
 
     #[test]

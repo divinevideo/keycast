@@ -268,6 +268,25 @@ If neither is set, requests from unknown domains are rejected.
 | `FROM_EMAIL` | — | Sender email address |
 | `FROM_NAME` | `Divine` | Sender display name |
 | `BASE_URL` | — | Base URL used in email verification links |
+| `EMAIL_DELIVERY_DESTINATION_COOLDOWN_SECONDS` | `300` | Minimum interval per normalized destination |
+| `EMAIL_DELIVERY_DESTINATION_LIMIT` | `5` | Deliveries allowed per purpose and destination window |
+| `EMAIL_DELIVERY_DESTINATION_WINDOW_SECONDS` | `3600` | Per-purpose destination rolling-window length |
+| `EMAIL_DELIVERY_ACCOUNT_LIMIT` | `6` | Email-change deliveries allowed per authenticated account window |
+| `EMAIL_DELIVERY_ACCOUNT_WINDOW_SECONDS` | `3600` | Authenticated-account rolling-window length |
+| `EMAIL_DELIVERY_SOURCE_LIMIT` | `50` | Secondary coarse-source observation threshold; `0` disables it and exceeding it never suppresses recovery |
+| `EMAIL_DELIVERY_SOURCE_WINDOW_SECONDS` | `3600` | Coarse-source rolling-window length |
+| `EMAIL_DELIVERY_SOURCE_TRUSTED_PROXY_HOPS` | `0` | Trusted addresses after the client in `X-Forwarded-For`; Cloud Run domain mapping uses `0`, while other ingresses must set their observed suffix depth |
+| `EMAIL_DELIVERY_GLOBAL_LIMIT` | `1000` | Process-cluster delivery budget per global window |
+| `EMAIL_DELIVERY_GLOBAL_WINDOW_SECONDS` | `60` | Global rolling-window length |
+| `EMAIL_PROVIDER_MAX_IN_FLIGHT` | `20` | Cluster and per-instance provider concurrency bound |
+| `EMAIL_PROVIDER_CONNECT_TIMEOUT_MS` | `3000` | Provider connection deadline |
+| `EMAIL_PROVIDER_REQUEST_TIMEOUT_MS` | `10000` | Total provider request deadline |
+| `EMAIL_DELIVERY_FALLBACK_INSTANCE_DIVISOR` | `3` | Divides limits for bounded per-instance admission while Redis is unavailable |
+
+Alert on any sustained
+`keycast_email_delivery_admissions_total{decision="fallback",reason="admission_unavailable"}`
+increase. Recovery remains available through bounded per-instance admission, but cluster-wide
+coordination is degraded until Redis recovers.
 
 ### Other common variables
 
