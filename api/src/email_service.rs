@@ -23,7 +23,7 @@ fn html_escape(input: &str) -> String {
 }
 
 /// Captured email for testing/inspection
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CapturedEmail {
     pub to: String,
     pub subject: String,
@@ -131,7 +131,7 @@ pub trait EmailSender: Send + Sync {
     async fn send_email_change_notification(
         &self,
         to_old_email: &str,
-        _new_email: &str,
+        new_email: &str,
         confirm_token: &str,
         cancel_token: &str,
     ) -> Result<(), EmailSendError>;
