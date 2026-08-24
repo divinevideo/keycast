@@ -10,9 +10,22 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 
 pub async fn run_loadtest(args: RunArgs) -> Result<TestResults> {
+    run_loadtest_with_stop(args, None).await
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LiveStopConditions {
+    pub max_unintentional_error_rate: f64,
+    pub max_latency_p95_ms: f64,
+}
+
+pub async fn run_loadtest_with_stop(
+    args: RunArgs,
+    stop_conditions: Option<LiveStopConditions>,
+) -> Result<TestResults> {
     // For registration mode, we don't need existing users
     let is_registration_mode = matches!(args.method, RpcMethod::Register);
 
@@ -97,6 +110,7 @@ pub async fn run_loadtest(args: RunArgs) -> Result<TestResults> {
     let metrics = Arc::new(Metrics::new());
     let semaphore = Arc::new(Semaphore::new(args.concurrency));
     let running = Arc::new(AtomicBool::new(true));
+    let stop_notify = Arc::new(Notify::new());
     let request_counter = Arc::new(AtomicUsize::new(0));
 
     let duration = Duration::from_secs(args.duration);
@@ -106,6 +120,8 @@ pub async fn run_loadtest(args: RunArgs) -> Result<TestResults> {
     // Spawn progress reporter
     let progress_metrics = metrics.clone();
     let progress_running = running.clone();
+    let progress_stop_notify = stop_notify.clone();
+    let progress_stop_conditions = stop_conditions;
     let report_interval = args.report_interval;
     let progress_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(report_interval));
@@ -126,6 +142,18 @@ pub async fn run_loadtest(args: RunArgs) -> Result<TestResults> {
                 snapshot.latency_p99_ms,
                 snapshot.requests_error
             );
+            if let Some(stop) = progress_stop_conditions {
+                let summary = progress_metrics.summary();
+                if live_stop_breached(&summary, stop) {
+                    tracing::warn!(
+                        unintentional_error_rate = summary.unintentional_error_rate,
+                        latency_p95_ms = summary.latency_p95_ms,
+                        "Stopping load test after an absolute stop-condition breach"
+                    );
+                    progress_running.store(false, Ordering::Relaxed);
+                    progress_stop_notify.notify_waiters();
+                }
+            }
         }
     });
 
@@ -137,6 +165,7 @@ pub async fn run_loadtest(args: RunArgs) -> Result<TestResults> {
         let metrics = metrics.clone();
         let semaphore = semaphore.clone();
         let running = running.clone();
+        let stop_notify = stop_notify.clone();
         let users = users.clone();
         let counter = request_counter.clone();
         let scenario = args.scenario;
@@ -155,7 +184,10 @@ pub async fn run_loadtest(args: RunArgs) -> Result<TestResults> {
         let handle = tokio::spawn(async move {
             // Ramp-up delay
             if worker_delay > 0 {
-                tokio::time::sleep(Duration::from_millis(worker_delay)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(worker_delay)) => {}
+                    _ = stop_notify.notified() => return,
+                }
             }
 
             let hot_count = if users.is_empty() {
@@ -211,7 +243,12 @@ pub async fn run_loadtest(args: RunArgs) -> Result<TestResults> {
                     }
                 }
 
-                metrics.record_request(result.duration, result.success, result.status);
+                metrics.record_request(
+                    result.duration,
+                    result.success,
+                    result.status,
+                    result.error_code.as_deref(),
+                );
             }
         });
 
@@ -220,7 +257,7 @@ pub async fn run_loadtest(args: RunArgs) -> Result<TestResults> {
 
     // Wait for all workers
     for handle in handles {
-        let _ = handle.await;
+        handle.await?;
     }
 
     // Stop progress reporter
@@ -300,6 +337,12 @@ pub async fn run_loadtest(args: RunArgs) -> Result<TestResults> {
     tracing::info!("Results saved to {:?}", args.output);
 
     Ok(results)
+}
+
+fn live_stop_breached(summary: &crate::metrics::MetricsSummary, stop: LiveStopConditions) -> bool {
+    summary.total_requests > 0
+        && (summary.unintentional_error_rate > stop.max_unintentional_error_rate
+            || summary.latency_p95_ms > stop.max_latency_p95_ms)
 }
 
 fn select_user_index(
@@ -405,5 +448,18 @@ mod tests {
             7
         );
         assert_eq!(select_user_index(&users, TestScenario::Mixed, 0, 2, 7), 1);
+    }
+
+    #[test]
+    fn live_stop_requires_requests_and_stops_on_either_absolute_limit() {
+        let metrics = Metrics::new();
+        let stop = LiveStopConditions {
+            max_unintentional_error_rate: 0.05,
+            max_latency_p95_ms: 100.0,
+        };
+        assert!(!live_stop_breached(&metrics.summary(), stop));
+
+        metrics.record_request(Duration::from_millis(150), true, Some(200), None);
+        assert!(live_stop_breached(&metrics.summary(), stop));
     }
 }

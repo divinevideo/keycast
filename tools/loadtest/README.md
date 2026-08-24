@@ -170,14 +170,33 @@ keycast-loadtest capacity \
 ```
 
 Each plan must include ramp, spike, soak, recovery, rollout, and scale-down
-phases. Every phase declares its method, cache scenario, concurrency, duration,
-client-side unintentional-error and p95 latency limits, whether the profile SLO applies, and
-the minimum expected HTTP 429 rejection rate. The plan seed deterministically
+exactly once in that order. Every phase declares its method, cache scenario,
+concurrency, duration, client-side unintentional-error and p95 latency limits,
+and whether the profile SLO applies. The plan seed deterministically
 offsets the user-selection schedule and is recorded in every phase. Registration
 is excluded because its generated identities are not seed-reproducible. The
 command records ordinary phase or SLO misses and continues so later recovery can
-still be measured. It stops after an absolute profile stop-condition breach,
-writes `evidence.json`, and exits unsuccessfully when any check failed.
+still be measured. Absolute profile stop conditions are checked during each
+phase and stop active work when breached. `evidence.json` is also written when a
+phase errors, preserving all completed and partial evidence.
+
+Intentional capacity shedding is distinct from caller-specific HTTP 429 rate
+limiting and from ordinary dependency failures. It is recognized only as HTTP
+503 with the machine-readable response code `admission_rejected`. A spike may
+declare the following expectation once the target implements that contract:
+
+```json
+"intentional_shedding": {
+  "status": 503,
+  "error_code": "admission_rejected",
+  "min_rate": 0.01
+}
+```
+
+When the field is `null`, the evidence records shedding as `not-tested`; the
+rehearsal may pass its other checks but `certification_ready` remains false.
+Unmarked 503 responses remain unintentional errors. A final platform capacity
+profile must test and pass the declared shedding expectation.
 Healthy-phase availability counts every failed request, including unexpected
 HTTP 429 responses; phase error limits exclude intentional shedding.
 

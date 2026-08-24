@@ -30,7 +30,7 @@
       "max_error_rate": 0.01,
       "max_latency_p95_ms": 1000.0,
       "slo_applies": true,
-      "min_intentional_rejection_rate": 0.0
+      "intentional_shedding": null
     },
     {
       "name": "sudden-spike",
@@ -43,7 +43,7 @@
       "max_error_rate": 0.05,
       "max_latency_p95_ms": 2000.0,
       "slo_applies": false,
-      "min_intentional_rejection_rate": 0.01
+      "intentional_shedding": null
     },
     {
       "name": "sustained-soak",
@@ -56,7 +56,7 @@
       "max_error_rate": 0.01,
       "max_latency_p95_ms": 1000.0,
       "slo_applies": true,
-      "min_intentional_rejection_rate": 0.0
+      "intentional_shedding": null
     },
     {
       "name": "traffic-recovery",
@@ -69,7 +69,7 @@
       "max_error_rate": 0.01,
       "max_latency_p95_ms": 1000.0,
       "slo_applies": true,
-      "min_intentional_rejection_rate": 0.0
+      "intentional_shedding": null
     },
     {
       "name": "rollout-observation",
@@ -82,7 +82,7 @@
       "max_error_rate": 0.01,
       "max_latency_p95_ms": 1000.0,
       "slo_applies": true,
-      "min_intentional_rejection_rate": 0.0
+      "intentional_shedding": null
     },
     {
       "name": "scale-down-observation",
@@ -95,7 +95,7 @@
       "max_error_rate": 0.01,
       "max_latency_p95_ms": 1000.0,
       "slo_applies": true,
-      "min_intentional_rejection_rate": 0.0
+      "intentional_shedding": null
     }
   ]
 }

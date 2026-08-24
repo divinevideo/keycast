@@ -19,7 +19,8 @@ pub struct Metrics {
     errors_server: AtomicU64,
     errors_client: AtomicU64,
     errors_network: AtomicU64,
-    rejected_requests: AtomicU64,
+    rate_limited_requests: AtomicU64,
+    intentional_rejections: AtomicU64,
 
     /// Cache estimation (based on latency thresholds)
     cache_hits_estimated: AtomicU64,
@@ -46,7 +47,8 @@ impl Metrics {
             errors_server: AtomicU64::new(0),
             errors_client: AtomicU64::new(0),
             errors_network: AtomicU64::new(0),
-            rejected_requests: AtomicU64::new(0),
+            rate_limited_requests: AtomicU64::new(0),
+            intentional_rejections: AtomicU64::new(0),
             cache_hits_estimated: AtomicU64::new(0),
             cache_misses_estimated: AtomicU64::new(0),
             start_time: Instant::now(),
@@ -55,7 +57,13 @@ impl Metrics {
         }
     }
 
-    pub fn record_request(&self, duration: Duration, success: bool, status: Option<u16>) {
+    pub fn record_request(
+        &self,
+        duration: Duration,
+        success: bool,
+        status: Option<u16>,
+        error_code: Option<&str>,
+    ) {
         let micros = duration.as_micros() as u64;
 
         // Record latency
@@ -75,20 +83,23 @@ impl Metrics {
             }
         } else {
             self.requests_error.fetch_add(1, Ordering::Relaxed);
-            match status {
-                Some(401) | Some(403) => {
+            match (status, error_code) {
+                (Some(503), Some("admission_rejected")) => {
+                    self.intentional_rejections.fetch_add(1, Ordering::Relaxed);
+                }
+                (Some(401), _) | (Some(403), _) => {
                     self.errors_auth.fetch_add(1, Ordering::Relaxed);
                 }
-                Some(429) => {
-                    self.rejected_requests.fetch_add(1, Ordering::Relaxed);
+                (Some(429), _) => {
+                    self.rate_limited_requests.fetch_add(1, Ordering::Relaxed);
                 }
-                Some(s) if s >= 500 => {
+                (Some(s), _) if s >= 500 => {
                     self.errors_server.fetch_add(1, Ordering::Relaxed);
                 }
-                Some(s) if s >= 400 => {
+                (Some(s), _) if s >= 400 => {
                     self.errors_client.fetch_add(1, Ordering::Relaxed);
                 }
-                None => {
+                (None, _) => {
                     self.errors_network.fetch_add(1, Ordering::Relaxed);
                 }
                 _ => {}
@@ -151,7 +162,7 @@ impl Metrics {
             unintentional_error_rate: if total > 0 {
                 self.requests_error
                     .load(Ordering::Relaxed)
-                    .saturating_sub(self.rejected_requests.load(Ordering::Relaxed))
+                    .saturating_sub(self.intentional_rejections.load(Ordering::Relaxed))
                     as f64
                     / total as f64
             } else {
@@ -161,8 +172,10 @@ impl Metrics {
             errors_server: self.errors_server.load(Ordering::Relaxed),
             errors_client: self.errors_client.load(Ordering::Relaxed),
             errors_network: self.errors_network.load(Ordering::Relaxed),
+            rate_limited_requests: self.rate_limited_requests.load(Ordering::Relaxed),
+            intentional_rejections: self.intentional_rejections.load(Ordering::Relaxed),
             intentional_rejection_rate: if total > 0 {
-                self.rejected_requests.load(Ordering::Relaxed) as f64 / total as f64
+                self.intentional_rejections.load(Ordering::Relaxed) as f64 / total as f64
             } else {
                 0.0
             },
@@ -216,6 +229,10 @@ pub struct MetricsSummary {
     pub errors_server: u64,
     pub errors_client: u64,
     pub errors_network: u64,
+    #[serde(default)]
+    pub rate_limited_requests: u64,
+    #[serde(default)]
+    pub intentional_rejections: u64,
     #[serde(default)]
     pub intentional_rejection_rate: f64,
 }
@@ -279,7 +296,9 @@ Errors:
   Auth:    {}
   Server:  {}
   Client:  {}
-  Network: {}"#,
+  Network: {}
+  Rate limited (429):       {}
+  Intentional shedding:     {}"#,
             self.metadata.url,
             self.metadata.scenario,
             self.metadata.method,
@@ -300,6 +319,8 @@ Errors:
             s.errors_server,
             s.errors_client,
             s.errors_network,
+            s.rate_limited_requests,
+            s.intentional_rejections,
         )
     }
 
@@ -356,14 +377,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn http_429_is_counted_as_intentional_rejection() {
+    fn http_429_is_visible_but_not_intentional_shedding() {
         let metrics = Metrics::new();
-        metrics.record_request(Duration::from_millis(1), false, Some(429));
+        metrics.record_request(Duration::from_millis(1), false, Some(429), None);
 
         let summary = metrics.summary();
-        assert_eq!(summary.intentional_rejection_rate, 1.0);
-        assert_eq!(summary.unintentional_error_rate, 0.0);
+        assert_eq!(summary.rate_limited_requests, 1);
+        assert_eq!(summary.intentional_rejection_rate, 0.0);
+        assert_eq!(summary.unintentional_error_rate, 1.0);
         assert_eq!(summary.errors_client, 0);
         assert_eq!(summary.error_rate, 1.0);
+    }
+
+    #[test]
+    fn only_marked_503_is_counted_as_intentional_shedding() {
+        let metrics = Metrics::new();
+        metrics.record_request(
+            Duration::from_millis(1),
+            false,
+            Some(503),
+            Some("admission_rejected"),
+        );
+        metrics.record_request(Duration::from_millis(1), false, Some(503), None);
+
+        let summary = metrics.summary();
+        assert_eq!(summary.intentional_rejections, 1);
+        assert_eq!(summary.errors_server, 1);
+        assert_eq!(summary.intentional_rejection_rate, 0.5);
+        assert_eq!(summary.unintentional_error_rate, 0.5);
     }
 }

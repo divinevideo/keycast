@@ -85,7 +85,15 @@ struct CapacityPhase {
     max_error_rate: f64,
     max_latency_p95_ms: f64,
     slo_applies: bool,
-    min_intentional_rejection_rate: f64,
+    intentional_shedding: Option<IntentionalSheddingExpectation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct IntentionalSheddingExpectation {
+    status: u16,
+    error_code: String,
+    min_rate: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -96,6 +104,7 @@ struct CapacityEvidence {
     execution_environment: ExecutionEnvironment,
     plan: CapacityPlan,
     passed: bool,
+    certification_ready: bool,
     stopped_after_phase: Option<String>,
     phases: Vec<PhaseEvidence>,
 }
@@ -108,7 +117,8 @@ struct PhaseEvidence {
     checks: Vec<EvidenceCheck>,
     stop_breached: bool,
     stop_checks: Vec<EvidenceCheck>,
-    results: TestResults,
+    results: Option<TestResults>,
+    error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -124,7 +134,15 @@ struct EvidenceCheck {
     comparison: &'static str,
     observed: f64,
     limit: f64,
-    passed: bool,
+    outcome: CheckOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum CheckOutcome {
+    Passed,
+    Failed,
+    NotTested,
 }
 
 pub async fn run_capacity(args: CapacityArgs) -> Result<()> {
@@ -145,21 +163,43 @@ pub async fn run_capacity(args: CapacityArgs) -> Result<()> {
             index + 1,
             safe_file_component(&phase.name)
         ));
-        let results = runner::run_loadtest(RunArgs {
-            url: plan.target_url.clone(),
-            concurrency: phase.concurrency,
-            requests: 0,
-            duration: phase.duration_seconds,
-            ramp_up: phase.ramp_up_seconds,
-            scenario: phase.scenario,
-            method: phase.method,
-            users_file: plan.users_file.clone(),
-            output: phase_output,
-            report_interval: phase.duration_seconds.clamp(1, 5),
-            seed: plan.seed,
-        })
-        .await
-        .with_context(|| format!("capacity phase {:?} failed", phase.name))?;
+        let results = runner::run_loadtest_with_stop(
+            RunArgs {
+                url: plan.target_url.clone(),
+                concurrency: phase.concurrency,
+                requests: 0,
+                duration: phase.duration_seconds,
+                ramp_up: phase.ramp_up_seconds,
+                scenario: phase.scenario,
+                method: phase.method,
+                users_file: plan.users_file.clone(),
+                output: phase_output,
+                report_interval: phase.duration_seconds.clamp(1, 5),
+                seed: plan.seed,
+            },
+            Some(runner::LiveStopConditions {
+                max_unintentional_error_rate: plan.stop_conditions.max_error_rate,
+                max_latency_p95_ms: plan.stop_conditions.max_latency_p95_ms,
+            }),
+        )
+        .await;
+        let results = match results {
+            Ok(results) => results,
+            Err(error) => {
+                stopped_after_phase = Some(phase.name.clone());
+                phase_evidence.push(PhaseEvidence {
+                    name: phase.name.clone(),
+                    kind: phase.kind,
+                    passed: false,
+                    checks: Vec::new(),
+                    stop_breached: false,
+                    stop_checks: Vec::new(),
+                    results: None,
+                    error: Some(format!("{error:#}")),
+                });
+                break;
+            }
+        };
 
         let mut checks = vec![
             EvidenceCheck {
@@ -167,46 +207,59 @@ pub async fn run_capacity(args: CapacityArgs) -> Result<()> {
                 comparison: "at-least",
                 observed: results.summary.total_requests as f64,
                 limit: 1.0,
-                passed: results.summary.total_requests > 0,
+                outcome: outcome(results.summary.total_requests > 0),
             },
             EvidenceCheck {
                 metric: "unintentional_error_rate",
                 comparison: "at-most",
                 observed: results.summary.unintentional_error_rate,
                 limit: phase.max_error_rate,
-                passed: results.summary.unintentional_error_rate <= phase.max_error_rate,
+                outcome: outcome(results.summary.unintentional_error_rate <= phase.max_error_rate),
             },
             EvidenceCheck {
                 metric: "latency_p95_ms",
                 comparison: "at-most",
                 observed: results.summary.latency_p95_ms,
                 limit: phase.max_latency_p95_ms,
-                passed: results.summary.latency_p95_ms <= phase.max_latency_p95_ms,
+                outcome: outcome(results.summary.latency_p95_ms <= phase.max_latency_p95_ms),
             },
-            EvidenceCheck {
+        ];
+        checks.push(match &phase.intentional_shedding {
+            Some(expectation) => EvidenceCheck {
                 metric: "intentional_rejection_rate",
                 comparison: "at-least",
                 observed: results.summary.intentional_rejection_rate,
-                limit: phase.min_intentional_rejection_rate,
-                passed: results.summary.intentional_rejection_rate
-                    >= phase.min_intentional_rejection_rate,
+                limit: expectation.min_rate,
+                outcome: outcome(
+                    results.summary.intentional_rejection_rate >= expectation.min_rate,
+                ),
             },
-        ];
+            None => EvidenceCheck {
+                metric: "intentional_rejection_rate",
+                comparison: "at-least",
+                observed: results.summary.intentional_rejection_rate,
+                limit: 0.0,
+                outcome: CheckOutcome::NotTested,
+            },
+        });
+        let availability = availability_percent(&results);
         if phase.slo_applies {
             checks.extend([
                 EvidenceCheck {
                     metric: "availability_percent",
                     comparison: "at-least",
-                    observed: availability_percent(&results),
+                    observed: availability,
                     limit: plan.objectives.availability_percent,
-                    passed: availability_percent(&results) >= plan.objectives.availability_percent,
+                    outcome: outcome(availability >= plan.objectives.availability_percent),
                 },
                 EvidenceCheck {
                     metric: "slo_latency_p95_ms",
                     comparison: "at-most",
                     observed: results.summary.latency_p95_ms,
                     limit: plan.objectives.latency_p95_ms,
-                    passed: results.summary.latency_p95_ms <= plan.objectives.latency_p95_ms,
+                    outcome: outcome(
+                        results.summary.latency_p95_ms <= plan.objectives.latency_p95_ms,
+                    ),
                 },
             ]);
         }
@@ -216,15 +269,18 @@ pub async fn run_capacity(args: CapacityArgs) -> Result<()> {
                 comparison: "at-most",
                 observed: results.summary.unintentional_error_rate,
                 limit: plan.stop_conditions.max_error_rate,
-                passed: results.summary.unintentional_error_rate
-                    <= plan.stop_conditions.max_error_rate,
+                outcome: outcome(
+                    results.summary.unintentional_error_rate <= plan.stop_conditions.max_error_rate,
+                ),
             },
             EvidenceCheck {
                 metric: "stop_latency_p95_ms",
                 comparison: "at-most",
                 observed: results.summary.latency_p95_ms,
                 limit: plan.stop_conditions.max_latency_p95_ms,
-                passed: results.summary.latency_p95_ms <= plan.stop_conditions.max_latency_p95_ms,
+                outcome: outcome(
+                    results.summary.latency_p95_ms <= plan.stop_conditions.max_latency_p95_ms,
+                ),
             },
         ];
         let (phase_passed, stop_breached) = phase_outcome(&checks, &stop_checks);
@@ -235,7 +291,8 @@ pub async fn run_capacity(args: CapacityArgs) -> Result<()> {
             checks,
             stop_breached,
             stop_checks,
-            results,
+            results: Some(results),
+            error: None,
         });
         if stop_breached {
             stopped_after_phase = Some(phase.name.clone());
@@ -243,7 +300,19 @@ pub async fn run_capacity(args: CapacityArgs) -> Result<()> {
         }
     }
 
-    let passed = phase_evidence.iter().all(|phase| phase.passed);
+    let passed = phase_evidence.len() == plan.phases.len()
+        && phase_evidence.iter().all(|phase| phase.passed);
+    let certification_ready = passed
+        && plan
+            .phases
+            .iter()
+            .any(|phase| phase.intentional_shedding.is_some())
+        && phase_evidence.iter().all(|phase| {
+            phase.checks.iter().all(|check| {
+                check.metric != "intentional_rejection_rate"
+                    || check.outcome != CheckOutcome::Failed
+            })
+        });
     let evidence = CapacityEvidence {
         schema_version: EVIDENCE_SCHEMA_VERSION,
         evidence_scope: "synthetic non-production capacity rehearsal",
@@ -251,6 +320,7 @@ pub async fn run_capacity(args: CapacityArgs) -> Result<()> {
         execution_environment,
         plan,
         passed,
+        certification_ready,
         stopped_after_phase,
         phases: phase_evidence,
     };
@@ -270,11 +340,24 @@ fn availability_percent(results: &TestResults) -> f64 {
 }
 
 fn phase_outcome(checks: &[EvidenceCheck], stop_checks: &[EvidenceCheck]) -> (bool, bool) {
-    let stop_breached = stop_checks.iter().any(|check| !check.passed);
+    let stop_breached = stop_checks
+        .iter()
+        .any(|check| check.outcome == CheckOutcome::Failed);
     (
-        checks.iter().all(|check| check.passed) && !stop_breached,
+        checks
+            .iter()
+            .all(|check| check.outcome != CheckOutcome::Failed)
+            && !stop_breached,
         stop_breached,
     )
+}
+
+fn outcome(passed: bool) -> CheckOutcome {
+    if passed {
+        CheckOutcome::Passed
+    } else {
+        CheckOutcome::Failed
+    }
 }
 
 fn validate_plan(plan: &CapacityPlan, allowed_host: Option<&str>) -> Result<ExecutionEnvironment> {
@@ -322,11 +405,11 @@ fn validate_plan(plan: &CapacityPlan, allowed_host: Option<&str>) -> Result<Exec
         ExecutionEnvironment::AuthorizedNonProduction
     };
 
-    let present: BTreeSet<_> = plan.phases.iter().map(|phase| phase.kind).collect();
-    for required in REQUIRED_PHASES {
-        if !present.contains(&required) {
-            anyhow::bail!("capacity plan is missing required {required:?} phase");
-        }
+    let actual_phases: Vec<_> = plan.phases.iter().map(|phase| phase.kind).collect();
+    if actual_phases != REQUIRED_PHASES {
+        anyhow::bail!(
+            "capacity phases must appear exactly once in this order: ramp, spike, soak, recovery, rollout, scale-down"
+        );
     }
     let mut phase_names = BTreeSet::new();
     for phase in &plan.phases {
@@ -341,11 +424,30 @@ fn validate_plan(plan: &CapacityPlan, allowed_host: Option<&str>) -> Result<Exec
                 phase.name
             );
         }
+        if phase.ramp_up_seconds >= phase.duration_seconds && phase.ramp_up_seconds != 0 {
+            anyhow::bail!(
+                "phase {:?} ramp-up must be shorter than its duration",
+                phase.name
+            );
+        }
         validate_rate("phases[].max_error_rate", phase.max_error_rate)?;
-        validate_rate(
-            "phases[].min_intentional_rejection_rate",
-            phase.min_intentional_rejection_rate,
-        )?;
+        if let Some(expectation) = &phase.intentional_shedding {
+            if phase.kind != PhaseKind::Spike {
+                anyhow::bail!("only the spike phase may declare intentional shedding");
+            }
+            if expectation.status != 503 || expectation.error_code != "admission_rejected" {
+                anyhow::bail!(
+                    "intentional shedding must use HTTP 503 with error code admission_rejected"
+                );
+            }
+            validate_rate(
+                "phases[].intentional_shedding.min_rate",
+                expectation.min_rate,
+            )?;
+            if expectation.min_rate <= 0.0 {
+                anyhow::bail!("intentional shedding min_rate must be greater than zero");
+            }
+        }
         validate_positive("phases[].max_latency_p95_ms", phase.max_latency_p95_ms)?;
         if matches!(phase.method, RpcMethod::Register) {
             anyhow::bail!("capacity profiles do not support non-deterministic registration phases");
@@ -353,15 +455,12 @@ fn validate_plan(plan: &CapacityPlan, allowed_host: Option<&str>) -> Result<Exec
         if phase.kind != PhaseKind::Spike && !phase.slo_applies {
             anyhow::bail!("only the spike phase may opt out of profile SLO checks");
         }
-        if phase.kind == PhaseKind::Spike && phase.min_intentional_rejection_rate <= 0.0 {
-            anyhow::bail!("the spike phase must declare a non-zero intentional rejection rate");
-        }
     }
     Ok(execution_environment)
 }
 
 fn is_local_host(host: &str) -> bool {
-    host == "localhost" || host == "127.0.0.1" || host == "::1" || host.ends_with(".localhost")
+    host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host.ends_with(".localhost")
 }
 
 fn validate_nonempty(field: &str, value: &str) -> Result<()> {
@@ -441,6 +540,8 @@ mod tests {
                 errors_server: 0,
                 errors_client: 0,
                 errors_network: 0,
+                rate_limited_requests: 0,
+                intentional_rejections: 1,
                 intentional_rejection_rate: error_rate,
             },
             timeline: Vec::new(),
@@ -454,7 +555,7 @@ mod tests {
             comparison: "at-most",
             observed: 0.0,
             limit: 0.0,
-            passed,
+            outcome: outcome(passed),
         }
     }
 
@@ -492,10 +593,14 @@ mod tests {
                     max_error_rate: 0.01,
                     max_latency_p95_ms: 500.0,
                     slo_applies: kind != PhaseKind::Spike,
-                    min_intentional_rejection_rate: if kind == PhaseKind::Spike {
-                        0.01
+                    intentional_shedding: if kind == PhaseKind::Spike {
+                        Some(IntentionalSheddingExpectation {
+                            status: 503,
+                            error_code: "admission_rejected".to_owned(),
+                            min_rate: 0.01,
+                        })
                     } else {
-                        0.0
+                        None
                     },
                 })
                 .collect(),
@@ -560,15 +665,23 @@ mod tests {
     }
 
     #[test]
-    fn every_required_phase_must_be_predeclared() {
-        let mut plan = plan();
-        plan.phases
+    fn every_required_phase_must_be_predeclared_in_order() {
+        let mut missing_plan = plan();
+        missing_plan
+            .phases
             .retain(|phase| phase.kind != PhaseKind::Recovery);
 
-        let error = validate_plan(&plan, None).unwrap_err();
+        let error = validate_plan(&missing_plan, None).unwrap_err();
         assert!(error
             .to_string()
-            .contains("missing required Recovery phase"));
+            .contains("must appear exactly once in this order"));
+
+        let mut reordered_plan = plan();
+        reordered_plan.phases.swap(1, 3);
+        assert!(validate_plan(&reordered_plan, None)
+            .unwrap_err()
+            .to_string()
+            .contains("must appear exactly once in this order"));
     }
 
     #[test]
@@ -586,6 +699,85 @@ mod tests {
 
         let error = validate_plan(&plan, None).unwrap_err();
         assert!(error.to_string().contains("non-deterministic registration"));
+    }
+
+    #[test]
+    fn spike_may_leave_shedding_not_tested() {
+        let mut plan = plan();
+        plan.phases[1].intentional_shedding = None;
+
+        validate_plan(&plan, None).unwrap();
+    }
+
+    #[test]
+    fn shedding_contract_is_fixed_and_explicit() {
+        let mut plan = plan();
+        plan.phases[1]
+            .intentional_shedding
+            .as_mut()
+            .unwrap()
+            .error_code = "database_unavailable".to_owned();
+
+        assert!(validate_plan(&plan, None)
+            .unwrap_err()
+            .to_string()
+            .contains("admission_rejected"));
+    }
+
+    #[test]
+    fn ramp_up_must_be_shorter_than_duration() {
+        let mut plan = plan();
+        plan.phases[0].ramp_up_seconds = plan.phases[0].duration_seconds;
+
+        assert!(validate_plan(&plan, None)
+            .unwrap_err()
+            .to_string()
+            .contains("ramp-up must be shorter"));
+    }
+
+    #[test]
+    fn ipv6_loopback_is_local() {
+        let mut plan = plan();
+        plan.target_url = "http://[::1]:3000".to_owned();
+
+        assert_eq!(
+            validate_plan(&plan, None).unwrap(),
+            ExecutionEnvironment::Local
+        );
+    }
+
+    #[tokio::test]
+    async fn phase_setup_error_still_writes_partial_evidence() {
+        let temp = std::env::temp_dir().join(format!(
+            "keycast-capacity-partial-evidence-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        let mut plan = plan();
+        plan.users_file = temp.join("missing-users.json");
+        plan.phases[1].intentional_shedding = None;
+        let plan_path = temp.join("plan.json");
+        std::fs::write(&plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
+        let output = temp.join("evidence");
+
+        let error = run_capacity(CapacityArgs {
+            plan: plan_path,
+            output: output.clone(),
+            allow_host: None,
+        })
+        .await
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("exceeded their predeclared limits"));
+        let evidence: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output.join("evidence.json")).unwrap()).unwrap();
+        assert_eq!(evidence["passed"], false);
+        assert_eq!(evidence["certification_ready"], false);
+        assert_eq!(evidence["phases"][0]["passed"], false);
+        assert!(!evidence["phases"][0]["error"].as_str().unwrap().is_empty());
+        std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]
