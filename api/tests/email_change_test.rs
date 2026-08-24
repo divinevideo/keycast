@@ -23,6 +23,10 @@ use keycast_api::api::{
     },
     tenant::{Tenant, TenantExtractor},
 };
+use keycast_api::{
+    email_delivery::{EmailAdmissionRefusal, EmailDeliveryService},
+    email_service::{DevEmailSender, EmailSender},
+};
 use nostr_sdk::Keys;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -117,6 +121,13 @@ async fn create_user(pool: &PgPool, pubkey: &str, email: &str, password: &str) {
 
 /// Router mounting all three handlers.
 fn build_app(pool: PgPool) -> Router {
+    build_app_with_delivery(
+        pool,
+        EmailDeliveryService::unrestricted_for_tests(Arc::new(DevEmailSender::new())),
+    )
+}
+
+fn build_app_with_delivery(pool: PgPool, email_delivery: EmailDeliveryService) -> Router {
     let p1 = pool.clone();
     let p2 = pool.clone();
     let p3 = pool;
@@ -126,6 +137,7 @@ fn build_app(pool: PgPool) -> Router {
             post(
                 move |headers: HeaderMap, Json(req): Json<ChangeEmailRequest>| {
                     let pool = p1.clone();
+                    let email_delivery = email_delivery.clone();
                     async move {
                         change_email(
                             create_test_tenant(),
@@ -134,6 +146,7 @@ fn build_app(pool: PgPool) -> Router {
                                 1,
                                 std::time::Duration::from_secs(1),
                             )),
+                            axum::Extension(email_delivery),
                             headers,
                             Json(req),
                         )
@@ -216,6 +229,78 @@ async fn current_email(pool: &PgPool, pubkey: &str) -> String {
         .fetch_one(pool)
         .await
         .expect("read email")
+}
+
+#[tokio::test]
+async fn suppressed_email_change_preserves_pending_state_and_skips_provider() {
+    let pool = setup_pool().await;
+    let keys = Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    let old_email = format!("old-suppressed-{}@example.com", Uuid::new_v4());
+    let prior_target = format!("prior-target-{}@example.com", Uuid::new_v4());
+    let new_email = format!("new-suppressed-{}@example.com", Uuid::new_v4());
+    create_user(&pool, &pubkey, &old_email, "correct-horse-battery").await;
+    sqlx::query(
+        "UPDATE users SET pending_email = $1, pending_email_old_token = $2,
+         pending_email_new_token = $3, pending_email_expires_at = $4,
+         pending_email_sent_at = $5 WHERE pubkey = $6 AND tenant_id = $7",
+    )
+    .bind(&prior_target)
+    .bind("prior-old-token")
+    .bind("prior-new-token")
+    .bind(Utc::now() + Duration::hours(1))
+    .bind(Utc::now() - Duration::hours(1))
+    .bind(&pubkey)
+    .bind(TENANT_ID)
+    .execute(&pool)
+    .await
+    .expect("seed pending email state");
+    let before = pending_state(&pool, &pubkey).await;
+
+    let sender = Arc::new(DevEmailSender::new());
+    sender.clear_captured_emails();
+    let app = build_app_with_delivery(
+        pool.clone(),
+        EmailDeliveryService::denying_for_tests(
+            sender.clone(),
+            EmailAdmissionRefusal::AccountVolume,
+        ),
+    );
+    let auth = mint_session_token(&keys).await;
+    let response = post_json(
+        &app,
+        "/user/change-email",
+        Some(&auth),
+        serde_json::json!({
+            "new_email": new_email,
+            "password": "correct-horse-battery"
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(pending_state(&pool, &pubkey).await, before);
+    assert!(sender.get_captured_emails().is_empty());
+    let event: (String, Option<String>) = sqlx::query_as(
+        "SELECT outcome, reason_code FROM auth_events
+         WHERE pubkey = $1 AND event_type = 'email_delivery'
+         ORDER BY occurred_at DESC, id DESC LIMIT 1",
+    )
+    .bind(&pubkey)
+    .fetch_one(&pool)
+    .await
+    .expect("suppressed delivery event");
+    assert_eq!(
+        event,
+        ("suppressed".to_string(), Some("account_volume".to_string()))
+    );
+
+    sqlx::query("DELETE FROM auth_events WHERE pubkey = $1")
+        .bind(&pubkey)
+        .execute(&pool)
+        .await
+        .expect("delete test events");
+    cleanup_by_email(&pool, &old_email).await;
 }
 
 #[tokio::test]

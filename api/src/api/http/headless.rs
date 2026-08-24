@@ -1415,7 +1415,7 @@ pub async fn headless_resend_pin(
                 "Email service unavailable, skipping PIN resend email: {}",
                 e
             );
-            Err(e)
+            Err(crate::email_service::EmailSendError::Unavailable)
         }
     };
 

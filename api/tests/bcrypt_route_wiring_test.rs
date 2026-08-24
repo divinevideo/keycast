@@ -7,6 +7,8 @@ use axum::{
 use chrono::Utc;
 use keycast_api::{
     api::{http::routes::api_routes, tenant::Tenant},
+    email_delivery::EmailDeliveryService,
+    email_service::DevEmailSender,
     state::KEYCAST_STATE,
 };
 use sqlx::postgres::PgPoolOptions;
@@ -45,6 +47,7 @@ async fn bcrypt_handlers_are_wired_through_api_routes() {
     let app = api_routes(
         pool,
         auth_state.state,
+        EmailDeliveryService::unrestricted_for_tests(Arc::new(DevEmailSender::new())),
         CorsLayer::permissive(),
         CorsLayer::permissive(),
         None,
