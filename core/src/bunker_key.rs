@@ -48,7 +48,7 @@ pub fn derive_bunker_keys(user_secret: &SecretKey, connection_secret: &str) -> K
         let derived_info = if counter == 0 {
             info.clone()
         } else {
-            Zeroizing::new(format!("{}-retry{}", &*info, counter))
+            Zeroizing::new(format!("{}-retry{}", *info, counter))
         };
 
         hkdf.expand(derived_info.as_bytes(), bytes.as_mut())
