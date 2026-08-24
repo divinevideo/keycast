@@ -6,6 +6,7 @@ pub mod atproto_oauth_metadata;
 pub mod auth;
 pub mod auth_observability;
 pub mod claim;
+pub mod expensive_work;
 pub mod headless;
 pub mod html_safety;
 pub mod metrics;

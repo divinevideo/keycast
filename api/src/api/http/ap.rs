@@ -235,6 +235,18 @@ pub struct SignRequest {
     pub signing_string: String,
 }
 
+const MAX_SIGNING_STRING_BYTES: usize = 16 * 1024;
+
+fn validate_signing_string(signing_string: &str) -> Result<(), ApError> {
+    if signing_string.len() > MAX_SIGNING_STRING_BYTES {
+        Err(ApError::BadRequest(
+            "signing_string exceeds 16384 bytes".to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct SignResponse {
     pub pubkey: String,
@@ -249,7 +261,7 @@ async fn create_actor_key(
     user_pubkey: &str,
 ) -> Result<(String, String, bool), ApError> {
     // Generate (CPU-bound) off the async runtime.
-    let material = tokio::task::spawn_blocking(ap_signing::generate_rsa_2048)
+    let material = super::expensive_work::spawn_cpu(ap_signing::generate_rsa_2048)
         .await
         .map_err(|e| ApError::Internal(format!("join error: {e}")))?
         .map_err(|e| ApError::Internal(e.to_string()))?;
@@ -367,6 +379,7 @@ pub async fn sign(
     headers: HeaderMap,
     Json(req): Json<SignRequest>,
 ) -> Result<Json<SignResponse>, ApError> {
+    validate_signing_string(&req.signing_string)?;
     let tenant_id = tenant.0.id;
     let pool = &auth_state.state.db;
     let user_pubkey = resolve_principal(
@@ -410,14 +423,29 @@ pub async fn sign(
         .map_err(|e| ApError::Internal(e.to_string()))?;
 
     let message = req.signing_string.into_bytes();
-    let signature = tokio::task::spawn_blocking(move || ap_signing::sign_base64(&der, &message))
-        .await
-        .map_err(|e| ApError::Internal(format!("join error: {e}")))?
-        .map_err(|e| ApError::Internal(e.to_string()))?;
+    let signature =
+        super::expensive_work::spawn_cpu(move || ap_signing::sign_base64(&der, &message))
+            .await
+            .map_err(|e| ApError::Internal(format!("join error: {e}")))?
+            .map_err(|e| ApError::Internal(e.to_string()))?;
 
     Ok(Json(SignResponse {
         pubkey: user_pubkey,
         signature,
         algorithm: "rsa-sha256",
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signing_string_limit_matches_protocol_boundary() {
+        assert!(validate_signing_string(&"x".repeat(MAX_SIGNING_STRING_BYTES)).is_ok());
+        assert!(matches!(
+            validate_signing_string(&"x".repeat(MAX_SIGNING_STRING_BYTES + 1)),
+            Err(ApError::BadRequest(_))
+        ));
+    }
 }

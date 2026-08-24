@@ -481,10 +481,31 @@ fn metadata_document_url(
     Ok(Some(url))
 }
 
+const MAX_REMOTE_JSON_BYTES: usize = 64 * 1024;
+const MAX_CLIENT_ASSERTION_BYTES: usize = 8 * 1024;
+const MAX_CLIENT_SIGNING_KEYS: usize = 16;
+
+fn validate_signing_key_count(count: usize, label: &str) -> Result<(), AuthError> {
+    if count > MAX_CLIENT_SIGNING_KEYS {
+        Err(AuthError::BadRequest(format!(
+            "{label} contains too many keys"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 async fn fetch_json(url: &reqwest::Url, label: &str) -> Result<Value, AuthError> {
     ensure_secure_or_loopback_url(url, label)?;
     let client = reqwest::Client::builder()
-        .timeout(StdDuration::from_secs(3))
+        .timeout(
+            super::expensive_work::remaining_timeout(StdDuration::from_secs(3)).map_err(|_| {
+                AuthError::ServiceUnavailable {
+                    message: "Insufficient request budget for remote client metadata".to_string(),
+                    retry_after: Some(1),
+                }
+            })?,
+        )
         .build()
         .map_err(|error| AuthError::Internal(format!("Failed to build HTTP client: {error}")))?;
     let response = client
@@ -498,9 +519,17 @@ async fn fetch_json(url: &reqwest::Url, label: &str) -> Result<Value, AuthError>
             response.status()
         )));
     }
-    response
-        .json::<Value>()
+    if response.content_length().unwrap_or(0) > MAX_REMOTE_JSON_BYTES as u64 {
+        return Err(AuthError::BadRequest(format!("{label} is too large")));
+    }
+    let bytes = response
+        .bytes()
         .await
+        .map_err(|error| AuthError::BadRequest(format!("Failed to read {label}: {error}")))?;
+    if bytes.len() > MAX_REMOTE_JSON_BYTES {
+        return Err(AuthError::BadRequest(format!("{label} is too large")));
+    }
+    serde_json::from_slice(&bytes)
         .map_err(|error| AuthError::BadRequest(format!("Invalid {label} JSON: {error}")))
 }
 
@@ -548,6 +577,7 @@ async fn load_client_signing_keys(metadata: &ClientMetadata) -> Result<Vec<Clien
                 "Client metadata jwks must contain at least one key".to_string(),
             ));
         }
+        validate_signing_key_count(jwks.keys.len(), "Client metadata jwks")?;
         return Ok(jwks.keys.clone());
     }
     if let Some(jwks_uri) = metadata.jwks_uri.as_deref() {
@@ -561,6 +591,7 @@ async fn load_client_signing_keys(metadata: &ClientMetadata) -> Result<Vec<Clien
                 "Client metadata jwks_uri must resolve to at least one key".to_string(),
             ));
         }
+        validate_signing_key_count(jwks.keys.len(), "Client JWKS")?;
         return Ok(jwks.keys);
     }
     Err(AuthError::BadRequest(
@@ -575,6 +606,11 @@ fn expected_client_assertion_audiences() -> Vec<String> {
 type CompactJwtParts = (Vec<u8>, Vec<u8>, Vec<u8>, String);
 
 fn compact_jwt_parts(jwt: &str) -> Result<CompactJwtParts, AuthError> {
+    if jwt.len() > MAX_CLIENT_ASSERTION_BYTES {
+        return Err(AuthError::BadRequest(
+            "client_assertion exceeds 8192 bytes".to_string(),
+        ));
+    }
     let segments: Vec<&str> = jwt.split('.').collect();
     if segments.len() != 3 {
         return Err(AuthError::BadRequest(
@@ -1331,5 +1367,26 @@ pub async fn token(
             "Only authorization_code and refresh_token are supported for ATProto token exchange"
                 .to_string(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod resource_bound_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_client_assertion_is_rejected_before_decode() {
+        let assertion = "x".repeat(MAX_CLIENT_ASSERTION_BYTES + 1);
+        let error = compact_jwt_parts(&assertion).unwrap_err();
+        assert!(matches!(error, AuthError::BadRequest(message) if message.contains("8192")));
+    }
+
+    #[test]
+    fn remote_jwks_cardinality_is_bounded() {
+        assert!(validate_signing_key_count(MAX_CLIENT_SIGNING_KEYS, "JWKS").is_ok());
+        assert!(matches!(
+            validate_signing_key_count(MAX_CLIENT_SIGNING_KEYS + 1, "JWKS"),
+            Err(AuthError::BadRequest(message)) if message.contains("too many keys")
+        ));
     }
 }

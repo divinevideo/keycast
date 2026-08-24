@@ -11,8 +11,8 @@ use std::{sync::Arc, time::Duration};
 use tower::{timeout::error::Elapsed, ServiceBuilder};
 
 use crate::api::http::{
-    admin, ap, atproto, atproto_oauth, auth, claim, headless, metrics, nostr_rpc, oauth, policies,
-    service_deletion, service_provisioning, teams,
+    admin, ap, atproto, atproto_oauth, auth, claim, expensive_work, headless, metrics, nostr_rpc,
+    oauth, policies, service_deletion, service_provisioning, teams,
 };
 use crate::state::KeycastState;
 use axum::response::Json as AxumJson;
@@ -48,6 +48,13 @@ pub fn public_verify_email_route(
 ) -> Router {
     Router::new()
         .route("/verify-email", get(auth::verify_email_get))
+        .route_layer(axum::middleware::from_fn_with_state(
+            expensive_work::ADMISSION.clone(),
+            expensive_work::enforce,
+        ))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            expensive_work::HTTP_BODY_LIMIT,
+        ))
         .with_state(AuthState { state, auth_tx })
 }
 
@@ -352,7 +359,7 @@ pub fn api_routes(
     // First-party routes have restricted CORS (prevent phishing)
     // Authenticated routes have restricted CORS (need cookies)
     // Public routes have wildcard CORS (third-party safe, no credentials)
-    Router::new()
+    let bounded_routes = Router::new()
         .merge(first_party_routes) // Has auth_cors (credentials, accepts passwords)
         .merge(user_routes) // Has auth_cors (authenticated, needs cookies)
         .merge(internal_service_routes) // Service-authenticated route, not browser-facing
@@ -368,7 +375,6 @@ pub fn api_routes(
         .merge(atproto_oauth_routes)
         .merge(connect_routes.layer(public_cors.clone()))
         .merge(signing_routes.layer(public_cors.clone()))
-        .merge(nostr_rpc_routes.layer(public_cors.clone())) // NIP-46 RPC for OAuth apps
         .merge(ap_routes.layer(public_cors.clone())) // AP RSA signing (gateway service-to-service)
         .merge(team_routes.layer(auth_cors.clone())) // Team routes need credentials
         .merge(discovery_route.layer(public_cors.clone()))
@@ -378,7 +384,19 @@ pub fn api_routes(
         .merge(service_admin_routes) // Service-token admin routes (no CORS, server-to-server)
         .merge(claim_routes.layer(public_cors.clone())) // Public - claim preloaded accounts
         .merge(metrics_route.layer(public_cors.clone())) // Public - Prometheus metrics
-        .merge(docs_route.layer(public_cors))
+        .merge(docs_route.layer(public_cors.clone()))
+        .route_layer(axum::middleware::from_fn_with_state(
+            expensive_work::ADMISSION.clone(),
+            expensive_work::enforce,
+        ))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            expensive_work::HTTP_BODY_LIMIT,
+        ));
+
+    // `/api/nostr` keeps its existing Axum 2 MiB body limit and dedicated
+    // timeout/admission contract.
+    bounded_routes
+        .merge(nostr_rpc_routes.layer(public_cors.clone()))
         .fallback(api_not_found) // Return 404 for unmatched API routes
 }
 

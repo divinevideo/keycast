@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
 use rand::Rng;
 use secrecy::SecretString;
 
@@ -108,23 +108,20 @@ impl SecretPool {
                     hash: secret_hash,
                 };
 
-                // Send to pool - blocks if full (backpressure)
-                // Use spawn_blocking since crossbeam send is sync
-                let tx_clone = tx.clone();
-                let send_result = tokio::task::spawn_blocking(move || tx_clone.send(pair)).await;
-
-                match send_result {
-                    Ok(Ok(())) => {
-                        // Successfully added to pool
-                    }
-                    Ok(Err(_)) => {
-                        // Channel disconnected - pool dropped, shutdown
-                        tracing::info!("Secret pool producer shutting down (channel closed)");
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::error!("Secret pool producer: spawn_blocking panicked: {}", e);
-                        break;
+                // Keep backpressure async so a full pool never parks one of
+                // Tokio's shared blocking workers.
+                let mut pending = pair;
+                loop {
+                    match tx.try_send(pending) {
+                        Ok(()) => break,
+                        Err(TrySendError::Full(pair)) => {
+                            pending = pair;
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        Err(TrySendError::Disconnected(_)) => {
+                            tracing::info!("Secret pool producer shutting down (channel closed)");
+                            return;
+                        }
                     }
                 }
             }
@@ -167,14 +164,19 @@ impl SecretPoolReceiver {
     /// retryable overload instead of parking the request. A closed pool
     /// returns [`SecretPoolError::Closed`].
     pub async fn get(&self) -> Result<SecretPair, SecretPoolError> {
-        let rx = self.rx.clone();
-        tokio::task::spawn_blocking(move || match rx.recv_timeout(SECRET_POOL_GET_TIMEOUT) {
-            Ok(pair) => Ok(pair),
-            Err(RecvTimeoutError::Timeout) => Err(SecretPoolError::Exhausted),
-            Err(RecvTimeoutError::Disconnected) => Err(SecretPoolError::Closed),
-        })
-        .await
-        .unwrap_or(Err(SecretPoolError::Closed))
+        let deadline = tokio::time::Instant::now() + SECRET_POOL_GET_TIMEOUT;
+        loop {
+            match self.rx.try_recv() {
+                Ok(pair) => return Ok(pair),
+                Err(TryRecvError::Disconnected) => return Err(SecretPoolError::Closed),
+                Err(TryRecvError::Empty) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(SecretPoolError::Exhausted);
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
     }
 
     /// Try to get a pair without blocking
