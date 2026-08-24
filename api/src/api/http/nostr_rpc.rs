@@ -18,7 +18,9 @@ use keycast_core::repositories::{
 };
 use keycast_core::signing_session::{parse_cache_key, CacheKey, SigningSession};
 use keycast_core::traits::CustomPermission;
+use moka::future::Cache;
 use nostr_sdk::{Event, JsonUtil, Keys, PublicKey, UnsignedEvent};
+use once_cell::sync::Lazy;
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -46,6 +48,37 @@ const MAX_UNWRAP_BATCH: usize = 100;
 /// The shared rumor is processed sequentially so this is also a hard bound on
 /// per-request seal and gift-wrap crypto.
 const MAX_WRAP_BATCH: usize = 100;
+
+/// Account restrictions and the minor-safety gate may be stale for at most this
+/// long when another instance changes them. Local admin writes invalidate the
+/// entry immediately. Misses still query Postgres and errors are never cached.
+const ACCOUNT_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
+const ACCOUNT_STATUS_CACHE_CAPACITY: u64 = 100_000;
+
+type AccountStatusCacheKey = (i64, String);
+
+#[derive(Clone, Debug)]
+enum AccountGateState {
+    Present {
+        status: String,
+        verified_minor: bool,
+    },
+    Missing,
+}
+
+#[derive(Debug)]
+enum AccountGateLoadError {
+    Unavailable,
+    Query,
+}
+
+static ACCOUNT_STATUS_CACHE: Lazy<Cache<AccountStatusCacheKey, AccountGateState>> =
+    Lazy::new(|| {
+        Cache::builder()
+            .max_capacity(ACCOUNT_STATUS_CACHE_CAPACITY)
+            .time_to_live(ACCOUNT_STATUS_CACHE_TTL)
+            .build()
+    });
 
 /// RPC request format (mirrors NIP-46)
 #[derive(Debug, Deserialize)]
@@ -220,8 +253,9 @@ async fn nostr_rpc_inner(
     // For mutating operations (sign/encrypt/decrypt), check user account status.
     // get_public_key is NOT gated -- suspended users need to retrieve their pubkey.
     // The same per-request row also carries verified_minor, which drives the DM
-    // containment gate below (support-trust-safety#183); reading it here (not
-    // from the cached handler) means protection flips apply immediately.
+    // containment gate below (support-trust-safety#183). This short-lived cache
+    // removes the mandatory pool checkout from warm calls while bounding
+    // cross-instance status and minor-safety changes to five seconds.
     // `sign_event` still reads the row, because the verified_minor gate below
     // depends on it, but is not refused on account status (keycast#373).
     let needs_status_check = !matches!(req.method.as_str(), "get_public_key");
@@ -465,7 +499,11 @@ fn http_rpc_outcome(response: &Result<Json<NostrRpcResponse>, RpcError>) -> &'st
 }
 
 /// Read the account gate state before a mutating operation.
-/// This runs a DB query per request (not cached) so status changes take effect immediately.
+///
+/// Cache misses query Postgres and fail closed. Concurrent misses for one account
+/// are coalesced, backend errors are not cached, and local admin writes invalidate
+/// immediately. Changes made on another instance take effect within
+/// [`ACCOUNT_STATUS_CACHE_TTL`].
 /// Returns the account's `verified_minor` flag (same row, no extra query) for
 /// the DM containment gate; a missing user row is a refusal, never a default.
 ///
@@ -481,6 +519,59 @@ async fn check_user_status_active(
     tenant_id: i64,
     deny_when_restricted: bool,
 ) -> Result<bool, RpcError> {
+    let status_started = Instant::now();
+    let cache_key = (tenant_id, user_pubkey_hex.to_string());
+    let pool = pool.clone();
+    let pubkey = user_pubkey_hex.to_string();
+
+    let status = ACCOUNT_STATUS_CACHE
+        .try_get_with(cache_key, async move {
+            load_account_gate_state(&pool, &pubkey, tenant_id).await
+        })
+        .await
+        .map_err(|error| match error.as_ref() {
+            AccountGateLoadError::Unavailable => {
+                RpcError::Unavailable("Database temporarily unavailable".to_string())
+            }
+            AccountGateLoadError::Query => {
+                RpcError::Internal("Database error checking user status".to_string())
+            }
+        })?;
+
+    let result = match status {
+        AccountGateState::Present {
+            status,
+            verified_minor,
+        } if status == "active" => Ok(verified_minor),
+        AccountGateState::Present {
+            status,
+            verified_minor,
+        } if !deny_when_restricted => {
+            tracing::info!(
+                event = "rpc.sign_allowed_for_restricted_account",
+                status = %status,
+                "Signing allowed for a restricted account (keycast#373)"
+            );
+            Ok(verified_minor)
+        }
+        AccountGateState::Present { .. } => {
+            Err(RpcError::AccountSuspended("Account restricted".to_string()))
+        }
+        AccountGateState::Missing => Err(RpcError::Auth(AuthError::InvalidToken)),
+    };
+
+    METRICS.observe_http_rpc_status_check(
+        http_rpc_outcome_for_status_check(&result),
+        status_started.elapsed(),
+    );
+    result
+}
+
+async fn load_account_gate_state(
+    pool: &sqlx::PgPool,
+    user_pubkey_hex: &str,
+    tenant_id: i64,
+) -> Result<AccountGateState, AccountGateLoadError> {
     let status_started = Instant::now();
     METRICS.set_http_rpc_db_pool_state(pool.size(), pool.num_idle() as u32);
 
@@ -505,9 +596,7 @@ async fn check_user_status_active(
             // TLS text and this response is reachable before the caller is known
             // to be legitimate.
             tracing::warn!(error = %e, "HTTP RPC could not acquire a connection for the status check");
-            return Err(RpcError::Unavailable(
-                "Database temporarily unavailable".to_string(),
-            ));
+            return Err(AccountGateLoadError::Unavailable);
         }
     };
 
@@ -521,28 +610,22 @@ async fn check_user_status_active(
     .map_err(|e| {
         METRICS.observe_http_rpc_status_check("error", status_started.elapsed());
         tracing::error!(error = %e, "HTTP RPC user status query failed");
-        RpcError::Internal("Database error checking user status".to_string())
+        AccountGateLoadError::Query
     })?;
 
-    let result = match status {
-        Some((s, verified_minor)) if s == "active" => Ok(verified_minor),
-        Some((s, verified_minor)) if !deny_when_restricted => {
-            tracing::info!(
-                event = "rpc.sign_allowed_for_restricted_account",
-                status = %s,
-                "Signing allowed for a restricted account (keycast#373)"
-            );
-            Ok(verified_minor)
-        }
-        Some(_) => Err(RpcError::AccountSuspended("Account restricted".to_string())),
-        None => Err(RpcError::Auth(AuthError::InvalidToken)),
-    };
+    Ok(match status {
+        Some((status, verified_minor)) => AccountGateState::Present {
+            status,
+            verified_minor,
+        },
+        None => AccountGateState::Missing,
+    })
+}
 
-    METRICS.observe_http_rpc_status_check(
-        http_rpc_outcome_for_status_check(&result),
-        status_started.elapsed(),
-    );
-    result
+pub(crate) async fn invalidate_account_status_cache(user_pubkey_hex: &str, tenant_id: i64) {
+    ACCOUNT_STATUS_CACHE
+        .invalidate(&(tenant_id, user_pubkey_hex.to_string()))
+        .await;
 }
 
 fn http_rpc_outcome_for_status_check(result: &Result<bool, RpcError>) -> &'static str {
