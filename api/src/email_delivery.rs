@@ -124,6 +124,7 @@ pub struct EmailDeliveryConfig {
     pub account_window: Duration,
     pub source_limit: usize,
     pub source_window: Duration,
+    pub source_trusted_proxy_hops: usize,
     pub global_limit: usize,
     pub global_window: Duration,
     pub provider_in_flight_limit: usize,
@@ -140,6 +141,8 @@ impl Default for EmailDeliveryConfig {
             account_window: Duration::from_secs(60 * 60),
             source_limit: 50,
             source_window: Duration::from_secs(60 * 60),
+            // Google frontends append `<client-ip>,<load-balancer-ip>`.
+            source_trusted_proxy_hops: 1,
             global_limit: 1_000,
             global_window: Duration::from_secs(60),
             provider_in_flight_limit: 20,
@@ -153,7 +156,7 @@ impl EmailDeliveryConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error when a configured value is zero or not an integer.
+    /// Returns an error when a limit or timeout is zero, or any value is not an integer.
     pub fn from_env() -> Result<Self, String> {
         let defaults = Self::default();
         Ok(Self {
@@ -178,6 +181,10 @@ impl EmailDeliveryConfig {
             source_window: env_duration(
                 "EMAIL_DELIVERY_SOURCE_WINDOW_SECONDS",
                 defaults.source_window,
+            )?,
+            source_trusted_proxy_hops: env_nonnegative_usize(
+                "EMAIL_DELIVERY_SOURCE_TRUSTED_PROXY_HOPS",
+                defaults.source_trusted_proxy_hops,
             )?,
             global_limit: env_usize("EMAIL_DELIVERY_GLOBAL_LIMIT", defaults.global_limit)?,
             global_window: env_duration(
@@ -211,6 +218,15 @@ fn env_usize(name: &str, default: usize) -> Result<usize, String> {
         .ok()
         .filter(|parsed| *parsed > 0)
         .ok_or_else(|| format!("{name} must be a positive integer"))
+}
+
+fn env_nonnegative_usize(name: &str, default: usize) -> Result<usize, String> {
+    let Some(value) = env::var(name).ok() else {
+        return Ok(default);
+    };
+    value
+        .parse::<usize>()
+        .map_err(|_| format!("{name} must be a non-negative integer"))
 }
 
 fn env_duration(name: &str, default: Duration) -> Result<Duration, String> {
@@ -382,6 +398,12 @@ impl EmailDeliveryService {
             provider_semaphore: Arc::new(Semaphore::new(config.provider_in_flight_limit)),
             config,
         }
+    }
+
+    /// Derive a coarse source from the trusted suffix of `X-Forwarded-For`.
+    #[must_use]
+    pub fn coarse_source(&self, headers: &HeaderMap) -> Option<String> {
+        coarse_source(headers, self.config.source_trusted_proxy_hops)
     }
 
     /// Atomically reserve all rolling budgets and provider slots for one flow.
@@ -610,21 +632,29 @@ fn subject_hash(tenant_id: i64, subject: &str) -> String {
 
 /// Return a coarse source subnet without retaining the request address.
 #[must_use]
-pub fn coarse_source(headers: &HeaderMap) -> Option<String> {
-    let value = headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        // The trusted ingress appends the socket peer to the right side. Earlier values may have
-        // been supplied by the caller and are not suitable for an abuse-control subject.
-        .and_then(|value| value.split(',').next_back())
-        .or_else(|| {
-            headers
-                .get("x-real-ip")
-                .and_then(|value| value.to_str().ok())
-        })?
-        .trim()
-        .parse::<IpAddr>()
-        .ok()?;
+fn coarse_source(headers: &HeaderMap, trusted_proxy_hops: usize) -> Option<String> {
+    let value = if let Some(forwarded) = headers.get("x-forwarded-for") {
+        // Trusted ingress addresses form a suffix. Values before the selected hop may have been
+        // supplied by the caller. An unusable trusted suffix disables this secondary control
+        // rather than falling back to a potentially caller-controlled header.
+        forwarded
+            .to_str()
+            .ok()?
+            .split(',')
+            .rev()
+            .nth(trusted_proxy_hops)?
+            .trim()
+            .parse::<IpAddr>()
+            .ok()?
+    } else {
+        headers
+            .get("x-real-ip")?
+            .to_str()
+            .ok()?
+            .trim()
+            .parse::<IpAddr>()
+            .ok()?
+    };
     Some(match value {
         IpAddr::V4(address) => {
             let octets = address.octets();
@@ -648,11 +678,11 @@ mod tests {
     fn source_addresses_are_grouped_into_subnets() {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", "192.0.2.91, 10.0.0.1".parse().unwrap());
-        assert_eq!(coarse_source(&headers).as_deref(), Some("10.0.0.0"));
+        assert_eq!(coarse_source(&headers, 1).as_deref(), Some("192.0.2.0"));
 
         headers.insert("x-forwarded-for", "2001:db8:1234:5678::1".parse().unwrap());
         assert_eq!(
-            coarse_source(&headers).as_deref(),
+            coarse_source(&headers, 0).as_deref(),
             Some("2001:db8:1234:5600::")
         );
     }
@@ -662,11 +692,20 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-forwarded-for",
-            "198.51.100.9, 203.0.113.77".parse().unwrap(),
+            "198.51.100.9, 203.0.113.77, 192.0.2.10".parse().unwrap(),
         );
         headers.insert("x-real-ip", "192.0.2.44".parse().unwrap());
 
-        assert_eq!(coarse_source(&headers).as_deref(), Some("203.0.113.0"));
+        assert_eq!(coarse_source(&headers, 1).as_deref(), Some("203.0.113.0"));
+    }
+
+    #[test]
+    fn unusable_trusted_forwarded_hop_does_not_fall_back() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "198.51.100.9, unknown".parse().unwrap());
+        headers.insert("x-real-ip", "192.0.2.44".parse().unwrap());
+
+        assert_eq!(coarse_source(&headers, 0), None);
     }
 
     struct SlowSender {

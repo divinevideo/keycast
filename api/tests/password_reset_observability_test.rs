@@ -149,7 +149,7 @@ async fn public_recovery_responses_match_for_existing_missing_admitted_and_suppr
     sqlx::query(
         "INSERT INTO users (
             pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at
-         ) VALUES ($1, 1, $2, $3, true, NOW(), NOW())",
+         ) VALUES ($1, 1, $2, $3, false, NOW(), NOW())",
     )
     .bind(&pubkey)
     .bind(&existing)
@@ -165,7 +165,10 @@ async fn public_recovery_responses_match_for_existing_missing_admitted_and_suppr
     );
     let suppressed = public_recovery_app(
         pool.clone(),
-        EmailDeliveryService::denying_for_tests(sender, EmailAdmissionRefusal::DestinationCooldown),
+        EmailDeliveryService::denying_for_tests(
+            sender.clone(),
+            EmailAdmissionRefusal::DestinationCooldown,
+        ),
     );
 
     for uri in ["/auth/forgot-password", "/auth/resend-verification"] {
@@ -180,6 +183,14 @@ async fn public_recovery_responses_match_for_existing_missing_admitted_and_suppr
             .all(|(status, _)| *status == StatusCode::OK));
         assert!(responses.windows(2).all(|pair| pair[0].1 == pair[1].1));
     }
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while sender.get_captured_emails().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("password-reset and verification sends should both run");
 
     cleanup_by_email(&pool, &existing).await;
     cleanup_by_email(&pool, &missing).await;
