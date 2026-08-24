@@ -39,7 +39,7 @@ enum PhaseKind {
 #[serde(deny_unknown_fields)]
 struct CapacityPlan {
     profile_name: String,
-    platform: PlatformProfile,
+    profile_platform: PlatformProfile,
     target_url: String,
     users_file: PathBuf,
     seed: u64,
@@ -63,7 +63,6 @@ struct Revisions {
 struct Objectives {
     availability_percent: f64,
     latency_p95_ms: f64,
-    recovery_seconds: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -85,6 +84,8 @@ struct CapacityPhase {
     ramp_up_seconds: u64,
     max_error_rate: f64,
     max_latency_p95_ms: f64,
+    slo_applies: bool,
+    min_intentional_rejection_rate: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -92,8 +93,10 @@ struct CapacityEvidence {
     schema_version: u32,
     evidence_scope: &'static str,
     generated_at: chrono::DateTime<chrono::Utc>,
+    execution_environment: ExecutionEnvironment,
     plan: CapacityPlan,
     passed: bool,
+    stopped_after_phase: Option<String>,
     phases: Vec<PhaseEvidence>,
 }
 
@@ -104,6 +107,13 @@ struct PhaseEvidence {
     passed: bool,
     checks: Vec<EvidenceCheck>,
     results: TestResults,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum ExecutionEnvironment {
+    Local,
+    AuthorizedNonProduction,
 }
 
 #[derive(Debug, Serialize)]
@@ -120,12 +130,13 @@ pub async fn run_capacity(args: CapacityArgs) -> Result<()> {
         .with_context(|| format!("failed to read capacity plan {:?}", args.plan))?;
     let plan: CapacityPlan = serde_json::from_str(&plan_text)
         .with_context(|| format!("failed to parse capacity plan {:?}", args.plan))?;
-    validate_plan(&plan, args.allow_host.as_deref())?;
+    let execution_environment = validate_plan(&plan, args.allow_host.as_deref())?;
 
     std::fs::create_dir_all(&args.output)
         .with_context(|| format!("failed to create evidence directory {:?}", args.output))?;
 
     let mut phase_evidence = Vec::with_capacity(plan.phases.len());
+    let mut stopped_after_phase = None;
     for (index, phase) in plan.phases.iter().enumerate() {
         let phase_output = args.output.join(format!(
             "phase-{:02}-{}.json",
@@ -148,7 +159,7 @@ pub async fn run_capacity(args: CapacityArgs) -> Result<()> {
         .await
         .with_context(|| format!("capacity phase {:?} failed", phase.name))?;
 
-        let checks = vec![
+        let mut checks = vec![
             EvidenceCheck {
                 metric: "total_requests",
                 comparison: "at-least",
@@ -170,14 +181,60 @@ pub async fn run_capacity(args: CapacityArgs) -> Result<()> {
                 limit: phase.max_latency_p95_ms,
                 passed: results.summary.latency_p95_ms <= phase.max_latency_p95_ms,
             },
+            EvidenceCheck {
+                metric: "intentional_rejection_rate",
+                comparison: "at-least",
+                observed: results.summary.intentional_rejection_rate,
+                limit: phase.min_intentional_rejection_rate,
+                passed: results.summary.intentional_rejection_rate
+                    >= phase.min_intentional_rejection_rate,
+            },
+            EvidenceCheck {
+                metric: "stop_error_rate",
+                comparison: "at-most",
+                observed: results.summary.error_rate,
+                limit: plan.stop_conditions.max_error_rate,
+                passed: results.summary.error_rate <= plan.stop_conditions.max_error_rate,
+            },
+            EvidenceCheck {
+                metric: "stop_latency_p95_ms",
+                comparison: "at-most",
+                observed: results.summary.latency_p95_ms,
+                limit: plan.stop_conditions.max_latency_p95_ms,
+                passed: results.summary.latency_p95_ms <= plan.stop_conditions.max_latency_p95_ms,
+            },
         ];
+        if phase.slo_applies {
+            checks.extend([
+                EvidenceCheck {
+                    metric: "availability_percent",
+                    comparison: "at-least",
+                    observed: (1.0 - results.summary.error_rate) * 100.0,
+                    limit: plan.objectives.availability_percent,
+                    passed: (1.0 - results.summary.error_rate) * 100.0
+                        >= plan.objectives.availability_percent,
+                },
+                EvidenceCheck {
+                    metric: "slo_latency_p95_ms",
+                    comparison: "at-most",
+                    observed: results.summary.latency_p95_ms,
+                    limit: plan.objectives.latency_p95_ms,
+                    passed: results.summary.latency_p95_ms <= plan.objectives.latency_p95_ms,
+                },
+            ]);
+        }
+        let phase_passed = checks.iter().all(|check| check.passed);
         phase_evidence.push(PhaseEvidence {
             name: phase.name.clone(),
             kind: phase.kind,
-            passed: checks.iter().all(|check| check.passed),
+            passed: phase_passed,
             checks,
             results,
         });
+        if !phase_passed {
+            stopped_after_phase = Some(phase.name.clone());
+            break;
+        }
     }
 
     let passed = phase_evidence.iter().all(|phase| phase.passed);
@@ -185,8 +242,10 @@ pub async fn run_capacity(args: CapacityArgs) -> Result<()> {
         schema_version: EVIDENCE_SCHEMA_VERSION,
         evidence_scope: "synthetic non-production capacity rehearsal",
         generated_at: chrono::Utc::now(),
+        execution_environment,
         plan,
         passed,
+        stopped_after_phase,
         phases: phase_evidence,
     };
     let evidence_path = args.output.join("evidence.json");
@@ -200,7 +259,7 @@ pub async fn run_capacity(args: CapacityArgs) -> Result<()> {
     Ok(())
 }
 
-fn validate_plan(plan: &CapacityPlan, allowed_host: Option<&str>) -> Result<()> {
+fn validate_plan(plan: &CapacityPlan, allowed_host: Option<&str>) -> Result<ExecutionEnvironment> {
     validate_nonempty("profile_name", &plan.profile_name)?;
     validate_nonempty("environment_parity", &plan.environment_parity)?;
     validate_nonempty("revisions.code", &plan.revisions.code)?;
@@ -239,6 +298,11 @@ fn validate_plan(plan: &CapacityPlan, allowed_host: Option<&str>) -> Result<()> 
             "non-local target {host} requires the exact --allow-host {host} authorization"
         );
     }
+    let execution_environment = if is_local_host(host) {
+        ExecutionEnvironment::Local
+    } else {
+        ExecutionEnvironment::AuthorizedNonProduction
+    };
 
     let present: BTreeSet<_> = plan.phases.iter().map(|phase| phase.kind).collect();
     for required in REQUIRED_PHASES {
@@ -260,7 +324,20 @@ fn validate_plan(plan: &CapacityPlan, allowed_host: Option<&str>) -> Result<()> 
             );
         }
         validate_rate("phases[].max_error_rate", phase.max_error_rate)?;
+        validate_rate(
+            "phases[].min_intentional_rejection_rate",
+            phase.min_intentional_rejection_rate,
+        )?;
         validate_positive("phases[].max_latency_p95_ms", phase.max_latency_p95_ms)?;
+        if matches!(phase.method, RpcMethod::Register) {
+            anyhow::bail!("capacity profiles do not support non-deterministic registration phases");
+        }
+        if phase.kind != PhaseKind::Spike && !phase.slo_applies {
+            anyhow::bail!("only the spike phase may opt out of profile SLO checks");
+        }
+        if phase.kind == PhaseKind::Spike && phase.min_intentional_rejection_rate <= 0.0 {
+            anyhow::bail!("the spike phase must declare a non-zero intentional rejection rate");
+        }
         if phase.max_error_rate > plan.stop_conditions.max_error_rate
             || phase.max_latency_p95_ms > plan.stop_conditions.max_latency_p95_ms
         {
@@ -270,7 +347,7 @@ fn validate_plan(plan: &CapacityPlan, allowed_host: Option<&str>) -> Result<()> 
             );
         }
     }
-    Ok(())
+    Ok(execution_environment)
 }
 
 fn is_local_host(host: &str) -> bool {
@@ -326,7 +403,7 @@ mod tests {
     fn plan() -> CapacityPlan {
         CapacityPlan {
             profile_name: "local-cloud-run".to_owned(),
-            platform: PlatformProfile::CloudRun,
+            profile_platform: PlatformProfile::CloudRun,
             target_url: "http://localhost:3000".to_owned(),
             users_file: PathBuf::from("users.json"),
             seed: 371,
@@ -339,7 +416,6 @@ mod tests {
             objectives: Objectives {
                 availability_percent: 99.9,
                 latency_p95_ms: 500.0,
-                recovery_seconds: 60,
             },
             stop_conditions: StopConditions {
                 max_error_rate: 0.05,
@@ -357,6 +433,12 @@ mod tests {
                     ramp_up_seconds: 0,
                     max_error_rate: 0.01,
                     max_latency_p95_ms: 500.0,
+                    slo_applies: kind != PhaseKind::Spike,
+                    min_intentional_rejection_rate: if kind == PhaseKind::Spike {
+                        0.01
+                    } else {
+                        0.0
+                    },
                 })
                 .collect(),
         }
@@ -376,7 +458,10 @@ mod tests {
         assert!(error
             .to_string()
             .contains("--allow-host staging.example.test"));
-        validate_plan(&plan, Some("staging.example.test")).unwrap();
+        assert_eq!(
+            validate_plan(&plan, Some("staging.example.test")).unwrap(),
+            ExecutionEnvironment::AuthorizedNonProduction
+        );
     }
 
     #[test]
@@ -420,6 +505,15 @@ mod tests {
         assert!(error
             .to_string()
             .contains("exceed the profile stop conditions"));
+    }
+
+    #[test]
+    fn registration_is_excluded_from_seeded_capacity_profiles() {
+        let mut plan = plan();
+        plan.phases[0].method = RpcMethod::Register;
+
+        let error = validate_plan(&plan, None).unwrap_err();
+        assert!(error.to_string().contains("non-deterministic registration"));
     }
 
     #[test]

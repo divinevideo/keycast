@@ -36,7 +36,7 @@ pub struct RequestResult {
 }
 
 /// Server-side metrics from /metrics endpoint
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct ServerMetrics {
     pub http_rpc_requests_total: u64,
     pub http_rpc_cache_hits: u64,

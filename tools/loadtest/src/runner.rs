@@ -1,5 +1,5 @@
 use crate::client::{RegistrationClient, RpcClient};
-use crate::metrics::{Metrics, TestMetadata, TestResults};
+use crate::metrics::{Metrics, ServerMetricsSnapshots, TestMetadata, TestResults};
 use crate::setup::{TestUser, TestUsersFile};
 use crate::{RpcMethod, RunArgs, TestScenario};
 use anyhow::Result;
@@ -282,7 +282,14 @@ pub async fn run_loadtest(args: RunArgs) -> Result<TestResults> {
         seed: args.seed,
     };
 
-    let results = metrics.to_results(metadata);
+    let server_metrics = metrics_before.zip(metrics_after).map(|(before, after)| {
+        ServerMetricsSnapshots {
+            scope: "Endpoint snapshots; calculate deltas only when the metrics endpoint aggregates every serving instance".to_owned(),
+            before,
+            after,
+        }
+    });
+    let results = metrics.to_results(metadata, server_metrics);
 
     // Print summary
     println!("\n{}", results.format_text());

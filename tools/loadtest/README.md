@@ -171,10 +171,12 @@ keycast-loadtest capacity \
 
 Each plan must include ramp, spike, soak, recovery, rollout, and scale-down
 phases. Every phase declares its method, cache scenario, concurrency, duration,
-and client-side error and p95 latency limits. The plan seed deterministically
-offsets the user-selection schedule and is recorded in every phase. The command exits unsuccessfully
-when a phase exceeds a declared limit, while still writing `evidence.json` and
-the individual phase results.
+client-side error and p95 latency limits, whether the profile SLO applies, and
+the minimum expected HTTP 429 rejection rate. The plan seed deterministically
+offsets the user-selection schedule and is recorded in every phase. Registration
+is excluded because its generated identities are not seed-reproducible. The
+command stops after the first failed phase or profile stop-condition breach,
+writes `evidence.json`, and exits unsuccessfully.
 
 Localhost targets run without an additional flag. A non-local test environment
 requires an exact host authorization so a stale plan cannot silently target a
@@ -191,12 +193,17 @@ The capacity command rejects the production Keycast host even when passed via
 `--allow-host`. Production exercises require a separately approved operational
 procedure, monitoring, stop authority, and rollback plan.
 
-`evidence.json` records the plan, revision identifiers, environment-parity
-statement, phase summaries, threshold checks, and an overall result. It does
+`evidence.json` records the profile platform separately from the derived local
+or authorized-non-production execution environment. It also records the plan,
+revision identifiers, environment-parity statement, phase summaries, SLO and
+threshold checks, the stop point, and an overall result. It does
 not contain the credential file's tokens, generated passwords, request bodies,
-or raw server errors. The bundle is client evidence only: dashboards, dependency
-headroom, autoscaling timelines, notification receipts, and rollback drill
-records must be gathered by the platform runbook before certifying a platform.
+or raw server errors. When available it preserves before/after server metric
+snapshots, but their difference is meaningful only if that endpoint aggregates
+all serving instances. The bundle remains rehearsal evidence: dependency
+headroom, autoscaling timelines, notification receipts, recovery timing, and
+rollback drill records must be gathered by the platform runbook before
+certifying a platform.
 
 ### Session Affinity Behavior Under Load
 

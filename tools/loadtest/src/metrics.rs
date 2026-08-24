@@ -1,3 +1,4 @@
+use crate::client::ServerMetrics;
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,6 +19,7 @@ pub struct Metrics {
     errors_server: AtomicU64,
     errors_client: AtomicU64,
     errors_network: AtomicU64,
+    rejected_requests: AtomicU64,
 
     /// Cache estimation (based on latency thresholds)
     cache_hits_estimated: AtomicU64,
@@ -44,6 +46,7 @@ impl Metrics {
             errors_server: AtomicU64::new(0),
             errors_client: AtomicU64::new(0),
             errors_network: AtomicU64::new(0),
+            rejected_requests: AtomicU64::new(0),
             cache_hits_estimated: AtomicU64::new(0),
             cache_misses_estimated: AtomicU64::new(0),
             start_time: Instant::now(),
@@ -75,6 +78,9 @@ impl Metrics {
             match status {
                 Some(401) | Some(403) => {
                     self.errors_auth.fetch_add(1, Ordering::Relaxed);
+                }
+                Some(429) => {
+                    self.rejected_requests.fetch_add(1, Ordering::Relaxed);
                 }
                 Some(s) if s >= 500 => {
                     self.errors_server.fetch_add(1, Ordering::Relaxed);
@@ -146,14 +152,24 @@ impl Metrics {
             errors_server: self.errors_server.load(Ordering::Relaxed),
             errors_client: self.errors_client.load(Ordering::Relaxed),
             errors_network: self.errors_network.load(Ordering::Relaxed),
+            intentional_rejection_rate: if total > 0 {
+                self.rejected_requests.load(Ordering::Relaxed) as f64 / total as f64
+            } else {
+                0.0
+            },
         }
     }
 
-    pub fn to_results(&self, metadata: TestMetadata) -> TestResults {
+    pub fn to_results(
+        &self,
+        metadata: TestMetadata,
+        server_metrics: Option<ServerMetricsSnapshots>,
+    ) -> TestResults {
         TestResults {
             metadata,
             summary: self.summary(),
             timeline: self.timeline.lock().clone(),
+            server_metrics,
         }
     }
 }
@@ -189,6 +205,8 @@ pub struct MetricsSummary {
     pub errors_server: u64,
     pub errors_client: u64,
     pub errors_network: u64,
+    #[serde(default)]
+    pub intentional_rejection_rate: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +224,15 @@ pub struct TestResults {
     pub metadata: TestMetadata,
     pub summary: MetricsSummary,
     pub timeline: Vec<TimelinePoint>,
+    #[serde(default)]
+    pub server_metrics: Option<ServerMetricsSnapshots>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerMetricsSnapshots {
+    pub scope: String,
+    pub before: ServerMetrics,
+    pub after: ServerMetrics,
 }
 
 impl TestResults {
@@ -310,5 +337,21 @@ Latency p99 (ms):   {:.1}       {:.1}       {:+.1}%"#,
             s2.latency_p99_ms,
             p99_diff,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_429_is_counted_as_intentional_rejection() {
+        let metrics = Metrics::new();
+        metrics.record_request(Duration::from_millis(1), false, Some(429));
+
+        let summary = metrics.summary();
+        assert_eq!(summary.intentional_rejection_rate, 1.0);
+        assert_eq!(summary.errors_client, 0);
+        assert_eq!(summary.error_rate, 1.0);
     }
 }

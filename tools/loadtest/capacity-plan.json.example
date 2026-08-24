@@ -1,6 +1,6 @@
 {
   "profile_name": "local-cloud-run-rehearsal",
-  "platform": "cloud-run",
+  "profile_platform": "cloud-run",
   "target_url": "http://localhost:3000",
   "users_file": "./loadtest-users.json",
   "seed": 371,
@@ -12,8 +12,7 @@
   "environment_parity": "Local rehearsal only; not Cloud Run or GKE capacity evidence.",
   "objectives": {
     "availability_percent": 99.0,
-    "latency_p95_ms": 1000.0,
-    "recovery_seconds": 60
+    "latency_p95_ms": 1000.0
   },
   "stop_conditions": {
     "max_error_rate": 0.05,
@@ -29,7 +28,9 @@
       "duration_seconds": 60,
       "ramp_up_seconds": 30,
       "max_error_rate": 0.01,
-      "max_latency_p95_ms": 1000.0
+      "max_latency_p95_ms": 1000.0,
+      "slo_applies": true,
+      "min_intentional_rejection_rate": 0.0
     },
     {
       "name": "sudden-spike",
@@ -40,7 +41,9 @@
       "duration_seconds": 30,
       "ramp_up_seconds": 0,
       "max_error_rate": 0.05,
-      "max_latency_p95_ms": 2000.0
+      "max_latency_p95_ms": 2000.0,
+      "slo_applies": false,
+      "min_intentional_rejection_rate": 0.01
     },
     {
       "name": "sustained-soak",
@@ -51,7 +54,9 @@
       "duration_seconds": 300,
       "ramp_up_seconds": 10,
       "max_error_rate": 0.01,
-      "max_latency_p95_ms": 1000.0
+      "max_latency_p95_ms": 1000.0,
+      "slo_applies": true,
+      "min_intentional_rejection_rate": 0.0
     },
     {
       "name": "traffic-recovery",
@@ -62,7 +67,9 @@
       "duration_seconds": 60,
       "ramp_up_seconds": 0,
       "max_error_rate": 0.01,
-      "max_latency_p95_ms": 1000.0
+      "max_latency_p95_ms": 1000.0,
+      "slo_applies": true,
+      "min_intentional_rejection_rate": 0.0
     },
     {
       "name": "rollout-observation",
@@ -73,7 +80,9 @@
       "duration_seconds": 60,
       "ramp_up_seconds": 10,
       "max_error_rate": 0.01,
-      "max_latency_p95_ms": 1000.0
+      "max_latency_p95_ms": 1000.0,
+      "slo_applies": true,
+      "min_intentional_rejection_rate": 0.0
     },
     {
       "name": "scale-down-observation",
@@ -84,7 +93,9 @@
       "duration_seconds": 60,
       "ramp_up_seconds": 0,
       "max_error_rate": 0.01,
-      "max_latency_p95_ms": 1000.0
+      "max_latency_p95_ms": 1000.0,
+      "slo_applies": true,
+      "min_intentional_rejection_rate": 0.0
     }
   ]
 }
