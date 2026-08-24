@@ -304,6 +304,63 @@ async fn suppressed_email_change_preserves_pending_state_and_skips_provider() {
 }
 
 #[tokio::test]
+async fn same_target_cooldown_returns_before_shared_admission() {
+    let pool = setup_pool().await;
+    let keys = Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    let old_email = format!("old-cooldown-{}@example.com", Uuid::new_v4());
+    let new_email = format!("new-cooldown-{}@example.com", Uuid::new_v4());
+    create_user(&pool, &pubkey, &old_email, "correct-horse-battery").await;
+    sqlx::query(
+        "UPDATE users SET pending_email = $1, pending_email_old_token = $2,
+         pending_email_new_token = $3, pending_email_expires_at = $4,
+         pending_email_sent_at = NOW() WHERE pubkey = $5 AND tenant_id = $6",
+    )
+    .bind(&new_email)
+    .bind("prior-old-token")
+    .bind("prior-new-token")
+    .bind(Utc::now() + Duration::hours(1))
+    .bind(&pubkey)
+    .bind(TENANT_ID)
+    .execute(&pool)
+    .await
+    .expect("seed recent same-target change");
+
+    let sender = Arc::new(DevEmailSender::new());
+    let app = build_app_with_delivery(
+        pool.clone(),
+        EmailDeliveryService::denying_for_tests(
+            sender.clone(),
+            EmailAdmissionRefusal::AccountVolume,
+        ),
+    );
+    let auth = mint_session_token(&keys).await;
+    let response = post_json(
+        &app,
+        "/user/change-email",
+        Some(&auth),
+        serde_json::json!({
+            "new_email": new_email,
+            "password": "correct-horse-battery"
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(sender.get_captured_emails().is_empty());
+    let delivery_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM auth_events WHERE pubkey = $1 AND event_type = 'email_delivery'",
+    )
+    .bind(&pubkey)
+    .fetch_one(&pool)
+    .await
+    .expect("count delivery events");
+    assert_eq!(delivery_events, 0);
+
+    cleanup_by_email(&pool, &old_email).await;
+}
+
+#[tokio::test]
 async fn test_happy_path_dual_confirm_finalizes() {
     let pool = setup_pool().await;
     let keys = Keys::generate();

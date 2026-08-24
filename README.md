@@ -269,8 +269,8 @@ If neither is set, requests from unknown domains are rejected.
 | `FROM_NAME` | `Divine` | Sender display name |
 | `BASE_URL` | — | Base URL used in email verification links |
 | `EMAIL_DELIVERY_DESTINATION_COOLDOWN_SECONDS` | `300` | Minimum interval per normalized destination |
-| `EMAIL_DELIVERY_DESTINATION_LIMIT` | `5` | Deliveries allowed per destination window |
-| `EMAIL_DELIVERY_DESTINATION_WINDOW_SECONDS` | `86400` | Destination rolling-window length |
+| `EMAIL_DELIVERY_DESTINATION_LIMIT` | `5` | Deliveries allowed per purpose and destination window |
+| `EMAIL_DELIVERY_DESTINATION_WINDOW_SECONDS` | `3600` | Per-purpose destination rolling-window length |
 | `EMAIL_DELIVERY_ACCOUNT_LIMIT` | `6` | Email-change deliveries allowed per authenticated account window |
 | `EMAIL_DELIVERY_ACCOUNT_WINDOW_SECONDS` | `3600` | Authenticated-account rolling-window length |
 | `EMAIL_DELIVERY_SOURCE_LIMIT` | `50` | Secondary coarse-source delivery budget |

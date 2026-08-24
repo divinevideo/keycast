@@ -2668,6 +2668,14 @@ pub async fn resend_verification(
         return success_response;
     };
 
+    let should_send = !email_verified
+        && last_sent.is_none_or(|sent_at| Utc::now() - sent_at >= Duration::minutes(5));
+    // Authenticated callers can be checked before admission without exposing another account.
+    // Public requests have already spent admission before lookup to preserve anti-enumeration.
+    if reservation.is_none() && !should_send {
+        return success_response;
+    }
+
     if reservation.is_none() {
         reservation = match email_delivery
             .admit(EmailAdmissionRequest {
@@ -2709,20 +2717,9 @@ pub async fn resend_verification(
     )
     .await;
 
-    // Already verified - return success (don't leak verification status)
-    if email_verified {
+    if !should_send {
         release_email_reservation(reservation).await;
         return success_response;
-    }
-
-    // Rate limit: 1 per 5 minutes
-    if let Some(sent_at) = last_sent {
-        let minutes_since = (Utc::now() - sent_at).num_minutes();
-        if minutes_since < 5 {
-            release_email_reservation(reservation).await;
-            // Return success anyway - don't reveal rate limiting to potential attackers
-            return success_response;
-        }
     }
 
     // Generate new verification token
@@ -2744,20 +2741,24 @@ pub async fn resend_verification(
         return success_response;
     }
 
-    let provider_outcome = email_delivery
-        .send_verification(&email, &verification_token)
+    // Keep the public response independent of provider latency while the shared service still
+    // bounds and times the background provider call.
+    tokio::spawn(async move {
+        let provider_outcome = email_delivery
+            .send_verification(&email, &verification_token)
+            .await;
+        release_email_reservation(reservation).await;
+        record_provider_event(
+            &pool,
+            &headers,
+            tenant_id,
+            "/api/auth/resend-verification",
+            EmailDeliveryPurpose::Verification,
+            &provider_outcome,
+            Some(&pubkey),
+        )
         .await;
-    release_email_reservation(reservation).await;
-    record_provider_event(
-        &pool,
-        &headers,
-        tenant_id,
-        "/api/auth/resend-verification",
-        EmailDeliveryPurpose::Verification,
-        &provider_outcome,
-        Some(&pubkey),
-    )
-    .await;
+    });
 
     success_response
 }
@@ -4451,6 +4452,24 @@ pub async fn change_email(
         message: "Check both your current and new email to confirm the change.".to_string(),
     });
 
+    // Preserve the persisted same-target cooldown for links issued before shared admission was
+    // deployed. This authenticated read can avoid spending delivery budgets when no send is due.
+    let pending_send_state = user_repo
+        .pending_email_send_state(&user_pubkey, tenant_id)
+        .await?;
+    if let Some((Some(existing_target), Some(last_sent))) = pending_send_state {
+        if existing_target == new_email
+            && Utc::now() - last_sent < Duration::minutes(EMAIL_CHANGE_RESEND_COOLDOWN_MINUTES)
+        {
+            return Ok(Json(ChangeEmailResponse {
+                success: true,
+                message:
+                    "We recently sent confirmation links for this change. Please check your inbox."
+                        .to_string(),
+            }));
+        }
+    }
+
     let source = coarse_source(&headers);
     let reservation = match email_delivery
         .admit(EmailAdmissionRequest {
@@ -4494,33 +4513,6 @@ pub async fn change_email(
         Some(&user_pubkey),
     )
     .await;
-
-    // Preserve the persisted same-target cooldown for links issued before shared admission was
-    // deployed. New requests have already spent the atomic destination and account budgets above.
-    let pending_send_state = match user_repo
-        .pending_email_send_state(&user_pubkey, tenant_id)
-        .await
-    {
-        Ok(state) => state,
-        Err(error) => {
-            reservation.release().await;
-            return Err(error.into());
-        }
-    };
-    if let Some((Some(existing_target), Some(last_sent))) = pending_send_state {
-        if existing_target == new_email
-            && Utc::now() - last_sent < Duration::minutes(EMAIL_CHANGE_RESEND_COOLDOWN_MINUTES)
-        {
-            // Honest message: nothing fresh was sent, the earlier links are still valid.
-            reservation.release().await;
-            return Ok(Json(ChangeEmailResponse {
-                success: true,
-                message:
-                    "We recently sent confirmation links for this change. Please check your inbox."
-                        .to_string(),
-            }));
-        }
-    }
 
     // Anti-enumeration: if the new email is already registered, return success without sending
     // or storing anything, so the endpoint can't be used to probe for registered addresses.
