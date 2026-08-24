@@ -520,23 +520,34 @@ async fn check_user_status_active(
     deny_when_restricted: bool,
 ) -> Result<bool, RpcError> {
     let status_started = Instant::now();
+    METRICS.set_http_rpc_db_pool_state(pool.size(), pool.num_idle() as u32);
     let cache_key = (tenant_id, user_pubkey_hex.to_string());
     let pool = pool.clone();
     let pubkey = user_pubkey_hex.to_string();
 
-    let status = ACCOUNT_STATUS_CACHE
+    let status = match ACCOUNT_STATUS_CACHE
         .try_get_with(cache_key, async move {
             load_account_gate_state(&pool, &pubkey, tenant_id).await
         })
         .await
-        .map_err(|error| match error.as_ref() {
-            AccountGateLoadError::Unavailable => {
-                RpcError::Unavailable("Database temporarily unavailable".to_string())
-            }
-            AccountGateLoadError::Query => {
-                RpcError::Internal("Database error checking user status".to_string())
-            }
-        })?;
+    {
+        Ok(status) => status,
+        Err(error) => {
+            let result = Err(match error.as_ref() {
+                AccountGateLoadError::Unavailable => {
+                    RpcError::Unavailable("Database temporarily unavailable".to_string())
+                }
+                AccountGateLoadError::Query => {
+                    RpcError::Internal("Database error checking user status".to_string())
+                }
+            });
+            METRICS.observe_http_rpc_status_check(
+                http_rpc_outcome_for_status_check(&result),
+                status_started.elapsed(),
+            );
+            return result;
+        }
+    };
 
     let result = match status {
         AccountGateState::Present {
@@ -572,9 +583,6 @@ async fn load_account_gate_state(
     user_pubkey_hex: &str,
     tenant_id: i64,
 ) -> Result<AccountGateState, AccountGateLoadError> {
-    let status_started = Instant::now();
-    METRICS.set_http_rpc_db_pool_state(pool.size(), pool.num_idle() as u32);
-
     let acquire_started = Instant::now();
     let mut conn = match pool.acquire().await {
         Ok(conn) => {
@@ -591,7 +599,6 @@ async fn load_account_gate_state(
                 "unavailable",
                 acquire_started.elapsed(),
             );
-            METRICS.observe_http_rpc_status_check("unavailable", status_started.elapsed());
             // Detail to the log only: connect-level failures carry host, DNS and
             // TLS text and this response is reachable before the caller is known
             // to be legitimate.
@@ -608,7 +615,6 @@ async fn load_account_gate_state(
     .fetch_optional(&mut *conn)
     .await
     .map_err(|e| {
-        METRICS.observe_http_rpc_status_check("error", status_started.elapsed());
         tracing::error!(error = %e, "HTTP RPC user status query failed");
         AccountGateLoadError::Query
     })?;

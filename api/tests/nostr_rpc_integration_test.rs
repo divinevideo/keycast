@@ -6,7 +6,7 @@
 mod common;
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
@@ -19,6 +19,7 @@ use chrono::{Duration, Utc};
 use keycast_api::activity_log::ActivityLogger;
 use keycast_api::api::{
     http::{
+        admin::{set_user_status_admin, SetUserStatusRequest},
         auth::{sign_event, AuthError, SignEventRequest},
         nostr_rpc::{nostr_rpc, NostrRpcRequest, NostrRpcResponse, RpcError},
         routes::AuthState,
@@ -1805,6 +1806,9 @@ async fn test_suspended_user_allowed_nostr_rpc_sign() {
 #[tokio::test]
 #[serial]
 async fn account_status_cache_removes_the_warm_pool_dependency() {
+    const SERVICE_TOKEN: &str = "status-cache-invalidation-test-token";
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+
     let pool = setup_single_connection_db().await;
     let tenant_id = create_test_tenant(&pool).await;
     let (user_keys, pubkey) = create_test_user();
@@ -1896,6 +1900,73 @@ async fn account_status_cache_removes_the_warm_pool_dependency() {
     )
     .await
     .expect("successful status load should fill the account cache");
+
+    let mut admin_headers = HeaderMap::new();
+    admin_headers.insert(
+        "Authorization",
+        format!("Bearer {SERVICE_TOKEN}")
+            .parse()
+            .expect("valid service authorization header"),
+    );
+    let suspended = set_user_status_admin(
+        create_test_tenant_extractor(tenant_id),
+        State(auth_state.clone()),
+        admin_headers.clone(),
+        Path(pubkey.clone()),
+        Json(SetUserStatusRequest {
+            status: "suspended".to_string(),
+            reason: Some("cache invalidation test".to_string()),
+            actor: None,
+        }),
+    )
+    .await
+    .expect("suspending the user should invalidate the local account cache");
+    assert_eq!(suspended.0.status, "suspended");
+
+    let recipient = Keys::generate();
+    let err = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state.clone(),
+        &auth_header,
+        None,
+        NostrRpcRequest {
+            method: "nip44_encrypt".to_string(),
+            params: vec![json!(recipient.public_key().to_hex()), json!("denied")],
+        },
+    )
+    .await
+    .expect_err("local invalidation must make suspension effective immediately");
+    assert!(matches!(err, RpcError::AccountSuspended(_)));
+
+    let active = set_user_status_admin(
+        create_test_tenant_extractor(tenant_id),
+        State(auth_state.clone()),
+        admin_headers,
+        Path(pubkey.clone()),
+        Json(SetUserStatusRequest {
+            status: "active".to_string(),
+            reason: None,
+            actor: None,
+        }),
+    )
+    .await
+    .expect("reactivating the user should invalidate the restricted cache entry");
+    assert_eq!(active.0.status, "active");
+    invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state.clone(),
+        &auth_header,
+        None,
+        NostrRpcRequest {
+            method: "nip44_encrypt".to_string(),
+            params: vec![
+                json!(recipient.public_key().to_hex()),
+                json!("allowed again"),
+            ],
+        },
+    )
+    .await
+    .expect("local invalidation must make reactivation effective immediately");
 
     let sender = Keys::generate();
     let ciphertext = nip44::encrypt(
