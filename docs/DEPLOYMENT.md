@@ -445,7 +445,7 @@ Prometheus metrics are exposed at:
 GET /api/metrics
 ```
 
-The endpoint is unauthenticated and reads only in-process state, so a scrape does no database or Redis work. It emits counters, gauges, and one histogram. The table below is the full set of families. Every family's `# HELP`/`# TYPE` lines are written on every scrape; the four label-keyed families at the end of the table carry no samples until the matching code path has run.
+The endpoint is unauthenticated and reads only in-process state, so a scrape does no database or Redis work. It emits counters, gauges, summaries, and histograms. The table below is the full set of families. Every family's `# HELP`/`# TYPE` lines are written on every scrape; label-keyed families carry no samples until the matching code path has run.
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -480,6 +480,12 @@ The endpoint is unauthenticated and reads only in-process state, so a scrape doe
 | `keycast_http_rpc_cache_misses_total` | counter | HTTP RPC handler loaded from DB |
 | `keycast_http_rpc_cache_size` | gauge | Current HTTP RPC handlers in cache |
 | `keycast_http_rpc_success_total` | counter | HTTP RPC requests processed successfully |
+| `keycast_http_rpc_request_duration_seconds` | histogram | Total HTTP RPC request latency, labelled `method` and `outcome` |
+| `keycast_http_rpc_operation_duration_seconds` | histogram | Signing, encryption, decryption, and batch latency excluding authentication and account-status checks, labelled `method` and `outcome` |
+| `keycast_http_rpc_status_check_duration_seconds` | histogram | Live account-status check latency, labelled `outcome` |
+| `keycast_http_rpc_db_acquire_duration_seconds` | histogram | Database pool acquisition latency, labelled `operation` and `outcome` |
+| `keycast_http_rpc_db_pool_size` / `keycast_http_rpc_db_pool_idle` | gauge | Most recently observed SQLx pool size and idle connections |
+| `keycast_http_rpc_activity_dropped_total` | counter | OAuth activity updates dropped before reaching the database |
 | `keycast_registrations_total` | counter | User registrations |
 | `keycast_logins_total` | counter | Successful logins |
 | `keycast_login_failures_total` | counter | Failed logins |
