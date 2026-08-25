@@ -487,13 +487,44 @@ fn metadata_document_url(
     Ok(Some(url))
 }
 
+const MAX_REMOTE_JSON_BYTES: usize = 64 * 1024;
+const MAX_CLIENT_ASSERTION_BYTES: usize = 8 * 1024;
+const MAX_CLIENT_SIGNING_KEYS: usize = 16;
+
+fn validate_signing_key_count(count: usize, label: &str) -> Result<(), AuthError> {
+    if count > MAX_CLIENT_SIGNING_KEYS {
+        Err(AuthError::BadRequest(format!(
+            "{label} contains too many keys"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn append_remote_json_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    label: &str,
+) -> Result<(), AuthError> {
+    if chunk.len() > MAX_REMOTE_JSON_BYTES.saturating_sub(body.len()) {
+        return Err(AuthError::BadRequest(format!("{label} is too large")));
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
 async fn fetch_json(url: &reqwest::Url, label: &str) -> Result<Value, AuthError> {
     ensure_secure_or_loopback_url(url, label)?;
+    let _remote_permit =
+        super::expensive_work::admit_remote_fetch().map_err(|_| AuthError::ServiceUnavailable {
+            message: "Remote client metadata capacity is busy".to_string(),
+            retry_after: Some(1),
+        })?;
     let client = reqwest::Client::builder()
         .timeout(StdDuration::from_secs(3))
         .build()
         .map_err(|error| AuthError::Internal(format!("Failed to build HTTP client: {error}")))?;
-    let response = client
+    let mut response = client
         .get(url.clone())
         .send()
         .await
@@ -504,9 +535,23 @@ async fn fetch_json(url: &reqwest::Url, label: &str) -> Result<Value, AuthError>
             response.status()
         )));
     }
-    response
-        .json::<Value>()
+    if response.content_length().unwrap_or(0) > MAX_REMOTE_JSON_BYTES as u64 {
+        return Err(AuthError::BadRequest(format!("{label} is too large")));
+    }
+    let mut bytes = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or(0)
+            .min(MAX_REMOTE_JSON_BYTES as u64) as usize,
+    );
+    while let Some(chunk) = response
+        .chunk()
         .await
+        .map_err(|error| AuthError::BadRequest(format!("Failed to read {label}: {error}")))?
+    {
+        append_remote_json_chunk(&mut bytes, &chunk, label)?;
+    }
+    serde_json::from_slice(&bytes)
         .map_err(|error| AuthError::BadRequest(format!("Invalid {label} JSON: {error}")))
 }
 
@@ -554,6 +599,7 @@ async fn load_client_signing_keys(metadata: &ClientMetadata) -> Result<Vec<Clien
                 "Client metadata jwks must contain at least one key".to_string(),
             ));
         }
+        validate_signing_key_count(jwks.keys.len(), "Client metadata jwks")?;
         return Ok(jwks.keys.clone());
     }
     if let Some(jwks_uri) = metadata.jwks_uri.as_deref() {
@@ -567,6 +613,7 @@ async fn load_client_signing_keys(metadata: &ClientMetadata) -> Result<Vec<Clien
                 "Client metadata jwks_uri must resolve to at least one key".to_string(),
             ));
         }
+        validate_signing_key_count(jwks.keys.len(), "Client JWKS")?;
         return Ok(jwks.keys);
     }
     Err(AuthError::BadRequest(
@@ -581,6 +628,11 @@ fn expected_client_assertion_audiences() -> Vec<String> {
 type CompactJwtParts = (Vec<u8>, Vec<u8>, Vec<u8>, String);
 
 fn compact_jwt_parts(jwt: &str) -> Result<CompactJwtParts, AuthError> {
+    if jwt.len() > MAX_CLIENT_ASSERTION_BYTES {
+        return Err(AuthError::BadRequest(
+            "client_assertion exceeds 8192 bytes".to_string(),
+        ));
+    }
     let segments: Vec<&str> = jwt.split('.').collect();
     if segments.len() != 3 {
         return Err(AuthError::BadRequest(
@@ -1339,5 +1391,34 @@ pub async fn token(
             "Only authorization_code and refresh_token are supported for ATProto token exchange"
                 .to_string(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod resource_bound_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_client_assertion_is_rejected_before_decode() {
+        let assertion = "x".repeat(MAX_CLIENT_ASSERTION_BYTES + 1);
+        let error = compact_jwt_parts(&assertion).unwrap_err();
+        assert!(matches!(error, AuthError::BadRequest(message) if message.contains("8192")));
+    }
+
+    #[test]
+    fn remote_jwks_cardinality_is_bounded() {
+        assert!(validate_signing_key_count(MAX_CLIENT_SIGNING_KEYS, "JWKS").is_ok());
+        assert!(matches!(
+            validate_signing_key_count(MAX_CLIENT_SIGNING_KEYS + 1, "JWKS"),
+            Err(AuthError::BadRequest(message)) if message.contains("too many keys")
+        ));
+    }
+
+    #[test]
+    fn chunked_remote_json_is_rejected_before_exceeding_the_cap() {
+        let mut body = vec![0; MAX_REMOTE_JSON_BYTES - 1];
+        let error = append_remote_json_chunk(&mut body, &[1, 2], "metadata").unwrap_err();
+        assert!(matches!(error, AuthError::BadRequest(message) if message.contains("too large")));
+        assert_eq!(body.len(), MAX_REMOTE_JSON_BYTES - 1);
     }
 }

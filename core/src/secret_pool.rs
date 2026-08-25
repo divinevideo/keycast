@@ -1,9 +1,12 @@
 // ABOUTME: Pre-computed secret pool for zero-latency authorization creation
 // ABOUTME: Background producer generates (secret, bcrypt_hash) pairs ahead of time
 
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
-use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use async_channel::{bounded, Receiver, Sender, TryRecvError};
 use rand::Rng;
 use secrecy::SecretString;
 
@@ -27,6 +30,32 @@ const SECRET_LENGTH: usize = 48;
 /// overload instead of an unbounded recv. Do not reserve a background CPU
 /// slot; that would cut request hashing capacity on the serving instances.
 pub const SECRET_POOL_GET_TIMEOUT: Duration = Duration::from_secs(1);
+
+static SECRET_POOL_WAITERS: AtomicU64 = AtomicU64::new(0);
+static SECRET_POOL_EXHAUSTIONS: AtomicU64 = AtomicU64::new(0);
+
+pub fn active_waiters() -> u64 {
+    SECRET_POOL_WAITERS.load(Ordering::Relaxed)
+}
+
+pub fn exhaustion_count() -> u64 {
+    SECRET_POOL_EXHAUSTIONS.load(Ordering::Relaxed)
+}
+
+struct WaiterMetricGuard;
+
+impl WaiterMetricGuard {
+    fn new() -> Self {
+        SECRET_POOL_WAITERS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for WaiterMetricGuard {
+    fn drop(&mut self) {
+        SECRET_POOL_WAITERS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// Pre-computed (secret, hash) pair
 pub struct SecretPair {
@@ -108,24 +137,11 @@ impl SecretPool {
                     hash: secret_hash,
                 };
 
-                // Send to pool - blocks if full (backpressure)
-                // Use spawn_blocking since crossbeam send is sync
-                let tx_clone = tx.clone();
-                let send_result = tokio::task::spawn_blocking(move || tx_clone.send(pair)).await;
-
-                match send_result {
-                    Ok(Ok(())) => {
-                        // Successfully added to pool
-                    }
-                    Ok(Err(_)) => {
-                        // Channel disconnected - pool dropped, shutdown
-                        tracing::info!("Secret pool producer shutting down (channel closed)");
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::error!("Secret pool producer: spawn_blocking panicked: {}", e);
-                        break;
-                    }
+                // The bounded async channel provides event-driven backpressure
+                // without occupying Tokio's blocking pool or polling a timer.
+                if tx.send(pair).await.is_err() {
+                    tracing::info!("Secret pool producer shutting down (channel closed)");
+                    return;
                 }
             }
 
@@ -167,14 +183,15 @@ impl SecretPoolReceiver {
     /// retryable overload instead of parking the request. A closed pool
     /// returns [`SecretPoolError::Closed`].
     pub async fn get(&self) -> Result<SecretPair, SecretPoolError> {
-        let rx = self.rx.clone();
-        tokio::task::spawn_blocking(move || match rx.recv_timeout(SECRET_POOL_GET_TIMEOUT) {
-            Ok(pair) => Ok(pair),
-            Err(RecvTimeoutError::Timeout) => Err(SecretPoolError::Exhausted),
-            Err(RecvTimeoutError::Disconnected) => Err(SecretPoolError::Closed),
-        })
-        .await
-        .unwrap_or(Err(SecretPoolError::Closed))
+        let _waiter = WaiterMetricGuard::new();
+        match tokio::time::timeout(SECRET_POOL_GET_TIMEOUT, self.rx.recv()).await {
+            Ok(Ok(pair)) => Ok(pair),
+            Ok(Err(_)) => Err(SecretPoolError::Closed),
+            Err(_) => {
+                SECRET_POOL_EXHAUSTIONS.fetch_add(1, Ordering::Relaxed);
+                Err(SecretPoolError::Exhausted)
+            }
+        }
     }
 
     /// Try to get a pair without blocking
@@ -185,7 +202,7 @@ impl SecretPoolReceiver {
         match self.rx.try_recv() {
             Ok(pair) => Some(pair),
             Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => None,
+            Err(TryRecvError::Closed) => None,
         }
     }
 

@@ -3054,7 +3054,7 @@ pub async fn create_minor_account(
 
 // --- Batch user lookup by email (for divine-invite-sync HubSpot enrichment) ---
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BatchLookupRequest {
     pub emails: Vec<String>,
 }

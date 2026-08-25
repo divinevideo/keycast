@@ -41,6 +41,8 @@ pub struct Nip05Info {
 
 #[derive(Debug, thiserror::Error)]
 pub enum DivineNameError {
+    #[error("remote dependency is at capacity")]
+    AtCapacity(#[from] crate::api::http::expensive_work::RemoteFetchAtCapacity),
     #[error("NIP-98 signing failed: {0}")]
     SigningError(String),
     #[error("HTTP request failed: {0}")]
@@ -122,6 +124,7 @@ pub async fn claim_username(
 
     // Make HTTP request
     let client = name_server_client()?;
+    let _remote_permit = crate::api::http::expensive_work::admit_remote_fetch()?;
     let response = client
         .post(&url)
         .header("Authorization", auth_header)
@@ -192,6 +195,7 @@ pub async fn check_availability(username: &str) -> Result<AvailabilityResponse, 
     );
 
     let client = name_server_client()?;
+    let _remote_permit = crate::api::http::expensive_work::admit_remote_fetch()?;
     let response = client.get(&url).send().await?;
 
     let status = response.status();
@@ -229,6 +233,7 @@ pub async fn lookup_by_name(username: &str) -> Result<Option<String>, DivineName
     );
 
     let client = name_server_client()?;
+    let _remote_permit = crate::api::http::expensive_work::admit_remote_fetch()?;
     let response = client.get(&url).send().await?;
 
     let status = response.status();
@@ -294,6 +299,7 @@ pub async fn lookup_by_pubkey(
     );
 
     let client = name_server_client()?;
+    let _remote_permit = crate::api::http::expensive_work::admit_remote_fetch()?;
     let response = client.get(&url).send().await?;
 
     let status = response.status();
