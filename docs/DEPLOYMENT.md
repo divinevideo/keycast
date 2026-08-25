@@ -127,6 +127,8 @@ These are set by `cloudbuild.yaml --set-env-vars`:
 | `SHUTDOWN_HTTP_DRAIN_SECS` | `3` |
 | `SHUTDOWN_SIGNER_DRAIN_SECS` | `3` |
 | `SHUTDOWN_TEARDOWN_MARGIN_SECS` | `4` |
+| `CPU_WORK_CONCURRENCY` | detected CPU count |
+| `KMS_CONCURRENCY` | `16` |
 
 Relay NIP-46 admission has optional per-instance tuning controls. Defaults are
 used when these variables are unset or invalid:
@@ -386,7 +388,7 @@ Live updates that do not require a process restart:
 
 | Dependency | Startup behavior | Runtime behavior |
 |------------|------------------|------------------|
-| Redis unavailable | Hard failure, app exits | Heartbeat and Pub/Sub reconnect loops retry; stale hashring data can misroute NIP-46 requests while HTTP may continue. |
+| Redis unavailable | Hard failure, app exits | Heartbeat and Pub/Sub reconnect loops retry; stale hashring data can misroute NIP-46 requests while HTTP may continue. ATProto OAuth PAR and token requests fail closed with a retryable `temporarily_unavailable` response while replay-reservation storage is unreachable (see ATProto entryway below). |
 | KMS unavailable | Hard failure when using `gcp` or `aws` provider | Cached keys still work; cache misses retry and then fail. |
 | Postgres unavailable | startup retries then exits | Requests needing DB return errors; pool reconnects when the database recovers. |
 | ATProto control plane unavailable | invalid/missing URL logs a warning and Keycast still starts | ATProto enablement endpoints fail closed with 503; other routes continue. |
@@ -401,7 +403,9 @@ Current IaC also sets `ATPROTO_ENTRYWAY_ENABLED` and `ATPROTO_ENTRYWAY_HOSTS`, b
 
 PAR state is stored in shared Postgres in `atproto_oauth_sessions` with a unique `request_uri`, so PAR lookup is replica-safe.
 
-The current per-replica safety gap is replay protection: DPoP and client assertion replay caches are in-memory `DashMap`s. A replay that reaches a different pod inside the replay window may not be caught. Before production GKE cutover, decide whether that risk is acceptable or move those replay caches to shared storage.
+Replay protection for DPoP proofs and `private_key_jwt` client assertions is also shared: every serving instance atomically reserves the validated replay identity (key thumbprint plus `jti`, or client id plus `jti`) in Redis with `SET ... EX ... NX`, so a replay that reaches any other instance inside the replay window is rejected. Reservations are retained for the complete period in which the validator can still accept the proof or assertion: until `iat + 300s` for DPoP proofs and until `exp` (at most `now + 300s`) for client assertions, plus a 30s clock-skew margin (max retention 630s for DPoP proofs, 330s for client assertions). Reservation keys are namespaced (`atproto:oauth:replay:dpop-proof:` / `atproto:oauth:replay:client-assertion:`) and digest-derived, so their size and count stay bounded; because they carry TTLs, the deployment Redis eviction policy (`volatile-lru` on Memorystore by default) applies to them under memory pressure.
+
+Fail-closed behavior: when replay-reservation storage is unavailable or its answer is inconclusive, protected ATProto OAuth endpoints reject the request with HTTP 503 and the OAuth error `temporarily_unavailable` (retryable, no internal details). An outage does not revoke grants: confidential-client sessions and refresh tokens survive it, so the retry the response promises can succeed once storage recovers. Setting `ATPROTO_OAUTH_REPLAY_FAIL_OPEN=true` degrades to per-instance replay protection instead of rejecting — a development-only escape hatch; cross-instance replay is possible while it is active. This variable is independent of the older `DPOP_REPLAY_FAIL_OPEN` (which governs only the UCAN/HTTP-RPC DPoP path): setting one does not change the other path's posture. Monitor `keycast_atproto_oauth_replay_reservations_total{outcome="storage_unavailable"}` (see `docs/MONITORING.md`) to detect degraded replay storage.
 
 ---
 
@@ -441,7 +445,7 @@ Prometheus metrics are exposed at:
 GET /api/metrics
 ```
 
-The endpoint is unauthenticated and reads only in-process state, so a scrape does no database or Redis work. It emits counters, gauges, and one histogram. The table below is the full set of families. Every family's `# HELP`/`# TYPE` lines are written on every scrape; the four label-keyed families at the end of the table carry no samples until the matching code path has run.
+The endpoint is unauthenticated and reads only in-process state, so a scrape does no database or Redis work. It emits counters, gauges, summaries, and histograms. The table below is the full set of families. Every family's `# HELP`/`# TYPE` lines are written on every scrape; label-keyed families carry no samples until the matching code path has run.
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -476,6 +480,12 @@ The endpoint is unauthenticated and reads only in-process state, so a scrape doe
 | `keycast_http_rpc_cache_misses_total` | counter | HTTP RPC handler loaded from DB |
 | `keycast_http_rpc_cache_size` | gauge | Current HTTP RPC handlers in cache |
 | `keycast_http_rpc_success_total` | counter | HTTP RPC requests processed successfully |
+| `keycast_http_rpc_request_duration_seconds` | histogram | Total HTTP RPC request latency, labelled `method` and `outcome` |
+| `keycast_http_rpc_operation_duration_seconds` | histogram | Signing, encryption, decryption, and batch latency excluding authentication and account-status checks, labelled `method` and `outcome` |
+| `keycast_http_rpc_status_check_duration_seconds` | histogram | Live account-status check latency, labelled `outcome` |
+| `keycast_http_rpc_db_acquire_duration_seconds` | histogram | Database pool acquisition latency, labelled `operation` and `outcome` |
+| `keycast_http_rpc_db_pool_size` / `keycast_http_rpc_db_pool_idle` | gauge | Most recently observed SQLx pool size and idle connections |
+| `keycast_http_rpc_activity_dropped_total` | counter | OAuth activity updates dropped before reaching the database |
 | `keycast_registrations_total` | counter | User registrations |
 | `keycast_logins_total` | counter | Successful logins |
 | `keycast_login_failures_total` | counter | Failed logins |

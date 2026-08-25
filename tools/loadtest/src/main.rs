@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+mod capacity;
 mod client;
 mod metrics;
 mod runner;
@@ -30,6 +32,9 @@ enum Commands {
 
     /// Display results from a previous test run
     Report(ReportArgs),
+
+    /// Run a predeclared capacity-readiness profile
+    Capacity(CapacityArgs),
 }
 
 #[derive(clap::Args)]
@@ -112,9 +117,14 @@ struct RunArgs {
     /// Real-time progress report interval in seconds
     #[arg(long, default_value = "5")]
     report_interval: u64,
+
+    /// Seed used to offset the deterministic user schedule
+    #[arg(long, default_value = "0")]
+    seed: u64,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
 pub enum TestScenario {
     /// All requests use first user (100% cache hit after warmup)
     WarmCache,
@@ -124,7 +134,8 @@ pub enum TestScenario {
     Mixed,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
 pub enum RpcMethod {
     /// Sign a Nostr event (kind 1 text note)
     SignEvent,
@@ -149,6 +160,21 @@ struct ReportArgs {
     /// Compare with another results file
     #[arg(long)]
     compare: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct CapacityArgs {
+    /// Capacity plan with predeclared phases and limits
+    #[arg(short, long)]
+    plan: PathBuf,
+
+    /// Directory for the sanitized evidence bundle and phase results
+    #[arg(short, long, default_value = "./capacity-evidence")]
+    output: PathBuf,
+
+    /// Explicitly authorize a non-local target host from the plan
+    #[arg(long)]
+    allow_host: Option<String>,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -180,6 +206,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Report(args) => {
             report::run_report(args)?;
+        }
+        Commands::Capacity(args) => {
+            capacity::run_capacity(args).await?;
         }
     }
 

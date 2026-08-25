@@ -25,6 +25,8 @@ struct RpcRequest {
 struct RpcResponse {
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    code: Option<String>,
 }
 
 #[derive(Debug)]
@@ -33,10 +35,11 @@ pub struct RequestResult {
     pub success: bool,
     pub status: Option<u16>,
     pub error: Option<String>,
+    pub error_code: Option<String>,
 }
 
 /// Server-side metrics from /metrics endpoint
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct ServerMetrics {
     pub http_rpc_requests_total: u64,
     pub http_rpc_cache_hits: u64,
@@ -148,12 +151,14 @@ impl RpcClient {
                             success: body.error.is_none(),
                             status: Some(status),
                             error: body.error,
+                            error_code: body.code,
                         },
                         Err(e) => RequestResult {
                             duration,
                             success: false,
                             status: Some(status),
                             error: Some(format!("Failed to parse response: {}", e)),
+                            error_code: None,
                         },
                     }
                 } else {
@@ -161,11 +166,15 @@ impl RpcClient {
                         .text()
                         .await
                         .unwrap_or_else(|_| "Unknown error".to_string());
+                    let error_code = serde_json::from_str::<Value>(&error_text)
+                        .ok()
+                        .and_then(|body| body.get("code")?.as_str().map(str::to_owned));
                     RequestResult {
                         duration,
                         success: false,
                         status: Some(status),
                         error: Some(error_text),
+                        error_code,
                     }
                 }
             }
@@ -174,6 +183,7 @@ impl RpcClient {
                 success: false,
                 status: None,
                 error: Some(e.to_string()),
+                error_code: None,
             },
         }
     }
@@ -433,6 +443,7 @@ impl RegistrationClient {
             success: result.success,
             status: if result.success { Some(201) } else { Some(500) },
             error: result.error,
+            error_code: None,
         }
     }
 }

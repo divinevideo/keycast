@@ -27,6 +27,7 @@ pub enum ApError {
     Forbidden(String),
     BadRequest(String),
     NotFound(String),
+    ServiceUnavailable(String),
     Internal(String),
 }
 
@@ -37,6 +38,7 @@ impl IntoResponse for ApError {
             ApError::Forbidden(m) => (StatusCode::FORBIDDEN, m),
             ApError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             ApError::NotFound(m) => (StatusCode::NOT_FOUND, m),
+            ApError::ServiceUnavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
             ApError::Internal(m) => {
                 tracing::error!("AP signing internal error: {}", m);
                 (
@@ -45,7 +47,13 @@ impl IntoResponse for ApError {
                 )
             }
         };
-        (status, Json(serde_json::json!({ "error": message }))).into_response()
+        let mut response = (status, Json(serde_json::json!({ "error": message }))).into_response();
+        if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, "1".parse().unwrap());
+        }
+        response
     }
 }
 
@@ -235,6 +243,39 @@ pub struct SignRequest {
     pub signing_string: String,
 }
 
+const MAX_SIGNING_STRING_BYTES: usize = 16 * 1024;
+
+fn validate_signing_string(signing_string: &str) -> Result<(), ApError> {
+    if signing_string.len() > MAX_SIGNING_STRING_BYTES {
+        Err(ApError::BadRequest(
+            "signing_string exceeds 16384 bytes".to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn map_cpu_error(error: super::expensive_work::CpuWorkError) -> ApError {
+    match error {
+        super::expensive_work::CpuWorkError::AtCapacity
+        | super::expensive_work::CpuWorkError::ShuttingDown => {
+            ApError::ServiceUnavailable("Server is busy. Please retry.".to_string())
+        }
+        super::expensive_work::CpuWorkError::WorkerFailed(error) => {
+            ApError::Internal(format!("join error: {error}"))
+        }
+    }
+}
+
+fn map_key_manager_error(error: keycast_core::encryption::KeyManagerError) -> ApError {
+    match error {
+        keycast_core::encryption::KeyManagerError::AtCapacity => {
+            ApError::ServiceUnavailable("Key service is busy. Please retry.".to_string())
+        }
+        other => ApError::Internal(other.to_string()),
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct SignResponse {
     pub pubkey: String,
@@ -249,17 +290,18 @@ async fn create_actor_key(
     user_pubkey: &str,
 ) -> Result<(String, String, bool), ApError> {
     // Generate (CPU-bound) off the async runtime.
-    let material = tokio::task::spawn_blocking(ap_signing::generate_rsa_2048)
-        .await
-        .map_err(|e| ApError::Internal(format!("join error: {e}")))?
-        .map_err(|e| ApError::Internal(e.to_string()))?;
+    let material =
+        super::expensive_work::spawn_cpu(&auth_state.state.bcrypt, ap_signing::generate_rsa_2048)
+            .await
+            .map_err(map_cpu_error)?
+            .map_err(|e| ApError::Internal(e.to_string()))?;
 
     let encrypted = auth_state
         .state
         .key_manager
         .encrypt(&material.pkcs8_der)
         .await
-        .map_err(|e| ApError::Internal(e.to_string()))?;
+        .map_err(map_key_manager_error)?;
 
     // create() may race a concurrent create; the UNIQUE constraint is the backstop.
     match repo
@@ -367,6 +409,7 @@ pub async fn sign(
     headers: HeaderMap,
     Json(req): Json<SignRequest>,
 ) -> Result<Json<SignResponse>, ApError> {
+    validate_signing_string(&req.signing_string)?;
     let tenant_id = tenant.0.id;
     let pool = &auth_state.state.db;
     let user_pubkey = resolve_principal(
@@ -407,17 +450,80 @@ pub async fn sign(
         .key_manager
         .decrypt(&row.encrypted_private_key)
         .await
-        .map_err(|e| ApError::Internal(e.to_string()))?;
+        .map_err(map_key_manager_error)?;
 
     let message = req.signing_string.into_bytes();
-    let signature = tokio::task::spawn_blocking(move || ap_signing::sign_base64(&der, &message))
-        .await
-        .map_err(|e| ApError::Internal(format!("join error: {e}")))?
-        .map_err(|e| ApError::Internal(e.to_string()))?;
+    let signature = super::expensive_work::spawn_cpu(&auth_state.state.bcrypt, move || {
+        ap_signing::sign_base64(&der, &message)
+    })
+    .await
+    .map_err(map_cpu_error)?
+    .map_err(|e| ApError::Internal(e.to_string()))?;
 
     Ok(Json(SignResponse {
         pubkey: user_pubkey,
         signature,
         algorithm: "rsa-sha256",
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, http::Request, routing::post, Router};
+    use tower::ServiceExt;
+    use tower_http::cors::{Any, CorsLayer};
+
+    #[test]
+    fn signing_string_limit_matches_protocol_boundary() {
+        assert!(validate_signing_string(&"x".repeat(MAX_SIGNING_STRING_BYTES)).is_ok());
+        assert!(matches!(
+            validate_signing_string(&"x".repeat(MAX_SIGNING_STRING_BYTES + 1)),
+            Err(ApError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn cpu_capacity_error_is_retryable() {
+        let response =
+            map_cpu_error(super::super::expensive_work::CpuWorkError::AtCapacity).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
+    }
+
+    #[tokio::test]
+    async fn overload_response_remains_visible_through_cors() {
+        let app = Router::new()
+            .route(
+                "/",
+                post(|| async {
+                    map_cpu_error(super::super::expensive_work::CpuWorkError::AtCapacity)
+                }),
+            )
+            .layer(
+                CorsLayer::new()
+                    .allow_origin(Any)
+                    .expose_headers([axum::http::header::RETRY_AFTER]),
+            );
+        let response = app
+            .oneshot(
+                Request::post("/")
+                    .header(axum::http::header::ORIGIN, "https://app.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers()[axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "*"
+        );
+        assert_eq!(
+            response.headers()[axum::http::header::ACCESS_CONTROL_EXPOSE_HEADERS],
+            "retry-after"
+        );
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
+    }
 }

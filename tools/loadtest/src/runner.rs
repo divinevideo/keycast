@@ -1,5 +1,5 @@
 use crate::client::{RegistrationClient, RpcClient};
-use crate::metrics::{Metrics, TestMetadata};
+use crate::metrics::{Metrics, ServerMetricsSnapshots, TestMetadata, TestResults};
 use crate::setup::{TestUser, TestUsersFile};
 use crate::{RpcMethod, RunArgs, TestScenario};
 use anyhow::Result;
@@ -10,9 +10,22 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 
-pub async fn run_loadtest(args: RunArgs) -> Result<()> {
+pub async fn run_loadtest(args: RunArgs) -> Result<TestResults> {
+    run_loadtest_with_stop(args, None).await
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LiveStopConditions {
+    pub max_unintentional_error_rate: f64,
+    pub max_latency_p95_ms: f64,
+}
+
+pub async fn run_loadtest_with_stop(
+    args: RunArgs,
+    stop_conditions: Option<LiveStopConditions>,
+) -> Result<TestResults> {
     // For registration mode, we don't need existing users
     let is_registration_mode = matches!(args.method, RpcMethod::Register);
 
@@ -97,6 +110,7 @@ pub async fn run_loadtest(args: RunArgs) -> Result<()> {
     let metrics = Arc::new(Metrics::new());
     let semaphore = Arc::new(Semaphore::new(args.concurrency));
     let running = Arc::new(AtomicBool::new(true));
+    let stop_notify = Arc::new(Notify::new());
     let request_counter = Arc::new(AtomicUsize::new(0));
 
     let duration = Duration::from_secs(args.duration);
@@ -106,6 +120,8 @@ pub async fn run_loadtest(args: RunArgs) -> Result<()> {
     // Spawn progress reporter
     let progress_metrics = metrics.clone();
     let progress_running = running.clone();
+    let progress_stop_notify = stop_notify.clone();
+    let progress_stop_conditions = stop_conditions;
     let report_interval = args.report_interval;
     let progress_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(report_interval));
@@ -126,6 +142,18 @@ pub async fn run_loadtest(args: RunArgs) -> Result<()> {
                 snapshot.latency_p99_ms,
                 snapshot.requests_error
             );
+            if let Some(stop) = progress_stop_conditions {
+                let summary = progress_metrics.summary();
+                if live_stop_breached(&summary, stop) {
+                    tracing::warn!(
+                        unintentional_error_rate = summary.unintentional_error_rate,
+                        latency_p95_ms = summary.latency_p95_ms,
+                        "Stopping load test after an absolute stop-condition breach"
+                    );
+                    progress_running.store(false, Ordering::Relaxed);
+                    progress_stop_notify.notify_waiters();
+                }
+            }
         }
     });
 
@@ -137,12 +165,14 @@ pub async fn run_loadtest(args: RunArgs) -> Result<()> {
         let metrics = metrics.clone();
         let semaphore = semaphore.clone();
         let running = running.clone();
+        let stop_notify = stop_notify.clone();
         let users = users.clone();
         let counter = request_counter.clone();
         let scenario = args.scenario;
         let method = args.method;
         let max_requests = args.requests;
         let run_id = run_id.clone();
+        let seed = args.seed;
 
         // Calculate ramp-up delay for this worker
         let worker_delay = if args.concurrency > 1 {
@@ -154,7 +184,10 @@ pub async fn run_loadtest(args: RunArgs) -> Result<()> {
         let handle = tokio::spawn(async move {
             // Ramp-up delay
             if worker_delay > 0 {
-                tokio::time::sleep(Duration::from_millis(worker_delay)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(worker_delay)) => {}
+                    _ = stop_notify.notified() => return,
+                }
             }
 
             let hot_count = if users.is_empty() {
@@ -196,7 +229,8 @@ pub async fn run_loadtest(args: RunArgs) -> Result<()> {
                     user_client.register_timed(&email, &password).await
                 } else {
                     // RPC mode: select existing user and their dedicated client
-                    let user_index = select_user_index(&users, scenario, request_num, hot_count);
+                    let user_index =
+                        select_user_index(&users, scenario, request_num, hot_count, seed);
                     let user = &users[user_index];
                     let client = user_clients.get(&user_index).expect("user client exists");
                     execute_request(client, user, method).await
@@ -209,7 +243,12 @@ pub async fn run_loadtest(args: RunArgs) -> Result<()> {
                     }
                 }
 
-                metrics.record_request(result.duration, result.success, result.status);
+                metrics.record_request(
+                    result.duration,
+                    result.success,
+                    result.status,
+                    result.error_code.as_deref(),
+                );
             }
         });
 
@@ -218,7 +257,7 @@ pub async fn run_loadtest(args: RunArgs) -> Result<()> {
 
     // Wait for all workers
     for handle in handles {
-        let _ = handle.await;
+        handle.await?;
     }
 
     // Stop progress reporter
@@ -277,9 +316,17 @@ pub async fn run_loadtest(args: RunArgs) -> Result<()> {
         duration_secs: args.duration,
         user_count: users.len(),
         timestamp: chrono::Utc::now(),
+        seed: args.seed,
     };
 
-    let results = metrics.to_results(metadata);
+    let server_metrics = metrics_before.zip(metrics_after).map(|(before, after)| {
+        ServerMetricsSnapshots {
+            scope: "Endpoint snapshots; calculate deltas only when the metrics endpoint aggregates every serving instance".to_owned(),
+            before,
+            after,
+        }
+    });
+    let results = metrics.to_results(metadata, server_metrics);
 
     // Print summary
     println!("\n{}", results.format_text());
@@ -289,7 +336,13 @@ pub async fn run_loadtest(args: RunArgs) -> Result<()> {
     std::fs::write(&args.output, &json)?;
     tracing::info!("Results saved to {:?}", args.output);
 
-    Ok(())
+    Ok(results)
+}
+
+fn live_stop_breached(summary: &crate::metrics::MetricsSummary, stop: LiveStopConditions) -> bool {
+    summary.total_requests > 0
+        && (summary.unintentional_error_rate > stop.max_unintentional_error_rate
+            || summary.latency_p95_ms > stop.max_latency_p95_ms)
 }
 
 fn select_user_index(
@@ -297,7 +350,9 @@ fn select_user_index(
     scenario: TestScenario,
     request_num: usize,
     hot_count: usize,
+    seed: u64,
 ) -> usize {
+    let request_num = request_num.wrapping_add(seed as usize);
     match scenario {
         TestScenario::WarmCache => {
             // Always use first user
@@ -364,4 +419,47 @@ fn generate_password() -> String {
         .take(32)
         .map(char::from)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn users(count: usize) -> Vec<TestUser> {
+        (0..count)
+            .map(|index| TestUser {
+                email: format!("user-{index}@bench.local"),
+                pubkey: format!("pubkey-{index}"),
+                ucan_token: format!("token-{index}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn seed_offsets_the_deterministic_user_schedule() {
+        let users = users(20);
+
+        assert_eq!(
+            select_user_index(&users, TestScenario::ColdStart, 0, 2, 0),
+            0
+        );
+        assert_eq!(
+            select_user_index(&users, TestScenario::ColdStart, 0, 2, 7),
+            7
+        );
+        assert_eq!(select_user_index(&users, TestScenario::Mixed, 0, 2, 7), 1);
+    }
+
+    #[test]
+    fn live_stop_requires_requests_and_stops_on_either_absolute_limit() {
+        let metrics = Metrics::new();
+        let stop = LiveStopConditions {
+            max_unintentional_error_rate: 0.05,
+            max_latency_p95_ms: 100.0,
+        };
+        assert!(!live_stop_breached(&metrics.summary(), stop));
+
+        metrics.record_request(Duration::from_millis(150), true, Some(200), None);
+        assert!(live_stop_breached(&metrics.summary(), stop));
+    }
 }

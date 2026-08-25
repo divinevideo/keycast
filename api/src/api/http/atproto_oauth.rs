@@ -6,7 +6,6 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{Duration, Utc};
-use dashmap::DashMap;
 use jwt_simple::algorithms::ECDSAP256kKeyPairLike;
 use jwt_simple::prelude::{Claims, Duration as JwtDuration, ES256kKeyPair};
 use keycast_core::repositories::{
@@ -14,7 +13,6 @@ use keycast_core::repositories::{
     IssueAtprotoTokensParams,
 };
 use keycast_core::types::refresh_token::hash_refresh_token;
-use once_cell::sync::Lazy;
 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,21 +23,20 @@ use std::time::Duration as StdDuration;
 use crate::api::tenant::{get_or_create_tenant, TenantError};
 
 use super::atproto_oauth_metadata::authorization_server_origin;
+use super::atproto_oauth_replay::{
+    reserve_client_assertion_jti, reserve_dpop_proof_jti, ReplayReservationError,
+    CLIENT_ASSERTION_MAX_EXP_SKEW_SECONDS, DPOP_MAX_IAT_SKEW_SECONDS,
+};
 use super::auth::{extract_user_from_token, generate_secure_token, AuthError};
 
 const PAR_EXPIRY_MINUTES: i64 = 10;
 const AUTH_CODE_EXPIRY_MINUTES: i64 = 5;
 const ACCESS_TOKEN_EXPIRY_MINUTES: i64 = 15;
 const REFRESH_TOKEN_EXPIRY_DAYS: i64 = 30;
-const DPOP_MAX_IAT_SKEW_SECONDS: i64 = 300;
-const CLIENT_ASSERTION_MAX_EXP_SKEW_SECONDS: i64 = 300;
 const CLIENT_ASSERTION_TYPE_JWT_BEARER: &str =
     "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 const PAR_PATH_SUFFIX: &str = "/atproto/oauth/par";
 const TOKEN_PATH_SUFFIX: &str = "/atproto/oauth/token";
-
-static DPOP_REPLAY_CACHE: Lazy<DashMap<String, i64>> = Lazy::new(DashMap::new);
-static CLIENT_ASSERTION_REPLAY_CACHE: Lazy<DashMap<String, i64>> = Lazy::new(DashMap::new);
 
 #[derive(Debug, Deserialize)]
 pub struct ParRequest {
@@ -294,12 +291,20 @@ fn dpop_htu_matches_expected(htu: &str, expected_path_suffix: &str) -> bool {
     htu.ends_with(expected_path_suffix)
 }
 
-fn validate_dpop_proof(
+fn replay_reservation_error(error: ReplayReservationError, replay_message: &str) -> AuthError {
+    match error {
+        ReplayReservationError::Replay => AuthError::BadRequest(replay_message.to_string()),
+        ReplayReservationError::StorageUnavailable => AuthError::ReplayProtectionUnavailable,
+    }
+}
+
+async fn validate_dpop_proof(
     headers: &HeaderMap,
     expected_method: &str,
     expected_path_suffix: &str,
     expected_nonce: Option<&str>,
     expected_ath: Option<&str>,
+    expected_jkt: Option<&str>,
 ) -> Result<String, AuthError> {
     let proof = headers
         .get("DPoP")
@@ -415,15 +420,16 @@ fn validate_dpop_proof(
     }
 
     let jkt = dpop_jwk_thumbprint(&header.jwk);
-    let replay_key = format!("{jkt}:{}", claims.jti);
-    if let Some(previous) = DPOP_REPLAY_CACHE.get(&replay_key) {
-        if now - *previous < DPOP_MAX_IAT_SKEW_SECONDS {
+    if let Some(expected) = expected_jkt {
+        if jkt != expected {
             return Err(AuthError::BadRequest(
-                "DPoP proof jti has already been used".to_string(),
+                "DPoP proof key does not match the session binding".to_string(),
             ));
         }
     }
-    DPOP_REPLAY_CACHE.insert(replay_key, now);
+    reserve_dpop_proof_jti(&jkt, &claims.jti, claims.iat, now)
+        .await
+        .map_err(|error| replay_reservation_error(error, "DPoP proof jti has already been used"))?;
 
     Ok(jkt)
 }
@@ -481,13 +487,44 @@ fn metadata_document_url(
     Ok(Some(url))
 }
 
+const MAX_REMOTE_JSON_BYTES: usize = 64 * 1024;
+const MAX_CLIENT_ASSERTION_BYTES: usize = 8 * 1024;
+const MAX_CLIENT_SIGNING_KEYS: usize = 16;
+
+fn validate_signing_key_count(count: usize, label: &str) -> Result<(), AuthError> {
+    if count > MAX_CLIENT_SIGNING_KEYS {
+        Err(AuthError::BadRequest(format!(
+            "{label} contains too many keys"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn append_remote_json_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    label: &str,
+) -> Result<(), AuthError> {
+    if chunk.len() > MAX_REMOTE_JSON_BYTES.saturating_sub(body.len()) {
+        return Err(AuthError::BadRequest(format!("{label} is too large")));
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
 async fn fetch_json(url: &reqwest::Url, label: &str) -> Result<Value, AuthError> {
     ensure_secure_or_loopback_url(url, label)?;
+    let _remote_permit =
+        super::expensive_work::admit_remote_fetch().map_err(|_| AuthError::ServiceUnavailable {
+            message: "Remote client metadata capacity is busy".to_string(),
+            retry_after: Some(1),
+        })?;
     let client = reqwest::Client::builder()
         .timeout(StdDuration::from_secs(3))
         .build()
         .map_err(|error| AuthError::Internal(format!("Failed to build HTTP client: {error}")))?;
-    let response = client
+    let mut response = client
         .get(url.clone())
         .send()
         .await
@@ -498,9 +535,23 @@ async fn fetch_json(url: &reqwest::Url, label: &str) -> Result<Value, AuthError>
             response.status()
         )));
     }
-    response
-        .json::<Value>()
+    if response.content_length().unwrap_or(0) > MAX_REMOTE_JSON_BYTES as u64 {
+        return Err(AuthError::BadRequest(format!("{label} is too large")));
+    }
+    let mut bytes = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or(0)
+            .min(MAX_REMOTE_JSON_BYTES as u64) as usize,
+    );
+    while let Some(chunk) = response
+        .chunk()
         .await
+        .map_err(|error| AuthError::BadRequest(format!("Failed to read {label}: {error}")))?
+    {
+        append_remote_json_chunk(&mut bytes, &chunk, label)?;
+    }
+    serde_json::from_slice(&bytes)
         .map_err(|error| AuthError::BadRequest(format!("Invalid {label} JSON: {error}")))
 }
 
@@ -548,6 +599,7 @@ async fn load_client_signing_keys(metadata: &ClientMetadata) -> Result<Vec<Clien
                 "Client metadata jwks must contain at least one key".to_string(),
             ));
         }
+        validate_signing_key_count(jwks.keys.len(), "Client metadata jwks")?;
         return Ok(jwks.keys.clone());
     }
     if let Some(jwks_uri) = metadata.jwks_uri.as_deref() {
@@ -561,6 +613,7 @@ async fn load_client_signing_keys(metadata: &ClientMetadata) -> Result<Vec<Clien
                 "Client metadata jwks_uri must resolve to at least one key".to_string(),
             ));
         }
+        validate_signing_key_count(jwks.keys.len(), "Client JWKS")?;
         return Ok(jwks.keys);
     }
     Err(AuthError::BadRequest(
@@ -575,6 +628,11 @@ fn expected_client_assertion_audiences() -> Vec<String> {
 type CompactJwtParts = (Vec<u8>, Vec<u8>, Vec<u8>, String);
 
 fn compact_jwt_parts(jwt: &str) -> Result<CompactJwtParts, AuthError> {
+    if jwt.len() > MAX_CLIENT_ASSERTION_BYTES {
+        return Err(AuthError::BadRequest(
+            "client_assertion exceeds 8192 bytes".to_string(),
+        ));
+    }
     let segments: Vec<&str> = jwt.split('.').collect();
     if segments.len() != 3 {
         return Err(AuthError::BadRequest(
@@ -705,7 +763,7 @@ fn unexpected_client_assertion(
     }
 }
 
-fn verify_client_assertion(
+async fn verify_client_assertion(
     client_id: &str,
     client_assertion_type: &Option<String>,
     client_assertion: &Option<String>,
@@ -806,15 +864,11 @@ fn verify_client_assertion(
                 ));
             }
         }
-        let replay_key = format!("{client_id}:{}", claims.jti);
-        if let Some(previous_exp) = CLIENT_ASSERTION_REPLAY_CACHE.get(&replay_key) {
-            if now <= *previous_exp {
-                return Err(AuthError::BadRequest(
-                    "client_assertion jti has already been used".to_string(),
-                ));
-            }
-        }
-        CLIENT_ASSERTION_REPLAY_CACHE.insert(replay_key, claims.exp);
+        reserve_client_assertion_jti(client_id, &claims.jti, claims.exp, now)
+            .await
+            .map_err(|error| {
+                replay_reservation_error(error, "client_assertion jti has already been used")
+            })?;
         return Ok(ClientAuthBinding::PrivateKeyJwt {
             alg: header.alg.clone(),
             kid: header.kid.clone(),
@@ -852,6 +906,7 @@ async fn validate_par_client_binding(request: &ParRequest) -> Result<ClientAuthB
                 &keys,
                 None,
             )
+            .await
         }
         _ => Err(AuthError::BadRequest(
             "Unsupported token_endpoint_auth_method in client metadata".to_string(),
@@ -889,7 +944,8 @@ async fn enforce_session_client_binding(
                 &expected_client_assertion_audiences(),
                 &keys,
                 session.client_auth_jkt.as_deref(),
-            )?;
+            )
+            .await?;
             let expected_binding = ClientAuthBinding::PrivateKeyJwt {
                 alg: session.client_auth_alg.clone().ok_or_else(|| {
                     AuthError::BadRequest(
@@ -981,7 +1037,7 @@ pub async fn par(
         ));
     }
 
-    let dpop_jkt = validate_dpop_proof(&headers, "POST", PAR_PATH_SUFFIX, None, None)?;
+    let dpop_jkt = validate_dpop_proof(&headers, "POST", PAR_PATH_SUFFIX, None, None, None).await?;
     let client_binding = validate_par_client_binding(&request).await?;
     let request_uri = format!(
         "urn:ietf:params:oauth:request_uri:{}",
@@ -1134,7 +1190,12 @@ pub async fn token(
             )
             .await
             {
-                let _ = repo.revoke_session(&session.request_uri).await;
+                // A replay-storage outage is an infrastructure failure, not a
+                // binding failure: keep the grant so the retryable response can
+                // actually be retried once storage recovers (keycast#367).
+                if !matches!(error, AuthError::ReplayProtectionUnavailable) {
+                    let _ = repo.revoke_session(&session.request_uri).await;
+                }
                 return Err(error);
             }
 
@@ -1162,21 +1223,18 @@ pub async fn token(
             let session_nonce = session.dpop_nonce.clone().ok_or_else(|| {
                 AuthError::BadRequest("Missing DPoP nonce for authorization code".to_string())
             })?;
+            let expected_jkt = session.dpop_jkt.clone().ok_or_else(|| {
+                AuthError::BadRequest("Authorization code session is not DPoP-bound".to_string())
+            })?;
             let proof_jkt = validate_dpop_proof(
                 &headers,
                 "POST",
                 TOKEN_PATH_SUFFIX,
                 Some(&session_nonce),
                 None,
-            )?;
-            let expected_jkt = session.dpop_jkt.clone().ok_or_else(|| {
-                AuthError::BadRequest("Authorization code session is not DPoP-bound".to_string())
-            })?;
-            if proof_jkt != expected_jkt {
-                return Err(AuthError::BadRequest(
-                    "DPoP proof key does not match the session binding".to_string(),
-                ));
-            }
+                Some(&expected_jkt),
+            )
+            .await?;
             repo.consume_authorization_code(code)
                 .await?
                 .ok_or_else(|| {
@@ -1253,12 +1311,20 @@ pub async fn token(
             )
             .await
             {
-                let _ = repo.revoke_refresh_session(&refresh_token_hash).await;
+                // Same distinction as the authorization-code arm: a
+                // replay-storage outage must not destroy the refresh token the
+                // response tells the client to retry with (keycast#367).
+                if !matches!(error, AuthError::ReplayProtectionUnavailable) {
+                    let _ = repo.revoke_refresh_session(&refresh_token_hash).await;
+                }
                 return Err(error);
             }
 
             let session_nonce = session.dpop_nonce.clone().ok_or_else(|| {
                 AuthError::BadRequest("Missing DPoP nonce for refresh token".to_string())
+            })?;
+            let expected_jkt = session.dpop_jkt.clone().ok_or_else(|| {
+                AuthError::BadRequest("Refresh token session is not DPoP-bound".to_string())
             })?;
             let proof_jkt = validate_dpop_proof(
                 &headers,
@@ -1266,15 +1332,9 @@ pub async fn token(
                 TOKEN_PATH_SUFFIX,
                 Some(&session_nonce),
                 None,
-            )?;
-            let expected_jkt = session.dpop_jkt.clone().ok_or_else(|| {
-                AuthError::BadRequest("Refresh token session is not DPoP-bound".to_string())
-            })?;
-            if proof_jkt != expected_jkt {
-                return Err(AuthError::BadRequest(
-                    "DPoP proof key does not match the session binding".to_string(),
-                ));
-            }
+                Some(&expected_jkt),
+            )
+            .await?;
 
             let subject_did = session.atproto_did.clone().ok_or_else(|| {
                 AuthError::BadRequest(
@@ -1331,5 +1391,34 @@ pub async fn token(
             "Only authorization_code and refresh_token are supported for ATProto token exchange"
                 .to_string(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod resource_bound_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_client_assertion_is_rejected_before_decode() {
+        let assertion = "x".repeat(MAX_CLIENT_ASSERTION_BYTES + 1);
+        let error = compact_jwt_parts(&assertion).unwrap_err();
+        assert!(matches!(error, AuthError::BadRequest(message) if message.contains("8192")));
+    }
+
+    #[test]
+    fn remote_jwks_cardinality_is_bounded() {
+        assert!(validate_signing_key_count(MAX_CLIENT_SIGNING_KEYS, "JWKS").is_ok());
+        assert!(matches!(
+            validate_signing_key_count(MAX_CLIENT_SIGNING_KEYS + 1, "JWKS"),
+            Err(AuthError::BadRequest(message)) if message.contains("too many keys")
+        ));
+    }
+
+    #[test]
+    fn chunked_remote_json_is_rejected_before_exceeding_the_cap() {
+        let mut body = vec![0; MAX_REMOTE_JSON_BYTES - 1];
+        let error = append_remote_json_chunk(&mut body, &[1, 2], "metadata").unwrap_err();
+        assert!(matches!(error, AuthError::BadRequest(message) if message.contains("too large")));
+        assert_eq!(body.len(), MAX_REMOTE_JSON_BYTES - 1);
     }
 }

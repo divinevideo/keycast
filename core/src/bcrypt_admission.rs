@@ -2,7 +2,10 @@
 
 use std::{
     fmt,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -10,6 +13,38 @@ use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use crate::metrics::METRICS;
+
+static GENERAL_CPU_ACTIVE: AtomicU64 = AtomicU64::new(0);
+static GENERAL_CPU_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+
+pub fn general_cpu_active() -> u64 {
+    GENERAL_CPU_ACTIVE.load(Ordering::Relaxed)
+}
+
+pub fn general_cpu_rejections() -> u64 {
+    GENERAL_CPU_REJECTIONS.load(Ordering::Relaxed)
+}
+
+struct GeneralCpuMetricGuard {
+    inner: Arc<Inner>,
+}
+
+impl Drop for GeneralCpuMetricGuard {
+    fn drop(&mut self) {
+        GENERAL_CPU_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+        let mut lifecycle = self
+            .inner
+            .lifecycle
+            .lock()
+            .expect("CPU lifecycle lock poisoned");
+        lifecycle.active -= 1;
+        let is_idle = lifecycle.active == 0;
+        drop(lifecycle);
+        if is_idle {
+            self.inner.idle.notify_waiters();
+        }
+    }
+}
 
 /// Bounded request classes used for admission fairness and metrics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,6 +143,17 @@ pub enum BcryptAdmissionError {
     Bcrypt(#[from] bcrypt::BcryptError),
 }
 
+/// A non-bcrypt CPU operation failed inside the shared process CPU boundary.
+#[derive(Debug, thiserror::Error)]
+pub enum CpuAdmissionError {
+    #[error("CPU admission is at capacity")]
+    AtCapacity,
+    #[error("CPU admission is shutting down")]
+    ShuttingDown,
+    #[error("CPU blocking worker failed: {0}")]
+    WorkerFailed(#[from] tokio::task::JoinError),
+}
+
 #[derive(Debug, Default)]
 struct LifecycleState {
     shutting_down: bool,
@@ -197,6 +243,55 @@ impl BcryptAdmission {
             .await?
             .burn_dummy(cost)
             .await
+    }
+
+    /// Run non-bcrypt CPU work inside the same process-wide CPU boundary.
+    ///
+    /// This sheds immediately rather than joining bcrypt's per-workload queues.
+    /// The permit moves into the blocking closure so cancelling the caller does
+    /// not release capacity while CPU work is still running.
+    pub async fn run_cpu<T, F>(&self, work: F) -> Result<T, CpuAdmissionError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let permit = Arc::clone(&self.inner.permits)
+            .try_acquire_owned()
+            .map_err(|error| {
+                GENERAL_CPU_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+                if matches!(error, TryAcquireError::Closed) {
+                    CpuAdmissionError::ShuttingDown
+                } else {
+                    CpuAdmissionError::AtCapacity
+                }
+            })?;
+        {
+            let mut lifecycle = self
+                .inner
+                .lifecycle
+                .lock()
+                .expect("CPU lifecycle lock poisoned");
+            if lifecycle.shutting_down {
+                drop(lifecycle);
+                drop(permit);
+                GENERAL_CPU_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+                return Err(CpuAdmissionError::ShuttingDown);
+            }
+            lifecycle.active += 1;
+        }
+        GENERAL_CPU_ACTIVE.fetch_add(1, Ordering::Relaxed);
+        let metrics = GeneralCpuMetricGuard {
+            inner: Arc::clone(&self.inner),
+        };
+
+        tokio::task::spawn_blocking(move || {
+            let output = work();
+            drop(permit);
+            drop(metrics);
+            output
+        })
+        .await
+        .map_err(CpuAdmissionError::WorkerFailed)
     }
 
     /// Reserve CPU capacity before acquiring downstream state.

@@ -9,12 +9,14 @@ use keycast_core::metrics::METRICS;
 /// Returns in-memory atomic counters that are incremented during operations.
 /// This follows Prometheus best practices: no database queries on scrape.
 pub async fn metrics() -> impl IntoResponse {
+    let mut body = METRICS.to_prometheus();
+    body.push_str(&super::expensive_work::prometheus_metrics());
     Response::builder()
         .status(StatusCode::OK)
         .header(
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )
-        .body(METRICS.to_prometheus())
+        .body(body)
         .unwrap()
 }

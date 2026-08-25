@@ -20,6 +20,7 @@ cargo build --release -p keycast-loadtest
   --users-file ./test-users.json \
   --concurrency 50 \
   --duration 60 \
+  --seed 371 \
   --scenario warm-cache \
   --method get-public-key \
   --output ./results.json
@@ -64,7 +65,7 @@ keycast-loadtest run \
 **Scenarios:**
 | Scenario | Behavior | Use Case |
 |----------|----------|----------|
-| `warm-cache` | Cycles through users (cache gets warm) | Steady-state performance |
+| `warm-cache` | Reuses the first user | Steady-state performance |
 | `cold-start` | Each request uses different user | Cache miss impact |
 | `mixed` | 80% repeat / 20% new users | Realistic traffic |
 
@@ -155,28 +156,76 @@ Key metrics:
 - `keycast_http_rpc_success_total` - Successful requests
 - `keycast_http_rpc_auth_errors_total` - Auth failures
 
-## Production Testing
+## Capacity Readiness Profiles
 
-### Against Cloud Run
+The `capacity` command runs a predeclared sequence and writes a versioned,
+aggregate-only evidence bundle. Copy `capacity-plan.json.example`, replace its
+illustrative objectives and revision placeholders with values approved for the
+specific run, and keep separate plans and outputs for Cloud Run and GKE.
 
 ```bash
-# Create users (takes ~1 min per 1000 users at 200 concurrency)
-./target/release/keycast-loadtest setup \
-  --url https://login.divine.video \
-  --users 1000 \
-  --concurrency 200 \
-  --output ./prod-users.json
-
-# Run test
-./target/release/keycast-loadtest run \
-  --url https://login.divine.video \
-  --users-file ./prod-users.json \
-  --concurrency 500 \
-  --duration 60 \
-  --scenario warm-cache \
-  --method get-public-key \
-  --output ./prod-results.json
+keycast-loadtest capacity \
+  --plan ./capacity-plan.json \
+  --output ./capacity-evidence
 ```
+
+Each plan must include ramp, spike, soak, recovery, rollout, and scale-down
+exactly once in that order. Every phase declares its method, cache scenario,
+concurrency, duration, client-side unintentional-error and p95 latency limits,
+and whether the profile SLO applies. The plan seed deterministically
+offsets the user-selection schedule and is recorded in every phase. Registration
+is excluded because its generated identities are not seed-reproducible. The
+command records ordinary phase or SLO misses and continues so later recovery can
+still be measured. Absolute profile stop conditions are checked during each
+phase and stop active work when breached. `evidence.json` is also written when a
+phase errors, preserving all completed and partial evidence.
+
+Intentional capacity shedding is distinct from caller-specific HTTP 429 rate
+limiting and from ordinary dependency failures. It is recognized only as HTTP
+503 with the machine-readable response code `admission_rejected`. A spike may
+declare the following expectation once the target implements that contract:
+
+```json
+"intentional_shedding": {
+  "status": 503,
+  "error_code": "admission_rejected",
+  "min_rate": 0.01
+}
+```
+
+When the field is `null`, the evidence records shedding as `not-tested`; the
+rehearsal may pass its other checks but `certification_ready` remains false.
+Unmarked 503 responses remain unintentional errors. A final platform capacity
+profile must test and pass the declared shedding expectation.
+Healthy-phase availability counts every failed request, including unexpected
+HTTP 429 responses; phase error limits exclude intentional shedding.
+
+Localhost targets run without an additional flag. A non-local test environment
+requires an exact host authorization so a stale plan cannot silently target a
+different service:
+
+```bash
+keycast-loadtest capacity \
+  --plan ./capacity-plan.json \
+  --allow-host keycast.staging.example \
+  --output ./capacity-evidence
+```
+
+The capacity command rejects the production Keycast host even when passed via
+`--allow-host`. Production exercises require a separately approved operational
+procedure, monitoring, stop authority, and rollback plan.
+
+`evidence.json` records the profile platform separately from the derived local
+or authorized-non-production execution environment. It also records the plan,
+revision identifiers, environment-parity statement, phase summaries, SLO and
+threshold checks, the stop point, and an overall result. It does
+not contain the credential file's tokens, generated passwords, request bodies,
+or raw server errors. When available it preserves before/after server metric
+snapshots, but their difference is meaningful only if that endpoint aggregates
+all serving instances. The bundle remains rehearsal evidence: dependency
+headroom, autoscaling timelines, notification receipts, recovery timing, and
+rollback drill records must be gathered by the platform runbook before
+certifying a platform.
 
 ### Session Affinity Behavior Under Load
 
