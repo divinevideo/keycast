@@ -568,9 +568,10 @@ fn batch_operation_outcome(results: &[JsonValue]) -> &'static str {
 /// Read the account gate state before a mutating operation.
 ///
 /// Cache misses query Postgres and fail closed. Concurrent misses for one account
-/// are coalesced, backend errors are not cached, and local admin writes invalidate
-/// immediately. Changes made on another instance take effect within
-/// [`crate::state::ACCOUNT_STATUS_CACHE_TTL`].
+/// are coalesced, backend errors are not cached, and local writes remove the
+/// current entry after commit. A load that started before invalidation can still
+/// repopulate its result, so concurrent local writes and changes made on another
+/// instance both remain bounded by [`crate::state::ACCOUNT_STATUS_CACHE_TTL`].
 /// Returns the account's `verified_minor` flag (same row, no extra query) for
 /// the DM containment gate; a missing user row is a refusal, never a default.
 ///
