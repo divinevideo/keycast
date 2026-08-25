@@ -9,6 +9,7 @@ pub mod handlers;
 pub mod key_egress_limiter;
 pub mod nip98;
 pub mod redis;
+mod replay_reservation;
 pub mod state;
 pub mod ucan_auth;
 

@@ -64,6 +64,12 @@ impl Default for HttpRpcDurationMetric {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct ReplayReservationKey {
+    namespace: String,
+    outcome: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct HttpRpcAcquireKey {
     operation: String,
     outcome: String,
@@ -215,6 +221,7 @@ pub struct Metrics {
     http_rpc_request_durations: Mutex<BTreeMap<HttpRpcDurationKey, HttpRpcDurationMetric>>,
     http_rpc_status_check_durations: Mutex<BTreeMap<String, HttpRpcDurationMetric>>,
     http_rpc_db_acquire_durations: Mutex<BTreeMap<HttpRpcAcquireKey, HttpRpcAcquireMetric>>,
+    atproto_oauth_replay_reservations_total: Mutex<BTreeMap<ReplayReservationKey, u64>>,
 }
 
 impl Metrics {
@@ -291,6 +298,7 @@ impl Metrics {
             http_rpc_request_durations: Mutex::new(BTreeMap::new()),
             http_rpc_status_check_durations: Mutex::new(BTreeMap::new()),
             http_rpc_db_acquire_durations: Mutex::new(BTreeMap::new()),
+            atproto_oauth_replay_reservations_total: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -654,6 +662,27 @@ impl Metrics {
             &self.bcrypt_rejected_capacity
         };
         metrics[workload.index()][operation.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one ATProto OAuth replay-reservation attempt. Labels are
+    /// normalized through allowlists so the exported series stay low
+    /// cardinality and never carry identifiers or token material.
+    ///
+    /// In fail-open degraded mode the outcomes do not partition attempts: a
+    /// single attempt whose shared storage failed is counted under
+    /// `storage_unavailable` and then under `fallback_reserved` or
+    /// `fallback_rejected`. Read `storage_unavailable` as the storage-failure
+    /// signal, not as a terminal outcome.
+    pub fn inc_atproto_oauth_replay_reservation(&self, namespace: &str, outcome: &str) {
+        let key = ReplayReservationKey {
+            namespace: normalize_replay_namespace(namespace).to_string(),
+            outcome: normalize_replay_outcome(outcome).to_string(),
+        };
+        let mut reservations = self
+            .atproto_oauth_replay_reservations_total
+            .lock()
+            .expect("atproto oauth replay reservations lock poisoned");
+        *reservations.entry(key).or_insert(0) += 1;
     }
 
     /// Format all metrics as Prometheus text
@@ -1172,6 +1201,22 @@ impl Metrics {
             ));
         }
 
+        output.push_str(
+            "\n# HELP keycast_atproto_oauth_replay_reservations_total ATProto OAuth replay-reservation outcomes by namespace; in fail-open degraded mode one attempt may count under storage_unavailable and a fallback outcome\n",
+        );
+        output.push_str("# TYPE keycast_atproto_oauth_replay_reservations_total counter\n");
+        for (key, count) in self
+            .atproto_oauth_replay_reservations_total
+            .lock()
+            .expect("atproto oauth replay reservations lock poisoned")
+            .iter()
+        {
+            output.push_str(&format!(
+                "keycast_atproto_oauth_replay_reservations_total{{namespace=\"{}\",outcome=\"{}\"}} {}\n",
+                key.namespace, key.outcome, count
+            ));
+        }
+
         output
     }
 }
@@ -1306,6 +1351,25 @@ fn normalize_email_template(template: &str) -> &'static str {
     }
 }
 
+fn normalize_replay_namespace(namespace: &str) -> &'static str {
+    match namespace {
+        "dpop_proof" => "dpop_proof",
+        "client_assertion" => "client_assertion",
+        _ => "other",
+    }
+}
+
+fn normalize_replay_outcome(outcome: &str) -> &'static str {
+    match outcome {
+        "reserved" => "reserved",
+        "replay_rejected" => "replay_rejected",
+        "storage_unavailable" => "storage_unavailable",
+        "fallback_reserved" => "fallback_reserved",
+        "fallback_rejected" => "fallback_rejected",
+        _ => "other",
+    }
+}
+
 /// Global metrics instance
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::new);
 
@@ -1344,6 +1408,40 @@ mod tests {
         ));
         assert!(output
             .contains("keycast_auth_email_send_failures_total{template=\"password_reset\"} 1"));
+    }
+
+    #[test]
+    fn test_atproto_oauth_replay_metrics_render_bounded_labels() {
+        let metrics = Metrics::new();
+
+        metrics.inc_atproto_oauth_replay_reservation("dpop_proof", "reserved");
+        metrics.inc_atproto_oauth_replay_reservation("dpop_proof", "replay_rejected");
+        metrics.inc_atproto_oauth_replay_reservation("client_assertion", "reserved");
+        metrics.inc_atproto_oauth_replay_reservation("client_assertion", "storage_unavailable");
+        // Unknown labels collapse to "other" instead of creating new series.
+        metrics.inc_atproto_oauth_replay_reservation("spoofed_namespace", "reserved");
+        metrics.inc_atproto_oauth_replay_reservation("dpop_proof", "spoofed_outcome");
+
+        let output = metrics.to_prometheus();
+
+        assert!(output.contains(
+            "keycast_atproto_oauth_replay_reservations_total{namespace=\"dpop_proof\",outcome=\"reserved\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_atproto_oauth_replay_reservations_total{namespace=\"dpop_proof\",outcome=\"replay_rejected\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_atproto_oauth_replay_reservations_total{namespace=\"client_assertion\",outcome=\"reserved\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_atproto_oauth_replay_reservations_total{namespace=\"client_assertion\",outcome=\"storage_unavailable\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_atproto_oauth_replay_reservations_total{namespace=\"other\",outcome=\"reserved\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_atproto_oauth_replay_reservations_total{namespace=\"dpop_proof\",outcome=\"other\"} 1"
+        ));
     }
 
     #[test]
