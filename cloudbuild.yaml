@@ -5,13 +5,20 @@ steps:
     args:
       - 'build'
       - '--build-arg'
-      - 'BUILD_VERSION=${BUILD_ID}'
+      - 'BUILD_VERSION=${COMMIT_SHA}'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/${PROJECT_ID}/docker/keycast:${COMMIT_SHA}'
       - '-t'
       - 'us-central1-docker.pkg.dev/${PROJECT_ID}/docker/keycast:latest'
       - '.'
     timeout: 1200s
 
-  # Push the Docker image
+  # Push the commit-addressable image and update the convenience pointer.
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'us-central1-docker.pkg.dev/${PROJECT_ID}/docker/keycast:${COMMIT_SHA}'
+
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'push'
@@ -46,7 +53,7 @@ steps:
       - 'run'
       - 'deploy'
       - 'keycast'
-      - '--image=us-central1-docker.pkg.dev/${PROJECT_ID}/docker/keycast:latest'
+      - '--image=us-central1-docker.pkg.dev/${PROJECT_ID}/docker/keycast:${COMMIT_SHA}'
       - '--region=us-central1'
       - '--platform=managed'
       - '--allow-unauthenticated'
@@ -177,6 +184,7 @@ steps:
         echo "🎉 All smoke tests passed!"
 
 images:
+  - 'us-central1-docker.pkg.dev/${PROJECT_ID}/docker/keycast:${COMMIT_SHA}'
   - 'us-central1-docker.pkg.dev/${PROJECT_ID}/docker/keycast:latest'
 
 options:
