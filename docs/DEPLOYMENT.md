@@ -46,23 +46,24 @@ That script submits `cloudbuild.yaml` to project `openvine-co`.
 
 Current `cloudbuild.yaml` does the following:
 
-1. Builds the Docker image with `BUILD_VERSION=${BUILD_ID}` and tags it as `us-central1-docker.pkg.dev/${PROJECT_ID}/docker/keycast:latest`.
-2. Pushes the `:latest` image.
-3. Runs database migrations by executing the Cloud Run Job `keycast-migrate` with `gcloud run jobs execute keycast-migrate --wait`.
-4. Deploys the Cloud Run service `keycast`.
-5. Runs smoke checks:
+1. Verifies the uploaded source matches the current Git commit, then passes that full commit SHA to Cloud Build.
+2. Builds the Docker image with `BUILD_VERSION=${COMMIT_SHA}` and tags the same image as both `us-central1-docker.pkg.dev/${PROJECT_ID}/docker/keycast:${COMMIT_SHA}` and `:latest`.
+3. Pushes both tags. The commit tag identifies the image immutably; `:latest` remains a convenience pointer.
+4. Runs database migrations by executing the Cloud Run Job `keycast-migrate` with `gcloud run jobs execute keycast-migrate --wait`.
+5. Deploys the Cloud Run service `keycast` from the commit tag, not `:latest`.
+6. Runs smoke checks:
    - `GET /healthz/ready`
    - CORS preflight for `/api/auth/register`
    - CORS preflight for `/api/headless/login`
 
-Cloud Build only publishes `:latest` for the Cloud Run path. It does not push a separate `:$BUILD_ID` tag in this pipeline.
+The deploy commands derive `COMMIT_SHA` from `git rev-parse HEAD`. The preflight rejects modified tracked content and untracked upload paths so that tag always describes the submitted source.
 
 ### Cloud Run service settings
 
 | Setting | Value |
 |---------|-------|
 | Service | `keycast` |
-| Image | `us-central1-docker.pkg.dev/openvine-co/docker/keycast:latest` |
+| Image | `us-central1-docker.pkg.dev/openvine-co/docker/keycast:<full-commit-sha>` (`:latest` also points to the most recently built image) |
 | Region | `us-central1` |
 | Port | `3000` |
 | CPU / memory | `4` vCPU / `4Gi` |
@@ -172,6 +173,15 @@ gcloud run revisions list \
 
 gcloud run services update-traffic keycast \
   --to-revisions=<revision-name>=100 \
+  --region=us-central1 \
+  --project=openvine-co
+```
+
+An earlier commit can also be redeployed directly by its immutable image tag:
+
+```bash
+gcloud run services update keycast \
+  --image=us-central1-docker.pkg.dev/openvine-co/docker/keycast:<full-commit-sha> \
   --region=us-central1 \
   --project=openvine-co
 ```
@@ -539,7 +549,7 @@ Cloud Run currently targets 50 concurrent requests per instance and `SQLX_POOL_S
 | Situation | Check |
 |-----------|-------|
 | Which platform serves production | Cloud Run service `keycast` in `openvine-co` |
-| Current Cloud Run revision | `gcloud run services describe keycast --region=us-central1 --project=openvine-co --format='value(status.latestReadyRevisionName)'` |
+| Current Cloud Run commit image | `gcloud run services describe keycast --region=us-central1 --project=openvine-co --format='value(spec.template.spec.containers[0].image)'` |
 | Current GKE image | `kubectl -n identity get deployment keycast -o jsonpath='{.spec.template.spec.containers[0].image}'` |
 | ArgoCD sync state | ArgoCD app for the relevant keycast overlay in `divine-iac-coreconfig` |
 | High latency, low CPU | cache misses, Redis, relay health, KMS latency |

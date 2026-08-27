@@ -18,6 +18,13 @@ fi
 
 cd "$repo_root"
 
+if ! git diff --quiet HEAD --; then
+	printf 'Cloud Build source differs from commit %s:\n' "$(git rev-parse HEAD)" >&2
+	git diff --name-only HEAD -- >&2
+	printf 'Refusing to assign a commit image tag to modified tracked content.\n' >&2
+	exit 1
+fi
+
 upload_list=$(mktemp)
 trap 'rm -f "$upload_list"' EXIT
 

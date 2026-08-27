@@ -50,4 +50,19 @@ if ! grep -Fq 'Could not determine Cloud Build upload files.' "$result_file"; th
 	exit 1
 fi
 
+tracked_file="$repo_root/tests/fixtures/bin/gcloud"
+printf '\n' >>"$tracked_file"
+if run_guard $'.gcloudignore\npackage.json\n' 0; then
+	git -C "$repo_root" checkout-index --force -- tests/fixtures/bin/gcloud
+	printf 'FAIL: modified tracked content should fail\n' >&2
+	exit 1
+fi
+git -C "$repo_root" checkout-index --force -- tests/fixtures/bin/gcloud
+
+if ! grep -Fq 'Refusing to assign a commit image tag to modified tracked content.' "$result_file"; then
+	printf 'FAIL: tracked-content rejection should explain the tag mismatch\n' >&2
+	cat "$result_file" >&2
+	exit 1
+fi
+
 printf 'Cloud Build context guard tests passed.\n'
