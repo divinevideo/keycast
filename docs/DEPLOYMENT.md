@@ -47,7 +47,7 @@ That script submits `cloudbuild.yaml` to project `openvine-co`.
 Current `cloudbuild.yaml` does the following:
 
 1. Verifies the uploaded source matches the current Git commit, then passes that full commit SHA to Cloud Build.
-2. Builds the Docker image with `BUILD_VERSION=${COMMIT_SHA}` and tags the same image as both `us-central1-docker.pkg.dev/${PROJECT_ID}/docker/keycast:${COMMIT_SHA}` and `:latest`.
+2. Builds the Docker image and tags it as both `us-central1-docker.pkg.dev/${PROJECT_ID}/docker/keycast:${COMMIT_SHA}` and `:latest`.
 3. Pushes both tags. The commit tag identifies the image immutably; `:latest` remains a convenience pointer.
 4. Runs database migrations by executing the Cloud Run Job `keycast-migrate` with `gcloud run jobs execute keycast-migrate --wait`.
 5. Deploys the Cloud Run service `keycast` from the commit tag, not `:latest`.
