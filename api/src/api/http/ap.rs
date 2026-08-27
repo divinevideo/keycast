@@ -188,7 +188,11 @@ async fn resolve_principal(
     Ok(token_pubkey)
 }
 
-/// Reject signing for suspended/banned accounts (mirrors auth::sign_event).
+/// Reject restricted accounts from creating, retrieving, or using ActivityPub keys.
+///
+/// Unlike generic Nostr event signing, these Divine-issued keys only represent
+/// Divine-hosted ActivityPub actors, so the account-status gate is deliberate
+/// (keycast#374).
 async fn ensure_active(
     pool: &sqlx::PgPool,
     tenant_id: i64,
