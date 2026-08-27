@@ -27,7 +27,6 @@ reject_text() {
 	fi
 }
 
-require_text "$cloudbuild" "BUILD_VERSION=\${COMMIT_SHA}"
 require_text "$cloudbuild" "- '$sha_image'"
 require_text "$cloudbuild" "- '$latest_image'"
 require_text "$cloudbuild" "- '--image=$sha_image'"

@@ -2,24 +2,35 @@
 set -euo pipefail
 
 repo_root=$(git rev-parse --show-toplevel)
-guard="$repo_root/scripts/check-cloudbuild-context.sh"
+source_guard="$repo_root/scripts/check-cloudbuild-context.sh"
 fake_bin="$repo_root/tests/fixtures/bin"
 result_file=$(mktemp)
-trap 'rm -f "$result_file"' EXIT
+test_repo=$(mktemp -d)
+trap 'rm -f "$result_file"; rm -rf "$test_repo"' EXIT
 
-if [[ ! -x "$guard" ]]; then
-	printf 'FAIL: expected executable guard at %s\n' "$guard" >&2
+if [[ ! -x "$source_guard" ]]; then
+	printf 'FAIL: expected executable guard at %s\n' "$source_guard" >&2
 	exit 1
 fi
+
+cp "$source_guard" "$test_repo/check-cloudbuild-context.sh"
+touch "$test_repo/.gcloudignore" "$test_repo/package.json"
+git -C "$test_repo" init --quiet
+git -C "$test_repo" add .
+git -C "$test_repo" -c user.name='Keycast Tests' -c user.email='tests@keycast.invalid' commit --quiet -m fixture
+guard="$test_repo/check-cloudbuild-context.sh"
 
 run_guard() {
 	local output=$1
 	local status=$2
 
-	PATH="$fake_bin:$PATH" \
-		FAKE_GCLOUD_OUTPUT="$output" \
-		FAKE_GCLOUD_STATUS="$status" \
-		"$guard" >"$result_file" 2>&1
+	(
+		cd "$test_repo"
+		PATH="$fake_bin:$PATH" \
+			FAKE_GCLOUD_OUTPUT="$output" \
+			FAKE_GCLOUD_STATUS="$status" \
+			"$guard"
+	) >"$result_file" 2>&1
 }
 
 if ! run_guard $'.gcloudignore\npackage.json\n' 0; then
@@ -50,14 +61,11 @@ if ! grep -Fq 'Could not determine Cloud Build upload files.' "$result_file"; th
 	exit 1
 fi
 
-tracked_file="$repo_root/tests/fixtures/bin/gcloud"
-printf '\n' >>"$tracked_file"
+printf '\n' >>"$test_repo/package.json"
 if run_guard $'.gcloudignore\npackage.json\n' 0; then
-	git -C "$repo_root" checkout-index --force -- tests/fixtures/bin/gcloud
 	printf 'FAIL: modified tracked content should fail\n' >&2
 	exit 1
 fi
-git -C "$repo_root" checkout-index --force -- tests/fixtures/bin/gcloud
 
 if ! grep -Fq 'Refusing to assign a commit image tag to modified tracked content.' "$result_file"; then
 	printf 'FAIL: tracked-content rejection should explain the tag mismatch\n' >&2

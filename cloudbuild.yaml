@@ -4,8 +4,6 @@ steps:
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'build'
-      - '--build-arg'
-      - 'BUILD_VERSION=${COMMIT_SHA}'
       - '-t'
       - 'us-central1-docker.pkg.dev/${PROJECT_ID}/docker/keycast:${COMMIT_SHA}'
       - '-t'

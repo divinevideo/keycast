@@ -38,7 +38,7 @@ Runs the full production stack locally: Postgres, Redis, migrations, and the uni
 - Version tags (`v*`) → auto-deploys to production
 - Manual dispatch via GitHub Actions UI
 
-**Legacy:** `gcloud builds submit --config=cloudbuild.yaml --project=openvine-co`
+Cloud Run production deploys through `bun run deploy`, which runs the source preflight and supplies the commit image tag.
 
 ## Testing
 
