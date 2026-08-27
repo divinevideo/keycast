@@ -17,7 +17,7 @@ cp "$source_guard" "$test_repo/check-cloudbuild-context.sh"
 touch "$test_repo/.gcloudignore" "$test_repo/package.json"
 git -C "$test_repo" init --quiet
 git -C "$test_repo" add .
-git -C "$test_repo" -c user.name='Keycast Tests' -c user.email='tests@keycast.invalid' commit --quiet -m fixture
+git -C "$test_repo" -c user.name='Keycast Tests' -c user.email='tests@keycast.invalid' -c commit.gpgsign=false commit --quiet -m fixture
 guard="$test_repo/check-cloudbuild-context.sh"
 
 run_guard() {

@@ -34,11 +34,11 @@ docker compose up --build
 Runs the full production stack locally: Postgres, Redis, migrations, and the unified keycast service. Requires `.env` with `POSTGRES_PASSWORD`, `DOMAIN`, `ALLOWED_ORIGINS`, `SERVER_NSEC`. Good for testing the complete deployment before pushing.
 
 ### Deploy
-- Push to `main`/`master` → auto-deploys to dev (poc/test/staging)
-- Version tags (`v*`) → auto-deploys to production
-- Manual dispatch via GitHub Actions UI
+- Push to `main` builds the POC and staging GKE images and dispatches their IaC updates.
+- Version tags (`v*`) can publish the staged production GKE image; they do not deploy the Cloud Run production service.
+- Cloud Run production deploys manually through `bun run deploy`, which runs the source preflight and supplies the commit image tag.
 
-Cloud Run production deploys through `bun run deploy`, which runs the source preflight and supplies the commit image tag.
+See [`DEPLOYMENT.md`](./DEPLOYMENT.md) for the current environment mapping and rollout paths.
 
 ## Testing
 
