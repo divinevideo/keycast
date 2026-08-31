@@ -88,6 +88,16 @@ Cloud Run does not have readiness-probe-driven endpoint removal during shutdown.
 | `keycast-sendgrid-api-key` | `SENDGRID_API_KEY` |
 | `keycast-redis-url` | `REDIS_URL` |
 | `keycast-service-token` | `KEYCAST_SERVICE_TOKEN` |
+| `account-deletion-service-token-production` | `KEYCAST_DELETION_SERVICE_TOKEN` |
+
+The trusted account-deletion endpoint uses a dedicated credential rather than
+`keycast-service-token`. The production coordinator reads the Terraform-managed
+value from `dv-platform-prod`, while Cloud Run resolves the unqualified secret
+name above in `openvine-co`. Before deploying this mapping, an operator must copy
+the same value into `openvine-co` and grant the Cloud Run runtime service account
+Secret Manager access. Until the mirrored secret exists and a new revision is
+deployed, the endpoint fails closed while unrelated service-token routes remain
+available.
 
 There is no Cloud Run Sentry secret or `sentry-cli` release step in the current Cloud Build file.
 
@@ -117,6 +127,8 @@ These are set by `cloudbuild.yaml --set-env-vars`:
 | `SHUTDOWN_HTTP_DRAIN_SECS` | `3` |
 | `SHUTDOWN_SIGNER_DRAIN_SECS` | `3` |
 | `SHUTDOWN_TEARDOWN_MARGIN_SECS` | `4` |
+| `CPU_WORK_CONCURRENCY` | detected CPU count |
+| `KMS_CONCURRENCY` | `16` |
 
 Relay NIP-46 admission has optional per-instance tuning controls. Defaults are
 used when these variables are unset or invalid:
@@ -274,6 +286,10 @@ The base deployment reads these secrets:
 | `keycast-sendgrid-api-key` | `SENDGRID_API_KEY` |
 | `keycast-atproto-runtime` | `KEYCAST_ATPROTO_TOKEN` |
 
+The trusted account-deletion endpoint additionally requires
+`KEYCAST_DELETION_SERVICE_TOKEN`. Each environment must inject it from a
+deletion-specific Kubernetes Secret; do not reuse `KEYCAST_SERVICE_TOKEN`.
+
 The migration job also reads:
 
 | Kubernetes Secret | Env var | Scope |
@@ -359,6 +375,7 @@ Configuration is read at startup. There is no hot reload.
 
 - Cloud Run: update Secret Manager or env config, then run `bun run deploy` so a new revision starts with the new values.
 - GKE: update the source secret/config in the platform, wait for External Secrets where applicable, then roll the Deployment if the pods do not restart automatically.
+- Production deletion credential: pause production deletion requests before adding new secret versions because Cloud Run resolves `:latest` when each instance starts and autoscaling can temporarily mix versions. Update the Terraform-managed `dv-platform-prod` value and its `openvine-co` mirror to the same value, wait for both GKE ExternalSecrets to report `Ready`, deploy Cloud Run, roll the production Funnelcake API, and wait for old instances to drain before resuming deletion requests.
 
 Live updates that do not require a process restart:
 
@@ -371,7 +388,7 @@ Live updates that do not require a process restart:
 
 | Dependency | Startup behavior | Runtime behavior |
 |------------|------------------|------------------|
-| Redis unavailable | Hard failure, app exits | Heartbeat and Pub/Sub reconnect loops retry; stale hashring data can misroute NIP-46 requests while HTTP may continue. |
+| Redis unavailable | Hard failure, app exits | Heartbeat and Pub/Sub reconnect loops retry; stale hashring data can misroute NIP-46 requests while HTTP may continue. ATProto OAuth PAR and token requests fail closed with a retryable `temporarily_unavailable` response while replay-reservation storage is unreachable (see ATProto entryway below). |
 | KMS unavailable | Hard failure when using `gcp` or `aws` provider | Cached keys still work; cache misses retry and then fail. |
 | Postgres unavailable | startup retries then exits | Requests needing DB return errors; pool reconnects when the database recovers. |
 | ATProto control plane unavailable | invalid/missing URL logs a warning and Keycast still starts | ATProto enablement endpoints fail closed with 503; other routes continue. |
@@ -386,7 +403,9 @@ Current IaC also sets `ATPROTO_ENTRYWAY_ENABLED` and `ATPROTO_ENTRYWAY_HOSTS`, b
 
 PAR state is stored in shared Postgres in `atproto_oauth_sessions` with a unique `request_uri`, so PAR lookup is replica-safe.
 
-The current per-replica safety gap is replay protection: DPoP and client assertion replay caches are in-memory `DashMap`s. A replay that reaches a different pod inside the replay window may not be caught. Before production GKE cutover, decide whether that risk is acceptable or move those replay caches to shared storage.
+Replay protection for DPoP proofs and `private_key_jwt` client assertions is also shared: every serving instance atomically reserves the validated replay identity (key thumbprint plus `jti`, or client id plus `jti`) in Redis with `SET ... EX ... NX`, so a replay that reaches any other instance inside the replay window is rejected. Reservations are retained for the complete period in which the validator can still accept the proof or assertion: until `iat + 300s` for DPoP proofs and until `exp` (at most `now + 300s`) for client assertions, plus a 30s clock-skew margin (max retention 630s for DPoP proofs, 330s for client assertions). Reservation keys are namespaced (`atproto:oauth:replay:dpop-proof:` / `atproto:oauth:replay:client-assertion:`) and digest-derived, so their size and count stay bounded; because they carry TTLs, the deployment Redis eviction policy (`volatile-lru` on Memorystore by default) applies to them under memory pressure.
+
+Fail-closed behavior: when replay-reservation storage is unavailable or its answer is inconclusive, protected ATProto OAuth endpoints reject the request with HTTP 503 and the OAuth error `temporarily_unavailable` (retryable, no internal details). An outage does not revoke grants: confidential-client sessions and refresh tokens survive it, so the retry the response promises can succeed once storage recovers. Setting `ATPROTO_OAUTH_REPLAY_FAIL_OPEN=true` degrades to per-instance replay protection instead of rejecting — a development-only escape hatch; cross-instance replay is possible while it is active. This variable is independent of the older `DPOP_REPLAY_FAIL_OPEN` (which governs only the UCAN/HTTP-RPC DPoP path): setting one does not change the other path's posture. Monitor `keycast_atproto_oauth_replay_reservations_total{outcome="storage_unavailable"}` (see `docs/MONITORING.md`) to detect degraded replay storage.
 
 ---
 
@@ -426,7 +445,7 @@ Prometheus metrics are exposed at:
 GET /api/metrics
 ```
 
-The endpoint is unauthenticated and reads only in-process state, so a scrape does no database or Redis work. It emits counters, gauges, and one histogram. The table below is the full set of families. Every family's `# HELP`/`# TYPE` lines are written on every scrape; the four label-keyed families at the end of the table carry no samples until the matching code path has run.
+The endpoint is unauthenticated and reads only in-process state, so a scrape does no database or Redis work. It emits counters, gauges, summaries, and histograms. The table below is the full set of families. Every family's `# HELP`/`# TYPE` lines are written on every scrape; label-keyed families carry no samples until the matching code path has run.
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -461,6 +480,12 @@ The endpoint is unauthenticated and reads only in-process state, so a scrape doe
 | `keycast_http_rpc_cache_misses_total` | counter | HTTP RPC handler loaded from DB |
 | `keycast_http_rpc_cache_size` | gauge | Current HTTP RPC handlers in cache |
 | `keycast_http_rpc_success_total` | counter | HTTP RPC requests processed successfully |
+| `keycast_http_rpc_request_duration_seconds` | histogram | Total HTTP RPC request latency, labelled `method` and `outcome` |
+| `keycast_http_rpc_operation_duration_seconds` | histogram | Signing, encryption, decryption, and batch latency excluding authentication and account-status checks, labelled `method` and `outcome` |
+| `keycast_http_rpc_status_check_duration_seconds` | histogram | Live account-status check latency, labelled `outcome` |
+| `keycast_http_rpc_db_acquire_duration_seconds` | histogram | Database pool acquisition latency, labelled `operation` and `outcome` |
+| `keycast_http_rpc_db_pool_size` / `keycast_http_rpc_db_pool_idle` | gauge | Most recently observed SQLx pool size and idle connections |
+| `keycast_http_rpc_activity_dropped_total` | counter | OAuth activity updates dropped before reaching the database |
 | `keycast_registrations_total` | counter | User registrations |
 | `keycast_logins_total` | counter | Successful logins |
 | `keycast_login_failures_total` | counter | Failed logins |
@@ -471,6 +496,9 @@ The endpoint is unauthenticated and reads only in-process state, so a scrape doe
 | `keycast_auth_request_duration_seconds` | histogram | Auth request latency, labelled `endpoint` and `outcome`; exposed as `_bucket`/`_sum`/`_count` series |
 | `keycast_auth_audit_write_failures_total` | counter | Auth audit writes that failed without failing the user request, labelled `endpoint` |
 | `keycast_auth_email_send_failures_total` | counter | Auth email send failures, labelled `template` |
+| `keycast_bcrypt_active_work` | gauge | Running bcrypt work, labelled by bounded `workload` and `operation` values |
+| `keycast_bcrypt_waiting_work` | gauge | Request bcrypt work waiting for CPU admission, labelled by bounded `workload` and `operation` values |
+| `keycast_bcrypt_admission_rejections_total` | counter | Bcrypt work rejected before execution, labelled by bounded `workload`, `operation`, and `reason` values |
 
 High `keycast_cache_misses_total` relative to hits usually points at session affinity or cold-cache behavior. Increasing `keycast_nip46_queue_dropped_total` means the signer path is overloaded.
 
@@ -492,8 +520,8 @@ CPU-bound work:
 
 - secp256k1 signing
 - NIP-44/NIP-04 encrypt/decrypt
-- login bcrypt verification through `spawn_blocking`
-- registration bcrypt hashing in the background queue
+- password, PIN, claim, OAuth-secret, and NIP-46 connection-secret bcrypt work through one bounded blocking-work admission service
+- background OAuth-secret precomputation only when that shared service has idle capacity
 
 I/O-bound work:
 

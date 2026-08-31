@@ -1,5 +1,6 @@
 #[cfg(feature = "aws")]
 pub mod aws_key_manager;
+pub mod bounded_key_manager;
 pub mod file_key_manager;
 pub mod gcp_key_manager;
 
@@ -9,6 +10,8 @@ use zeroize::Zeroizing;
 
 #[derive(Error, Debug)]
 pub enum KeyManagerError {
+    #[error("Key manager is at capacity")]
+    AtCapacity,
     #[error("Failed to load key")]
     LoadKey(String),
     #[error("Failed to encrypt")]

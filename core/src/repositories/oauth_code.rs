@@ -1599,7 +1599,7 @@ impl OAuthCodeRepository {
     /// Delete dead rows: anything past expiry plus a grace interval, plus consumed pending
     /// registrations (terminal once their exchange code successfully issued tokens).
     ///
-    /// The grace window (10 minutes, matching the sibling users cleanup in `bcrypt_queue`) keeps
+    /// The grace window (10 minutes, matching the legacy users cleanup) keeps
     /// an expired pending registration reachable long enough for `resend-pin` to answer honestly
     /// instead of falling through to the anti-enumeration uniform success after the reaper runs
     /// (keycast#362). Bounds table growth and enforces the pending row's finite lifecycle

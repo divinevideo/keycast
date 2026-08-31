@@ -4,7 +4,7 @@
 use chrono::{DateTime, Utc};
 use keycast_core::creator_binding::validate_creator_binding_payload;
 use keycast_core::secret_types::DecryptedPlaintext;
-use keycast_core::signing_session::{CacheKey, SigningSession};
+use keycast_core::signing_session::{CacheKey, SessionError, SigningSession};
 use keycast_core::traits::CustomPermission;
 use moka::future::Cache;
 use nostr_sdk::nips::nip04;
@@ -30,6 +30,8 @@ pub enum HandlerError {
     Signing(String),
     #[error("encryption error: {0}")]
     Encryption(String),
+    #[error("internal handler error: {0}")]
+    Internal(String),
 }
 
 /// Per-item failure reason for the NIP-17 gift-wrap unwrap batch.
@@ -95,6 +97,8 @@ pub enum WrapError {
     SignFailed,
     #[error("gift wrap construction failed")]
     WrapFailed,
+    #[error("internal error")]
+    Internal,
 }
 
 impl WrapError {
@@ -108,7 +112,26 @@ impl WrapError {
             WrapError::EncryptFailed => "encrypt_failed",
             WrapError::SignFailed => "sign_failed",
             WrapError::WrapFailed => "wrap_failed",
+            WrapError::Internal => "internal",
         }
+    }
+}
+
+fn map_signing_error(error: SessionError) -> HandlerError {
+    match error {
+        SessionError::BlockingTask(error) => {
+            HandlerError::Internal(format!("blocking task failed: {error}"))
+        }
+        other => HandlerError::Signing(other.to_string()),
+    }
+}
+
+fn map_encryption_error(error: SessionError) -> HandlerError {
+    match error {
+        SessionError::BlockingTask(error) => {
+            HandlerError::Internal(format!("blocking task failed: {error}"))
+        }
+        other => HandlerError::Encryption(other.to_string()),
     }
 }
 
@@ -383,7 +406,7 @@ impl HttpRpcHandler {
         self.signing
             .sign_event(unsigned)
             .await
-            .map_err(|e| HandlerError::Signing(e.to_string()))
+            .map_err(map_signing_error)
     }
 
     /// Sign a validated creator-binding payload after checking validity and permissions.
@@ -399,7 +422,7 @@ impl HttpRpcHandler {
         self.signing
             .sign_canonical(payload)
             .await
-            .map_err(|e| HandlerError::Signing(e.to_string()))
+            .map_err(map_signing_error)
     }
 
     /// Encrypt plaintext using NIP-44 after checking validity and permissions
@@ -418,7 +441,7 @@ impl HttpRpcHandler {
         self.signing
             .nip44_encrypt(recipient, plaintext)
             .await
-            .map_err(|e| HandlerError::Encryption(e.to_string()))
+            .map_err(map_encryption_error)
     }
 
     /// Decrypt ciphertext using NIP-44 after checking validity and permissions
@@ -438,7 +461,7 @@ impl HttpRpcHandler {
         self.signing
             .nip44_decrypt(sender, ciphertext)
             .await
-            .map_err(|e| HandlerError::Encryption(e.to_string()))
+            .map_err(map_encryption_error)
     }
 
     /// Build one NIP-59 gift wrap while preserving the cached HTTP
@@ -490,6 +513,7 @@ impl HttpRpcHandler {
                     HandlerError::InvalidRequest(_)
                     | HandlerError::Encryption(_)
                     | HandlerError::Signing(_) => WrapError::EncryptFailed,
+                    HandlerError::Internal(_) => WrapError::Internal,
                 })?;
 
         let seal = EventBuilder::new(Kind::Seal, ciphertext)
@@ -501,6 +525,7 @@ impl HttpRpcHandler {
             HandlerError::InvalidRequest(_)
             | HandlerError::Signing(_)
             | HandlerError::Encryption(_) => WrapError::SignFailed,
+            HandlerError::Internal(_) => WrapError::Internal,
         })?;
 
         let recipient = *recipient;
@@ -621,7 +646,7 @@ impl HttpRpcHandler {
 
         tokio::task::spawn_blocking(move || nip04::encrypt(&secret, &recipient, &plaintext))
             .await
-            .map_err(|e| HandlerError::Encryption(format!("blocking task failed: {}", e)))?
+            .map_err(|e| HandlerError::Internal(format!("blocking task failed: {e}")))?
             .map_err(|e| HandlerError::Encryption(e.to_string()))
     }
 
@@ -647,7 +672,7 @@ impl HttpRpcHandler {
             nip04::decrypt(&secret, &sender, &ciphertext).map(SecretString::from)
         })
         .await
-        .map_err(|e| HandlerError::Encryption(format!("blocking task failed: {}", e)))?
+        .map_err(|e| HandlerError::Internal(format!("blocking task failed: {e}")))?
         .map_err(|e| HandlerError::Encryption(e.to_string()))
     }
 }

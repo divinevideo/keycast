@@ -2462,14 +2462,33 @@ pub async fn test_registered_client_pattern(
 
 // --- Service-token-authenticated admin endpoints (for relay-manager, COOP) ---
 
-fn authorize_service_token(headers: &HeaderMap) -> Result<(), ApiError> {
+/// Constant-time bearer check against `KEYCAST_SERVICE_TOKEN`.
+///
+/// `pub(crate)` so the service-deletion endpoint authenticates through this
+/// exact check rather than growing a third copy of it.
+pub(crate) fn authorize_service_token(headers: &HeaderMap) -> Result<(), ApiError> {
+    authorize_configured_service_token(
+        headers,
+        "KEYCAST_SERVICE_TOKEN",
+        "KEYCAST_SERVICE_TOKEN not configured",
+    )
+}
+
+/// Constant-time bearer check for a service credential held in an environment
+/// variable. Callers supply the missing-configuration message so each endpoint
+/// controls whether its response names the credential.
+pub(crate) fn authorize_configured_service_token(
+    headers: &HeaderMap,
+    env_var: &str,
+    not_configured_message: &'static str,
+) -> Result<(), ApiError> {
     use subtle::ConstantTimeEq;
 
-    let expected = std::env::var("KEYCAST_SERVICE_TOKEN")
+    let expected = std::env::var(env_var)
         .ok()
         .map(|token| token.trim().to_string())
         .filter(|token| !token.is_empty())
-        .ok_or_else(|| ApiError::internal("KEYCAST_SERVICE_TOKEN not configured"))?;
+        .ok_or_else(|| ApiError::internal(not_configured_message))?;
 
     let actual = headers
         .get("authorization")
@@ -3035,7 +3054,7 @@ pub async fn create_minor_account(
 
 // --- Batch user lookup by email (for divine-invite-sync HubSpot enrichment) ---
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BatchLookupRequest {
     pub emails: Vec<String>,
 }

@@ -3,17 +3,21 @@
 
 use axum::{
     extract::{Query, State},
-    http::header,
+    http::{header, StatusCode},
     response::{Html, IntoResponse, Response},
     Form,
 };
 use nostr_sdk::Keys;
+use secrecy::SecretString;
 use serde::Deserialize;
 
 use super::html_safety::{escape_attr, escape_html};
 use super::routes::AuthState;
 use crate::brand::BRAND_NAME;
-use keycast_core::repositories::{ClaimTokenRepository, UserRepository};
+use keycast_core::{
+    bcrypt_admission::{BcryptAdmissionError, BcryptWorkload},
+    repositories::{ClaimTokenRepository, UserRepository},
+};
 
 fn password_visibility_toggle_html(field_id: &str) -> String {
     format!(
@@ -359,9 +363,23 @@ pub async fn claim_post(
         return Err(ClaimError::EmailExists);
     }
 
-    // Hash password (synchronous bcrypt for claim flow - simpler)
-    let password_hash = bcrypt::hash(&form.password, bcrypt::DEFAULT_COST)
-        .map_err(|e| ClaimError::Internal(format!("Password hashing failed: {}", e)))?;
+    let password_hash = auth_state
+        .state
+        .bcrypt
+        .hash(
+            BcryptWorkload::Claim,
+            SecretString::from(form.password.clone()),
+            bcrypt::DEFAULT_COST,
+        )
+        .await
+        .map_err(|error| match error {
+            BcryptAdmissionError::AtCapacity | BcryptAdmissionError::ShuttingDown => {
+                ClaimError::ServiceUnavailable
+            }
+            BcryptAdmissionError::WorkerFailed | BcryptAdmissionError::Bcrypt(_) => {
+                ClaimError::Internal("Password hashing failed".to_string())
+            }
+        })?;
 
     // Consume the token and claim the account atomically (#280 review): the
     // classification above is a point-in-time read, so an admin invalidation
@@ -674,6 +692,7 @@ pub enum ClaimError {
     WeakPassword,
     InvalidEmail,
     EmailExists,
+    ServiceUnavailable,
     Internal(String),
 }
 
@@ -720,6 +739,14 @@ impl IntoResponse for ClaimError {
                 "Email Already Registered",
                 "This email address is already associated with another account. Please use a different email or contact support.",
             ),
+            ClaimError::ServiceUnavailable => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [("Retry-After", "1")],
+                    Html("Password service is busy. Please try again shortly."),
+                )
+                    .into_response();
+            }
             ClaimError::Internal(ref msg) => {
                 tracing::error!("Claim error: {}", msg);
                 (
@@ -808,6 +835,13 @@ impl IntoResponse for ClaimError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bcrypt_capacity_maps_to_retryable_service_unavailable() {
+        let response = ClaimError::ServiceUnavailable.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["Retry-After"], "1");
+    }
 
     #[test]
     fn password_visibility_controls_target_claim_fields() {

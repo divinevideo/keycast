@@ -55,9 +55,6 @@ moka = { version = "0.12", features = ["future"] }
 reqwest = { version = "0.12", features = ["json"] }
 jwt-simple = { version = "0.12.9", default-features = false, features = ["pure-rust"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
-# Async bcrypt queue dependencies
-crossbeam-channel = "0.5"
-num_cpus = "1.16"
 secrecy = { workspace = true }
 zeroize = { workspace = true }
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "aio"] }
@@ -72,3 +69,4 @@ md5 = "0.7"
 bcrypt = "0.17.1"
 serial_test = "3.2"
 rsa = { version = "0.9", features = ["pem"] }
+syn = { version = "2", features = ["full", "visit"] }

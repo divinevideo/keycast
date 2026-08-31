@@ -127,7 +127,17 @@ fn build_app(pool: PgPool) -> Router {
                 move |headers: HeaderMap, Json(req): Json<ChangeEmailRequest>| {
                     let pool = p1.clone();
                     async move {
-                        change_email(create_test_tenant(), State(pool), headers, Json(req)).await
+                        change_email(
+                            create_test_tenant(),
+                            State(pool),
+                            axum::Extension(keycast_api::BcryptAdmission::new(
+                                1,
+                                std::time::Duration::from_secs(1),
+                            )),
+                            headers,
+                            Json(req),
+                        )
+                        .await
                     }
                 },
             ),

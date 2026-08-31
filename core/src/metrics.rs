@@ -1,6 +1,7 @@
 // ABOUTME: Global metrics counters for Prometheus endpoint
 // ABOUTME: Uses atomic counters that can be incremented from signer and read from API
 
+use crate::bcrypt_admission::{BcryptOperation, BcryptWorkload};
 use once_cell::sync::Lazy;
 use std::{
     collections::BTreeMap,
@@ -15,7 +16,12 @@ const AUTH_DURATION_BUCKETS: [f64; 8] = [0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10
 const HTTP_RPC_DURATION_BUCKETS: [f64; 12] = [
     0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
+const HTTP_RPC_OPERATION_DURATION_BUCKETS: [f64; 14] = [
+    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
 const HTTP_RPC_ACQUIRE_BUCKETS: [f64; 9] = [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1.0, 5.0];
+const BCRYPT_WORKLOADS: usize = BcryptWorkload::ALL.len();
+const BCRYPT_OPERATIONS: usize = BcryptOperation::ALL.len();
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct AuthRequestKey {
@@ -30,12 +36,37 @@ struct AuthDurationKey {
     outcome: String,
 }
 
-#[derive(Clone, Debug, Default)]
-struct AuthDurationMetric {
-    buckets: [u64; AUTH_DURATION_BUCKETS.len()],
+#[derive(Clone, Debug)]
+struct Histogram<const N: usize> {
+    buckets: [u64; N],
     count: u64,
     sum: f64,
 }
+
+impl<const N: usize> Default for Histogram<N> {
+    fn default() -> Self {
+        Self {
+            buckets: [0; N],
+            count: 0,
+            sum: 0.0,
+        }
+    }
+}
+
+impl<const N: usize> Histogram<N> {
+    fn observe(&mut self, boundaries: &[f64; N], duration: Duration) {
+        let seconds = duration.as_secs_f64();
+        self.count += 1;
+        self.sum += seconds;
+        for (index, boundary) in boundaries.iter().enumerate() {
+            if seconds <= *boundary {
+                self.buckets[index] += 1;
+            }
+        }
+    }
+}
+
+type AuthDurationMetric = Histogram<{ AUTH_DURATION_BUCKETS.len() }>;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct HttpRpcDurationKey {
@@ -43,21 +74,13 @@ struct HttpRpcDurationKey {
     outcome: String,
 }
 
-#[derive(Clone, Debug)]
-struct HttpRpcDurationMetric {
-    buckets: [u64; HTTP_RPC_DURATION_BUCKETS.len()],
-    count: u64,
-    sum: f64,
-}
+type HttpRpcDurationMetric = Histogram<{ HTTP_RPC_DURATION_BUCKETS.len() }>;
+type HttpRpcOperationDurationMetric = Histogram<{ HTTP_RPC_OPERATION_DURATION_BUCKETS.len() }>;
 
-impl Default for HttpRpcDurationMetric {
-    fn default() -> Self {
-        Self {
-            buckets: [0; HTTP_RPC_DURATION_BUCKETS.len()],
-            count: 0,
-            sum: 0.0,
-        }
-    }
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct ReplayReservationKey {
+    namespace: String,
+    outcome: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -66,22 +89,7 @@ struct HttpRpcAcquireKey {
     outcome: String,
 }
 
-#[derive(Clone, Debug)]
-struct HttpRpcAcquireMetric {
-    buckets: [u64; HTTP_RPC_ACQUIRE_BUCKETS.len()],
-    count: u64,
-    sum: f64,
-}
-
-impl Default for HttpRpcAcquireMetric {
-    fn default() -> Self {
-        Self {
-            buckets: [0; HTTP_RPC_ACQUIRE_BUCKETS.len()],
-            count: 0,
-            sum: 0.0,
-        }
-    }
-}
+type HttpRpcAcquireMetric = Histogram<{ HTTP_RPC_ACQUIRE_BUCKETS.len() }>;
 
 /// Global metrics counters accessible from any crate
 pub struct Metrics {
@@ -198,14 +206,23 @@ pub struct Metrics {
     /// Total OAuth authorizations revoked
     pub oauth_authorizations_revoked: AtomicU64,
 
+    // === Bcrypt admission metrics ===
+    bcrypt_active: [[AtomicU64; BCRYPT_OPERATIONS]; BCRYPT_WORKLOADS],
+    bcrypt_waiting: [[AtomicU64; BCRYPT_OPERATIONS]; BCRYPT_WORKLOADS],
+    bcrypt_rejected_capacity: [[AtomicU64; BCRYPT_OPERATIONS]; BCRYPT_WORKLOADS],
+    bcrypt_rejected_shutdown: [[AtomicU64; BCRYPT_OPERATIONS]; BCRYPT_WORKLOADS],
+
     // === Labeled Auth Metrics ===
     auth_requests_total: Mutex<BTreeMap<AuthRequestKey, u64>>,
     auth_request_durations: Mutex<BTreeMap<AuthDurationKey, AuthDurationMetric>>,
     auth_audit_write_failures_total: Mutex<BTreeMap<String, u64>>,
     auth_email_send_failures_total: Mutex<BTreeMap<String, u64>>,
     http_rpc_request_durations: Mutex<BTreeMap<HttpRpcDurationKey, HttpRpcDurationMetric>>,
+    http_rpc_operation_durations:
+        Mutex<BTreeMap<HttpRpcDurationKey, HttpRpcOperationDurationMetric>>,
     http_rpc_status_check_durations: Mutex<BTreeMap<String, HttpRpcDurationMetric>>,
     http_rpc_db_acquire_durations: Mutex<BTreeMap<HttpRpcAcquireKey, HttpRpcAcquireMetric>>,
+    atproto_oauth_replay_reservations_total: Mutex<BTreeMap<ReplayReservationKey, u64>>,
 }
 
 impl Metrics {
@@ -266,14 +283,24 @@ impl Metrics {
             // OAuth metrics
             oauth_authorizations_created: AtomicU64::new(0),
             oauth_authorizations_revoked: AtomicU64::new(0),
+            bcrypt_active: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+            bcrypt_waiting: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+            bcrypt_rejected_capacity: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicU64::new(0))
+            }),
+            bcrypt_rejected_shutdown: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicU64::new(0))
+            }),
             // Labeled auth metrics
             auth_requests_total: Mutex::new(BTreeMap::new()),
             auth_request_durations: Mutex::new(BTreeMap::new()),
             auth_audit_write_failures_total: Mutex::new(BTreeMap::new()),
             auth_email_send_failures_total: Mutex::new(BTreeMap::new()),
             http_rpc_request_durations: Mutex::new(BTreeMap::new()),
+            http_rpc_operation_durations: Mutex::new(BTreeMap::new()),
             http_rpc_status_check_durations: Mutex::new(BTreeMap::new()),
             http_rpc_db_acquire_durations: Mutex::new(BTreeMap::new()),
+            atproto_oauth_replay_reservations_total: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -478,7 +505,40 @@ impl Metrics {
         let metric = duration_metrics
             .entry(HttpRpcDurationKey { method, outcome })
             .or_default();
-        observe_http_rpc_duration(metric, duration);
+        metric.observe(&HTTP_RPC_DURATION_BUCKETS, duration);
+    }
+
+    pub fn observe_http_rpc_operation(&self, method: &str, outcome: &str, duration: Duration) {
+        let method = normalize_http_rpc_method(method).to_string();
+        let outcome = normalize_http_rpc_outcome(outcome).to_string();
+        let mut duration_metrics = self
+            .http_rpc_operation_durations
+            .lock()
+            .expect("http rpc operation duration metrics lock poisoned");
+        let metric = duration_metrics
+            .entry(HttpRpcDurationKey { method, outcome })
+            .or_default();
+        metric.observe(&HTTP_RPC_OPERATION_DURATION_BUCKETS, duration);
+    }
+
+    /// Best-effort observation for cancellation paths running from `Drop`.
+    /// A poisoned metrics lock must never turn request unwinding into a process abort.
+    pub fn try_observe_http_rpc_operation(
+        &self,
+        method: &str,
+        outcome: &str,
+        duration: Duration,
+    ) -> bool {
+        let method = normalize_http_rpc_method(method).to_string();
+        let outcome = normalize_http_rpc_outcome(outcome).to_string();
+        let Ok(mut duration_metrics) = self.http_rpc_operation_durations.lock() else {
+            return false;
+        };
+        duration_metrics
+            .entry(HttpRpcDurationKey { method, outcome })
+            .or_default()
+            .observe(&HTTP_RPC_OPERATION_DURATION_BUCKETS, duration);
+        true
     }
 
     pub fn observe_http_rpc_status_check(&self, outcome: &str, duration: Duration) {
@@ -488,7 +548,7 @@ impl Metrics {
             .lock()
             .expect("http rpc status check metrics lock poisoned");
         let metric = duration_metrics.entry(outcome).or_default();
-        observe_http_rpc_duration(metric, duration);
+        metric.observe(&HTTP_RPC_DURATION_BUCKETS, duration);
     }
 
     pub fn observe_http_rpc_db_acquire(&self, operation: &str, outcome: &str, duration: Duration) {
@@ -501,7 +561,7 @@ impl Metrics {
         let metric = duration_metrics
             .entry(HttpRpcAcquireKey { operation, outcome })
             .or_default();
-        observe_http_rpc_acquire_duration(metric, duration);
+        metric.observe(&HTTP_RPC_ACQUIRE_BUCKETS, duration);
     }
 
     pub fn set_http_rpc_db_pool_state(&self, size: u32, idle: u32) {
@@ -574,7 +634,6 @@ impl Metrics {
             .or_insert(0) += 1;
         drop(request_totals);
 
-        let seconds = duration.as_secs_f64();
         let mut duration_metrics = self
             .auth_request_durations
             .lock()
@@ -582,13 +641,7 @@ impl Metrics {
         let metric = duration_metrics
             .entry(AuthDurationKey { endpoint, outcome })
             .or_default();
-        metric.count += 1;
-        metric.sum += seconds;
-        for (index, bucket) in AUTH_DURATION_BUCKETS.iter().enumerate() {
-            if seconds <= *bucket {
-                metric.buckets[index] += 1;
-            }
-        }
+        metric.observe(&AUTH_DURATION_BUCKETS, duration);
     }
 
     pub fn inc_auth_audit_write_failure(&self, endpoint: &str) {
@@ -607,6 +660,57 @@ impl Metrics {
             .lock()
             .expect("auth email failures lock poisoned");
         *failures.entry(template).or_insert(0) += 1;
+    }
+
+    pub fn inc_bcrypt_active(&self, workload: BcryptWorkload, operation: BcryptOperation) {
+        self.bcrypt_active[workload.index()][operation.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn dec_bcrypt_active(&self, workload: BcryptWorkload, operation: BcryptOperation) {
+        self.bcrypt_active[workload.index()][operation.index()].fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_bcrypt_waiting(&self, workload: BcryptWorkload, operation: BcryptOperation) {
+        self.bcrypt_waiting[workload.index()][operation.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn dec_bcrypt_waiting(&self, workload: BcryptWorkload, operation: BcryptOperation) {
+        self.bcrypt_waiting[workload.index()][operation.index()].fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_bcrypt_rejection(
+        &self,
+        workload: BcryptWorkload,
+        operation: BcryptOperation,
+        shutting_down: bool,
+    ) {
+        let metrics = if shutting_down {
+            &self.bcrypt_rejected_shutdown
+        } else {
+            &self.bcrypt_rejected_capacity
+        };
+        metrics[workload.index()][operation.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one ATProto OAuth replay-reservation attempt. Labels are
+    /// normalized through allowlists so the exported series stay low
+    /// cardinality and never carry identifiers or token material.
+    ///
+    /// In fail-open degraded mode the outcomes do not partition attempts: a
+    /// single attempt whose shared storage failed is counted under
+    /// `storage_unavailable` and then under `fallback_reserved` or
+    /// `fallback_rejected`. Read `storage_unavailable` as the storage-failure
+    /// signal, not as a terminal outcome.
+    pub fn inc_atproto_oauth_replay_reservation(&self, namespace: &str, outcome: &str) {
+        let key = ReplayReservationKey {
+            namespace: normalize_replay_namespace(namespace).to_string(),
+            outcome: normalize_replay_outcome(outcome).to_string(),
+        };
+        let mut reservations = self
+            .atproto_oauth_replay_reservations_total
+            .lock()
+            .expect("atproto oauth replay reservations lock poisoned");
+        *reservations.entry(key).or_insert(0) += 1;
     }
 
     /// Format all metrics as Prometheus text
@@ -848,24 +952,32 @@ impl Metrics {
             .expect("http rpc duration metrics lock poisoned")
             .iter()
         {
-            for (index, bucket) in HTTP_RPC_DURATION_BUCKETS.iter().enumerate() {
-                output.push_str(&format!(
-                    "keycast_http_rpc_request_duration_seconds_bucket{{method=\"{}\",outcome=\"{}\",le=\"{}\"}} {}\n",
-                    key.method, key.outcome, bucket, metric.buckets[index]
-                ));
-            }
-            output.push_str(&format!(
-                "keycast_http_rpc_request_duration_seconds_bucket{{method=\"{}\",outcome=\"{}\",le=\"+Inf\"}} {}\n",
-                key.method, key.outcome, metric.count
-            ));
-            output.push_str(&format!(
-                "keycast_http_rpc_request_duration_seconds_sum{{method=\"{}\",outcome=\"{}\"}} {}\n",
-                key.method, key.outcome, metric.sum
-            ));
-            output.push_str(&format!(
-                "keycast_http_rpc_request_duration_seconds_count{{method=\"{}\",outcome=\"{}\"}} {}\n",
-                key.method, key.outcome, metric.count
-            ));
+            render_histogram(
+                &mut output,
+                "keycast_http_rpc_request_duration_seconds",
+                &format!("method=\"{}\",outcome=\"{}\"", key.method, key.outcome),
+                metric,
+                &HTTP_RPC_DURATION_BUCKETS,
+            );
+        }
+
+        output.push_str(
+            "\n# HELP keycast_http_rpc_operation_duration_seconds HTTP RPC operation latency excluding authentication and account status checks\n",
+        );
+        output.push_str("# TYPE keycast_http_rpc_operation_duration_seconds histogram\n");
+        for (key, metric) in self
+            .http_rpc_operation_durations
+            .lock()
+            .expect("http rpc operation duration metrics lock poisoned")
+            .iter()
+        {
+            render_histogram(
+                &mut output,
+                "keycast_http_rpc_operation_duration_seconds",
+                &format!("method=\"{}\",outcome=\"{}\"", key.method, key.outcome),
+                metric,
+                &HTTP_RPC_OPERATION_DURATION_BUCKETS,
+            );
         }
 
         output.push_str(
@@ -878,24 +990,13 @@ impl Metrics {
             .expect("http rpc status check metrics lock poisoned")
             .iter()
         {
-            for (index, bucket) in HTTP_RPC_DURATION_BUCKETS.iter().enumerate() {
-                output.push_str(&format!(
-                    "keycast_http_rpc_status_check_duration_seconds_bucket{{outcome=\"{}\",le=\"{}\"}} {}\n",
-                    outcome, bucket, metric.buckets[index]
-                ));
-            }
-            output.push_str(&format!(
-                "keycast_http_rpc_status_check_duration_seconds_bucket{{outcome=\"{}\",le=\"+Inf\"}} {}\n",
-                outcome, metric.count
-            ));
-            output.push_str(&format!(
-                "keycast_http_rpc_status_check_duration_seconds_sum{{outcome=\"{}\"}} {}\n",
-                outcome, metric.sum
-            ));
-            output.push_str(&format!(
-                "keycast_http_rpc_status_check_duration_seconds_count{{outcome=\"{}\"}} {}\n",
-                outcome, metric.count
-            ));
+            render_histogram(
+                &mut output,
+                "keycast_http_rpc_status_check_duration_seconds",
+                &format!("outcome=\"{outcome}\""),
+                metric,
+                &HTTP_RPC_DURATION_BUCKETS,
+            );
         }
 
         output.push_str(
@@ -908,24 +1009,16 @@ impl Metrics {
             .expect("http rpc db acquire metrics lock poisoned")
             .iter()
         {
-            for (index, bucket) in HTTP_RPC_ACQUIRE_BUCKETS.iter().enumerate() {
-                output.push_str(&format!(
-                    "keycast_http_rpc_db_acquire_duration_seconds_bucket{{operation=\"{}\",outcome=\"{}\",le=\"{}\"}} {}\n",
-                    key.operation, key.outcome, bucket, metric.buckets[index]
-                ));
-            }
-            output.push_str(&format!(
-                "keycast_http_rpc_db_acquire_duration_seconds_bucket{{operation=\"{}\",outcome=\"{}\",le=\"+Inf\"}} {}\n",
-                key.operation, key.outcome, metric.count
-            ));
-            output.push_str(&format!(
-                "keycast_http_rpc_db_acquire_duration_seconds_sum{{operation=\"{}\",outcome=\"{}\"}} {}\n",
-                key.operation, key.outcome, metric.sum
-            ));
-            output.push_str(&format!(
-                "keycast_http_rpc_db_acquire_duration_seconds_count{{operation=\"{}\",outcome=\"{}\"}} {}\n",
-                key.operation, key.outcome, metric.count
-            ));
+            render_histogram(
+                &mut output,
+                "keycast_http_rpc_db_acquire_duration_seconds",
+                &format!(
+                    "operation=\"{}\",outcome=\"{}\"",
+                    key.operation, key.outcome
+                ),
+                metric,
+                &HTTP_RPC_ACQUIRE_BUCKETS,
+            );
         }
 
         output.push_str(
@@ -1005,6 +1098,49 @@ impl Metrics {
         ));
 
         output.push_str(
+            "\n# HELP keycast_bcrypt_active_work Current bcrypt operations running on blocking workers\n",
+        );
+        output.push_str("# TYPE keycast_bcrypt_active_work gauge\n");
+        output.push_str(
+            "# HELP keycast_bcrypt_waiting_work Current bcrypt operations waiting for CPU admission\n",
+        );
+        output.push_str("# TYPE keycast_bcrypt_waiting_work gauge\n");
+        output.push_str(
+            "# HELP keycast_bcrypt_admission_rejections_total Bcrypt operations rejected before blocking execution\n",
+        );
+        output.push_str("# TYPE keycast_bcrypt_admission_rejections_total counter\n");
+        for workload in BcryptWorkload::ALL {
+            for operation in BcryptOperation::ALL {
+                let workload_index = workload.index();
+                let operation_index = operation.index();
+                output.push_str(&format!(
+                    "keycast_bcrypt_active_work{{workload=\"{}\",operation=\"{}\"}} {}\n",
+                    workload.as_str(),
+                    operation.as_str(),
+                    self.bcrypt_active[workload_index][operation_index].load(Ordering::Relaxed)
+                ));
+                output.push_str(&format!(
+                    "keycast_bcrypt_waiting_work{{workload=\"{}\",operation=\"{}\"}} {}\n",
+                    workload.as_str(),
+                    operation.as_str(),
+                    self.bcrypt_waiting[workload_index][operation_index].load(Ordering::Relaxed)
+                ));
+                for (reason, metrics) in [
+                    ("capacity", &self.bcrypt_rejected_capacity),
+                    ("shutdown", &self.bcrypt_rejected_shutdown),
+                ] {
+                    output.push_str(&format!(
+                        "keycast_bcrypt_admission_rejections_total{{workload=\"{}\",operation=\"{}\",reason=\"{}\"}} {}\n",
+                        workload.as_str(),
+                        operation.as_str(),
+                        reason,
+                        metrics[workload_index][operation_index].load(Ordering::Relaxed)
+                    ));
+                }
+            }
+        }
+
+        output.push_str(
             "\n# HELP keycast_auth_requests_total Auth request outcomes by endpoint and reason\n",
         );
         output.push_str("# TYPE keycast_auth_requests_total counter\n");
@@ -1030,24 +1166,13 @@ impl Metrics {
             .expect("auth duration metrics lock poisoned")
             .iter()
         {
-            for (index, bucket) in AUTH_DURATION_BUCKETS.iter().enumerate() {
-                output.push_str(&format!(
-                    "keycast_auth_request_duration_seconds_bucket{{endpoint=\"{}\",outcome=\"{}\",le=\"{}\"}} {}\n",
-                    key.endpoint, key.outcome, bucket, metric.buckets[index]
-                ));
-            }
-            output.push_str(&format!(
-                "keycast_auth_request_duration_seconds_bucket{{endpoint=\"{}\",outcome=\"{}\",le=\"+Inf\"}} {}\n",
-                key.endpoint, key.outcome, metric.count
-            ));
-            output.push_str(&format!(
-                "keycast_auth_request_duration_seconds_sum{{endpoint=\"{}\",outcome=\"{}\"}} {}\n",
-                key.endpoint, key.outcome, metric.sum
-            ));
-            output.push_str(&format!(
-                "keycast_auth_request_duration_seconds_count{{endpoint=\"{}\",outcome=\"{}\"}} {}\n",
-                key.endpoint, key.outcome, metric.count
-            ));
+            render_histogram(
+                &mut output,
+                "keycast_auth_request_duration_seconds",
+                &format!("endpoint=\"{}\",outcome=\"{}\"", key.endpoint, key.outcome),
+                metric,
+                &AUTH_DURATION_BUCKETS,
+            );
         }
 
         output.push_str(
@@ -1082,36 +1207,52 @@ impl Metrics {
             ));
         }
 
+        output.push_str(
+            "\n# HELP keycast_atproto_oauth_replay_reservations_total ATProto OAuth replay-reservation outcomes by namespace; in fail-open degraded mode one attempt may count under storage_unavailable and a fallback outcome\n",
+        );
+        output.push_str("# TYPE keycast_atproto_oauth_replay_reservations_total counter\n");
+        for (key, count) in self
+            .atproto_oauth_replay_reservations_total
+            .lock()
+            .expect("atproto oauth replay reservations lock poisoned")
+            .iter()
+        {
+            output.push_str(&format!(
+                "keycast_atproto_oauth_replay_reservations_total{{namespace=\"{}\",outcome=\"{}\"}} {}\n",
+                key.namespace, key.outcome, count
+            ));
+        }
+
         output
     }
 }
 
-fn observe_http_rpc_duration(metric: &mut HttpRpcDurationMetric, duration: Duration) {
-    let seconds = duration.as_secs_f64();
-    metric.count += 1;
-    metric.sum += seconds;
-    for (index, bucket) in HTTP_RPC_DURATION_BUCKETS.iter().enumerate() {
-        if seconds <= *bucket {
-            metric.buckets[index] += 1;
-        }
+fn render_histogram<const N: usize>(
+    output: &mut String,
+    name: &str,
+    labels: &str,
+    metric: &Histogram<N>,
+    boundaries: &[f64; N],
+) {
+    for (index, boundary) in boundaries.iter().enumerate() {
+        output.push_str(&format!(
+            "{name}_bucket{{{labels},le=\"{boundary}\"}} {}\n",
+            metric.buckets[index]
+        ));
     }
-}
-
-fn observe_http_rpc_acquire_duration(metric: &mut HttpRpcAcquireMetric, duration: Duration) {
-    let seconds = duration.as_secs_f64();
-    metric.count += 1;
-    metric.sum += seconds;
-    for (index, bucket) in HTTP_RPC_ACQUIRE_BUCKETS.iter().enumerate() {
-        if seconds <= *bucket {
-            metric.buckets[index] += 1;
-        }
-    }
+    output.push_str(&format!(
+        "{name}_bucket{{{labels},le=\"+Inf\"}} {}\n",
+        metric.count
+    ));
+    output.push_str(&format!("{name}_sum{{{labels}}} {}\n", metric.sum));
+    output.push_str(&format!("{name}_count{{{labels}}} {}\n", metric.count));
 }
 
 fn normalize_http_rpc_method(method: &str) -> &'static str {
     match method {
         "get_public_key" => "get_public_key",
         "sign_event" => "sign_event",
+        "sign_canonical" => "sign_canonical",
         "nip04_encrypt" => "nip04_encrypt",
         "nip04_decrypt" => "nip04_decrypt",
         "nip44_encrypt" => "nip44_encrypt",
@@ -1130,6 +1271,9 @@ fn normalize_http_rpc_outcome(outcome: &str) -> &'static str {
         "account_restricted" => "account_restricted",
         "unavailable" => "unavailable",
         "timeout" => "timeout",
+        "cancelled" => "cancelled",
+        "partial_error" => "partial_error",
+        "server_error" => "server_error",
         "error" => "error",
         _ => "other",
     }
@@ -1216,12 +1360,32 @@ fn normalize_email_template(template: &str) -> &'static str {
     }
 }
 
+fn normalize_replay_namespace(namespace: &str) -> &'static str {
+    match namespace {
+        "dpop_proof" => "dpop_proof",
+        "client_assertion" => "client_assertion",
+        _ => "other",
+    }
+}
+
+fn normalize_replay_outcome(outcome: &str) -> &'static str {
+    match outcome {
+        "reserved" => "reserved",
+        "replay_rejected" => "replay_rejected",
+        "storage_unavailable" => "storage_unavailable",
+        "fallback_reserved" => "fallback_reserved",
+        "fallback_rejected" => "fallback_rejected",
+        _ => "other",
+    }
+}
+
 /// Global metrics instance
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::new);
 
 #[cfg(test)]
 mod tests {
     use super::Metrics;
+    use crate::bcrypt_admission::{BcryptOperation, BcryptWorkload};
     use std::time::Duration;
 
     #[test]
@@ -1256,10 +1420,57 @@ mod tests {
     }
 
     #[test]
+    fn test_atproto_oauth_replay_metrics_render_bounded_labels() {
+        let metrics = Metrics::new();
+
+        metrics.inc_atproto_oauth_replay_reservation("dpop_proof", "reserved");
+        metrics.inc_atproto_oauth_replay_reservation("dpop_proof", "replay_rejected");
+        metrics.inc_atproto_oauth_replay_reservation("client_assertion", "reserved");
+        metrics.inc_atproto_oauth_replay_reservation("client_assertion", "storage_unavailable");
+        // Unknown labels collapse to "other" instead of creating new series.
+        metrics.inc_atproto_oauth_replay_reservation("spoofed_namespace", "reserved");
+        metrics.inc_atproto_oauth_replay_reservation("dpop_proof", "spoofed_outcome");
+
+        let output = metrics.to_prometheus();
+
+        assert!(output.contains(
+            "keycast_atproto_oauth_replay_reservations_total{namespace=\"dpop_proof\",outcome=\"reserved\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_atproto_oauth_replay_reservations_total{namespace=\"dpop_proof\",outcome=\"replay_rejected\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_atproto_oauth_replay_reservations_total{namespace=\"client_assertion\",outcome=\"reserved\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_atproto_oauth_replay_reservations_total{namespace=\"client_assertion\",outcome=\"storage_unavailable\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_atproto_oauth_replay_reservations_total{namespace=\"other\",outcome=\"reserved\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_atproto_oauth_replay_reservations_total{namespace=\"dpop_proof\",outcome=\"other\"} 1"
+        ));
+    }
+
+    #[test]
     fn test_http_rpc_labeled_metrics_render_long_tail_buckets() {
         let metrics = Metrics::new();
 
         metrics.observe_http_rpc_request("nip44_encrypt", "success", Duration::from_secs(23));
+        metrics.observe_http_rpc_operation("sign_event", "success", Duration::from_millis(8));
+        metrics.observe_http_rpc_operation("nip44_encrypt", "success", Duration::from_millis(9));
+        metrics.observe_http_rpc_operation(
+            "nip44_decrypt",
+            "client_error",
+            Duration::from_millis(10),
+        );
+        metrics.observe_http_rpc_operation("nip04_decrypt", "success", Duration::from_millis(11));
+        metrics.observe_http_rpc_operation(
+            "nip17_unwrap_batch",
+            "cancelled",
+            Duration::from_secs(8),
+        );
         metrics.observe_http_rpc_status_check("success", Duration::from_millis(25));
         metrics.observe_http_rpc_db_acquire(
             "check_user_status_active",
@@ -1276,6 +1487,24 @@ mod tests {
         ));
         assert!(output.contains(
             "keycast_http_rpc_request_duration_seconds_bucket{method=\"nip44_encrypt\",outcome=\"success\",le=\"10\"} 0"
+        ));
+        assert!(output.contains(
+            "keycast_http_rpc_operation_duration_seconds_count{method=\"sign_event\",outcome=\"success\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_http_rpc_operation_duration_seconds_count{method=\"nip44_encrypt\",outcome=\"success\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_http_rpc_operation_duration_seconds_count{method=\"nip44_decrypt\",outcome=\"client_error\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_http_rpc_operation_duration_seconds_count{method=\"nip04_decrypt\",outcome=\"success\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_http_rpc_operation_duration_seconds_bucket{method=\"sign_event\",outcome=\"success\",le=\"0.01\"} 1"
+        ));
+        assert!(output.contains(
+            "keycast_http_rpc_operation_duration_seconds_count{method=\"nip17_unwrap_batch\",outcome=\"cancelled\"} 1"
         ));
         assert!(output.contains(
             "keycast_http_rpc_status_check_duration_seconds_count{outcome=\"success\"} 1"
@@ -1332,5 +1561,23 @@ mod tests {
         );
         assert!(output.contains("keycast_nip46_queue_wait_seconds_count 1"));
         assert!(output.contains("keycast_nip46_worker_duration_seconds_count 1"));
+    }
+
+    #[test]
+    fn bcrypt_admission_metrics_use_bounded_labels() {
+        let metrics = Metrics::new();
+        metrics.inc_bcrypt_active(BcryptWorkload::Login, BcryptOperation::Verify);
+        metrics.inc_bcrypt_waiting(BcryptWorkload::Pin, BcryptOperation::Verify);
+        metrics.inc_bcrypt_rejection(BcryptWorkload::Background, BcryptOperation::Hash, false);
+
+        let output = metrics.to_prometheus();
+        assert!(output
+            .contains("keycast_bcrypt_active_work{workload=\"login\",operation=\"verify\"} 1"));
+        assert!(
+            output.contains("keycast_bcrypt_waiting_work{workload=\"pin\",operation=\"verify\"} 1")
+        );
+        assert!(output.contains(
+            "keycast_bcrypt_admission_rejections_total{workload=\"background\",operation=\"hash\",reason=\"capacity\"} 1"
+        ));
     }
 }

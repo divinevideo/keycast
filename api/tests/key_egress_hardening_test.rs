@@ -20,10 +20,10 @@ use keycast_api::api::{
     },
     tenant::{Tenant, TenantExtractor},
 };
-use keycast_api::bcrypt_queue::BcryptQueue;
 use keycast_api::handlers::http_rpc_handler::new_http_handler_cache;
 use keycast_api::state::KeycastState;
 use keycast_api::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
+use keycast_api::BcryptAdmission;
 use keycast_api::PrefixedRedis;
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::KeyManager;
@@ -78,6 +78,19 @@ fn create_test_tenant() -> TenantExtractor {
 }
 
 async fn create_test_auth_state(pool: PgPool, key_manager: Arc<Box<dyn KeyManager>>) -> AuthState {
+    create_test_auth_state_with_bcrypt(
+        pool,
+        key_manager,
+        BcryptAdmission::new(1, std::time::Duration::from_secs(1)),
+    )
+    .await
+}
+
+async fn create_test_auth_state_with_bcrypt(
+    pool: PgPool,
+    key_manager: Arc<Box<dyn KeyManager>>,
+    bcrypt: BcryptAdmission,
+) -> AuthState {
     let redis_url =
         std::env::var("TEST_REDIS_URL").expect("TEST_REDIS_URL must name dedicated Redis");
     let client = redis::Client::open(redis_url).expect("valid Redis URL");
@@ -85,10 +98,11 @@ async fn create_test_auth_state(pool: PgPool, key_manager: Arc<Box<dyn KeyManage
         .await
         .expect("connect to dedicated Redis");
     let prefix = format!("keycast-pr326-independent-review:{}", Uuid::new_v4());
-    create_test_auth_state_with_redis(
+    create_test_auth_state_with_redis_and_bcrypt(
         pool,
         key_manager,
         Some(PrefixedRedis::new(connection, Some(prefix))),
+        bcrypt,
     )
 }
 
@@ -97,7 +111,20 @@ fn create_test_auth_state_with_redis(
     key_manager: Arc<Box<dyn KeyManager>>,
     redis: Option<PrefixedRedis>,
 ) -> AuthState {
-    let bcrypt_queue = BcryptQueue::new();
+    create_test_auth_state_with_redis_and_bcrypt(
+        pool,
+        key_manager,
+        redis,
+        BcryptAdmission::new(1, std::time::Duration::from_secs(1)),
+    )
+}
+
+fn create_test_auth_state_with_redis_and_bcrypt(
+    pool: PgPool,
+    key_manager: Arc<Box<dyn KeyManager>>,
+    redis: Option<PrefixedRedis>,
+    bcrypt: BcryptAdmission,
+) -> AuthState {
     let secret_pool = SecretPool::new(1);
     let tenant_cache = Cache::builder().max_capacity(10).build();
     AuthState {
@@ -108,7 +135,7 @@ fn create_test_auth_state_with_redis(
             http_handler_cache: new_http_handler_cache(),
             server_keys: Keys::generate(),
             tenant_cache,
-            bcrypt_sender: bcrypt_queue.sender(),
+            bcrypt,
             redis,
             secret_pool: secret_pool.receiver(),
             activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),
@@ -744,7 +771,12 @@ async fn concurrent_wrong_password_burst_spends_only_the_attempt_budget() {
     let pubkey = keys.public_key().to_hex();
     insert_user(&pool, &pubkey, &unique_email(), PASSWORD, true, false).await;
     create_personal_key(&pool, &pubkey, &keys, &km).await;
-    let auth_state = create_test_auth_state(pool.clone(), km_arc(km)).await;
+    let auth_state = create_test_auth_state_with_bcrypt(
+        pool.clone(),
+        km_arc(km),
+        BcryptAdmission::new(MAX_ATTEMPTS + 5, std::time::Duration::from_secs(1)),
+    )
+    .await;
     let bearer = bearer_for(&keys).await;
 
     let mut attempts = tokio::task::JoinSet::new();

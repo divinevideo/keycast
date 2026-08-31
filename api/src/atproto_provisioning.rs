@@ -26,6 +26,8 @@ pub enum ControlPlaneUrlError {
 pub enum AtprotoProvisioningError {
     #[error("ATProto control-plane dependency is not configured")]
     DependencyNotConfigured,
+    #[error("remote dependency is at capacity")]
+    AtCapacity(#[from] crate::api::http::expensive_work::RemoteFetchAtCapacity),
     #[error("request failed: {0}")]
     Request(#[from] reqwest::Error),
     #[error("provisioning service returned {status}: {body}")]
@@ -39,6 +41,7 @@ impl AtprotoProvisioningError {
     pub fn is_dependency_unavailable(&self) -> bool {
         match self {
             AtprotoProvisioningError::DependencyNotConfigured
+            | AtprotoProvisioningError::AtCapacity(_)
             | AtprotoProvisioningError::Request(_) => true,
             AtprotoProvisioningError::UnexpectedStatus { status, .. } => status.is_server_error(),
         }
@@ -141,6 +144,7 @@ pub async fn request_enable(
     };
 
     let client = control_plane_client();
+    let _remote_permit = crate::api::http::expensive_work::admit_remote_fetch()?;
     let response = maybe_apply_service_auth(client.post(url).json(&body))
         .send()
         .await?;
@@ -164,6 +168,7 @@ pub async fn request_reenable(nostr_pubkey: &str) -> Result<(), AtprotoProvision
     );
 
     let client = control_plane_client();
+    let _remote_permit = crate::api::http::expensive_work::admit_remote_fetch()?;
     let response = maybe_apply_service_auth(client.post(url)).send().await?;
 
     if response.status().is_success() {
@@ -185,6 +190,7 @@ pub async fn request_disable(nostr_pubkey: &str) -> Result<(), AtprotoProvisioni
     );
 
     let client = control_plane_client();
+    let _remote_permit = crate::api::http::expensive_work::admit_remote_fetch()?;
     let response = maybe_apply_service_auth(client.post(url)).send().await?;
 
     if response.status().is_success() {

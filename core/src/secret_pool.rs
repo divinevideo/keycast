@@ -1,10 +1,16 @@
 // ABOUTME: Pre-computed secret pool for zero-latency authorization creation
 // ABOUTME: Background producer generates (secret, bcrypt_hash) pairs ahead of time
 
-use bcrypt::hash;
-use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
+
+use async_channel::{bounded, Receiver, Sender, TryRecvError};
 use rand::Rng;
 use secrecy::SecretString;
+
+use crate::bcrypt_admission::{BcryptAdmission, BcryptAdmissionError, BcryptWorkload};
 
 /// Default pool capacity - enough for typical burst while limiting memory usage
 const DEFAULT_POOL_CAPACITY: usize = 100;
@@ -15,6 +21,41 @@ const BCRYPT_COST: u32 = 10;
 
 /// Length of generated secrets (48 alphanumeric chars = ~284 bits entropy)
 const SECRET_LENGTH: usize = 48;
+
+/// How long [`SecretPoolReceiver::get`] waits for a produced secret pair.
+///
+/// Background hashing yields to request work, so an empty pool during a login
+/// storm may never refill. One second matches bcrypt admission's permit wait:
+/// long enough for one cost-10 hash if a CPU slot frees, then a retryable
+/// overload instead of an unbounded recv. Do not reserve a background CPU
+/// slot; that would cut request hashing capacity on the serving instances.
+pub const SECRET_POOL_GET_TIMEOUT: Duration = Duration::from_secs(1);
+
+static SECRET_POOL_WAITERS: AtomicU64 = AtomicU64::new(0);
+static SECRET_POOL_EXHAUSTIONS: AtomicU64 = AtomicU64::new(0);
+
+pub fn active_waiters() -> u64 {
+    SECRET_POOL_WAITERS.load(Ordering::Relaxed)
+}
+
+pub fn exhaustion_count() -> u64 {
+    SECRET_POOL_EXHAUSTIONS.load(Ordering::Relaxed)
+}
+
+struct WaiterMetricGuard;
+
+impl WaiterMetricGuard {
+    fn new() -> Self {
+        SECRET_POOL_WAITERS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for WaiterMetricGuard {
+    fn drop(&mut self) {
+        SECRET_POOL_WAITERS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// Pre-computed (secret, hash) pair
 pub struct SecretPair {
@@ -52,7 +93,7 @@ impl SecretPool {
     /// The producer generates secrets, hashes them with bcrypt, and pushes to the pool.
     /// When the pool is full, the producer blocks (backpressure).
     /// Returns when the channel is closed (pool dropped).
-    pub fn spawn_producer(&self) -> tokio::task::JoinHandle<()> {
+    pub fn spawn_producer(&self, bcrypt: BcryptAdmission) -> tokio::task::JoinHandle<()> {
         let tx = self.tx.clone();
 
         tokio::spawn(async move {
@@ -70,22 +111,22 @@ impl SecretPool {
                     .map(char::from)
                     .collect();
 
-                // Hash in blocking thread (bcrypt is CPU-bound)
-                let hash_result = {
-                    let secret_for_hash = secret.clone();
-                    tokio::task::spawn_blocking(move || hash(&secret_for_hash, BCRYPT_COST)).await
-                };
-
-                let secret_hash = match hash_result {
-                    Ok(Ok(h)) => h,
-                    Ok(Err(e)) => {
-                        tracing::error!("Secret pool producer: bcrypt error: {}", e);
-                        // Brief pause before retrying to avoid tight error loop
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let secret_hash = match bcrypt
+                    .hash(
+                        BcryptWorkload::Background,
+                        SecretString::from(secret.clone()),
+                        BCRYPT_COST,
+                    )
+                    .await
+                {
+                    Ok(hash) => hash,
+                    Err(BcryptAdmissionError::AtCapacity) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                         continue;
                     }
+                    Err(BcryptAdmissionError::ShuttingDown) => break,
                     Err(e) => {
-                        tracing::error!("Secret pool producer: spawn_blocking panicked: {}", e);
+                        tracing::error!("Secret pool producer: bcrypt error: {}", e);
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         continue;
                     }
@@ -96,24 +137,11 @@ impl SecretPool {
                     hash: secret_hash,
                 };
 
-                // Send to pool - blocks if full (backpressure)
-                // Use spawn_blocking since crossbeam send is sync
-                let tx_clone = tx.clone();
-                let send_result = tokio::task::spawn_blocking(move || tx_clone.send(pair)).await;
-
-                match send_result {
-                    Ok(Ok(())) => {
-                        // Successfully added to pool
-                    }
-                    Ok(Err(_)) => {
-                        // Channel disconnected - pool dropped, shutdown
-                        tracing::info!("Secret pool producer shutting down (channel closed)");
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::error!("Secret pool producer: spawn_blocking panicked: {}", e);
-                        break;
-                    }
+                // The bounded async channel provides event-driven backpressure
+                // without occupying Tokio's blocking pool or polling a timer.
+                if tx.send(pair).await.is_err() {
+                    tracing::info!("Secret pool producer shutting down (channel closed)");
+                    return;
                 }
             }
 
@@ -148,16 +176,22 @@ pub struct SecretPoolReceiver {
 }
 
 impl SecretPoolReceiver {
-    /// Get a pre-computed (secret, hash) pair from the pool
+    /// Get a pre-computed (secret, hash) pair from the pool.
     ///
-    /// Blocks if pool is empty (waits for producer to generate more).
-    /// Returns None if the pool is closed (shutdown).
-    pub async fn get(&self) -> Option<SecretPair> {
-        let rx = self.rx.clone();
-        tokio::task::spawn_blocking(move || rx.recv().ok())
-            .await
-            .ok()
-            .flatten()
+    /// Waits up to [`SECRET_POOL_GET_TIMEOUT`] when the pool is empty.
+    /// Times out as [`SecretPoolError::Exhausted`] so callers can return a
+    /// retryable overload instead of parking the request. A closed pool
+    /// returns [`SecretPoolError::Closed`].
+    pub async fn get(&self) -> Result<SecretPair, SecretPoolError> {
+        let _waiter = WaiterMetricGuard::new();
+        match tokio::time::timeout(SECRET_POOL_GET_TIMEOUT, self.rx.recv()).await {
+            Ok(Ok(pair)) => Ok(pair),
+            Ok(Err(_)) => Err(SecretPoolError::Closed),
+            Err(_) => {
+                SECRET_POOL_EXHAUSTIONS.fetch_add(1, Ordering::Relaxed);
+                Err(SecretPoolError::Exhausted)
+            }
+        }
     }
 
     /// Try to get a pair without blocking
@@ -168,7 +202,7 @@ impl SecretPoolReceiver {
         match self.rx.try_recv() {
             Ok(pair) => Some(pair),
             Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => None,
+            Err(TryRecvError::Closed) => None,
         }
     }
 
@@ -192,47 +226,22 @@ pub enum SecretPoolError {
     Closed,
 }
 
-/// Utility function to generate a secret and hash it inline (for fallback/migration)
-///
-/// This is slower than using the pool but useful for:
-/// - Fallback when pool is empty
-/// - Migration scripts that need to hash existing secrets
-/// - Tests
-pub async fn generate_secret_hash_inline() -> Result<SecretPair, bcrypt::BcryptError> {
-    let secret: String = rand::thread_rng()
-        .sample_iter(&rand::distributions::Alphanumeric)
-        .take(SECRET_LENGTH)
-        .map(char::from)
-        .collect();
-
-    let secret_for_hash = secret.clone();
-    let hash_result =
-        tokio::task::spawn_blocking(move || hash(&secret_for_hash, BCRYPT_COST)).await;
-
-    match hash_result {
-        Ok(Ok(h)) => Ok(SecretPair {
-            secret: SecretString::from(secret),
-            hash: h,
-        }),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(bcrypt::BcryptError::InvalidCost(format!(
-            "spawn_blocking failed for cost {}",
-            BCRYPT_COST
-        ))),
-    }
-}
-
 /// Verify a provided secret against a stored hash
 ///
 /// Uses bcrypt::verify which is constant-time internally.
 /// Returns true if the secret matches the hash.
-pub async fn verify_secret(provided_secret: &str, stored_hash: &str) -> bool {
-    let provided = provided_secret.to_string();
-    let hash = stored_hash.to_string();
-
-    tokio::task::spawn_blocking(move || bcrypt::verify(&provided, &hash).unwrap_or(false))
+pub async fn verify_secret(
+    bcrypt: &BcryptAdmission,
+    provided_secret: &str,
+    stored_hash: &str,
+) -> Result<bool, BcryptAdmissionError> {
+    bcrypt
+        .verify(
+            BcryptWorkload::Signer,
+            SecretString::from(provided_secret.to_string()),
+            stored_hash.to_string(),
+        )
         .await
-        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -259,34 +268,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_generate_secret_hash_inline() {
-        let pair = generate_secret_hash_inline().await.unwrap();
-
-        // Secret should be the expected length
-        assert_eq!(pair.secret.expose_secret().len(), SECRET_LENGTH);
-
-        // Hash should be a valid bcrypt hash (starts with $2b$ or similar)
-        assert!(pair.hash.starts_with("$2"));
-
-        // Verify should succeed
-        assert!(verify_secret(pair.secret.expose_secret(), &pair.hash).await);
-    }
-
-    #[tokio::test]
     async fn test_verify_secret_wrong_secret() {
-        let pair = generate_secret_hash_inline().await.unwrap();
+        let bcrypt = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
+        let pool = SecretPool::new(1);
+        let receiver = pool.receiver();
+        let producer_handle = pool.spawn_producer(bcrypt.clone());
+        let pair = receiver.get().await.unwrap();
 
         // Wrong secret should fail
-        assert!(!verify_secret("wrong_secret", &pair.hash).await);
+        assert!(!verify_secret(&bcrypt, "wrong_secret", &pair.hash)
+            .await
+            .unwrap());
+
+        drop(receiver);
+        drop(pool);
+        tokio::time::timeout(std::time::Duration::from_secs(5), producer_handle)
+            .await
+            .expect("Producer should exit within timeout")
+            .expect("Producer should not panic");
     }
 
     #[tokio::test]
     async fn test_pool_producer_and_consumer() {
         let pool = SecretPool::new(5);
         let receiver = pool.receiver();
+        let bcrypt = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
 
         // Start producer
-        let producer_handle = pool.spawn_producer();
+        let producer_handle = pool.spawn_producer(bcrypt.clone());
 
         // Wait a bit for producer to fill pool (bcrypt is slow)
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
@@ -300,7 +309,11 @@ mod tests {
         assert!(pair.hash.starts_with("$2"));
 
         // Verify works
-        assert!(verify_secret(pair.secret.expose_secret(), &pair.hash).await);
+        assert!(
+            verify_secret(&bcrypt, pair.secret.expose_secret(), &pair.hash)
+                .await
+                .unwrap()
+        );
 
         // Cleanup - must drop receiver first so channel disconnects
         drop(receiver);
@@ -311,5 +324,33 @@ mod tests {
             .await
             .expect("Producer should exit within timeout")
             .expect("Producer should not panic");
+    }
+
+    #[tokio::test]
+    async fn get_times_out_when_the_producer_never_refills() {
+        let pool = SecretPool::new(1);
+        let receiver = pool.receiver();
+        let started = std::time::Instant::now();
+
+        let error = match receiver.get().await {
+            Ok(_) => panic!("an empty live pool must not return a pair"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SecretPoolError::Exhausted));
+        assert!(started.elapsed() >= SECRET_POOL_GET_TIMEOUT);
+        assert!(started.elapsed() < SECRET_POOL_GET_TIMEOUT + Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn get_reports_closed_when_the_pool_is_dropped() {
+        let pool = SecretPool::new(1);
+        let receiver = pool.receiver();
+        drop(pool);
+
+        let error = match receiver.get().await {
+            Ok(_) => panic!("a disconnected pool must not return a pair"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SecretPoolError::Closed));
     }
 }

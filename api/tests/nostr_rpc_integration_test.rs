@@ -25,10 +25,10 @@ use keycast_api::api::{
     },
     tenant::{Tenant, TenantExtractor},
 };
-use keycast_api::bcrypt_queue::BcryptQueue;
 use keycast_api::handlers::http_rpc_handler::{new_http_handler_cache, HttpRpcHandler};
 use keycast_api::state::KeycastState;
 use keycast_api::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
+use keycast_api::BcryptAdmission;
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::KeyManager;
 use keycast_core::request_bounds::{HTTP_RPC_HANDLER_TIMEOUT, SQLX_ACQUIRE_TIMEOUT};
@@ -150,7 +150,7 @@ fn create_test_auth_state_with_activity_logger(
     key_manager: Arc<Box<dyn KeyManager>>,
     activity_logger: ActivityLogger,
 ) -> AuthState {
-    let bcrypt_queue = BcryptQueue::new();
+    let bcrypt = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
     let secret_pool = SecretPool::new(1);
     let tenant_cache = Cache::builder().max_capacity(10).build();
 
@@ -162,7 +162,7 @@ fn create_test_auth_state_with_activity_logger(
             http_handler_cache: new_http_handler_cache(),
             server_keys: Keys::generate(),
             tenant_cache,
-            bcrypt_sender: bcrypt_queue.sender(),
+            bcrypt: bcrypt.clone(),
             redis: None,
             secret_pool: secret_pool.receiver(),
             activity_logger,
@@ -1135,6 +1135,9 @@ async fn test_suspended_user_denied_nostr_rpc_sign_canonical() {
     .await;
     let auth_state = create_test_auth_state(pool.clone(), key_manager);
 
+    // sign_canonical stays gated (keycast#373). It signs a creator-binding
+    // payload, which is a Divine-hosted capability rather than the generic
+    // event signing an account needs to export itself or republish elsewhere.
     let err = invoke_nostr_rpc(
         create_test_tenant_extractor(tenant_id),
         auth_state,
@@ -1401,7 +1404,7 @@ async fn test_warm_cache_preload_handler_rejected_after_ucan_expiry() {
     // Build AuthState whose state.server_keys matches SERVER_NSEC so behavior is
     // consistent across the request lifecycle.
     let auth_state = {
-        let bcrypt_queue = BcryptQueue::new();
+        let bcrypt = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
         let secret_pool = SecretPool::new(1);
         let tenant_cache = Cache::builder().max_capacity(10).build();
         AuthState {
@@ -1412,7 +1415,7 @@ async fn test_warm_cache_preload_handler_rejected_after_ucan_expiry() {
                 http_handler_cache: new_http_handler_cache(),
                 server_keys: server_keys.clone(),
                 tenant_cache,
-                bcrypt_sender: bcrypt_queue.sender(),
+                bcrypt: bcrypt.clone(),
                 redis: None,
                 secret_pool: secret_pool.receiver(),
                 activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),
@@ -1519,7 +1522,7 @@ async fn test_server_signed_non_preload_redirect_origin_rejected() {
     create_personal_key(&pool, tenant_id, &pubkey_hex, &user_keys, &**key_manager).await;
 
     let auth_state = {
-        let bcrypt_queue = BcryptQueue::new();
+        let bcrypt = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
         let secret_pool = SecretPool::new(1);
         let tenant_cache = Cache::builder().max_capacity(10).build();
         AuthState {
@@ -1530,7 +1533,7 @@ async fn test_server_signed_non_preload_redirect_origin_rejected() {
                 http_handler_cache: new_http_handler_cache(),
                 server_keys: server_keys.clone(),
                 tenant_cache,
-                bcrypt_sender: bcrypt_queue.sender(),
+                bcrypt: bcrypt.clone(),
                 redis: None,
                 secret_pool: secret_pool.receiver(),
                 activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),
@@ -1608,10 +1611,20 @@ async fn suspend_user(pool: &PgPool, pubkey: &str, tenant_id: i64) {
         .expect("Failed to suspend user");
 }
 
-/// Test: suspended user denied from sign_event HTTP endpoint (covers slow path)
+async fn ban_user(pool: &PgPool, pubkey: &str, tenant_id: i64) {
+    use keycast_core::repositories::UserRepository;
+    use keycast_core::types::user::UserStatus;
+    let user_repo = UserRepository::new(pool.clone());
+    user_repo
+        .set_user_status(pubkey, tenant_id, &UserStatus::Banned, Some("test_ban"))
+        .await
+        .expect("Failed to ban user");
+}
+
+/// Test: suspended user may still sign via the HTTP endpoint (keycast#373, covers slow path)
 #[tokio::test]
 #[serial]
-async fn test_suspended_user_denied_sign_event() {
+async fn test_suspended_user_allowed_sign_event() {
     let pool = setup_db().await;
     let tenant_id = create_test_tenant(&pool).await;
     let (user_keys, pubkey) = create_test_user();
@@ -1662,18 +1675,79 @@ async fn test_suspended_user_denied_sign_event() {
     )
     .await;
 
-    match result {
-        Err(AuthError::Forbidden(msg)) => {
-            assert_eq!(msg, "Account restricted");
-        }
-        other => panic!("expected Forbidden(Account restricted), got: {:?}", other),
-    }
+    assert!(
+        result.is_ok(),
+        "suspended user should still be able to sign (keycast#373), got: {:?}",
+        result.err()
+    );
 }
 
-/// Test: suspended user denied from nostr_rpc sign_event method
+/// Test: banned user may still sign, so a banned account can export and
+/// republish elsewhere (keycast#373).
 #[tokio::test]
 #[serial]
-async fn test_suspended_user_denied_nostr_rpc_sign() {
+async fn test_banned_user_allowed_sign_event() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (user_keys, pubkey) = create_test_user();
+    let key_manager = FileKeyManager::new().expect("Failed to create key manager");
+
+    insert_user(&pool, tenant_id, &pubkey).await;
+    create_personal_key(&pool, tenant_id, &pubkey, &user_keys, &key_manager).await;
+
+    let redirect_origin = format!("https://ban-sign-{}.example.com", Uuid::new_v4());
+    create_test_oauth_authorization(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &redirect_origin,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    // Ban the user
+    ban_user(&pool, &pubkey, tenant_id).await;
+
+    // Build UCAN and call sign_event (no cached handler → slow path)
+    // sign_event extracts user from UCAN audience, doesn't need bunker_pubkey
+    let token = build_self_signed_ucan(&user_keys, tenant_id, &redirect_origin, None).await;
+    let auth_state = create_test_auth_state(
+        pool.clone(),
+        Arc::new(Box::new(key_manager) as Box<dyn KeyManager>),
+    );
+
+    let unsigned = EventBuilder::text_note("should be denied").build(user_keys.public_key());
+    let event_json = serde_json::to_value(&unsigned).expect("Failed to serialize unsigned event");
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "Authorization",
+        format!("Bearer {}", token).parse().unwrap(),
+    );
+    headers.insert("host", "login.divine.video".parse().unwrap());
+    headers.insert("x-forwarded-proto", "https".parse().unwrap());
+
+    let result = sign_event(
+        create_test_tenant_extractor(tenant_id),
+        State(auth_state),
+        headers,
+        Json(SignEventRequest { event: event_json }),
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "banned user should still be able to sign (keycast#373), got: {:?}",
+        result.err()
+    );
+}
+
+/// Test: suspended user may still sign via nostr_rpc (keycast#373)
+#[tokio::test]
+#[serial]
+async fn test_suspended_user_allowed_nostr_rpc_sign() {
     let pool = setup_db().await;
     let tenant_id = create_test_tenant(&pool).await;
     let (user_keys, pubkey) = create_test_user();
@@ -1713,7 +1787,7 @@ async fn test_suspended_user_denied_nostr_rpc_sign() {
     let unsigned = EventBuilder::text_note("should be denied").build(user_keys.public_key());
     let event_json = serde_json::to_value(&unsigned).expect("Failed to serialize unsigned event");
 
-    let err = invoke_nostr_rpc(
+    invoke_nostr_rpc(
         create_test_tenant_extractor(tenant_id),
         auth_state,
         &format!("Bearer {}", token),
@@ -1724,14 +1798,7 @@ async fn test_suspended_user_denied_nostr_rpc_sign() {
         },
     )
     .await
-    .expect_err("Suspended user should be denied signing via RPC");
-
-    match err {
-        RpcError::AccountSuspended(msg) => {
-            assert_eq!(msg, "Account restricted");
-        }
-        other => panic!("expected AccountSuspended, got: {:?}", other),
-    }
+    .expect("suspended user should still be able to sign via RPC (keycast#373)");
 }
 
 /// Test: a saturated DB pool returns retryable 503 before the handler timeout.

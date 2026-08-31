@@ -15,9 +15,9 @@ use http_body_util::BodyExt;
 use keycast_api::{
     api::http::ap::{self, CreateKeyRequest, SignRequest},
     api::http::routes::AuthState,
-    bcrypt_queue::BcryptQueue,
     handlers::http_rpc_handler::new_http_handler_cache,
     state::KeycastState,
+    BcryptAdmission,
 };
 use keycast_core::{
     encryption::{KeyManager, KeyManagerError},
@@ -61,7 +61,7 @@ impl KeyManager for TestKeyManager {
 }
 
 fn create_test_auth_state(pool: PgPool) -> AuthState {
-    let bcrypt_queue = BcryptQueue::new();
+    let bcrypt = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
     let secret_pool = SecretPool::new(1);
     let tenant_cache = Cache::builder().max_capacity(10).build();
     let key_manager: Arc<Box<dyn KeyManager>> = Arc::new(Box::new(TestKeyManager));
@@ -74,7 +74,7 @@ fn create_test_auth_state(pool: PgPool) -> AuthState {
             http_handler_cache: new_http_handler_cache(),
             server_keys: Keys::generate(),
             tenant_cache,
-            bcrypt_sender: bcrypt_queue.sender(),
+            bcrypt: bcrypt.clone(),
             redis: None,
             secret_pool: secret_pool.receiver(),
             activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),
@@ -508,53 +508,57 @@ async fn deleted_user_removes_key_and_later_sign_returns_404() {
 }
 
 #[tokio::test]
-async fn suspended_user_cannot_create_get_or_sign() {
+/// ActivityPub keys represent Divine-hosted actors, so both suspended and banned
+/// accounts remain unable to create, retrieve, or use them (keycast#374).
+async fn restricted_users_cannot_create_get_or_sign() {
     common::assert_test_database_url();
     unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
     let pool = common::setup_test_db().await;
 
-    let pubkey = Keys::generate().public_key().to_hex();
-    create_test_user(&pool, &pubkey).await;
-    UserRepository::new(pool.clone())
-        .set_user_status(&pubkey, TENANT_ID, &UserStatus::Suspended, Some("ap test"))
-        .await
-        .expect("suspend user");
+    for status in [UserStatus::Suspended, UserStatus::Banned] {
+        let pubkey = Keys::generate().public_key().to_hex();
+        create_test_user(&pool, &pubkey).await;
+        UserRepository::new(pool.clone())
+            .set_user_status(&pubkey, TENANT_ID, &status, Some("ap test"))
+            .await
+            .expect("restrict user");
 
-    let app = build_app(create_test_auth_state(pool.clone()));
-    let resp = app
-        .oneshot(bearer_json(
-            "/ap/keys",
-            serde_json::json!({ "pubkey": pubkey }),
-            Some(SERVICE_TOKEN),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let app = build_app(create_test_auth_state(pool.clone()));
+        let resp = app
+            .oneshot(bearer_json(
+                "/ap/keys",
+                serde_json::json!({ "pubkey": pubkey }),
+                Some(SERVICE_TOKEN),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "status: {status:?}");
 
-    let app = build_app(create_test_auth_state(pool.clone()));
-    let resp = app
-        .oneshot(
-            Request::get(format!("/ap/keys/{}", pubkey))
-                .header("authorization", format!("Bearer {}", SERVICE_TOKEN))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let app = build_app(create_test_auth_state(pool.clone()));
+        let resp = app
+            .oneshot(
+                Request::get(format!("/ap/keys/{}", pubkey))
+                    .header("authorization", format!("Bearer {}", SERVICE_TOKEN))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "status: {status:?}");
 
-    let app = build_app(create_test_auth_state(pool.clone()));
-    let resp = app
-        .oneshot(bearer_json(
-            "/ap/sign",
-            serde_json::json!({ "pubkey": pubkey, "signing_string": "x" }),
-            Some(SERVICE_TOKEN),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let app = build_app(create_test_auth_state(pool.clone()));
+        let resp = app
+            .oneshot(bearer_json(
+                "/ap/sign",
+                serde_json::json!({ "pubkey": pubkey, "signing_string": "x" }),
+                Some(SERVICE_TOKEN),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "status: {status:?}");
 
-    cleanup(&pool, &pubkey).await;
+        cleanup(&pool, &pubkey).await;
+    }
 }
 
 #[tokio::test]

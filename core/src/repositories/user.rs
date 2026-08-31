@@ -741,11 +741,6 @@ impl UserRepository {
     /// Creates both the user record and personal key in a single transaction,
     /// ensuring consistency if either operation fails.
     ///
-    /// # Arguments
-    ///
-    /// * `password_hash` - Optional password hash. Pass `None` for async bcrypt flow where
-    ///   the hash is computed in background and updated later via `UPDATE users SET password_hash`.
-    ///
     /// # Errors
     ///
     /// Returns [`RepositoryError::Duplicate`] if email already exists.
@@ -756,7 +751,7 @@ impl UserRepository {
         pubkey: &str,
         tenant_id: i64,
         email: &str,
-        password_hash: Option<&str>,
+        password_hash: &str,
         verification_token: &str,
         verification_expires_at: DateTime<Utc>,
         encrypted_secret: &[u8],
@@ -764,8 +759,7 @@ impl UserRepository {
         let mut tx = self.pool.begin().await?;
         let now = Utc::now();
 
-        // Insert user with email verification token
-        // password_hash may be NULL for async bcrypt flow (computed in background)
+        // Insert user with email verification token.
         sqlx::query(
             "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, email_verification_token, email_verification_expires_at, created_at, updated_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
@@ -2291,6 +2285,38 @@ impl UserRepository {
         Ok(result)
     }
 
+    pub async fn find_user_minor_status_by_username_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        username: &str,
+        tenant_id: i64,
+    ) -> Result<Option<(String, bool, bool)>, RepositoryError> {
+        sqlx::query_as(
+            "SELECT pubkey, verified_minor,
+                    (verified_minor = TRUE AND email IS NULL AND password_hash IS NULL) AS is_unclaimed
+             FROM users
+             WHERE LOWER(username) = LOWER($1) AND tenant_id = $2",
+        )
+        .bind(username)
+        .bind(tenant_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Serialize distinct provisioning operation ids that target one username.
+    pub async fn lock_minor_username_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        username: &str,
+        tenant_id: i64,
+    ) -> Result<(), RepositoryError> {
+        let key = format!("service-provisioning-username:{tenant_id}:{username}");
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(key)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
     /// Create an approved minor account with personal key atomically.
     /// Like create_preloaded_user but without vine_id and with verified_minor=true.
     pub async fn create_minor_account(
@@ -2330,6 +2356,61 @@ impl UserRepository {
 
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Create the protected account and hosted key inside a caller-owned
+    /// transaction so provisioning idempotency can commit with them.
+    pub async fn create_minor_account_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        pubkey: &str,
+        tenant_id: i64,
+        username: &str,
+        display_name: Option<&str>,
+        encrypted_secret: &[u8],
+    ) -> Result<(), RepositoryError> {
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, username, display_name, verified_minor, verified_minor_at, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, TRUE, $5, $5, $5)",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .bind(username)
+        .bind(display_name)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $4)",
+        )
+        .bind(pubkey)
+        .bind(encrypted_secret)
+        .bind(tenant_id)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    /// Whether a recorded provisioning account still exists and is claimable.
+    /// Missing or claimed rows both return `Some(false)`/`None` and must never
+    /// trigger recreation from an old operation id.
+    pub async fn is_unclaimed_minor_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<Option<bool>, RepositoryError> {
+        sqlx::query_scalar(
+            "SELECT (verified_minor = TRUE AND email IS NULL AND password_hash IS NULL)
+             FROM users WHERE pubkey = $1 AND tenant_id = $2",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(Into::into)
     }
 
     // =========================================================================
@@ -2830,9 +2911,16 @@ impl UserRepository {
     /// This performs a complete account deletion:
     /// 1. Removes user from all teams (team_users)
     /// 2. Clears pending OAuth codes
-    /// 3. Deletes the user (cascades to personal_keys, oauth_authorizations, etc.)
+    /// 3. Deletes AP RSA key material (ap_actor_keys)
+    /// 4. Deletes account claim tokens (account_claim_tokens)
+    /// 5. Deletes the user (cascades to personal_keys, oauth_authorizations, etc.)
     ///
     /// Returns information about what was deleted for logging.
+    ///
+    /// Returns [`RepositoryError::NotFound`] when no such account exists. A
+    /// caller that needs to treat an absent account as success should use
+    /// [`Self::delete_account_in_tx`], which reports it as
+    /// [`AccountDeletionOutcome::AlreadyAbsent`] rather than as an error.
     pub async fn delete_account(
         &self,
         pubkey: &str,
@@ -2840,18 +2928,63 @@ impl UserRepository {
     ) -> Result<DeleteAccountResult, RepositoryError> {
         let mut tx = self.pool.begin().await?;
 
+        match Self::delete_account_in_tx(&mut tx, pubkey, tenant_id).await? {
+            AccountDeletionOutcome::Deleted(result) => {
+                tx.commit().await?;
+                Ok(result)
+            }
+            AccountDeletionOutcome::AlreadyAbsent => {
+                Err(RepositoryError::NotFound("User not found".to_string()))
+            }
+        }
+    }
+
+    /// The account deletion itself, running inside a caller-owned transaction.
+    ///
+    /// Split out so a caller can commit deletion together with its own record of
+    /// having done it. The service deletion path needs that: its idempotency row
+    /// and the deletion have to land in the same commit, or a crash between them
+    /// leaves a deleted account whose completion nobody can prove.
+    ///
+    /// Reports an absent account as [`AccountDeletionOutcome::AlreadyAbsent`]
+    /// instead of erroring, so the caller can still commit work in the same
+    /// transaction. An error here aborts the transaction and cannot be
+    /// distinguished from any other failure by the caller.
+    pub async fn delete_account_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<AccountDeletionOutcome, RepositoryError> {
+        // Confirm the account exists in this tenant before deleting anything.
+        // Several of the deletes below are keyed on user_pubkey alone, so
+        // running them for an account this tenant does not own would destroy
+        // another tenant's rows and then report AlreadyAbsent -- which the
+        // caller would commit. Locking the row also serializes two concurrent
+        // deletions of the same account instead of letting both proceed.
+        let owned: Option<i64> = sqlx::query_scalar(
+            "SELECT tenant_id FROM users WHERE pubkey = $1 AND tenant_id = $2 FOR UPDATE",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        if owned.is_none() {
+            return Ok(AccountDeletionOutcome::AlreadyAbsent);
+        }
+
         // Count teams for logging
         let teams_removed: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM team_users WHERE user_pubkey = $1")
                 .bind(pubkey)
-                .fetch_one(&mut *tx)
+                .fetch_one(&mut **tx)
                 .await?;
 
         // Count OAuth authorizations for logging
         let oauth_authorizations_deleted: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM oauth_authorizations WHERE user_pubkey = $1")
                 .bind(pubkey)
-                .fetch_one(&mut *tx)
+                .fetch_one(&mut **tx)
                 .await?;
 
         // Get bunker pubkeys for signer daemon notification (before deletion)
@@ -2859,20 +2992,20 @@ impl UserRepository {
             "SELECT bunker_public_key FROM oauth_authorizations WHERE user_pubkey = $1",
         )
         .bind(pubkey)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut **tx)
         .await?;
 
         // 1. Remove from all teams (no CASCADE, would block user delete)
         sqlx::query("DELETE FROM team_users WHERE user_pubkey = $1")
             .bind(pubkey)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
 
         // 2. Clear pending OAuth codes
         sqlx::query("DELETE FROM oauth_codes WHERE user_pubkey = $1 AND tenant_id = $2")
             .bind(pubkey)
             .bind(tenant_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
 
         // 3. Delete AP RSA key material. The FK cascade also handles this, but
@@ -2881,29 +3014,37 @@ impl UserRepository {
         sqlx::query("DELETE FROM ap_actor_keys WHERE user_pubkey = $1 AND tenant_id = $2")
             .bind(pubkey)
             .bind(tenant_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
 
-        // 4. Delete user (cascades to personal_keys, oauth_authorizations -> refresh_tokens,
+        // 4. Delete claim tokens. A token only exists to hand this account to its
+        // owner, so it cannot outlive the account. The FK cascade also handles this,
+        // but the explicit delete keeps deletion working on a database that has not
+        // applied the cascade migration yet, where the old NO ACTION constraint
+        // rejects the user delete outright (#296).
+        sqlx::query("DELETE FROM account_claim_tokens WHERE user_pubkey = $1")
+            .bind(pubkey)
+            .execute(&mut **tx)
+            .await?;
+
+        // 5. Delete user (cascades to personal_keys, oauth_authorizations -> refresh_tokens,
         //    email_verification_tokens, password_reset_tokens, user_profiles,
         //    account_claim_tokens)
         let result = sqlx::query("DELETE FROM users WHERE pubkey = $1 AND tenant_id = $2")
             .bind(pubkey)
             .bind(tenant_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
 
         if result.rows_affected() == 0 {
-            return Err(RepositoryError::NotFound("User not found".to_string()));
+            return Ok(AccountDeletionOutcome::AlreadyAbsent);
         }
 
-        tx.commit().await?;
-
-        Ok(DeleteAccountResult {
+        Ok(AccountDeletionOutcome::Deleted(DeleteAccountResult {
             teams_removed,
             oauth_authorizations_deleted,
             bunker_pubkeys,
-        })
+        }))
     }
 }
 
@@ -2916,6 +3057,19 @@ pub struct DeleteAccountResult {
     pub oauth_authorizations_deleted: i64,
     /// Bunker public keys for signer daemon notification
     pub bunker_pubkeys: Vec<String>,
+}
+
+/// What a deletion attempt found when it ran.
+///
+/// An idempotent caller needs to tell "I deleted it" apart from "it was already
+/// gone" while treating both as success, and needs the second case to stay
+/// committable rather than aborting the transaction.
+#[derive(Debug, Clone)]
+pub enum AccountDeletionOutcome {
+    /// The account existed in this tenant and every owned row was removed.
+    Deleted(DeleteAccountResult),
+    /// No such account in this tenant. Nothing was changed.
+    AlreadyAbsent,
 }
 
 #[cfg(all(test, feature = "integration-tests"))]

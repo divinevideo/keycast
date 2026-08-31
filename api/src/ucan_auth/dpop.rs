@@ -4,17 +4,21 @@
 use anyhow::{anyhow, Result};
 use axum::http::HeaderMap;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use dashmap::mapref::entry::Entry;
-use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use p256::ecdsa::{signature::Verifier, Signature as P256Signature, VerifyingKey};
 use p256::EncodedPoint;
 use serde_json::Value;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use thiserror::Error;
+
+use crate::replay_reservation::{
+    reservation_ttl_seconds, reserve_shared, truthy_env_value, LocalReplayCache,
+    SharedReservationOutcome,
+};
 
 /// Maximum age of a DPoP proof (5 minutes)
 const DPOP_MAX_AGE_SECS: u64 = 300;
+const REPLAY_RESERVATION_SKEW_MARGIN_SECONDS: i64 = 30;
 /// Explicit override for development-only degraded mode.
 const DPOP_REPLAY_FAIL_OPEN_ENV: &str = "DPOP_REPLAY_FAIL_OPEN";
 
@@ -42,28 +46,8 @@ const JTI_CLEANUP_INTERVAL_SECS: u64 = 60;
 /// Global JTI (JWT ID) replay protection cache
 /// Maps JTI string -> expiry instant
 /// Used as a fallback when Redis is unavailable.
-static JTI_CACHE: Lazy<DashMap<String, Instant>> = Lazy::new(DashMap::new);
-
-/// Track when we last ran cleanup to avoid doing it on every request
-static LAST_CLEANUP: Lazy<std::sync::Mutex<Instant>> =
-    Lazy::new(|| std::sync::Mutex::new(Instant::now()));
-
-/// Remove expired JTI entries from the cache (called inline, rate-limited)
-fn maybe_cleanup_jtis() {
-    let should_cleanup = LAST_CLEANUP
-        .lock()
-        .ok()
-        .map(|last| last.elapsed() > Duration::from_secs(JTI_CLEANUP_INTERVAL_SECS))
-        .unwrap_or(false);
-
-    if should_cleanup {
-        let now = Instant::now();
-        JTI_CACHE.retain(|_, expiry| *expiry > now);
-        if let Ok(mut last) = LAST_CLEANUP.lock() {
-            *last = now;
-        }
-    }
-}
+static JTI_CACHE: Lazy<LocalReplayCache> =
+    Lazy::new(|| LocalReplayCache::new(Duration::from_secs(JTI_CLEANUP_INTERVAL_SECS)));
 
 fn replay_cache_key(thumbprint: &str, jti: &str) -> String {
     // Replay key is scoped to DPoP key thumbprint + jti (RFC 9449 §11.1-compatible).
@@ -71,15 +55,8 @@ fn replay_cache_key(thumbprint: &str, jti: &str) -> String {
     format!("dpop:jti:{thumbprint}:{jti}")
 }
 
-fn parse_truthy_env(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
-
 fn dpop_replay_fail_open_from_env_value(value: Option<&str>) -> bool {
-    value.map(parse_truthy_env).unwrap_or(false)
+    truthy_env_value(value)
 }
 
 fn dpop_replay_fail_open_enabled() -> bool {
@@ -142,39 +119,32 @@ async fn record_jti_usage_with_fail_open(
     iat: i64,
     fail_open: bool,
 ) -> Result<()> {
-    if let Some(redis) = crate::state::get_keycast_state()
+    let redis = crate::state::get_keycast_state()
         .ok()
-        .and_then(|state| state.redis.clone())
-    {
-        match redis
-            // TTL must match DPoP proof freshness window (DPOP_MAX_AGE_SECS) to prevent
-            // replay acceptance after cache expiry while a proof is still considered fresh.
-            .set_nx_ex(replay_key, DPOP_MAX_AGE_SECS, &iat.to_string())
-            .await
-        {
-            Ok(true) => return Ok(()),
-            Ok(false) => return Err(anyhow!("DPoP proof JTI has already been used (replay)")),
-            Err(error) => {
-                handle_redis_replay_cache_error(&error, fail_open)?;
-            }
+        .and_then(|state| state.redis.clone());
+    let now = chrono::Utc::now().timestamp();
+    let ttl_seconds = reservation_ttl_seconds(
+        iat.saturating_add(DPOP_MAX_AGE_SECS as i64),
+        now,
+        (2 * DPOP_MAX_AGE_SECS) as i64,
+        REPLAY_RESERVATION_SKEW_MARGIN_SECONDS,
+    );
+
+    match reserve_shared(redis.as_ref(), replay_key, ttl_seconds, &iat.to_string()).await {
+        SharedReservationOutcome::Reserved => return Ok(()),
+        SharedReservationOutcome::Replay => {
+            return Err(anyhow!("DPoP proof JTI has already been used (replay)"));
         }
-    } else {
-        handle_redis_replay_cache_unavailable(fail_open)?;
+        SharedReservationOutcome::Unavailable(Some(error)) => {
+            handle_redis_replay_cache_error(&error, fail_open)?;
+        }
+        SharedReservationOutcome::Unavailable(None) => {
+            handle_redis_replay_cache_unavailable(fail_open)?;
+        }
     }
 
-    maybe_cleanup_jtis();
-    let now = Instant::now();
-    let expiry = now + Duration::from_secs(DPOP_MAX_AGE_SECS);
-    match JTI_CACHE.entry(replay_key.to_string()) {
-        Entry::Occupied(mut existing) => {
-            if *existing.get() > now {
-                return Err(anyhow!("DPoP proof JTI has already been used (replay)"));
-            }
-            existing.insert(expiry);
-        }
-        Entry::Vacant(vacant) => {
-            vacant.insert(expiry);
-        }
+    if !JTI_CACHE.reserve(replay_key, ttl_seconds) {
+        return Err(anyhow!("DPoP proof JTI has already been used (replay)"));
     }
     Ok(())
 }
@@ -826,14 +796,14 @@ mod tests {
 
     #[test]
     fn test_parse_truthy_env_values() {
-        assert!(parse_truthy_env("true"));
-        assert!(parse_truthy_env("TRUE"));
-        assert!(parse_truthy_env("1"));
-        assert!(parse_truthy_env("yes"));
-        assert!(parse_truthy_env("on"));
-        assert!(!parse_truthy_env("false"));
-        assert!(!parse_truthy_env("0"));
-        assert!(!parse_truthy_env("no"));
+        assert!(truthy_env_value(Some("true")));
+        assert!(truthy_env_value(Some("TRUE")));
+        assert!(truthy_env_value(Some("1")));
+        assert!(truthy_env_value(Some("yes")));
+        assert!(truthy_env_value(Some("on")));
+        assert!(!truthy_env_value(Some("false")));
+        assert!(!truthy_env_value(Some("0")));
+        assert!(!truthy_env_value(Some("no")));
     }
 
     #[test]
