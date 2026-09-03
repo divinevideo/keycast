@@ -29,6 +29,22 @@
 - `authorize_service_token(&headers)` already exists in `api/src/api/http/admin.rs` and is already
   used by `POST /admin/users/batch-lookup`. No new auth mechanism is introduced here.
 
+## Review
+
+**This needs Daniel's review before it lands.** It is not a self-contained feature: it adds public
+surface and writes inside core paths of the authentication service.
+
+Specifically worth his eye:
+- Three new service-token endpoints on keycast, and the fact that `KEYCAST_SERVICE_TOKEN` is a
+  single shared secret rather than per-service scoped, so a marketing sync service holding it can
+  also reach service-provisioning and ActivityPub gateway routes.
+- New columns on `users`, on a table central to authentication.
+- Statements added inside the account-deletion transaction (Task 4) and the email-change
+  finalization transaction (Task 4b). Both are correctness-critical: a write in the wrong place or
+  outside the transaction either loses the record or claims something happened that was rolled back.
+- Whether the cursor index `(updated_at, pubkey)` on `users` is acceptable on a table of this size
+  and write frequency.
+
 ## Prerequisite
 
 This plan amends the migration on **divinevideo/keycast#404 before that PR merges**. Nothing has shipped, so the migration file is rewritten in place rather than superseded. Work on branch `feat/marketing-consent-registration`.
@@ -43,6 +59,7 @@ This plan amends the migration on **divinevideo/keycast#404 before that PR merge
 |---|---|
 | `database/migrations/20260823120000_add_marketing_consent.sql` | Rewritten: tri-state consent event, suppression floor, renamed columns |
 | `database/migrations/20260903120000_email_marketing_deletions.sql` | New: deletion tombstones |
+| `database/migrations/20260903120100_email_marketing_email_changes.sql` | New: email-change rows |
 | `core/src/repositories/email_marketing.rs` | New: the `EmailMarketingConsent` enum and its conversions |
 | `core/src/repositories/oauth_code.rs` | Modified: carry tri-state consent through the three materialization write branches |
 | `core/src/repositories/user.rs` | Modified: write a tombstone during account deletion |
@@ -662,6 +679,297 @@ git commit -m "feat(consent): write a deletion tombstone for opted-in accounts"
 
 ---
 
+### Task 4b: Email-change rows
+
+**Files:**
+- Create: `database/migrations/20260903120100_email_marketing_email_changes.sql`
+- Modify: `core/src/repositories/user.rs` (the email-change finalize path, around line 1166)
+- Test: alongside the existing email-change tests
+
+**Interfaces:**
+- Consumes: Task 1's consent column.
+- Produces: table `email_marketing_email_changes (id BIGSERIAL, pubkey TEXT, old_email TEXT, new_email TEXT, changed_at TIMESTAMPTZ)`.
+
+**Why this exists.** keycast overwrites `users.email` in place, so a changed row reaching the sync
+service carries only the new address. Without the old one it cannot find the existing contact in the
+email platform: it would create a *second* contact and leave the original subscribed at an address
+the person has left, quietly mailing them there forever. This row is how the old address survives
+the overwrite.
+
+- [ ] **Step 1: Write the migration**
+
+```sql
+-- The old address, captured before it is overwritten.
+--
+-- `users.email` is updated in place when someone changes their email, so by the time the sync
+-- service sees the changed row it knows only the new address. It needs the old one to find and move
+-- the existing contact in the email platform. Without this the sync creates a duplicate contact and
+-- the previous address stays subscribed indefinitely.
+--
+-- Transient, like email_marketing_deletions: a row exists only until the sync service has moved the
+-- contact, then it is cleared.
+CREATE TABLE email_marketing_email_changes (
+    id         BIGSERIAL PRIMARY KEY,
+    pubkey     TEXT NOT NULL,
+    old_email  TEXT NOT NULL,
+    new_email  TEXT NOT NULL,
+    changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+- [ ] **Step 2: Write the failing test**
+
+```rust
+#[tokio::test]
+async fn finalizing_an_email_change_records_the_old_address() {
+    let pool = setup_pool().await;
+    let repo = UserRepository::new(pool.clone());
+    let pubkey = seed_user_with_pending_change(
+        &pool, "old@example.test", "new@example.test", "opted_in", "tok-1",
+    ).await;
+
+    repo.finalize_email_change(1, "tok-1").await.unwrap();
+
+    let (old, new): (String, String) = sqlx::query_as(
+        "SELECT old_email, new_email FROM email_marketing_email_changes WHERE pubkey = $1",
+    )
+    .bind(&pubkey)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(old, "old@example.test");
+    assert_eq!(new, "new@example.test");
+}
+
+#[tokio::test]
+async fn an_account_that_never_opted_in_records_no_email_change() {
+    // We only move contacts we created. Someone who never opted in has none of ours to move.
+    let pool = setup_pool().await;
+    let repo = UserRepository::new(pool.clone());
+    let pubkey = seed_user_with_pending_change(
+        &pool, "old2@example.test", "new2@example.test", "never_asked", "tok-2",
+    ).await;
+
+    repo.finalize_email_change(1, "tok-2").await.unwrap();
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM email_marketing_email_changes WHERE pubkey = $1",
+    )
+    .bind(&pubkey)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn the_recorded_old_address_is_the_pre_change_value() {
+    // The insert must read `email` BEFORE the UPDATE overwrites it. If the statements are ordered
+    // the other way round, old_email and new_email are identical and the sync service has no way to
+    // find the original contact.
+    let pool = setup_pool().await;
+    let repo = UserRepository::new(pool.clone());
+    let pubkey = seed_user_with_pending_change(
+        &pool, "before@example.test", "after@example.test", "opted_in", "tok-3",
+    ).await;
+
+    repo.finalize_email_change(1, "tok-3").await.unwrap();
+
+    let old: String = sqlx::query_scalar(
+        "SELECT old_email FROM email_marketing_email_changes WHERE pubkey = $1",
+    )
+    .bind(&pubkey)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_ne!(old, "after@example.test", "old_email captured after the overwrite");
+    assert_eq!(old, "before@example.test");
+}
+```
+
+Write `seed_user_with_pending_change` to insert a user with the given email and consent state plus a
+matching `pending_email` and `pending_email_verification_token`, mirroring the existing email-change
+tests in this file.
+
+- [ ] **Step 3: Run the tests to verify they fail**
+
+Run: `cargo test -p keycast_core email_change`
+Expected: FAIL, `relation "email_marketing_email_changes" does not exist`.
+
+- [ ] **Step 4: Record the old address before the overwrite**
+
+In `core/src/repositories/user.rs`, in the transaction that finalizes an email change, **immediately
+before** the `UPDATE users SET email = pending_email, ...` statement near line 1166:
+
+```rust
+        // Capture the outgoing address before the UPDATE overwrites it. Ordering is load-bearing:
+        // after the update, `email` is already the new value and old_email would be meaningless.
+        // Inside the transaction so a rolled-back change leaves no row claiming a move happened.
+        sqlx::query(
+            "INSERT INTO email_marketing_email_changes (pubkey, old_email, new_email, changed_at)
+             SELECT pubkey, email, pending_email, NOW() FROM users
+             WHERE pubkey = $1 AND tenant_id = $2
+               AND email IS NOT NULL
+               AND pending_email IS NOT NULL
+               AND email IS DISTINCT FROM pending_email
+               AND email_marketing_consent = 'opted_in'",
+        )
+        .bind(user_pubkey)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `cargo test -p keycast_core email_change`
+Expected: PASS, 3 tests.
+
+- [ ] **Step 6: Verify the ordering guard can fail**
+
+Temporarily move the INSERT to *after* the `UPDATE users SET email = pending_email` statement, then
+run `cargo test -p keycast_core the_recorded_old_address_is_the_pre_change_value`.
+Expected: FAIL, because `old_email` now equals the new address. Restore the order and confirm it
+passes. This ordering is the whole point of the task.
+
+- [ ] **Step 7: Commit**
+
+```bash
+cargo fmt && cargo clippy --all-targets -- -D warnings
+git add -A
+git commit -m "feat(consent): record the old address when an account email changes"
+```
+
+---
+
+### Task 4c: Expose email changes to the sync service
+
+**Files:**
+- Modify: `api/src/api/http/email_marketing.rs`, `api/src/api/http/routes.rs`
+- Test: `api/tests/email_marketing_endpoints_test.rs`
+
+**Note:** this task depends on Task 5 having created `api/src/api/http/email_marketing.rs`. Do Task 5 first, then return here, or fold this into Task 7 which adds the structurally identical tombstone endpoints.
+
+**Interfaces:**
+- Consumes: Task 4b's table; Task 5's module.
+- Produces: `GET /admin/email-marketing-email-changes?since=<id>&limit=<n>` returning `{"results":[{"id":n,"pubkey":"...","old_email":"...","new_email":"...","changed_at":"..."}]}`; `POST /admin/email-marketing-email-changes/ack` accepting `{"ids":[n]}` returning `{"cleared": n}`.
+
+- [ ] **Step 1: Write the failing test**
+
+```rust
+#[tokio::test]
+async fn lists_then_clears_email_changes_only_when_acknowledged() {
+    let pool = setup_pool().await;
+    sqlx::query(
+        "INSERT INTO email_marketing_email_changes (pubkey, old_email, new_email, changed_at)
+         VALUES ($1, $2, $3, NOW())",
+    )
+    .bind("aa".repeat(32))
+    .bind("old@example.test")
+    .bind("new@example.test")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let listed = get_email_changes(&pool, None, 10).await;
+    assert_eq!(listed.results.len(), 1);
+    assert_eq!(listed.results[0].old_email, "old@example.test");
+
+    // Unacknowledged rows stay, so a crash between read and act replays rather than loses.
+    assert_eq!(get_email_changes(&pool, None, 10).await.results.len(), 1);
+
+    ack_email_changes(&pool, &[listed.results[0].id]).await;
+    assert!(get_email_changes(&pool, None, 10).await.results.is_empty());
+}
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `cargo test -p keycast_api --test email_marketing_endpoints_test email_changes`
+Expected: FAIL, route not found (404).
+
+- [ ] **Step 3: Write the handlers**
+
+Structurally identical to the tombstone handlers in Task 7. Add to `api/src/api/http/email_marketing.rs`:
+
+```rust
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct EmailChangeRecord {
+    pub id: i64,
+    pub pubkey: String,
+    pub old_email: String,
+    pub new_email: String,
+    pub changed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmailChangePage {
+    pub results: Vec<EmailChangeRecord>,
+}
+
+pub async fn list_email_changes(
+    State(auth_state): State<AuthState>,
+    headers: HeaderMap,
+    Query(query): Query<DeletionPageQuery>,
+) -> Result<Json<EmailChangePage>, super::admin::AdminError> {
+    authorize_service_token(&headers)?;
+    let limit = query.limit.unwrap_or(500).clamp(1, MAX_LIMIT);
+
+    let results: Vec<EmailChangeRecord> = sqlx::query_as(
+        "SELECT id, pubkey, old_email, new_email, changed_at FROM email_marketing_email_changes
+         WHERE ($1::bigint IS NULL OR id > $1)
+         ORDER BY id LIMIT $2",
+    )
+    .bind(query.since)
+    .bind(limit)
+    .fetch_all(&auth_state.state.db)
+    .await
+    .map_err(|e| super::admin::AdminError::Internal(e.to_string()))?;
+
+    Ok(Json(EmailChangePage { results }))
+}
+
+pub async fn ack_email_changes(
+    State(auth_state): State<AuthState>,
+    headers: HeaderMap,
+    Json(req): Json<AckRequest>,
+) -> Result<Json<AckResponse>, super::admin::AdminError> {
+    authorize_service_token(&headers)?;
+
+    let result = sqlx::query("DELETE FROM email_marketing_email_changes WHERE id = ANY($1)")
+        .bind(&req.ids)
+        .execute(&auth_state.state.db)
+        .await
+        .map_err(|e| super::admin::AdminError::Internal(e.to_string()))?;
+
+    Ok(Json(AckResponse { cleared: result.rows_affected() }))
+}
+```
+
+- [ ] **Step 4: Mount the routes**
+
+```rust
+        .route("/admin/email-marketing-email-changes", get(email_marketing::list_email_changes))
+        .route("/admin/email-marketing-email-changes/ack", post(email_marketing::ack_email_changes))
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `cargo test -p keycast_api --test email_marketing_endpoints_test`
+Expected: PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+cargo fmt && cargo clippy --all-targets -- -D warnings
+git add -A
+git commit -m "feat(consent): expose email-change rows to the sync service"
+```
+
+---
+
 ### Task 5: Read consent by cursor
 
 **Files:**
@@ -1169,3 +1477,5 @@ git commit -m "docs(consent): document the marketing consent service endpoints"
 - [ ] `grep -rn "marketing_consent" api/src core/src` returns no unqualified names outside comments
 - [ ] `grep -rn "email_marketing_consent\s*=" api/src` shows the consent event written only during materialization
 - [ ] The race-fallback mutation check from Task 3 Step 8 was actually run and observed failing
+- [ ] The email-change ordering check from Task 4b Step 6 was actually run and observed failing
+- [ ] `SELECT old_email, new_email FROM email_marketing_email_changes` on a test change shows two different addresses
