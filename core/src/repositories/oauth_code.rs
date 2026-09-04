@@ -1928,6 +1928,92 @@ mod tests {
         }
     }
 
+    /// Two materializations of the same pending registration racing each other. One wins the
+    /// INSERT; the other hits `ON CONFLICT DO NOTHING`, returns no row, and falls into the
+    /// race-fallback path. The opt-in must survive whichever order they interleave in.
+    ///
+    /// This exists because the fallback path silently dropped consent once already. Note the
+    /// honest limit of this test: in the common interleaving the loser finds a *complete* row and
+    /// skips the fallback UPDATE altogether, so this guards the outcome (consent survives a race)
+    /// rather than proving the fallback's UPDATE statement itself ran. Forcing that statement
+    /// deterministically needs the winner's row to be incomplete at the moment the loser re-reads
+    /// it, which this harness cannot arrange.
+    #[tokio::test]
+    async fn test_marketing_consent_survives_concurrent_materialization() {
+        let pool = setup_pool().await;
+        let repo = OAuthCodeRepository::new(pool.clone());
+
+        let user_pubkey = nostr_sdk::Keys::generate().public_key().to_hex();
+        let code = format!("consent_race_{}", uuid::Uuid::new_v4());
+        let token = format!("consent_race_verif_{}", uuid::Uuid::new_v4());
+        let device_code = format!("consent_race_dc_{}", uuid::Uuid::new_v4());
+        let email = format!("consent-race-{}@example.com", uuid::Uuid::new_v4());
+
+        repo.store_with_pending_registration(StoreOAuthCodeWithRegistrationParams {
+            tenant_id: 1,
+            code: &code,
+            user_pubkey: &user_pubkey,
+            client_id: "test_client",
+            redirect_uri: "http://localhost:3000/callback",
+            scope: "policy:social",
+            code_challenge: None,
+            code_challenge_method: None,
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            pending_email: &email,
+            pending_password_hash: "hashed",
+            pending_email_verification_token: &token,
+            pending_encrypted_secret: Some(b"secret"),
+            pending_email_marketing_consent: EmailMarketingConsent::OptedIn,
+            pending_email_marketing_app_version: Some("1.42.0"),
+            state: None,
+            device_code: Some(&device_code),
+            is_headless: true,
+            pin_hash: Some("pin"),
+        })
+        .await
+        .unwrap();
+
+        let candidate_a = format!("race_a_{}", uuid::Uuid::new_v4());
+        let candidate_b = format!("race_b_{}", uuid::Uuid::new_v4());
+        let (first, second) = tokio::join!(
+            repo.materialize_pending_registration(1, &token, &candidate_a),
+            repo.materialize_pending_registration(1, &token, &candidate_b),
+        );
+        first.expect("first materializer must not error");
+        second.expect("second materializer must not error");
+
+        // Exactly one account, carrying the opt-in the person actually gave.
+        let (count, consent, consent_at): (i64, String, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT COUNT(*)::bigint, MIN(email_marketing_consent), MIN(email_marketing_consent_at)
+             FROM users WHERE pubkey = $1 AND tenant_id = 1",
+        )
+        .bind(&user_pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(count, 1, "a race must not create two accounts");
+        assert_eq!(
+            consent, "opted_in",
+            "a racing materialization must not lose the opt-in"
+        );
+        assert!(
+            consent_at.is_some(),
+            "the surviving row must still carry when consent was given"
+        );
+
+        sqlx::query("DELETE FROM oauth_codes WHERE user_pubkey = $1")
+            .bind(&user_pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(&user_pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
     /// The UPDATE branch of materialization (a pre-existing incomplete user —
     /// e.g. an anonymous account being upgraded) must also carry marketing
     /// consent onto the users row, not just the fresh-INSERT branch.
