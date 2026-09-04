@@ -19,6 +19,8 @@
 - All three new endpoints authenticate via the existing `authorize_service_token(&headers)`. Never `is_support_admin`.
 - The npub is internal. It appears in these APIs because the sync service writes state back by pubkey; it must never be forwarded to HubSpot.
 - Migrations must sort after main's latest (`20260822010000`). Check for prefix collisions before naming a new one.
+- **Every query is tenant-scoped.** keycast is multi-tenant; `batch_lookup_users` takes a `TenantExtractor` and filters on `tenant_id`, and these endpoints must do the same. An unscoped read or write crosses tenants.
+- Handlers return `ApiResult<Json<T>>`. `ApiError` has `Database(#[from] sqlx::Error)`, so `?` converts sqlx errors directly; do not wrap them.
 - No `Co-Authored-By` lines in commits.
 
 ## Verified preconditions
@@ -28,6 +30,14 @@
   depends on this; if that ever stops being true, email changes become invisible to the sync.
 - `authorize_service_token(&headers)` already exists in `api/src/api/http/admin.rs` and is already
   used by `POST /admin/users/batch-lookup`. No new auth mechanism is introduced here.
+- **Path convention, by precedent rather than traced.** `routes.rs` registers routes as
+  `/admin/...` with no `/api` prefix, and no `nest("/api")` exists anywhere in `api/src`. Yet the
+  2026-05-27 spec documents `POST /api/admin/users/batch-lookup` and `divine-invite-sync` calls that
+  path successfully in production. The prefix is therefore applied outside the application, by
+  ingress or a proxy. Register these routes as `/admin/...` to match the existing pattern, and
+  expect callers to reach them at `/api/admin/...`. **Confirm this against the deployed service
+  before assuming the syncer's URLs are right**: if the prefix is applied differently, the syncer
+  gets a 404 and no consent is ever synced.
 
 ## Review
 
@@ -569,6 +579,7 @@ git commit -m "feat(consent): carry tri-state consent, source and app version th
 -- deletion. No pubkey is stored: the account is gone, and the address is all that is needed.
 CREATE TABLE email_marketing_deletions (
     id         BIGSERIAL PRIMARY KEY,
+    tenant_id  BIGINT NOT NULL,
     email      TEXT NOT NULL,
     deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -648,8 +659,8 @@ In `delete_account_in_tx`, **before** the statement that removes the `users` row
         // should not act on records we do not own. Inside the transaction deliberately, so a
         // rolled-back deletion cannot leave an orphan tombstone that unsubscribes a live account.
         sqlx::query(
-            "INSERT INTO email_marketing_deletions (email, deleted_at)
-             SELECT email, NOW() FROM users
+            "INSERT INTO email_marketing_deletions (tenant_id, email, deleted_at)
+             SELECT tenant_id, email, NOW() FROM users
              WHERE pubkey = $1 AND tenant_id = $2
                AND email IS NOT NULL
                AND email_marketing_consent = 'opted_in'",
@@ -710,6 +721,7 @@ the overwrite.
 -- contact, then it is cleared.
 CREATE TABLE email_marketing_email_changes (
     id         BIGSERIAL PRIMARY KEY,
+    tenant_id  BIGINT NOT NULL,
     pubkey     TEXT NOT NULL,
     old_email  TEXT NOT NULL,
     new_email  TEXT NOT NULL,
@@ -808,8 +820,8 @@ before** the `UPDATE users SET email = pending_email, ...` statement near line 1
         // after the update, `email` is already the new value and old_email would be meaningless.
         // Inside the transaction so a rolled-back change leaves no row claiming a move happened.
         sqlx::query(
-            "INSERT INTO email_marketing_email_changes (pubkey, old_email, new_email, changed_at)
-             SELECT pubkey, email, pending_email, NOW() FROM users
+            "INSERT INTO email_marketing_email_changes (tenant_id, pubkey, old_email, new_email, changed_at)
+             SELECT tenant_id, pubkey, email, pending_email, NOW() FROM users
              WHERE pubkey = $1 AND tenant_id = $2
                AND email IS NOT NULL
                AND pending_email IS NOT NULL
@@ -910,39 +922,43 @@ pub struct EmailChangePage {
 }
 
 pub async fn list_email_changes(
+    tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
     headers: HeaderMap,
     Query(query): Query<DeletionPageQuery>,
-) -> Result<Json<EmailChangePage>, super::admin::AdminError> {
+) -> ApiResult<Json<EmailChangePage>> {
     authorize_service_token(&headers)?;
     let limit = query.limit.unwrap_or(500).clamp(1, MAX_LIMIT);
 
     let results: Vec<EmailChangeRecord> = sqlx::query_as(
         "SELECT id, pubkey, old_email, new_email, changed_at FROM email_marketing_email_changes
-         WHERE ($1::bigint IS NULL OR id > $1)
+         WHERE tenant_id = $3 AND ($1::bigint IS NULL OR id > $1)
          ORDER BY id LIMIT $2",
     )
     .bind(query.since)
     .bind(limit)
+    .bind(tenant.0.id)
     .fetch_all(&auth_state.state.db)
     .await
-    .map_err(|e| super::admin::AdminError::Internal(e.to_string()))?;
+    ?;
 
     Ok(Json(EmailChangePage { results }))
 }
 
 pub async fn ack_email_changes(
+    tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
     headers: HeaderMap,
     Json(req): Json<AckRequest>,
-) -> Result<Json<AckResponse>, super::admin::AdminError> {
+) -> ApiResult<Json<AckResponse>> {
     authorize_service_token(&headers)?;
 
-    let result = sqlx::query("DELETE FROM email_marketing_email_changes WHERE id = ANY($1)")
+    let result = sqlx::query("DELETE FROM email_marketing_email_changes WHERE id = ANY($1) AND tenant_id = $2")
         .bind(&req.ids)
+        .bind(tenant.0.id)
         .execute(&auth_state.state.db)
         .await
-        .map_err(|e| super::admin::AdminError::Internal(e.to_string()))?;
+        ?;
 
     Ok(Json(AckResponse { cleared: result.rows_affected() }))
 }
@@ -1044,6 +1060,7 @@ use serde::{Deserialize, Serialize};
 
 use super::admin::authorize_service_token;
 use super::routes::AuthState;
+use crate::api::error::ApiResult;
 
 #[derive(Debug, Deserialize)]
 pub struct ConsentPageQuery {
@@ -1083,10 +1100,11 @@ pub struct ConsentPage {
 const MAX_LIMIT: i64 = 1000;
 
 pub async fn list_consents(
+    tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
     headers: HeaderMap,
     Query(query): Query<ConsentPageQuery>,
-) -> Result<Json<ConsentPage>, super::admin::AdminError> {
+) -> ApiResult<Json<ConsentPage>> {
     authorize_service_token(&headers)?;
 
     let limit = query.limit.unwrap_or(500).clamp(1, MAX_LIMIT);
@@ -1102,16 +1120,18 @@ pub async fn list_consents(
                 email_marketing_optout_observed_at AS optout_observed_at,
                 updated_at
          FROM users
-         WHERE ($1::timestamptz IS NULL OR (updated_at, pubkey) > ($1, $2))
+         WHERE tenant_id = $4
+           AND ($1::timestamptz IS NULL OR (updated_at, pubkey) > ($1, $2))
          ORDER BY updated_at, pubkey
          LIMIT $3",
     )
     .bind(query.since)
     .bind(query.since_pubkey.unwrap_or_default())
     .bind(limit)
+    .bind(tenant.0.id)
     .fetch_all(&auth_state.state.db)
     .await
-    .map_err(|e| super::admin::AdminError::Internal(e.to_string()))?;
+    ?;
 
     let next = if rows.len() as i64 == limit {
         rows.last().map(|r| ConsentCursor { since: r.updated_at, since_pubkey: r.pubkey.clone() })
@@ -1239,10 +1259,11 @@ pub struct ObservationsResponse {
 /// statement: immutability is enforced by there being no code path that writes them, not by
 /// anyone remembering the rule.
 pub async fn record_observations(
+    tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
     headers: HeaderMap,
     Json(req): Json<ObservationsRequest>,
-) -> Result<Json<ObservationsResponse>, super::admin::AdminError> {
+) -> ApiResult<Json<ObservationsResponse>> {
     authorize_service_token(&headers)?;
 
     let mut updated = 0u64;
@@ -1253,15 +1274,16 @@ pub async fn record_observations(
             "UPDATE users
              SET email_marketing_global_optout = $2,
                  email_marketing_optout_observed_at = $3
-             WHERE pubkey = $1
+             WHERE pubkey = $1 AND tenant_id = $4
                AND (email_marketing_global_optout IS DISTINCT FROM $2)",
         )
         .bind(&obs.pubkey)
         .bind(obs.global_optout)
         .bind(obs.observed_at)
+        .bind(tenant.0.id)
         .execute(&auth_state.state.db)
         .await
-        .map_err(|e| super::admin::AdminError::Internal(e.to_string()))?;
+        ?;
         updated += result.rows_affected();
     }
 
@@ -1372,23 +1394,25 @@ pub struct AckResponse {
 }
 
 pub async fn list_deletions(
+    tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
     headers: HeaderMap,
     Query(query): Query<DeletionPageQuery>,
-) -> Result<Json<DeletionPage>, super::admin::AdminError> {
+) -> ApiResult<Json<DeletionPage>> {
     authorize_service_token(&headers)?;
     let limit = query.limit.unwrap_or(500).clamp(1, MAX_LIMIT);
 
     let results: Vec<DeletionRecord> = sqlx::query_as(
         "SELECT id, email, deleted_at FROM email_marketing_deletions
-         WHERE ($1::bigint IS NULL OR id > $1)
+         WHERE tenant_id = $3 AND ($1::bigint IS NULL OR id > $1)
          ORDER BY id LIMIT $2",
     )
     .bind(query.since)
     .bind(limit)
+    .bind(tenant.0.id)
     .fetch_all(&auth_state.state.db)
     .await
-    .map_err(|e| super::admin::AdminError::Internal(e.to_string()))?;
+    ?;
 
     Ok(Json(DeletionPage { results }))
 }
@@ -1396,17 +1420,19 @@ pub async fn list_deletions(
 /// Clearing is a separate call from listing so that a sync service which crashes after reading but
 /// before acting replays the deletion instead of dropping it.
 pub async fn ack_deletions(
+    tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
     headers: HeaderMap,
     Json(req): Json<AckRequest>,
-) -> Result<Json<AckResponse>, super::admin::AdminError> {
+) -> ApiResult<Json<AckResponse>> {
     authorize_service_token(&headers)?;
 
-    let result = sqlx::query("DELETE FROM email_marketing_deletions WHERE id = ANY($1)")
+    let result = sqlx::query("DELETE FROM email_marketing_deletions WHERE id = ANY($1) AND tenant_id = $2")
         .bind(&req.ids)
+        .bind(tenant.0.id)
         .execute(&auth_state.state.db)
         .await
-        .map_err(|e| super::admin::AdminError::Internal(e.to_string()))?;
+        ?;
 
     Ok(Json(AckResponse { cleared: result.rows_affected() }))
 }
@@ -1478,4 +1504,5 @@ git commit -m "docs(consent): document the marketing consent service endpoints"
 - [ ] `grep -rn "email_marketing_consent\s*=" api/src` shows the consent event written only during materialization
 - [ ] The race-fallback mutation check from Task 3 Step 8 was actually run and observed failing
 - [ ] The email-change ordering check from Task 4b Step 6 was actually run and observed failing
+- [ ] Every new SQL statement filters or sets `tenant_id`; `grep -n "email_marketing" api/src core/src` reviewed line by line for an unscoped query
 - [ ] `SELECT old_email, new_email FROM email_marketing_email_changes` on a test change shows two different addresses
