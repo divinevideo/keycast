@@ -382,3 +382,66 @@ Common HTTP status codes:
 - `404` - Not found
 - `409` - Conflict (duplicate resource)
 - `500` - Internal server error
+
+---
+
+## Email marketing consent (service token)
+
+Six endpoints used by the marketing consent sync worker. They authenticate with
+`KEYCAST_SERVICE_TOKEN` (constant-time bearer check), not with an admin UCAN, and every statement
+is tenant-scoped.
+
+keycast never calls the email platform. It records what happened; the sync worker acts on it.
+
+### Two different facts, deliberately kept apart
+
+- **The consent event** (`email_marketing_consent`, `_at`, `_source`, `_app_version`) is what
+  somebody answered, when, from where, and under which app version. It is **immutable**. No
+  endpoint here can write it: the observations endpoint's statement does not name those columns, so
+  the guarantee holds structurally rather than by convention. Overwriting it would destroy the
+  evidence that consent was validly obtained.
+- **The suppression floor** (`email_marketing_global_optout`, `_observed_at`) records that somebody
+  opted out of all email. It is **nullable, and NULL means never observed**, which is not the same
+  as "not opted out". It exists because the email platform forgets an opt-out as soon as an address
+  changes, so this is the only place that remembers. Any Divine system that sends marketing email
+  must respect it, whatever CRM it uses.
+
+### Endpoints
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/api/admin/email-marketing-consents` | Read consent by cursor |
+| POST | `/api/admin/email-marketing-consents/observed` | Write the suppression floor |
+| GET | `/api/admin/email-marketing-deletions` | Addresses whose account was deleted |
+| POST | `/api/admin/email-marketing-deletions/ack` | Clear deletions once acted on |
+| GET | `/api/admin/email-marketing-email-changes` | Addresses that moved |
+| POST | `/api/admin/email-marketing-email-changes/ack` | Clear email changes once acted on |
+
+### Cursor
+
+`GET /api/admin/email-marketing-consents?since=<timestamp>&since_pubkey=<pubkey>&limit=<n>`
+
+The cursor is the pair `(updated_at, pubkey)`, not a timestamp alone. Two accounts can share an
+`updated_at`, and a timestamp-only cursor would either skip one or loop on it forever. A response
+returns `next` only when the page was full; its absence means the caller has reached the end.
+Omitting `since` starts from the beginning, which is how a backfill or a reconciliation sweep
+enumerates everyone.
+
+### Read then acknowledge
+
+Deletions and email changes are read and cleared in **separate calls**. A worker that crashes
+between the two replays the row rather than losing it. Losing a deletion means continuing to email
+somebody who deleted their account; losing an email change means a duplicate contact with the old
+address still subscribed. Acknowledging an unknown id is harmless.
+
+### Why email changes are recorded at all
+
+keycast overwrites `users.email` in place, so a changed row carries only the new address. The sync
+worker needs the old one to find and move the existing contact. Without it, it would create a
+second contact and leave the previous address subscribed indefinitely. The row is written inside the
+same transaction that finalizes the change, capturing the outgoing address **before** the update
+overwrites it.
+
+Deletion and email-change rows are transient: they exist only until the worker has acted, which
+bounds how long an address is retained past account deletion. Both are written only for accounts
+whose consent state is `opted_in`, since those are the only contacts the sync created.
