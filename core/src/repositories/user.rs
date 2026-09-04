@@ -3027,6 +3027,26 @@ impl UserRepository {
             .execute(&mut **tx)
             .await?;
 
+        // 4b. Record the address so the sync service can remove the contact from the email
+        // platform. keycast hard-deletes, so once the row below is gone there is nothing left for a
+        // cursor-based sync to notice, and the person would keep receiving marketing after deleting
+        // their account.
+        //
+        // Only for accounts that actually opted in: those are the only contacts we created, and we
+        // should not act on records we do not own. Inside the transaction deliberately, so a
+        // rolled-back deletion cannot leave a tombstone that removes a live account's contact.
+        sqlx::query(
+            "INSERT INTO email_marketing_deletions (tenant_id, email, deleted_at)
+             SELECT tenant_id, email, NOW() FROM users
+             WHERE pubkey = $1 AND tenant_id = $2
+               AND email IS NOT NULL
+               AND email_marketing_consent = 'opted_in'",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .execute(&mut **tx)
+        .await?;
+
         // 5. Delete user (cascades to personal_keys, oauth_authorizations -> refresh_tokens,
         //    email_verification_tokens, password_reset_tokens, user_profiles,
         //    account_claim_tokens)
@@ -3096,6 +3116,89 @@ mod tests {
 
     fn test_suffix() -> String {
         uuid::Uuid::new_v4().to_string()[..8].to_string()
+    }
+
+    /// Deleting an opted-in account must leave the address behind for the sync service. keycast
+    /// hard-deletes, so without this there is nothing for a cursor-based sync to notice and the
+    /// person keeps receiving marketing after deleting their account.
+    #[tokio::test]
+    async fn test_account_deletion_leaves_a_tombstone_for_opted_in_accounts() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let email = format!("leaver-{}@example.test", test_suffix());
+        let pubkey = seed_consented_user(&pool, &email, "opted_in").await;
+
+        repo.delete_account(&pubkey, 1).await.unwrap();
+
+        let recorded: Option<String> =
+            sqlx::query_scalar("SELECT email FROM email_marketing_deletions WHERE email = $1")
+                .bind(&email)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded.as_deref(), Some(email.as_str()));
+
+        sqlx::query("DELETE FROM email_marketing_deletions WHERE email = $1")
+            .bind(&email)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// We only remove contacts we created. Someone who never opted in has no contact of ours to
+    /// delete, and writing a tombstone would have the sync act on a record it does not own.
+    #[tokio::test]
+    async fn test_account_deletion_leaves_no_tombstone_when_never_opted_in() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let email = format!("browser-{}@example.test", test_suffix());
+        let pubkey = seed_consented_user(&pool, &email, "never_asked").await;
+
+        repo.delete_account(&pubkey, 1).await.unwrap();
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM email_marketing_deletions WHERE email = $1")
+                .bind(&email)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// A declined answer is an answer, but it is not a contact we created, so it gets no tombstone
+    /// either. Only opted_in produces one.
+    #[tokio::test]
+    async fn test_account_deletion_leaves_no_tombstone_when_declined() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let email = format!("declined-{}@example.test", test_suffix());
+        let pubkey = seed_consented_user(&pool, &email, "declined").await;
+
+        repo.delete_account(&pubkey, 1).await.unwrap();
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM email_marketing_deletions WHERE email = $1")
+                .bind(&email)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    async fn seed_consented_user(pool: &PgPool, email: &str, consent: &str) -> String {
+        let pubkey = Keys::generate().public_key().to_hex();
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, email_marketing_consent,
+                                created_at, updated_at)
+             VALUES ($1, 1, $2, $3, NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .bind(email)
+        .bind(consent)
+        .execute(pool)
+        .await
+        .unwrap();
+        pubkey
     }
 
     fn plan_mentions_index(plan: &serde_json::Value, index_name: &str) -> bool {
