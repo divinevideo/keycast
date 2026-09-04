@@ -3,6 +3,7 @@
 
 use crate::activity_log::ActivityLogResult;
 use crate::handlers::http_rpc_handler::{HandlerError, HttpRpcHandler};
+use crate::state::{AccountGateState, AccountStatusCache};
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
@@ -46,6 +47,12 @@ const MAX_UNWRAP_BATCH: usize = 100;
 /// The shared rumor is processed sequentially so this is also a hard bound on
 /// per-request seal and gift-wrap crypto.
 const MAX_WRAP_BATCH: usize = 100;
+
+#[derive(Debug)]
+enum AccountGateLoadError {
+    Unavailable,
+    Query,
+}
 
 /// RPC request format (mirrors NIP-46)
 #[derive(Debug, Deserialize)]
@@ -221,14 +228,16 @@ async fn nostr_rpc_inner(
     // For mutating operations (sign/encrypt/decrypt), check user account status.
     // get_public_key is NOT gated -- suspended users need to retrieve their pubkey.
     // The same per-request row also carries verified_minor, which drives the DM
-    // containment gate below (support-trust-safety#183); reading it here (not
-    // from the cached handler) means protection flips apply immediately.
+    // containment gate below (support-trust-safety#183). This short-lived cache
+    // removes the mandatory pool checkout from warm calls while bounding
+    // cross-instance status and minor-safety changes to five seconds.
     // `sign_event` still reads the row, because the verified_minor gate below
     // depends on it, but is not refused on account status (keycast#373).
     let needs_status_check = !matches!(req.method.as_str(), "get_public_key");
     let verified_minor = if needs_status_check {
         let deny_when_restricted = req.method.as_str() != "sign_event";
         check_user_status_active(
+            &auth_state.state.account_status_cache,
             pool,
             &handler.user_pubkey_hex(),
             tenant_id,
@@ -557,7 +566,12 @@ fn batch_operation_outcome(results: &[JsonValue]) -> &'static str {
 }
 
 /// Read the account gate state before a mutating operation.
-/// This runs a DB query per request (not cached) so status changes take effect immediately.
+///
+/// Cache misses query Postgres and fail closed. Concurrent misses for one account
+/// are coalesced, backend errors are not cached, and local writes remove the
+/// current entry after commit. A load that started before invalidation can still
+/// repopulate its result, so concurrent local writes and changes made on another
+/// instance both remain bounded by [`crate::state::ACCOUNT_STATUS_CACHE_TTL`].
 /// Returns the account's `verified_minor` flag (same row, no extra query) for
 /// the DM containment gate; a missing user row is a refusal, never a default.
 ///
@@ -568,6 +582,7 @@ fn batch_operation_outcome(results: &[JsonValue]) -> &'static str {
 /// and republishes elsewhere. Enforcement governs what Divine hosts — the relay
 /// rejects banned authors on write — not whether the identity can act off Divine.
 async fn check_user_status_active(
+    cache: &AccountStatusCache,
     pool: &sqlx::PgPool,
     user_pubkey_hex: &str,
     tenant_id: i64,
@@ -575,7 +590,79 @@ async fn check_user_status_active(
 ) -> Result<bool, RpcError> {
     let status_started = Instant::now();
     METRICS.set_http_rpc_db_pool_state(pool.size(), pool.num_idle() as u32);
+    let cache_key = (tenant_id, user_pubkey_hex.to_string());
+    let pool = pool.clone();
+    let pubkey = user_pubkey_hex.to_string();
 
+    let cache_hit = cache.get(&cache_key).await.is_some();
+    if cache_hit {
+        METRICS.inc_http_rpc_account_status_cache_hit();
+    } else {
+        METRICS.inc_http_rpc_account_status_cache_miss();
+    }
+
+    let status = match cache
+        .try_get_with(cache_key, async move {
+            load_account_gate_state(&pool, &pubkey, tenant_id).await
+        })
+        .await
+    {
+        Ok(status) => status,
+        Err(error) => {
+            let result = Err(match error.as_ref() {
+                AccountGateLoadError::Unavailable => {
+                    RpcError::Unavailable("Database temporarily unavailable".to_string())
+                }
+                AccountGateLoadError::Query => {
+                    RpcError::Internal("Database error checking user status".to_string())
+                }
+            });
+            METRICS.observe_http_rpc_status_check(
+                http_rpc_outcome_for_status_check(&result),
+                status_started.elapsed(),
+            );
+            return result;
+        }
+    };
+
+    METRICS.set_http_rpc_account_status_cache_size(cache.entry_count());
+
+    let result = match status {
+        AccountGateState::Present {
+            status,
+            verified_minor,
+        } if status == "active" => Ok(verified_minor),
+        AccountGateState::Present {
+            status,
+            verified_minor,
+        } if !deny_when_restricted => {
+            tracing::info!(
+                event = "rpc.sign_allowed_for_restricted_account",
+                status = %status,
+                "Signing allowed for a restricted account (keycast#373)"
+            );
+            Ok(verified_minor)
+        }
+        AccountGateState::Present { .. } => {
+            Err(RpcError::AccountSuspended("Account restricted".to_string()))
+        }
+        AccountGateState::Missing => Err(RpcError::Auth(AuthError::InvalidToken)),
+    };
+
+    if !cache_hit {
+        METRICS.observe_http_rpc_status_check(
+            http_rpc_outcome_for_status_check(&result),
+            status_started.elapsed(),
+        );
+    }
+    result
+}
+
+async fn load_account_gate_state(
+    pool: &sqlx::PgPool,
+    user_pubkey_hex: &str,
+    tenant_id: i64,
+) -> Result<AccountGateState, AccountGateLoadError> {
     let acquire_started = Instant::now();
     let mut conn = match pool.acquire().await {
         Ok(conn) => {
@@ -592,14 +679,11 @@ async fn check_user_status_active(
                 "unavailable",
                 acquire_started.elapsed(),
             );
-            METRICS.observe_http_rpc_status_check("unavailable", status_started.elapsed());
             // Detail to the log only: connect-level failures carry host, DNS and
             // TLS text and this response is reachable before the caller is known
             // to be legitimate.
             tracing::warn!(error = %e, "HTTP RPC could not acquire a connection for the status check");
-            return Err(RpcError::Unavailable(
-                "Database temporarily unavailable".to_string(),
-            ));
+            return Err(AccountGateLoadError::Unavailable);
         }
     };
 
@@ -611,30 +695,28 @@ async fn check_user_status_active(
     .fetch_optional(&mut *conn)
     .await
     .map_err(|e| {
-        METRICS.observe_http_rpc_status_check("error", status_started.elapsed());
         tracing::error!(error = %e, "HTTP RPC user status query failed");
-        RpcError::Internal("Database error checking user status".to_string())
+        AccountGateLoadError::Query
     })?;
 
-    let result = match status {
-        Some((s, verified_minor)) if s == "active" => Ok(verified_minor),
-        Some((s, verified_minor)) if !deny_when_restricted => {
-            tracing::info!(
-                event = "rpc.sign_allowed_for_restricted_account",
-                status = %s,
-                "Signing allowed for a restricted account (keycast#373)"
-            );
-            Ok(verified_minor)
-        }
-        Some(_) => Err(RpcError::AccountSuspended("Account restricted".to_string())),
-        None => Err(RpcError::Auth(AuthError::InvalidToken)),
-    };
+    Ok(match status {
+        Some((status, verified_minor)) => AccountGateState::Present {
+            status,
+            verified_minor,
+        },
+        None => AccountGateState::Missing,
+    })
+}
 
-    METRICS.observe_http_rpc_status_check(
-        http_rpc_outcome_for_status_check(&result),
-        status_started.elapsed(),
-    );
-    result
+pub(crate) async fn invalidate_account_status_cache(
+    cache: &AccountStatusCache,
+    user_pubkey_hex: &str,
+    tenant_id: i64,
+) {
+    cache
+        .invalidate(&(tenant_id, user_pubkey_hex.to_string()))
+        .await;
+    METRICS.set_http_rpc_account_status_cache_size(cache.entry_count());
 }
 
 fn http_rpc_outcome_for_status_check(result: &Result<bool, RpcError>) -> &'static str {

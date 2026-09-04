@@ -2617,6 +2617,12 @@ pub async fn set_user_status_admin(
     let (old_status, updated_status, suspended_reason, suspended_at) = user_repo
         .set_user_status(&pubkey, tenant_id, &status, reason)
         .await?;
+    super::nostr_rpc::invalidate_account_status_cache(
+        &auth_state.state.account_status_cache,
+        &pubkey,
+        tenant_id,
+    )
+    .await;
 
     tracing::info!(
         event = "user_status_changed",
@@ -2752,6 +2758,12 @@ pub async fn clear_verified_minor_admin(
 
     let user_repo = UserRepository::new(auth_state.state.db.clone());
     let transitioned = user_repo.clear_verified_minor(&pubkey, tenant_id).await?;
+    super::nostr_rpc::invalidate_account_status_cache(
+        &auth_state.state.account_status_cache,
+        &pubkey,
+        tenant_id,
+    )
+    .await;
 
     tracing::info!(
         event = "verified_minor_cleared",

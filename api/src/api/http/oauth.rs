@@ -4847,6 +4847,7 @@ mod tests {
                 key_manager,
                 signer_handlers: None,
                 http_handler_cache: crate::handlers::http_rpc_handler::new_http_handler_cache(),
+                account_status_cache: crate::state::new_account_status_cache(),
                 server_keys: Keys::generate(),
                 tenant_cache,
                 bcrypt,

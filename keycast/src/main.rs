@@ -1483,6 +1483,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         key_manager: Arc::new(api_key_manager),
         signer_handlers: None, // Deprecated: api uses http_handler_cache with on-demand loading
         http_handler_cache: new_http_handler_cache(),
+        account_status_cache: keycast_api::state::new_account_status_cache(),
         server_keys,
         tenant_cache,
         bcrypt: bcrypt.clone(),
