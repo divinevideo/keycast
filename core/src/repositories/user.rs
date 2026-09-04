@@ -1161,6 +1161,34 @@ impl UserRepository {
         tenant_id: i64,
     ) -> Result<FinalizeEmailOutcome, RepositoryError> {
         let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+
+        // Capture the outgoing address BEFORE the UPDATE below overwrites it. Ordering is
+        // load-bearing: afterwards `email` is already the new value and old_email would be
+        // meaningless, leaving the sync service unable to find the existing contact. It would then
+        // create a duplicate and leave the previous address subscribed indefinitely.
+        //
+        // The guards mirror the UPDATE's exactly, so a change that is not actually ready records
+        // nothing. Only opted-in accounts: those are the only contacts we created. In the same
+        // transaction, so a failed finalize leaves no row claiming a move happened.
+        sqlx::query(
+            "INSERT INTO email_marketing_email_changes
+                 (tenant_id, pubkey, old_email, new_email, changed_at)
+             SELECT tenant_id, pubkey, email, pending_email, $1 FROM users
+             WHERE pubkey = $2 AND tenant_id = $3
+               AND pending_email IS NOT NULL
+               AND pending_email_old_confirmed_at IS NOT NULL
+               AND pending_email_new_confirmed_at IS NOT NULL
+               AND email IS NOT NULL
+               AND email IS DISTINCT FROM pending_email
+               AND email_marketing_consent = 'opted_in'",
+        )
+        .bind(now)
+        .bind(pubkey)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+
         let result = sqlx::query(
             "UPDATE users
              SET email = pending_email,
@@ -1181,17 +1209,29 @@ impl UserRepository {
         .bind(now)
         .bind(pubkey)
         .bind(tenant_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await;
 
         match result {
-            Ok(r) if r.rows_affected() > 0 => Ok(FinalizeEmailOutcome::Finalized),
-            Ok(_) => Ok(FinalizeEmailOutcome::NotReady),
+            Ok(r) if r.rows_affected() > 0 => {
+                tx.commit().await?;
+                Ok(FinalizeEmailOutcome::Finalized)
+            }
+            Ok(_) => {
+                // Not ready: roll back so the tombstone-style row cannot survive a change that
+                // never happened.
+                tx.rollback().await?;
+                Ok(FinalizeEmailOutcome::NotReady)
+            }
             Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+                tx.rollback().await?;
                 self.clear_pending_email_change(pubkey, tenant_id).await?;
                 Ok(FinalizeEmailOutcome::EmailTaken)
             }
-            Err(e) => Err(e.into()),
+            Err(e) => {
+                tx.rollback().await?;
+                Err(e.into())
+            }
         }
     }
 
@@ -3199,6 +3239,145 @@ mod tests {
         .await
         .unwrap();
         pubkey
+    }
+
+    /// keycast overwrites users.email in place, so the sync service only ever sees the new address.
+    /// The old one has to be captured before the overwrite or the sync cannot find the existing
+    /// contact, creates a duplicate, and leaves the previous address subscribed.
+    #[tokio::test]
+    async fn test_finalizing_an_email_change_records_the_old_address() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let old_email = format!("before-{}@example.test", test_suffix());
+        let new_email = format!("after-{}@example.test", test_suffix());
+        let pubkey =
+            seed_user_with_confirmed_email_change(&pool, &old_email, &new_email, "opted_in").await;
+
+        let outcome = repo
+            .finalize_email_change_if_ready(&pubkey, 1)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, FinalizeEmailOutcome::Finalized));
+
+        let (recorded_old, recorded_new): (String, String) = sqlx::query_as(
+            "SELECT old_email, new_email FROM email_marketing_email_changes WHERE pubkey = $1",
+        )
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // The ordering guard: if the INSERT ran after the UPDATE, old_email would already be the
+        // new address and the row would be useless.
+        assert_eq!(
+            recorded_old, old_email,
+            "old_email captured after the overwrite"
+        );
+        assert_eq!(recorded_new, new_email);
+
+        cleanup_email_change(&pool, &pubkey).await;
+    }
+
+    /// We only move contacts we created, so an account that never opted in records nothing.
+    #[tokio::test]
+    async fn test_email_change_records_nothing_when_never_opted_in() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let old_email = format!("nc-before-{}@example.test", test_suffix());
+        let new_email = format!("nc-after-{}@example.test", test_suffix());
+        let pubkey =
+            seed_user_with_confirmed_email_change(&pool, &old_email, &new_email, "never_asked")
+                .await;
+
+        repo.finalize_email_change_if_ready(&pubkey, 1)
+            .await
+            .unwrap();
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM email_marketing_email_changes WHERE pubkey = $1",
+        )
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
+
+        cleanup_email_change(&pool, &pubkey).await;
+    }
+
+    /// A change that is not ready must record nothing. The INSERT's guards mirror the UPDATE's, and
+    /// the whole thing is one transaction, so a NotReady outcome leaves no row behind claiming a
+    /// move happened.
+    #[tokio::test]
+    async fn test_email_change_records_nothing_when_not_ready() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let old_email = format!("nr-before-{}@example.test", test_suffix());
+        let new_email = format!("nr-after-{}@example.test", test_suffix());
+        let pubkey =
+            seed_user_with_confirmed_email_change(&pool, &old_email, &new_email, "opted_in").await;
+
+        // Only one side confirmed: the change is not ready to finalize.
+        sqlx::query("UPDATE users SET pending_email_new_confirmed_at = NULL WHERE pubkey = $1")
+            .bind(&pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let outcome = repo
+            .finalize_email_change_if_ready(&pubkey, 1)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, FinalizeEmailOutcome::NotReady));
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM email_marketing_email_changes WHERE pubkey = $1",
+        )
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "an unfinalized change must leave no row");
+
+        cleanup_email_change(&pool, &pubkey).await;
+    }
+
+    async fn seed_user_with_confirmed_email_change(
+        pool: &PgPool,
+        old_email: &str,
+        new_email: &str,
+        consent: &str,
+    ) -> String {
+        let pubkey = Keys::generate().public_key().to_hex();
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, email_verified, email_marketing_consent,
+                                pending_email, pending_email_old_confirmed_at,
+                                pending_email_new_confirmed_at, pending_email_expires_at,
+                                created_at, updated_at)
+             VALUES ($1, 1, $2, true, $3, $4, NOW(), NOW(), NOW() + interval '1 hour',
+                     NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .bind(old_email)
+        .bind(consent)
+        .bind(new_email)
+        .execute(pool)
+        .await
+        .unwrap();
+        pubkey
+    }
+
+    async fn cleanup_email_change(pool: &PgPool, pubkey: &str) {
+        sqlx::query("DELETE FROM email_marketing_email_changes WHERE pubkey = $1")
+            .bind(pubkey)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(pubkey)
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     fn plan_mentions_index(plan: &serde_json::Value, index_name: &str) -> bool {
