@@ -1,6 +1,7 @@
 // ABOUTME: Repository for OAuth authorization codes
 // ABOUTME: Handles temporary code storage for OAuth 2.0 authorization flow
 
+use crate::repositories::EmailMarketingConsent;
 use crate::repositories::RepositoryError;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
@@ -21,9 +22,11 @@ pub struct OAuthCodeData {
     pub pending_password_hash: Option<String>,
     pub pending_email_verification_token: Option<String>,
     pub pending_encrypted_secret: Option<Vec<u8>>,
-    /// Marketing-communications opt-in the user chose on the create-account screen. Carried on the
-    /// pending row and written onto the materialized user; FALSE for every non-registration code.
-    pub pending_marketing_consent: bool,
+    /// The consent answer carried on the pending row and written onto the materialized user.
+    /// Stored as text; parse with EmailMarketingConsent::from_db at the point of use.
+    pub pending_email_marketing_consent: String,
+    /// Client app version at the moment of the answer, so we can tell which wording was shown.
+    pub pending_email_marketing_app_version: Option<String>,
     pub previous_auth_id: Option<i32>,
     pub state: Option<String>,
     /// RFC 8628 device_code for secure polling (returned in response body, never in URLs)
@@ -100,9 +103,11 @@ pub struct StoreOAuthCodeWithRegistrationParams<'a> {
     pub pending_password_hash: &'a str,
     pub pending_email_verification_token: &'a str,
     pub pending_encrypted_secret: Option<&'a [u8]>,
-    /// Marketing-communications opt-in from the create-account screen; defaults false when the
-    /// client omits it (older apps, non-consent flows).
-    pub pending_marketing_consent: bool,
+    /// The consent answer from the create-account screen. `NeverAsked` for flows that do not show
+    /// the choice (browser OAuth, older clients).
+    pub pending_email_marketing_consent: EmailMarketingConsent,
+    /// Client app version at the moment of the answer. None when the client does not send it.
+    pub pending_email_marketing_app_version: Option<&'a str>,
     pub state: Option<&'a str>,
     /// RFC 8628 device_code for secure polling (returned in response body, never in URLs)
     pub device_code: Option<&'a str>,
@@ -312,8 +317,8 @@ impl OAuthCodeRepository {
         let mut tx = self.pool.begin().await?;
         let row: Option<(Option<String>,)> = sqlx::query_as(
             "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at,
-             pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret, state, device_code, is_headless, pin_hash, pin_sent_at, pending_marketing_consent)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+             pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret, state, device_code, is_headless, pin_hash, pin_sent_at, pending_email_marketing_consent, pending_email_marketing_app_version)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
              ON CONFLICT (tenant_id, lower(pending_email))
                  WHERE pending_email IS NOT NULL AND consumed_at IS NULL
              DO UPDATE SET
@@ -328,7 +333,8 @@ impl OAuthCodeRepository {
                  pending_password_hash = EXCLUDED.pending_password_hash,
                  pending_email_verification_token = EXCLUDED.pending_email_verification_token,
                  pending_encrypted_secret = EXCLUDED.pending_encrypted_secret,
-                 pending_marketing_consent = EXCLUDED.pending_marketing_consent,
+                 pending_email_marketing_consent = EXCLUDED.pending_email_marketing_consent,
+                 pending_email_marketing_app_version = EXCLUDED.pending_email_marketing_app_version,
                  state = EXCLUDED.state,
                  is_headless = EXCLUDED.is_headless,
                  pin_hash = EXCLUDED.pin_hash,
@@ -362,7 +368,8 @@ impl OAuthCodeRepository {
         .bind(params.pin_hash)
         // pin_sent_at tracks confirmed delivery; callers set it after the email send succeeds.
         .bind(None::<DateTime<Utc>>)
-        .bind(params.pending_marketing_consent)
+        .bind(params.pending_email_marketing_consent.as_str())
+        .bind(params.pending_email_marketing_app_version)
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -438,10 +445,23 @@ impl OAuthCodeRepository {
             RepositoryError::Integrity("pending registration has no password hash".to_string())
         })?;
         let now = Utc::now();
-        // Consent is the choice made on the create-account screen, carried on the pending row.
-        // Stamp the timestamp only when the user opted in, so a NULL means "never opted in".
-        let marketing_consent = pending.pending_marketing_consent;
-        let marketing_consent_at = marketing_consent.then_some(now);
+        // The consent answer carried on the pending row. Stamped whenever they answered, either
+        // way: only "never asked" leaves the timestamp NULL, which is what keeps "declined"
+        // distinguishable from "never offered the choice".
+        let consent = EmailMarketingConsent::from_db(&pending.pending_email_marketing_consent)
+            .map_err(RepositoryError::Integrity)?;
+        let consent_state = consent.as_str();
+        let consent_at = match consent {
+            EmailMarketingConsent::NeverAsked => None,
+            _ => Some(now),
+        };
+        // Derived server-side rather than taken from the client: the endpoint knows which surface
+        // this came from, and a client cannot misreport its own provenance.
+        let consent_source = match consent {
+            EmailMarketingConsent::NeverAsked => None,
+            _ => Some("mobile_create_account"),
+        };
+        let consent_app_version = pending.pending_email_marketing_app_version.as_deref();
 
         let existing: Option<(Option<String>, bool, bool)> = sqlx::query_as(
             "SELECT u.email, u.email_verified,
@@ -483,7 +503,10 @@ impl OAuthCodeRepository {
                                  SET email = $1, password_hash = COALESCE(password_hash, $2),
                                      email_verified = true, email_verification_token = $3,
                                      updated_at = $4,
-                                     marketing_consent = $7, marketing_consent_at = $8
+                                     email_marketing_consent = $7,
+                                     email_marketing_consent_at = $8,
+                                     email_marketing_consent_source = $9,
+                                     email_marketing_consent_app_version = $10
                                  WHERE pubkey = $5 AND tenant_id = $6",
                             )
                             .bind(email)
@@ -492,8 +515,10 @@ impl OAuthCodeRepository {
                             .bind(now)
                             .bind(&pending.user_pubkey)
                             .bind(tenant_id)
-                            .bind(marketing_consent)
-                            .bind(marketing_consent_at)
+                            .bind(consent_state)
+                            .bind(consent_at)
+                            .bind(consent_source)
+                            .bind(consent_app_version)
                             .execute(&mut *tx)
                             .await?;
                         }
@@ -508,8 +533,9 @@ impl OAuthCodeRepository {
                 "INSERT INTO users
                      (pubkey, tenant_id, email, password_hash, email_verified,
                       email_verification_token, created_at, updated_at,
-                      marketing_consent, marketing_consent_at)
-                 VALUES ($1, $2, $3, $4, true, $5, $6, $6, $7, $8)
+                      email_marketing_consent, email_marketing_consent_at,
+                      email_marketing_consent_source, email_marketing_consent_app_version)
+                 VALUES ($1, $2, $3, $4, true, $5, $6, $6, $7, $8, $9, $10)
                  ON CONFLICT DO NOTHING
                  RETURNING pubkey",
             )
@@ -519,8 +545,10 @@ impl OAuthCodeRepository {
             .bind(password_hash)
             .bind(verification_token)
             .bind(now)
-            .bind(marketing_consent)
-            .bind(marketing_consent_at)
+            .bind(consent_state)
+            .bind(consent_at)
+            .bind(consent_source)
+            .bind(consent_app_version)
             .fetch_optional(&mut *tx)
             .await?;
 
@@ -565,7 +593,10 @@ impl OAuthCodeRepository {
                                      SET email = $1, password_hash = COALESCE(password_hash, $2),
                                          email_verified = true, email_verification_token = $3,
                                          updated_at = $4,
-                                         marketing_consent = $7, marketing_consent_at = $8
+                                         email_marketing_consent = $7,
+                                         email_marketing_consent_at = $8,
+                                         email_marketing_consent_source = $9,
+                                         email_marketing_consent_app_version = $10
                                      WHERE pubkey = $5 AND tenant_id = $6",
                                 )
                                 .bind(email)
@@ -574,8 +605,10 @@ impl OAuthCodeRepository {
                                 .bind(now)
                                 .bind(&pending.user_pubkey)
                                 .bind(tenant_id)
-                                .bind(marketing_consent)
-                                .bind(marketing_consent_at)
+                                .bind(consent_state)
+                                .bind(consent_at)
+                                .bind(consent_source)
+                                .bind(consent_app_version)
                                 .execute(&mut *tx)
                                 .await?;
                             }
@@ -754,7 +787,8 @@ impl OAuthCodeRepository {
     const SELECT_COLUMNS: &'static str =
         "user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method, \
          pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret, \
-         pending_marketing_consent, \
+         pending_email_marketing_consent, \
+         pending_email_marketing_app_version, \
          previous_auth_id, state, device_code, is_headless, pin_hash, pin_attempts, \
          pin_failed_total, pin_sent_at, pin_resend_at, consumed_at, expires_at";
 
@@ -1748,7 +1782,8 @@ mod tests {
             pending_password_hash: "hashed",
             pending_email_verification_token: &token,
             pending_encrypted_secret: Some(b"secret"),
-            pending_marketing_consent: false,
+            pending_email_marketing_consent: EmailMarketingConsent::NeverAsked,
+            pending_email_marketing_app_version: None,
             state: None,
             device_code: Some(device_code),
             is_headless: true,
@@ -1782,9 +1817,9 @@ mod tests {
         *finalized
     }
 
-    /// Marketing consent chosen at register time must ride the pending row through
-    /// materialization onto the users row, and marketing_consent_at must be stamped only when the
-    /// user actually opted in (NULL otherwise). Guards the create-account opt-in capture.
+    /// The consent answer chosen at register time must ride the pending row through
+    /// materialization onto the users row, and be timestamped whenever the person answered,
+    /// either way. Guards the create-account opt-in capture.
     #[tokio::test]
     async fn test_marketing_consent_threads_from_pending_to_materialized_user() {
         async fn register_and_materialize(
@@ -1811,7 +1846,10 @@ mod tests {
                 pending_password_hash: "hashed",
                 pending_email_verification_token: &token,
                 pending_encrypted_secret: Some(b"secret"),
-                pending_marketing_consent: marketing_consent,
+                pending_email_marketing_consent: EmailMarketingConsent::from(Some(
+                    marketing_consent,
+                )),
+                pending_email_marketing_app_version: None,
                 state: None,
                 device_code: Some(&device_code),
                 is_headless: true,
@@ -1838,7 +1876,7 @@ mod tests {
         // Opted in: consent true and marketing_consent_at is stamped.
         let opted_in_pubkey = register_and_materialize(&repo, true).await;
         let (consent, consent_at): (bool, Option<DateTime<Utc>>) = sqlx::query_as(
-            "SELECT marketing_consent, marketing_consent_at FROM users WHERE pubkey = $1",
+            "SELECT email_marketing_consent = 'opted_in', email_marketing_consent_at FROM users WHERE pubkey = $1",
         )
         .bind(&opted_in_pubkey)
         .fetch_one(&pool)
@@ -1856,19 +1894,19 @@ mod tests {
         // Declined: consent false and marketing_consent_at stays NULL.
         let declined_pubkey = register_and_materialize(&repo, false).await;
         let (consent, consent_at): (bool, Option<DateTime<Utc>>) = sqlx::query_as(
-            "SELECT marketing_consent, marketing_consent_at FROM users WHERE pubkey = $1",
+            "SELECT email_marketing_consent = 'opted_in', email_marketing_consent_at FROM users WHERE pubkey = $1",
         )
         .bind(&declined_pubkey)
         .fetch_one(&pool)
         .await
         .unwrap();
+        assert!(!consent, "declined user must not be opted in");
+        // Changed deliberately from the previous boolean design: an answer is timestamped whichever
+        // way it went. Only "never asked" leaves this NULL, which is what keeps "they saw the
+        // checkbox and declined" distinguishable from "nobody ever offered them the choice".
         assert!(
-            !consent,
-            "declined user should have marketing_consent = false"
-        );
-        assert!(
-            consent_at.is_none(),
-            "declined user should have NULL marketing_consent_at",
+            consent_at.is_some(),
+            "a declined answer is still an answer and must be timestamped",
         );
 
         for pubkey in [opted_in_pubkey, declined_pubkey] {
@@ -1929,7 +1967,8 @@ mod tests {
             pending_password_hash: "hashed",
             pending_email_verification_token: &token,
             pending_encrypted_secret: Some(b"secret"),
-            pending_marketing_consent: true,
+            pending_email_marketing_consent: EmailMarketingConsent::OptedIn,
+            pending_email_marketing_app_version: Some("1.42.0"),
             state: None,
             device_code: Some(&device_code),
             is_headless: true,
@@ -1949,7 +1988,7 @@ mod tests {
         );
 
         let (consent, consent_at): (bool, Option<DateTime<Utc>>) = sqlx::query_as(
-            "SELECT marketing_consent, marketing_consent_at FROM users WHERE pubkey = $1",
+            "SELECT email_marketing_consent = 'opted_in', email_marketing_consent_at FROM users WHERE pubkey = $1",
         )
         .bind(&user_pubkey)
         .fetch_one(&pool)
@@ -2130,7 +2169,8 @@ mod tests {
                     pending_password_hash: "replacement-hash",
                     pending_email_verification_token: "replacement-token",
                     pending_encrypted_secret: Some(b"replacement-secret"),
-                    pending_marketing_consent: false,
+                    pending_email_marketing_consent: EmailMarketingConsent::NeverAsked,
+                    pending_email_marketing_app_version: None,
                     state: None,
                     device_code: Some(&replacement_device),
                     is_headless: true,
@@ -2554,7 +2594,8 @@ mod tests {
             pending_password_hash: "replacement-hash",
             pending_email_verification_token: &replacement_token,
             pending_encrypted_secret: Some(b"replacement-secret"),
-            pending_marketing_consent: false,
+            pending_email_marketing_consent: EmailMarketingConsent::NeverAsked,
+            pending_email_marketing_app_version: None,
             state: None,
             device_code: Some(&replacement_device),
             is_headless: true,
@@ -2626,7 +2667,8 @@ mod tests {
             pending_password_hash: "replacement-hash",
             pending_email_verification_token: &replacement_token,
             pending_encrypted_secret: Some(b"replacement-secret"),
-            pending_marketing_consent: false,
+            pending_email_marketing_consent: EmailMarketingConsent::NeverAsked,
+            pending_email_marketing_app_version: None,
             state: None,
             device_code: Some(&replacement_device),
             is_headless: true,
@@ -3005,7 +3047,8 @@ mod tests {
             pending_password_hash: "replacement-hash",
             pending_email_verification_token: &replacement_token,
             pending_encrypted_secret: Some(b"replacement-secret"),
-            pending_marketing_consent: false,
+            pending_email_marketing_consent: EmailMarketingConsent::NeverAsked,
+            pending_email_marketing_app_version: None,
             state: None,
             device_code: Some(&replacement_device),
             is_headless: true,
@@ -3475,7 +3518,8 @@ mod tests {
             pending_password_hash: "hashed",
             pending_email_verification_token: &token_a,
             pending_encrypted_secret: Some(b"secret-a"),
-            pending_marketing_consent: false,
+            pending_email_marketing_consent: EmailMarketingConsent::NeverAsked,
+            pending_email_marketing_app_version: None,
             state: Some("state-a"),
             device_code: Some(&device_a),
             is_headless: true,
@@ -3497,7 +3541,8 @@ mod tests {
             pending_password_hash: "hashed",
             pending_email_verification_token: &token_b,
             pending_encrypted_secret: Some(b"secret-b"),
-            pending_marketing_consent: false,
+            pending_email_marketing_consent: EmailMarketingConsent::NeverAsked,
+            pending_email_marketing_app_version: None,
             state: Some("state-b"),
             device_code: Some(&device_b),
             is_headless: true,
@@ -4297,7 +4342,8 @@ mod tests {
             pending_password_hash: "hashed",
             pending_email_verification_token: &token_a,
             pending_encrypted_secret: Some(b"secret-a"),
-            pending_marketing_consent: false,
+            pending_email_marketing_consent: EmailMarketingConsent::NeverAsked,
+            pending_email_marketing_app_version: None,
             state: Some("state-a"),
             device_code: Some(&device_a),
             is_headless: true,
@@ -4319,7 +4365,8 @@ mod tests {
             pending_password_hash: "hashed",
             pending_email_verification_token: &token_b,
             pending_encrypted_secret: Some(b"secret-b"),
-            pending_marketing_consent: false,
+            pending_email_marketing_consent: EmailMarketingConsent::NeverAsked,
+            pending_email_marketing_app_version: None,
             state: Some("state-b"),
             device_code: Some(&device_b),
             is_headless: true,

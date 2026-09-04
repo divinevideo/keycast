@@ -228,7 +228,10 @@ async fn store_oauth_code_with_pending_registration(
         pending_email_verification_token,
         pending_encrypted_secret,
         // Browser OAuth registration has no marketing-consent capture (mobile-only for now).
-        pending_marketing_consent: false,
+        // Browser OAuth never shows the opt-in, so nobody was asked.
+        pending_email_marketing_consent:
+            keycast_core::repositories::EmailMarketingConsent::NeverAsked,
+        pending_email_marketing_app_version: None,
         state,
         device_code,
         is_headless: false,
