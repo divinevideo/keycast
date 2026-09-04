@@ -11,8 +11,8 @@ use std::{sync::Arc, time::Duration};
 use tower::{timeout::error::Elapsed, ServiceBuilder};
 
 use crate::api::http::{
-    admin, ap, atproto, atproto_oauth, auth, claim, expensive_work, headless, metrics, nostr_rpc,
-    oauth, policies, service_deletion, service_provisioning, teams,
+    admin, ap, atproto, atproto_oauth, auth, claim, email_marketing, expensive_work, headless,
+    metrics, nostr_rpc, oauth, policies, service_deletion, service_provisioning, teams,
 };
 use crate::state::KeycastState;
 use axum::response::Json as AxumJson;
@@ -320,6 +320,35 @@ pub fn api_routes(
         ))
         .with_state(auth_state.clone());
 
+    // Marketing consent sync: service-token routes for the consent sync worker. Read consent by
+    // cursor, write back the suppression floor, and drain deletion / email-change rows.
+    let email_marketing_routes = Router::new()
+        .route(
+            "/admin/email-marketing-consents",
+            get(email_marketing::list_consents),
+        )
+        .route(
+            "/admin/email-marketing-consents/observed",
+            post(email_marketing::record_observations),
+        )
+        .route(
+            "/admin/email-marketing-deletions",
+            get(email_marketing::list_deletions),
+        )
+        .route(
+            "/admin/email-marketing-deletions/ack",
+            post(email_marketing::ack_deletions),
+        )
+        .route(
+            "/admin/email-marketing-email-changes",
+            get(email_marketing::list_email_changes),
+        )
+        .route(
+            "/admin/email-marketing-email-changes/ack",
+            post(email_marketing::ack_email_changes),
+        )
+        .with_state(auth_state.clone());
+
     // Claim routes (public, accessed via email link)
     // Users claim preloaded accounts by setting email/password
     let claim_routes = Router::new()
@@ -387,6 +416,7 @@ pub fn api_routes(
         .merge(admin_routes) // Admin routes for preloaded accounts (has auth_cors)
         .merge(service_admin_routes) // Service-token admin routes (no CORS, server-to-server)
         .merge(batch_lookup_route) // Service-token route with a documented 1,000-email contract
+        .merge(email_marketing_routes) // Service-token routes for the consent sync worker
         .merge(claim_routes.layer(public_cors.clone())) // Public - claim preloaded accounts
         .merge(metrics_route.layer(public_cors.clone())) // Public - Prometheus metrics
         .merge(docs_route.layer(public_cors.clone()))
