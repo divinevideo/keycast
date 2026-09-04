@@ -293,7 +293,9 @@ async fn test_incomplete_oauth_allows_reregistration() {
             pending_password_hash: "hash2",
             pending_email_verification_token: "token2",
             pending_encrypted_secret: None,
-            pending_marketing_consent: false,
+            pending_email_marketing_consent:
+                keycast_core::repositories::EmailMarketingConsent::NeverAsked,
+            pending_email_marketing_app_version: None,
             state: None,
             device_code: None,
             is_headless: false,
@@ -699,7 +701,9 @@ async fn test_email_race_condition_at_token_exchange() {
                 pending_password_hash: hash,
                 pending_email_verification_token: token,
                 pending_encrypted_secret: Some(secret),
-                pending_marketing_consent: false,
+                pending_email_marketing_consent:
+                    keycast_core::repositories::EmailMarketingConsent::NeverAsked,
+                pending_email_marketing_app_version: None,
                 state: None,
                 device_code: None,
                 is_headless: false,
