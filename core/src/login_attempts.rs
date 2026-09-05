@@ -8,7 +8,7 @@ pub const LOGIN_FREE_FAILURES: u32 = 3;
 /// Sliding window used to count recent failures.
 pub const LOGIN_FAILURE_WINDOW: Duration = Duration::from_secs(15 * 60);
 /// Maximum lifetime of an abandoned in-flight attempt.
-pub const LOGIN_RESERVATION_TTL: Duration = Duration::from_secs(60);
+pub const LOGIN_RESERVATION_TTL: Duration = Duration::from_secs(5);
 /// Concurrent password checks admitted for one account identifier.
 pub const LOGIN_MAX_IN_FLIGHT: u32 = 1;
 /// Escalating delays selected after the free failures are spent.

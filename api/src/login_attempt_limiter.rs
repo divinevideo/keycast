@@ -45,6 +45,7 @@ local blocked_key = KEYS[3]
 local reservation_id = ARGV[1]
 local free_failures = tonumber(ARGV[2])
 local failure_window_ms = tonumber(ARGV[3])
+local schedule_length = tonumber(ARGV[4])
 
 local server_time = redis.call('TIME')
 local now_ms = (tonumber(server_time[1]) * 1000)
@@ -60,7 +61,8 @@ redis.call('PEXPIRE', failures_key, failure_window_ms)
 local failures = redis.call('ZCARD', failures_key)
 local delay_seconds = 0
 if failures >= free_failures then
-    local delay_index = math.min(failures - free_failures + 4, #ARGV)
+    local schedule_start = #ARGV - schedule_length + 1
+    local delay_index = math.min(schedule_start + failures - free_failures, #ARGV)
     delay_seconds = tonumber(ARGV[delay_index])
     redis.call('SET', blocked_key, '1', 'PX', delay_seconds * 1000)
 end
@@ -130,6 +132,7 @@ impl LoginAttemptReservation {
             self.id,
             LOGIN_FREE_FAILURES.to_string(),
             LOGIN_FAILURE_WINDOW.as_millis().to_string(),
+            LOGIN_DELAYS_SECONDS.len().to_string(),
         ];
         let arguments = arguments
             .into_iter()
@@ -274,6 +277,7 @@ for index = 1, tonumber(ARGV[2]) do
 end
 return 1
 "#;
+    const PTTL_SCRIPT: &str = "return redis.call('PTTL', KEYS[1])";
 
     async fn test_limiter() -> LoginAttemptLimiter {
         let redis_url = std::env::var("TEST_REDIS_URL")
@@ -424,6 +428,31 @@ return 1
             panic!("expired failures must not impose a delay");
         };
         reservation.release().await.expect("release attempt");
+        limiter.reset(1, email).await.expect("cleanup subject");
+    }
+
+    #[tokio::test]
+    async fn abandoned_attempt_has_short_bounded_ttl() {
+        let limiter = test_limiter().await;
+        let email = "abandoned@example.com";
+        let LoginAttemptAdmission::Reserved(reservation) =
+            limiter.reserve(1, email).await.expect("reserve attempt")
+        else {
+            panic!("first attempt should be admitted");
+        };
+        drop(reservation);
+
+        let subject = LoginAttemptSubject::new(1, email);
+        let reservations_key = format!("{}:reservations", subject.storage_key());
+        let remaining_ms: i64 = limiter
+            .redis
+            .invoke_script(PTTL_SCRIPT, &[reservations_key], &[])
+            .await
+            .expect("read reservation TTL");
+        assert!(
+            remaining_ms > 0 && remaining_ms <= LOGIN_RESERVATION_TTL.as_millis() as i64,
+            "abandoned reservation must expire inside the five-second bound: {remaining_ms}ms"
+        );
         limiter.reset(1, email).await.expect("cleanup subject");
     }
 
