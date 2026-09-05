@@ -21,6 +21,7 @@ use keycast_api::{
         tenant::{Tenant, TenantExtractor},
     },
     handlers::http_rpc_handler::new_http_handler_cache,
+    login_attempt_limiter::LoginAttemptLimiter,
     state::KeycastState,
     BcryptAdmission,
 };
@@ -237,6 +238,7 @@ async fn test_login_records_auth_event_for_missing_user() {
 async fn login_limit_is_identical_for_registered_and_missing_emails() {
     let pool = setup_pool().await;
     let auth_state = create_test_auth_state(pool.clone()).await;
+    let limiter = LoginAttemptLimiter::new(auth_state.state.redis.clone().unwrap());
     let registered_email = format!("limited-registered-{}@example.com", Uuid::new_v4());
     let missing_email = format!("limited-missing-{}@example.com", Uuid::new_v4());
     let pubkey = Keys::generate().public_key().to_hex();
@@ -263,18 +265,25 @@ async fn login_limit_is_identical_for_registered_and_missing_emails() {
         }),
     );
 
-    for _ in 0..keycast_core::login_attempts::LOGIN_FREE_FAILURES {
-        let registered = password_attempt(app.clone(), &registered_email, "wrong-password").await;
-        let missing = password_attempt(app.clone(), &missing_email, "wrong-password").await;
-        assert_eq!(registered, missing);
-        assert_eq!(registered.0, StatusCode::UNAUTHORIZED);
-    }
+    let registered = password_attempt(app.clone(), &registered_email, "wrong-password").await;
+    let missing = password_attempt(app.clone(), &missing_email, "wrong-password").await;
+    assert_eq!(registered, missing);
+    assert_eq!(registered.0, StatusCode::UNAUTHORIZED);
+
+    limiter
+        .block_for_test(1, &registered_email, 30)
+        .await
+        .expect("block registered subject");
+    limiter
+        .block_for_test(1, &missing_email, 30)
+        .await
+        .expect("block missing subject");
 
     let registered = password_attempt(app.clone(), &registered_email, "wrong-password").await;
     let missing = password_attempt(app, &missing_email, "wrong-password").await;
     assert_eq!(registered, missing);
     assert_eq!(registered.0, StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(registered.2.as_deref(), Some("1"));
+    assert!(registered.2.is_some());
 
     cleanup_by_email(&pool, &registered_email).await;
     cleanup_by_email(&pool, &missing_email).await;

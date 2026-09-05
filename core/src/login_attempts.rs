@@ -5,14 +5,14 @@ use std::{fmt, time::Duration};
 
 /// Failures allowed before the first delay is imposed.
 pub const LOGIN_FREE_FAILURES: u32 = 3;
-/// Longest delay imposed between password attempts.
-pub const LOGIN_MAX_DELAY: Duration = Duration::from_secs(15 * 60);
-/// Lifetime of failure history after the latest failed attempt.
-pub const LOGIN_FAILURE_STATE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Sliding window used to count recent failures.
+pub const LOGIN_FAILURE_WINDOW: Duration = Duration::from_secs(15 * 60);
 /// Maximum lifetime of an abandoned in-flight attempt.
 pub const LOGIN_RESERVATION_TTL: Duration = Duration::from_secs(60);
 /// Concurrent password checks admitted for one account identifier.
-pub const LOGIN_MAX_IN_FLIGHT: u32 = 5;
+pub const LOGIN_MAX_IN_FLIGHT: u32 = 1;
+/// Escalating delays selected after the free failures are spent.
+pub const LOGIN_DELAYS_SECONDS: &[u32] = &[5, 10, 20, 40, 80, 160, 320, 640, 900];
 
 /// Redis-safe identity for one tenant's normalized login email.
 #[derive(Clone, Eq, PartialEq)]
@@ -42,28 +42,14 @@ impl fmt::Debug for LoginAttemptSubject {
     }
 }
 
-/// Return the delay imposed after a given number of failures.
-#[must_use]
-pub fn delay_after_failure(failures: u32) -> Option<Duration> {
-    let exponent = failures.checked_sub(LOGIN_FREE_FAILURES)?;
-    let seconds = 1_u64
-        .checked_shl(exponent.min(63))
-        .unwrap_or(u64::MAX)
-        .min(LOGIN_MAX_DELAY.as_secs());
-    Some(Duration::from_secs(seconds))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn delay_starts_at_boundary_and_escalates_to_cap() {
-        assert_eq!(delay_after_failure(2), None);
-        assert_eq!(delay_after_failure(3), Some(Duration::from_secs(1)));
-        assert_eq!(delay_after_failure(4), Some(Duration::from_secs(2)));
-        assert_eq!(delay_after_failure(5), Some(Duration::from_secs(4)));
-        assert_eq!(delay_after_failure(20), Some(LOGIN_MAX_DELAY));
+    fn delay_schedule_escalates_to_fifteen_minutes() {
+        assert_eq!(&LOGIN_DELAYS_SECONDS[..3], &[5, 10, 20]);
+        assert_eq!(LOGIN_DELAYS_SECONDS.last(), Some(&900));
     }
 
     #[test]

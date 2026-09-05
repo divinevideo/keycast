@@ -22,12 +22,10 @@ use serde::{Deserialize, Serialize};
 use super::auth::{
     generate_secure_token, normalize_registration_email, EMAIL_ALREADY_EXISTS_CODE,
     EMAIL_ALREADY_EXISTS_MESSAGE, EMAIL_VERIFICATION_EXPIRY_HOURS, INVALID_EMAIL_CODE,
-    INVALID_EMAIL_MESSAGE,
+    INVALID_EMAIL_MESSAGE, LOGIN_RATE_LIMIT_MESSAGE, TOO_MANY_ATTEMPTS_CODE,
 };
 use super::oauth::{extract_origin, parse_policy_scope};
-use crate::login_attempt_limiter::{
-    LoginAttemptAdmission, LoginAttemptLimiter, LOGIN_RATE_LIMIT_CODE, LOGIN_RATE_LIMIT_MESSAGE,
-};
+use crate::login_attempt_limiter::{LoginAttemptAdmission, LoginAttemptLimiter};
 
 // ============================================================================
 // Headless Registration
@@ -434,6 +432,11 @@ pub async fn headless_login(
         }
     };
 
+    // Query first so database failures cannot strand an attempt lease. The
+    // limiter still runs before either credential branch returns.
+    let user_repo = UserRepository::new(pool.clone());
+    let user = user_repo.find_with_password(&req.email, tenant_id).await?;
+
     let login_limiter = LoginAttemptLimiter::new(
         auth_state
             .state
@@ -470,10 +473,6 @@ pub async fn headless_login(
             return Err(login_limiter_unavailable());
         }
     };
-
-    // Fetch user with password hash
-    let user_repo = UserRepository::new(pool.clone());
-    let user = user_repo.find_with_password(&req.email, tenant_id).await?;
 
     let (public_key, password_hash, email_verified, _user_status) = match user {
         Some(u) => u,
@@ -512,7 +511,7 @@ pub async fn headless_login(
         }
     };
 
-    let valid = auth_state
+    let valid = match auth_state
         .state
         .bcrypt
         .verify(
@@ -521,7 +520,15 @@ pub async fn headless_login(
             password_hash.clone(),
         )
         .await
-        .map_err(bcrypt_headless_error)?;
+    {
+        Ok(valid) => valid,
+        Err(error) => {
+            if let Err(release_error) = login_reservation.release().await {
+                tracing::error!("Password-login reservation release failed: {release_error}");
+            }
+            return Err(bcrypt_headless_error(error));
+        }
+    };
 
     if !valid {
         login_reservation.record_failure().await.map_err(|error| {
@@ -1527,7 +1534,7 @@ impl IntoResponse for HeadlessError {
                     [("Retry-After", retry_after.to_string())],
                     Json(serde_json::json!({
                         "error": LOGIN_RATE_LIMIT_MESSAGE,
-                        "code": LOGIN_RATE_LIMIT_CODE,
+                        "code": TOO_MANY_ATTEMPTS_CODE,
                     })),
                 )
                     .into_response();

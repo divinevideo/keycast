@@ -23,9 +23,11 @@ Keycast is a hosted NIP-46 (Nostr remote signer) bunker service. We take securit
 
 Password login uses a tenant-scoped attempt budget shared by the web, OAuth popup, and
 headless login endpoints. Repeated failures introduce an escalating delay and return `429`
-with `Retry-After`; successful login clears the budget. Completing the existing password
-reset flow also clears it, providing recovery when a user cannot wait for the current delay.
-The limiter applies the same response to registered and unregistered email addresses.
+with `Retry-After`; only failures in the latest 15-minute window contribute to the delay.
+Successful login clears the budget. Completing the existing password reset flow also clears
+it, providing recovery when a user cannot wait for the current delay. The limiter applies
+the same response to registered and unregistered email addresses. Login fails closed with a
+retryable service-unavailable response when the shared Redis coordination store is unavailable.
 
 ### In Memory (During Signing)
 - ✅ **Immediate zeroization**: Keys zeroed from memory after each signing operation using `zeroize` crate

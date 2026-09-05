@@ -2,34 +2,30 @@
 
 use crate::PrefixedRedis;
 use keycast_core::login_attempts::{
-    LoginAttemptSubject, LOGIN_FAILURE_STATE_TTL, LOGIN_FREE_FAILURES, LOGIN_MAX_DELAY,
+    LoginAttemptSubject, LOGIN_DELAYS_SECONDS, LOGIN_FAILURE_WINDOW, LOGIN_FREE_FAILURES,
     LOGIN_MAX_IN_FLIGHT, LOGIN_RESERVATION_TTL,
 };
 use redis::RedisResult;
 use std::fmt;
 use uuid::Uuid;
 
-/// Enumeration-safe response code for a delayed password attempt.
-pub const LOGIN_RATE_LIMIT_CODE: &str = "TOO_MANY_ATTEMPTS";
-/// Enumeration-safe response text for a delayed password attempt.
-pub const LOGIN_RATE_LIMIT_MESSAGE: &str =
-    "Too many login attempts. Please wait before trying again or reset your password.";
-
 const RESERVE_SCRIPT: &str = r#"
-local state_key = KEYS[1]
+local failures_key = KEYS[1]
 local reservations_key = KEYS[2]
+local blocked_key = KEYS[3]
 local reservation_id = ARGV[1]
 local reservation_ttl_ms = tonumber(ARGV[2])
 local max_in_flight = tonumber(ARGV[3])
+local failure_window_ms = tonumber(ARGV[4])
 
 local server_time = redis.call('TIME')
 local now_ms = (tonumber(server_time[1]) * 1000)
     + math.floor(tonumber(server_time[2]) / 1000)
 redis.call('ZREMRANGEBYSCORE', reservations_key, '-inf', now_ms)
+redis.call('ZREMRANGEBYSCORE', failures_key, '-inf', now_ms - failure_window_ms)
 
-local blocked_until_ms = tonumber(redis.call('HGET', state_key, 'blocked_until_ms') or '0')
-if blocked_until_ms > now_ms then
-    local retry_ms = blocked_until_ms - now_ms
+local retry_ms = redis.call('PTTL', blocked_key)
+if retry_ms > 0 then
     return {0, math.max(1, math.floor((retry_ms + 999) / 1000))}
 end
 
@@ -44,11 +40,11 @@ return {1, 0}
 
 const RECORD_FAILURE_SCRIPT: &str = r#"
 local reservations_key = KEYS[1]
-local state_key = KEYS[2]
+local failures_key = KEYS[2]
+local blocked_key = KEYS[3]
 local reservation_id = ARGV[1]
 local free_failures = tonumber(ARGV[2])
-local max_delay_seconds = tonumber(ARGV[3])
-local state_ttl_ms = tonumber(ARGV[4])
+local failure_window_ms = tonumber(ARGV[3])
 
 local server_time = redis.call('TIME')
 local now_ms = (tonumber(server_time[1]) * 1000)
@@ -58,13 +54,16 @@ if not expires_at or tonumber(expires_at) <= now_ms then
     return redis.error_reply('login-attempt reservation is no longer active')
 end
 
-local failures = redis.call('HINCRBY', state_key, 'failures', 1)
+redis.call('ZREMRANGEBYSCORE', failures_key, '-inf', now_ms - failure_window_ms)
+redis.call('ZADD', failures_key, now_ms, reservation_id)
+redis.call('PEXPIRE', failures_key, failure_window_ms)
+local failures = redis.call('ZCARD', failures_key)
 local delay_seconds = 0
 if failures >= free_failures then
-    delay_seconds = math.min(max_delay_seconds, math.pow(2, failures - free_failures))
-    redis.call('HSET', state_key, 'blocked_until_ms', now_ms + (delay_seconds * 1000))
+    local delay_index = math.min(failures - free_failures + 4, #ARGV)
+    delay_seconds = tonumber(ARGV[delay_index])
+    redis.call('SET', blocked_key, '1', 'PX', delay_seconds * 1000)
 end
-redis.call('PEXPIRE', state_key, state_ttl_ms)
 local removed = redis.call('ZREM', reservations_key, reservation_id)
 if removed ~= 1 then
     return redis.error_reply('login-attempt reservation is no longer active')
@@ -80,7 +79,7 @@ local now_ms = (tonumber(server_time[1]) * 1000)
 if not expires_at or tonumber(expires_at) <= now_ms then
     return redis.error_reply('login-attempt reservation is no longer active')
 end
-redis.call('DEL', KEYS[1], KEYS[2])
+redis.call('DEL', KEYS[1], KEYS[2], KEYS[3])
 return 1
 "#;
 
@@ -93,7 +92,7 @@ return 1
 "#;
 
 const RESET_SCRIPT: &str = r#"
-return redis.call('DEL', KEYS[1], KEYS[2])
+return redis.call('DEL', KEYS[1], KEYS[2], KEYS[3])
 "#;
 
 /// Result of reserving one password-login attempt.
@@ -108,8 +107,9 @@ pub enum LoginAttemptAdmission {
 /// One in-flight password-login attempt.
 pub struct LoginAttemptReservation {
     redis: PrefixedRedis,
-    state_key: String,
+    failures_key: String,
     reservations_key: String,
+    blocked_key: String,
     id: String,
 }
 
@@ -129,14 +129,17 @@ impl LoginAttemptReservation {
         let arguments = vec![
             self.id,
             LOGIN_FREE_FAILURES.to_string(),
-            LOGIN_MAX_DELAY.as_secs().to_string(),
-            LOGIN_FAILURE_STATE_TTL.as_millis().to_string(),
+            LOGIN_FAILURE_WINDOW.as_millis().to_string(),
         ];
+        let arguments = arguments
+            .into_iter()
+            .chain(LOGIN_DELAYS_SECONDS.iter().map(ToString::to_string))
+            .collect::<Vec<_>>();
         let _: i64 = self
             .redis
             .invoke_script(
                 RECORD_FAILURE_SCRIPT,
-                &[self.reservations_key, self.state_key],
+                &[self.reservations_key, self.failures_key, self.blocked_key],
                 &arguments,
             )
             .await?;
@@ -149,7 +152,7 @@ impl LoginAttemptReservation {
             .redis
             .invoke_script(
                 CLEAR_SCRIPT,
-                &[self.state_key, self.reservations_key],
+                &[self.failures_key, self.reservations_key, self.blocked_key],
                 &[self.id],
             )
             .await?;
@@ -186,19 +189,25 @@ impl LoginAttemptLimiter {
         normalized_email: &str,
     ) -> RedisResult<LoginAttemptAdmission> {
         let subject = LoginAttemptSubject::new(tenant_id, normalized_email);
-        let state_key = format!("{}:state", subject.storage_key());
+        let failures_key = format!("{}:failures", subject.storage_key());
         let reservations_key = format!("{}:reservations", subject.storage_key());
+        let blocked_key = format!("{}:blocked", subject.storage_key());
         let id = Uuid::new_v4().to_string();
         let arguments = vec![
             id.clone(),
             LOGIN_RESERVATION_TTL.as_millis().to_string(),
             LOGIN_MAX_IN_FLIGHT.to_string(),
+            LOGIN_FAILURE_WINDOW.as_millis().to_string(),
         ];
         let (admitted, retry_after): (i64, i64) = self
             .redis
             .invoke_script(
                 RESERVE_SCRIPT,
-                &[state_key.clone(), reservations_key.clone()],
+                &[
+                    failures_key.clone(),
+                    reservations_key.clone(),
+                    blocked_key.clone(),
+                ],
                 &arguments,
             )
             .await?;
@@ -206,8 +215,9 @@ impl LoginAttemptLimiter {
         if admitted == 1 {
             Ok(LoginAttemptAdmission::Reserved(LoginAttemptReservation {
                 redis: self.redis.clone(),
-                state_key,
+                failures_key,
                 reservations_key,
+                blocked_key,
                 id,
             }))
         } else {
@@ -220,13 +230,32 @@ impl LoginAttemptLimiter {
     /// Clear failure history after password-reset recovery.
     pub async fn reset(&self, tenant_id: i64, normalized_email: &str) -> RedisResult<()> {
         let subject = LoginAttemptSubject::new(tenant_id, normalized_email);
-        let state_key = format!("{}:state", subject.storage_key());
+        let failures_key = format!("{}:failures", subject.storage_key());
         let reservations_key = format!("{}:reservations", subject.storage_key());
+        let blocked_key = format!("{}:blocked", subject.storage_key());
         let _: i64 = self
             .redis
-            .invoke_script(RESET_SCRIPT, &[state_key, reservations_key], &[])
+            .invoke_script(
+                RESET_SCRIPT,
+                &[failures_key, reservations_key, blocked_key],
+                &[],
+            )
             .await?;
         Ok(())
+    }
+
+    /// Install a deterministic block for HTTP integration tests.
+    #[cfg(any(test, feature = "integration-tests"))]
+    pub async fn block_for_test(
+        &self,
+        tenant_id: i64,
+        normalized_email: &str,
+        seconds: u64,
+    ) -> RedisResult<()> {
+        let subject = LoginAttemptSubject::new(tenant_id, normalized_email);
+        self.redis
+            .setex(&format!("{}:blocked", subject.storage_key()), seconds, "1")
+            .await
     }
 }
 
@@ -234,6 +263,17 @@ impl LoginAttemptLimiter {
 mod tests {
     use super::*;
     use redis::aio::ConnectionManager;
+
+    const SEED_EXPIRED_FAILURES_SCRIPT: &str = r#"
+local server_time = redis.call('TIME')
+local now_ms = (tonumber(server_time[1]) * 1000)
+    + math.floor(tonumber(server_time[2]) / 1000)
+local score = now_ms - tonumber(ARGV[1]) - 1000
+for index = 1, tonumber(ARGV[2]) do
+    redis.call('ZADD', KEYS[1], score, 'expired-' .. index)
+end
+return 1
+"#;
 
     async fn test_limiter() -> LoginAttemptLimiter {
         let redis_url = std::env::var("TEST_REDIS_URL")
@@ -260,6 +300,15 @@ mod tests {
             .expect("record login failure");
     }
 
+    async fn clear_block(limiter: &LoginAttemptLimiter, email: &str) {
+        let subject = LoginAttemptSubject::new(1, email);
+        limiter
+            .redis
+            .del(&format!("{}:blocked", subject.storage_key()))
+            .await
+            .expect("clear test block");
+    }
+
     #[tokio::test]
     async fn failure_boundary_returns_retry_after() {
         let limiter = test_limiter().await;
@@ -271,7 +320,7 @@ mod tests {
 
         assert!(matches!(
             limiter.reserve(1, email).await.expect("limited admission"),
-            LoginAttemptAdmission::Limited { retry_after: 1 }
+            LoginAttemptAdmission::Limited { retry_after: 5 }
         ));
         limiter.reset(1, email).await.expect("cleanup subject");
     }
@@ -296,8 +345,85 @@ mod tests {
         }
         assert!(matches!(
             limiter.reserve(1, email).await.expect("limited admission"),
-            LoginAttemptAdmission::Limited { retry_after: 1 }
+            LoginAttemptAdmission::Limited { retry_after: 5 }
         ));
+        limiter.reset(1, email).await.expect("cleanup subject");
+    }
+
+    #[tokio::test]
+    async fn enforced_delay_curve_escalates_to_cap() {
+        let limiter = test_limiter().await;
+        let email = "escalation@example.com";
+        for _ in 0..LOGIN_FREE_FAILURES - 1 {
+            record_failure(&limiter, email).await;
+        }
+
+        for expected in LOGIN_DELAYS_SECONDS {
+            record_failure(&limiter, email).await;
+            assert!(matches!(
+                limiter.reserve(1, email).await.expect("limited admission"),
+                LoginAttemptAdmission::Limited { retry_after } if retry_after == *expected
+            ));
+            clear_block(&limiter, email).await;
+        }
+
+        limiter.reset(1, email).await.expect("cleanup subject");
+    }
+
+    #[tokio::test]
+    async fn released_attempt_does_not_consume_failure_budget() {
+        let limiter = test_limiter().await;
+        let email = "released@example.com";
+        for _ in 0..LOGIN_FREE_FAILURES {
+            let LoginAttemptAdmission::Reserved(reservation) = limiter
+                .reserve(1, email)
+                .await
+                .expect("reserve login attempt")
+            else {
+                panic!("released attempt should not consume the budget");
+            };
+            reservation.release().await.expect("release attempt");
+        }
+
+        let LoginAttemptAdmission::Reserved(reservation) = limiter
+            .reserve(1, email)
+            .await
+            .expect("reserve after releases")
+        else {
+            panic!("released attempts must leave the budget open");
+        };
+        reservation.release().await.expect("release final attempt");
+        limiter.reset(1, email).await.expect("cleanup subject");
+    }
+
+    #[tokio::test]
+    async fn failures_outside_the_window_do_not_escalate() {
+        let limiter = test_limiter().await;
+        let email = "decayed@example.com";
+        let subject = LoginAttemptSubject::new(1, email);
+        let failures_key = format!("{}:failures", subject.storage_key());
+        let _: i64 = limiter
+            .redis
+            .invoke_script(
+                SEED_EXPIRED_FAILURES_SCRIPT,
+                &[failures_key],
+                &[
+                    LOGIN_FAILURE_WINDOW.as_millis().to_string(),
+                    LOGIN_FREE_FAILURES.to_string(),
+                ],
+            )
+            .await
+            .expect("seed expired failures");
+
+        record_failure(&limiter, email).await;
+        let LoginAttemptAdmission::Reserved(reservation) = limiter
+            .reserve(1, email)
+            .await
+            .expect("admission after decay")
+        else {
+            panic!("expired failures must not impose a delay");
+        };
+        reservation.release().await.expect("release attempt");
         limiter.reset(1, email).await.expect("cleanup subject");
     }
 

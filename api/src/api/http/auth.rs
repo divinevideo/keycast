@@ -18,9 +18,7 @@ use crate::key_egress_limiter::{
     KeyEgressAdmission, KeyEgressLimiter, KeyEgressReservation, KEY_EGRESS_FINALIZATION_DEADLINE,
     KEY_EGRESS_RESERVED_WORK_DEADLINE,
 };
-use crate::login_attempt_limiter::{
-    LoginAttemptAdmission, LoginAttemptLimiter, LOGIN_RATE_LIMIT_MESSAGE,
-};
+use crate::login_attempt_limiter::{LoginAttemptAdmission, LoginAttemptLimiter};
 use crate::nip98;
 use keycast_core::bcrypt_admission::{
     BcryptAdmission, BcryptAdmissionError, BcryptOperation, BcryptPermit, BcryptWorkload,
@@ -75,6 +73,8 @@ pub(crate) const EMAIL_NOT_VERIFIED_MESSAGE: &str =
 pub(crate) const KEY_EGRESS_DENIED_CODE: &str = "KEY_EGRESS_DENIED";
 pub(crate) const KEY_EGRESS_DENIED_MESSAGE: &str = "Operation denied by policy";
 pub(crate) const TOO_MANY_ATTEMPTS_CODE: &str = "TOO_MANY_ATTEMPTS";
+pub(crate) const LOGIN_RATE_LIMIT_MESSAGE: &str =
+    "Too many login attempts. Please wait before trying again or reset your password.";
 /// `auth_events.endpoint` for the two raw-key egress routes.
 pub(crate) const EXPORT_KEY_ENDPOINT: &str = "/api/user/export-key";
 pub(crate) const CHANGE_KEY_ENDPOINT: &str = "/api/user/change-key";
@@ -1267,6 +1267,11 @@ pub async fn login(
         "Login attempt"
     );
 
+    // Query first so database failures cannot strand an attempt lease. The
+    // limiter still runs before either credential branch returns.
+    let user_repo = UserRepository::new(pool.clone());
+    let user = user_repo.find_with_password(&req.email, tenant_id).await?;
+
     let login_limiter = LoginAttemptLimiter::new(
         auth_state
             .state
@@ -1307,10 +1312,6 @@ pub async fn login(
         }
     };
 
-    // Fetch user with password hash and email_verified status from this tenant
-    let user_repo = UserRepository::new(pool.clone());
-    let user = user_repo.find_with_password(&req.email, tenant_id).await?;
-
     let (public_key, password_hash, email_verified, user_status) = match user {
         Some(u) => u,
         None => {
@@ -1348,7 +1349,7 @@ pub async fn login(
         }
     };
 
-    let valid = auth_state
+    let valid = match auth_state
         .state
         .bcrypt
         .verify(
@@ -1357,7 +1358,15 @@ pub async fn login(
             password_hash.clone(),
         )
         .await
-        .map_err(bcrypt_auth_error)?;
+    {
+        Ok(valid) => valid,
+        Err(error) => {
+            if let Err(release_error) = login_reservation.release().await {
+                tracing::error!("Password-login reservation release failed: {release_error}");
+            }
+            return Err(bcrypt_auth_error(error));
+        }
+    };
     if !valid {
         login_reservation.record_failure().await.map_err(|error| {
             tracing::error!("Password-login failure recording failed: {error}");
@@ -2927,9 +2936,7 @@ pub async fn reset_password(
     .bind(&public_key)
     .bind(tenant_id)
     .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
+    .await?;
 
     // Check if token is expired
     if let Some(expires) = expires_at {
@@ -2969,23 +2976,22 @@ pub async fn reset_password(
         .await
         .map_err(bcrypt_auth_error)?;
 
-    let account_email = account_email.ok_or_else(|| {
-        AuthError::Internal("Password-reset account email is missing".to_string())
-    })?;
-    let login_limiter = LoginAttemptLimiter::new(
-        auth_state
-            .state
-            .redis
-            .clone()
-            .ok_or_else(login_limiter_unavailable)?,
-    );
-    login_limiter
-        .reset(tenant_id, &account_email)
-        .await
-        .map_err(|error| {
-            tracing::error!("Password-login recovery reset failed: {error}");
-            login_limiter_unavailable()
-        })?;
+    if let Some(account_email) = account_email.as_deref() {
+        let login_limiter = LoginAttemptLimiter::new(
+            auth_state
+                .state
+                .redis
+                .clone()
+                .ok_or_else(login_limiter_unavailable)?,
+        );
+        login_limiter
+            .reset(tenant_id, account_email)
+            .await
+            .map_err(|error| {
+                tracing::error!("Password-login recovery reset failed: {error}");
+                login_limiter_unavailable()
+            })?;
+    }
 
     // Update password, clear reset token, and mark email as verified
     // (user proved email ownership by receiving and using the reset link)
@@ -3005,7 +3011,7 @@ pub async fn reset_password(
             outcome: "success",
             reason_code: Some("password_hash_updated"),
             http_status: 200,
-            email: Some(&account_email),
+            email: account_email.as_deref(),
             pubkey: Some(&public_key),
             client_id: None,
             redirect_origin: None,
