@@ -32,6 +32,9 @@ use super::auth::{
 };
 use super::html_safety::{escape_attr, escape_html, js_string_literal};
 use crate::brand::BRAND_NAME;
+use crate::login_attempt_limiter::{
+    LoginAttemptAdmission, LoginAttemptLimiter, LOGIN_RATE_LIMIT_CODE, LOGIN_RATE_LIMIT_MESSAGE,
+};
 
 /// Generate a 256-bit random authorization handle (64 hex characters)
 /// Used for silent re-authentication in OAuth flows
@@ -408,6 +411,9 @@ pub enum OAuthError {
     Encryption(String),
     ServerError(String),
     ServiceUnavailable,
+    TooManyRequests {
+        retry_after: u32,
+    },
 }
 
 impl OAuthError {
@@ -420,6 +426,7 @@ impl OAuthError {
             Self::Database(_) | Self::Encryption(_) | Self::ServiceUnavailable => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
+            Self::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::ServerError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -485,6 +492,17 @@ impl IntoResponse for OAuthError {
                     [("Retry-After", "1")],
                     Json(serde_json::json!({
                         "error": "Password service is busy. Please try again shortly."
+                    })),
+                )
+                    .into_response();
+            }
+            OAuthError::TooManyRequests { retry_after } => {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("Retry-After", retry_after.to_string())],
+                    Json(serde_json::json!({
+                        "error": LOGIN_RATE_LIMIT_MESSAGE,
+                        "code": LOGIN_RATE_LIMIT_CODE,
                     })),
                 )
                     .into_response();
@@ -3593,12 +3611,53 @@ pub async fn oauth_login(
         tenant_id
     );
 
+    let login_limiter = LoginAttemptLimiter::new(
+        auth_state
+            .state
+            .redis
+            .clone()
+            .ok_or(OAuthError::ServiceUnavailable)?,
+    );
+    let login_reservation = match login_limiter.reserve(tenant_id, &req.email).await {
+        Ok(LoginAttemptAdmission::Reserved(reservation)) => reservation,
+        Ok(LoginAttemptAdmission::Limited { retry_after }) => {
+            super::auth_observability::record_auth_event_and_log(
+                pool,
+                &headers,
+                None,
+                super::auth_observability::AuthEvent {
+                    tenant_id,
+                    endpoint,
+                    event_type: "login",
+                    outcome: "failure",
+                    reason_code: Some("rate_limited"),
+                    http_status: 429,
+                    email: Some(&req.email),
+                    pubkey: None,
+                    client_id: Some(&req.client_id),
+                    redirect_origin: None,
+                    metadata_json: serde_json::json!({}),
+                },
+            )
+            .await;
+            return Err(OAuthError::TooManyRequests { retry_after });
+        }
+        Err(error) => {
+            tracing::error!("Password-login limiter admission failed: {error}");
+            return Err(OAuthError::ServiceUnavailable);
+        }
+    };
+
     // Validate credentials
     let user_repo = UserRepository::new(pool.clone());
     let (public_key, password_hash, email_verified, user_status) =
         match user_repo.find_with_password(&req.email, tenant_id).await? {
             Some(user) => user,
             None => {
+                login_reservation.record_failure().await.map_err(|error| {
+                    tracing::error!("Password-login failure recording failed: {error}");
+                    OAuthError::ServiceUnavailable
+                })?;
                 super::auth_observability::record_auth_event_and_log(
                     pool,
                     &headers,
@@ -3634,6 +3693,10 @@ pub async fn oauth_login(
         .map_err(bcrypt_oauth_error)?;
 
     if !valid {
+        login_reservation.record_failure().await.map_err(|error| {
+            tracing::error!("Password-login failure recording failed: {error}");
+            OAuthError::ServiceUnavailable
+        })?;
         super::auth_observability::record_auth_event_and_log(
             pool,
             &headers,
@@ -3655,6 +3718,11 @@ pub async fn oauth_login(
         .await;
         return Err(OAuthError::Unauthorized);
     }
+
+    login_reservation.clear().await.map_err(|error| {
+        tracing::error!("Password-login limiter reset failed: {error}");
+        OAuthError::ServiceUnavailable
+    })?;
 
     // Check if email is verified
     if !email_verified {
@@ -4770,6 +4838,13 @@ mod tests {
         let response = bcrypt_oauth_error(BcryptAdmissionError::AtCapacity).into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()["Retry-After"], "1");
+    }
+
+    #[test]
+    fn login_limit_maps_to_429_with_retry_after() {
+        let response = OAuthError::TooManyRequests { retry_after: 7 }.into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["Retry-After"], "7");
     }
 
     #[derive(Clone, Default)]

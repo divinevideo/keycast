@@ -10,6 +10,7 @@ use axum::{
 };
 use bcrypt::hash;
 use chrono::Utc;
+use http_body_util::BodyExt;
 use keycast_api::{
     api::{
         http::{
@@ -69,11 +70,21 @@ impl KeyManager for TestKeyManager {
     }
 }
 
-fn create_test_auth_state(pool: PgPool) -> keycast_api::api::http::routes::AuthState {
+async fn create_test_auth_state(pool: PgPool) -> keycast_api::api::http::routes::AuthState {
     let bcrypt = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
     let secret_pool = SecretPool::new(1);
     let tenant_cache = Cache::builder().max_capacity(10).build();
     let key_manager: Arc<Box<dyn KeyManager>> = Arc::new(Box::new(TestKeyManager));
+    let redis_url =
+        std::env::var("TEST_REDIS_URL").unwrap_or_else(|_| "redis://localhost:16379".to_string());
+    let client = redis::Client::open(redis_url).expect("valid test Redis URL");
+    let connection = redis::aio::ConnectionManager::new(client)
+        .await
+        .expect("connect to test Redis");
+    let redis = keycast_api::PrefixedRedis::new(
+        connection,
+        Some(format!("login-observability:{}", Uuid::new_v4())),
+    );
 
     keycast_api::api::http::routes::AuthState {
         state: Arc::new(KeycastState {
@@ -84,7 +95,7 @@ fn create_test_auth_state(pool: PgPool) -> keycast_api::api::http::routes::AuthS
             server_keys: Keys::generate(),
             tenant_cache,
             bcrypt: bcrypt.clone(),
-            redis: None,
+            redis: Some(redis),
             secret_pool: secret_pool.receiver(),
             activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),
         }),
@@ -114,10 +125,46 @@ async fn cleanup_by_email(pool: &PgPool, email: &str) {
         .await;
 }
 
+async fn password_attempt(
+    app: Router,
+    email: &str,
+    password: &str,
+) -> (StatusCode, String, Option<String>) {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/login")
+                .header("content-type", "application/json")
+                .header("origin", "https://app.divine.video")
+                .body(Body::from(
+                    serde_json::json!({
+                        "email": email,
+                        "password": password
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let retry_after = response
+        .headers()
+        .get("Retry-After")
+        .map(|value| value.to_str().unwrap().to_string());
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        String::from_utf8(body.to_vec()).unwrap(),
+        retry_after,
+    )
+}
+
 #[tokio::test]
 async fn test_login_records_auth_event_for_missing_user() {
     let pool = setup_pool().await;
-    let auth_state = create_test_auth_state(pool.clone());
+    let auth_state = create_test_auth_state(pool.clone()).await;
     let email = format!("missing-login-{}@example.com", Uuid::new_v4());
     let request_id = format!("trace-{}", Uuid::new_v4());
 
@@ -187,9 +234,123 @@ async fn test_login_records_auth_event_for_missing_user() {
 }
 
 #[tokio::test]
+async fn login_limit_is_identical_for_registered_and_missing_emails() {
+    let pool = setup_pool().await;
+    let auth_state = create_test_auth_state(pool.clone()).await;
+    let registered_email = format!("limited-registered-{}@example.com", Uuid::new_v4());
+    let missing_email = format!("limited-missing-{}@example.com", Uuid::new_v4());
+    let pubkey = Keys::generate().public_key().to_hex();
+    let password_hash = hash("correct-password", 4).unwrap();
+
+    cleanup_by_email(&pool, &registered_email).await;
+    cleanup_by_email(&pool, &missing_email).await;
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
+         VALUES ($1, 1, $2, $3, true, NOW(), NOW())",
+    )
+    .bind(&pubkey)
+    .bind(&registered_email)
+    .bind(&password_hash)
+    .execute(&pool)
+    .await
+    .expect("create registered login subject");
+
+    let app = Router::new().route(
+        "/auth/login",
+        post(move |headers: HeaderMap, body: String| {
+            let auth_state = auth_state.clone();
+            async move { login(create_test_tenant(), State(auth_state), headers, body).await }
+        }),
+    );
+
+    for _ in 0..keycast_core::login_attempts::LOGIN_FREE_FAILURES {
+        let registered = password_attempt(app.clone(), &registered_email, "wrong-password").await;
+        let missing = password_attempt(app.clone(), &missing_email, "wrong-password").await;
+        assert_eq!(registered, missing);
+        assert_eq!(registered.0, StatusCode::UNAUTHORIZED);
+    }
+
+    let registered = password_attempt(app.clone(), &registered_email, "wrong-password").await;
+    let missing = password_attempt(app, &missing_email, "wrong-password").await;
+    assert_eq!(registered, missing);
+    assert_eq!(registered.0, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(registered.2.as_deref(), Some("1"));
+
+    cleanup_by_email(&pool, &registered_email).await;
+    cleanup_by_email(&pool, &missing_email).await;
+}
+
+#[tokio::test]
+async fn successful_login_resets_the_failure_budget() {
+    let pool = setup_pool().await;
+    let auth_state = create_test_auth_state(pool.clone()).await;
+    let email = format!("successful-reset-{}@example.com", Uuid::new_v4());
+    let keys = Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    let password = "correct-password";
+    let password_hash = hash(password, 4).unwrap();
+
+    cleanup_by_email(&pool, &email).await;
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
+         VALUES ($1, 1, $2, $3, true, NOW(), NOW())",
+    )
+    .bind(&pubkey)
+    .bind(&email)
+    .bind(&password_hash)
+    .execute(&pool)
+    .await
+    .expect("create login subject");
+    sqlx::query(
+        "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id)
+         VALUES ($1, $2, 1)",
+    )
+    .bind(&pubkey)
+    .bind(keys.secret_key().secret_bytes().to_vec())
+    .execute(&pool)
+    .await
+    .expect("create personal key");
+
+    let app = Router::new().route(
+        "/auth/login",
+        post(move |headers: HeaderMap, body: String| {
+            let auth_state = auth_state.clone();
+            async move { login(create_test_tenant(), State(auth_state), headers, body).await }
+        }),
+    );
+
+    for _ in 0..2 {
+        assert_eq!(
+            password_attempt(app.clone(), &email, "wrong-password")
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        password_attempt(app.clone(), &email, password).await.0,
+        StatusCode::OK
+    );
+    for _ in 0..keycast_core::login_attempts::LOGIN_FREE_FAILURES {
+        assert_eq!(
+            password_attempt(app.clone(), &email, "wrong-password")
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        password_attempt(app, &email, "wrong-password").await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    cleanup_by_email(&pool, &email).await;
+}
+
+#[tokio::test]
 async fn test_oauth_login_records_auth_event_for_unverified_user() {
     let pool = setup_pool().await;
-    let auth_state = create_test_auth_state(pool.clone());
+    let auth_state = create_test_auth_state(pool.clone()).await;
     let email = format!("oauth-unverified-{}@example.com", Uuid::new_v4());
     let request_id = format!("trace-{}", Uuid::new_v4());
     let pubkey = Keys::generate().public_key().to_hex();

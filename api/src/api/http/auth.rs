@@ -18,6 +18,9 @@ use crate::key_egress_limiter::{
     KeyEgressAdmission, KeyEgressLimiter, KeyEgressReservation, KEY_EGRESS_FINALIZATION_DEADLINE,
     KEY_EGRESS_RESERVED_WORK_DEADLINE,
 };
+use crate::login_attempt_limiter::{
+    LoginAttemptAdmission, LoginAttemptLimiter, LOGIN_RATE_LIMIT_MESSAGE,
+};
 use crate::nip98;
 use keycast_core::bcrypt_admission::{
     BcryptAdmission, BcryptAdmissionError, BcryptOperation, BcryptPermit, BcryptWorkload,
@@ -768,6 +771,13 @@ fn retryable_service_unavailable(
     }
 }
 
+fn login_limiter_unavailable() -> AuthError {
+    retryable_service_unavailable(
+        "Login is temporarily unavailable. Please try again shortly.",
+        Some(1),
+    )
+}
+
 fn bcrypt_auth_error(error: BcryptAdmissionError) -> AuthError {
     match error {
         BcryptAdmissionError::Bcrypt(error) => AuthError::PasswordHash(error),
@@ -1257,6 +1267,46 @@ pub async fn login(
         "Login attempt"
     );
 
+    let login_limiter = LoginAttemptLimiter::new(
+        auth_state
+            .state
+            .redis
+            .clone()
+            .ok_or_else(login_limiter_unavailable)?,
+    );
+    let login_reservation = match login_limiter.reserve(tenant_id, &req.email).await {
+        Ok(LoginAttemptAdmission::Reserved(reservation)) => reservation,
+        Ok(LoginAttemptAdmission::Limited { retry_after }) => {
+            super::auth_observability::record_auth_event_and_log(
+                pool,
+                &headers,
+                None,
+                super::auth_observability::AuthEvent {
+                    tenant_id,
+                    endpoint,
+                    event_type: "login",
+                    outcome: "failure",
+                    reason_code: Some("rate_limited"),
+                    http_status: 429,
+                    email: Some(&req.email),
+                    pubkey: None,
+                    client_id: None,
+                    redirect_origin: Some(&redirect_origin),
+                    metadata_json: serde_json::json!({}),
+                },
+            )
+            .await;
+            return Err(AuthError::TooManyRequests {
+                message: LOGIN_RATE_LIMIT_MESSAGE.to_string(),
+                retry_after,
+            });
+        }
+        Err(error) => {
+            tracing::error!("Password-login limiter admission failed: {error}");
+            return Err(login_limiter_unavailable());
+        }
+    };
+
     // Fetch user with password hash and email_verified status from this tenant
     let user_repo = UserRepository::new(pool.clone());
     let user = user_repo.find_with_password(&req.email, tenant_id).await?;
@@ -1264,6 +1314,10 @@ pub async fn login(
     let (public_key, password_hash, email_verified, user_status) = match user {
         Some(u) => u,
         None => {
+            login_reservation.record_failure().await.map_err(|error| {
+                tracing::error!("Password-login failure recording failed: {error}");
+                login_limiter_unavailable()
+            })?;
             super::auth_observability::record_auth_event_and_log(
                 pool,
                 &headers,
@@ -1305,6 +1359,10 @@ pub async fn login(
         .await
         .map_err(bcrypt_auth_error)?;
     if !valid {
+        login_reservation.record_failure().await.map_err(|error| {
+            tracing::error!("Password-login failure recording failed: {error}");
+            login_limiter_unavailable()
+        })?;
         super::auth_observability::record_auth_event_and_log(
             pool,
             &headers,
@@ -1334,6 +1392,11 @@ pub async fn login(
         METRICS.inc_login_failure();
         return Err(AuthError::InvalidCredentials);
     }
+
+    login_reservation.clear().await.map_err(|error| {
+        tracing::error!("Password-login limiter reset failed: {error}");
+        login_limiter_unavailable()
+    })?;
 
     // Check if email is verified
     if !email_verified {
@@ -2816,12 +2879,13 @@ pub async fn forgot_password(
 /// Reset password with token
 pub async fn reset_password(
     tenant: crate::api::tenant::TenantExtractor,
-    State(pool): State<PgPool>,
-    Extension(bcrypt): Extension<BcryptAdmission>,
+    State(auth_state): State<super::routes::AuthState>,
     headers: HeaderMap,
     Json(req): Json<ResetPasswordRequest>,
 ) -> Result<Json<ResetPasswordResponse>, AuthError> {
     let tenant_id = tenant.0.id;
+    let pool = &auth_state.state.db;
+    let bcrypt = &auth_state.state.bcrypt;
     let endpoint = "/api/auth/reset-password";
     tracing::info!(
         "Password reset attempt with token: {}... for tenant: {}",
@@ -2836,7 +2900,7 @@ pub async fn reset_password(
             Some(data) => data,
             None => {
                 super::auth_observability::record_auth_event_and_log(
-                    &pool,
+                    pool,
                     &headers,
                     None,
                     super::auth_observability::AuthEvent {
@@ -2862,7 +2926,7 @@ pub async fn reset_password(
     )
     .bind(&public_key)
     .bind(tenant_id)
-    .fetch_optional(&pool)
+    .fetch_optional(pool)
     .await
     .ok()
     .flatten();
@@ -2871,7 +2935,7 @@ pub async fn reset_password(
     if let Some(expires) = expires_at {
         if expires < Utc::now() {
             super::auth_observability::record_auth_event_and_log(
-                &pool,
+                pool,
                 &headers,
                 None,
                 super::auth_observability::AuthEvent {
@@ -2905,6 +2969,24 @@ pub async fn reset_password(
         .await
         .map_err(bcrypt_auth_error)?;
 
+    let account_email = account_email.ok_or_else(|| {
+        AuthError::Internal("Password-reset account email is missing".to_string())
+    })?;
+    let login_limiter = LoginAttemptLimiter::new(
+        auth_state
+            .state
+            .redis
+            .clone()
+            .ok_or_else(login_limiter_unavailable)?,
+    );
+    login_limiter
+        .reset(tenant_id, &account_email)
+        .await
+        .map_err(|error| {
+            tracing::error!("Password-login recovery reset failed: {error}");
+            login_limiter_unavailable()
+        })?;
+
     // Update password, clear reset token, and mark email as verified
     // (user proved email ownership by receiving and using the reset link)
     let user_repo = UserRepository::new(pool.clone());
@@ -2913,7 +2995,7 @@ pub async fn reset_password(
         .await?;
 
     super::auth_observability::record_auth_event_and_log(
-        &pool,
+        pool,
         &headers,
         None,
         super::auth_observability::AuthEvent {
@@ -2923,7 +3005,7 @@ pub async fn reset_password(
             outcome: "success",
             reason_code: Some("password_hash_updated"),
             http_status: 200,
-            email: account_email.as_deref(),
+            email: Some(&account_email),
             pubkey: Some(&public_key),
             client_id: None,
             redirect_origin: None,
@@ -7833,7 +7915,7 @@ mod tests {
     #[tokio::test]
     async fn test_login_missing_personal_keys_returns_conflict() {
         let pool = create_test_db().await;
-        let auth_state = create_test_auth_state(pool.clone());
+        let auth_state = create_test_auth_state_with_redis(pool.clone()).await;
         let pubkey = Keys::generate().public_key().to_hex();
         let email = format!("missing-keys-{}@example.com", Uuid::new_v4());
         let password = "testpassword123";

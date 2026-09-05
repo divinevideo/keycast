@@ -95,7 +95,6 @@ pub fn api_routes(
 
     let email_routes = Router::new()
         .route("/auth/forgot-password", post(auth::forgot_password))
-        .route("/auth/reset-password", post(auth::reset_password))
         .route("/auth/resend-verification", post(auth::resend_verification))
         .route(
             "/auth/confirm-email-change",
@@ -104,6 +103,10 @@ pub fn api_routes(
         .route("/auth/cancel-email-change", post(auth::cancel_email_change))
         .layer(axum::Extension(auth_state.state.bcrypt.clone()))
         .with_state(pool.clone());
+
+    let password_reset_route = Router::new()
+        .route("/auth/reset-password", post(auth::reset_password))
+        .with_state(auth_state.clone());
 
     // OAuth routes (no authentication required for initial authorize request)
     // Public CORS - third parties use authorization_code grant (never see passwords)
@@ -407,6 +410,7 @@ pub fn api_routes(
         .merge(account_delete_route.layer(public_cors.clone())) // Public CORS - Bearer token auth, third-party apps
         .merge(verify_email_route.layer(public_cors.clone())) // Public CORS - same-origin sets cookie, cross-origin uses Bearer
         .merge(email_routes.layer(public_cors.clone()))
+        .merge(password_reset_route.layer(public_cors.clone()))
         .merge(oauth_routes) // Has public_cors (third-party safe)
         .merge(atproto_oauth_routes)
         .merge(connect_routes.layer(public_cors.clone()))
