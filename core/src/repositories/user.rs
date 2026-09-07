@@ -3098,6 +3098,12 @@ mod tests {
         uuid::Uuid::new_v4().to_string()[..8].to_string()
     }
 
+    /// Smallest cost advantage the trigram plan must hold over the best plan that cannot use it.
+    ///
+    /// Measured at 8x or better across empty, populated, and index-bloated databases. Before
+    /// #335 the fixture ran at 1.0x to 1.5x, close enough that ambient rows decided the winner.
+    const MIN_TRIGRAM_PLAN_COST_ADVANTAGE: f64 = 4.0;
+
     fn plan_mentions_index(plan: &serde_json::Value, index_name: &str) -> bool {
         match plan {
             serde_json::Value::Array(values) => values
@@ -3109,6 +3115,12 @@ mod tests {
             }),
             _ => false,
         }
+    }
+
+    fn plan_total_cost(plan: &serde_json::Value) -> f64 {
+        plan[0]["Plan"]["Total Cost"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("EXPLAIN output should carry a total cost: {plan}"))
     }
 
     async fn create_test_team(pool: &PgPool, name: &str) -> i32 {
@@ -3713,6 +3725,23 @@ mod tests {
         .execute(&mut *transaction)
         .await
         .unwrap();
+        // A GIN index buffers new entries in a fastupdate pending list, and the planner charges
+        // every scan of the index for a sequential read of that whole list. The rows seeded above
+        // land there, so without this flush the fixture inflates the cost of the very index it is
+        // asserting on, by an amount that also varies with what other suites left pending in the
+        // same shared list — which is how this assertion came to pick idx_users_tenant_id in CI
+        // (#335). Flushing moves the seeded rows into the index proper, which is how production
+        // reads them. Looking the index up in pg_class rather than naming it directly leaves a
+        // missing index for the plan assertion below to report, instead of aborting here on a
+        // bare cast error.
+        sqlx::query(
+            "SELECT gin_clean_pending_list(oid)
+             FROM pg_class
+             WHERE relname = 'idx_users_email_trgm'",
+        )
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
         sqlx::query("ANALYZE users")
             .execute(&mut *transaction)
             .await
@@ -3742,6 +3771,38 @@ mod tests {
         assert!(
             plan_mentions_index(&plan, "idx_users_email_trgm"),
             "the production suggestion query should use idx_users_email_trgm: {plan}"
+        );
+
+        // GIN indexes are only reachable through a bitmap scan, so switching bitmap scans off
+        // prices the best plan the database can offer without the trigram index. Pinning the gap
+        // keeps the assertion above honest: it reads a planner preference, and a preference held
+        // by the 1.0x to 1.5x this fixture used to run at is not evidence the index does any work.
+        sqlx::query("SET LOCAL enable_bitmapscan = off")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        let plan_without_trigram_index: serde_json::Value = sqlx::query_scalar(&explain_sql)
+            .bind("publish")
+            .bind(1_i64)
+            .bind(ADMIN_EMAIL_SUGGESTION_MIN_WORD_SIMILARITY)
+            .bind(ADMIN_EMAIL_SUGGESTION_CANDIDATE_LIMIT)
+            .fetch_one(&mut *transaction)
+            .await
+            .unwrap();
+
+        assert!(
+            !plan_mentions_index(&plan_without_trigram_index, "idx_users_email_trgm"),
+            "disabling bitmap scans should price a plan that cannot reach the trigram index: \
+             {plan_without_trigram_index}"
+        );
+        let trigram_cost = plan_total_cost(&plan);
+        let fallback_cost = plan_total_cost(&plan_without_trigram_index);
+        let cost_advantage = fallback_cost / trigram_cost;
+        assert!(
+            cost_advantage >= MIN_TRIGRAM_PLAN_COST_ADVANTAGE,
+            "the trigram index should beat every plan that cannot use it by at least \
+             {MIN_TRIGRAM_PLAN_COST_ADVANTAGE}x, got {cost_advantage:.2}x \
+             ({trigram_cost} against {fallback_cost})"
         );
     }
 
