@@ -23,8 +23,14 @@ const DEFAULT_LIMIT: i64 = 500;
 
 #[derive(Debug, Deserialize)]
 pub struct ConsentPageQuery {
-    /// Cursor: the last `updated_at` processed. Paired with `since_pubkey` to break ties, because
-    /// two accounts can share a timestamp and a timestamp-only cursor would skip or loop.
+    /// Cursor: the last consent timestamp processed. Paired with `since_pubkey` to break ties,
+    /// because two accounts can consent in the same instant and a timestamp-only cursor would skip
+    /// or loop.
+    ///
+    /// Deliberately the CONSENT time, not `updated_at`. A consent answer is immutable, so each one
+    /// is read exactly once. Ordering on `updated_at` meant any unrelated account change (a
+    /// password reset, a profile edit) re-triggered a subscribe, which silently reversed a granular
+    /// unsubscribe the person had made in the meantime.
     pub since: Option<DateTime<Utc>>,
     pub since_pubkey: Option<String>,
     pub limit: Option<i64>,
@@ -67,6 +73,8 @@ pub async fn list_consents(
 
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
+    // Only rows carrying a consent event. An account nobody asked has nothing to sync and would
+    // only be pages the caller has to read past.
     let rows: Vec<ConsentRecord> = sqlx::query_as(
         "SELECT pubkey, email,
                 email_marketing_consent             AS consent,
@@ -78,8 +86,10 @@ pub async fn list_consents(
                 updated_at
          FROM users
          WHERE tenant_id = $4
-           AND ($1::timestamptz IS NULL OR (updated_at, pubkey) > ($1, $2))
-         ORDER BY updated_at, pubkey
+           AND email_marketing_consent_at IS NOT NULL
+           AND ($1::timestamptz IS NULL
+                OR (email_marketing_consent_at, pubkey) > ($1, $2))
+         ORDER BY email_marketing_consent_at, pubkey
          LIMIT $3",
     )
     .bind(query.since)
@@ -90,9 +100,11 @@ pub async fn list_consents(
     .await?;
 
     let next = if rows.len() as i64 == limit {
-        rows.last().map(|r| ConsentCursor {
-            since: r.updated_at,
-            since_pubkey: r.pubkey.clone(),
+        rows.last().and_then(|r| {
+            r.consent_at.map(|since| ConsentCursor {
+                since,
+                since_pubkey: r.pubkey.clone(),
+            })
         })
     } else {
         None

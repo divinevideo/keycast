@@ -31,5 +31,12 @@ ALTER TABLE oauth_codes
         CHECK (pending_email_marketing_consent IN ('never_asked', 'declined', 'opted_in')),
     ADD COLUMN pending_email_marketing_app_version TEXT;
 
--- The sync service reads consent by cursor, ordered by (updated_at, pubkey).
-CREATE INDEX idx_users_email_marketing_cursor ON users (updated_at, pubkey);
+-- The sync service reads consent events by cursor, ordered by (consent_at, pubkey).
+--
+-- Deliberately not on updated_at. A consent answer is immutable, so ordering on it processes each
+-- one exactly once; ordering on updated_at meant any unrelated account change re-triggered a
+-- subscribe and could silently reverse a granular unsubscribe. Partial, because rows without a
+-- consent event are never read through this path.
+CREATE INDEX idx_users_email_marketing_cursor
+    ON users (email_marketing_consent_at, pubkey)
+    WHERE email_marketing_consent_at IS NOT NULL;

@@ -60,8 +60,20 @@ async fn cleanup(pool: &PgPool, pubkeys: &[String]) {
 async fn cursor_pages_deterministically_when_timestamps_collide() {
     let pool = setup_pool().await;
     let shared = Utc::now() + Duration::days(3650);
-    let a = seed(&pool, "collide-a@example.test", "opted_in", shared).await;
-    let b = seed(&pool, "collide-b@example.test", "opted_in", shared).await;
+    let a = seed(
+        &pool,
+        &format!("collide-a-{}@example.test", uuid::Uuid::new_v4()),
+        "opted_in",
+        shared,
+    )
+    .await;
+    let b = seed(
+        &pool,
+        &format!("collide-b-{}@example.test", uuid::Uuid::new_v4()),
+        "opted_in",
+        shared,
+    )
+    .await;
     let (first, second) = if a < b {
         (a.clone(), b.clone())
     } else {
@@ -106,7 +118,13 @@ async fn cursor_pages_deterministically_when_timestamps_collide() {
 #[tokio::test]
 async fn the_floor_starts_null_not_false() {
     let pool = setup_pool().await;
-    let pubkey = seed(&pool, "fresh@example.test", "opted_in", Utc::now()).await;
+    let pubkey = seed(
+        &pool,
+        &format!("fresh-{}@example.test", uuid::Uuid::new_v4()),
+        "opted_in",
+        Utc::now(),
+    )
+    .await;
 
     let floor: Option<bool> =
         sqlx::query_scalar("SELECT email_marketing_global_optout FROM users WHERE pubkey = $1")
@@ -124,7 +142,13 @@ async fn the_floor_starts_null_not_false() {
 #[tokio::test]
 async fn observing_an_optout_does_not_rewrite_the_consent_event() {
     let pool = setup_pool().await;
-    let pubkey = seed(&pool, "stable@example.test", "opted_in", Utc::now()).await;
+    let pubkey = seed(
+        &pool,
+        &format!("stable-{}@example.test", uuid::Uuid::new_v4()),
+        "opted_in",
+        Utc::now(),
+    )
+    .await;
 
     // Exactly the statement the endpoint runs.
     sqlx::query(
@@ -167,7 +191,13 @@ async fn observing_an_optout_does_not_rewrite_the_consent_event() {
 #[tokio::test]
 async fn an_identical_observation_is_a_no_op() {
     let pool = setup_pool().await;
-    let pubkey = seed(&pool, "twice@example.test", "opted_in", Utc::now()).await;
+    let pubkey = seed(
+        &pool,
+        &format!("twice-{}@example.test", uuid::Uuid::new_v4()),
+        "opted_in",
+        Utc::now(),
+    )
+    .await;
 
     let statement = "UPDATE users
          SET email_marketing_global_optout = $2,
@@ -343,3 +373,98 @@ async fn reads_are_tenant_scoped() {
 // suite does not stand up. Until then the guard is verified by reading `email_marketing.rs`: every
 // one of the six handlers calls `authorize_service_token(&headers)?` as its first statement.
 // Worth closing when the harness gains a Redis, and worth a reviewer's eye in the meantime.
+
+/// An account whose consent is old but whose row was touched for an unrelated reason must not
+/// reappear on the cursor.
+///
+/// The sync's unit of work is a consent event, not "an account that changed". Ordering on
+/// `updated_at` meant a password change or profile edit re-triggered a subscribe, silently
+/// reversing a granular unsubscribe the person had made in the meantime. Consent timestamps are
+/// immutable, so ordering on them processes each answer exactly once.
+///
+/// Note the trigger: `users_update_trigger` forces `updated_at` to NOW() on every UPDATE, so an
+/// unrelated write always moves it forward. That is exactly the hazard, and it is why the consent
+/// timestamp here is in the PAST rather than the future: a future consent_at would sort after
+/// NOW() and the test would pass without discriminating anything.
+#[tokio::test]
+async fn an_unrelated_account_update_does_not_reappear_on_the_cursor() {
+    let pool = setup_pool().await;
+    let consented_at = Utc::now() - Duration::days(90);
+    let pubkey = seed(
+        &pool,
+        &format!("settled-{}@example.test", uuid::Uuid::new_v4()),
+        "opted_in",
+        consented_at,
+    )
+    .await;
+
+    // Somebody changes their password long after consenting. The trigger moves updated_at to now.
+    sqlx::query("UPDATE users SET password_hash = 'changed' WHERE pubkey = $1")
+        .bind(&pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let moved: bool = sqlx::query_scalar(
+        "SELECT updated_at > email_marketing_consent_at FROM users WHERE pubkey = $1",
+    )
+    .bind(&pubkey)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        moved,
+        "precondition: the unrelated write must move updated_at past consent_at"
+    );
+
+    // A sync that already processed this consent asks for anything newer.
+    let after: Vec<(String,)> = sqlx::query_as(
+        "SELECT pubkey FROM users
+         WHERE tenant_id = 1
+           AND email_marketing_consent_at IS NOT NULL
+           AND (email_marketing_consent_at, pubkey) > ($1, $2)
+         ORDER BY email_marketing_consent_at, pubkey",
+    )
+    .bind(consented_at)
+    .bind(&pubkey)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert!(
+        !after.iter().any(|(p,)| p == &pubkey),
+        "an unrelated update must not re-trigger a subscribe"
+    );
+
+    cleanup(&pool, &[pubkey]).await;
+}
+
+/// Accounts nobody ever asked have no consent event, so they are not consent records and must not
+/// occupy pages the sync has to read past.
+#[tokio::test]
+async fn never_asked_accounts_are_not_returned() {
+    let pool = setup_pool().await;
+    let at = Utc::now() + Duration::days(3650);
+    let pubkey = Keys::generate().public_key().to_hex();
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, email, email_marketing_consent, created_at, updated_at)
+         VALUES ($1, 1, $2, 'never_asked', $3, $3)",
+    )
+    .bind(&pubkey)
+    .bind(&format!("unasked-{}@example.test", uuid::Uuid::new_v4()))
+    .bind(at)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT pubkey FROM users
+         WHERE tenant_id = 1 AND email_marketing_consent_at IS NOT NULL",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert!(!rows.iter().any(|(p,)| p == &pubkey));
+    cleanup(&pool, &[pubkey]).await;
+}
