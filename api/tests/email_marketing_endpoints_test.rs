@@ -451,7 +451,7 @@ async fn never_asked_accounts_are_not_returned() {
          VALUES ($1, 1, $2, 'never_asked', $3, $3)",
     )
     .bind(&pubkey)
-    .bind(&format!("unasked-{}@example.test", uuid::Uuid::new_v4()))
+    .bind(format!("unasked-{}@example.test", uuid::Uuid::new_v4()))
     .bind(at)
     .execute(&pool)
     .await
