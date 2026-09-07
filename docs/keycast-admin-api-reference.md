@@ -447,6 +447,14 @@ deletions first tries to remove `new` (not yet a contact) and then the email-cha
 `new`, leaving a subscribed contact for a deleted account. Email-change first, then deletion,
 removes the moved contact. Correlate by address: the deletion row has no pubkey.
 
+A deletion tombstone and a later consent for the same address can coexist: hard-delete frees the
+mailbox, so a new account can opt in before the worker drains. Apply a deletion only when no
+consent record for that address is newer than `deleted_at`, or re-check the address against
+batch-lookup before deleting. `GET /api/admin/email-marketing-consents` returns the account's
+current email, not the address at consent time; after an email change the consent row already
+shows the new address, so treating an `old → new` email-change as a HubSpot move of a contact
+created at `new` is the worker's to make idempotent.
+
 ### Why email changes are recorded at all
 
 keycast overwrites `users.email` in place, so a changed row carries only the new address. The sync
