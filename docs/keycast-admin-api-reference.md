@@ -440,10 +440,12 @@ between the two replays the row rather than losing it. Losing a deletion means c
 somebody who deleted their account; losing an email change means a duplicate contact with the old
 address still subscribed. Acknowledging an unknown id is harmless.
 
-Drain **deletions before email-changes**. The two queues have independent id cursors. A person who
-changes email and then deletes the account can leave a row in both; processing the email-change
-after the deletion re-creates a contact the tombstone just removed. Correlate by address: the
-deletion row has no pubkey.
+Drain **email-changes before deletions**. The two queues have independent id cursors. A person who
+changes email and then deletes the account leaves `email_marketing_email_changes(old → new)` and
+`email_marketing_deletions(new)` — the tombstone is the address at deletion time. Processing
+deletions first tries to remove `new` (not yet a contact) and then the email-change moves `old` to
+`new`, leaving a subscribed contact for a deleted account. Email-change first, then deletion,
+removes the moved contact. Correlate by address: the deletion row has no pubkey.
 
 ### Why email changes are recorded at all
 
@@ -453,6 +455,7 @@ second contact and leave the previous address subscribed indefinitely. The row i
 same transaction that finalizes the change, capturing the outgoing address **before** the update
 overwrites it.
 
-Deletion and email-change rows are transient: they exist only until the worker has acted, which
-bounds how long an address is retained past account deletion. Both are written only for accounts
-whose consent state is `opted_in`, since those are the only contacts the sync created.
+Deletion and email-change rows exist only until the worker acks them. keycast does not expire them
+on its own; the worker's drain is what bounds how long an address is retained past deletion. Both
+are written only for accounts whose consent state is `opted_in`, since those are the only contacts
+the sync created.
