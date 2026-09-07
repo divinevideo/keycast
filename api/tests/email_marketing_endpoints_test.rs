@@ -5,7 +5,16 @@
 
 mod common;
 
+use axum::{
+    extract::{Query, State},
+    http::{HeaderMap, HeaderValue, StatusCode},
+    response::IntoResponse,
+};
 use chrono::{DateTime, Duration, Utc};
+use keycast_api::api::http::email_marketing::{
+    ack_deletions, ack_email_changes, list_consents, list_deletions, list_email_changes,
+    record_observations, AckRequest, ConsentPageQuery, IdPageQuery, ObservationsRequest,
+};
 use nostr_sdk::Keys;
 use sqlx::PgPool;
 
@@ -54,8 +63,8 @@ async fn cleanup(pool: &PgPool, pubkeys: &[String]) {
     }
 }
 
-/// The cursor is (updated_at, pubkey) precisely because two accounts can share a timestamp. A
-/// timestamp-only cursor either skips a record or loops on it forever.
+/// The cursor is (email_marketing_consent_at, pubkey) precisely because two accounts can share a
+/// timestamp. A timestamp-only cursor either skips a record or loops on it forever.
 #[tokio::test]
 async fn cursor_pages_deterministically_when_timestamps_collide() {
     let pool = setup_pool().await;
@@ -80,11 +89,12 @@ async fn cursor_pages_deterministically_when_timestamps_collide() {
         (b.clone(), a.clone())
     };
 
-    // Page one, ordered by (updated_at, pubkey).
     let page_one: Vec<(String,)> = sqlx::query_as(
         "SELECT pubkey FROM users
-         WHERE tenant_id = 1 AND (updated_at, pubkey) > ($1, $2)
-         ORDER BY updated_at, pubkey LIMIT 1",
+         WHERE tenant_id = 1
+           AND email_marketing_consent_at IS NOT NULL
+           AND (email_marketing_consent_at, pubkey) > ($1, $2)
+         ORDER BY email_marketing_consent_at, pubkey LIMIT 1",
     )
     .bind(shared - Duration::seconds(1))
     .bind("")
@@ -93,12 +103,12 @@ async fn cursor_pages_deterministically_when_timestamps_collide() {
     .unwrap();
     assert_eq!(page_one[0].0, first);
 
-    // Page two, continuing from page one's last row. Without the pubkey tiebreak this returns the
-    // same row again.
     let page_two: Vec<(String,)> = sqlx::query_as(
         "SELECT pubkey FROM users
-         WHERE tenant_id = 1 AND (updated_at, pubkey) > ($1, $2)
-         ORDER BY updated_at, pubkey LIMIT 1",
+         WHERE tenant_id = 1
+           AND email_marketing_consent_at IS NOT NULL
+           AND (email_marketing_consent_at, pubkey) > ($1, $2)
+         ORDER BY email_marketing_consent_at, pubkey LIMIT 1",
     )
     .bind(shared)
     .bind(&first)
@@ -153,10 +163,11 @@ async fn observing_an_optout_does_not_rewrite_the_consent_event() {
     // Exactly the statement the endpoint runs.
     sqlx::query(
         "UPDATE users
-         SET email_marketing_global_optout = $2,
+         SET email_marketing_global_optout = TRUE,
              email_marketing_optout_observed_at = $3
          WHERE pubkey = $1 AND tenant_id = 1
-           AND email_marketing_global_optout IS DISTINCT FROM $2",
+           AND $2 IS TRUE
+           AND email_marketing_global_optout IS DISTINCT FROM TRUE",
     )
     .bind(&pubkey)
     .bind(true)
@@ -200,10 +211,11 @@ async fn an_identical_observation_is_a_no_op() {
     .await;
 
     let statement = "UPDATE users
-         SET email_marketing_global_optout = $2,
+         SET email_marketing_global_optout = TRUE,
              email_marketing_optout_observed_at = $3
          WHERE pubkey = $1 AND tenant_id = 1
-           AND email_marketing_global_optout IS DISTINCT FROM $2";
+           AND $2 IS TRUE
+           AND email_marketing_global_optout IS DISTINCT FROM TRUE";
 
     let first = sqlx::query(statement)
         .bind(&pubkey)
@@ -226,6 +238,58 @@ async fn an_identical_observation_is_a_no_op() {
         0,
         "an unchanged observation must not rewrite the row"
     );
+
+    cleanup(&pool, &[pubkey]).await;
+}
+
+/// HubSpot forgets an opt-out when the address changes. A later observation that the new
+/// contact is not globally opted out must not clear the floor we already recorded.
+#[tokio::test]
+async fn a_later_false_observation_does_not_clear_the_floor() {
+    let pool = setup_pool().await;
+    let pubkey = seed(
+        &pool,
+        &format!("floor-{}@example.test", uuid::Uuid::new_v4()),
+        "opted_in",
+        Utc::now(),
+    )
+    .await;
+
+    let statement = "UPDATE users
+         SET email_marketing_global_optout = TRUE,
+             email_marketing_optout_observed_at = $3
+         WHERE pubkey = $1 AND tenant_id = 1
+           AND $2 IS TRUE
+           AND email_marketing_global_optout IS DISTINCT FROM TRUE";
+
+    sqlx::query(statement)
+        .bind(&pubkey)
+        .bind(true)
+        .bind(Utc::now())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let cleared = sqlx::query(statement)
+        .bind(&pubkey)
+        .bind(false)
+        .bind(Utc::now())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        cleared.rows_affected(),
+        0,
+        "a false observation must not lift the floor"
+    );
+
+    let floor: Option<bool> =
+        sqlx::query_scalar("SELECT email_marketing_global_optout FROM users WHERE pubkey = $1")
+            .bind(&pubkey)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(floor, Some(true));
 
     cleanup(&pool, &[pubkey]).await;
 }
@@ -361,18 +425,135 @@ async fn reads_are_tenant_scoped() {
     cleanup(&pool, &[pubkey]).await;
 }
 
-// NOT COVERED HERE: handler-level behaviour.
-//
-// The tests above exercise the SQL these endpoints run, not the handlers themselves, so they do not
-// prove that the service-token guard is wired up. An HTTP-level test was attempted and removed: it
-// passed with `authorize_service_token` deleted, because the TenantExtractor 500s first on
-// "Tenant cache not initialized". A test that rejects for the wrong reason is worse than none,
-// since it reads as proof the guard works.
-//
-// Covering this properly needs the global test state installed, which requires a live Redis this
-// suite does not stand up. Until then the guard is verified by reading `email_marketing.rs`: every
-// one of the six handlers calls `authorize_service_token(&headers)?` as its first statement.
-// Worth closing when the harness gains a Redis, and worth a reviewer's eye in the meantime.
+fn handler_status<T: IntoResponse>(
+    result: Result<T, keycast_api::api::error::ApiError>,
+) -> StatusCode {
+    match result {
+        Ok(ok) => ok.into_response().status(),
+        Err(err) => err.into_response().status(),
+    }
+}
+
+fn empty_headers() -> HeaderMap {
+    HeaderMap::new()
+}
+
+fn bearer_headers(token: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+    );
+    headers
+}
+
+/// Inject TenantExtractor the same way other service-token tests do. Routing through the real
+/// extractor 500s on an uninitialized tenant cache before the guard runs, which is why a naive
+/// HTTP test passed with `authorize_service_token` deleted.
+#[tokio::test]
+async fn service_token_is_required_on_every_email_marketing_handler() {
+    common::assert_test_database_url();
+    const TOKEN: &str = "test-service-token-secret";
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", TOKEN) };
+    let pool = common::setup_test_db().await;
+    let (auth_state, _producer) = common::create_test_auth_state(pool);
+    let headers = empty_headers();
+    let statuses = [
+        handler_status(
+            list_consents(
+                common::test_tenant(),
+                State(auth_state.clone()),
+                headers.clone(),
+                Query(ConsentPageQuery {
+                    since: None,
+                    since_pubkey: None,
+                    limit: None,
+                }),
+            )
+            .await,
+        ),
+        handler_status(
+            record_observations(
+                common::test_tenant(),
+                State(auth_state.clone()),
+                headers.clone(),
+                axum::Json(ObservationsRequest {
+                    observations: vec![],
+                }),
+            )
+            .await,
+        ),
+        handler_status(
+            list_deletions(
+                common::test_tenant(),
+                State(auth_state.clone()),
+                headers.clone(),
+                Query(IdPageQuery {
+                    since: None,
+                    limit: None,
+                }),
+            )
+            .await,
+        ),
+        handler_status(
+            ack_deletions(
+                common::test_tenant(),
+                State(auth_state.clone()),
+                headers.clone(),
+                axum::Json(AckRequest { ids: vec![] }),
+            )
+            .await,
+        ),
+        handler_status(
+            list_email_changes(
+                common::test_tenant(),
+                State(auth_state.clone()),
+                headers.clone(),
+                Query(IdPageQuery {
+                    since: None,
+                    limit: None,
+                }),
+            )
+            .await,
+        ),
+        handler_status(
+            ack_email_changes(
+                common::test_tenant(),
+                State(auth_state),
+                headers,
+                axum::Json(AckRequest { ids: vec![] }),
+            )
+            .await,
+        ),
+    ];
+
+    for status in statuses {
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[tokio::test]
+async fn a_valid_service_token_reaches_the_consent_list() {
+    common::assert_test_database_url();
+    const TOKEN: &str = "test-service-token-secret";
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", TOKEN) };
+    let pool = common::setup_test_db().await;
+    let (auth_state, _producer) = common::create_test_auth_state(pool);
+    let status = handler_status(
+        list_consents(
+            common::test_tenant(),
+            State(auth_state),
+            bearer_headers(TOKEN),
+            Query(ConsentPageQuery {
+                since: None,
+                since_pubkey: None,
+                limit: None,
+            }),
+        )
+        .await,
+    );
+    assert_eq!(status, StatusCode::OK);
+}
 
 /// An account whose consent is old but whose row was touched for an unrelated reason must not
 /// reappear on the cursor.

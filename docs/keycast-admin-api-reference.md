@@ -421,11 +421,14 @@ keycast never calls the email platform. It records what happened; the sync worke
 
 `GET /api/admin/email-marketing-consents?since=<timestamp>&since_pubkey=<pubkey>&limit=<n>`
 
-The cursor is the pair `(updated_at, pubkey)`, not a timestamp alone. Two accounts can share an
-`updated_at`, and a timestamp-only cursor would either skip one or loop on it forever. A response
-returns `next` only when the page was full; its absence means the caller has reached the end.
-Omitting `since` starts from the beginning, which is how a backfill or a reconciliation sweep
-enumerates everyone.
+The cursor is the pair `(email_marketing_consent_at, pubkey)`, not `updated_at` and not a
+timestamp alone. A consent answer is immutable, so each one is read exactly once. Ordering on
+`updated_at` re-triggered a subscribe after any unrelated account change and could reverse a
+granular unsubscribe. Two accounts can share a consent timestamp, and a timestamp-only cursor
+would either skip one or loop on it forever. A response returns `next` only when the page was
+full; its absence means the caller has reached the end. Omitting `since` starts from the
+beginning and enumerates accounts that have a consent event (`consent_at IS NOT NULL`), not
+accounts nobody asked.
 
 ### Read then acknowledge
 

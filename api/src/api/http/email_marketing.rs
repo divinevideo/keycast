@@ -151,14 +151,17 @@ pub async fn record_observations(
 
     let mut updated = 0u64;
     for obs in req.observations {
-        // Idempotent: an identical observation changes nothing, so replaying a batch after a crash
-        // does not churn the observation timestamp.
+        // Floor, not a mirror of the email platform's current flag. HubSpot forgets an opt-out
+        // when the address changes; a later `false` for the new contact must not clear the floor
+        // we already recorded. Identical `true` is a no-op so a crash-replayed batch does not
+        // churn the observation timestamp.
         let result = sqlx::query(
             "UPDATE users
-             SET email_marketing_global_optout = $2,
+             SET email_marketing_global_optout = TRUE,
                  email_marketing_optout_observed_at = $3
              WHERE pubkey = $1 AND tenant_id = $4
-               AND email_marketing_global_optout IS DISTINCT FROM $2",
+               AND $2 IS TRUE
+               AND email_marketing_global_optout IS DISTINCT FROM TRUE",
         )
         .bind(&obs.pubkey)
         .bind(obs.global_optout)
