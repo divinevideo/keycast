@@ -1,5 +1,10 @@
 # Email Marketing Consent (keycast side) Implementation Plan
 
+> **Superseded as a contract.** This plan is the working notes that produced the
+> change. The shipped behaviour and cursor are in `docs/keycast-admin-api-reference.md`
+> (six service-token endpoints; consent cursor is `(email_marketing_consent_at, pubkey)`,
+> not `updated_at`). Do not implement from this file.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make keycast record email marketing consent in an auditable, tri-state form and expose it to a sync service, including a suppression floor and account-deletion tombstones.

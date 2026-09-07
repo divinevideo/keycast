@@ -399,12 +399,15 @@ keycast never calls the email platform. It records what happened; the sync worke
   somebody answered, when, from where, and under which app version. It is **immutable**. No
   endpoint here can write it: the observations endpoint's statement does not name those columns, so
   the guarantee holds structurally rather than by convention. Overwriting it would destroy the
-  evidence that consent was validly obtained.
+  evidence that consent was validly obtained. `consent_at` is the time the account materialized
+  (after email verification), not the time the checkbox was shown.
 - **The suppression floor** (`email_marketing_global_optout`, `_observed_at`) records that somebody
   opted out of all email. It is **nullable, and NULL means never observed**, which is not the same
   as "not opted out". It exists because the email platform forgets an opt-out as soon as an address
   changes, so this is the only place that remembers. Any Divine system that sends marketing email
-  must respect it, whatever CRM it uses.
+  must respect it, whatever CRM it uses. The observations endpoint is write-once to `true`: a
+  `global_optout: false` observation is a no-op (`updated: 0`) and does not lift a recorded floor.
+  An observation batch is capped at 1,000 rows.
 
 ### Endpoints
 
@@ -436,6 +439,11 @@ Deletions and email changes are read and cleared in **separate calls**. A worker
 between the two replays the row rather than losing it. Losing a deletion means continuing to email
 somebody who deleted their account; losing an email change means a duplicate contact with the old
 address still subscribed. Acknowledging an unknown id is harmless.
+
+Drain **deletions before email-changes**. The two queues have independent id cursors. A person who
+changes email and then deletes the account can leave a row in both; processing the email-change
+after the deletion re-creates a contact the tombstone just removed. Correlate by address: the
+deletion row has no pubkey.
 
 ### Why email changes are recorded at all
 

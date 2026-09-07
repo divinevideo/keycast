@@ -435,6 +435,12 @@ struct RotatedIdentityRow {
     suspended_at: Option<DateTime<Utc>>,
     verified_minor: bool,
     verified_minor_at: Option<DateTime<Utc>>,
+    email_marketing_consent: String,
+    email_marketing_consent_at: Option<DateTime<Utc>>,
+    email_marketing_consent_source: Option<String>,
+    email_marketing_consent_app_version: Option<String>,
+    email_marketing_global_optout: Option<bool>,
+    email_marketing_optout_observed_at: Option<DateTime<Utc>>,
 }
 
 /// Outcome of atomically consuming a claim token and claiming the account.
@@ -2154,7 +2160,10 @@ impl UserRepository {
         // replacement row would default to `active` and hand the actor back both
         // Nostr and ActivityPub signing.
         let old_identity: RotatedIdentityRow = sqlx::query_as(
-            "SELECT username, status, suspended_reason, suspended_at, verified_minor, verified_minor_at \
+            "SELECT username, status, suspended_reason, suspended_at, verified_minor, verified_minor_at, \
+                    email_marketing_consent, email_marketing_consent_at, \
+                    email_marketing_consent_source, email_marketing_consent_app_version, \
+                    email_marketing_global_optout, email_marketing_optout_observed_at \
              FROM users WHERE pubkey = $1 AND tenant_id = $2",
         )
         .bind(old_pubkey)
@@ -2162,9 +2171,17 @@ impl UserRepository {
         .fetch_one(&mut **tx)
         .await?;
 
-        // Orphan old identity (transfer email/password/username to NULL)
+        // Orphan old identity (transfer email/password/username to NULL). Consent
+        // and the suppression floor move with the live account; leaving them on
+        // this row would keep a null-email consent event on the sync cursor.
         sqlx::query(
-            "UPDATE users SET email = NULL, password_hash = NULL, username = NULL, updated_at = $1
+            "UPDATE users SET email = NULL, password_hash = NULL, username = NULL, updated_at = $1,
+                 email_marketing_consent = 'never_asked',
+                 email_marketing_consent_at = NULL,
+                 email_marketing_consent_source = NULL,
+                 email_marketing_consent_app_version = NULL,
+                 email_marketing_global_optout = NULL,
+                 email_marketing_optout_observed_at = NULL
              WHERE pubkey = $2 AND tenant_id = $3",
         )
         .bind(now)
@@ -2178,8 +2195,11 @@ impl UserRepository {
         sqlx::query(
             "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, username, \
                                 status, suspended_reason, suspended_at, verified_minor, verified_minor_at, \
+                                email_marketing_consent, email_marketing_consent_at, \
+                                email_marketing_consent_source, email_marketing_consent_app_version, \
+                                email_marketing_global_optout, email_marketing_optout_observed_at, \
                                 created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
         )
         .bind(new_pubkey)
         .bind(tenant_id)
@@ -2192,6 +2212,12 @@ impl UserRepository {
         .bind(old_identity.suspended_at)
         .bind(old_identity.verified_minor)
         .bind(old_identity.verified_minor_at)
+        .bind(old_identity.email_marketing_consent)
+        .bind(old_identity.email_marketing_consent_at)
+        .bind(old_identity.email_marketing_consent_source)
+        .bind(old_identity.email_marketing_consent_app_version)
+        .bind(old_identity.email_marketing_global_optout)
+        .bind(old_identity.email_marketing_optout_observed_at)
         .bind(now)
         .bind(now)
         .execute(&mut **tx)
@@ -3135,6 +3161,7 @@ pub enum AccountDeletionOutcome {
 #[cfg(all(test, feature = "integration-tests"))]
 mod tests {
     use super::*;
+    use chrono::{DateTime, Utc};
     use nostr_sdk::Keys;
     use sqlx::postgres::PgPoolOptions;
     use sqlx::PgPool;
@@ -3365,6 +3392,64 @@ mod tests {
         .await
         .unwrap();
         pubkey
+    }
+
+    /// A Nostr key rotation must take the consent event and the suppression floor with the live
+    /// account. Leaving them on the orphaned row would drop tombstones and keep a null-email
+    /// record on the sync cursor.
+    #[tokio::test]
+    async fn test_change_key_carries_marketing_consent_and_clears_the_orphan() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let email = format!("rotate-{}@example.test", test_suffix());
+        let old_pubkey = seed_consented_user(&pool, &email, "opted_in").await;
+        sqlx::query(
+            "UPDATE users SET email_verified = true, password_hash = 'hashed',
+                 email_marketing_consent_at = NOW(),
+                 email_marketing_global_optout = true,
+                 email_marketing_optout_observed_at = NOW()
+             WHERE pubkey = $1",
+        )
+        .bind(&old_pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let new_pubkey = Keys::generate().public_key().to_hex();
+
+        repo.change_key_transaction(&old_pubkey, &new_pubkey, 1, &email, "hashed", b"secret")
+            .await
+            .unwrap();
+
+        let (consent, floor): (String, Option<bool>) = sqlx::query_as(
+            "SELECT email_marketing_consent, email_marketing_global_optout FROM users WHERE pubkey = $1",
+        )
+        .bind(&new_pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(consent, "opted_in");
+        assert_eq!(floor, Some(true));
+
+        let (old_consent, old_at): (String, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT email_marketing_consent, email_marketing_consent_at FROM users WHERE pubkey = $1",
+        )
+        .bind(&old_pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(old_consent, "never_asked");
+        assert!(old_at.is_none());
+
+        sqlx::query("DELETE FROM personal_keys WHERE user_pubkey = $1")
+            .bind(&new_pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM users WHERE pubkey = ANY($1)")
+            .bind(vec![old_pubkey, new_pubkey])
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     async fn cleanup_email_change(pool: &PgPool, pubkey: &str) {

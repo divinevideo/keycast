@@ -503,10 +503,22 @@ impl OAuthCodeRepository {
                                  SET email = $1, password_hash = COALESCE(password_hash, $2),
                                      email_verified = true, email_verification_token = $3,
                                      updated_at = $4,
-                                     email_marketing_consent = $7,
-                                     email_marketing_consent_at = $8,
-                                     email_marketing_consent_source = $9,
-                                     email_marketing_consent_app_version = $10
+                                     email_marketing_consent = CASE
+                                         WHEN email_marketing_consent = 'never_asked' THEN $7
+                                         ELSE email_marketing_consent
+                                     END,
+                                     email_marketing_consent_at = CASE
+                                         WHEN email_marketing_consent = 'never_asked' THEN $8
+                                         ELSE email_marketing_consent_at
+                                     END,
+                                     email_marketing_consent_source = CASE
+                                         WHEN email_marketing_consent = 'never_asked' THEN $9
+                                         ELSE email_marketing_consent_source
+                                     END,
+                                     email_marketing_consent_app_version = CASE
+                                         WHEN email_marketing_consent = 'never_asked' THEN $10
+                                         ELSE email_marketing_consent_app_version
+                                     END
                                  WHERE pubkey = $5 AND tenant_id = $6",
                             )
                             .bind(email)
@@ -593,10 +605,22 @@ impl OAuthCodeRepository {
                                      SET email = $1, password_hash = COALESCE(password_hash, $2),
                                          email_verified = true, email_verification_token = $3,
                                          updated_at = $4,
-                                         email_marketing_consent = $7,
-                                         email_marketing_consent_at = $8,
-                                         email_marketing_consent_source = $9,
-                                         email_marketing_consent_app_version = $10
+                                         email_marketing_consent = CASE
+                                             WHEN email_marketing_consent = 'never_asked' THEN $7
+                                             ELSE email_marketing_consent
+                                         END,
+                                         email_marketing_consent_at = CASE
+                                             WHEN email_marketing_consent = 'never_asked' THEN $8
+                                             ELSE email_marketing_consent_at
+                                         END,
+                                         email_marketing_consent_source = CASE
+                                             WHEN email_marketing_consent = 'never_asked' THEN $9
+                                             ELSE email_marketing_consent_source
+                                         END,
+                                         email_marketing_consent_app_version = CASE
+                                             WHEN email_marketing_consent = 'never_asked' THEN $10
+                                             ELSE email_marketing_consent_app_version
+                                         END
                                      WHERE pubkey = $5 AND tenant_id = $6",
                                 )
                                 .bind(email)

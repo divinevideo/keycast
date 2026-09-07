@@ -85,8 +85,9 @@ pub async fn list_consents(
                 email_marketing_optout_observed_at  AS optout_observed_at,
                 updated_at
          FROM users
-         WHERE tenant_id = $4
-           AND email_marketing_consent_at IS NOT NULL
+          WHERE tenant_id = $4
+            AND email IS NOT NULL
+            AND email_marketing_consent_at IS NOT NULL
            AND ($1::timestamptz IS NULL
                 OR (email_marketing_consent_at, pubkey) > ($1, $2))
          ORDER BY email_marketing_consent_at, pubkey
@@ -148,6 +149,12 @@ pub async fn record_observations(
     Json(req): Json<ObservationsRequest>,
 ) -> ApiResult<Json<ObservationsResponse>> {
     authorize_service_token(&headers)?;
+
+    if req.observations.len() as i64 > MAX_LIMIT {
+        return Err(crate::api::error::ApiError::bad_request(format!(
+            "observations batch exceeds {MAX_LIMIT}"
+        )));
+    }
 
     let mut updated = 0u64;
     for obs in req.observations {
