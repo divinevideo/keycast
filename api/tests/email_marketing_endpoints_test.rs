@@ -1009,3 +1009,141 @@ async fn the_consent_cursor_does_not_drop_rows_sharing_a_timestamp() {
          comparison skips the rest of a tied group and those people are never synced",
     );
 }
+
+/// The reclaim guard has to fire on the address, not on the timing.
+///
+/// The original predicate also required the live account's consent to be NEWER than deleted_at,
+/// which only catches somebody registering after the deletion. It misses the reverse order, which
+/// is just as reachable: A frees an address by changing their own, B claims it and opts in, and only
+/// then does A delete. B consented first, so the guard stayed silent and B's contact was removed.
+///
+/// The timing comparison was never needed. 4b and 4c run inside the deletion transaction and the
+/// users row goes at step 5 of that same transaction, so once a tombstone is visible no live row can
+/// be the account it came from. Any live opted-in holder of that address is therefore someone else.
+#[tokio::test]
+async fn a_tombstone_is_withheld_even_when_the_new_holder_consented_first() {
+    common::assert_test_database_url();
+    const TOKEN: &str = "test-service-token-secret";
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", TOKEN) };
+    let pool = common::setup_test_db().await;
+    let (auth_state, _producer) = common::create_test_auth_state(pool.clone());
+
+    let reclaimed = format!("early-{}@example.test", uuid::Uuid::new_v4());
+    let orphaned = format!("nobody-{}@example.test", uuid::Uuid::new_v4());
+
+    // The new holder opted in BEFORE the previous holder's account was deleted.
+    let holder = seed(
+        &pool,
+        &reclaimed,
+        "opted_in",
+        Utc::now() - Duration::hours(2),
+    )
+    .await;
+
+    for email in [&reclaimed, &orphaned] {
+        sqlx::query(
+            "INSERT INTO email_marketing_deletions (tenant_id, email, deleted_at)
+             VALUES (1, $1, $2)",
+        )
+        .bind(email)
+        .bind(Utc::now())
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let page = list_deletions(
+        common::test_tenant(),
+        State(auth_state),
+        bearer_headers(TOKEN),
+        Query(IdPageQuery {
+            since: None,
+            limit: None,
+        }),
+    )
+    .await
+    .unwrap()
+    .0;
+
+    let served: Vec<&str> = page.results.iter().map(|r| r.email.as_str()).collect();
+    assert!(
+        !served.contains(&reclaimed.as_str()),
+        "serving this deletes a live opted-in account's contact, and nothing re-subscribes them",
+    );
+    assert!(
+        served.contains(&orphaned.as_str()),
+        "an address with no live holder must still be served",
+    );
+
+    cleanup(&pool, &[holder]).await;
+}
+
+/// Rotation has to carry undrained email changes to the new pubkey.
+///
+/// The deletion fold matches change rows on pubkey. Rotation moved the consent columns to the
+/// replacement identity but left the change rows pointing at the old one, so the fold missed them:
+/// the old address was never tombstoned, and the change row outlived the account it belonged to.
+#[tokio::test]
+async fn rotation_carries_undrained_email_changes_to_the_new_identity() {
+    common::assert_test_database_url();
+    let pool = common::setup_test_db().await;
+
+    let old_address = format!("before-{}@example.test", uuid::Uuid::new_v4());
+    let current = format!("after-{}@example.test", uuid::Uuid::new_v4());
+    let old_pubkey = seed(&pool, &current, "opted_in", Utc::now()).await;
+
+    sqlx::query(
+        "INSERT INTO email_marketing_email_changes
+             (tenant_id, pubkey, old_email, new_email, changed_at)
+         VALUES (1, $1, $2, $3, NOW())",
+    )
+    .bind(&old_pubkey)
+    .bind(&old_address)
+    .bind(&current)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let new_pubkey = Keys::generate().public_key().to_hex();
+    let _: i64 = keycast_core::repositories::UserRepository::new(pool.clone())
+        .change_key_transaction(
+            &old_pubkey,
+            &new_pubkey,
+            1,
+            &current,
+            "$2b$12$abcdefghijklmnopqrstuv",
+            b"rotated-secret",
+        )
+        .await
+        .unwrap();
+
+    let moved: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM email_marketing_email_changes WHERE tenant_id = 1 AND pubkey = $1",
+    )
+    .bind(&new_pubkey)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        moved, 1,
+        "the change row must follow the account to its new pubkey"
+    );
+
+    // And the deletion fold, which matches on pubkey, must now find it.
+    keycast_core::repositories::UserRepository::new(pool.clone())
+        .delete_account(&new_pubkey, 1)
+        .await
+        .unwrap();
+
+    let tombstoned: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM email_marketing_deletions WHERE tenant_id = 1 AND email = $1",
+    )
+    .bind(&old_address)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        tombstoned, 1,
+        "the old address was left subscribed for a deleted account"
+    );
+}

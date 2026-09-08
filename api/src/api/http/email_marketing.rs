@@ -299,6 +299,14 @@ pub async fn list_deletions(
         // cursor has already passed their consent_at, so nothing re-subscribes them and they lose
         // the subscription silently.
         //
+        // Deliberately no comparison against deleted_at. 4b and 4c run inside the deletion
+        // transaction and the users row goes at step 5 of that same transaction, so by the time a
+        // tombstone is visible here no live row can be the account it came from. Any live opted-in
+        // holder of the address is therefore somebody else, and removing their contact is wrong
+        // whenever they consented. An earlier version required consent newer than deleted_at and so
+        // only caught a reclaim after the deletion, missing the equally reachable order where the
+        // address is freed by a change, claimed, and only then does the first account delete.
+        //
         // Decided here rather than documented for the consumer to honour, because the comparison
         // needs consent state the consumer would have to fetch per tombstone, and because a rule
         // that lives only in prose is one a future consumer can skip. Restricted to opted_in: for
@@ -314,7 +322,6 @@ pub async fn list_deletions(
                WHERE u.tenant_id = d.tenant_id
                  AND LOWER(u.email) = LOWER(d.email)
                  AND u.email_marketing_consent = 'opted_in'
-                 AND u.email_marketing_consent_at > d.deleted_at
            )
          ORDER BY d.id LIMIT $2",
     )

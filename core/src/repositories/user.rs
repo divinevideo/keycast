@@ -2210,6 +2210,21 @@ impl UserRepository {
         .execute(&mut **tx)
         .await?;
 
+        // Undrained email-change rows have to follow the account. The deletion fold and its
+        // cleanup both match on pubkey, so a row left pointing at the retired identity is invisible
+        // to them: the old address is never tombstoned, and the row outlives the account it belongs
+        // to. That also reintroduces the drain-order dependence the fold exists to remove, because
+        // a surviving row can recreate a contact after its tombstone has been acted on.
+        sqlx::query(
+            "UPDATE email_marketing_email_changes SET pubkey = $1
+             WHERE pubkey = $2 AND tenant_id = $3",
+        )
+        .bind(new_pubkey)
+        .bind(old_pubkey)
+        .bind(tenant_id)
+        .execute(&mut **tx)
+        .await?;
+
         // Preserve the actor's published ActivityPub RSA public key across
         // Nostr key rotation; remote servers cache publicKeyPem.
         sqlx::query(
