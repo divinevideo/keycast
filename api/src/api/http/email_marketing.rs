@@ -89,7 +89,7 @@ pub async fn list_consents(
             AND email IS NOT NULL
             AND email_marketing_consent_at IS NOT NULL
            AND ($1::timestamptz IS NULL
-                OR email_marketing_consent_at > $1)
+                OR (email_marketing_consent_at, pubkey) > ($1, $2))
          ORDER BY email_marketing_consent_at, pubkey
          LIMIT $3",
     )

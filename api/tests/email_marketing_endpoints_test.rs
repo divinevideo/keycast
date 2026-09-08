@@ -64,66 +64,6 @@ async fn cleanup(pool: &PgPool, pubkeys: &[String]) {
     }
 }
 
-/// The cursor is (email_marketing_consent_at, pubkey) precisely because two accounts can share a
-/// timestamp. A timestamp-only cursor either skips a record or loops on it forever.
-#[tokio::test]
-async fn cursor_pages_deterministically_when_timestamps_collide() {
-    let pool = setup_pool().await;
-    let shared = Utc::now() + Duration::days(3650);
-    let a = seed(
-        &pool,
-        &format!("collide-a-{}@example.test", uuid::Uuid::new_v4()),
-        "opted_in",
-        shared,
-    )
-    .await;
-    let b = seed(
-        &pool,
-        &format!("collide-b-{}@example.test", uuid::Uuid::new_v4()),
-        "opted_in",
-        shared,
-    )
-    .await;
-    let (first, second) = if a < b {
-        (a.clone(), b.clone())
-    } else {
-        (b.clone(), a.clone())
-    };
-
-    let page_one: Vec<(String,)> = sqlx::query_as(
-        "SELECT pubkey FROM users
-         WHERE tenant_id = 1
-           AND email_marketing_consent_at IS NOT NULL
-           AND (email_marketing_consent_at, pubkey) > ($1, $2)
-         ORDER BY email_marketing_consent_at, pubkey LIMIT 1",
-    )
-    .bind(shared - Duration::seconds(1))
-    .bind("")
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-    assert_eq!(page_one[0].0, first);
-
-    let page_two: Vec<(String,)> = sqlx::query_as(
-        "SELECT pubkey FROM users
-         WHERE tenant_id = 1
-           AND email_marketing_consent_at IS NOT NULL
-           AND (email_marketing_consent_at, pubkey) > ($1, $2)
-         ORDER BY email_marketing_consent_at, pubkey LIMIT 1",
-    )
-    .bind(shared)
-    .bind(&first)
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        page_two[0].0, second,
-        "the tiebreak must advance the cursor"
-    );
-
-    cleanup(&pool, &[a, b]).await;
-}
-
 /// NULL is "never observed", which is not the same as "not opted out". Defaulting it to false
 /// would let an unchecked account read as safe to email.
 #[tokio::test]
@@ -991,5 +931,76 @@ async fn deleting_an_account_tombstones_its_unprocessed_old_addresses() {
     assert_eq!(
         leftover, 0,
         "pending email-change rows outlived the account"
+    );
+}
+
+/// The tie-break has to be exercised through the handler, not restated in the test.
+///
+/// `cursor_pages_deterministically_when_timestamps_collide` writes a corrected row-value
+/// comparison inline and asserts on that, so it only ever proved PostgreSQL supports the syntax.
+/// The handler bound `since_pubkey` and never used it, and no test could see the difference.
+#[tokio::test]
+async fn the_consent_cursor_does_not_drop_rows_sharing_a_timestamp() {
+    common::assert_test_database_url();
+    const TOKEN: &str = "test-service-token-secret";
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", TOKEN) };
+    let pool = common::setup_test_db().await;
+    let (auth_state, _producer) = common::create_test_auth_state(pool.clone());
+
+    // Three accounts answering in the same transaction share a consent_at exactly.
+    let shared = Utc::now() + Duration::days(3650);
+    let mut seeded = Vec::new();
+    for _ in 0..3 {
+        seeded.push(
+            seed(
+                &pool,
+                &format!("tie-{}@example.test", uuid::Uuid::new_v4()),
+                "opted_in",
+                shared,
+            )
+            .await,
+        );
+    }
+    seeded.sort();
+
+    // Page one at a time, exactly as the worker does, and collect everything the cursor yields.
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor = Some(ConsentPageQuery {
+        since: Some(shared - Duration::seconds(1)),
+        since_pubkey: Some(String::new()),
+        limit: Some(1),
+    });
+
+    for _ in 0..6 {
+        let Some(query) = cursor.take() else { break };
+        let page = list_consents(
+            common::test_tenant(),
+            State(auth_state.clone()),
+            bearer_headers(TOKEN),
+            Query(query),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        for r in &page.results {
+            if seeded.contains(&r.pubkey) {
+                seen.push(r.pubkey.clone());
+            }
+        }
+
+        cursor = page.next.map(|n| ConsentPageQuery {
+            since: Some(n.since),
+            since_pubkey: Some(n.since_pubkey),
+            limit: Some(1),
+        });
+    }
+
+    seen.sort();
+    seen.dedup();
+    assert_eq!(
+        seen, seeded,
+        "every account sharing a consent_at must be reachable through the cursor; a timestamp-only \
+         comparison skips the rest of a tied group and those people are never synced",
     );
 }
