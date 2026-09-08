@@ -433,6 +433,19 @@ full; its absence means the caller has reached the end. Omitting `since` starts 
 beginning and enumerates accounts that have a consent event (`consent_at IS NOT NULL`), not
 accounts nobody asked.
 
+### The floor snapshot on email changes
+
+An email-change row carries `global_optout`: the suppression floor as it stood when the change was
+finalized. The consumer should prefer it over asking the email platform about the old address.
+
+That lookup does not survive a second change. If somebody changes address twice before the drain
+runs, the row reads `B -> C` while the platform no longer knows `B`, so an opt-out becomes invisible
+and the consumer would subscribe a person who had asked not to be emailed. Capturing the value
+inside the transaction that finalizes the change removes the reconstruction entirely.
+
+NULL means never observed, or a row written before the column existed. It is not "not opted out", so
+a NULL is the one case where falling back to a platform lookup is still correct.
+
 ### Read then acknowledge
 
 Deletions and email changes are read and cleared in **separate calls**. A worker that crashes

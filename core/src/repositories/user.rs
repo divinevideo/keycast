@@ -1178,9 +1178,14 @@ impl UserRepository {
         // nothing. Only opted-in accounts: those are the only contacts we created. In the same
         // transaction, so a failed finalize leaves no row claiming a move happened.
         sqlx::query(
+            // The floor is snapshotted here, not looked up later. A lookup against the old address
+            // does not survive a second change: the row would say "B -> C" while the email platform
+            // no longer knows B, so the opt-out would be invisible and the sync would subscribe
+            // somebody who had asked not to be emailed.
             "INSERT INTO email_marketing_email_changes
-                 (tenant_id, pubkey, old_email, new_email, changed_at)
-             SELECT tenant_id, pubkey, email, pending_email, $1 FROM users
+                 (tenant_id, pubkey, old_email, new_email, changed_at, global_optout)
+             SELECT tenant_id, pubkey, email, pending_email, $1, email_marketing_global_optout
+             FROM users
              WHERE pubkey = $2 AND tenant_id = $3
                AND pending_email IS NOT NULL
                AND pending_email_old_confirmed_at IS NOT NULL
@@ -3347,6 +3352,78 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, 0, "an unfinalized change must leave no row");
+
+        cleanup_email_change(&pool, &pubkey).await;
+    }
+
+    /// The floor is snapshotted onto the email-change row when the change is finalized.
+    ///
+    /// Looking it up later against the old address does not survive a second change: the row would
+    /// say "B -> C" while the email platform no longer knows B, so an opt-out would be invisible and
+    /// the sync would subscribe somebody who had asked not to be emailed.
+    #[tokio::test]
+    async fn test_email_change_snapshots_the_suppression_floor() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let old_email = format!("snap-before-{}@example.test", test_suffix());
+        let new_email = format!("snap-after-{}@example.test", test_suffix());
+        let pubkey =
+            seed_user_with_confirmed_email_change(&pool, &old_email, &new_email, "opted_in").await;
+
+        sqlx::query("UPDATE users SET email_marketing_global_optout = TRUE WHERE pubkey = $1")
+            .bind(&pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        repo.finalize_email_change_if_ready(&pubkey, 1)
+            .await
+            .unwrap();
+
+        let snapshot: Option<bool> = sqlx::query_scalar(
+            "SELECT global_optout FROM email_marketing_email_changes WHERE pubkey = $1",
+        )
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            snapshot,
+            Some(true),
+            "an opt-out must be captured at change time, not reconstructed later"
+        );
+
+        cleanup_email_change(&pool, &pubkey).await;
+    }
+
+    /// Never observed stays never observed. A NULL snapshot is not "not opted out": it tells the
+    /// consumer it has no answer and must fall back rather than assume one.
+    #[tokio::test]
+    async fn test_email_change_snapshot_is_null_when_the_floor_was_never_observed() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let old_email = format!("snapnull-before-{}@example.test", test_suffix());
+        let new_email = format!("snapnull-after-{}@example.test", test_suffix());
+        let pubkey =
+            seed_user_with_confirmed_email_change(&pool, &old_email, &new_email, "opted_in").await;
+
+        repo.finalize_email_change_if_ready(&pubkey, 1)
+            .await
+            .unwrap();
+
+        let snapshot: Option<bool> = sqlx::query_scalar(
+            "SELECT global_optout FROM email_marketing_email_changes WHERE pubkey = $1",
+        )
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            snapshot, None,
+            "unobserved must not be recorded as not-opted-out"
+        );
 
         cleanup_email_change(&pool, &pubkey).await;
     }

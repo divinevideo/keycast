@@ -347,6 +347,10 @@ pub struct EmailChangeRecord {
     pub old_email: String,
     pub new_email: String,
     pub changed_at: DateTime<Utc>,
+    /// The suppression floor as it stood when the change was finalized. NULL means never observed,
+    /// or a row written before this column existed. The consumer prefers this over asking the email
+    /// platform about the old address, because that lookup does not survive a second change.
+    pub global_optout: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -366,7 +370,8 @@ pub async fn list_email_changes(
     purge_expired(&auth_state, "email_marketing_email_changes", tenant.0.id).await?;
 
     let results: Vec<EmailChangeRecord> = sqlx::query_as(
-        "SELECT id, pubkey, old_email, new_email, changed_at FROM email_marketing_email_changes
+        "SELECT id, pubkey, old_email, new_email, changed_at, global_optout
+         FROM email_marketing_email_changes
          WHERE tenant_id = $3 AND ($1::bigint IS NULL OR id > $1)
          ORDER BY id LIMIT $2",
     )
