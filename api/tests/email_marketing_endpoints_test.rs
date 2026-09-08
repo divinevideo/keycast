@@ -936,9 +936,14 @@ async fn deleting_an_account_tombstones_its_unprocessed_old_addresses() {
 
 /// The tie-break has to be exercised through the handler, not restated in the test.
 ///
-/// `cursor_pages_deterministically_when_timestamps_collide` writes a corrected row-value
-/// comparison inline and asserts on that, so it only ever proved PostgreSQL supports the syntax.
-/// The handler bound `since_pubkey` and never used it, and no test could see the difference.
+/// This replaces `cursor_pages_deterministically_when_timestamps_collide`, which wrote its own
+/// row-value comparison inline and asserted on that, so it only ever proved PostgreSQL supports
+/// the syntax rather than that `list_consents` uses it.
+///
+/// That gap was demonstrated the hard way. The tuple comparison was briefly deleted from the
+/// handler by an editing accident on this branch, and the whole suite stayed green: the one test
+/// named after this behaviour did not notice its own subject being removed. A test that restates
+/// production SQL cannot fail when production SQL changes, which is the only time it matters.
 #[tokio::test]
 async fn the_consent_cursor_does_not_drop_rows_sharing_a_timestamp() {
     common::assert_test_database_url();
