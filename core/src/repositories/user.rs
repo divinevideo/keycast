@@ -1850,30 +1850,6 @@ impl UserRepository {
     // Key change methods
     // =========================================================================
 
-    /// Orphan user's identity (clear email/password for key change).
-    pub async fn orphan_identity(
-        &self,
-        pubkey: &str,
-        tenant_id: i64,
-    ) -> Result<(), RepositoryError> {
-        sqlx::query(
-            "UPDATE users SET email = NULL, password_hash = NULL, updated_at = $1,
-                 email_marketing_consent = 'never_asked',
-                 email_marketing_consent_at = NULL,
-                 email_marketing_consent_source = NULL,
-                 email_marketing_consent_app_version = NULL,
-                 email_marketing_global_optout = NULL,
-                 email_marketing_optout_observed_at = NULL
-             WHERE pubkey = $2 AND tenant_id = $3",
-        )
-        .bind(Utc::now())
-        .bind(pubkey)
-        .bind(tenant_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
     /// Finalize OAuth registration atomically.
     ///
     /// Creates user and personal key records, then deletes the one-time oauth code.

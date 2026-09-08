@@ -649,3 +649,150 @@ async fn never_asked_accounts_are_not_returned() {
     assert!(!rows.iter().any(|(p,)| p == &pubkey));
     cleanup(&pool, &[pubkey]).await;
 }
+
+/// A summed row count cannot tell an expected no-op from a lost write: an unknown pubkey, a
+/// wrong-tenant caller, an orphan and an identical replay all contribute zero.
+#[tokio::test]
+async fn observations_report_per_pubkey_outcomes() {
+    let pool = setup_pool().await;
+    let at = Utc::now() - Duration::days(1);
+    let live = seed(
+        &pool,
+        &format!("live-{}@example.test", uuid::Uuid::new_v4()),
+        "opted_in",
+        at,
+    )
+    .await;
+    let ghost = Keys::generate().public_key().to_hex();
+
+    let touched: Vec<(String, bool)> = sqlx::query_as(
+        "WITH input AS (
+             SELECT * FROM UNNEST($1::text[], $2::bool[], $3::timestamptz[])
+                 AS t(pubkey, global_optout, observed_at)
+         ),
+         live AS (
+             SELECT i.pubkey, i.global_optout, i.observed_at
+             FROM input i
+             JOIN users u ON u.pubkey = i.pubkey AND u.tenant_id = $4 AND u.email IS NOT NULL
+         ),
+         changed AS (
+             UPDATE users u
+             SET email_marketing_global_optout = TRUE,
+                 email_marketing_optout_observed_at = l.observed_at
+             FROM live l
+             WHERE u.pubkey = l.pubkey AND u.tenant_id = $4
+               AND l.global_optout IS TRUE
+               AND u.email_marketing_global_optout IS DISTINCT FROM TRUE
+             RETURNING u.pubkey
+         )
+         SELECT l.pubkey, (c.pubkey IS NOT NULL) AS changed
+         FROM live l LEFT JOIN changed c ON c.pubkey = l.pubkey",
+    )
+    .bind(vec![live.clone(), ghost.clone()])
+    .bind(vec![true, true])
+    .bind(vec![Utc::now(), Utc::now()])
+    .bind(1i64)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    let seen: Vec<&String> = touched.iter().map(|(p, _)| p).collect();
+    assert!(seen.contains(&&live), "a live account must be reported");
+    assert!(
+        !seen.contains(&&ghost),
+        "a pubkey with no live row must not be reported as touched"
+    );
+    assert!(
+        touched.iter().any(|(p, c)| p == &live && *c),
+        "and its floor must have changed"
+    );
+
+    cleanup(&pool, &[live]).await;
+}
+
+/// An orphaned identity left by a key rotation has no email and must not accept a floor write:
+/// recording an opt-out against a row nothing reads loses the opt-out.
+#[tokio::test]
+async fn observations_skip_an_orphaned_identity() {
+    let pool = setup_pool().await;
+    let orphan = Keys::generate().public_key().to_hex();
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, email, email_marketing_consent, created_at, updated_at)
+         VALUES ($1, 1, NULL, 'never_asked', NOW(), NOW())",
+    )
+    .bind(&orphan)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let touched: Vec<(String,)> = sqlx::query_as(
+        "SELECT i.pubkey FROM UNNEST($1::text[]) AS i(pubkey)
+         JOIN users u ON u.pubkey = i.pubkey AND u.tenant_id = 1 AND u.email IS NOT NULL",
+    )
+    .bind(vec![orphan.clone()])
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert!(
+        touched.is_empty(),
+        "an orphan must not be a floor-write target"
+    );
+    sqlx::query("DELETE FROM users WHERE pubkey = $1")
+        .bind(&orphan)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+/// Retention must be a property of the data, not of a consumer that may never run. Otherwise a
+/// deleted account's address is kept indefinitely whenever the worker is switched off.
+#[tokio::test]
+async fn expired_deletion_rows_are_purged() {
+    let pool = setup_pool().await;
+    let stale = format!("stale-{}@example.test", uuid::Uuid::new_v4());
+    let fresh = format!("fresh-{}@example.test", uuid::Uuid::new_v4());
+
+    sqlx::query(
+        "INSERT INTO email_marketing_deletions (tenant_id, email, deleted_at, expires_at)
+         VALUES (1, $1, NOW() - interval '30 days', NOW() - interval '1 day'),
+                (1, $2, NOW(), NOW() + interval '14 days')",
+    )
+    .bind(&stale)
+    .bind(&fresh)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "DELETE FROM email_marketing_deletions WHERE tenant_id = $1 AND expires_at <= NOW()",
+    )
+    .bind(1i64)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let remaining: Vec<(String,)> =
+        sqlx::query_as("SELECT email FROM email_marketing_deletions WHERE email IN ($1, $2)")
+            .bind(&stale)
+            .bind(&fresh)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+
+    let emails: Vec<&String> = remaining.iter().map(|(e,)| e).collect();
+    assert!(
+        !emails.contains(&&stale),
+        "an expired address must not be retained"
+    );
+    assert!(
+        emails.contains(&&fresh),
+        "a live pending removal must survive"
+    );
+
+    sqlx::query("DELETE FROM email_marketing_deletions WHERE email = $1")
+        .bind(&fresh)
+        .execute(&pool)
+        .await
+        .unwrap();
+}

@@ -135,7 +135,15 @@ pub struct ObservationsRequest {
 
 #[derive(Debug, Serialize)]
 pub struct ObservationsResponse {
+    /// Rows whose floor actually changed.
     pub updated: u64,
+    /// Accounts that exist and were left alone. A `false` observation and an identical `true`
+    /// replay both land here, and both are expected.
+    pub unchanged: Vec<String>,
+    /// Pubkeys with no live account in this tenant: rotated away, deleted, or a wrong-tenant
+    /// caller. Reported separately because a summed row count cannot distinguish those from an
+    /// ordinary no-op, and they mean something is wrong rather than nothing to do.
+    pub not_found: Vec<String>,
 }
 
 /// Writes only the suppression floor.
@@ -155,31 +163,81 @@ pub async fn record_observations(
             "observations batch exceeds {MAX_LIMIT}"
         )));
     }
-
-    let mut updated = 0u64;
-    for obs in req.observations {
-        // Floor, not a mirror of the email platform's current flag. HubSpot forgets an opt-out
-        // when the address changes; a later `false` for the new contact must not clear the floor
-        // we already recorded. Identical `true` is a no-op so a crash-replayed batch does not
-        // churn the observation timestamp.
-        let result = sqlx::query(
-            "UPDATE users
-             SET email_marketing_global_optout = TRUE,
-                 email_marketing_optout_observed_at = $3
-             WHERE pubkey = $1 AND tenant_id = $4
-               AND $2 IS TRUE
-               AND email_marketing_global_optout IS DISTINCT FROM TRUE",
-        )
-        .bind(&obs.pubkey)
-        .bind(obs.global_optout)
-        .bind(obs.observed_at)
-        .bind(tenant.0.id)
-        .execute(&auth_state.state.db)
-        .await?;
-        updated += result.rows_affected();
+    if req.observations.is_empty() {
+        return Ok(Json(ObservationsResponse {
+            updated: 0,
+            unchanged: Vec::new(),
+            not_found: Vec::new(),
+        }));
     }
 
-    Ok(Json(ObservationsResponse { updated }))
+    let pubkeys: Vec<String> = req.observations.iter().map(|o| o.pubkey.clone()).collect();
+    let optouts: Vec<bool> = req.observations.iter().map(|o| o.global_optout).collect();
+    let observed: Vec<DateTime<Utc>> = req.observations.iter().map(|o| o.observed_at).collect();
+
+    // One set-based statement rather than a row-at-a-time loop. A thousand sequential updates each
+    // acquiring from the pool is poor under transaction-mode pooling, and a summed row count cannot
+    // tell the caller which input did what.
+    //
+    // The floor is write-once-true, not a mirror of the email platform's current flag: that platform
+    // forgets an opt-out when an address changes, so a later `false` for the new contact must not
+    // clear a floor already recorded. An identical `true` is a no-op, so a crash-replayed batch does
+    // not churn the observation timestamp.
+    //
+    // Only the floor columns appear here. The consent event is absent by construction, so its
+    // immutability holds because no code path can write it rather than because somebody remembers.
+    //
+    // An account with no email is an orphaned identity left by a key rotation. It is reported as
+    // not-found rather than written to: recording somebody's opt-out against a row nothing reads
+    // loses the opt-out.
+    let touched: Vec<(String, bool)> = sqlx::query_as(
+        "WITH input AS (
+             SELECT * FROM UNNEST($1::text[], $2::bool[], $3::timestamptz[])
+                 AS t(pubkey, global_optout, observed_at)
+         ),
+         live AS (
+             SELECT i.pubkey, i.global_optout, i.observed_at
+             FROM input i
+             JOIN users u ON u.pubkey = i.pubkey AND u.tenant_id = $4 AND u.email IS NOT NULL
+         ),
+         changed AS (
+             UPDATE users u
+             SET email_marketing_global_optout = TRUE,
+                 email_marketing_optout_observed_at = l.observed_at
+             FROM live l
+             WHERE u.pubkey = l.pubkey AND u.tenant_id = $4
+               AND l.global_optout IS TRUE
+               AND u.email_marketing_global_optout IS DISTINCT FROM TRUE
+             RETURNING u.pubkey
+         )
+         SELECT l.pubkey, (c.pubkey IS NOT NULL) AS changed
+         FROM live l LEFT JOIN changed c ON c.pubkey = l.pubkey",
+    )
+    .bind(&pubkeys)
+    .bind(&optouts)
+    .bind(&observed)
+    .bind(tenant.0.id)
+    .fetch_all(&auth_state.state.db)
+    .await?;
+
+    let mut updated = 0u64;
+    let mut unchanged = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (pubkey, changed) in touched {
+        seen.insert(pubkey.clone());
+        if changed {
+            updated += 1;
+        } else {
+            unchanged.push(pubkey);
+        }
+    }
+    let not_found: Vec<String> = pubkeys.into_iter().filter(|p| !seen.contains(p)).collect();
+
+    Ok(Json(ObservationsResponse {
+        updated,
+        unchanged,
+        not_found,
+    }))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -202,6 +260,23 @@ pub struct AckResponse {
     pub cleared: u64,
 }
 
+/// Drop rows past their retention window.
+///
+/// `table` is one of two compile-time literals from this module, never user input, so the
+/// interpolation cannot carry anything a caller controls.
+async fn purge_expired(
+    auth_state: &AuthState,
+    table: &'static str,
+    tenant_id: i64,
+) -> ApiResult<()> {
+    let statement = format!("DELETE FROM {table} WHERE tenant_id = $1 AND expires_at <= NOW()");
+    sqlx::query(&statement)
+        .bind(tenant_id)
+        .execute(&auth_state.state.db)
+        .await?;
+    Ok(())
+}
+
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct DeletionRecord {
     pub id: i64,
@@ -222,6 +297,11 @@ pub async fn list_deletions(
 ) -> ApiResult<Json<DeletionPage>> {
     authorize_service_token(&headers)?;
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+
+    // Purge past-retention rows before reading. This makes the bound a property of the data rather
+    // than of a consumer that may never run: somebody who deleted their account should not have
+    // their address kept indefinitely because a worker elsewhere is switched off.
+    purge_expired(&auth_state, "email_marketing_deletions", tenant.0.id).await?;
 
     let results: Vec<DeletionRecord> = sqlx::query_as(
         "SELECT id, email, deleted_at FROM email_marketing_deletions
@@ -282,6 +362,8 @@ pub async fn list_email_changes(
 ) -> ApiResult<Json<EmailChangePage>> {
     authorize_service_token(&headers)?;
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+
+    purge_expired(&auth_state, "email_marketing_email_changes", tenant.0.id).await?;
 
     let results: Vec<EmailChangeRecord> = sqlx::query_as(
         "SELECT id, pubkey, old_email, new_email, changed_at FROM email_marketing_email_changes
