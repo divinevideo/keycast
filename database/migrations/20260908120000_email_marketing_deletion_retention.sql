@@ -7,9 +7,9 @@
 -- Somebody who deleted their Divine account is entitled to a stronger guarantee than "a service in
 -- another repository is expected to be running".
 --
--- `expires_at` makes the bound a property of the data rather than of an external process. Rows past
--- it are purged on read, so the guarantee holds even if nothing ever drains the queue. Fourteen days
--- is generous for a worker that runs every five minutes, while still being a real ceiling.
+-- `expires_at` gives keycast's existing five-minute background cleanup task an absolute deadline
+-- that does not depend on the sync worker reading or acknowledging the queues. Fourteen days is
+-- generous for a worker that runs every five minutes, while still being a real ceiling.
 --
 -- The trade-off is stated plainly: if the worker is down for longer than the retention window, the
 -- pending removal is dropped and that contact stays in the email platform until some other pass

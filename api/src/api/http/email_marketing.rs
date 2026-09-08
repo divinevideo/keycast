@@ -171,6 +171,17 @@ pub async fn record_observations(
         }));
     }
 
+    let mut unique_pubkeys = std::collections::HashSet::with_capacity(req.observations.len());
+    if !req
+        .observations
+        .iter()
+        .all(|observation| unique_pubkeys.insert(&observation.pubkey))
+    {
+        return Err(crate::api::error::ApiError::bad_request(
+            "observations must contain unique pubkeys",
+        ));
+    }
+
     let pubkeys: Vec<String> = req.observations.iter().map(|o| o.pubkey.clone()).collect();
     let optouts: Vec<bool> = req.observations.iter().map(|o| o.global_optout).collect();
     let observed: Vec<DateTime<Utc>> = req.observations.iter().map(|o| o.observed_at).collect();
@@ -260,23 +271,6 @@ pub struct AckResponse {
     pub cleared: u64,
 }
 
-/// Drop rows past their retention window.
-///
-/// `table` is one of two compile-time literals from this module, never user input, so the
-/// interpolation cannot carry anything a caller controls.
-async fn purge_expired(
-    auth_state: &AuthState,
-    table: &'static str,
-    tenant_id: i64,
-) -> ApiResult<()> {
-    let statement = format!("DELETE FROM {table} WHERE tenant_id = $1 AND expires_at <= NOW()");
-    sqlx::query(&statement)
-        .bind(tenant_id)
-        .execute(&auth_state.state.db)
-        .await?;
-    Ok(())
-}
-
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct DeletionRecord {
     pub id: i64,
@@ -298,15 +292,17 @@ pub async fn list_deletions(
     authorize_service_token(&headers)?;
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
-    // Purge past-retention rows before reading. This makes the bound a property of the data rather
-    // than of a consumer that may never run: somebody who deleted their account should not have
-    // their address kept indefinitely because a worker elsewhere is switched off.
-    purge_expired(&auth_state, "email_marketing_deletions", tenant.0.id).await?;
-
     let results: Vec<DeletionRecord> = sqlx::query_as(
-        "SELECT id, email, deleted_at FROM email_marketing_deletions
-         WHERE tenant_id = $3 AND ($1::bigint IS NULL OR id > $1)
-         ORDER BY id LIMIT $2",
+        "SELECT d.id, d.email, d.deleted_at FROM email_marketing_deletions d
+         WHERE d.tenant_id = $3 AND ($1::bigint IS NULL OR d.id > $1)
+           AND NOT EXISTS (
+               SELECT 1 FROM users u
+               WHERE u.tenant_id = d.tenant_id
+                 AND LOWER(u.email) = LOWER(d.email)
+                 AND u.email_marketing_consent = 'opted_in'
+                 AND u.email_marketing_consent_at > d.deleted_at
+           )
+         ORDER BY d.id LIMIT $2",
     )
     .bind(query.since)
     .bind(limit)
@@ -366,8 +362,6 @@ pub async fn list_email_changes(
 ) -> ApiResult<Json<EmailChangePage>> {
     authorize_service_token(&headers)?;
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-
-    purge_expired(&auth_state, "email_marketing_email_changes", tenant.0.id).await?;
 
     let results: Vec<EmailChangeRecord> = sqlx::query_as(
         "SELECT id, pubkey, old_email, new_email, changed_at, global_optout

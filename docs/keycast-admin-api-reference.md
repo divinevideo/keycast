@@ -407,7 +407,9 @@ keycast never calls the email platform. It records what happened; the sync worke
   changes, so this is the only place that remembers. Any Divine system that sends marketing email
   must respect it, whatever CRM it uses. The observations endpoint is write-once to `true`: a
   `global_optout: false` observation is a no-op (`updated: 0`) and does not lift a recorded floor.
-  An observation batch is capped at 1,000 rows.
+  An observation batch is capped at 1,000 rows and must contain unique pubkeys. Its response
+  separates changed accounts (`updated`) from expected no-ops (`unchanged`) and missing live
+  accounts (`not_found`); consumers must surface `not_found` rather than silently discarding it.
 
 ### Endpoints
 
@@ -460,6 +462,10 @@ deletions first tries to remove `new` (not yet a contact) and then the email-cha
 `new`, leaving a subscribed contact for a deleted account. Email-change first, then deletion,
 removes the moved contact. Correlate by address: the deletion row has no pubkey.
 
+Keycast also suppresses a deletion row from the list response when the same tenant has a newer
+`opted_in` consent event for that address. The server-side guard prevents an old tombstone from
+deleting a newly consented contact even if a consumer fails to perform the timestamp check itself.
+
 A deletion tombstone and a later consent for the same address can coexist: hard-delete frees the
 mailbox, so a new account can opt in before the worker drains. Apply a deletion only when no
 consent record for that address is newer than `deleted_at`, or re-check the address against
@@ -476,7 +482,9 @@ second contact and leave the previous address subscribed indefinitely. The row i
 same transaction that finalizes the change, capturing the outgoing address **before** the update
 overwrites it.
 
-Deletion and email-change rows exist only until the worker acks them. keycast does not expire them
-on its own; the worker's drain is what bounds how long an address is retained past deletion. Both
-are written only for accounts whose consent state is `opted_in`, since those are the only contacts
-the sync created.
+Deletion and email-change rows exist until the worker acks them or their 14-day retention window
+ends. Keycast's five-minute background cleanup task deletes expired rows independently of reads from
+the sync worker. Both queues are written only for accounts whose consent state is `opted_in`, since
+those are the only contacts the sync created. If the worker cannot deliver a deletion inside the
+window, privacy retention wins: the queued address is removed even though the external contact may
+remain until another reconciliation catches it.

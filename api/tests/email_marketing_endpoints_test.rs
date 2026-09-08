@@ -13,7 +13,8 @@ use axum::{
 use chrono::{DateTime, Duration, Utc};
 use keycast_api::api::http::email_marketing::{
     ack_deletions, ack_email_changes, list_consents, list_deletions, list_email_changes,
-    record_observations, AckRequest, ConsentPageQuery, IdPageQuery, ObservationsRequest,
+    record_observations, AckRequest, ConsentPageQuery, IdPageQuery, Observation,
+    ObservationsRequest,
 };
 use nostr_sdk::Keys;
 use sqlx::PgPool;
@@ -655,6 +656,8 @@ async fn never_asked_accounts_are_not_returned() {
 #[tokio::test]
 async fn observations_report_per_pubkey_outcomes() {
     let pool = setup_pool().await;
+    const TOKEN: &str = "test-service-token-secret";
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", TOKEN) };
     let at = Utc::now() - Duration::days(1);
     let live = seed(
         &pool,
@@ -664,50 +667,89 @@ async fn observations_report_per_pubkey_outcomes() {
     )
     .await;
     let ghost = Keys::generate().public_key().to_hex();
+    let (auth_state, _producer) = common::create_test_auth_state(pool.clone());
 
-    let touched: Vec<(String, bool)> = sqlx::query_as(
-        "WITH input AS (
-             SELECT * FROM UNNEST($1::text[], $2::bool[], $3::timestamptz[])
-                 AS t(pubkey, global_optout, observed_at)
-         ),
-         live AS (
-             SELECT i.pubkey, i.global_optout, i.observed_at
-             FROM input i
-             JOIN users u ON u.pubkey = i.pubkey AND u.tenant_id = $4 AND u.email IS NOT NULL
-         ),
-         changed AS (
-             UPDATE users u
-             SET email_marketing_global_optout = TRUE,
-                 email_marketing_optout_observed_at = l.observed_at
-             FROM live l
-             WHERE u.pubkey = l.pubkey AND u.tenant_id = $4
-               AND l.global_optout IS TRUE
-               AND u.email_marketing_global_optout IS DISTINCT FROM TRUE
-             RETURNING u.pubkey
-         )
-         SELECT l.pubkey, (c.pubkey IS NOT NULL) AS changed
-         FROM live l LEFT JOIN changed c ON c.pubkey = l.pubkey",
+    let response = record_observations(
+        common::test_tenant(),
+        State(auth_state.clone()),
+        bearer_headers(TOKEN),
+        axum::Json(ObservationsRequest {
+            observations: vec![
+                Observation {
+                    pubkey: live.clone(),
+                    global_optout: true,
+                    observed_at: Utc::now(),
+                },
+                Observation {
+                    pubkey: ghost.clone(),
+                    global_optout: true,
+                    observed_at: Utc::now(),
+                },
+            ],
+        }),
     )
-    .bind(vec![live.clone(), ghost.clone()])
-    .bind(vec![true, true])
-    .bind(vec![Utc::now(), Utc::now()])
-    .bind(1i64)
-    .fetch_all(&pool)
     .await
     .unwrap();
 
-    let seen: Vec<&String> = touched.iter().map(|(p, _)| p).collect();
-    assert!(seen.contains(&&live), "a live account must be reported");
-    assert!(
-        !seen.contains(&&ghost),
-        "a pubkey with no live row must not be reported as touched"
-    );
-    assert!(
-        touched.iter().any(|(p, c)| p == &live && *c),
-        "and its floor must have changed"
-    );
+    assert_eq!(response.0.updated, 1);
+    assert!(response.0.unchanged.is_empty());
+    assert_eq!(response.0.not_found, vec![ghost]);
+
+    let replay = record_observations(
+        common::test_tenant(),
+        State(auth_state),
+        bearer_headers(TOKEN),
+        axum::Json(ObservationsRequest {
+            observations: vec![Observation {
+                pubkey: live.clone(),
+                global_optout: false,
+                observed_at: Utc::now(),
+            }],
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay.0.updated, 0);
+    assert_eq!(replay.0.unchanged, vec![live.clone()]);
+    assert!(replay.0.not_found.is_empty());
 
     cleanup(&pool, &[live]).await;
+}
+
+#[tokio::test]
+async fn observations_reject_duplicate_pubkeys() {
+    common::assert_test_database_url();
+    const TOKEN: &str = "test-service-token-secret";
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", TOKEN) };
+    let pool = common::setup_test_db().await;
+    let (auth_state, _producer) = common::create_test_auth_state(pool);
+    let pubkey = Keys::generate().public_key().to_hex();
+    let observed_at = Utc::now();
+
+    let status = handler_status(
+        record_observations(
+            common::test_tenant(),
+            State(auth_state),
+            bearer_headers(TOKEN),
+            axum::Json(ObservationsRequest {
+                observations: vec![
+                    Observation {
+                        pubkey: pubkey.clone(),
+                        global_optout: false,
+                        observed_at,
+                    },
+                    Observation {
+                        pubkey,
+                        global_optout: true,
+                        observed_at,
+                    },
+                ],
+            }),
+        )
+        .await,
+    );
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 /// An orphaned identity left by a key rotation has no email and must not accept a floor write:
@@ -715,6 +757,8 @@ async fn observations_report_per_pubkey_outcomes() {
 #[tokio::test]
 async fn observations_skip_an_orphaned_identity() {
     let pool = setup_pool().await;
+    const TOKEN: &str = "test-service-token-secret";
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", TOKEN) };
     let orphan = Keys::generate().public_key().to_hex();
     sqlx::query(
         "INSERT INTO users (pubkey, tenant_id, email, email_marketing_consent, created_at, updated_at)
@@ -724,20 +768,26 @@ async fn observations_skip_an_orphaned_identity() {
     .execute(&pool)
     .await
     .unwrap();
+    let (auth_state, _producer) = common::create_test_auth_state(pool.clone());
 
-    let touched: Vec<(String,)> = sqlx::query_as(
-        "SELECT i.pubkey FROM UNNEST($1::text[]) AS i(pubkey)
-         JOIN users u ON u.pubkey = i.pubkey AND u.tenant_id = 1 AND u.email IS NOT NULL",
+    let response = record_observations(
+        common::test_tenant(),
+        State(auth_state),
+        bearer_headers(TOKEN),
+        axum::Json(ObservationsRequest {
+            observations: vec![Observation {
+                pubkey: orphan.clone(),
+                global_optout: true,
+                observed_at: Utc::now(),
+            }],
+        }),
     )
-    .bind(vec![orphan.clone()])
-    .fetch_all(&pool)
     .await
     .unwrap();
 
-    assert!(
-        touched.is_empty(),
-        "an orphan must not be a floor-write target"
-    );
+    assert_eq!(response.0.updated, 0);
+    assert!(response.0.unchanged.is_empty());
+    assert_eq!(response.0.not_found, vec![orphan.clone()]);
     sqlx::query("DELETE FROM users WHERE pubkey = $1")
         .bind(&orphan)
         .execute(&pool)
@@ -752,6 +802,8 @@ async fn expired_deletion_rows_are_purged() {
     let pool = setup_pool().await;
     let stale = format!("stale-{}@example.test", uuid::Uuid::new_v4());
     let fresh = format!("fresh-{}@example.test", uuid::Uuid::new_v4());
+    let stale_change = Keys::generate().public_key().to_hex();
+    let fresh_change = Keys::generate().public_key().to_hex();
 
     sqlx::query(
         "INSERT INTO email_marketing_deletions (tenant_id, email, deleted_at, expires_at)
@@ -763,14 +815,24 @@ async fn expired_deletion_rows_are_purged() {
     .execute(&pool)
     .await
     .unwrap();
-
     sqlx::query(
-        "DELETE FROM email_marketing_deletions WHERE tenant_id = $1 AND expires_at <= NOW()",
+        "INSERT INTO email_marketing_email_changes
+             (tenant_id, pubkey, old_email, new_email, changed_at, expires_at)
+         VALUES (1, $1, 'stale-old@example.test', 'stale-new@example.test', NOW(),
+                    NOW() - interval '1 day'),
+                (1, $2, 'fresh-old@example.test', 'fresh-new@example.test', NOW(),
+                    NOW() + interval '14 days')",
     )
-    .bind(1i64)
+    .bind(&stale_change)
+    .bind(&fresh_change)
     .execute(&pool)
     .await
     .unwrap();
+
+    let removed = keycast_api::auth_cleanup::delete_expired_email_marketing_queue_rows(&pool)
+        .await
+        .unwrap();
+    assert_eq!(removed, (1, 1));
 
     let remaining: Vec<(String,)> =
         sqlx::query_as("SELECT email FROM email_marketing_deletions WHERE email IN ($1, $2)")
@@ -789,10 +851,78 @@ async fn expired_deletion_rows_are_purged() {
         emails.contains(&&fresh),
         "a live pending removal must survive"
     );
+    let remaining_changes: Vec<(String,)> =
+        sqlx::query_as("SELECT pubkey FROM email_marketing_email_changes WHERE pubkey = ANY($1)")
+            .bind(vec![stale_change, fresh_change.clone()])
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(remaining_changes, vec![(fresh_change.clone(),)]);
 
     sqlx::query("DELETE FROM email_marketing_deletions WHERE email = $1")
         .bind(&fresh)
         .execute(&pool)
         .await
         .unwrap();
+    sqlx::query("DELETE FROM email_marketing_email_changes WHERE pubkey = $1")
+        .bind(&fresh_change)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn deletion_list_hides_tombstone_when_the_address_has_newer_consent() {
+    common::assert_test_database_url();
+    const TOKEN: &str = "test-service-token-secret";
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", TOKEN) };
+    let pool = common::setup_test_db().await;
+    let email = format!("reused-{}@example.test", uuid::Uuid::new_v4());
+    let declined_email = format!("declined-{}@example.test", uuid::Uuid::new_v4());
+    let deleted_at = Utc::now() - Duration::days(1);
+    sqlx::query(
+        "INSERT INTO email_marketing_deletions (tenant_id, email, deleted_at)
+         VALUES (1, $1, $3), (1, $2, $3)",
+    )
+    .bind(&email)
+    .bind(&declined_email)
+    .bind(deleted_at)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let replacement = seed(&pool, &email.to_uppercase(), "opted_in", Utc::now()).await;
+    let declined = seed(&pool, &declined_email, "declined", Utc::now()).await;
+    let (auth_state, _producer) = common::create_test_auth_state(pool.clone());
+
+    let response = list_deletions(
+        common::test_tenant(),
+        State(auth_state),
+        bearer_headers(TOKEN),
+        Query(IdPageQuery {
+            since: None,
+            limit: None,
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        response.0.results.iter().all(|row| row.email != email),
+        "an old tombstone must not delete a newer consent for the same address"
+    );
+    assert!(
+        response
+            .0
+            .results
+            .iter()
+            .any(|row| row.email == declined_email),
+        "a declined replacement did not create a contact and must not suppress deletion"
+    );
+
+    sqlx::query("DELETE FROM email_marketing_deletions WHERE email = ANY($1)")
+        .bind(vec![email, declined_email])
+        .execute(&pool)
+        .await
+        .unwrap();
+    cleanup(&pool, &[replacement, declined]).await;
 }
