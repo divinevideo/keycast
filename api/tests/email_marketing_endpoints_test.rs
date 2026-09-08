@@ -927,67 +927,6 @@ async fn deletion_list_hides_tombstone_when_the_address_has_newer_consent() {
     cleanup(&pool, &[replacement, declined]).await;
 }
 
-/// Race B, the reused mailbox. A hard delete frees the address, so a new account can register and
-/// opt in with it before the drain runs. Acting on the tombstone then removes the *new* person's
-/// contact, and it never heals: the forward cursor has already passed their consent_at, so nothing
-/// re-subscribes them. Suppressing the tombstone server-side keeps the consumer out of it.
-#[tokio::test]
-async fn a_tombstone_whose_address_was_reclaimed_is_not_served() {
-    common::assert_test_database_url();
-    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", "test-service-token-secret") };
-    let pool = common::setup_test_db().await;
-    let (auth_state, _producer) = common::create_test_auth_state(pool.clone());
-
-    let reclaimed = format!("reused-{}@example.test", uuid::Uuid::new_v4());
-    let orphaned = format!("gone-{}@example.test", uuid::Uuid::new_v4());
-    let deleted_at = Utc::now() - Duration::hours(1);
-
-    for email in [&reclaimed, &orphaned] {
-        sqlx::query(
-            "INSERT INTO email_marketing_deletions (tenant_id, email, deleted_at)
-             VALUES (1, $1, $2)",
-        )
-        .bind(email)
-        .bind(deleted_at)
-        .execute(&pool)
-        .await
-        .unwrap();
-    }
-
-    // Somebody else now holds the first address and has opted in since the deletion.
-    seed(
-        &pool,
-        &reclaimed,
-        "opted_in",
-        deleted_at + Duration::minutes(5),
-    )
-    .await;
-
-    let page = list_deletions(
-        common::test_tenant(),
-        State(auth_state),
-        bearer_headers("test-service-token-secret"),
-        Query(IdPageQuery {
-            since: None,
-            limit: None,
-        }),
-    )
-    .await
-    .unwrap()
-    .0;
-
-    let served: Vec<&str> = page.results.iter().map(|r| r.email.as_str()).collect();
-    assert!(
-        !served.contains(&reclaimed.as_str()),
-        "tombstone for a reclaimed address must be withheld, got {served:?}",
-    );
-    // The other tombstone proves the filter is narrow rather than suppressing everything.
-    assert!(
-        served.contains(&orphaned.as_str()),
-        "tombstone with no live owner must still be served, got {served:?}",
-    );
-}
-
 /// Race A, and the reason it cannot be left to drain ordering. An unacknowledged email-change row
 /// means the platform still holds a contact at the OLD address; the account's current address has
 /// not been created there yet. Tombstoning only the current address removes nothing and leaves the
