@@ -926,3 +926,131 @@ async fn deletion_list_hides_tombstone_when_the_address_has_newer_consent() {
         .unwrap();
     cleanup(&pool, &[replacement, declined]).await;
 }
+
+/// Race B, the reused mailbox. A hard delete frees the address, so a new account can register and
+/// opt in with it before the drain runs. Acting on the tombstone then removes the *new* person's
+/// contact, and it never heals: the forward cursor has already passed their consent_at, so nothing
+/// re-subscribes them. Suppressing the tombstone server-side keeps the consumer out of it.
+#[tokio::test]
+async fn a_tombstone_whose_address_was_reclaimed_is_not_served() {
+    common::assert_test_database_url();
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", "test-service-token-secret") };
+    let pool = common::setup_test_db().await;
+    let (auth_state, _producer) = common::create_test_auth_state(pool.clone());
+
+    let reclaimed = format!("reused-{}@example.test", uuid::Uuid::new_v4());
+    let orphaned = format!("gone-{}@example.test", uuid::Uuid::new_v4());
+    let deleted_at = Utc::now() - Duration::hours(1);
+
+    for email in [&reclaimed, &orphaned] {
+        sqlx::query(
+            "INSERT INTO email_marketing_deletions (tenant_id, email, deleted_at)
+             VALUES (1, $1, $2)",
+        )
+        .bind(email)
+        .bind(deleted_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // Somebody else now holds the first address and has opted in since the deletion.
+    seed(
+        &pool,
+        &reclaimed,
+        "opted_in",
+        deleted_at + Duration::minutes(5),
+    )
+    .await;
+
+    let page = list_deletions(
+        common::test_tenant(),
+        State(auth_state),
+        bearer_headers("test-service-token-secret"),
+        Query(IdPageQuery {
+            since: None,
+            limit: None,
+        }),
+    )
+    .await
+    .unwrap()
+    .0;
+
+    let served: Vec<&str> = page.results.iter().map(|r| r.email.as_str()).collect();
+    assert!(
+        !served.contains(&reclaimed.as_str()),
+        "tombstone for a reclaimed address must be withheld, got {served:?}",
+    );
+    // The other tombstone proves the filter is narrow rather than suppressing everything.
+    assert!(
+        served.contains(&orphaned.as_str()),
+        "tombstone with no live owner must still be served, got {served:?}",
+    );
+}
+
+/// Race A, and the reason it cannot be left to drain ordering. An unacknowledged email-change row
+/// means the platform still holds a contact at the OLD address; the account's current address has
+/// not been created there yet. Tombstoning only the current address removes nothing and leaves the
+/// old one subscribed for a deleted account. Folding the pending change into the deletion means the
+/// queue names every address that needs removing, whatever order a consumer drains in.
+#[tokio::test]
+async fn deleting_an_account_tombstones_its_unprocessed_old_addresses() {
+    common::assert_test_database_url();
+    let pool = common::setup_test_db().await;
+
+    let first = format!("first-{}@example.test", uuid::Uuid::new_v4());
+    let second = format!("second-{}@example.test", uuid::Uuid::new_v4());
+    let current = format!("current-{}@example.test", uuid::Uuid::new_v4());
+    let pubkey = seed(&pool, &current, "opted_in", Utc::now()).await;
+
+    // Two changes the sync worker has not drained yet: first -> second -> current.
+    for (old, new) in [(&first, &second), (&second, &current)] {
+        sqlx::query(
+            "INSERT INTO email_marketing_email_changes
+                 (tenant_id, pubkey, old_email, new_email, changed_at)
+             VALUES (1, $1, $2, $3, NOW())",
+        )
+        .bind(&pubkey)
+        .bind(old)
+        .bind(new)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    keycast_core::repositories::UserRepository::new(pool.clone())
+        .delete_account(&pubkey, 1)
+        .await
+        .unwrap();
+
+    let tombstoned: Vec<(String,)> = sqlx::query_as(
+        "SELECT email FROM email_marketing_deletions
+         WHERE tenant_id = 1 AND email = ANY($1) ORDER BY email",
+    )
+    .bind(vec![first.clone(), second.clone(), current.clone()])
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let got: Vec<&str> = tombstoned.iter().map(|r| r.0.as_str()).collect();
+
+    for addr in [&first, &second, &current] {
+        assert!(
+            got.contains(&addr.as_str()),
+            "every address the platform may hold must be tombstoned; {addr} missing from {got:?}",
+        );
+    }
+
+    // The change rows must not survive the account. Left behind, a consumer would replay them and
+    // re-create a contact for an account that no longer exists.
+    let leftover: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM email_marketing_email_changes WHERE tenant_id = 1 AND pubkey = $1",
+    )
+    .bind(&pubkey)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        leftover, 0,
+        "pending email-change rows outlived the account"
+    );
+}

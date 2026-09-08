@@ -293,6 +293,20 @@ pub async fn list_deletions(
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
     let results: Vec<DeletionRecord> = sqlx::query_as(
+        // Withhold a tombstone whose address has since been reclaimed. A hard delete frees the
+        // mailbox, so a new account can register and opt in with it before the drain runs. Acting
+        // on the tombstone then removes the new person's contact, and it does not heal: the forward
+        // cursor has already passed their consent_at, so nothing re-subscribes them and they lose
+        // the subscription silently.
+        //
+        // Decided here rather than documented for the consumer to honour, because the comparison
+        // needs consent state the consumer would have to fetch per tombstone, and because a rule
+        // that lives only in prose is one a future consumer can skip. Restricted to opted_in: for
+        // any other state we hold no contact of theirs, and suppressing would strand the deleted
+        // account's contact in the email platform indefinitely.
+        //
+        // Case-insensitive because the unique index is on raw (tenant_id, email) and this codebase
+        // compares addresses with LOWER() elsewhere, so two rows can differ only in case.
         "SELECT d.id, d.email, d.deleted_at FROM email_marketing_deletions d
          WHERE d.tenant_id = $3 AND ($1::bigint IS NULL OR d.id > $1)
            AND NOT EXISTS (

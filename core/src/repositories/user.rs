@@ -3100,6 +3100,47 @@ impl UserRepository {
         .execute(&mut **tx)
         .await?;
 
+        // 4c. Fold any undrained email changes into the deletion.
+        //
+        // An unacknowledged change row means the sync service has not moved the contact yet, so the
+        // email platform still holds one at the OLD address while the account's current address does
+        // not exist there. Tombstoning only the current address therefore removes nothing and leaves
+        // the old one subscribed for an account that is gone.
+        //
+        // Resolving it here rather than in the consumer is deliberate. The alternative is a drain
+        // order the consumer has to honour forever, which is exactly the kind of invariant that
+        // survives review and then quietly fails: the first implementation of this contract ran the
+        // two queues concurrently. After this, the queue names every address that may need removing
+        // and the order a consumer drains in cannot produce a wrong answer.
+        //
+        // Not gated on consent, unlike 4b. A change row only exists because the account was opted in
+        // when the address changed, so a contact was created at that address; a later withdrawal
+        // does not make it disappear.
+        sqlx::query(
+            "INSERT INTO email_marketing_deletions (tenant_id, email, deleted_at)
+             SELECT DISTINCT c.tenant_id, c.old_email, NOW()
+             FROM email_marketing_email_changes c
+             WHERE c.pubkey = $1 AND c.tenant_id = $2
+               AND NOT EXISTS (
+                   SELECT 1 FROM email_marketing_deletions d
+                   WHERE d.tenant_id = c.tenant_id AND d.email = c.old_email
+               )",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .execute(&mut **tx)
+        .await?;
+
+        // The rows themselves must not outlive the account: replayed after deletion, a change row
+        // would move a contact for somebody who no longer exists.
+        sqlx::query(
+            "DELETE FROM email_marketing_email_changes WHERE pubkey = $1 AND tenant_id = $2",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .execute(&mut **tx)
+        .await?;
+
         // 5. Delete user (cascades to personal_keys, oauth_authorizations -> refresh_tokens,
         //    email_verification_tokens, password_reset_tokens, user_profiles,
         //    account_claim_tokens)

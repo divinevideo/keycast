@@ -455,21 +455,34 @@ between the two replays the row rather than losing it. Losing a deletion means c
 somebody who deleted their account; losing an email change means a duplicate contact with the old
 address still subscribed. Acknowledging an unknown id is harmless.
 
-Drain **email-changes before deletions**. The two queues have independent id cursors. A person who
-changes email and then deletes the account leaves `email_marketing_email_changes(old → new)` and
-`email_marketing_deletions(new)` — the tombstone is the address at deletion time. Processing
-deletions first tries to remove `new` (not yet a contact) and then the email-change moves `old` to
-`new`, leaving a subscribed contact for a deleted account. Email-change first, then deletion,
-removes the moved contact. Correlate by address: the deletion row has no pubkey.
+Deleting an account **folds its undrained email changes into the deletion**. Any pending
+`email_marketing_email_changes` row for that pubkey contributes a tombstone for its `old_email`, and
+the change rows are removed in the same transaction. The queue therefore names every address the
+email platform may hold for that person, so no drain order can produce a wrong answer.
+
+This replaces an earlier rule requiring consumers to drain email-changes before deletions. That rule
+was correct and still insufficient: it lived only in this document, and the first consumer written
+against it ran the two queues concurrently. Where correctness can be established in the data, it
+should not depend on a consumer remembering a paragraph.
+
+One ordering still matters, and belongs to the consumer because only it knows what it has read: a
+worker that read an email-change row before the account was deleted should apply it before draining
+deletions in the same pass. Otherwise it removes the tombstone first (a `DELETE` of an address the
+platform does not hold is a success, not a no-op) and then recreates the contact from the row it is
+still holding.
 
 Keycast also suppresses a deletion row from the list response when the same tenant has a newer
 `opted_in` consent event for that address. The server-side guard prevents an old tombstone from
 deleting a newly consented contact even if a consumer fails to perform the timestamp check itself.
 
 A deletion tombstone and a later consent for the same address can coexist: hard-delete frees the
-mailbox, so a new account can opt in before the worker drains. Apply a deletion only when no
-consent record for that address is newer than `deleted_at`, or re-check the address against
-batch-lookup before deleting. `GET /api/admin/email-marketing-consents` returns the account's
+mailbox, so a new account can opt in before the worker drains. **The deletions endpoint withholds
+these rows**; a tombstone is not served while a live account holds that address with an opted-in
+consent recorded after `deleted_at`. Acting on one would remove the new person's contact, and it
+would not heal, because the forward cursor has already passed their `consent_at`. The row remains
+queued rather than being dropped, so it is served again if the address is released.
+
+Consumers need no rule for this case. `GET /api/admin/email-marketing-consents` returns the account's
 current email, not the address at consent time; after an email change the consent row already
 shows the new address, so treating an `old → new` email-change as a HubSpot move of a contact
 created at `new` is the worker's to make idempotent.
