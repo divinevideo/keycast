@@ -44,7 +44,9 @@ pub struct ConsentRecord {
     pub consent_at: Option<DateTime<Utc>>,
     pub source: Option<String>,
     pub app_version: Option<String>,
-    /// NULL means never observed. Not the same as "not opted out".
+    /// NULL means no floor recorded. A false observation writes nothing, so this never holds
+    /// FALSE and NULL covers both "never checked" and "checked and not opted out". Not the same as
+    /// "safe to email": the consumer still has to ask the email platform.
     pub global_optout: Option<bool>,
     pub optout_observed_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
@@ -411,6 +413,36 @@ pub async fn list_email_changes(
     .bind(tenant.0.id)
     .fetch_all(&auth_state.state.db)
     .await?;
+
+    // A withheld row is invisible to the consumer by design, and retention purges it after the
+    // expiry window whether or not it was ever served. If the new holder keeps the address, which is
+    // the ordinary outcome, the move is dropped: the original account's contact stays at an address
+    // somebody else now owns, the next upsert there overwrites it, and that account loses the
+    // subscription it asked for. Nothing else would record that. Counted, never listed, because the
+    // rows carry two email addresses and this log has a wider audience than the database.
+    // This condition is the inverse of the guard above and has to stay that way, or the count
+    // reports something other than what was withheld.
+    let withheld: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM email_marketing_email_changes c
+         WHERE c.tenant_id = $1
+           AND EXISTS (
+               SELECT 1 FROM users u
+               WHERE u.tenant_id = c.tenant_id
+                 AND LOWER(u.email) = LOWER(c.old_email)
+                 AND u.email_marketing_consent = 'opted_in'
+           )",
+    )
+    .bind(tenant.0.id)
+    .fetch_one(&auth_state.state.db)
+    .await?;
+
+    if withheld > 0 {
+        tracing::warn!(
+            tenant_id = tenant.0.id,
+            withheld,
+            "email-marketing changes withheld: the outgoing address is held by a live opted-in              account. These expire undrained if it is not released, and the moving account then              loses its subscription."
+        );
+    }
 
     Ok(Json(EmailChangePage { results }))
 }

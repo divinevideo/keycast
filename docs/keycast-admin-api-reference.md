@@ -402,8 +402,11 @@ keycast never calls the email platform. It records what happened; the sync worke
   evidence that consent was validly obtained. `consent_at` is the time the account materialized
   (after email verification), not the time the checkbox was shown.
 - **The suppression floor** (`email_marketing_global_optout`, `_observed_at`) records that somebody
-  opted out of all email. It is **nullable, and NULL means never observed**, which is not the same
-  as "not opted out". It exists because the email platform forgets an opt-out as soon as an address
+  opted out of all email. It is **nullable, and NULL means no floor recorded**. A false observation
+  writes nothing, so the column never holds FALSE and NULL covers both "never checked" and "checked
+  and not opted out". The migration comment still describes an unreachable tri-state; it is left
+  alone deliberately, because editing an applied migration changes its sqlx checksum and breaks any
+  environment that already ran it. It exists because the email platform forgets an opt-out as soon as an address
   changes, so this is the only place that remembers. Any Divine system that sends marketing email
   must respect it, whatever CRM it uses. The observations endpoint is write-once to `true`: a
   `global_optout: false` observation is a no-op (`updated: 0`) and does not lift a recorded floor.
@@ -495,7 +498,11 @@ The email-change endpoint applies the same reclaimed-address rule to `old_email`
 not served while another live opted-in account holds that address, regardless of whether the reclaim
 happened before or after the row was written. The email platform identifies the contact by address,
 so serving the stale move would rename the current holder's contact to somebody else's new address.
-The row remains queued and becomes eligible again if the address is released.
+The row remains queued and becomes eligible again if the address is released. If it is not released
+before the retention window closes, the row is purged undrained: the moving account's contact is
+never relocated, stays at an address another account now owns, and is overwritten by that account's
+next upsert. The moving account then loses the subscription it opted into. Keycast logs a count of
+withheld rows on every read so this is visible before the window closes.
 
 ### Why email changes are recorded at all
 
