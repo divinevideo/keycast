@@ -389,10 +389,22 @@ pub async fn list_email_changes(
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
     let results: Vec<EmailChangeRecord> = sqlx::query_as(
-        "SELECT id, pubkey, old_email, new_email, changed_at, global_optout
-         FROM email_marketing_email_changes
-         WHERE tenant_id = $3 AND ($1::bigint IS NULL OR id > $1)
-         ORDER BY id LIMIT $2",
+        // Withhold a stale move when another live opted-in account now holds the outgoing address.
+        // The email platform identifies contacts by address, so applying old_email -> new_email in
+        // that state would rename the new holder's contact. There is deliberately no timestamp
+        // comparison: whether the reclaim happened before or after this row was written, the live
+        // holder is the contact the worker would find now. Keep declined/never-asked holders out of
+        // the guard because Keycast did not create a marketing contact for them.
+        "SELECT c.id, c.pubkey, c.old_email, c.new_email, c.changed_at, c.global_optout
+         FROM email_marketing_email_changes c
+         WHERE c.tenant_id = $3 AND ($1::bigint IS NULL OR c.id > $1)
+           AND NOT EXISTS (
+               SELECT 1 FROM users u
+               WHERE u.tenant_id = c.tenant_id
+                 AND LOWER(u.email) = LOWER(c.old_email)
+                 AND u.email_marketing_consent = 'opted_in'
+           )
+         ORDER BY c.id LIMIT $2",
     )
     .bind(query.since)
     .bind(limit)

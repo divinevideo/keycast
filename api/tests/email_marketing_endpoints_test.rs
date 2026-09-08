@@ -927,6 +927,97 @@ async fn deletion_list_hides_tombstone_when_the_address_has_newer_consent() {
     cleanup(&pool, &[replacement, declined]).await;
 }
 
+/// A queued email move must not act on an address that now belongs to another opted-in account.
+/// This is independent of ordering: the worker finds contacts by address at drain time, so both a
+/// reclaim before the queued change and one after it would rename the new holder's contact.
+#[tokio::test]
+async fn email_change_list_withholds_reclaimed_addresses_in_both_orders() {
+    common::assert_test_database_url();
+    const TOKEN: &str = "test-service-token-secret";
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", TOKEN) };
+    let pool = common::setup_test_db().await;
+    let (auth_state, _producer) = common::create_test_auth_state(pool.clone());
+
+    let reclaimed_before = format!("reclaimed-before-{}@example.test", uuid::Uuid::new_v4());
+    let reclaimed_after = format!("reclaimed-after-{}@example.test", uuid::Uuid::new_v4());
+    let declined_address = format!("declined-holder-{}@example.test", uuid::Uuid::new_v4());
+    let now = Utc::now();
+
+    let before_holder = seed(
+        &pool,
+        &reclaimed_before,
+        "opted_in",
+        now - Duration::hours(2),
+    )
+    .await;
+    let declined_holder = seed(&pool, &declined_address, "declined", now).await;
+    let source_pubkeys: Vec<String> = (0..3)
+        .map(|_| Keys::generate().public_key().to_hex())
+        .collect();
+
+    for (pubkey, old_email) in source_pubkeys.iter().zip([
+        reclaimed_before.as_str(),
+        reclaimed_after.as_str(),
+        declined_address.as_str(),
+    ]) {
+        sqlx::query(
+            "INSERT INTO email_marketing_email_changes
+                 (tenant_id, pubkey, old_email, new_email, changed_at)
+             VALUES (1, $1, $2, $3, $4)",
+        )
+        .bind(pubkey)
+        .bind(old_email)
+        .bind(format!("destination-{}@example.test", uuid::Uuid::new_v4()))
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // This holder claims the address after the change row was queued. Uppercasing also pins the
+    // case-insensitive comparison used everywhere else for email identity.
+    let after_holder = seed(
+        &pool,
+        &reclaimed_after.to_uppercase(),
+        "opted_in",
+        now + Duration::hours(2),
+    )
+    .await;
+
+    let page = list_email_changes(
+        common::test_tenant(),
+        State(auth_state),
+        bearer_headers(TOKEN),
+        Query(IdPageQuery {
+            since: None,
+            limit: None,
+        }),
+    )
+    .await
+    .unwrap()
+    .0;
+
+    assert!(
+        page.results
+            .iter()
+            .all(|row| row.old_email != reclaimed_before && row.old_email != reclaimed_after),
+        "neither reclaim order may expose a stale move"
+    );
+    assert!(
+        page.results
+            .iter()
+            .any(|row| row.old_email == declined_address),
+        "a declined holder has no Keycast-created contact and must not suppress the move"
+    );
+
+    sqlx::query("DELETE FROM email_marketing_email_changes WHERE pubkey = ANY($1)")
+        .bind(&source_pubkeys)
+        .execute(&pool)
+        .await
+        .unwrap();
+    cleanup(&pool, &[before_holder, after_holder, declined_holder]).await;
+}
+
 /// Race A, and the reason it cannot be left to drain ordering. An unacknowledged email-change row
 /// means the platform still holds a contact at the OLD address; the account's current address has
 /// not been created there yet. Tombstoning only the current address removes nothing and leaves the

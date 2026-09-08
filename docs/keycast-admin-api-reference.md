@@ -474,14 +474,15 @@ deletions in the same pass. Otherwise it removes the tombstone first (a `DELETE`
 platform does not hold is a success, not a no-op) and then recreates the contact from the row it is
 still holding.
 
-Keycast also suppresses a deletion row from the list response when the same tenant has a newer
-`opted_in` consent event for that address. The server-side guard prevents an old tombstone from
-deleting a newly consented contact even if a consumer fails to perform the timestamp check itself.
+Keycast also suppresses a deletion row from the list response when the same tenant has a live
+`opted_in` account for that address. The server-side guard prevents an old tombstone from deleting
+the current holder's contact; it deliberately does not compare timestamps because either reclaim
+order can leave a stale tombstone pointing at somebody else's contact.
 
 A deletion tombstone and a later consent for the same address can coexist: hard-delete frees the
 mailbox, so a new account can opt in before the worker drains. **The deletions endpoint withholds
 these rows**; a tombstone is not served while a live account holds that address with an opted-in
-consent recorded after `deleted_at`. Acting on one would remove the new person's contact, and it
+consent. Acting on one would remove the current holder's contact, and it
 would not heal, because the forward cursor has already passed their `consent_at`. The row remains
 queued rather than being dropped, so it is served again if the address is released.
 
@@ -489,6 +490,12 @@ Consumers need no rule for this case. `GET /api/admin/email-marketing-consents` 
 current email, not the address at consent time; after an email change the consent row already
 shows the new address, so treating an `old → new` email-change as a HubSpot move of a contact
 created at `new` is the worker's to make idempotent.
+
+The email-change endpoint applies the same reclaimed-address rule to `old_email`. A queued move is
+not served while another live opted-in account holds that address, regardless of whether the reclaim
+happened before or after the row was written. The email platform identifies the contact by address,
+so serving the stale move would rename the current holder's contact to somebody else's new address.
+The row remains queued and becomes eligible again if the address is released.
 
 ### Why email changes are recorded at all
 
