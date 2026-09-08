@@ -87,6 +87,10 @@ pub async fn list_consents(
          FROM users
           WHERE tenant_id = $4
             AND email IS NOT NULL
+            -- Load-bearing, not redundant beside the row comparison below. It is what lets the
+            -- planner use the partial index idx_users_email_marketing_cursor: the tuple comparison
+            -- alone does not prove NOT NULL, because the $1 IS NULL arm admits a NULL consent_at.
+            -- Removing it collapses this to a sequential scan that degrades with table size.
             AND email_marketing_consent_at IS NOT NULL
            AND ($1::timestamptz IS NULL
                 OR (email_marketing_consent_at, pubkey) > ($1, $2))

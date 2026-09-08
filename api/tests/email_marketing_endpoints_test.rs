@@ -64,6 +64,63 @@ async fn cleanup(pool: &PgPool, pubkeys: &[String]) {
     }
 }
 
+const TEST_TOKEN: &str = "test-service-token-secret";
+
+/// Build the auth state the handlers take, with the service token set.
+async fn handler_ctx(pool: PgPool) -> keycast_api::api::http::AuthState {
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", TEST_TOKEN) };
+    let (auth_state, _producer) = common::create_test_auth_state(pool);
+    auth_state
+}
+
+/// Post one observation through the real endpoint.
+async fn observe(
+    auth_state: &keycast_api::api::http::AuthState,
+    pubkey: &str,
+    global_optout: bool,
+) -> keycast_api::api::http::email_marketing::ObservationsResponse {
+    record_observations(
+        common::test_tenant(),
+        State(auth_state.clone()),
+        bearer_headers(TEST_TOKEN),
+        axum::Json(ObservationsRequest {
+            observations: vec![Observation {
+                pubkey: pubkey.to_string(),
+                global_optout,
+                observed_at: Utc::now(),
+            }],
+        }),
+    )
+    .await
+    .unwrap()
+    .0
+}
+
+/// Read one page of consents through the real endpoint.
+async fn consents_since(
+    auth_state: &keycast_api::api::http::AuthState,
+    since: Option<DateTime<Utc>>,
+    since_pubkey: Option<String>,
+) -> Vec<String> {
+    list_consents(
+        common::test_tenant(),
+        State(auth_state.clone()),
+        bearer_headers(TEST_TOKEN),
+        Query(ConsentPageQuery {
+            since,
+            since_pubkey,
+            limit: Some(200),
+        }),
+    )
+    .await
+    .unwrap()
+    .0
+    .results
+    .into_iter()
+    .map(|r| r.pubkey)
+    .collect()
+}
+
 /// NULL is "never observed", which is not the same as "not opted out". Defaulting it to false
 /// would let an unchecked account read as safe to email.
 #[tokio::test]
@@ -93,6 +150,7 @@ async fn the_floor_starts_null_not_false() {
 #[tokio::test]
 async fn observing_an_optout_does_not_rewrite_the_consent_event() {
     let pool = setup_pool().await;
+    let auth_state = handler_ctx(pool.clone()).await;
     let pubkey = seed(
         &pool,
         &format!("stable-{}@example.test", uuid::Uuid::new_v4()),
@@ -101,21 +159,8 @@ async fn observing_an_optout_does_not_rewrite_the_consent_event() {
     )
     .await;
 
-    // Exactly the statement the endpoint runs.
-    sqlx::query(
-        "UPDATE users
-         SET email_marketing_global_optout = TRUE,
-             email_marketing_optout_observed_at = $3
-         WHERE pubkey = $1 AND tenant_id = 1
-           AND $2 IS TRUE
-           AND email_marketing_global_optout IS DISTINCT FROM TRUE",
-    )
-    .bind(&pubkey)
-    .bind(true)
-    .bind(Utc::now())
-    .execute(&pool)
-    .await
-    .unwrap();
+    let response = observe(&auth_state, &pubkey, true).await;
+    assert_eq!(response.updated, 1);
 
     let (consent, consent_at, floor): (String, Option<DateTime<Utc>>, Option<bool>) =
         sqlx::query_as(
@@ -143,6 +188,7 @@ async fn observing_an_optout_does_not_rewrite_the_consent_event() {
 #[tokio::test]
 async fn an_identical_observation_is_a_no_op() {
     let pool = setup_pool().await;
+    let auth_state = handler_ctx(pool.clone()).await;
     let pubkey = seed(
         &pool,
         &format!("twice-{}@example.test", uuid::Uuid::new_v4()),
@@ -151,33 +197,36 @@ async fn an_identical_observation_is_a_no_op() {
     )
     .await;
 
-    let statement = "UPDATE users
-         SET email_marketing_global_optout = TRUE,
-             email_marketing_optout_observed_at = $3
-         WHERE pubkey = $1 AND tenant_id = 1
-           AND $2 IS TRUE
-           AND email_marketing_global_optout IS DISTINCT FROM TRUE";
+    assert_eq!(observe(&auth_state, &pubkey, true).await.updated, 1);
 
-    let first = sqlx::query(statement)
-        .bind(&pubkey)
-        .bind(true)
-        .bind(Utc::now())
-        .execute(&pool)
-        .await
-        .unwrap();
-    assert_eq!(first.rows_affected(), 1);
+    let stamped: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT email_marketing_optout_observed_at FROM users WHERE pubkey = $1",
+    )
+    .bind(&pubkey)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
 
-    let second = sqlx::query(statement)
-        .bind(&pubkey)
-        .bind(true)
-        .bind(Utc::now())
-        .execute(&pool)
-        .await
-        .unwrap();
+    let replay = observe(&auth_state, &pubkey, true).await;
     assert_eq!(
-        second.rows_affected(),
-        0,
+        replay.updated, 0,
         "an unchanged observation must not rewrite the row"
+    );
+    assert!(
+        replay.unchanged.contains(&pubkey),
+        "and must be reported as a no-op, not lost"
+    );
+
+    let after: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT email_marketing_optout_observed_at FROM users WHERE pubkey = $1",
+    )
+    .bind(&pubkey)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        after, stamped,
+        "the observation timestamp must not churn on replay"
     );
 
     cleanup(&pool, &[pubkey]).await;
@@ -188,6 +237,7 @@ async fn an_identical_observation_is_a_no_op() {
 #[tokio::test]
 async fn a_later_false_observation_does_not_clear_the_floor() {
     let pool = setup_pool().await;
+    let auth_state = handler_ctx(pool.clone()).await;
     let pubkey = seed(
         &pool,
         &format!("floor-{}@example.test", uuid::Uuid::new_v4()),
@@ -196,33 +246,11 @@ async fn a_later_false_observation_does_not_clear_the_floor() {
     )
     .await;
 
-    let statement = "UPDATE users
-         SET email_marketing_global_optout = TRUE,
-             email_marketing_optout_observed_at = $3
-         WHERE pubkey = $1 AND tenant_id = 1
-           AND $2 IS TRUE
-           AND email_marketing_global_optout IS DISTINCT FROM TRUE";
+    assert_eq!(observe(&auth_state, &pubkey, true).await.updated, 1);
 
-    sqlx::query(statement)
-        .bind(&pubkey)
-        .bind(true)
-        .bind(Utc::now())
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    let cleared = sqlx::query(statement)
-        .bind(&pubkey)
-        .bind(false)
-        .bind(Utc::now())
-        .execute(&pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        cleared.rows_affected(),
-        0,
-        "a false observation must not lift the floor"
-    );
+    let response = observe(&auth_state, &pubkey, false).await;
+    assert_eq!(response.updated, 0);
+    assert!(response.unchanged.contains(&pubkey));
 
     let floor: Option<bool> =
         sqlx::query_scalar("SELECT email_marketing_global_optout FROM users WHERE pubkey = $1")
@@ -230,9 +258,35 @@ async fn a_later_false_observation_does_not_clear_the_floor() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(floor, Some(true));
+    assert_eq!(
+        floor,
+        Some(true),
+        "a false observation must never clear a recorded opt-out"
+    );
 
-    cleanup(&pool, &[pubkey]).await;
+    // A never-observed account is the direction that can actually distinguish the two guards: an
+    // already-TRUE floor is protected by the write-once check regardless, so that case alone would
+    // stay green even if the endpoint started writing whatever it was told.
+    let fresh = seed(
+        &pool,
+        &format!("nullfloor-{}@example.test", uuid::Uuid::new_v4()),
+        "opted_in",
+        Utc::now(),
+    )
+    .await;
+    assert_eq!(observe(&auth_state, &fresh, false).await.updated, 0);
+    let fresh_floor: Option<bool> =
+        sqlx::query_scalar("SELECT email_marketing_global_optout FROM users WHERE pubkey = $1")
+            .bind(&fresh)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        fresh_floor, None,
+        "a false observation must stay 'never observed', not record 'not opted out'",
+    );
+
+    cleanup(&pool, &[pubkey, fresh]).await;
 }
 
 /// Read and acknowledge are separate calls on purpose: a crash between them replays the deletion
@@ -342,28 +396,53 @@ async fn email_changes_carry_both_addresses_and_survive_until_acknowledged() {
     assert_eq!(cleared.rows_affected(), 1);
 }
 
-/// Every statement these endpoints run is tenant-scoped. An unscoped read would return another
-/// tenant's accounts to a marketing sync service.
+/// Tenant scoping has to be proved through the endpoint. Counting rows with the test's own WHERE
+/// clause proves only that the test wrote a WHERE clause.
 #[tokio::test]
 async fn reads_are_tenant_scoped() {
     let pool = setup_pool().await;
+    let auth_state = handler_ctx(pool.clone()).await;
+    let at = Utc::now() + Duration::days(3650);
     let email = format!("tenant-{}@example.test", uuid::Uuid::new_v4());
-    let pubkey = seed(&pool, &email, "opted_in", Utc::now()).await;
+    let pubkey = seed(&pool, &email, "opted_in", at).await;
 
-    let visible_to_other_tenant: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE tenant_id = $1 AND pubkey = $2")
-            .bind(9999i64)
-            .bind(&pubkey)
+    // common::test_tenant() is tenant 1; move the seeded row to a real second tenant. users.tenant_id
+    // carries an FK, so this has to be an actual row rather than an arbitrary id.
+    let other_tenant: i64 =
+        sqlx::query_scalar("INSERT INTO tenants (domain, name) VALUES ($1, $1) RETURNING id")
+            .bind(format!("other-{}.example.test", uuid::Uuid::new_v4()))
             .fetch_one(&pool)
             .await
             .unwrap();
 
-    assert_eq!(
-        visible_to_other_tenant, 0,
-        "a tenant-scoped read must not see another tenant's account"
+    sqlx::query("UPDATE users SET tenant_id = $2 WHERE pubkey = $1")
+        .bind(&pubkey)
+        .bind(other_tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let visible = consents_since(
+        &auth_state,
+        Some(at - Duration::seconds(1)),
+        Some(String::new()),
+    )
+    .await;
+    assert!(
+        !visible.contains(&pubkey),
+        "the consent endpoint must not return another tenant's account",
     );
 
-    cleanup(&pool, &[pubkey]).await;
+    sqlx::query("DELETE FROM users WHERE pubkey = $1")
+        .bind(&pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM tenants WHERE id = $1")
+        .bind(other_tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
 }
 
 fn handler_status<T: IntoResponse>(
@@ -496,21 +575,12 @@ async fn a_valid_service_token_reaches_the_consent_list() {
     assert_eq!(status, StatusCode::OK);
 }
 
-/// An account whose consent is old but whose row was touched for an unrelated reason must not
-/// reappear on the cursor.
-///
-/// The sync's unit of work is a consent event, not "an account that changed". Ordering on
-/// `updated_at` meant a password change or profile edit re-triggered a subscribe, silently
-/// reversing a granular unsubscribe the person had made in the meantime. Consent timestamps are
-/// immutable, so ordering on them processes each answer exactly once.
-///
-/// Note the trigger: `users_update_trigger` forces `updated_at` to NOW() on every UPDATE, so an
-/// unrelated write always moves it forward. That is exactly the hazard, and it is why the consent
-/// timestamp here is in the PAST rather than the future: a future consent_at would sort after
-/// NOW() and the test would pass without discriminating anything.
+/// The cursor is the consent timestamp, not updated_at, so an unrelated account change must not
+/// put somebody back in front of the sync and re-trigger a subscribe.
 #[tokio::test]
 async fn an_unrelated_account_update_does_not_reappear_on_the_cursor() {
     let pool = setup_pool().await;
+    let auth_state = handler_ctx(pool.clone()).await;
     let consented_at = Utc::now() - Duration::days(90);
     let pubkey = seed(
         &pool,
@@ -539,33 +609,23 @@ async fn an_unrelated_account_update_does_not_reappear_on_the_cursor() {
         "precondition: the unrelated write must move updated_at past consent_at"
     );
 
-    // A sync that already processed this consent asks for anything newer.
-    let after: Vec<(String,)> = sqlx::query_as(
-        "SELECT pubkey FROM users
-         WHERE tenant_id = 1
-           AND email_marketing_consent_at IS NOT NULL
-           AND (email_marketing_consent_at, pubkey) > ($1, $2)
-         ORDER BY email_marketing_consent_at, pubkey",
-    )
-    .bind(consented_at)
-    .bind(&pubkey)
-    .fetch_all(&pool)
-    .await
-    .unwrap();
+    // A sync that already processed this consent asks the endpoint for anything newer.
+    let after = consents_since(&auth_state, Some(consented_at), Some(pubkey.clone())).await;
 
     assert!(
-        !after.iter().any(|(p,)| p == &pubkey),
-        "an unrelated update must not re-trigger a subscribe"
+        !after.contains(&pubkey),
+        "an unrelated update must not re-trigger a subscribe",
     );
 
     cleanup(&pool, &[pubkey]).await;
 }
 
-/// Accounts nobody ever asked have no consent event, so they are not consent records and must not
-/// occupy pages the sync has to read past.
+/// An account nobody asked has no consent event, so the endpoint must not hand it to the sync at
+/// all. Filtering it out in the test's own query would prove nothing about the endpoint.
 #[tokio::test]
 async fn never_asked_accounts_are_not_returned() {
     let pool = setup_pool().await;
+    let auth_state = handler_ctx(pool.clone()).await;
     let at = Utc::now() + Duration::days(3650);
     let pubkey = Keys::generate().public_key().to_hex();
     sqlx::query(
@@ -579,15 +639,15 @@ async fn never_asked_accounts_are_not_returned() {
     .await
     .unwrap();
 
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT pubkey FROM users
-         WHERE tenant_id = 1 AND email_marketing_consent_at IS NOT NULL",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap();
+    // No cursor: with one set, the (consent_at, pubkey) comparison already excludes a NULL
+    // consent_at, so the test would pass without the endpoint filtering anything at all. The
+    // first page is where the filter is the only thing standing between this row and the sync.
+    let returned = consents_since(&auth_state, None, None).await;
+    assert!(
+        !returned.contains(&pubkey),
+        "an account with no consent event must not appear in the consent feed",
+    );
 
-    assert!(!rows.iter().any(|(p,)| p == &pubkey));
     cleanup(&pool, &[pubkey]).await;
 }
 
