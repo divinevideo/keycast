@@ -438,15 +438,18 @@ accounts nobody asked.
 ### The floor snapshot on email changes
 
 An email-change row carries `global_optout`: the suppression floor as it stood when the change was
-finalized. The consumer should prefer it over asking the email platform about the old address.
+finalized. It is a **second source, not a replacement** for asking the email platform. A consumer
+should treat somebody as opted out if **either** says so.
 
-That lookup does not survive a second change. If somebody changes address twice before the drain
-runs, the row reads `B -> C` while the platform no longer knows `B`, so an opt-out becomes invisible
-and the consumer would subscribe a person who had asked not to be emailed. Capturing the value
-inside the transaction that finalizes the change removes the reconstruction entirely.
+The snapshot covers what a lookup cannot. If somebody changes address twice before the drain runs,
+the row reads `B -> C` while the platform no longer knows `B`, so a lookup returns nothing and an
+opt-out becomes invisible.
 
-NULL means never observed, or a row written before the column existed. It is not "not opted out", so
-a NULL is the one case where falling back to a platform lookup is still correct.
+The lookup covers what the snapshot cannot. The value is copied from
+`users.email_marketing_global_optout`, which only the reconciliation sweep maintains, a page of
+accounts at a time. It is therefore as old as that account's last sweep, which on a large tenant is
+days. `false` means "not opted out when we last looked", never "not opted out", and NULL means never
+observed. Only `true` settles the question alone, because `true` is permanent.
 
 ### Read then acknowledge
 
