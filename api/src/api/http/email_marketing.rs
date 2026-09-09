@@ -397,8 +397,17 @@ pub async fn list_email_changes(
         // comparison: whether the reclaim happened before or after this row was written, the live
         // holder is the contact the worker would find now. Keep declined/never-asked holders out of
         // the guard because Keycast did not create a marketing contact for them.
-        "SELECT c.id, c.pubkey, c.old_email, c.new_email, c.changed_at, c.global_optout
+        // The row's snapshot is frozen at insert time, so a floor recorded afterwards has to win.
+        // A withdrawal discovered while draining is written to users, but this row still carries
+        // the NULL it was created with; replay it and the consumer's own lookup no longer finds the
+        // opt-out either, because the rename moved the contact and subscription state does not
+        // follow an address change. The live column is write-once-true, so taking it first can only
+        // ever be more suppressive, never less.
+        "SELECT c.id, c.pubkey, c.old_email, c.new_email, c.changed_at,
+                COALESCE(live.email_marketing_global_optout, c.global_optout) AS global_optout
          FROM email_marketing_email_changes c
+         LEFT JOIN users live
+                ON live.pubkey = c.pubkey AND live.tenant_id = c.tenant_id
          WHERE c.tenant_id = $3 AND ($1::bigint IS NULL OR c.id > $1)
            AND NOT EXISTS (
                SELECT 1 FROM users u

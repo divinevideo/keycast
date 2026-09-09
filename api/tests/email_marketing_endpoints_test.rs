@@ -1350,3 +1350,65 @@ async fn queue_rows_near_expiry_are_counted_before_they_are_dropped() {
         .await
         .unwrap();
 }
+
+/// The row's snapshot is frozen at insert time, so a floor recorded afterwards has to win.
+///
+/// A withdrawal discovered while draining is written to users, but the queue row still carries the
+/// NULL it was created with. If that row is replayed, the consumer's own lookup no longer finds the
+/// opt-out either, because the rename moved the contact and the platform does not carry
+/// subscription state across an address change. Serving the stale snapshot would then subscribe
+/// somebody whose withdrawal this database already records.
+#[tokio::test]
+async fn an_email_change_row_reflects_a_floor_recorded_after_it_was_written() {
+    common::assert_test_database_url();
+    const TOKEN: &str = "test-service-token-secret";
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", TOKEN) };
+    let pool = common::setup_test_db().await;
+    let auth_state = handler_ctx(pool.clone()).await;
+
+    let current = format!("now-{}@example.test", uuid::Uuid::new_v4());
+    let old = format!("was-{}@example.test", uuid::Uuid::new_v4());
+    let pubkey = seed(&pool, &current, "opted_in", Utc::now()).await;
+
+    // Written with no floor known at the time.
+    sqlx::query(
+        "INSERT INTO email_marketing_email_changes
+             (tenant_id, pubkey, old_email, new_email, changed_at, global_optout)
+         VALUES (1, $1, $2, $3, NOW(), NULL)",
+    )
+    .bind(&pubkey)
+    .bind(&old)
+    .bind(&current)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // The withdrawal is discovered and recorded afterwards.
+    assert_eq!(observe(&auth_state, &pubkey, true).await.updated, 1);
+
+    let page = list_email_changes(
+        common::test_tenant(),
+        State(auth_state.clone()),
+        bearer_headers(TOKEN),
+        Query(IdPageQuery {
+            since: None,
+            limit: None,
+        }),
+    )
+    .await
+    .unwrap()
+    .0;
+
+    let row = page
+        .results
+        .iter()
+        .find(|r| r.pubkey == pubkey)
+        .expect("the change row must still be served");
+    assert_eq!(
+        row.global_optout,
+        Some(true),
+        "a floor recorded after the row was written must win over the row's stale snapshot",
+    );
+
+    cleanup(&pool, &[pubkey]).await;
+}

@@ -444,6 +444,8 @@ An email-change row carries `global_optout`: the suppression floor as it stood w
 finalized. It is a **second source, not a replacement** for asking the email platform. A consumer
 should treat somebody as opted out if **either** says so.
 
+The value served is the account's live floor where one is recorded, falling back to the row's snapshot. The snapshot is frozen at insert time, so a withdrawal recorded after the row was written would otherwise be invisible on a replay of that row, exactly when the consumer's own lookup has stopped working too. The live column is write-once-true, so preferring it can only be more suppressive.
+
 The snapshot covers what a lookup cannot. If somebody changes address twice before the drain runs,
 the row reads `B -> C` while the platform no longer knows `B`, so a lookup returns nothing and an
 opt-out becomes invisible.
