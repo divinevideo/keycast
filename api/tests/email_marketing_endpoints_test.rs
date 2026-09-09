@@ -1298,3 +1298,55 @@ async fn rotation_carries_undrained_email_changes_to_the_new_identity() {
         "the old address was left subscribed for a deleted account"
     );
 }
+
+/// A queue row that is about to expire has to be visible before it is gone, not after.
+///
+/// Draining reads from the head and acknowledges on success, so a row that keeps failing is retried
+/// forever while everything behind it is never served. Expiry then removes it and the deleted
+/// account's contact is never taken out of the email platform. Both steps are silent otherwise.
+#[tokio::test]
+async fn queue_rows_near_expiry_are_counted_before_they_are_dropped() {
+    common::assert_test_database_url();
+    let pool = common::setup_test_db().await;
+
+    let soon = format!("soon-{}@example.test", uuid::Uuid::new_v4());
+    let later = format!("later-{}@example.test", uuid::Uuid::new_v4());
+
+    let (base_d, base_c) = keycast_api::auth_cleanup::count_email_marketing_queue_near_expiry(
+        &pool,
+        std::time::Duration::from_secs(48 * 60 * 60),
+    )
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO email_marketing_deletions (tenant_id, email, deleted_at, expires_at)
+         VALUES (1, $1, NOW(), NOW() + INTERVAL '1 hour'),
+                (1, $2, NOW(), NOW() + INTERVAL '13 days')",
+    )
+    .bind(&soon)
+    .bind(&later)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (deletions, changes) = keycast_api::auth_cleanup::count_email_marketing_queue_near_expiry(
+        &pool,
+        std::time::Duration::from_secs(48 * 60 * 60),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        deletions - base_d,
+        1,
+        "only the row inside the window counts; a fresh row must not raise the alarm",
+    );
+    assert_eq!(changes - base_c, 0);
+
+    sqlx::query("DELETE FROM email_marketing_deletions WHERE email = ANY($1)")
+        .bind(vec![soon, later])
+        .execute(&pool)
+        .await
+        .unwrap();
+}
