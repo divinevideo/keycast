@@ -3,17 +3,16 @@
 
 use axum::{
     extract::{Query, State},
-    http::{header, StatusCode},
+    http::StatusCode,
     response::{Html, IntoResponse, Response},
     Form,
 };
-use nostr_sdk::Keys;
+use chrono::{Duration, Utc};
 use secrecy::SecretString;
 use serde::Deserialize;
 
 use super::html_safety::{escape_attr, escape_html};
 use super::routes::AuthState;
-use crate::brand::BRAND_NAME;
 use keycast_core::{
     bcrypt_admission::{BcryptAdmissionError, BcryptWorkload},
     repositories::{ClaimTokenRepository, UserRepository},
@@ -24,14 +23,6 @@ fn password_visibility_toggle_html(field_id: &str) -> String {
         r#"<button type="button" class="password-toggle" data-password-target="{}" aria-label="Show password" title="Show password" onclick="togglePasswordVisibility(this)">Show</button>"#,
         escape_attr(field_id)
     )
-}
-
-/// Get server keys from SERVER_NSEC environment variable
-fn get_server_keys() -> Result<Keys, ClaimError> {
-    let server_nsec = std::env::var("SERVER_NSEC")
-        .map_err(|_| ClaimError::Internal("SERVER_NSEC not configured".to_string()))?;
-    Keys::parse(&server_nsec)
-        .map_err(|e| ClaimError::Internal(format!("Invalid SERVER_NSEC: {}", e)))
 }
 
 /// Query parameters for GET /claim
@@ -381,117 +372,126 @@ pub async fn claim_post(
             }
         })?;
 
-    // Consume the token and claim the account atomically (#280 review): the
-    // classification above is a point-in-time read, so an admin invalidation
-    // (e.g. clear-verified-minor revoking this account's outstanding link) can
-    // land between it and this point. The single-transaction consume re-checks
-    // validity under the row lock and only mutates the user if it wins, so a
-    // revoked link can never complete a claim.
-    use keycast_core::repositories::ClaimConsumeOutcome;
-    let outcome = user_repo
-        .claim_account_consuming_token(&form.token, tenant_id, &form.email, &password_hash)
-        .await
-        .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?;
+    // Stage the pending claim instead of completing it: email, password hash,
+    // and a fresh confirmation token sit on the claim-token row until the
+    // claimer proves control of the address via the emailed confirmation link
+    // (claim_confirm_get, Task 7). The guarded write re-checks validity under
+    // the row lock, same as the old consume did, so a concurrent admin
+    // invalidation (e.g. clear-verified-minor revoking this account's
+    // outstanding link) still cannot land a claim.
+    let confirmation_token = super::auth::generate_secure_token();
+    let confirmation_expires_at = Utc::now()
+        + Duration::hours(keycast_core::types::claim_token::CLAIM_CONFIRMATION_EXPIRY_HOURS);
 
-    match outcome {
-        ClaimConsumeOutcome::Claimed { user_pubkey } if user_pubkey == claim_token.user_pubkey => {}
-        ClaimConsumeOutcome::Claimed { user_pubkey } => {
-            return Err(ClaimError::Internal(format!(
-                "Claimed pubkey mismatch: token row {} vs classified {}",
-                user_pubkey, claim_token.user_pubkey
-            )));
+    use keycast_core::repositories::StagePendingOutcome;
+    match claim_token_repo
+        .stage_pending_claim(
+            &form.token,
+            tenant_id,
+            &form.email,
+            &password_hash,
+            &confirmation_token,
+            confirmation_expires_at,
+        )
+        .await
+        .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?
+    {
+        StagePendingOutcome::Staged => {}
+        StagePendingOutcome::TokenNotStageable => {
+            // Token died between classification and staging (e.g. an admin
+            // invalidation landed in between) - re-classify so the user gets
+            // the state-specific error page.
+            return Err(reclassify_to_error(&claim_token_repo, &form.token, tenant_id).await?);
         }
-        ClaimConsumeOutcome::TokenNotConsumable => {
-            // Token died between classification and consume — re-classify so
-            // the user gets the state-specific error page.
-            return Err(
-                match claim_token_repo
-                    .classify(&form.token, tenant_id)
-                    .await
-                    .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?
-                {
-                    ClaimTokenState::AlreadyClaimed(_) => ClaimError::TokenAlreadyClaimed,
-                    ClaimTokenState::AdminInvalidated(_) => ClaimError::TokenAdminInvalidated,
-                    ClaimTokenState::Replaced { .. } => ClaimError::TokenReplaced,
-                    ClaimTokenState::Expired(_) => ClaimError::TokenExpired,
-                    ClaimTokenState::Unrecognized => ClaimError::TokenUnrecognized,
-                    // A token that failed the consume cannot classify Valid
-                    // (used/invalidated/expired are one-way); treat as internal.
-                    ClaimTokenState::Valid(_) => ClaimError::Internal(
-                        "Token consume failed but token classifies as valid".to_string(),
-                    ),
-                },
-            );
+    }
+
+    // Best-effort send; a send failure should not strand a staged claim
+    // silently, so surface it to the claimer instead of showing a
+    // "check your email" page for an email that was never sent.
+    match crate::email_service::EmailService::new() {
+        Ok(email_service) => {
+            if let Err(e) = email_service
+                .send_claim_confirmation(&form.email, &confirmation_token)
+                .await
+            {
+                tracing::error!(
+                    "Failed to send claim confirmation to {}: {}",
+                    &form.email,
+                    e
+                );
+                return Err(ClaimError::Internal(
+                    "Could not send confirmation email".to_string(),
+                ));
+            }
         }
-        ClaimConsumeOutcome::UserNotClaimable => {
-            return Err(ClaimError::TokenAlreadyClaimed);
+        Err(e) => {
+            tracing::error!("Email service unavailable: {}", e);
+            return Err(ClaimError::Internal(
+                "Could not send confirmation email".to_string(),
+            ));
         }
-        // TEMPORARY: claim_post still consumes email+password in one step.
-        // Task 6 rewrites this handler around the submit/confirm split, at
-        // which point this arm goes away with the rest of the one-step flow.
-        ClaimConsumeOutcome::EmailTaken => return Err(ClaimError::EmailExists),
     }
 
     tracing::info!(
-        "Account claimed: pubkey={}, email={}",
-        &claim_token.user_pubkey[..8],
-        &form.email
+        "Claim staged: pubkey={}, confirmation email sent",
+        &claim_token.user_pubkey
     );
 
-    // Generate session UCAN and set cookie
-    let user_pubkey = nostr_sdk::PublicKey::from_hex(&claim_token.user_pubkey)
-        .map_err(|e| ClaimError::Internal(format!("Invalid pubkey: {}", e)))?;
+    Ok(Html(claim_confirmation_sent_html(Some(&form.email))).into_response())
+}
 
-    // Fetch account status for UCAN fact (normally active at claim time)
-    let claim_user_status = user_repo
-        .get_user_status(&claim_token.user_pubkey, tenant_id)
-        .await
-        .ok()
-        .flatten()
-        .map(|(s, _, _)| s);
-
-    // Load server keys for UCAN signing
-    let server_keys = get_server_keys()?;
-
-    let token = super::auth::generate_server_signed_ucan(
-        &user_pubkey,
-        tenant_id,
-        &form.email,
-        "claim",
-        None,
-        &server_keys,
-        false, // Account claim is not first-party OAuth
-        None,
-        claim_user_status.as_ref(),
+/// Re-classify a claim token that failed a guarded write (stage_pending_claim
+/// now; claim_account_consuming_token previously) between the initial
+/// `classify` call and the write itself, most commonly an admin invalidation
+/// landing in between. Maps the token's current terminal state to the
+/// state-specific error page so the claimer isn't shown a generic failure.
+/// Shared by `claim_post` and (Task 7) `claim_confirm_get`.
+async fn reclassify_to_error(
+    claim_token_repo: &ClaimTokenRepository,
+    token: &str,
+    tenant_id: i64,
+) -> Result<ClaimError, ClaimError> {
+    use keycast_core::types::claim_token::ClaimTokenState;
+    Ok(
+        match claim_token_repo
+            .classify(token, tenant_id)
+            .await
+            .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?
+        {
+            ClaimTokenState::AlreadyClaimed(_) => ClaimError::TokenAlreadyClaimed,
+            ClaimTokenState::AdminInvalidated(_) => ClaimError::TokenAdminInvalidated,
+            ClaimTokenState::Replaced { .. } => ClaimError::TokenReplaced,
+            ClaimTokenState::Expired(_) => ClaimError::TokenExpired,
+            ClaimTokenState::Unrecognized => ClaimError::TokenUnrecognized,
+            // A token that failed the guarded write cannot classify Valid
+            // (used/invalidated/expired are one-way); treat as internal.
+            ClaimTokenState::Valid(_) => {
+                ClaimError::Internal("Token write failed but token classifies as valid".to_string())
+            }
+        },
     )
-    .await
-    .map_err(|e| ClaimError::Internal(format!("Failed to generate session: {:?}", e)))?;
+}
 
-    // Set session cookie
-    let cookie_value = format!(
-        "keycast_session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={}",
-        token,
-        60 * 60 * 24 * 7 // 7 days
-    );
+/// Interstitial shown after a claim is staged (POST /claim) or after a resend
+/// request (POST /claim/resend, Task 8). `email` is the destination address
+/// to display; `None` renders enumeration-safe generic copy so the resend
+/// endpoint never reveals whether a given address has a pending claim.
+fn claim_confirmation_sent_html(email: Option<&str>) -> String {
+    let message = match email {
+        Some(address) => format!(
+            "We sent a confirmation link to <strong>{}</strong>. Click the link in that email to finish claiming your account.",
+            escape_html(address)
+        ),
+        None => "If a pending claim exists for that address, we've sent another confirmation link. Check your email.".to_string(),
+    };
 
-    // Get user info for success page
-    let user_repo = UserRepository::new(pool.clone());
-    let (username, display_name) = user_repo
-        .get_claim_info(&claim_token.user_pubkey, tenant_id)
-        .await
-        .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?
-        .unwrap_or((None, None));
-
-    let display_name_str = display_name.unwrap_or_else(|| username.clone().unwrap_or_default());
-
-    // Show success page with app download instructions
-    let html = format!(
+    format!(
         r#"<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Account Claimed!</title>
+    <title>Check Your Email</title>
     <style>
         * {{ box-sizing: border-box; }}
         body {{
@@ -509,12 +509,12 @@ pub async fn claim_post(
             border: 1px solid #1C4033;
             border-radius: 12px;
             padding: 40px;
-            max-width: 440px;
+            max-width: 400px;
             width: 100%;
             text-align: center;
             box-shadow: 0 8px 32px rgba(39, 197, 139, 0.08);
         }}
-        .checkmark {{
+        .icon {{
             width: 56px;
             height: 56px;
             background: rgba(39, 197, 139, 0.15);
@@ -531,151 +531,43 @@ pub async fn claim_post(
             font-size: 22px;
             font-weight: 600;
         }}
-        .subtitle {{
+        p {{
             color: #BEB3A7;
             font-size: 14px;
-            margin: 0 0 28px 0;
+            margin: 0 0 24px 0;
             line-height: 1.5;
         }}
-        .steps {{
-            text-align: left;
-            margin-bottom: 28px;
-        }}
-        .step {{
-            display: flex;
-            gap: 14px;
-            align-items: flex-start;
-            margin-bottom: 18px;
-        }}
-        .step-num {{
-            flex-shrink: 0;
-            width: 28px;
-            height: 28px;
-            background: rgba(39, 197, 139, 0.15);
+        button {{
+            width: 100%;
+            padding: 12px;
+            background: transparent;
             color: #27C58B;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 13px;
-            font-weight: 700;
-        }}
-        .step-content {{
-            flex: 1;
-        }}
-        .step-title {{
-            color: #F9F7F6;
-            font-weight: 600;
-            font-size: 14px;
-            margin-bottom: 3px;
-        }}
-        .step-desc {{
-            color: #9CA3AF;
-            font-size: 13px;
-            line-height: 1.4;
-        }}
-        .app-links {{
-            display: flex;
-            gap: 10px;
-            margin-top: 8px;
-        }}
-        .app-link {{
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            padding: 8px 14px;
-            background: #072218;
             border: 1px solid #1C4033;
             border-radius: 8px;
-            color: #F9F7F6;
-            text-decoration: none;
-            font-size: 13px;
-            font-weight: 500;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
             transition: border-color 0.2s;
         }}
-        .app-link:hover {{
+        button:hover {{
             border-color: #27C58B;
-        }}
-        .divider {{
-            border-top: 1px solid #1C4033;
-            margin: 0 0 20px 0;
-        }}
-        .web-link {{
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            padding: 12px 24px;
-            background: #27C58B;
-            color: #072218;
-            text-decoration: none;
-            border-radius: 8px;
-            font-weight: 600;
-            font-size: 14px;
-            transition: background 0.2s;
-        }}
-        .web-link:hover {{
-            background: #1AA575;
-        }}
-        .note {{
-            color: #9CA3AF;
-            font-size: 12px;
-            margin-top: 16px;
-            line-height: 1.4;
         }}
     </style>
 </head>
 <body>
     <div class="container">
-        <div class="checkmark">&#10003;</div>
-        <h1>Account Claimed!</h1>
-        <p class="subtitle">Welcome, {display_name}. Your credentials have been set.</p>
-
-        <div class="steps">
-            <div class="step">
-                <div class="step-num">1</div>
-                <div class="step-content">
-                    <div class="step-title">Get the App</div>
-                    <div class="step-desc">Download {brand} for the best experience.</div>
-                    <div class="app-links">
-                        <a class="app-link" href="https://apps.apple.com/app/divine-video/id6744577425" target="_blank">
-                            &#63743; App Store
-                        </a>
-                        <a class="app-link" href="https://play.google.com/store/apps/details?id=com.openvine.divine" target="_blank">
-                            &#9654; Google Play
-                        </a>
-                    </div>
-                </div>
-            </div>
-            <div class="step">
-                <div class="step-num">2</div>
-                <div class="step-content">
-                    <div class="step-title">Sign In</div>
-                    <div class="step-desc">Use the email and password you just set to sign in.</div>
-                </div>
-            </div>
-            <div class="step">
-                <div class="step-num">3</div>
-                <div class="step-content">
-                    <div class="step-title">Your Content is Waiting</div>
-                    <div class="step-desc">Your videos and profile are ready to go.</div>
-                </div>
-            </div>
-        </div>
-
-        <div class="divider"></div>
-
-        <a class="web-link" href="https://divine.video" target="_blank">
-            Open {brand} on Web
-        </a>
-        <p class="note">You can also access your account at divine.video</p>
+        <div class="icon">&#9993;</div>
+        <h1>Check Your Email</h1>
+        <p>{message}</p>
+        <form method="POST" action="/api/claim/resend">
+            <input type="hidden" name="token" value="">
+            <button type="submit">Resend Confirmation Email</button>
+        </form>
     </div>
 </body>
 </html>"#,
-        display_name = escape_html(&display_name_str),
-        brand = BRAND_NAME,
-    );
-
-    Ok(([(header::SET_COOKIE, cookie_value)], Html(html)).into_response())
+        message = message,
+    )
 }
 
 /// Claim-specific errors
