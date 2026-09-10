@@ -3,16 +3,18 @@
 
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{Html, IntoResponse, Response},
     Form,
 };
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
+use nostr_sdk::Keys;
 use secrecy::SecretString;
 use serde::Deserialize;
 
 use super::html_safety::{escape_attr, escape_html};
 use super::routes::AuthState;
+use crate::brand::BRAND_NAME;
 use keycast_core::{
     bcrypt_admission::{BcryptAdmissionError, BcryptWorkload},
     repositories::{ClaimTokenRepository, UserRepository},
@@ -23,6 +25,15 @@ fn password_visibility_toggle_html(field_id: &str) -> String {
         r#"<button type="button" class="password-toggle" data-password-target="{}" aria-label="Show password" title="Show password" onclick="togglePasswordVisibility(this)">Show</button>"#,
         escape_attr(field_id)
     )
+}
+
+/// Get server keys from SERVER_NSEC environment variable, for signing the
+/// session UCAN issued when a claim confirmation completes.
+fn get_server_keys() -> Result<Keys, ClaimError> {
+    let server_nsec = std::env::var("SERVER_NSEC")
+        .map_err(|_| ClaimError::Internal("SERVER_NSEC not configured".to_string()))?;
+    Keys::parse(&server_nsec)
+        .map_err(|e| ClaimError::Internal(format!("Invalid SERVER_NSEC: {}", e)))
 }
 
 /// Query parameters for GET /claim
@@ -472,6 +483,341 @@ async fn reclassify_to_error(
     )
 }
 
+/// GET /api/claim/confirm?token=<confirmation_token>
+/// Completes a staged claim when the claimer clicks the emailed confirmation
+/// link: consumes the confirmation token (writing the staged email/password
+/// onto the user atomically, per `confirm_claim_consuming_token`), issues the
+/// session UCAN, and renders the "Account Claimed!" success page. This is
+/// the second half of the flow `claim_post` starts.
+pub async fn claim_confirm_get(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    Query(params): Query<ClaimQuery>,
+) -> Result<Response, ClaimError> {
+    let tenant_id = tenant.0.id;
+    let pool = &auth_state.state.db;
+    let user_repo = UserRepository::new(pool.clone());
+
+    use keycast_core::repositories::ClaimConsumeOutcome;
+    let user_pubkey_hex = match user_repo
+        .confirm_claim_consuming_token(&params.token, tenant_id)
+        .await
+        .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?
+    {
+        ClaimConsumeOutcome::Claimed { user_pubkey } => user_pubkey,
+        ClaimConsumeOutcome::EmailTaken => return Err(ClaimError::EmailExists),
+        ClaimConsumeOutcome::UserNotClaimable => return Err(ClaimError::TokenAlreadyClaimed),
+        // No consumable row for this confirmation token: unknown or already
+        // consumed, the 24h confirmation window itself expired, or the
+        // underlying claim token died (admin-invalidated/replaced/expired)
+        // during that window. classify_confirmation_failure (R6) tells these
+        // apart for a precise error page.
+        ClaimConsumeOutcome::TokenNotConsumable => {
+            return Err(classify_confirmation_failure(pool, &params.token, tenant_id).await?);
+        }
+    };
+
+    // Session + success page: relocated (verbatim, aside from being split into
+    // named helpers) from the pre-Task-6 one-step claim_post tail --
+    // git show 3c69839:api/src/api/http/claim.rs.
+    let user_pubkey = nostr_sdk::PublicKey::from_hex(&user_pubkey_hex)
+        .map_err(|e| ClaimError::Internal(format!("Invalid pubkey: {}", e)))?;
+
+    // confirm_claim_consuming_token already wrote the staged email onto the
+    // user row; read it back rather than threading a second copy through,
+    // so the UCAN's email fact and the DB can never disagree.
+    let email = user_repo
+        .get_email(&user_pubkey_hex, tenant_id)
+        .await
+        .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?;
+
+    // Fetch account status for the UCAN fact (normally active at claim time).
+    let claim_user_status = user_repo
+        .get_user_status(&user_pubkey_hex, tenant_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|(s, _, _)| s);
+
+    let server_keys = get_server_keys()?;
+
+    let session_token = super::auth::generate_server_signed_ucan(
+        &user_pubkey,
+        tenant_id,
+        &email,
+        "claim",
+        None,
+        &server_keys,
+        false, // Account claim is not first-party OAuth
+        None,
+        claim_user_status.as_ref(),
+    )
+    .await
+    .map_err(|e| ClaimError::Internal(format!("Failed to generate session: {:?}", e)))?;
+
+    let cookie_value = format!(
+        "keycast_session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={}",
+        session_token,
+        60 * 60 * 24 * 7 // 7 days
+    );
+
+    let (username, display_name) = user_repo
+        .get_claim_info(&user_pubkey_hex, tenant_id)
+        .await
+        .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?
+        .unwrap_or((None, None));
+    let display_name_str = display_name.unwrap_or_else(|| username.unwrap_or_default());
+
+    tracing::info!("Claim confirmed: pubkey={}", &user_pubkey_hex);
+
+    Ok((
+        [(header::SET_COOKIE, cookie_value)],
+        Html(claim_success_html(&display_name_str)),
+    )
+        .into_response())
+}
+
+/// Classify a `TokenNotConsumable` outcome from `confirm_claim_consuming_token`
+/// into a precise error page (R6). That outcome collapses three distinct
+/// causes: the confirmation token is unknown, or was already consumed (a
+/// successful consume nulls `confirmation_token`, so a re-click of the same
+/// link lands here too -- the intended idempotent behavior); the 24h
+/// confirmation window itself expired; or the underlying claim token died
+/// (admin-invalidated, replaced, or expired) sometime during that window.
+async fn classify_confirmation_failure(
+    pool: &sqlx::PgPool,
+    confirmation_token: &str,
+    tenant_id: i64,
+) -> Result<ClaimError, ClaimError> {
+    let row: Option<(String, Option<DateTime<Utc>>)> = sqlx::query_as(
+        "SELECT token, confirmation_expires_at FROM account_claim_tokens \
+         WHERE confirmation_token = $1 AND tenant_id = $2",
+    )
+    .bind(confirmation_token)
+    .bind(tenant_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?;
+
+    let Some((claim_token, confirmation_expires_at)) = row else {
+        // No row: unrecognized token, or already consumed. Idempotent re-click
+        // behavior for the already-consumed case is intentional.
+        return Ok(ClaimError::ConfirmationUnrecognized);
+    };
+
+    let confirmation_expired = match confirmation_expires_at {
+        Some(expires_at) => expires_at <= Utc::now(),
+        // Defensive: stage_pending_claim always sets confirmation_expires_at
+        // alongside confirmation_token, so this shouldn't happen. Treat a
+        // missing expiry as expired rather than falling through to a claim
+        // token that may still classify as Valid.
+        None => true,
+    };
+    if confirmation_expired {
+        return Ok(ClaimError::ConfirmationExpired);
+    }
+
+    // The confirmation window is still valid, so the failure must be the
+    // underlying claim token itself. Re-classify it for a precise page.
+    let claim_token_repo = ClaimTokenRepository::new(pool.clone());
+    reclassify_to_error(&claim_token_repo, &claim_token, tenant_id).await
+}
+
+/// Success page shown after `claim_confirm_get` completes a claim. Relocated
+/// verbatim from the pre-Task-6 one-step `claim_post` tail, extracted into
+/// its own function so the handler above stays readable.
+fn claim_success_html(display_name: &str) -> String {
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Account Claimed!</title>
+    <style>
+        * {{ box-sizing: border-box; }}
+        body {{
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            background: #072218;
+            min-height: 100vh;
+            margin: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }}
+        .container {{
+            background: #0F2E23;
+            border: 1px solid #1C4033;
+            border-radius: 12px;
+            padding: 40px;
+            max-width: 440px;
+            width: 100%;
+            text-align: center;
+            box-shadow: 0 8px 32px rgba(39, 197, 139, 0.08);
+        }}
+        .checkmark {{
+            width: 56px;
+            height: 56px;
+            background: rgba(39, 197, 139, 0.15);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 20px;
+            font-size: 28px;
+        }}
+        h1 {{
+            margin: 0 0 8px 0;
+            color: #F9F7F6;
+            font-size: 22px;
+            font-weight: 600;
+        }}
+        .subtitle {{
+            color: #BEB3A7;
+            font-size: 14px;
+            margin: 0 0 28px 0;
+            line-height: 1.5;
+        }}
+        .steps {{
+            text-align: left;
+            margin-bottom: 28px;
+        }}
+        .step {{
+            display: flex;
+            gap: 14px;
+            align-items: flex-start;
+            margin-bottom: 18px;
+        }}
+        .step-num {{
+            flex-shrink: 0;
+            width: 28px;
+            height: 28px;
+            background: rgba(39, 197, 139, 0.15);
+            color: #27C58B;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 13px;
+            font-weight: 700;
+        }}
+        .step-content {{
+            flex: 1;
+        }}
+        .step-title {{
+            color: #F9F7F6;
+            font-weight: 600;
+            font-size: 14px;
+            margin-bottom: 3px;
+        }}
+        .step-desc {{
+            color: #9CA3AF;
+            font-size: 13px;
+            line-height: 1.4;
+        }}
+        .app-links {{
+            display: flex;
+            gap: 10px;
+            margin-top: 8px;
+        }}
+        .app-link {{
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 8px 14px;
+            background: #072218;
+            border: 1px solid #1C4033;
+            border-radius: 8px;
+            color: #F9F7F6;
+            text-decoration: none;
+            font-size: 13px;
+            font-weight: 500;
+            transition: border-color 0.2s;
+        }}
+        .app-link:hover {{
+            border-color: #27C58B;
+        }}
+        .divider {{
+            border-top: 1px solid #1C4033;
+            margin: 0 0 20px 0;
+        }}
+        .web-link {{
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 24px;
+            background: #27C58B;
+            color: #072218;
+            text-decoration: none;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 14px;
+            transition: background 0.2s;
+        }}
+        .web-link:hover {{
+            background: #1AA575;
+        }}
+        .note {{
+            color: #9CA3AF;
+            font-size: 12px;
+            margin-top: 16px;
+            line-height: 1.4;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="checkmark">&#10003;</div>
+        <h1>Account Claimed!</h1>
+        <p class="subtitle">Welcome, {display_name}. Your credentials have been set.</p>
+
+        <div class="steps">
+            <div class="step">
+                <div class="step-num">1</div>
+                <div class="step-content">
+                    <div class="step-title">Get the App</div>
+                    <div class="step-desc">Download {brand} for the best experience.</div>
+                    <div class="app-links">
+                        <a class="app-link" href="https://apps.apple.com/app/divine-video/id6744577425" target="_blank">
+                            &#63743; App Store
+                        </a>
+                        <a class="app-link" href="https://play.google.com/store/apps/details?id=com.openvine.divine" target="_blank">
+                            &#9654; Google Play
+                        </a>
+                    </div>
+                </div>
+            </div>
+            <div class="step">
+                <div class="step-num">2</div>
+                <div class="step-content">
+                    <div class="step-title">Sign In</div>
+                    <div class="step-desc">Use the email and password you just set to sign in.</div>
+                </div>
+            </div>
+            <div class="step">
+                <div class="step-num">3</div>
+                <div class="step-content">
+                    <div class="step-title">Your Content is Waiting</div>
+                    <div class="step-desc">Your videos and profile are ready to go.</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <a class="web-link" href="https://divine.video" target="_blank">
+            Open {brand} on Web
+        </a>
+        <p class="note">You can also access your account at divine.video</p>
+    </div>
+</body>
+</html>"#,
+        display_name = escape_html(display_name),
+        brand = BRAND_NAME,
+    )
+}
+
 /// Interstitial shown after a claim is staged (POST /claim) or after a resend
 /// request (POST /claim/resend, Task 8). `email` is the destination address
 /// to display; `None` renders enumeration-safe generic copy so the resend
@@ -587,6 +933,13 @@ pub enum ClaimError {
     TokenReplaced,
     /// Token is past `expires_at`, no newer valid token, no admin invalidation.
     TokenExpired,
+    /// No `account_claim_tokens` row matches the confirmation token: unknown,
+    /// or already consumed (a successful confirm nulls it, so a re-click of
+    /// the same link intentionally lands here too).
+    ConfirmationUnrecognized,
+    /// A row matches the confirmation token but its 24h confirmation window
+    /// has passed.
+    ConfirmationExpired,
     UserNotFound,
     PasswordMismatch,
     WeakPassword,
@@ -618,6 +971,14 @@ impl IntoResponse for ClaimError {
             ClaimError::TokenExpired => (
                 "Link has expired",
                 "Claim links are valid for 7 days. This one is past its expiration. Contact the person who sent it, or email support@divine.video, for a fresh link.",
+            ),
+            ClaimError::ConfirmationUnrecognized => (
+                "Link not recognized",
+                "We don't recognize this confirmation link. It may have already been used. If you set up your account, sign in at divine.video.",
+            ),
+            ClaimError::ConfirmationExpired => (
+                "Confirmation link expired",
+                "Confirmation links are valid for 24 hours. Open your original claim link again to restart, or email support@divine.video for a fresh one.",
             ),
             ClaimError::UserNotFound => (
                 "Account Not Found",
