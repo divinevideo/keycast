@@ -1,4 +1,4 @@
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::repositories::RepositoryError;
@@ -411,6 +411,54 @@ impl ClaimTokenRepository {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    /// Stage pending email/password/confirmation-token state on a claim
+    /// token, guarded by the same validity predicate as `find_valid`. This
+    /// mirrors `UserRepository::set_pending_email_change`
+    /// (`core/src/repositories/user.rs:1007`) but for the claim flow: it is a
+    /// sibling write, not a shared method, because the two guards differ
+    /// (claim tokens also gate on `used_at`/`invalidated_at`/`expires_at`
+    /// together, since an admin can invalidate an outstanding claim token).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stage_pending_claim(
+        &self,
+        token: &str,
+        tenant_id: i64,
+        pending_email: &str,
+        pending_password_hash: &str,
+        confirmation_token: &str,
+        confirmation_expires_at: DateTime<Utc>,
+    ) -> Result<StagePendingOutcome, RepositoryError> {
+        // Guarded write: only stage when the token is still valid. Re-checks
+        // validity under the row lock so an invalidation cannot be overwritten.
+        let updated = sqlx::query(
+            "UPDATE account_claim_tokens
+             SET pending_email = $1,
+                 pending_password_hash = $2,
+                 confirmation_token = $3,
+                 confirmation_expires_at = $4,
+                 confirmation_sent_at = NOW()
+             WHERE token = $5
+               AND tenant_id = $6
+               AND used_at IS NULL
+               AND invalidated_at IS NULL
+               AND expires_at > NOW()",
+        )
+        .bind(pending_email)
+        .bind(pending_password_hash)
+        .bind(confirmation_token)
+        .bind(confirmation_expires_at)
+        .bind(token)
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await?;
+
+        if updated.rows_affected() == 0 {
+            Ok(StagePendingOutcome::TokenNotStageable)
+        } else {
+            Ok(StagePendingOutcome::Staged)
+        }
     }
 
     /// Classify a token string into one of the ClaimTokenState variants by
