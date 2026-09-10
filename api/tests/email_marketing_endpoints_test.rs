@@ -125,6 +125,7 @@ async fn consents_since(
 /// NULL is "never observed", which is not the same as "not opted out". Defaulting it to false
 /// would let an unchecked account read as safe to email.
 #[tokio::test]
+#[serial]
 async fn the_floor_starts_null_not_false() {
     let pool = setup_pool().await;
     let pubkey = seed(
@@ -364,6 +365,7 @@ async fn an_observation_blocked_by_rotation_does_not_write_the_orphan() {
 /// Read and acknowledge are separate calls on purpose: a crash between them replays the deletion
 /// rather than losing it, and losing one means emailing someone who deleted their account.
 #[tokio::test]
+#[serial]
 async fn deletions_survive_until_acknowledged() {
     let pool = setup_pool().await;
     let email = format!("bye-{}@example.test", uuid::Uuid::new_v4());
@@ -407,6 +409,7 @@ async fn deletions_survive_until_acknowledged() {
 /// Acknowledging an id that does not exist must be harmless rather than an error, so a retry after
 /// a partial failure cannot wedge the drain.
 #[tokio::test]
+#[serial]
 async fn acknowledging_an_unknown_id_is_harmless() {
     let pool = setup_pool().await;
     let cleared =
@@ -422,6 +425,7 @@ async fn acknowledging_an_unknown_id_is_harmless() {
 /// Email-change rows follow the same read-then-acknowledge contract, and must carry two distinct
 /// addresses or the sync cannot find the contact it needs to move.
 #[tokio::test]
+#[serial]
 async fn email_changes_carry_both_addresses_and_survive_until_acknowledged() {
     let pool = setup_pool().await;
     let pubkey = Keys::generate().public_key().to_hex();
@@ -978,6 +982,7 @@ async fn observations_skip_an_orphaned_identity() {
 /// Retention must be a property of the data, not of a consumer that may never run. Otherwise a
 /// deleted account's address is kept indefinitely whenever the worker is switched off.
 #[tokio::test]
+#[serial]
 async fn expired_deletion_rows_are_purged() {
     let pool = setup_pool().await;
     let stale = format!("stale-{}@example.test", uuid::Uuid::new_v4());
@@ -1206,6 +1211,7 @@ async fn email_change_list_withholds_reclaimed_addresses_in_both_orders() {
 /// old one subscribed for a deleted account. Folding the pending change into the deletion means the
 /// queue names every address that needs removing, whatever order a consumer drains in.
 #[tokio::test]
+#[serial]
 async fn deleting_an_account_tombstones_its_unprocessed_old_addresses() {
     common::assert_test_database_url();
     let pool = common::setup_test_db().await;
@@ -1419,6 +1425,7 @@ async fn a_tombstone_is_withheld_even_when_the_new_holder_consented_first() {
 /// replacement identity but left the change rows pointing at the old one, so the fold missed them:
 /// the old address was never tombstoned, and the change row outlived the account it belonged to.
 #[tokio::test]
+#[serial]
 async fn rotation_carries_undrained_email_changes_to_the_new_identity() {
     common::assert_test_database_url();
     let pool = common::setup_test_db().await;
@@ -1489,6 +1496,7 @@ async fn rotation_carries_undrained_email_changes_to_the_new_identity() {
 /// forever while everything behind it is never served. Expiry then removes it and the deleted
 /// account's contact is never taken out of the email platform. Both steps are silent otherwise.
 #[tokio::test]
+#[serial]
 async fn queue_rows_near_expiry_are_counted_before_they_are_dropped() {
     common::assert_test_database_url();
     let pool = common::setup_test_db().await;
