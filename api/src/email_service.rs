@@ -94,6 +94,10 @@ fn build_verification_url(base_url: &str, verification_token: &str) -> String {
     format!("{base_url}/verify-email?token={verification_token}")
 }
 
+fn build_claim_confirmation_url(base_url: &str, confirm_token: &str) -> String {
+    format!("{base_url}/api/claim/confirm?token={confirm_token}")
+}
+
 /// Shared shell for action emails (a titled body with one primary button and a
 /// copy-paste fallback link). New emails build on this; shipped bodies are left
 /// as-is to preserve their exact rendered output.
@@ -349,10 +353,7 @@ impl EmailSender for DevEmailSender {
         to_email: &str,
         confirm_token: &str,
     ) -> Result<(), String> {
-        let confirm_url = format!(
-            "{}/api/claim/confirm?token={}",
-            self.base_url, confirm_token
-        );
+        let confirm_url = build_claim_confirmation_url(&self.base_url, confirm_token);
 
         tracing::info!("");
         tracing::info!("==================================================");
@@ -715,10 +716,7 @@ impl EmailSender for SendGridEmailSender {
         to_email: &str,
         confirm_token: &str,
     ) -> Result<(), String> {
-        let confirm_url = format!(
-            "{}/api/claim/confirm?token={}",
-            self.base_url, confirm_token
-        );
+        let confirm_url = build_claim_confirmation_url(&self.base_url, confirm_token);
         let subject = format!("Confirm your email to claim your {} account", BRAND_NAME);
         let intro = format!(
             "Confirm this email address to finish claiming your {} account.",

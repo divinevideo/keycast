@@ -15,10 +15,12 @@ use axum::{
 use chrono::Utc;
 use http_body_util::BodyExt;
 use keycast_api::api::http::{claim, routes::AuthState};
+use keycast_api::ucan_auth::did_to_nostr_pubkey;
 use nostr_sdk::{Keys, ToBech32};
 use sqlx::PgPool;
 use std::sync::Arc;
 use tower::ServiceExt;
+use ucan::Ucan;
 
 const TENANT_ID: i64 = 1;
 
@@ -224,6 +226,33 @@ async fn read_claim_token_used_at(
     .expect("read used_at")
 }
 
+/// Seed an unrelated, already-verified user occupying `email`, so a confirm
+/// attempt that lands on this address collides on the unique index.
+async fn seed_other_user_with_email(pool: &PgPool, email: &str) {
+    let pubkey = Keys::generate().public_key().to_hex();
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, email, email_verified, created_at, updated_at)
+         VALUES ($1, $2, $3, true, NOW(), NOW())",
+    )
+    .bind(&pubkey)
+    .bind(TENANT_ID)
+    .bind(email)
+    .execute(pool)
+    .await
+    .expect("insert other user with email");
+}
+
+/// Pull the `keycast_session` value out of a `Set-Cookie` header, discarding
+/// the `HttpOnly; Secure; ...` attributes that follow it.
+fn extract_session_token(set_cookie: &str) -> &str {
+    set_cookie
+        .strip_prefix("keycast_session=")
+        .expect("cookie must be the keycast_session cookie")
+        .split(';')
+        .next()
+        .expect("cookie value")
+}
+
 #[tokio::test]
 async fn post_claim_stages_and_sends_without_mutating_user() {
     common::assert_test_database_url();
@@ -323,6 +352,19 @@ async fn confirm_completes_claim_and_sets_session() {
         "set-cookie must carry the session token, got: {set_cookie}"
     );
 
+    // Decode the session UCAN and check its audience (the subject the token
+    // was issued for) is the confirmed user's own pubkey, not some other
+    // account -- the whole point of binding the session to the claim.
+    let session_token = extract_session_token(&set_cookie);
+    let ucan = Ucan::try_from_token_string(session_token).expect("decode session UCAN");
+    let audience_pubkey =
+        did_to_nostr_pubkey(ucan.audience()).expect("session UCAN audience must be a nostr DID");
+    assert_eq!(
+        audience_pubkey.to_hex(),
+        pubkey,
+        "session UCAN must be issued for the confirmed user's own pubkey"
+    );
+
     let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let html = String::from_utf8(body_bytes.to_vec()).unwrap();
     assert!(
@@ -397,6 +439,10 @@ async fn resend_within_cooldown_does_not_bump() {
     assert!(
         html.contains("Check Your Email") || html.contains("Check your email"),
         "response must show the check-your-email interstitial, got: {html}"
+    );
+    assert!(
+        !html.contains(&claim_email),
+        "resend response must use enumeration-safe generic copy, not echo the staged email, got: {html}"
     );
 
     let sent_at_after = read_confirmation_sent_at(&pool, &token)
@@ -555,5 +601,110 @@ async fn resend_unknown_token_is_enumeration_safe() {
     assert!(
         html.contains("Check Your Email") || html.contains("Check your email"),
         "response must show the same generic interstitial for an unknown token, got: {html}"
+    );
+}
+
+/// A confirm attempt against a link whose confirmation window has expired
+/// must show the ConfirmationExpired page, distinct from the generic
+/// "Link not recognized" unrecognized-token page.
+#[tokio::test]
+async fn confirm_with_expired_confirmation_window_shows_expired_page() {
+    common::assert_test_database_url();
+    let pool = common::setup_test_db().await;
+    let (auth_state, _producer_handle) = common::create_test_auth_state(pool.clone());
+    let (token, pubkey) = seed_valid_claim_token(&pool).await;
+    let claim_email = format!("new-{}@example.com", &pubkey[..12]);
+
+    let app = build_app(auth_state);
+    let body = format!(
+        "token={}&email={}&password=supersecret&password_confirmation=supersecret",
+        token, claim_email
+    );
+    let stage_resp = app.clone().oneshot(post_claim_form(&body)).await.unwrap();
+    assert_eq!(stage_resp.status(), StatusCode::OK);
+
+    let confirmation_token = read_confirmation_token(&pool, &token).await;
+
+    // Backdate ONLY the confirmation window; the claim token's own expires_at
+    // stays valid.
+    sqlx::query(
+        "UPDATE account_claim_tokens SET confirmation_expires_at = NOW() - INTERVAL '1 minute' WHERE token = $1",
+    )
+    .bind(&token)
+    .execute(&pool)
+    .await
+    .expect("backdate confirmation_expires_at");
+
+    let resp = app
+        .oneshot(get_claim_confirm(&confirmation_token))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(body_bytes.to_vec()).unwrap();
+    assert!(
+        html.contains("Confirmation link expired"),
+        "response must show the confirmation-expired page, got: {html}"
+    );
+    assert!(
+        !html.contains("Link not recognized"),
+        "an expired confirmation window is a distinct failure from an unrecognized link, got: {html}"
+    );
+
+    assert!(
+        read_user_email(&pool, &pubkey).await.is_none(),
+        "an expired confirmation must not mutate the user row"
+    );
+}
+
+/// When the staged email was claimed by another account between staging and
+/// confirmation, the confirm link must show the dedicated
+/// ConfirmationEmailTaken page (there is no form to resubmit at this point,
+/// unlike the submit-time EmailExists case), not a 500.
+#[tokio::test]
+async fn confirm_with_email_taken_by_another_account_shows_dedicated_page() {
+    common::assert_test_database_url();
+    let pool = common::setup_test_db().await;
+    let (auth_state, _producer_handle) = common::create_test_auth_state(pool.clone());
+    let (token, pubkey) = seed_valid_claim_token(&pool).await;
+    let claim_email = format!("new-{}@example.com", &pubkey[..12]);
+
+    // Seed the other user BEFORE staging so the race is: staged first, then
+    // occupied -- confirm-time is where this must be caught, since
+    // claim_post's own submit-time check already passed at staging.
+    let app = build_app(auth_state);
+    let body = format!(
+        "token={}&email={}&password=supersecret&password_confirmation=supersecret",
+        token, claim_email
+    );
+    let stage_resp = app.clone().oneshot(post_claim_form(&body)).await.unwrap();
+    assert_eq!(stage_resp.status(), StatusCode::OK);
+
+    let confirmation_token = read_confirmation_token(&pool, &token).await;
+
+    // Another account claims the same email after staging, before confirm.
+    seed_other_user_with_email(&pool, &claim_email).await;
+
+    let resp = app
+        .oneshot(get_claim_confirm(&confirmation_token))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(body_bytes.to_vec()).unwrap();
+    assert!(
+        html.contains("Email no longer available"),
+        "response must show the dedicated confirm-time email-taken page, got: {html}"
+    );
+    assert!(
+        html.contains("just claimed by another account"),
+        "response must show the confirm-time email-taken message, got: {html}"
+    );
+
+    assert!(
+        read_user_email(&pool, &pubkey).await.is_none(),
+        "a confirm that loses the email race must not mutate the claiming user's row"
     );
 }

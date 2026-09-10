@@ -43,10 +43,13 @@
 //! them needed a second connection. When you add a repository method that opens
 //! a transaction, add a case here for it.
 
+mod common;
+
 use std::future::Future;
 use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
+use common::{insert_bare_user, unique_pubkey, TENANT_ID};
 use keycast_core::repositories::{
     ClaimConsumeOutcome, ClaimTokenRepository, RepositoryError, StagePendingOutcome, UserRepository,
 };
@@ -58,9 +61,6 @@ use uuid::Uuid;
 
 /// Short on purpose: a nesting path burns all of it, a correct path uses none.
 const PROBE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(4);
-
-/// The default tenant seeded by `database/migrations`.
-const TENANT_ID: i64 = 1;
 
 const ADMIN_PUBKEY: &str = "adminadminadminadminadminadminadminadminadminadminadminadmin1234";
 
@@ -161,18 +161,6 @@ async fn insert_user(pool: &PgPool, pubkey: &str, email: Option<&str>) {
     .expect("insert user");
 }
 
-async fn insert_bare_user(pool: &PgPool, pubkey: &str) {
-    sqlx::query(
-        "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, NOW(), NOW())",
-    )
-    .bind(pubkey)
-    .bind(TENANT_ID)
-    .execute(pool)
-    .await
-    .expect("insert bare user");
-}
-
 async fn create_claim_token(pool: &PgPool, pubkey: &str) -> String {
     let token = Uuid::new_v4().to_string();
     ClaimTokenRepository::new(pool.clone())
@@ -198,10 +186,6 @@ async fn cleanup_user(pool: &PgPool, pubkey: &str) {
         .execute(pool)
         .await
         .ok();
-}
-
-fn unique_pubkey() -> String {
-    Uuid::new_v4().simple().to_string().repeat(2)
 }
 
 fn unique_email() -> String {
