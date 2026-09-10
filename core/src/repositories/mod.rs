@@ -29,7 +29,7 @@ pub use atproto_oauth_session::{
 };
 pub use auth_event::{AuthEventRecord, AuthEventRepository, AuthEventRow};
 pub use authorization::AuthorizationRepository;
-pub use claim_token::{ClaimTokenRepository, StagePendingOutcome};
+pub use claim_token::{ClaimTokenRepository, PendingClaimSendState, StagePendingOutcome};
 pub use email_marketing::EmailMarketingConsent;
 pub use error::RepositoryError;
 pub use oauth_authorization::{CreateOAuthAuthorizationParams, OAuthAuthorizationRepository};

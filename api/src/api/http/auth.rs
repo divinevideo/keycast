@@ -8,7 +8,7 @@ use axum::{
     Json,
 };
 use bcrypt::DEFAULT_COST;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use secrecy::{ExposeSecret, SecretString};
 
 use super::admin::{is_full_admin, is_support_admin};
@@ -44,6 +44,8 @@ pub const EMAIL_VERIFICATION_EXPIRY_HOURS: i64 = 24;
 pub const EMAIL_CHANGE_EXPIRY_HOURS: i64 = 24;
 /// Minimum minutes between successive email-change initiations (resend cooldown).
 const EMAIL_CHANGE_RESEND_COOLDOWN_MINUTES: i64 = 5;
+/// Minimum minutes between successive claim-confirmation resend requests.
+pub const CLAIM_RESEND_COOLDOWN_MINUTES: i64 = 5;
 const PASSWORD_RESET_EXPIRY_HOURS: i64 = 1;
 const DEFAULT_NIP05_DOMAIN: &str = "divine.video";
 const MAX_NIP05_USERNAME_LENGTH: usize = 64;
@@ -89,6 +91,15 @@ pub fn token_expiry_seconds() -> i64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_TOKEN_EXPIRY_HOURS * 3600)
+}
+
+/// True when `last_sent` is within `minutes` of now. A missing timestamp
+/// (never sent) is not within cooldown. Pure; shared by resend paths.
+pub(crate) fn within_cooldown(last_sent: Option<DateTime<Utc>>, minutes: i64) -> bool {
+    match last_sent {
+        Some(sent) => Utc::now() - sent < Duration::minutes(minutes),
+        None => false,
+    }
 }
 
 pub fn generate_secure_token() -> String {
@@ -5391,6 +5402,7 @@ mod tests {
     use super::generate_server_signed_ucan;
     use super::validate_origin;
     use super::verify_html_page;
+    use super::within_cooldown;
     use super::AccountStatusResponse;
     use super::BRAND_NAME;
     use super::{bcrypt_auth_error, BcryptAdmissionError};
@@ -5407,6 +5419,22 @@ mod tests {
             axum::http::StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(response.headers()["Retry-After"], "1");
+    }
+
+    #[test]
+    fn within_cooldown_treats_a_never_sent_timestamp_as_not_in_cooldown() {
+        assert!(!within_cooldown(None, 5));
+    }
+
+    #[test]
+    fn within_cooldown_is_true_immediately_after_sending() {
+        assert!(within_cooldown(Some(chrono::Utc::now()), 5));
+    }
+
+    #[test]
+    fn within_cooldown_is_false_once_the_window_has_passed() {
+        let ten_minutes_ago = chrono::Utc::now() - chrono::Duration::minutes(10);
+        assert!(!within_cooldown(Some(ten_minutes_ago), 5));
     }
 
     #[tokio::test]

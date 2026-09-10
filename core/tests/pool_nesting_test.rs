@@ -48,8 +48,9 @@ use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
 use keycast_core::repositories::{
-    ClaimConsumeOutcome, ClaimTokenRepository, RepositoryError, UserRepository,
+    ClaimConsumeOutcome, ClaimTokenRepository, RepositoryError, StagePendingOutcome, UserRepository,
 };
+use keycast_core::types::claim_token::CLAIM_CONFIRMATION_EXPIRY_HOURS;
 use serial_test::serial;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -79,7 +80,7 @@ const COVERED_SITES: &[&str] = &[
     "UserRepository::register_with_personal_key",
     "UserRepository::finalize_oauth_registration",
     "UserRepository::complete_pending_oauth_registration",
-    "UserRepository::claim_account_consuming_token",
+    "UserRepository::confirm_claim_consuming_token",
     "UserRepository::delete_account",
     "UserRepository::change_key_in_transaction",
     "UserRepository::create_preloaded_user",
@@ -375,23 +376,47 @@ async fn complete_pending_oauth_registration_uses_one_connection() {
     cleanup_user(&seed, &pubkey).await;
 }
 
-/// Account claim -> api/src/api/http/claim.rs.
+/// Account claim confirmation -> api/src/api/http/claim.rs
+/// (`claim_confirm_get`). The claim is staged on the seed pool first --
+/// staging isn't the transaction-bearing operation under test here, the
+/// atomic confirm-and-consume is (the single-step
+/// `claim_account_consuming_token` this probe used to exercise was removed
+/// in favor of the two-step stage/confirm flow).
 #[tokio::test]
 #[serial]
-async fn claim_account_consuming_token_uses_one_connection() {
+async fn confirm_claim_consuming_token_uses_one_connection() {
     let seed = seed_pool().await;
     let pubkey = unique_pubkey();
     let email = unique_email();
     insert_bare_user(&seed, &pubkey).await;
     let token = create_claim_token(&seed, &pubkey).await;
-    let probe_token = token.clone();
-    let probe_email = email.clone();
+
+    let confirmation_token = Uuid::new_v4().to_string();
+    let confirmation_expires_at =
+        Utc::now() + ChronoDuration::hours(CLAIM_CONFIRMATION_EXPIRY_HOURS);
+    let stage_outcome = ClaimTokenRepository::new(seed.clone())
+        .stage_pending_claim(
+            &token,
+            TENANT_ID,
+            &email,
+            "hash",
+            &confirmation_token,
+            confirmation_expires_at,
+        )
+        .await
+        .expect("stage pending claim");
+    assert_eq!(
+        stage_outcome,
+        StagePendingOutcome::Staged,
+        "fixture setup: staging must succeed"
+    );
+    let probe_confirmation_token = confirmation_token.clone();
 
     let outcome = assert_no_nested_acquisition(
-        "UserRepository::claim_account_consuming_token",
+        "UserRepository::confirm_claim_consuming_token",
         |pool| async move {
             UserRepository::new(pool)
-                .claim_account_consuming_token(&probe_token, TENANT_ID, &probe_email, "hash")
+                .confirm_claim_consuming_token(&probe_confirmation_token, TENANT_ID)
                 .await
         },
     )

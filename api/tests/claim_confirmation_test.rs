@@ -1,5 +1,5 @@
-// ABOUTME: HTTP-layer tests for the staged-claim submit + confirm paths (Tasks 6-7)
-// ABOUTME: POST /claim stages + emails; GET /claim/confirm completes the claim and issues the session
+// ABOUTME: HTTP-layer tests for the staged-claim submit + confirm + resend paths (Tasks 6-8)
+// ABOUTME: POST /claim stages + emails; GET /claim/confirm completes the claim; POST /claim/resend re-sends, cooldown-gated
 
 #![cfg(feature = "integration-tests")]
 
@@ -41,6 +41,7 @@ fn test_tenant() -> keycast_api::api::tenant::TenantExtractor {
 fn build_app(auth_state: AuthState) -> Router {
     let post_state = auth_state.clone();
     let get_state = auth_state.clone();
+    let resend_state = auth_state.clone();
     Router::new()
         .route(
             "/api/claim",
@@ -70,6 +71,22 @@ fn build_app(auth_state: AuthState) -> Router {
                 },
             ),
         )
+        .route(
+            "/api/claim/resend",
+            post(
+                move |axum::extract::Form(form): axum::extract::Form<claim::ClaimResendForm>| {
+                    let state = resend_state.clone();
+                    async move {
+                        claim::claim_resend_post(
+                            test_tenant(),
+                            State(state),
+                            axum::extract::Form(form),
+                        )
+                        .await
+                    }
+                },
+            ),
+        )
 }
 
 fn post_claim_form(body: &str) -> Request<Body> {
@@ -82,6 +99,13 @@ fn post_claim_form(body: &str) -> Request<Body> {
 fn get_claim_confirm(token: &str) -> Request<Body> {
     Request::get(format!("/api/claim/confirm?token={}", token))
         .body(Body::empty())
+        .unwrap()
+}
+
+fn post_claim_resend(token: &str) -> Request<Body> {
+    Request::post("/api/claim/resend")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(format!("token={}", token)))
         .unwrap()
 }
 
@@ -159,6 +183,19 @@ async fn read_confirmation_token(pool: &PgPool, claim_token: &str) -> String {
     .await
     .expect("read confirmation token")
     .expect("confirmation_token must be staged after POST /api/claim")
+}
+
+async fn read_confirmation_sent_at(
+    pool: &PgPool,
+    claim_token: &str,
+) -> Option<chrono::DateTime<Utc>> {
+    sqlx::query_scalar::<_, Option<chrono::DateTime<Utc>>>(
+        "SELECT confirmation_sent_at FROM account_claim_tokens WHERE token = $1",
+    )
+    .bind(claim_token)
+    .fetch_one(pool)
+    .await
+    .expect("read confirmation_sent_at")
 }
 
 async fn read_claim_token_used_at(
@@ -312,5 +349,136 @@ async fn confirm_with_unknown_token_is_unrecognized() {
     assert!(
         html.contains("Link not recognized"),
         "response must show the unrecognized-link page, got: {html}"
+    );
+}
+
+/// A resend requested immediately after staging is within the cooldown
+/// window: the response is the same generic interstitial, but nothing is
+/// touched -- `confirmation_sent_at` and `confirmation_token` stay exactly
+/// as they were left by the original POST /api/claim.
+#[tokio::test]
+async fn resend_within_cooldown_does_not_bump() {
+    common::assert_test_database_url();
+    let pool = common::setup_test_db().await;
+    let (auth_state, _producer_handle) = common::create_test_auth_state(pool.clone());
+    let (token, pubkey) = seed_valid_claim_token(&pool).await;
+    let claim_email = format!("new-{}@example.com", &pubkey[..12]);
+
+    let app = build_app(auth_state);
+    let body = format!(
+        "token={}&email={}&password=supersecret&password_confirmation=supersecret",
+        token, claim_email
+    );
+    let stage_resp = app.clone().oneshot(post_claim_form(&body)).await.unwrap();
+    assert_eq!(stage_resp.status(), StatusCode::OK);
+
+    let sent_at_before = read_confirmation_sent_at(&pool, &token)
+        .await
+        .expect("confirmation_sent_at must be set after staging");
+    let confirmation_token_before = read_confirmation_token(&pool, &token).await;
+
+    let resp = app.oneshot(post_claim_resend(&token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(body_bytes.to_vec()).unwrap();
+    assert!(
+        html.contains("Check Your Email") || html.contains("Check your email"),
+        "response must show the check-your-email interstitial, got: {html}"
+    );
+
+    let sent_at_after = read_confirmation_sent_at(&pool, &token)
+        .await
+        .expect("confirmation_sent_at must still be set");
+    let confirmation_token_after = read_confirmation_token(&pool, &token).await;
+    assert_eq!(
+        sent_at_before, sent_at_after,
+        "a resend within cooldown must not bump confirmation_sent_at"
+    );
+    assert_eq!(
+        confirmation_token_before, confirmation_token_after,
+        "a resend within cooldown must not rotate the confirmation token"
+    );
+}
+
+/// A resend requested after the cooldown window has passed bumps
+/// `confirmation_sent_at`. The confirmation token itself is unchanged,
+/// because it has not expired -- only an expired confirmation token gets
+/// rotated (see the resend handler).
+#[tokio::test]
+async fn resend_after_cooldown_bumps() {
+    common::assert_test_database_url();
+    let pool = common::setup_test_db().await;
+    let (auth_state, _producer_handle) = common::create_test_auth_state(pool.clone());
+    let (token, pubkey) = seed_valid_claim_token(&pool).await;
+    let claim_email = format!("new-{}@example.com", &pubkey[..12]);
+
+    let app = build_app(auth_state);
+    let body = format!(
+        "token={}&email={}&password=supersecret&password_confirmation=supersecret",
+        token, claim_email
+    );
+    let stage_resp = app.clone().oneshot(post_claim_form(&body)).await.unwrap();
+    assert_eq!(stage_resp.status(), StatusCode::OK);
+
+    let confirmation_token_before = read_confirmation_token(&pool, &token).await;
+
+    // Backdate confirmation_sent_at past the resend cooldown window.
+    sqlx::query(
+        "UPDATE account_claim_tokens SET confirmation_sent_at = NOW() - INTERVAL '6 minutes' WHERE token = $1",
+    )
+    .bind(&token)
+    .execute(&pool)
+    .await
+    .expect("backdate confirmation_sent_at");
+    let sent_at_before = read_confirmation_sent_at(&pool, &token)
+        .await
+        .expect("confirmation_sent_at must be set");
+
+    let resp = app.oneshot(post_claim_resend(&token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(body_bytes.to_vec()).unwrap();
+    assert!(
+        html.contains("Check Your Email") || html.contains("Check your email"),
+        "response must show the check-your-email interstitial, got: {html}"
+    );
+
+    let sent_at_after = read_confirmation_sent_at(&pool, &token)
+        .await
+        .expect("confirmation_sent_at must still be set");
+    let confirmation_token_after = read_confirmation_token(&pool, &token).await;
+    assert!(
+        sent_at_after > sent_at_before,
+        "a resend past cooldown must bump confirmation_sent_at (before={:?}, after={:?})",
+        sent_at_before,
+        sent_at_after
+    );
+    assert_eq!(
+        confirmation_token_before, confirmation_token_after,
+        "a resend of a still-valid (non-expired) confirmation token must not rotate it"
+    );
+}
+
+/// An unknown claim token must get the same generic interstitial as a real
+/// one, so the endpoint cannot be used to probe for the existence of a
+/// pending claim.
+#[tokio::test]
+async fn resend_unknown_token_is_enumeration_safe() {
+    common::assert_test_database_url();
+    let pool = common::setup_test_db().await;
+    let (auth_state, _producer_handle) = common::create_test_auth_state(pool.clone());
+
+    let app = build_app(auth_state);
+    let resp = app
+        .oneshot(post_claim_resend("does-not-exist"))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(body_bytes.to_vec()).unwrap();
+    assert!(
+        html.contains("Check Your Email") || html.contains("Check your email"),
+        "response must show the same generic interstitial for an unknown token, got: {html}"
     );
 }

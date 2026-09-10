@@ -22,6 +22,22 @@ pub enum StagePendingOutcome {
     TokenNotStageable,
 }
 
+/// Send-related state for a staged pending claim, read by the resend endpoint
+/// to decide whether a resend is due and which confirmation token to (re)send.
+/// `confirmation_token` and `confirmation_expired` are non-optional because
+/// `stage_pending_claim` always writes `pending_email`, `confirmation_token`,
+/// and `confirmation_expires_at` together, and `confirm_claim_consuming_token`
+/// always clears them together — so a row with `pending_email IS NOT NULL`
+/// (this query's guard) is guaranteed to also carry a confirmation token and
+/// expiry.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PendingClaimSendState {
+    pub to_email: String,
+    pub confirmation_sent_at: Option<DateTime<Utc>>,
+    pub confirmation_token: String,
+    pub confirmation_expired: bool,
+}
+
 /// Repository for account claim token operations.
 /// Used for preloaded users to claim their accounts by setting email/password.
 #[derive(Debug)]
@@ -93,9 +109,10 @@ impl ClaimTokenRepository {
     /// Returns the updated token, or None if token not found or already used.
     ///
     /// NOTE: the claim flow itself must NOT use this — it re-checks only
-    /// `used_at`, not `invalidated_at`/`expires_at`. `claim_post` consumes
-    /// tokens via `UserRepository::claim_account_consuming_token`, which is
-    /// atomic with full validity (#280 review). Kept for tests/fixtures.
+    /// `used_at`, not `invalidated_at`/`expires_at`. `claim_confirm_get`
+    /// consumes tokens via `UserRepository::confirm_claim_consuming_token`,
+    /// which is atomic with full validity (#280 review). Kept for
+    /// tests/fixtures.
     pub async fn mark_used(&self, token: &str) -> Result<Option<ClaimToken>, RepositoryError> {
         sqlx::query_as::<_, ClaimToken>(concat!(
             "UPDATE account_claim_tokens
@@ -459,6 +476,96 @@ impl ClaimTokenRepository {
         } else {
             Ok(StagePendingOutcome::Staged)
         }
+    }
+
+    /// Read the send-related state of a staged pending claim, for the resend
+    /// endpoint to decide whether a resend is due (cooldown) and whether the
+    /// existing confirmation token is still usable or needs rotating.
+    /// Explicit columns (no `SELECT *`), guarded by the same still-valid
+    /// predicate as `stage_pending_claim`. Returns `None` when no staged,
+    /// still-valid pending claim exists for this token (unknown token, no
+    /// pending claim staged, or the underlying claim token has been used,
+    /// invalidated, or has expired) — the caller (the resend handler) treats
+    /// that identically to "in cooldown" so the response stays
+    /// enumeration-safe.
+    pub async fn pending_claim_send_state(
+        &self,
+        token: &str,
+        tenant_id: i64,
+    ) -> Result<Option<PendingClaimSendState>, RepositoryError> {
+        sqlx::query_as::<_, PendingClaimSendState>(
+            "SELECT pending_email AS to_email,
+                    confirmation_sent_at,
+                    confirmation_token,
+                    (confirmation_expires_at <= NOW()) AS confirmation_expired
+             FROM account_claim_tokens
+             WHERE token = $1
+               AND tenant_id = $2
+               AND pending_email IS NOT NULL
+               AND used_at IS NULL
+               AND invalidated_at IS NULL
+               AND expires_at > NOW()",
+        )
+        .bind(token)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Record a claim-confirmation (re)send: bumps `confirmation_sent_at` to
+    /// start a fresh resend cooldown, and — when `rotated` is `Some` because
+    /// the prior confirmation token had expired — replaces
+    /// `confirmation_token`/`confirmation_expires_at` with a freshly minted
+    /// pair. Guarded by the same still-valid predicate as
+    /// `pending_claim_send_state`/`stage_pending_claim`, so a claim token that
+    /// died between the read and this write (e.g. a concurrent admin
+    /// invalidation) leaves the row untouched rather than reviving it.
+    pub async fn touch_claim_confirmation(
+        &self,
+        token: &str,
+        tenant_id: i64,
+        rotated: Option<(&str, DateTime<Utc>)>,
+    ) -> Result<(), RepositoryError> {
+        match rotated {
+            Some((new_confirmation_token, new_confirmation_expires_at)) => {
+                sqlx::query(
+                    "UPDATE account_claim_tokens
+                     SET confirmation_sent_at = NOW(),
+                         confirmation_token = $1,
+                         confirmation_expires_at = $2
+                     WHERE token = $3
+                       AND tenant_id = $4
+                       AND pending_email IS NOT NULL
+                       AND used_at IS NULL
+                       AND invalidated_at IS NULL
+                       AND expires_at > NOW()",
+                )
+                .bind(new_confirmation_token)
+                .bind(new_confirmation_expires_at)
+                .bind(token)
+                .bind(tenant_id)
+                .execute(&self.pool)
+                .await?;
+            }
+            None => {
+                sqlx::query(
+                    "UPDATE account_claim_tokens
+                     SET confirmation_sent_at = NOW()
+                     WHERE token = $1
+                       AND tenant_id = $2
+                       AND pending_email IS NOT NULL
+                       AND used_at IS NULL
+                       AND invalidated_at IS NULL
+                       AND expires_at > NOW()",
+                )
+                .bind(token)
+                .bind(tenant_id)
+                .execute(&self.pool)
+                .await?;
+            }
+        }
+        Ok(())
     }
 
     /// Classify a token string into one of the ClaimTokenState variants by
