@@ -198,6 +198,19 @@ async fn read_confirmation_sent_at(
     .expect("read confirmation_sent_at")
 }
 
+async fn read_confirmation_expires_at(
+    pool: &PgPool,
+    claim_token: &str,
+) -> Option<chrono::DateTime<Utc>> {
+    sqlx::query_scalar::<_, Option<chrono::DateTime<Utc>>>(
+        "SELECT confirmation_expires_at FROM account_claim_tokens WHERE token = $1",
+    )
+    .bind(claim_token)
+    .fetch_one(pool)
+    .await
+    .expect("read confirmation_expires_at")
+}
+
 async fn read_claim_token_used_at(
     pool: &PgPool,
     claim_token: &str,
@@ -456,6 +469,68 @@ async fn resend_after_cooldown_bumps() {
     assert_eq!(
         confirmation_token_before, confirmation_token_after,
         "a resend of a still-valid (non-expired) confirmation token must not rotate it"
+    );
+}
+
+/// When the previously-issued confirmation token has itself expired (past its
+/// own 24h confirmation window) but the underlying claim token is still valid
+/// (7-day `expires_at`, so the row is still stageable), a resend past cooldown
+/// must rotate to a fresh confirmation token with a new, future expiry -- the
+/// stale one can no longer be completed even if the claimer finds it.
+#[tokio::test]
+async fn resend_rotates_expired_confirmation_token() {
+    common::assert_test_database_url();
+    let pool = common::setup_test_db().await;
+    let (auth_state, _producer_handle) = common::create_test_auth_state(pool.clone());
+    let (token, pubkey) = seed_valid_claim_token(&pool).await;
+    let claim_email = format!("new-{}@example.com", &pubkey[..12]);
+
+    let app = build_app(auth_state);
+    let body = format!(
+        "token={}&email={}&password=supersecret&password_confirmation=supersecret",
+        token, claim_email
+    );
+    let stage_resp = app.clone().oneshot(post_claim_form(&body)).await.unwrap();
+    assert_eq!(stage_resp.status(), StatusCode::OK);
+
+    let confirmation_token_before = read_confirmation_token(&pool, &token).await;
+
+    // Past cooldown AND the confirmation window has expired, while the outer
+    // claim token's own expires_at (7 days from seed_valid_claim_token) stays
+    // valid, so the row is still a live, stageable pending claim.
+    sqlx::query(
+        "UPDATE account_claim_tokens \
+         SET confirmation_sent_at = NOW() - INTERVAL '6 minutes', \
+             confirmation_expires_at = NOW() - INTERVAL '1 minute' \
+         WHERE token = $1",
+    )
+    .bind(&token)
+    .execute(&pool)
+    .await
+    .expect("backdate confirmation_sent_at and expire the confirmation window");
+
+    let resp = app.oneshot(post_claim_resend(&token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(body_bytes.to_vec()).unwrap();
+    assert!(
+        html.contains("Check Your Email") || html.contains("Check your email"),
+        "response must show the check-your-email interstitial, got: {html}"
+    );
+
+    let confirmation_token_after = read_confirmation_token(&pool, &token).await;
+    assert_ne!(
+        confirmation_token_before, confirmation_token_after,
+        "a resend of an expired confirmation token must rotate to a fresh one"
+    );
+
+    let new_expires_at = read_confirmation_expires_at(&pool, &token)
+        .await
+        .expect("rotated confirmation_expires_at must be set");
+    assert!(
+        new_expires_at > Utc::now(),
+        "the rotated confirmation token must carry a future expiry, got: {:?}",
+        new_expires_at
     );
 }
 
