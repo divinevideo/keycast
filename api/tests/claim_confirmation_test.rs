@@ -141,6 +141,13 @@ async fn post_claim_stages_and_sends_without_mutating_user() {
         html.contains("Check Your Email"),
         "response must show the check-your-email interstitial, got: {html}"
     );
+    // Fix round 1: the resend form's hidden token field must carry the real
+    // claim token, not an empty value, or /api/claim/resend (Task 8) has
+    // nothing to act on.
+    assert!(
+        html.contains(&format!(r#"name="token" value="{token}""#)),
+        "resend form must carry the real claim token in its hidden field, got: {html}"
+    );
 
     // User row must be untouched: no email, no password set by submitting the form.
     assert!(
