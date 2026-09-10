@@ -207,6 +207,9 @@ pub async fn record_observations(
     // An account with no email is an orphaned identity left by a key rotation. It is reported as
     // not-found rather than written to: recording somebody's opt-out against a row nothing reads
     // loses the opt-out.
+    // Lock rows while establishing that they are live. Without this, rotation can retire a row
+    // after `live` reads it but before `changed` acquires its update lock, and the stale observation
+    // lands on the orphan instead of following the account.
     let touched: Vec<(String, bool)> = sqlx::query_as(
         "WITH input AS (
              SELECT * FROM UNNEST($1::text[], $2::bool[], $3::timestamptz[])
@@ -216,6 +219,7 @@ pub async fn record_observations(
              SELECT i.pubkey, i.global_optout, i.observed_at
              FROM input i
              JOIN users u ON u.pubkey = i.pubkey AND u.tenant_id = $4 AND u.email IS NOT NULL
+             FOR UPDATE OF u
          ),
          changed AS (
              UPDATE users u

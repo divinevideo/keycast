@@ -289,6 +289,73 @@ async fn a_later_false_observation_does_not_clear_the_floor() {
     cleanup(&pool, &[pubkey, fresh]).await;
 }
 
+/// An observation can select a live identity and then wait behind the transaction that retires it.
+/// Rechecking the target row after that wait must not write the floor onto the orphan.
+#[tokio::test]
+async fn an_observation_blocked_by_rotation_does_not_write_the_orphan() {
+    let pool = setup_pool().await;
+    let auth_state = handler_ctx(pool.clone()).await;
+    let pubkey = seed(
+        &pool,
+        &format!("rotating-{}@example.test", uuid::Uuid::new_v4()),
+        "opted_in",
+        Utc::now(),
+    )
+    .await;
+
+    let mut rotation = pool.begin().await.unwrap();
+    let rotation_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *rotation)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET email = NULL WHERE pubkey = $1")
+        .bind(&pubkey)
+        .execute(&mut *rotation)
+        .await
+        .unwrap();
+
+    let observation_pubkey = pubkey.clone();
+    let observation =
+        tokio::spawn(async move { observe(&auth_state, &observation_pubkey, true).await });
+
+    let mut observation_is_blocked = false;
+    for _ in 0..100 {
+        observation_is_blocked = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM pg_stat_activity
+                 WHERE $1 = ANY(pg_blocking_pids(pid))
+             )",
+        )
+        .bind(rotation_pid)
+        .fetch_one(&mut *rotation)
+        .await
+        .unwrap();
+        if observation_is_blocked {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        observation_is_blocked,
+        "the observation must reach the row lock before rotation commits"
+    );
+
+    rotation.commit().await.unwrap();
+    let response = observation.await.unwrap();
+    assert_eq!(response.updated, 0);
+    assert!(response.not_found.contains(&pubkey));
+
+    let floor: Option<bool> =
+        sqlx::query_scalar("SELECT email_marketing_global_optout FROM users WHERE pubkey = $1")
+            .bind(&pubkey)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(floor, None, "the retired identity must remain untouched");
+
+    cleanup(&pool, &[pubkey]).await;
+}
+
 /// Read and acknowledge are separate calls on purpose: a crash between them replays the deletion
 /// rather than losing it, and losing one means emailing someone who deleted their account.
 #[tokio::test]
