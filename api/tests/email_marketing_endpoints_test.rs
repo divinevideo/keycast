@@ -466,7 +466,7 @@ async fn email_changes_carry_both_addresses_and_survive_until_acknowledged() {
 /// Tenant scoping has to be proved through the endpoint. Counting rows with the test's own WHERE
 /// clause proves only that the test wrote a WHERE clause.
 #[tokio::test]
-async fn reads_are_tenant_scoped() {
+async fn consent_reads_are_tenant_scoped() {
     let pool = setup_pool().await;
     let auth_state = handler_ctx(pool.clone()).await;
     let at = Utc::now() + Duration::days(3650);

@@ -433,8 +433,8 @@ pub async fn list_email_changes(
     // somebody else now owns, the next upsert there overwrites it, and that account loses the
     // subscription it asked for. Nothing else would record that. Counted, never listed, because the
     // rows carry two email addresses and this log has a wider audience than the database.
-    // This condition is the inverse of the guard above and has to stay that way, or the count
-    // reports something other than what was withheld.
+    // Count the tenant-wide backlog rather than only this page. A paged drain should keep the full
+    // number visible until the address is released or retention expires the row.
     let withheld: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM email_marketing_email_changes c
          WHERE c.tenant_id = $1
@@ -453,7 +453,9 @@ pub async fn list_email_changes(
         tracing::warn!(
             tenant_id = tenant.0.id,
             withheld,
-            "email-marketing changes withheld: the outgoing address is held by a live opted-in              account. These expire undrained if it is not released, and the moving account then              loses its subscription."
+            "email-marketing changes withheld: the outgoing address is held by a live opted-in \
+             account. These expire undrained if it is not released, and the moving account then \
+             loses its subscription."
         );
     }
 

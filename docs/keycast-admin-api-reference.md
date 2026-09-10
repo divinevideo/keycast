@@ -463,6 +463,12 @@ between the two replays the row rather than losing it. Losing a deletion means c
 somebody who deleted their account; losing an email change means a duplicate contact with the old
 address still subscribed. Acknowledging an unknown id is harmless.
 
+The optional `since=<id>` parameter on both queue reads is only for paging within one drain pass.
+Start each new pass without `since`, then advance it while that pass has more rows. Do not persist
+the high-water id between passes: reclaimed-address guards can temporarily withhold an older row,
+and it must become visible again if the address is later released. Acknowledgement, not `since`, is
+what permanently removes completed work.
+
 Deleting an account **folds its undrained email changes into the deletion**. Any pending
 `email_marketing_email_changes` row for that pubkey contributes a tombstone for its `old_email`, and
 the change rows are removed in the same transaction. The queue therefore names every address the
