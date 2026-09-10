@@ -13,6 +13,15 @@ macro_rules! claim_token_columns {
     };
 }
 
+/// Outcome of staging a pending claim against a claim-token row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StagePendingOutcome {
+    /// Pending email/password/confirmation-token written to the row.
+    Staged,
+    /// Token was used, admin-invalidated, expired, or unknown — nothing staged.
+    TokenNotStageable,
+}
+
 /// Repository for account claim token operations.
 /// Used for preloaded users to claim their accounts by setting email/password.
 #[derive(Debug)]
