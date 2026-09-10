@@ -347,6 +347,9 @@ pub fn api_routes(
             "/admin/email-marketing-email-changes/ack",
             post(email_marketing::ack_email_changes),
         )
+        .layer(axum::extract::DefaultBodyLimit::max(
+            expensive_work::BATCH_LOOKUP_BODY_LIMIT,
+        ))
         .with_state(auth_state.clone());
 
     // Claim routes (public, accessed via email link)
@@ -576,6 +579,19 @@ mod tests {
             emails: vec!["a".repeat(254); 1_000],
         };
         let encoded = serde_json::to_vec(&request).expect("serialize batch lookup");
+        assert!(encoded.len() <= expensive_work::BATCH_LOOKUP_BODY_LIMIT);
+    }
+
+    #[test]
+    fn email_marketing_limit_fits_documented_observation_count() {
+        let observation = serde_json::json!({
+            "pubkey": "a".repeat(64),
+            "global_optout": true,
+            "observed_at": "2026-09-10T21:05:45.123456789Z",
+        });
+        let request = serde_json::json!({"observations": vec![observation; 1_000]});
+        let encoded = serde_json::to_vec(&request).expect("serialize observations");
+        assert!(encoded.len() > expensive_work::HTTP_BODY_LIMIT);
         assert!(encoded.len() <= expensive_work::BATCH_LOOKUP_BODY_LIMIT);
     }
 }
