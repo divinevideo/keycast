@@ -628,7 +628,7 @@ async fn service_token_is_required_on_every_email_marketing_handler() {
 
 #[tokio::test]
 #[serial]
-async fn a_valid_service_token_reaches_the_consent_list() {
+async fn a_valid_marketing_token_reaches_the_consent_list() {
     common::assert_test_database_url();
     const TOKEN: &str = "test-service-token-secret";
     unsafe { std::env::set_var("KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN", TOKEN) };
@@ -648,45 +648,6 @@ async fn a_valid_service_token_reaches_the_consent_list() {
         .await,
     );
     assert_eq!(status, StatusCode::OK);
-}
-
-/// The dedicated marketing credential must be sufficient on its own to authorize these endpoints.
-/// This is the positive half of the PR #404 review requirement: a bearer matching
-/// `KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN` reaches the handler without needing anything else
-/// configured. (This does not assert anything about `KEYCAST_SERVICE_TOKEN` being absent --
-/// `broad_service_token_alone_is_rejected` below covers that direction instead.)
-#[tokio::test]
-#[serial]
-async fn dedicated_marketing_token_alone_authorizes_the_consent_list() {
-    common::assert_test_database_url();
-    // Deliberately the same value every other test in this file sets `
-    // KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN` to. Reusing it (rather than a value unique to this
-    // test) keeps this test's env mutation a no-op against the rest of the suite, which runs
-    // concurrently in the same process and shares this env var.
-    const MARKETING_TOKEN: &str = "test-service-token-secret";
-    unsafe {
-        std::env::set_var("KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN", MARKETING_TOKEN);
-    }
-    let pool = common::setup_test_db().await;
-    let (auth_state, _producer) = common::create_test_auth_state(pool);
-    let status = handler_status(
-        list_consents(
-            common::test_tenant(),
-            State(auth_state),
-            bearer_headers(MARKETING_TOKEN),
-            Query(ConsentPageQuery {
-                since: None,
-                since_pubkey: None,
-                limit: None,
-            }),
-        )
-        .await,
-    );
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "the dedicated marketing credential must be sufficient on its own"
-    );
 }
 
 /// The broad `KEYCAST_SERVICE_TOKEN` credential must not authorize the marketing endpoints, even
@@ -727,14 +688,12 @@ async fn broad_service_token_alone_is_rejected() {
     );
 }
 
-/// Absence of the dedicated marketing credential must fail closed rather than falling back to any
-/// other configured credential. This is the other direction a fallback bug could take: not "the
-/// broad token works here", but "no marketing token configured, so anything goes". Restores the
-/// variable afterward so it does not leave the shared test-process env in a state that breaks the
-/// rest of this file's tests, which assume it is set to `"test-service-token-secret"`.
+/// Missing or blank dedicated marketing credentials must fail closed rather than falling back to
+/// any other configured credential. Restore the variable afterward so this test does not break
+/// the rest of the shared test process.
 #[tokio::test]
 #[serial]
-async fn missing_marketing_token_fails_closed() {
+async fn missing_and_empty_marketing_tokens_fail_closed() {
     common::assert_test_database_url();
     // Do the (comparatively slow) DB setup before touching the shared env var, so the window
     // where sibling tests could observe it unset is just the handler call below, not this
@@ -746,7 +705,24 @@ async fn missing_marketing_token_fails_closed() {
     unsafe {
         std::env::remove_var("KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN");
     }
-    let status = handler_status(
+    let missing_status = handler_status(
+        list_consents(
+            common::test_tenant(),
+            State(auth_state.clone()),
+            bearer_headers("any-bearer-value-at-all"),
+            Query(ConsentPageQuery {
+                since: None,
+                since_pubkey: None,
+                limit: None,
+            }),
+        )
+        .await,
+    );
+
+    unsafe {
+        std::env::set_var("KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN", "   ");
+    }
+    let empty_status = handler_status(
         list_consents(
             common::test_tenant(),
             State(auth_state),
@@ -759,12 +735,6 @@ async fn missing_marketing_token_fails_closed() {
         )
         .await,
     );
-    // Unset config is an operator error (500), not a bad credential (401) -- but either way it must
-    // never be a 2xx: nothing authorizes this request while the credential is unconfigured.
-    assert!(
-        !status.is_success(),
-        "an unconfigured marketing credential must never authorize a request, got {status}"
-    );
 
     unsafe {
         match previous {
@@ -775,6 +745,9 @@ async fn missing_marketing_token_fails_closed() {
             ),
         }
     }
+
+    assert_eq!(missing_status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(empty_status, StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 /// The cursor is the consent timestamp, not updated_at, so an unrelated account change must not
