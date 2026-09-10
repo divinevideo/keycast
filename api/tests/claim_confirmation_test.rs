@@ -1,4 +1,4 @@
-// ABOUTME: HTTP-layer tests for the staged-claim submit + confirm + resend paths (Tasks 6-8)
+// ABOUTME: HTTP-layer tests for the staged-claim submit + confirm + resend paths
 // ABOUTME: POST /claim stages + emails; GET /claim/confirm completes the claim; POST /claim/resend re-sends, cooldown-gated
 
 #![cfg(feature = "integration-tests")]
@@ -283,9 +283,8 @@ async fn post_claim_stages_and_sends_without_mutating_user() {
         html.contains("Check Your Email"),
         "response must show the check-your-email interstitial, got: {html}"
     );
-    // Fix round 1: the resend form's hidden token field must carry the real
-    // claim token, not an empty value, or /api/claim/resend (Task 8) has
-    // nothing to act on.
+    // The resend form's hidden token field must carry the real claim token,
+    // not an empty value, or POST /api/claim/resend has nothing to act on.
     assert!(
         html.contains(&format!(r#"name="token" value="{token}""#)),
         "resend form must carry the real claim token in its hidden field, got: {html}"
