@@ -94,6 +94,38 @@ fn build_verification_url(base_url: &str, verification_token: &str) -> String {
     format!("{base_url}/verify-email?token={verification_token}")
 }
 
+/// Shared shell for action emails (a titled body with one primary button and a
+/// copy-paste fallback link). New emails build on this; shipped bodies are left
+/// as-is to preserve their exact rendered output.
+fn action_email_html(
+    title: &str,
+    intro: &str,
+    button_label: &str,
+    url: &str,
+    footer: &str,
+) -> String {
+    format!(
+        r#"
+        <html>
+        <body style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+            <h1 style="color: #00B488;">{title}</h1>
+            <p>{intro}</p>
+            <div style="margin: 30px 0;">
+                <a href="{url}" style="background: #00B488; color: #fff; padding: 12px 24px; text-decoration: none; border-radius: 4px; display: inline-block; font-weight: bold;">{button_label}</a>
+            </div>
+            <p style="color: #666; font-size: 14px;">Or copy and paste this link into your browser:<br>
+                <a href="{url}" style="color: #00B488;">{url}</a></p>
+            <p style="color: #666; font-size: 14px; margin-top: 30px;">{footer}</p>
+        </body>
+        </html>
+        "#,
+    )
+}
+
+fn action_email_text(intro: &str, url: &str, footer: &str) -> String {
+    format!("{intro}\n\n{url}\n\n{footer}")
+}
+
 /// Trait for email sending - allows swapping implementations for testing
 #[async_trait]
 pub trait EmailSender: Send + Sync {
@@ -113,6 +145,13 @@ pub trait EmailSender: Send + Sync {
 
     /// Send a claim link email for a preloaded Vine account.
     async fn send_claim_email(&self, to_email: &str, claim_url: &str) -> Result<(), String>;
+
+    /// Send a confirmation link that finishes a staged account claim.
+    async fn send_claim_confirmation(
+        &self,
+        to_email: &str,
+        confirm_token: &str,
+    ) -> Result<(), String>;
 
     /// Send a confirmation link to the proposed NEW address during an email change.
     /// The implementation builds the URL from its configured base URL (mirrors
@@ -297,6 +336,49 @@ impl EmailSender for DevEmailSender {
                 to: to_email.to_string(),
                 subject: format!("Your Vine account on {} is ready to claim", BRAND_NAME),
                 verification_url: Some(claim_url.to_string()),
+                reset_url: None,
+                pin: None,
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn send_claim_confirmation(
+        &self,
+        to_email: &str,
+        confirm_token: &str,
+    ) -> Result<(), String> {
+        let confirm_url = format!(
+            "{}/api/claim/confirm?token={}",
+            self.base_url, confirm_token
+        );
+
+        tracing::info!("");
+        tracing::info!("==================================================");
+        tracing::info!("  CLAIM CONFIRMATION EMAIL");
+        tracing::info!("==================================================");
+        tracing::info!("  To: {}", to_email);
+        tracing::info!(
+            "  Subject: Confirm your email to claim your {} account",
+            BRAND_NAME
+        );
+        tracing::info!("");
+        tracing::info!("  Confirm link:");
+        tracing::info!("  {}", confirm_url);
+        tracing::info!("==================================================");
+        tracing::info!("");
+
+        eprintln!(
+            "\n\x1b[36m[DEV EMAIL]\x1b[0m Claim confirmation link for {}: \x1b[4m{}\x1b[0m\n",
+            to_email, confirm_url
+        );
+
+        if let Ok(mut captured) = self.captured.lock() {
+            captured.push(CapturedEmail {
+                to: to_email.to_string(),
+                subject: format!("Confirm your email to claim your {} account", BRAND_NAME),
+                verification_url: Some(confirm_url),
                 reset_url: None,
                 pin: None,
             });
@@ -628,6 +710,32 @@ impl EmailSender for SendGridEmailSender {
             .await
     }
 
+    async fn send_claim_confirmation(
+        &self,
+        to_email: &str,
+        confirm_token: &str,
+    ) -> Result<(), String> {
+        let confirm_url = format!(
+            "{}/api/claim/confirm?token={}",
+            self.base_url, confirm_token
+        );
+        let subject = format!("Confirm your email to claim your {} account", BRAND_NAME);
+        let intro = format!(
+            "Confirm this email address to finish claiming your {} account.",
+            BRAND_NAME
+        );
+        let footer = "This link will expire in 24 hours. If you didn't request this, you can safely ignore this email.";
+        let html = action_email_html(
+            "Confirm your email",
+            &intro,
+            "Confirm Email",
+            &confirm_url,
+            footer,
+        );
+        let text = action_email_text(&intro, &confirm_url, footer);
+        self.send_email(to_email, &subject, &html, &text).await
+    }
+
     async fn send_email_change_confirmation(
         &self,
         to_new_email: &str,
@@ -802,6 +910,16 @@ impl EmailService {
         self.inner.send_claim_email(to_email, claim_url).await
     }
 
+    pub async fn send_claim_confirmation(
+        &self,
+        to_email: &str,
+        confirm_token: &str,
+    ) -> Result<(), String> {
+        self.inner
+            .send_claim_confirmation(to_email, confirm_token)
+            .await
+    }
+
     pub async fn send_email_change_confirmation(
         &self,
         to_new_email: &str,
@@ -859,6 +977,37 @@ mod tests {
         assert!(!html.to_lowercase().contains("verification code"));
         assert!(!text.to_lowercase().contains("verification code"));
         assert!(html.contains(url));
+    }
+
+    #[test]
+    fn action_email_html_has_shell_button_and_fallback_link() {
+        let url = "https://login.example/api/claim/confirm?token=abc";
+        let html = action_email_html(
+            "Confirm your email",
+            "Click to finish.",
+            "Confirm",
+            url,
+            "Expires in 24 hours.",
+        );
+        assert!(html.contains("Confirm your email")); // title
+        assert!(html.contains(">Confirm<")); // button label
+        assert!(html.contains(url)); // button href + fallback link
+        assert!(html.contains("Expires in 24 hours.")); // footer
+    }
+
+    #[tokio::test]
+    async fn dev_sender_captures_claim_confirmation() {
+        let sender = DevEmailSender::new();
+        sender
+            .send_claim_confirmation("user@example.com", "conf-tok")
+            .await
+            .unwrap();
+        let captured = sender.get_captured_emails();
+        assert_eq!(captured.len(), 1);
+        assert!(captured[0]
+            .verification_url
+            .as_deref()
+            .is_some_and(|u| u.ends_with("/api/claim/confirm?token=conf-tok")));
     }
 
     #[tokio::test]
