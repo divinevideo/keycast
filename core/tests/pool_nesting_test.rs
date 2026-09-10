@@ -72,7 +72,7 @@ const ADMIN_PUBKEY: &str = "adminadminadminadminadminadminadminadminadminadminad
 /// - `rg -n "&mut Transaction<'_, Postgres>" core/src signer/src api/src`
 ///
 /// Exclude test-only matches from the count. Update this when it changes.
-const TOTAL_HOLD_SITES: usize = 21;
+const TOTAL_HOLD_SITES: usize = 20;
 
 /// The subset this probe exercises, highest reachability first. Each entry
 /// corresponds to one `#[tokio::test]` below.
@@ -218,7 +218,7 @@ fn unique_email() -> String {
 /// The name is the point: `println!` is swallowed on a passing test, but the
 /// harness always prints the test name.
 #[test]
-fn probe_samples_8_of_21_hold_sites_a_green_run_is_not_a_clean_sweep() {
+fn probe_samples_8_of_20_hold_sites_a_green_run_is_not_a_clean_sweep() {
     assert_eq!(
         COVERED_SITES.len(),
         8,
@@ -230,8 +230,8 @@ fn probe_samples_8_of_21_hold_sites_a_green_run_is_not_a_clean_sweep() {
         "COVERED_SITES lists more sites than exist"
     );
     assert_eq!(
-        TOTAL_HOLD_SITES, 21,
-        "TOTAL_HOLD_SITES changed but the test name still says 21; rename the test so \
+        TOTAL_HOLD_SITES, 20,
+        "TOTAL_HOLD_SITES changed but the test name still says 20; rename the test so \
          the printed coverage stays truthful"
     );
 
