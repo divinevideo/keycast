@@ -437,7 +437,7 @@ pub async fn claim_post(
         &claim_token.user_pubkey
     );
 
-    Ok(Html(claim_confirmation_sent_html(Some(&form.email))).into_response())
+    Ok(Html(claim_confirmation_sent_html(Some(&form.email), &form.token)).into_response())
 }
 
 /// Re-classify a claim token that failed a guarded write (stage_pending_claim
@@ -476,7 +476,10 @@ async fn reclassify_to_error(
 /// request (POST /claim/resend, Task 8). `email` is the destination address
 /// to display; `None` renders enumeration-safe generic copy so the resend
 /// endpoint never reveals whether a given address has a pending claim.
-fn claim_confirmation_sent_html(email: Option<&str>) -> String {
+/// `token` is the original claim token, always available at both call sites,
+/// and is threaded into the resend form's hidden field so the resend request
+/// has something to act on.
+fn claim_confirmation_sent_html(email: Option<&str>, token: &str) -> String {
     let message = match email {
         Some(address) => format!(
             "We sent a confirmation link to <strong>{}</strong>. Click the link in that email to finish claiming your account.",
@@ -560,13 +563,14 @@ fn claim_confirmation_sent_html(email: Option<&str>) -> String {
         <h1>Check Your Email</h1>
         <p>{message}</p>
         <form method="POST" action="/api/claim/resend">
-            <input type="hidden" name="token" value="">
+            <input type="hidden" name="token" value="{token}">
             <button type="submit">Resend Confirmation Email</button>
         </form>
     </div>
 </body>
 </html>"#,
         message = message,
+        token = escape_attr(token),
     )
 }
 
