@@ -51,6 +51,12 @@ pub struct ClaimForm {
     pub password_confirmation: String,
 }
 
+/// Form data for POST /api/claim/resend
+#[derive(Debug, Deserialize)]
+pub struct ClaimResendForm {
+    pub token: String,
+}
+
 /// GET /claim?token=...
 /// Shows HTML form for user to set email/password
 pub async fn claim_get(
@@ -575,6 +581,79 @@ pub async fn claim_confirm_get(
         Html(claim_success_html(&display_name_str)),
     )
         .into_response())
+}
+
+/// POST /api/claim/resend
+/// Resends the claim-confirmation email for a staged claim. Cooldown-gated
+/// (`CLAIM_RESEND_COOLDOWN_MINUTES`) and enumeration-safe: the response is
+/// always the same generic "Check your email" interstitial, whether the
+/// token is unknown, has no staged claim, is within cooldown, or a fresh
+/// email just went out — a caller cannot distinguish these from the response
+/// alone. Rotates the confirmation token only when the previously-issued one
+/// has expired (past its own 24h confirmation window); otherwise re-sends the
+/// existing token so an unclicked earlier link keeps working.
+pub async fn claim_resend_post(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    Form(form): Form<ClaimResendForm>,
+) -> Result<Response, ClaimError> {
+    let tenant_id = tenant.0.id;
+    let pool = &auth_state.state.db;
+    let claim_token_repo = ClaimTokenRepository::new(pool.clone());
+
+    if let Some(state) = claim_token_repo
+        .pending_claim_send_state(&form.token, tenant_id)
+        .await
+        .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?
+    {
+        if !super::auth::within_cooldown(
+            state.confirmation_sent_at,
+            super::auth::CLAIM_RESEND_COOLDOWN_MINUTES,
+        ) {
+            // Rotate the confirmation token only if the previous one expired;
+            // otherwise resend the same one so an already-delivered, unclicked
+            // link keeps working.
+            let confirmation_token = if state.confirmation_expired {
+                let fresh = super::auth::generate_secure_token();
+                let expiry = Utc::now()
+                    + Duration::hours(
+                        keycast_core::types::claim_token::CLAIM_CONFIRMATION_EXPIRY_HOURS,
+                    );
+                claim_token_repo
+                    .touch_claim_confirmation(&form.token, tenant_id, Some((&fresh, expiry)))
+                    .await
+                    .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?;
+                fresh
+            } else {
+                claim_token_repo
+                    .touch_claim_confirmation(&form.token, tenant_id, None)
+                    .await
+                    .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?;
+                state.confirmation_token
+            };
+
+            // Best-effort send: log and continue rather than fail the
+            // response. Failing here would leak, via a 500 vs 200, whether a
+            // pending claim exists for this token -- and a claimer who
+            // retries a failed send has nothing better to do than resend
+            // again anyway.
+            match crate::email_service::EmailService::new() {
+                Ok(email_service) => {
+                    if let Err(e) = email_service
+                        .send_claim_confirmation(&state.to_email, &confirmation_token)
+                        .await
+                    {
+                        tracing::error!("Failed to resend claim confirmation: {}", e);
+                    }
+                }
+                Err(e) => tracing::error!("Email service unavailable for claim resend: {}", e),
+            }
+        }
+    }
+
+    // Enumeration-safe: identical generic interstitial regardless of token
+    // state (unknown, no pending claim, in cooldown, or just resent).
+    Ok(Html(claim_confirmation_sent_html(None, &form.token)).into_response())
 }
 
 /// Classify a `TokenNotConsumable` outcome from `confirm_claim_consuming_token`
