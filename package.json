@@ -15,7 +15,7 @@
 		"build": "cargo build --release --bin keycast",
 		"build:web": "cd web && bun run build",
 		"deploy:preflight": "./scripts/check-cloudbuild-context.sh",
-		"deploy:gcp": "bun run deploy:preflight && gcloud builds submit --config=cloudbuild.yaml --project=openvine-co --substitutions=COMMIT_SHA=$(git rev-parse HEAD)",
+		"deploy:gcp": "bun run deploy",
 		"deploy": "bun run deploy:preflight && gcloud builds submit --config=cloudbuild.yaml --project=openvine-co --substitutions=COMMIT_SHA=$(git rev-parse HEAD)",
 		"logs": "./scripts/view-logs.sh",
 		"logs:watch": "./scripts/logs-watch.sh",
