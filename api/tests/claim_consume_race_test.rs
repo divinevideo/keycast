@@ -5,7 +5,11 @@
 
 mod common;
 
-use keycast_core::repositories::{ClaimConsumeOutcome, ClaimTokenRepository, UserRepository};
+use chrono::{Duration, Utc};
+use keycast_core::repositories::{
+    ClaimConsumeOutcome, ClaimTokenRepository, StagePendingOutcome, UserRepository,
+};
+use keycast_core::types::claim_token::CLAIM_CONFIRMATION_EXPIRY_HOURS;
 use nostr_sdk::Keys;
 use sqlx::PgPool;
 
@@ -14,6 +18,38 @@ const ADMIN_PUBKEY: &str = "adminadminadminadminadminadminadminadminadminadminad
 
 fn generate_token() -> String {
     Keys::generate().public_key().to_hex()
+}
+
+/// Stage a pending claim on `token` (submit-step equivalent of the removed
+/// single-step `claim_account_consuming_token`) and return the freshly
+/// minted confirmation token. The confirm-step tests below feed that
+/// confirmation token to `confirm_claim_consuming_token`, mirroring the real
+/// claim_post -> claim_confirm_get two-step flow.
+async fn stage_claim(
+    claim_repo: &ClaimTokenRepository,
+    token: &str,
+    email: &str,
+    password_hash: &str,
+) -> String {
+    let confirmation_token = generate_token();
+    let expires_at = Utc::now() + Duration::hours(CLAIM_CONFIRMATION_EXPIRY_HOURS);
+    let outcome = claim_repo
+        .stage_pending_claim(
+            token,
+            TENANT_ID,
+            email,
+            password_hash,
+            &confirmation_token,
+            expires_at,
+        )
+        .await
+        .expect("stage pending claim");
+    assert_eq!(
+        outcome,
+        StagePendingOutcome::Staged,
+        "fixture setup: staging must succeed while the token is still valid"
+    );
+    confirmation_token
 }
 
 /// Unique per-user email — the users table has a unique email index and the
@@ -75,9 +111,11 @@ async fn test_valid_token_consumed_and_account_claimed() {
     let pool = common::setup_test_db().await;
     let pubkey = create_unclaimed_minor(&pool).await;
     let token = create_token_for(&pool, &pubkey).await;
+    let claim_repo = ClaimTokenRepository::new(pool.clone());
+    let confirmation_token = stage_claim(&claim_repo, &token, &email_for(&pubkey), "hash").await;
 
     let outcome = UserRepository::new(pool.clone())
-        .claim_account_consuming_token(&token, TENANT_ID, &email_for(&pubkey), "hash")
+        .confirm_claim_consuming_token(&confirmation_token, TENANT_ID)
         .await
         .expect("consume+claim");
 
@@ -98,6 +136,14 @@ async fn test_valid_token_consumed_and_account_claimed() {
 /// invalidation lands (clear-verified-minor revoking the outstanding link),
 /// then the claim flow tries to proceed. The consume must fail and the user
 /// must be untouched.
+///
+/// Staged before the two-step split, this test's "claim flow tries to
+/// proceed" step is now `confirm_claim_consuming_token` (`claim_confirm_get`)
+/// rather than the single-step consume: staging happens first (mirroring
+/// `claim_post`, which itself re-checks validity and would already refuse a
+/// dead token), so the window this test targets -- a concurrent admin
+/// invalidation landing between staging and confirmation -- is the real
+/// vulnerability window in the two-step flow.
 #[tokio::test]
 async fn test_invalidated_token_not_consumed_user_untouched() {
     common::assert_test_database_url();
@@ -117,6 +163,9 @@ async fn test_invalidated_token_not_consumed_user_untouched() {
         ClaimTokenState::Valid(_)
     ));
 
+    // claim_post stages the pending claim while the token is still valid.
+    let confirmation_token = stage_claim(&claim_repo, &token, &email_for(&pubkey), "hash").await;
+
     // Concurrent admin action: revoke invalidates the outstanding link.
     let invalidated = claim_repo
         .invalidate_valid_for_user(&pubkey, TENANT_ID, ADMIN_PUBKEY, Some("revoked"))
@@ -124,9 +173,10 @@ async fn test_invalidated_token_not_consumed_user_untouched() {
         .expect("invalidate");
     assert_eq!(invalidated, 1);
 
-    // The claim flow proceeds — and must be refused with no side effects.
+    // The claimer clicks the confirmation link — and must be refused with no
+    // side effects.
     let outcome = UserRepository::new(pool.clone())
-        .claim_account_consuming_token(&token, TENANT_ID, &email_for(&pubkey), "hash")
+        .confirm_claim_consuming_token(&confirmation_token, TENANT_ID)
         .await
         .expect("consume attempt");
 
@@ -141,12 +191,20 @@ async fn test_invalidated_token_not_consumed_user_untouched() {
     assert!(invalidated);
 }
 
+/// The token is staged while still valid (mirroring `claim_post`, which
+/// itself would refuse to stage an already-expired token), then expires
+/// before the claimer confirms. `confirm_claim_consuming_token`'s own
+/// `expires_at > NOW()` guard on the underlying claim-token row must catch
+/// this even though the confirmation window itself hasn't lapsed.
 #[tokio::test]
 async fn test_expired_token_not_consumed() {
     common::assert_test_database_url();
     let pool = common::setup_test_db().await;
     let pubkey = create_unclaimed_minor(&pool).await;
     let token = create_token_for(&pool, &pubkey).await;
+    let claim_repo = ClaimTokenRepository::new(pool.clone());
+    let confirmation_token = stage_claim(&claim_repo, &token, &email_for(&pubkey), "hash").await;
+
     sqlx::query(
         "UPDATE account_claim_tokens SET expires_at = NOW() - INTERVAL '1 hour' WHERE token = $1",
     )
@@ -156,7 +214,7 @@ async fn test_expired_token_not_consumed() {
     .expect("expire token");
 
     let outcome = UserRepository::new(pool.clone())
-        .claim_account_consuming_token(&token, TENANT_ID, &email_for(&pubkey), "hash")
+        .confirm_claim_consuming_token(&confirmation_token, TENANT_ID)
         .await
         .expect("consume attempt");
 
@@ -166,29 +224,32 @@ async fn test_expired_token_not_consumed() {
     assert!(!used);
 }
 
+/// A second confirm against the same confirmation token (e.g. the claimer
+/// re-clicking the emailed link after already completing the claim) must not
+/// re-consume or overwrite anything. This is the two-step analog of replaying
+/// the same claim token twice against the removed single-step consume:
+/// `confirm_claim_consuming_token` nulls out `confirmation_token` on success,
+/// so the replay naturally finds no matching row.
 #[tokio::test]
 async fn test_used_token_not_consumed_again() {
     common::assert_test_database_url();
     let pool = common::setup_test_db().await;
     let pubkey = create_unclaimed_minor(&pool).await;
     let token = create_token_for(&pool, &pubkey).await;
+    let claim_repo = ClaimTokenRepository::new(pool.clone());
+    let confirmation_token = stage_claim(&claim_repo, &token, &email_for(&pubkey), "hash").await;
 
     let repo = UserRepository::new(pool.clone());
     let first = repo
-        .claim_account_consuming_token(&token, TENANT_ID, &email_for(&pubkey), "hash")
+        .confirm_claim_consuming_token(&confirmation_token, TENANT_ID)
         .await
-        .expect("first consume");
+        .expect("first confirm");
     assert!(matches!(first, ClaimConsumeOutcome::Claimed { .. }));
 
     let second = repo
-        .claim_account_consuming_token(
-            &token,
-            TENANT_ID,
-            &format!("other-{}", email_for(&pubkey)),
-            "hash2",
-        )
+        .confirm_claim_consuming_token(&confirmation_token, TENANT_ID)
         .await
-        .expect("second consume attempt");
+        .expect("second confirm attempt");
     assert!(matches!(second, ClaimConsumeOutcome::TokenNotConsumable));
     assert_eq!(
         user_email(&pool, &pubkey).await.as_deref(),
@@ -214,8 +275,11 @@ async fn test_unclaimable_user_rolls_back_token_consume() {
         .await
         .expect("pre-claim user");
 
+    let claim_repo = ClaimTokenRepository::new(pool.clone());
+    let confirmation_token = stage_claim(&claim_repo, &token, &email_for(&pubkey), "hash").await;
+
     let outcome = UserRepository::new(pool.clone())
-        .claim_account_consuming_token(&token, TENANT_ID, &email_for(&pubkey), "hash")
+        .confirm_claim_consuming_token(&confirmation_token, TENANT_ID)
         .await
         .expect("consume attempt");
 
@@ -232,9 +296,13 @@ async fn test_unclaimable_user_rolls_back_token_consume() {
     );
 }
 
-/// True concurrency: revoke-invalidation racing the claim consume. Exactly one
-/// side may win, and the user is mutated iff the consume won. Run several
+/// True concurrency: revoke-invalidation racing the claim confirm. Exactly one
+/// side may win, and the user is mutated iff the confirm won. Run several
 /// rounds to exercise both orderings.
+///
+/// The claim is staged sequentially, before the race starts -- staging isn't
+/// the operation under test here, `confirm_claim_consuming_token` is, since
+/// that's now the atomic consume-and-apply the #280 guarantee protects.
 #[tokio::test]
 async fn test_concurrent_invalidate_vs_claim_exactly_one_wins() {
     common::assert_test_database_url();
@@ -243,15 +311,17 @@ async fn test_concurrent_invalidate_vs_claim_exactly_one_wins() {
     for round in 0..20 {
         let pubkey = create_unclaimed_minor(&pool).await;
         let token = create_token_for(&pool, &pubkey).await;
+        let claim_repo = ClaimTokenRepository::new(pool.clone());
+        let confirmation_token =
+            stage_claim(&claim_repo, &token, &email_for(&pubkey), "hash").await;
 
         let user_repo = UserRepository::new(pool.clone());
-        let claim_repo = ClaimTokenRepository::new(pool.clone());
-        let (t, pk) = (token.clone(), pubkey.clone());
+        let pk = pubkey.clone();
 
-        let claim_email = email_for(&pubkey);
+        let ct = confirmation_token.clone();
         let claim_task = tokio::spawn(async move {
             user_repo
-                .claim_account_consuming_token(&t, TENANT_ID, &claim_email, "hash")
+                .confirm_claim_consuming_token(&ct, TENANT_ID)
                 .await
                 .expect("consume attempt")
         });
