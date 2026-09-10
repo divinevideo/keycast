@@ -17,6 +17,7 @@ use keycast_api::api::http::email_marketing::{
     ObservationsRequest,
 };
 use nostr_sdk::Keys;
+use serial_test::serial;
 use sqlx::PgPool;
 
 async fn setup_pool() -> PgPool {
@@ -148,6 +149,7 @@ async fn the_floor_starts_null_not_false() {
 /// Recording an opt-out must not touch the consent event. That record is the evidence consent was
 /// validly obtained; if this ever fails, the immutability guarantee has been broken.
 #[tokio::test]
+#[serial]
 async fn observing_an_optout_does_not_rewrite_the_consent_event() {
     let pool = setup_pool().await;
     let auth_state = handler_ctx(pool.clone()).await;
@@ -186,6 +188,7 @@ async fn observing_an_optout_does_not_rewrite_the_consent_event() {
 /// Replaying an identical observation must change nothing, so a batch retried after a crash does
 /// not churn the observation timestamp.
 #[tokio::test]
+#[serial]
 async fn an_identical_observation_is_a_no_op() {
     let pool = setup_pool().await;
     let auth_state = handler_ctx(pool.clone()).await;
@@ -235,6 +238,7 @@ async fn an_identical_observation_is_a_no_op() {
 /// HubSpot forgets an opt-out when the address changes. A later observation that the new
 /// contact is not globally opted out must not clear the floor we already recorded.
 #[tokio::test]
+#[serial]
 async fn a_later_false_observation_does_not_clear_the_floor() {
     let pool = setup_pool().await;
     let auth_state = handler_ctx(pool.clone()).await;
@@ -292,6 +296,7 @@ async fn a_later_false_observation_does_not_clear_the_floor() {
 /// An observation can select a live identity and then wait behind the transaction that retires it.
 /// Rechecking the target row after that wait must not write the floor onto the orphan.
 #[tokio::test]
+#[serial]
 async fn an_observation_blocked_by_rotation_does_not_write_the_orphan() {
     let pool = setup_pool().await;
     let auth_state = handler_ctx(pool.clone()).await;
@@ -466,6 +471,7 @@ async fn email_changes_carry_both_addresses_and_survive_until_acknowledged() {
 /// Tenant scoping has to be proved through the endpoint. Counting rows with the test's own WHERE
 /// clause proves only that the test wrote a WHERE clause.
 #[tokio::test]
+#[serial]
 async fn consent_reads_are_tenant_scoped() {
     let pool = setup_pool().await;
     let auth_state = handler_ctx(pool.clone()).await;
@@ -538,6 +544,7 @@ fn bearer_headers(token: &str) -> HeaderMap {
 /// extractor 500s on an uninitialized tenant cache before the guard runs, which is why a naive
 /// HTTP test passed with `authorize_service_token` deleted.
 #[tokio::test]
+#[serial]
 async fn service_token_is_required_on_every_email_marketing_handler() {
     common::assert_test_database_url();
     const TOKEN: &str = "test-service-token-secret";
@@ -620,6 +627,7 @@ async fn service_token_is_required_on_every_email_marketing_handler() {
 }
 
 #[tokio::test]
+#[serial]
 async fn a_valid_service_token_reaches_the_consent_list() {
     common::assert_test_database_url();
     const TOKEN: &str = "test-service-token-secret";
@@ -642,11 +650,13 @@ async fn a_valid_service_token_reaches_the_consent_list() {
     assert_eq!(status, StatusCode::OK);
 }
 
-/// The dedicated marketing credential, and only it, must authorize these endpoints. This is the
-/// positive half of the PR #404 review requirement: a bearer matching
-/// `KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN` reaches the handler on its own, with no broader
-/// credential configured at all.
+/// The dedicated marketing credential must be sufficient on its own to authorize these endpoints.
+/// This is the positive half of the PR #404 review requirement: a bearer matching
+/// `KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN` reaches the handler without needing anything else
+/// configured. (This does not assert anything about `KEYCAST_SERVICE_TOKEN` being absent --
+/// `broad_service_token_alone_is_rejected` below covers that direction instead.)
 #[tokio::test]
+#[serial]
 async fn dedicated_marketing_token_alone_authorizes_the_consent_list() {
     common::assert_test_database_url();
     // Deliberately the same value every other test in this file sets `
@@ -685,6 +695,7 @@ async fn dedicated_marketing_token_alone_authorizes_the_consent_list() {
 /// review finding directly: it fails red against the pre-fix code (the broad token would have been
 /// accepted) and green once the marketing endpoints check only their own dedicated variable.
 #[tokio::test]
+#[serial]
 async fn broad_service_token_alone_is_rejected() {
     common::assert_test_database_url();
     const MARKETING_TOKEN: &str = "test-service-token-secret";
@@ -722,6 +733,7 @@ async fn broad_service_token_alone_is_rejected() {
 /// variable afterward so it does not leave the shared test-process env in a state that breaks the
 /// rest of this file's tests, which assume it is set to `"test-service-token-secret"`.
 #[tokio::test]
+#[serial]
 async fn missing_marketing_token_fails_closed() {
     common::assert_test_database_url();
     // Do the (comparatively slow) DB setup before touching the shared env var, so the window
@@ -768,6 +780,7 @@ async fn missing_marketing_token_fails_closed() {
 /// The cursor is the consent timestamp, not updated_at, so an unrelated account change must not
 /// put somebody back in front of the sync and re-trigger a subscribe.
 #[tokio::test]
+#[serial]
 async fn an_unrelated_account_update_does_not_reappear_on_the_cursor() {
     let pool = setup_pool().await;
     let auth_state = handler_ctx(pool.clone()).await;
@@ -813,6 +826,7 @@ async fn an_unrelated_account_update_does_not_reappear_on_the_cursor() {
 /// An account nobody asked has no consent event, so the endpoint must not hand it to the sync at
 /// all. Filtering it out in the test's own query would prove nothing about the endpoint.
 #[tokio::test]
+#[serial]
 async fn never_asked_accounts_are_not_returned() {
     let pool = setup_pool().await;
     let auth_state = handler_ctx(pool.clone()).await;
@@ -844,6 +858,7 @@ async fn never_asked_accounts_are_not_returned() {
 /// A summed row count cannot tell an expected no-op from a lost write: an unknown pubkey, a
 /// wrong-tenant caller, an orphan and an identical replay all contribute zero.
 #[tokio::test]
+#[serial]
 async fn observations_report_per_pubkey_outcomes() {
     let pool = setup_pool().await;
     const TOKEN: &str = "test-service-token-secret";
@@ -907,6 +922,7 @@ async fn observations_report_per_pubkey_outcomes() {
 }
 
 #[tokio::test]
+#[serial]
 async fn observations_reject_duplicate_pubkeys() {
     common::assert_test_database_url();
     const TOKEN: &str = "test-service-token-secret";
@@ -945,6 +961,7 @@ async fn observations_reject_duplicate_pubkeys() {
 /// An orphaned identity left by a key rotation has no email and must not accept a floor write:
 /// recording an opt-out against a row nothing reads loses the opt-out.
 #[tokio::test]
+#[serial]
 async fn observations_skip_an_orphaned_identity() {
     let pool = setup_pool().await;
     const TOKEN: &str = "test-service-token-secret";
@@ -1062,6 +1079,7 @@ async fn expired_deletion_rows_are_purged() {
 }
 
 #[tokio::test]
+#[serial]
 async fn deletion_list_hides_tombstone_when_the_address_has_newer_consent() {
     common::assert_test_database_url();
     const TOKEN: &str = "test-service-token-secret";
@@ -1121,6 +1139,7 @@ async fn deletion_list_hides_tombstone_when_the_address_has_newer_consent() {
 /// This is independent of ordering: the worker finds contacts by address at drain time, so both a
 /// reclaim before the queued change and one after it would rename the new holder's contact.
 #[tokio::test]
+#[serial]
 async fn email_change_list_withholds_reclaimed_addresses_in_both_orders() {
     common::assert_test_database_url();
     const TOKEN: &str = "test-service-token-secret";
@@ -1286,6 +1305,7 @@ async fn deleting_an_account_tombstones_its_unprocessed_old_addresses() {
 /// named after this behaviour did not notice its own subject being removed. A test that restates
 /// production SQL cannot fail when production SQL changes, which is the only time it matters.
 #[tokio::test]
+#[serial]
 async fn the_consent_cursor_does_not_drop_rows_sharing_a_timestamp() {
     common::assert_test_database_url();
     const TOKEN: &str = "test-service-token-secret";
@@ -1362,6 +1382,7 @@ async fn the_consent_cursor_does_not_drop_rows_sharing_a_timestamp() {
 /// users row goes at step 5 of that same transaction, so once a tombstone is visible no live row can
 /// be the account it came from. Any live opted-in holder of that address is therefore someone else.
 #[tokio::test]
+#[serial]
 async fn a_tombstone_is_withheld_even_when_the_new_holder_consented_first() {
     common::assert_test_database_url();
     const TOKEN: &str = "test-service-token-secret";
@@ -1549,6 +1570,7 @@ async fn queue_rows_near_expiry_are_counted_before_they_are_dropped() {
 /// subscription state across an address change. Serving the stale snapshot would then subscribe
 /// somebody whose withdrawal this database already records.
 #[tokio::test]
+#[serial]
 async fn an_email_change_row_reflects_a_floor_recorded_after_it_was_written() {
     common::assert_test_database_url();
     const TOKEN: &str = "test-service-token-secret";
