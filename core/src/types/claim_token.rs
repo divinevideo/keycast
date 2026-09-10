@@ -13,6 +13,12 @@ use sqlx::FromRow;
 /// exposure unreasonably.
 pub const CLAIM_TOKEN_EXPIRY_DAYS: i64 = 14;
 
+/// Confirmation-link lifetime for a staged claim (24 hours), matching
+/// EMAIL_VERIFICATION_EXPIRY_HOURS. Independent of the 14-day token life:
+/// the claim token is the long-lived credential support hands out; the
+/// confirmation token is a short-lived proof-of-control minted at submit.
+pub const CLAIM_CONFIRMATION_EXPIRY_HOURS: i64 = 24;
+
 /// Account claim token for preloaded users to claim their accounts
 #[derive(Debug, FromRow)]
 pub struct ClaimToken {

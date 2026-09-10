@@ -426,6 +426,10 @@ pub async fn claim_post(
         ClaimConsumeOutcome::UserNotClaimable => {
             return Err(ClaimError::TokenAlreadyClaimed);
         }
+        // TEMPORARY: claim_post still consumes email+password in one step.
+        // Task 6 rewrites this handler around the submit/confirm split, at
+        // which point this arm goes away with the rest of the one-step flow.
+        ClaimConsumeOutcome::EmailTaken => return Err(ClaimError::EmailExists),
     }
 
     tracing::info!(
