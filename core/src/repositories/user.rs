@@ -2606,6 +2606,12 @@ impl UserRepository {
         // of the staged value. Locking in the CTE and joining the UPDATE to it
         // by primary key keeps this one atomic statement while still letting
         // us clear those columns and return their prior contents.
+        //
+        // `used_at IS NULL` here is defense-in-depth rather than the primary
+        // guard: a successful confirm already nulls `confirmation_token`, so a
+        // replay of the same link fails the `confirmation_token = $1` match
+        // on its own. This conjunct only matters for some future path that
+        // marks a token used without also nulling `confirmation_token`.
         let consumed: Option<(String, String, String)> = sqlx::query_as(
             "WITH locked AS (
                  SELECT id, user_pubkey, pending_email, pending_password_hash
