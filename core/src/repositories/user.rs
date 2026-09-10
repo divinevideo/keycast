@@ -456,6 +456,9 @@ pub enum ClaimConsumeOutcome {
     /// Token was valid but the user row was not claimable (already has an
     /// email) — the token consume was rolled back, nothing mutated.
     UserNotClaimable,
+    /// The pending email was taken by another user before confirmation
+    /// (unique violation on idx_users_email_tenant). Nothing mutated.
+    EmailTaken,
 }
 
 /// Outcome of a conditional ATProto lifecycle write.
