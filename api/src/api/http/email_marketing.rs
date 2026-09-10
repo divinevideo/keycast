@@ -9,9 +9,22 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::admin::authorize_service_token;
+use super::admin::authorize_configured_service_token;
 use super::routes::AuthState;
-use crate::api::error::ApiResult;
+use crate::api::error::{ApiError, ApiResult};
+
+/// Constant-time bearer check against the marketing-sync-only service credential.
+///
+/// This deliberately does not fall back to `KEYCAST_SERVICE_TOKEN`: that broader
+/// credential also authorizes unrelated administration and signing operations,
+/// while the marketing sync worker needs authority only over these endpoints.
+fn authorize_email_marketing_service_token(headers: &HeaderMap) -> Result<(), ApiError> {
+    authorize_configured_service_token(
+        headers,
+        "KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN",
+        "Email marketing service credential not configured",
+    )
+}
 
 /// Upper bound on a page. Matches the documented 1,000-row contract on batch-lookup.
 const MAX_LIMIT: i64 = 1000;
@@ -71,7 +84,7 @@ pub async fn list_consents(
     headers: HeaderMap,
     Query(query): Query<ConsentPageQuery>,
 ) -> ApiResult<Json<ConsentPage>> {
-    authorize_service_token(&headers)?;
+    authorize_email_marketing_service_token(&headers)?;
 
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
@@ -162,7 +175,7 @@ pub async fn record_observations(
     headers: HeaderMap,
     Json(req): Json<ObservationsRequest>,
 ) -> ApiResult<Json<ObservationsResponse>> {
-    authorize_service_token(&headers)?;
+    authorize_email_marketing_service_token(&headers)?;
 
     if req.observations.len() as i64 > MAX_LIMIT {
         return Err(crate::api::error::ApiError::bad_request(format!(
@@ -299,7 +312,7 @@ pub async fn list_deletions(
     headers: HeaderMap,
     Query(query): Query<IdPageQuery>,
 ) -> ApiResult<Json<DeletionPage>> {
-    authorize_service_token(&headers)?;
+    authorize_email_marketing_service_token(&headers)?;
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
     let results: Vec<DeletionRecord> = sqlx::query_as(
@@ -353,7 +366,7 @@ pub async fn ack_deletions(
     headers: HeaderMap,
     Json(req): Json<AckRequest>,
 ) -> ApiResult<Json<AckResponse>> {
-    authorize_service_token(&headers)?;
+    authorize_email_marketing_service_token(&headers)?;
 
     let result =
         sqlx::query("DELETE FROM email_marketing_deletions WHERE id = ANY($1) AND tenant_id = $2")
@@ -391,7 +404,7 @@ pub async fn list_email_changes(
     headers: HeaderMap,
     Query(query): Query<IdPageQuery>,
 ) -> ApiResult<Json<EmailChangePage>> {
-    authorize_service_token(&headers)?;
+    authorize_email_marketing_service_token(&headers)?;
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
     let results: Vec<EmailChangeRecord> = sqlx::query_as(
@@ -468,7 +481,7 @@ pub async fn ack_email_changes(
     headers: HeaderMap,
     Json(req): Json<AckRequest>,
 ) -> ApiResult<Json<AckResponse>> {
-    authorize_service_token(&headers)?;
+    authorize_email_marketing_service_token(&headers)?;
 
     let result = sqlx::query(
         "DELETE FROM email_marketing_email_changes WHERE id = ANY($1) AND tenant_id = $2",

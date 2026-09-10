@@ -387,9 +387,16 @@ Common HTTP status codes:
 
 ## Email marketing consent (service token)
 
-Six endpoints used by the marketing consent sync worker. They authenticate with
-`KEYCAST_SERVICE_TOKEN` (constant-time bearer check), not with an admin UCAN, and every statement
-is tenant-scoped.
+Six endpoints used by the marketing consent sync worker. They authenticate with the dedicated
+`KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN` (constant-time bearer check), not with an admin UCAN and
+not with the broader `KEYCAST_SERVICE_TOKEN`, and every statement is tenant-scoped.
+
+This credential is deliberately separate from `KEYCAST_SERVICE_TOKEN`, the same way
+`KEYCAST_DELETION_SERVICE_TOKEN` is kept separate for the account-deletion endpoint (see
+`docs/SERVICE_ACCOUNT_DELETION.md`): the broader service credential also authorizes unrelated
+administration and signing operations, while the marketing sync worker needs authority only over
+these six endpoints. The marketing credential cannot authorize unrelated service-admin routes, and
+the broader service credential cannot authorize these endpoints.
 
 keycast never calls the email platform. It records what happened; the sync worker acts on it.
 

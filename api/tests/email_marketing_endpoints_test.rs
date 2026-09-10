@@ -68,7 +68,7 @@ const TEST_TOKEN: &str = "test-service-token-secret";
 
 /// Build the auth state the handlers take, with the service token set.
 async fn handler_ctx(pool: PgPool) -> keycast_api::api::http::AuthState {
-    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", TEST_TOKEN) };
+    unsafe { std::env::set_var("KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN", TEST_TOKEN) };
     let (auth_state, _producer) = common::create_test_auth_state(pool);
     auth_state
 }
@@ -541,7 +541,7 @@ fn bearer_headers(token: &str) -> HeaderMap {
 async fn service_token_is_required_on_every_email_marketing_handler() {
     common::assert_test_database_url();
     const TOKEN: &str = "test-service-token-secret";
-    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", TOKEN) };
+    unsafe { std::env::set_var("KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN", TOKEN) };
     let pool = common::setup_test_db().await;
     let (auth_state, _producer) = common::create_test_auth_state(pool);
     let headers = empty_headers();
@@ -623,7 +623,7 @@ async fn service_token_is_required_on_every_email_marketing_handler() {
 async fn a_valid_service_token_reaches_the_consent_list() {
     common::assert_test_database_url();
     const TOKEN: &str = "test-service-token-secret";
-    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", TOKEN) };
+    unsafe { std::env::set_var("KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN", TOKEN) };
     let pool = common::setup_test_db().await;
     let (auth_state, _producer) = common::create_test_auth_state(pool);
     let status = handler_status(
@@ -640,6 +640,129 @@ async fn a_valid_service_token_reaches_the_consent_list() {
         .await,
     );
     assert_eq!(status, StatusCode::OK);
+}
+
+/// The dedicated marketing credential, and only it, must authorize these endpoints. This is the
+/// positive half of the PR #404 review requirement: a bearer matching
+/// `KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN` reaches the handler on its own, with no broader
+/// credential configured at all.
+#[tokio::test]
+async fn dedicated_marketing_token_alone_authorizes_the_consent_list() {
+    common::assert_test_database_url();
+    // Deliberately the same value every other test in this file sets `
+    // KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN` to. Reusing it (rather than a value unique to this
+    // test) keeps this test's env mutation a no-op against the rest of the suite, which runs
+    // concurrently in the same process and shares this env var.
+    const MARKETING_TOKEN: &str = "test-service-token-secret";
+    unsafe {
+        std::env::set_var("KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN", MARKETING_TOKEN);
+    }
+    let pool = common::setup_test_db().await;
+    let (auth_state, _producer) = common::create_test_auth_state(pool);
+    let status = handler_status(
+        list_consents(
+            common::test_tenant(),
+            State(auth_state),
+            bearer_headers(MARKETING_TOKEN),
+            Query(ConsentPageQuery {
+                since: None,
+                since_pubkey: None,
+                limit: None,
+            }),
+        )
+        .await,
+    );
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the dedicated marketing credential must be sufficient on its own"
+    );
+}
+
+/// The broad `KEYCAST_SERVICE_TOKEN` credential must not authorize the marketing endpoints, even
+/// when it is configured and presented. Before this fix, `email_marketing.rs` called
+/// `authorize_service_token`, which checks exactly this variable -- so this test reproduces the
+/// review finding directly: it fails red against the pre-fix code (the broad token would have been
+/// accepted) and green once the marketing endpoints check only their own dedicated variable.
+#[tokio::test]
+async fn broad_service_token_alone_is_rejected() {
+    common::assert_test_database_url();
+    const MARKETING_TOKEN: &str = "test-service-token-secret";
+    const BROAD_TOKEN: &str = "test-broad-service-token-not-marketing-scoped";
+    unsafe {
+        std::env::set_var("KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN", MARKETING_TOKEN);
+        std::env::set_var("KEYCAST_SERVICE_TOKEN", BROAD_TOKEN);
+    }
+    let pool = common::setup_test_db().await;
+    let (auth_state, _producer) = common::create_test_auth_state(pool);
+    let status = handler_status(
+        list_consents(
+            common::test_tenant(),
+            State(auth_state),
+            bearer_headers(BROAD_TOKEN),
+            Query(ConsentPageQuery {
+                since: None,
+                since_pubkey: None,
+                limit: None,
+            }),
+        )
+        .await,
+    );
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the broad service token must not authorize a marketing endpoint, \
+         even though it is configured and valid for other endpoints"
+    );
+}
+
+/// Absence of the dedicated marketing credential must fail closed rather than falling back to any
+/// other configured credential. This is the other direction a fallback bug could take: not "the
+/// broad token works here", but "no marketing token configured, so anything goes". Restores the
+/// variable afterward so it does not leave the shared test-process env in a state that breaks the
+/// rest of this file's tests, which assume it is set to `"test-service-token-secret"`.
+#[tokio::test]
+async fn missing_marketing_token_fails_closed() {
+    common::assert_test_database_url();
+    // Do the (comparatively slow) DB setup before touching the shared env var, so the window
+    // where sibling tests could observe it unset is just the handler call below, not this
+    // function's full setup cost.
+    let pool = common::setup_test_db().await;
+    let (auth_state, _producer) = common::create_test_auth_state(pool);
+
+    let previous = std::env::var("KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN").ok();
+    unsafe {
+        std::env::remove_var("KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN");
+    }
+    let status = handler_status(
+        list_consents(
+            common::test_tenant(),
+            State(auth_state),
+            bearer_headers("any-bearer-value-at-all"),
+            Query(ConsentPageQuery {
+                since: None,
+                since_pubkey: None,
+                limit: None,
+            }),
+        )
+        .await,
+    );
+    // Unset config is an operator error (500), not a bad credential (401) -- but either way it must
+    // never be a 2xx: nothing authorizes this request while the credential is unconfigured.
+    assert!(
+        !status.is_success(),
+        "an unconfigured marketing credential must never authorize a request, got {status}"
+    );
+
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN", value),
+            None => std::env::set_var(
+                "KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN",
+                "test-service-token-secret",
+            ),
+        }
+    }
 }
 
 /// The cursor is the consent timestamp, not updated_at, so an unrelated account change must not
@@ -724,7 +847,7 @@ async fn never_asked_accounts_are_not_returned() {
 async fn observations_report_per_pubkey_outcomes() {
     let pool = setup_pool().await;
     const TOKEN: &str = "test-service-token-secret";
-    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", TOKEN) };
+    unsafe { std::env::set_var("KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN", TOKEN) };
     let at = Utc::now() - Duration::days(1);
     let live = seed(
         &pool,
@@ -787,7 +910,7 @@ async fn observations_report_per_pubkey_outcomes() {
 async fn observations_reject_duplicate_pubkeys() {
     common::assert_test_database_url();
     const TOKEN: &str = "test-service-token-secret";
-    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", TOKEN) };
+    unsafe { std::env::set_var("KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN", TOKEN) };
     let pool = common::setup_test_db().await;
     let (auth_state, _producer) = common::create_test_auth_state(pool);
     let pubkey = Keys::generate().public_key().to_hex();
@@ -825,7 +948,7 @@ async fn observations_reject_duplicate_pubkeys() {
 async fn observations_skip_an_orphaned_identity() {
     let pool = setup_pool().await;
     const TOKEN: &str = "test-service-token-secret";
-    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", TOKEN) };
+    unsafe { std::env::set_var("KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN", TOKEN) };
     let orphan = Keys::generate().public_key().to_hex();
     sqlx::query(
         "INSERT INTO users (pubkey, tenant_id, email, email_marketing_consent, created_at, updated_at)
@@ -942,7 +1065,7 @@ async fn expired_deletion_rows_are_purged() {
 async fn deletion_list_hides_tombstone_when_the_address_has_newer_consent() {
     common::assert_test_database_url();
     const TOKEN: &str = "test-service-token-secret";
-    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", TOKEN) };
+    unsafe { std::env::set_var("KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN", TOKEN) };
     let pool = common::setup_test_db().await;
     let email = format!("reused-{}@example.test", uuid::Uuid::new_v4());
     let declined_email = format!("declined-{}@example.test", uuid::Uuid::new_v4());
@@ -1001,7 +1124,7 @@ async fn deletion_list_hides_tombstone_when_the_address_has_newer_consent() {
 async fn email_change_list_withholds_reclaimed_addresses_in_both_orders() {
     common::assert_test_database_url();
     const TOKEN: &str = "test-service-token-secret";
-    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", TOKEN) };
+    unsafe { std::env::set_var("KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN", TOKEN) };
     let pool = common::setup_test_db().await;
     let (auth_state, _producer) = common::create_test_auth_state(pool.clone());
 
@@ -1166,7 +1289,7 @@ async fn deleting_an_account_tombstones_its_unprocessed_old_addresses() {
 async fn the_consent_cursor_does_not_drop_rows_sharing_a_timestamp() {
     common::assert_test_database_url();
     const TOKEN: &str = "test-service-token-secret";
-    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", TOKEN) };
+    unsafe { std::env::set_var("KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN", TOKEN) };
     let pool = common::setup_test_db().await;
     let (auth_state, _producer) = common::create_test_auth_state(pool.clone());
 
@@ -1242,7 +1365,7 @@ async fn the_consent_cursor_does_not_drop_rows_sharing_a_timestamp() {
 async fn a_tombstone_is_withheld_even_when_the_new_holder_consented_first() {
     common::assert_test_database_url();
     const TOKEN: &str = "test-service-token-secret";
-    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", TOKEN) };
+    unsafe { std::env::set_var("KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN", TOKEN) };
     let pool = common::setup_test_db().await;
     let (auth_state, _producer) = common::create_test_auth_state(pool.clone());
 
@@ -1429,7 +1552,7 @@ async fn queue_rows_near_expiry_are_counted_before_they_are_dropped() {
 async fn an_email_change_row_reflects_a_floor_recorded_after_it_was_written() {
     common::assert_test_database_url();
     const TOKEN: &str = "test-service-token-secret";
-    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", TOKEN) };
+    unsafe { std::env::set_var("KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN", TOKEN) };
     let pool = common::setup_test_db().await;
     let auth_state = handler_ctx(pool.clone()).await;
 
