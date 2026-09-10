@@ -23,12 +23,24 @@
 - **No em dashes** in user-facing copy written in Matt's voice.
 - **Verification:** `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --all-features -- -D warnings -A deprecated` before every commit; targeted tests per task.
 
+## Reuse and shared primitives
+
+This feature is a sibling of the shipped **self-serve email-change** flow. Reuse decisions, so the executor shares what's cleanly shareable and mirrors (rather than bends) what isn't:
+
+- **REUSE `generate_secure_token()`** (`api/src/api/http/auth.rs:94`) for the confirmation token — the one shared generator, already used by verification/reset/email-change. Do not add a new generator.
+- **GENERALIZE the email body (Task 5):** introduce a shared `action_email_html(title, intro, button_label, url, footer)` + `action_email_text(...)` builder in `email_service.rs` and build the new claim-confirmation email on it. The four existing hand-rolled bodies (`send_password_reset_email`, `send_claim_email`, `send_email_change_confirmation`, `send_email_change_notification`) are **left byte-for-byte untouched** — retrofitting them onto the builder is a separate, deliberately-scoped cleanup, because reformatting a shipped email's HTML changes its rendered output.
+- **GENERALIZE the cooldown check (Task 8):** add a pure `within_cooldown(last_sent: Option<DateTime<Utc>>, minutes: i64) -> bool` helper (in `auth.rs` beside the expiry constants) and use it for the claim resend. The three existing inline copies (`auth.rs:2633` verification, `auth.rs:4282` email-change, `headless.rs:1234` PIN) keep their surrounding policy (enumeration-safety, same-target scoping, atomic re-check); migrating just their boolean check to the helper is a behavior-preserving optional follow-up, not part of this feature.
+- **MIRROR, do not share, the pending/confirm repository methods.** The email-change methods (`set_pending_email_change`, `find_by_pending_email_token`, `mark_pending_email_confirmed`, `finalize_email_change_if_ready`, `PendingEmailSide`, `user.rs:1007-1236`) are built around a **dual-token, both-sides** confirmation; a claim confirm is one-sided. Reuse their *shape* (stage token+expiry → guarded atomic apply → clear pending) and name the claim methods as visible siblings, but write claim-specific methods rather than distorting the dual-confirmation ones.
+- **MIRROR the confirm-handler skeleton.** There is no generic "look up by confirmation token + validate expiry" helper; `confirm_email_change` (`auth.rs:4373`) is bespoke against its own schema. `claim_confirm_get` follows the same lookup → expiry → atomic-apply → (log) skeleton against the claim columns.
+- **MIRROR the page shell.** No server-rendered page-shell helper exists (claim/auth/oauth each embed their own `<style>`); reuse only the `html_safety.rs` escapers (`escape_html`, `escape_attr`), as the existing claim pages do. Extracting a cross-file shell is out of scope.
+
 ## File Structure
 
 - `database/migrations/20260910120000_add_claim_confirmation.sql` — **create.** Adds `pending_email`, `pending_password_hash`, `confirmation_token`, `confirmation_expires_at`, `confirmation_sent_at` to `account_claim_tokens` + partial unique index on `confirmation_token`.
 - `core/src/repositories/user.rs` — **modify.** Add `EmailTaken` to `ClaimConsumeOutcome`; add `confirm_claim_consuming_token`; remove `claim_account_consuming_token`.
 - `core/src/repositories/claim_token.rs` — **modify.** Add `stage_pending_claim` + a `StagePendingOutcome` enum; add `CLAIM_CONFIRMATION_EXPIRY_HOURS`.
-- `api/src/email_service.rs` — **modify.** Add `send_claim_confirmation` to the `EmailSender` trait and both impls; extend `CapturedEmail` usage.
+- `api/src/email_service.rs` — **modify.** Add a shared `action_email_html`/`action_email_text` builder; add `send_claim_confirmation` to the `EmailSender` trait and both impls (SendGrid body built on the new builder); extend `CapturedEmail` usage. Shipped email bodies untouched.
+- `api/src/api/http/auth.rs` — **modify.** Add `pub(crate) fn within_cooldown(last_sent, minutes)` beside the expiry constants (used by the claim resend; existing call sites unchanged).
 - `api/src/api/http/claim.rs` — **modify.** Restructure `claim_post`; add `claim_confirm_get`, `claim_resend_post`; add interstitial page + `ConfirmationUnrecognized` / `ConfirmationExpired` error variants.
 - `api/src/api/http/routes.rs:355` — **modify.** Register `/claim/confirm` (GET) and `/claim/resend` (POST).
 - `api/tests/claim_consume_race_test.rs` — **modify.** Re-express the race coverage against the two-step methods.
@@ -168,6 +180,7 @@ git commit -m "feat(claim): add staging/confirm outcome types and confirmation w
       confirmation_expires_at: DateTime<Utc>,
   ) -> Result<StagePendingOutcome, RepositoryError>
   ```
+- Pattern: mirrors the guarded pending-state write `set_pending_email_change` (`core/src/repositories/user.rs:1007`) — a sibling, not a shared method.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -301,6 +314,7 @@ git commit -m "feat(claim): stage pending claim state under a validity guard"
   ) -> Result<ClaimConsumeOutcome, RepositoryError>
   ```
   On `Claimed`, the user row has `email`/`password_hash`/`email_verified = true` set and the claim token has `used_at = NOW()` with `pending_*`/`confirmation_*` cleared.
+- Pattern: the guarded-atomic-apply shape mirrors `finalize_email_change_if_ready` (`core/src/repositories/user.rs:1158`) — apply only if the guard still holds, mapping the unique violation to `EmailTaken`. One-sided, so it's a claim-specific method, not the dual-token one.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -471,11 +485,21 @@ git commit -m "feat(claim): atomic confirm-and-consume, replacing single-step cl
 - Test: inline `#[cfg(test)]` module in `api/src/email_service.rs`
 
 **Interfaces:**
-- Produces: `async fn send_claim_confirmation(&self, to_email: &str, confirm_token: &str) -> Result<(), String>` on `EmailSender`, `DevEmailSender`, `SendGridEmailSender`, and the legacy `EmailService` shim.
+- Produces: free functions `action_email_html(title, intro, button_label, url, footer) -> String` and `action_email_text(intro, url, footer) -> String`; `async fn send_claim_confirmation(&self, to_email: &str, confirm_token: &str) -> Result<(), String>` on `EmailSender`, `DevEmailSender`, `SendGridEmailSender`, and the legacy `EmailService` shim.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing test (shared builder + capture)**
 
 ```rust
+#[test]
+fn action_email_html_has_shell_button_and_fallback_link() {
+    let url = "https://login.example/api/claim/confirm?token=abc";
+    let html = action_email_html("Confirm your email", "Click to finish.", "Confirm", url, "Expires in 24 hours.");
+    assert!(html.contains("Confirm your email"));   // title
+    assert!(html.contains(">Confirm<"));            // button label
+    assert!(html.contains(url));                     // button href + fallback link
+    assert!(html.contains("Expires in 24 hours."));  // footer
+}
+
 #[tokio::test]
 async fn dev_sender_captures_claim_confirmation() {
     let sender = DevEmailSender::new();
@@ -489,12 +513,44 @@ async fn dev_sender_captures_claim_confirmation() {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cd api && cargo test --lib email_service::tests::dev_sender_captures_claim_confirmation`
-Expected: FAIL — method not found.
+Run: `cd api && cargo test --lib email_service::tests::action_email_html_has_shell_button_and_fallback_link email_service::tests::dev_sender_captures_claim_confirmation`
+Expected: FAIL — builder + method not found.
 
-- [ ] **Step 3: Implement**
+- [ ] **Step 3: Implement the shared builder**
+
+Add free functions modeled on the shared shell the four inline bodies already use (`#00B488` header, button `<div style="margin: 30px 0;">`, "Or copy and paste this link" fallback). The `title`/`button_label`/`footer`/`intro` are the only things that vary between the existing emails; `BRAND_NAME` is available from `crate::brand`. Do **not** modify the four shipped bodies.
+
+```rust
+/// Shared shell for action emails (a titled body with one primary button and a
+/// copy-paste fallback link). New emails build on this; shipped bodies are left
+/// as-is to preserve their exact rendered output.
+fn action_email_html(title: &str, intro: &str, button_label: &str, url: &str, footer: &str) -> String {
+    format!(
+        r#"
+        <html>
+        <body style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+            <h1 style="color: #00B488;">{title}</h1>
+            <p>{intro}</p>
+            <div style="margin: 30px 0;">
+                <a href="{url}" style="background: #00B488; color: #fff; padding: 12px 24px; text-decoration: none; border-radius: 4px; display: inline-block; font-weight: bold;">{button_label}</a>
+            </div>
+            <p style="color: #666; font-size: 14px;">Or copy and paste this link into your browser:<br>
+                <a href="{url}" style="color: #00B488;">{url}</a></p>
+            <p style="color: #666; font-size: 14px; margin-top: 30px;">{footer}</p>
+        </body>
+        </html>
+        "#,
+    )
+}
+
+fn action_email_text(intro: &str, url: &str, footer: &str) -> String {
+    format!("{intro}\n\n{url}\n\n{footer}")
+}
+```
+
+- [ ] **Step 4: Implement `send_claim_confirmation`**
 
 Add to the `EmailSender` trait:
 
@@ -505,20 +561,30 @@ async fn send_claim_confirmation(&self, to_email: &str, confirm_token: &str) -> 
 
 `DevEmailSender`: build `format!("{}/api/claim/confirm?token={}", self.base_url, confirm_token)`, log + `eprintln!` it (mirror `send_claim_email` at `email_service.rs:274`), and push a `CapturedEmail { to, subject: format!("Confirm your email to claim your {} account", BRAND_NAME), verification_url: Some(confirm_url), reset_url: None, pin: None }`.
 
-`SendGridEmailSender`: build the same URL, then a subject + HTML/text body mirroring `send_claim_email` (`email_service.rs:594`) but framed as confirming the address to finish claiming, noting the 24-hour expiry, and call `self.send_email(...)`. Copy uses no em dashes.
+`SendGridEmailSender`: build the same URL, a subject `format!("Confirm your email to claim your {} account", BRAND_NAME)`, then bodies via the shared builder, and call `self.send_email(...)`. Copy uses no em dashes:
+
+```rust
+let confirm_url = format!("{}/api/claim/confirm?token={}", self.base_url, confirm_token);
+let subject = format!("Confirm your email to claim your {} account", BRAND_NAME);
+let intro = format!("Confirm this email address to finish claiming your {} account.", BRAND_NAME);
+let footer = "This link will expire in 24 hours. If you didn't request this, you can safely ignore this email.";
+let html = action_email_html("Confirm your email", &intro, "Confirm Email", &confirm_url, footer);
+let text = action_email_text(&intro, &confirm_url, footer);
+self.send_email(to_email, &subject, &html, &text).await
+```
 
 `EmailService` shim: delegate `self.inner.send_claim_confirmation(to_email, confirm_token).await`.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cd api && cargo test --lib email_service::tests::dev_sender_captures_claim_confirmation`
+Run: `cd api && cargo test --lib email_service::tests::action_email_html_has_shell_button_and_fallback_link email_service::tests::dev_sender_captures_claim_confirmation`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add api/src/email_service.rs
-git commit -m "feat(claim): add claim-confirmation email"
+git commit -m "feat(claim): shared action-email builder and claim-confirmation email"
 ```
 
 ---
@@ -631,6 +697,7 @@ git commit -m "feat(claim): stage claim and email confirmation instead of comple
 **Interfaces:**
 - Consumes: `UserRepository::confirm_claim_consuming_token` (Task 4), the existing session-UCAN + success-page tail (moved from `claim_post`), `reclassify_to_error` (Task 6).
 - Produces: `pub async fn claim_confirm_get(tenant, State(auth_state), Query(params): Query<ClaimQuery>) -> Result<Response, ClaimError>`.
+- Pattern: mirrors the `confirm_email_change` handler skeleton (`api/src/api/http/auth.rs:4373`) — lookup by token → validate expiry → atomic guarded apply → branch on outcome. No shared validator exists; follow the shape.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -747,19 +814,27 @@ git commit -m "feat(claim): confirm handler completes the claim and issues the s
 - Test: `api/tests/claim_confirmation_test.rs`
 
 **Interfaces:**
-- Consumes: a new `ClaimTokenRepository::resend_claim_confirmation(token, tenant_id) -> ResendOutcome` that, under a 5-minute `confirmation_sent_at` cooldown (baked into the SQL), refreshes or regenerates the confirmation token.
-- Produces: `POST /api/claim/resend`; the outcome enum
-  ```rust
-  #[derive(Debug, Clone, PartialEq, Eq)]
-  pub enum ResendOutcome {
-      /// A fresh or reused confirmation token to email to `to_email`.
-      Sent { to_email: String, confirmation_token: String },
-      /// Within the 5-minute cooldown; nothing re-sent.
-      Cooldown,
-      /// No staged, still-valid pending claim for this token.
-      NoPendingClaim,
-  }
-  ```
+- Consumes: `within_cooldown` (defined here), `generate_secure_token`, `CLAIM_CONFIRMATION_EXPIRY_HOURS`, `EmailSender::send_claim_confirmation`, `claim_confirmation_sent_html` (Task 6).
+- Produces:
+  - `pub(crate) fn within_cooldown(last_sent: Option<DateTime<Utc>>, minutes: i64) -> bool` in `auth.rs` (pure; `None` last_sent is not within cooldown).
+  - `pub const CLAIM_RESEND_COOLDOWN_MINUTES: i64 = 5;`
+  - Repo (mirrors `pending_email_send_state` / the email-change setters, layering-clean: core returns data, the handler applies policy):
+    ```rust
+    pub struct PendingClaimSendState {
+        pub to_email: String,
+        pub confirmation_sent_at: Option<DateTime<Utc>>,
+        pub confirmation_token: String,
+        pub confirmation_expired: bool,
+    }
+    // None when no staged, still-valid pending claim exists for this token.
+    pub async fn pending_claim_send_state(&self, token: &str, tenant_id: i64)
+        -> Result<Option<PendingClaimSendState>, RepositoryError>;
+    // Bumps confirmation_sent_at = NOW(); when `rotated` is Some, also replaces
+    // confirmation_token + confirmation_expires_at (used when the prior one expired).
+    pub async fn touch_claim_confirmation(&self, token: &str, tenant_id: i64,
+        rotated: Option<(&str, DateTime<Utc>)>) -> Result<(), RepositoryError>;
+    ```
+  - `POST /api/claim/resend`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -792,11 +867,63 @@ async fn resend_is_rate_limited_and_enumeration_safe() {
 Run: `cd api && cargo test --test claim_confirmation_test resend_`
 Expected: FAIL — route/handler missing.
 
-- [ ] **Step 3: Implement**
+- [ ] **Step 3: Implement `within_cooldown` + the repo methods**
 
-Add `resend_claim_confirmation` to `ClaimTokenRepository`: select `confirmation_token`, `confirmation_sent_at`, `confirmation_expires_at` for the token where a pending claim exists (`pending_email IS NOT NULL AND used_at IS NULL AND invalidated_at IS NULL AND expires_at > NOW()`). If `confirmation_sent_at > NOW() - interval '5 minutes'` return `ResendOutcome::Cooldown`. Else if `confirmation_expires_at <= NOW()` mint a fresh `confirmation_token` + new `confirmation_expires_at`; otherwise reuse the current token. Bump `confirmation_sent_at = NOW()` and return `ResendOutcome::Sent { to_email, confirmation_token }`. No pending row → `ResendOutcome::NoPendingClaim`.
+Add the shared helper to `auth.rs` beside the expiry constants, and its unit test:
 
-`claim_resend_post`: on `Sent`, call `send_claim_confirmation` and render the interstitial; on `Cooldown` / `NoPendingClaim`, render the same interstitial without sending (enumeration-safe). The interstitial cannot show the destination address on the enumeration-safe branches, so the resend interstitial uses generic copy ("If a pending claim exists, we've sent another link.").
+```rust
+/// True when `last_sent` is within `minutes` of now. A missing timestamp
+/// (never sent) is not within cooldown. Pure; shared by resend paths.
+pub(crate) fn within_cooldown(last_sent: Option<DateTime<Utc>>, minutes: i64) -> bool {
+    match last_sent {
+        Some(sent) => Utc::now() - sent < Duration::minutes(minutes),
+        None => false,
+    }
+}
+```
+
+Define `pub const CLAIM_RESEND_COOLDOWN_MINUTES: i64 = 5;` in `auth.rs` beside `EMAIL_CHANGE_RESEND_COOLDOWN_MINUTES` (`auth.rs:46`).
+
+Add `pending_claim_send_state` (SELECT `pending_email`, `confirmation_sent_at`, `confirmation_token`, `(confirmation_expires_at <= NOW())` for the row where `token = $1 AND tenant_id = $2 AND pending_email IS NOT NULL AND used_at IS NULL AND invalidated_at IS NULL AND expires_at > NOW()`; explicit columns) and `touch_claim_confirmation` (one UPDATE: `SET confirmation_sent_at = NOW()`, plus `confirmation_token = $x, confirmation_expires_at = $y` when `rotated` is `Some`, guarded by the same still-valid predicate) to `ClaimTokenRepository`.
+
+- [ ] **Step 4: Implement `claim_resend_post`**
+
+```rust
+pub async fn claim_resend_post(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    Form(form): Form<ClaimResendForm>,   // { token: String }
+) -> Result<Response, ClaimError> {
+    let tenant_id = tenant.0.id;
+    let repo = ClaimTokenRepository::new(auth_state.state.db.clone());
+
+    if let Some(state) = repo.pending_claim_send_state(&form.token, tenant_id).await
+        .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?
+    {
+        if !super::auth::within_cooldown(state.confirmation_sent_at, CLAIM_RESEND_COOLDOWN_MINUTES) {
+            // Rotate the token only if the previous one expired; otherwise re-send the same one.
+            let confirm_token = if state.confirmation_expired {
+                let fresh = super::auth::generate_secure_token();
+                let expiry = Utc::now() + Duration::hours(CLAIM_CONFIRMATION_EXPIRY_HOURS);
+                repo.touch_claim_confirmation(&form.token, tenant_id, Some((&fresh, expiry))).await
+                    .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?;
+                fresh
+            } else {
+                repo.touch_claim_confirmation(&form.token, tenant_id, None).await
+                    .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?;
+                state.confirmation_token
+            };
+            if let Err(e) = auth_state.state.email_sender
+                .send_claim_confirmation(&state.to_email, &confirm_token).await
+            {
+                tracing::error!("Failed to resend claim confirmation: {}", e);
+            }
+        }
+    }
+    // Enumeration-safe: identical generic interstitial regardless of token state.
+    Ok(Html(claim_confirmation_sent_html(None)).into_response())
+}
+```
 
 Register the route:
 
@@ -804,16 +931,16 @@ Register the route:
 .route("/claim/resend", post(claim::claim_resend_post))
 ```
 
-- [ ] **Step 4: Migrate the legacy tests**
+- [ ] **Step 5: Migrate the legacy tests**
 
 In `api/tests/claim_consume_race_test.rs`, re-express each `claim_account_consuming_token` call as `stage_pending_claim` + `confirm_claim_consuming_token`, keeping the concurrent-consume assertions (only one confirm wins). Run with `max_connections(1)` where nested acquisition is under test. In `core/tests/pool_nesting_test.rs`, point the claim probe (line ~381) at `confirm_claim_consuming_token` (stage first, then confirm) so the one-connection assertion still covers the claim path.
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [ ] **Step 6: Run tests to verify they pass**
 
 Run: `cd api && cargo test --test claim_confirmation_test && cargo test --test claim_consume_race_test && cd ../core && cargo test --test pool_nesting_test`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add api/src/api/http/claim.rs api/src/api/http/routes.rs core/src/repositories/claim_token.rs api/tests/claim_consume_race_test.rs core/tests/pool_nesting_test.rs
