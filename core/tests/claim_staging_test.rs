@@ -2,74 +2,13 @@
 // ABOUTME: Tests for ClaimTokenRepository::stage_pending_claim -- the guarded
 // ABOUTME: write that stages pending email/password/confirmation state on a claim token.
 
+mod common;
+
 use chrono::{DateTime, Duration, Utc};
+use common::{seed_used_claim_token, seed_valid_claim_token, TENANT_ID};
 use keycast_core::repositories::{ClaimTokenRepository, StagePendingOutcome};
 use keycast_core::types::claim_token::CLAIM_CONFIRMATION_EXPIRY_HOURS;
 use sqlx::PgPool;
-use uuid::Uuid;
-
-/// The default tenant seeded by `database/migrations`.
-const TENANT_ID: i64 = 1;
-
-fn unique_pubkey() -> String {
-    Uuid::new_v4().simple().to_string().repeat(2)
-}
-
-async fn insert_bare_user(pool: &PgPool, pubkey: &str) {
-    sqlx::query(
-        "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, NOW(), NOW())",
-    )
-    .bind(pubkey)
-    .bind(TENANT_ID)
-    .execute(pool)
-    .await
-    .expect("insert bare user");
-}
-
-/// Inserts a user and an unused, non-invalidated, not-yet-expired claim
-/// token. Returns `(token, pubkey)`.
-async fn seed_valid_claim_token(pool: &PgPool) -> (String, String) {
-    let pubkey = unique_pubkey();
-    insert_bare_user(pool, &pubkey).await;
-
-    let token = Uuid::new_v4().to_string();
-    sqlx::query(
-        "INSERT INTO account_claim_tokens (token, user_pubkey, expires_at, created_at, tenant_id)
-         VALUES ($1, $2, $3, NOW(), $4)",
-    )
-    .bind(&token)
-    .bind(&pubkey)
-    .bind(Utc::now() + Duration::days(1))
-    .bind(TENANT_ID)
-    .execute(pool)
-    .await
-    .expect("insert valid claim token");
-
-    (token, pubkey)
-}
-
-/// Same as `seed_valid_claim_token`, but the token has already been used.
-async fn seed_used_claim_token(pool: &PgPool) -> (String, String) {
-    let pubkey = unique_pubkey();
-    insert_bare_user(pool, &pubkey).await;
-
-    let token = Uuid::new_v4().to_string();
-    sqlx::query(
-        "INSERT INTO account_claim_tokens
-             (token, user_pubkey, expires_at, used_at, created_at, tenant_id)
-         VALUES ($1, $2, $3, NOW(), NOW(), $4)",
-    )
-    .bind(&token)
-    .bind(&pubkey)
-    .bind(Utc::now() + Duration::days(1))
-    .bind(TENANT_ID)
-    .execute(pool)
-    .await
-    .expect("insert used claim token");
-
-    (token, pubkey)
-}
 
 // Stages pending state on a valid token; a used/expired/invalidated token stages nothing.
 #[sqlx::test(migrations = "../database/migrations")]

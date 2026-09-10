@@ -2646,6 +2646,94 @@ impl UserRepository {
         Ok(ClaimConsumeOutcome::Claimed { user_pubkey })
     }
 
+    /// Confirm a staged claim: consume the claim token and write the pending
+    /// email/password onto the user, atomically. Re-checks token validity under
+    /// the row lock (#280) so an invalidation or expiry during the confirmation
+    /// window cannot complete a claim.
+    pub async fn confirm_claim_consuming_token(
+        &self,
+        confirmation_token: &str,
+        tenant_id: i64,
+    ) -> Result<ClaimConsumeOutcome, RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+
+        // Consume iff the token is still valid AND this confirmation token is the
+        // current one. Returns the staged email/hash so the user update needs no
+        // second read.
+        //
+        // The staged values are read via a `FOR UPDATE`-locked CTE rather than
+        // the UPDATE's own RETURNING: RETURNING reflects the row *after* the
+        // SET is applied, so a naive `RETURNING pending_email` on a statement
+        // that also does `SET pending_email = NULL` would return NULL instead
+        // of the staged value. Locking in the CTE and joining the UPDATE to it
+        // by primary key keeps this one atomic statement while still letting
+        // us clear those columns and return their prior contents.
+        let consumed: Option<(String, String, String)> = sqlx::query_as(
+            "WITH locked AS (
+                 SELECT id, user_pubkey, pending_email, pending_password_hash
+                 FROM account_claim_tokens
+                 WHERE confirmation_token = $1
+                   AND tenant_id = $2
+                   AND used_at IS NULL
+                   AND invalidated_at IS NULL
+                   AND expires_at > NOW()
+                   AND confirmation_expires_at > NOW()
+                 FOR UPDATE
+             )
+             UPDATE account_claim_tokens t
+             SET used_at = NOW(),
+                 confirmation_token = NULL,
+                 pending_email = NULL,
+                 pending_password_hash = NULL,
+                 confirmation_expires_at = NULL,
+                 confirmation_sent_at = NULL
+             FROM locked
+             WHERE t.id = locked.id
+             RETURNING locked.user_pubkey, locked.pending_email, locked.pending_password_hash",
+        )
+        .bind(confirmation_token)
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some((user_pubkey, pending_email, pending_password_hash)) = consumed else {
+            tx.rollback().await?;
+            return Ok(ClaimConsumeOutcome::TokenNotConsumable);
+        };
+
+        let result = sqlx::query(
+            "UPDATE users
+             SET email = $1, password_hash = $2, email_verified = true, updated_at = $3
+             WHERE pubkey = $4 AND tenant_id = $5 AND email IS NULL",
+        )
+        .bind(&pending_email)
+        .bind(&pending_password_hash)
+        .bind(Utc::now())
+        .bind(&user_pubkey)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await;
+
+        match result {
+            Ok(r) if r.rows_affected() == 0 => {
+                tx.rollback().await?;
+                Ok(ClaimConsumeOutcome::UserNotClaimable)
+            }
+            Ok(_) => {
+                tx.commit().await?;
+                Ok(ClaimConsumeOutcome::Claimed { user_pubkey })
+            }
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+                tx.rollback().await?;
+                Ok(ClaimConsumeOutcome::EmailTaken)
+            }
+            Err(e) => {
+                tx.rollback().await?;
+                Err(e.into())
+            }
+        }
+    }
+
     /// Check if email is already in use.
     pub async fn email_exists(&self, email: &str, tenant_id: i64) -> Result<bool, RepositoryError> {
         let result: Option<(String,)> =
