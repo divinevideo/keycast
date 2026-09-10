@@ -32,5 +32,6 @@ require_text "$cloudbuild" "- '$latest_image'"
 require_text "$cloudbuild" "- '--image=$sha_image'"
 reject_text "$cloudbuild" "- '--image=$latest_image'"
 require_text "$package_json" '--substitutions=COMMIT_SHA=$(git rev-parse HEAD)'
+require_text "$package_json" '"deploy:gcp": "bun run deploy"'
 
 printf 'Cloud Build immutable image tag tests passed.\n'
