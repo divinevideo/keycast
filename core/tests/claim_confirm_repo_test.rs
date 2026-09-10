@@ -95,6 +95,55 @@ async fn confirm_refuses_after_admin_invalidation(pool: PgPool) {
     );
 }
 
+/// The confirm guard checks `confirmation_expires_at > NOW()` as well as the
+/// claim token's own `expires_at`. Backdate only `confirmation_expires_at`
+/// (leave the claim token's `expires_at` valid) so a confirm attempt exercises
+/// that conjunct specifically, rather than the outer claim-token expiry.
+#[sqlx::test(migrations = "../database/migrations")]
+async fn confirm_refuses_after_confirmation_window_expires(pool: PgPool) {
+    let repo = UserRepository::new(pool.clone());
+    let ct_repo = ClaimTokenRepository::new(pool.clone());
+    let (token, pubkey) = seed_valid_claim_token(&pool).await;
+    let expires = Utc::now() + Duration::hours(CLAIM_CONFIRMATION_EXPIRY_HOURS);
+    ct_repo
+        .stage_pending_claim(
+            &token,
+            TENANT_ID,
+            "new@example.com",
+            "hash",
+            "conf-expired-window",
+            expires,
+        )
+        .await
+        .unwrap();
+
+    // Backdate ONLY the confirmation window; the claim token's own expires_at
+    // (seeded 1 day out by seed_valid_claim_token) stays valid.
+    sqlx::query(
+        "UPDATE account_claim_tokens SET confirmation_expires_at = NOW() - INTERVAL '1 minute' WHERE token = $1",
+    )
+    .bind(&token)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let outcome = repo
+        .confirm_claim_consuming_token("conf-expired-window", TENANT_ID)
+        .await
+        .unwrap();
+    assert_eq!(outcome, ClaimConsumeOutcome::TokenNotConsumable);
+
+    let email: (Option<String>,) = sqlx::query_as("SELECT email FROM users WHERE pubkey = $1")
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        email.0.is_none(),
+        "user must not be mutated when only the confirmation window (not the claim token) expired"
+    );
+}
+
 #[sqlx::test(migrations = "../database/migrations")]
 async fn confirm_maps_duplicate_email_to_email_taken(pool: PgPool) {
     let repo = UserRepository::new(pool.clone());
