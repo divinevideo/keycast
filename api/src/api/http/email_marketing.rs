@@ -232,6 +232,7 @@ pub async fn record_observations(
              SELECT i.pubkey, i.global_optout, i.observed_at
              FROM input i
              JOIN users u ON u.pubkey = i.pubkey AND u.tenant_id = $4 AND u.email IS NOT NULL
+             ORDER BY u.pubkey
              FOR UPDATE OF u
          ),
          changed AS (

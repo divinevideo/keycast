@@ -1,15 +1,16 @@
 # Email Marketing Consent (keycast side) Implementation Plan
 
 > **Superseded as a contract.** This plan is the working notes that produced the
-> change. The shipped behaviour and cursor are in `docs/keycast-admin-api-reference.md`
-> (six service-token endpoints; consent cursor is `(email_marketing_consent_at, pubkey)`,
-> not `updated_at`). Do not implement from this file.
+> change. The shipped behaviour, cursor, and dedicated credential are in
+> `docs/keycast-admin-api-reference.md` (six service-token endpoints; consent cursor is
+> `(email_marketing_consent_at, pubkey)`, not `updated_at`; authentication uses
+> `KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN`). Do not implement from this file.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make keycast record email marketing consent in an auditable, tri-state form and expose it to a sync service, including a suppression floor and account-deletion tombstones.
 
-**Architecture:** Consent is an immutable event on the `users` row (state, when, source, app version). A separate nullable flag records the suppression floor observed from HubSpot. Three service-token endpoints let the sync service read consent by cursor, write back the floor, and drain deletion tombstones. keycast never calls HubSpot.
+**Architecture:** Consent is an immutable event on the `users` row (state, when, source, app version). A separate nullable flag records the suppression floor observed from HubSpot. Six endpoints authenticated with a dedicated marketing-sync credential let the sync service read consent by cursor, write back the floor, and drain deletion and email-change queues. keycast never calls HubSpot.
 
 **Tech Stack:** Rust, axum, sqlx, PostgreSQL.
 
@@ -21,7 +22,7 @@
 - Consent state is exactly one of `never_asked`, `declined`, `opted_in`.
 - `email_marketing_global_optout` is **nullable**. NULL means never observed; it must never default to `false`.
 - The consent event is immutable: no endpoint in this plan may write `email_marketing_consent`, `email_marketing_consent_at`, `email_marketing_consent_source`, or `email_marketing_consent_app_version` after materialization.
-- All three new endpoints authenticate via the existing `authorize_service_token(&headers)`. Never `is_support_admin`.
+- All six endpoints authenticate with `KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN`. Never fall back to `KEYCAST_SERVICE_TOKEN` or `is_support_admin`.
 - The npub is internal. It appears in these APIs because the sync service writes state back by pubkey; it must never be forwarded to HubSpot.
 - Migrations must sort after main's latest (`20260822010000`). Check for prefix collisions before naming a new one.
 - **Every query is tenant-scoped.** keycast is multi-tenant; `batch_lookup_users` takes a `TenantExtractor` and filters on `tenant_id`, and these endpoints must do the same. An unscoped read or write crosses tenants.
@@ -33,8 +34,8 @@
 - `core/src/repositories/user.rs:1166` bumps `updated_at` when an email change is finalized, so a
   changed address moves the row past the cursor and the sync service sees it. The cursor design
   depends on this; if that ever stops being true, email changes become invisible to the sync.
-- `authorize_service_token(&headers)` already exists in `api/src/api/http/admin.rs` and is already
-  used by `POST /admin/users/batch-lookup`. No new auth mechanism is introduced here.
+- `authorize_configured_service_token(&headers, ...)` provides the shared constant-time token
+  check. The marketing handlers call it with their dedicated environment variable.
 - **Path convention, by precedent rather than traced.** `routes.rs` registers routes as
   `/admin/...` with no `/api` prefix, and no `nest("/api")` exists anywhere in `api/src`. Yet the
   2026-05-27 spec documents `POST /api/admin/users/batch-lookup` and `divine-invite-sync` calls that
@@ -50,9 +51,8 @@
 surface and writes inside core paths of the authentication service.
 
 Specifically worth his eye:
-- Three new service-token endpoints on keycast, and the fact that `KEYCAST_SERVICE_TOKEN` is a
-  single shared secret rather than per-service scoped, so a marketing sync service holding it can
-  also reach service-provisioning and ActivityPub gateway routes.
+- Six new service-token endpoints on keycast, authenticated with the dedicated
+  `KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN` so the sync worker cannot reach unrelated admin routes.
 - New columns on `users`, on a table central to authentication.
 - Statements added inside the account-deletion transaction (Task 4) and the email-change
   finalization transaction (Task 4b). Both are correctness-critical: a write in the wrong place or

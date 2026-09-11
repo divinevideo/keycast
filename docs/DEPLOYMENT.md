@@ -103,7 +103,9 @@ available.
 The email marketing sync endpoints likewise use a dedicated credential. Before
 deploying them, an operator must create `email-marketing-service-token-production`
 in `openvine-co`, grant the Cloud Run runtime service account access, and configure
-the same token for the marketing sync worker. Until then, the endpoints fail closed.
+the same token for the marketing sync worker. Because Cloud Build binds this secret
+during revision creation, a missing secret or access grant fails the entire deploy;
+an unset variable only fails the marketing endpoints closed outside that deploy path.
 
 There is no Cloud Run Sentry secret or `sentry-cli` release step in the current Cloud Build file.
 
