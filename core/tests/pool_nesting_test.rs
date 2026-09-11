@@ -43,13 +43,17 @@
 //! them needed a second connection. When you add a repository method that opens
 //! a transaction, add a case here for it.
 
+mod common;
+
 use std::future::Future;
 use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
+use common::{insert_bare_user, unique_pubkey, TENANT_ID};
 use keycast_core::repositories::{
-    ClaimConsumeOutcome, ClaimTokenRepository, RepositoryError, UserRepository,
+    ClaimConsumeOutcome, ClaimTokenRepository, RepositoryError, StagePendingOutcome, UserRepository,
 };
+use keycast_core::types::claim_token::CLAIM_CONFIRMATION_EXPIRY_HOURS;
 use serial_test::serial;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -57,9 +61,6 @@ use uuid::Uuid;
 
 /// Short on purpose: a nesting path burns all of it, a correct path uses none.
 const PROBE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(4);
-
-/// The default tenant seeded by `database/migrations`.
-const TENANT_ID: i64 = 1;
 
 const ADMIN_PUBKEY: &str = "adminadminadminadminadminadminadminadminadminadminadminadmin1234";
 
@@ -71,7 +72,7 @@ const ADMIN_PUBKEY: &str = "adminadminadminadminadminadminadminadminadminadminad
 /// - `rg -n "&mut Transaction<'_, Postgres>" core/src signer/src api/src`
 ///
 /// Exclude test-only matches from the count. Update this when it changes.
-const TOTAL_HOLD_SITES: usize = 21;
+const TOTAL_HOLD_SITES: usize = 20;
 
 /// The subset this probe exercises, highest reachability first. Each entry
 /// corresponds to one `#[tokio::test]` below.
@@ -79,7 +80,7 @@ const COVERED_SITES: &[&str] = &[
     "UserRepository::register_with_personal_key",
     "UserRepository::finalize_oauth_registration",
     "UserRepository::complete_pending_oauth_registration",
-    "UserRepository::claim_account_consuming_token",
+    "UserRepository::confirm_claim_consuming_token",
     "UserRepository::delete_account",
     "UserRepository::change_key_in_transaction",
     "UserRepository::create_preloaded_user",
@@ -160,18 +161,6 @@ async fn insert_user(pool: &PgPool, pubkey: &str, email: Option<&str>) {
     .expect("insert user");
 }
 
-async fn insert_bare_user(pool: &PgPool, pubkey: &str) {
-    sqlx::query(
-        "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
-         VALUES ($1, $2, NOW(), NOW())",
-    )
-    .bind(pubkey)
-    .bind(TENANT_ID)
-    .execute(pool)
-    .await
-    .expect("insert bare user");
-}
-
 async fn create_claim_token(pool: &PgPool, pubkey: &str) -> String {
     let token = Uuid::new_v4().to_string();
     ClaimTokenRepository::new(pool.clone())
@@ -199,10 +188,6 @@ async fn cleanup_user(pool: &PgPool, pubkey: &str) {
         .ok();
 }
 
-fn unique_pubkey() -> String {
-    Uuid::new_v4().simple().to_string().repeat(2)
-}
-
 fn unique_email() -> String {
     format!("np-{}@example.com", Uuid::new_v4())
 }
@@ -217,7 +202,7 @@ fn unique_email() -> String {
 /// The name is the point: `println!` is swallowed on a passing test, but the
 /// harness always prints the test name.
 #[test]
-fn probe_samples_8_of_21_hold_sites_a_green_run_is_not_a_clean_sweep() {
+fn probe_samples_8_of_20_hold_sites_a_green_run_is_not_a_clean_sweep() {
     assert_eq!(
         COVERED_SITES.len(),
         8,
@@ -229,8 +214,8 @@ fn probe_samples_8_of_21_hold_sites_a_green_run_is_not_a_clean_sweep() {
         "COVERED_SITES lists more sites than exist"
     );
     assert_eq!(
-        TOTAL_HOLD_SITES, 21,
-        "TOTAL_HOLD_SITES changed but the test name still says 21; rename the test so \
+        TOTAL_HOLD_SITES, 20,
+        "TOTAL_HOLD_SITES changed but the test name still says 20; rename the test so \
          the printed coverage stays truthful"
     );
 
@@ -375,23 +360,47 @@ async fn complete_pending_oauth_registration_uses_one_connection() {
     cleanup_user(&seed, &pubkey).await;
 }
 
-/// Account claim -> api/src/api/http/claim.rs.
+/// Account claim confirmation -> api/src/api/http/claim.rs
+/// (`claim_confirm_get`). The claim is staged on the seed pool first --
+/// staging isn't the transaction-bearing operation under test here, the
+/// atomic confirm-and-consume is (the single-step
+/// `claim_account_consuming_token` this probe used to exercise was removed
+/// in favor of the two-step stage/confirm flow).
 #[tokio::test]
 #[serial]
-async fn claim_account_consuming_token_uses_one_connection() {
+async fn confirm_claim_consuming_token_uses_one_connection() {
     let seed = seed_pool().await;
     let pubkey = unique_pubkey();
     let email = unique_email();
     insert_bare_user(&seed, &pubkey).await;
     let token = create_claim_token(&seed, &pubkey).await;
-    let probe_token = token.clone();
-    let probe_email = email.clone();
+
+    let confirmation_token = Uuid::new_v4().to_string();
+    let confirmation_expires_at =
+        Utc::now() + ChronoDuration::hours(CLAIM_CONFIRMATION_EXPIRY_HOURS);
+    let stage_outcome = ClaimTokenRepository::new(seed.clone())
+        .stage_pending_claim(
+            &token,
+            TENANT_ID,
+            &email,
+            "hash",
+            &confirmation_token,
+            confirmation_expires_at,
+        )
+        .await
+        .expect("stage pending claim");
+    assert_eq!(
+        stage_outcome,
+        StagePendingOutcome::Staged,
+        "fixture setup: staging must succeed"
+    );
+    let probe_confirmation_token = confirmation_token.clone();
 
     let outcome = assert_no_nested_acquisition(
-        "UserRepository::claim_account_consuming_token",
+        "UserRepository::confirm_claim_consuming_token",
         |pool| async move {
             UserRepository::new(pool)
-                .claim_account_consuming_token(&probe_token, TENANT_ID, &probe_email, "hash")
+                .confirm_claim_consuming_token(&probe_confirmation_token, TENANT_ID)
                 .await
         },
     )

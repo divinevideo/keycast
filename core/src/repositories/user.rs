@@ -446,7 +446,7 @@ struct RotatedIdentityRow {
 /// Outcome of atomically consuming a claim token and claiming the account.
 /// Only `Claimed` mutates anything; the other outcomes guarantee both the
 /// token and the user row are untouched (see
-/// `UserRepository::claim_account_consuming_token`).
+/// `UserRepository::confirm_claim_consuming_token`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimConsumeOutcome {
     /// Token consumed and account claimed in one transaction.
@@ -456,6 +456,9 @@ pub enum ClaimConsumeOutcome {
     /// Token was valid but the user row was not claimable (already has an
     /// email) — the token consume was rolled back, nothing mutated.
     UserNotClaimable,
+    /// The pending email was taken by another user before confirmation
+    /// (unique violation on idx_users_email_tenant). Nothing mutated.
+    EmailTaken,
 }
 
 /// Outcome of a conditional ATProto lifecycle write.
@@ -2581,42 +2584,63 @@ impl UserRepository {
         .map_err(Into::into)
     }
 
-    /// Atomically consume a still-valid claim token and claim the account in
-    /// one transaction (#280 review). The consume re-checks full validity
-    /// (`used_at IS NULL AND invalidated_at IS NULL AND expires_at > NOW()`)
-    /// under the row lock, mirroring the predicates of
-    /// `ClaimTokenRepository::invalidate_valid_for_user`. A concurrent admin
-    /// invalidation (e.g. clear-verified-minor revoking an unclaimed minor's
-    /// outstanding link) therefore either commits first — we consume nothing
-    /// and the user is untouched — or blocks on the row lock and matches
-    /// nothing after we commit. The user mutation only happens if the token
-    /// consume succeeded, and rolls back if the user row itself is not
-    /// claimable, so a failed claim never burns the token.
-    pub async fn claim_account_consuming_token(
+    /// Confirm a staged claim: consume the claim token and write the pending
+    /// email/password onto the user, atomically. Re-checks token validity under
+    /// the row lock (#280) so an invalidation or expiry during the confirmation
+    /// window cannot complete a claim.
+    pub async fn confirm_claim_consuming_token(
         &self,
-        token: &str,
+        confirmation_token: &str,
         tenant_id: i64,
-        email: &str,
-        password_hash: &str,
     ) -> Result<ClaimConsumeOutcome, RepositoryError> {
         let mut tx = self.pool.begin().await?;
 
-        let consumed: Option<(String,)> = sqlx::query_as(
-            "UPDATE account_claim_tokens
-             SET used_at = NOW()
-             WHERE token = $1
-               AND tenant_id = $2
-               AND used_at IS NULL
-               AND invalidated_at IS NULL
-               AND expires_at > NOW()
-             RETURNING user_pubkey",
+        // Consume iff the token is still valid AND this confirmation token is the
+        // current one. Returns the staged email/hash so the user update needs no
+        // second read.
+        //
+        // The staged values are read via a `FOR UPDATE`-locked CTE rather than
+        // the UPDATE's own RETURNING: RETURNING reflects the row *after* the
+        // SET is applied, so a naive `RETURNING pending_email` on a statement
+        // that also does `SET pending_email = NULL` would return NULL instead
+        // of the staged value. Locking in the CTE and joining the UPDATE to it
+        // by primary key keeps this one atomic statement while still letting
+        // us clear those columns and return their prior contents.
+        //
+        // `used_at IS NULL` here is defense-in-depth rather than the primary
+        // guard: a successful confirm already nulls `confirmation_token`, so a
+        // replay of the same link fails the `confirmation_token = $1` match
+        // on its own. This conjunct only matters for some future path that
+        // marks a token used without also nulling `confirmation_token`.
+        let consumed: Option<(String, String, String)> = sqlx::query_as(
+            "WITH locked AS (
+                 SELECT id, user_pubkey, pending_email, pending_password_hash
+                 FROM account_claim_tokens
+                 WHERE confirmation_token = $1
+                   AND tenant_id = $2
+                   AND used_at IS NULL
+                   AND invalidated_at IS NULL
+                   AND expires_at > NOW()
+                   AND confirmation_expires_at > NOW()
+                 FOR UPDATE
+             )
+             UPDATE account_claim_tokens t
+             SET used_at = NOW(),
+                 confirmation_token = NULL,
+                 pending_email = NULL,
+                 pending_password_hash = NULL,
+                 confirmation_expires_at = NULL,
+                 confirmation_sent_at = NULL
+             FROM locked
+             WHERE t.id = locked.id
+             RETURNING locked.user_pubkey, locked.pending_email, locked.pending_password_hash",
         )
-        .bind(token)
+        .bind(confirmation_token)
         .bind(tenant_id)
         .fetch_optional(&mut *tx)
         .await?;
 
-        let Some((user_pubkey,)) = consumed else {
+        let Some((user_pubkey, pending_email, pending_password_hash)) = consumed else {
             tx.rollback().await?;
             return Ok(ClaimConsumeOutcome::TokenNotConsumable);
         };
@@ -2626,21 +2650,32 @@ impl UserRepository {
              SET email = $1, password_hash = $2, email_verified = true, updated_at = $3
              WHERE pubkey = $4 AND tenant_id = $5 AND email IS NULL",
         )
-        .bind(email)
-        .bind(password_hash)
+        .bind(&pending_email)
+        .bind(&pending_password_hash)
         .bind(Utc::now())
         .bind(&user_pubkey)
         .bind(tenant_id)
         .execute(&mut *tx)
-        .await?;
+        .await;
 
-        if result.rows_affected() == 0 {
-            tx.rollback().await?;
-            return Ok(ClaimConsumeOutcome::UserNotClaimable);
+        match result {
+            Ok(r) if r.rows_affected() == 0 => {
+                tx.rollback().await?;
+                Ok(ClaimConsumeOutcome::UserNotClaimable)
+            }
+            Ok(_) => {
+                tx.commit().await?;
+                Ok(ClaimConsumeOutcome::Claimed { user_pubkey })
+            }
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+                tx.rollback().await?;
+                Ok(ClaimConsumeOutcome::EmailTaken)
+            }
+            Err(e) => {
+                tx.rollback().await?;
+                Err(e.into())
+            }
         }
-
-        tx.commit().await?;
-        Ok(ClaimConsumeOutcome::Claimed { user_pubkey })
     }
 
     /// Check if email is already in use.

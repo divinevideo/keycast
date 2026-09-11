@@ -271,6 +271,10 @@ Decrypt a NIP-44 encrypted message.
 
 ## Claim Flow (User-facing)
 
+Claiming an account is a two-step, email-confirmed flow: submitting the claim
+form stages the entered email/password and sends a confirmation link, and the
+claim only completes when that link is clicked.
+
 ### GET /api/claim
 
 Display the claim form for a user to set email/password.
@@ -284,7 +288,9 @@ GET /api/claim?token=abc123xyz...
 
 ### POST /api/claim
 
-Process the claim - sets email/password and logs user in.
+Stage the claim: validates the token and inputs, checks the email isn't
+already taken, and stores the entered email/password hash on the claim-token
+row pending confirmation. Sends a confirmation email to the entered address.
 
 **Request:**
 ```http
@@ -294,13 +300,48 @@ Content-Type: application/x-www-form-urlencoded
 token=abc123xyz&email=user@example.com&password=secret123&password_confirmation=secret123
 ```
 
-**Response:** Redirect to dashboard with session cookie set
+**Response:** 200, HTML "Check your email" interstitial. No session cookie is set at this step.
 
 **Errors:**
 | Status | Description |
 |--------|-------------|
-| 400 | Invalid/expired token, passwords don't match, weak password, invalid email |
-| 409 | Email already registered |
+| 400 | Invalid/expired/replaced/deactivated token, passwords don't match, weak password, invalid email, or email already registered |
+
+### GET /api/claim/confirm
+
+Complete the claim: consumes the confirmation token from the emailed link,
+writes the staged email/password onto the user account, and issues the
+session.
+
+**Request:**
+```http
+GET /api/claim/confirm?token=<confirmation_token>
+```
+
+**Response:** 200, HTML "Account Claimed" success page, with `Set-Cookie: keycast_session=...` establishing the session.
+
+**Errors:**
+| Status | Description |
+|--------|-------------|
+| 400 | Confirmation link unrecognized/expired, staged email taken by another account, or the underlying claim token died before confirmation |
+
+### POST /api/claim/resend
+
+Re-send the confirmation email for a staged claim. Cooldown-gated (5
+minutes) and enumeration-safe: the response is always the same generic
+"check your email" interstitial regardless of whether the token is unknown,
+has no staged claim, is within cooldown, or a fresh email was just sent, so a
+caller cannot use the response to probe for a pending claim.
+
+**Request:**
+```http
+POST /api/claim/resend
+Content-Type: application/x-www-form-urlencoded
+
+token=abc123xyz
+```
+
+**Response:** 200, HTML "Check your email" interstitial.
 
 ---
 

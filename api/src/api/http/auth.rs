@@ -44,6 +44,9 @@ pub const EMAIL_VERIFICATION_EXPIRY_HOURS: i64 = 24;
 pub const EMAIL_CHANGE_EXPIRY_HOURS: i64 = 24;
 /// Minimum minutes between successive email-change initiations (resend cooldown).
 const EMAIL_CHANGE_RESEND_COOLDOWN_MINUTES: i64 = 5;
+/// Minimum minutes between successive claim-confirmation resend requests.
+/// `i32` because it is bound straight into `make_interval(mins => …)`.
+pub const CLAIM_RESEND_COOLDOWN_MINUTES: i32 = 5;
 const PASSWORD_RESET_EXPIRY_HOURS: i64 = 1;
 const DEFAULT_NIP05_DOMAIN: &str = "divine.video";
 const MAX_NIP05_USERNAME_LENGTH: usize = 64;

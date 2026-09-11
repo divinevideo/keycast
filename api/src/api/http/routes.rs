@@ -356,6 +356,8 @@ pub fn api_routes(
     // Users claim preloaded accounts by setting email/password
     let claim_routes = Router::new()
         .route("/claim", get(claim::claim_get).post(claim::claim_post))
+        .route("/claim/confirm", get(claim::claim_confirm_get))
+        .route("/claim/resend", post(claim::claim_resend_post))
         .with_state(auth_state.clone());
 
     // Prometheus metrics endpoint (public, no auth required)
