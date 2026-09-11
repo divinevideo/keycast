@@ -1,6 +1,6 @@
 #![cfg(feature = "integration-tests")]
 // ABOUTME: Tests for UserRepository::confirm_claim_consuming_token -- the atomic
-// ABOUTME: guarded consume-and-apply that finishes a staged claim (Task 4).
+// ABOUTME: guarded consume-and-apply that finishes a staged claim.
 
 mod common;
 
