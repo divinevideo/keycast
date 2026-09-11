@@ -46,12 +46,15 @@ pub use registered_client::{
     test_redirect_pattern, RegisteredClient, RegisteredClientRepository, RegisteredClientUpdate,
 };
 pub use service_account_deletion::{
-    ServiceAccountDeletionOutcome, ServiceAccountDeletionRecord, ServiceAccountDeletionRepository,
-    ServiceAccountDeletionRow,
+    verify_deletion_binding, RetentionCompactionStatus, ServiceAccountDeletionOutcome,
+    ServiceAccountDeletionRecord, ServiceAccountDeletionReplay, ServiceAccountDeletionRepository,
+    ServiceAccountDeletionRow, ServiceAccountDeletionTombstone,
 };
 pub use service_provisioning_operation::{
-    ServiceProvisioningOperationRecord, ServiceProvisioningOperationRepository,
-    ServiceProvisioningOperationRow, PROVISIONING_OPERATION_RETENTION_DAYS,
+    verify_provisioning_fingerprint, ProvisioningCompactionAcknowledgement,
+    ServiceProvisioningOperationRecord, ServiceProvisioningOperationReplay,
+    ServiceProvisioningOperationRepository, ServiceProvisioningOperationRow,
+    ServiceProvisioningOperationTombstone,
 };
 pub use stored_key::StoredKeyRepository;
 pub use team::TeamRepository;

@@ -199,6 +199,10 @@ pub struct Metrics {
     pub login_failures_total: AtomicU64,
     /// Total account deletions
     pub account_deletions_total: AtomicU64,
+    /// Complete deletion records eligible for compaction for more than 24 hours.
+    pub retention_deletions_overdue: AtomicU64,
+    /// Complete provisioning records eligible for compaction for more than 24 hours.
+    pub retention_provisioning_overdue: AtomicU64,
 
     // === OAuth Metrics ===
     /// Total OAuth authorizations created
@@ -280,6 +284,8 @@ impl Metrics {
             logins_total: AtomicU64::new(0),
             login_failures_total: AtomicU64::new(0),
             account_deletions_total: AtomicU64::new(0),
+            retention_deletions_overdue: AtomicU64::new(0),
+            retention_provisioning_overdue: AtomicU64::new(0),
             // OAuth metrics
             oauth_authorizations_created: AtomicU64::new(0),
             oauth_authorizations_revoked: AtomicU64::new(0),
@@ -596,6 +602,13 @@ impl Metrics {
 
     pub fn inc_account_deleted(&self) {
         self.account_deletions_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_retention_overdue(&self, deletions: u64, provisioning: u64) {
+        self.retention_deletions_overdue
+            .store(deletions, Ordering::Relaxed);
+        self.retention_provisioning_overdue
+            .store(provisioning, Ordering::Relaxed);
     }
 
     // === OAuth metric methods ===
@@ -1077,6 +1090,18 @@ impl Metrics {
             "keycast_account_deletions_total {}\n",
             self.account_deletions_total.load(Ordering::Relaxed)
         ));
+        output.push_str("\n# HELP keycast_retention_deletions_overdue Complete deletion records eligible for compaction for more than 24 hours\n");
+        output.push_str("# TYPE keycast_retention_deletions_overdue gauge\n");
+        output.push_str(&format!(
+            "keycast_retention_deletions_overdue {}\n",
+            self.retention_deletions_overdue.load(Ordering::Relaxed)
+        ));
+        output.push_str("\n# HELP keycast_retention_provisioning_overdue Complete provisioning records eligible for compaction for more than 24 hours\n");
+        output.push_str("# TYPE keycast_retention_provisioning_overdue gauge\n");
+        output.push_str(&format!(
+            "keycast_retention_provisioning_overdue {}\n",
+            self.retention_provisioning_overdue.load(Ordering::Relaxed)
+        ));
 
         // OAuth metrics
         output.push_str(
@@ -1451,6 +1476,17 @@ mod tests {
         assert!(output.contains(
             "keycast_atproto_oauth_replay_reservations_total{namespace=\"dpop_proof\",outcome=\"other\"} 1"
         ));
+    }
+
+    #[test]
+    fn retention_overdue_metrics_render_as_gauges() {
+        let metrics = Metrics::new();
+        metrics.set_retention_overdue(2, 3);
+        let output = metrics.to_prometheus();
+        assert!(output.contains("# TYPE keycast_retention_deletions_overdue gauge"));
+        assert!(output.contains("keycast_retention_deletions_overdue 2"));
+        assert!(output.contains("# TYPE keycast_retention_provisioning_overdue gauge"));
+        assert!(output.contains("keycast_retention_provisioning_overdue 3"));
     }
 
     #[test]

@@ -10,8 +10,10 @@ use axum::{
 use keycast_core::{
     repositories::{
         ClaimTokenRepository, RepositoryError, ServiceProvisioningOperationRecord,
-        ServiceProvisioningOperationRepository, ServiceProvisioningOperationRow, UserRepository,
+        ServiceProvisioningOperationReplay, ServiceProvisioningOperationRepository,
+        ServiceProvisioningOperationRow, UserRepository,
     },
+    retention::RetentionDigestKeyring,
     types::claim_token::generate_claim_token,
 };
 use nostr_sdk::Keys;
@@ -33,15 +35,17 @@ pub struct CreateMinorAccountRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum ProvisionedAccountState {
     Unclaimed,
     Claimed,
+    AccountDeleted,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateMinorAccountResponse {
-    pub pubkey: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pubkey: Option<String>,
     pub claim_url: Option<String>,
     pub expires_at: Option<String>,
     pub account_state: ProvisionedAccountState,
@@ -213,7 +217,7 @@ fn claim_response(
     (
         status,
         Json(CreateMinorAccountResponse {
-            pubkey,
+            pubkey: Some(pubkey),
             claim_url: Some(claim_url),
             expires_at: Some(token.expires_at.to_rfc3339()),
             account_state: ProvisionedAccountState::Unclaimed,
@@ -227,10 +231,24 @@ fn claimed_response(pubkey: String) -> Response {
     (
         StatusCode::OK,
         Json(CreateMinorAccountResponse {
-            pubkey,
+            pubkey: Some(pubkey),
             claim_url: None,
             expires_at: None,
             account_state: ProvisionedAccountState::Claimed,
+            replayed: true,
+        }),
+    )
+        .into_response()
+}
+
+fn deleted_response() -> Response {
+    (
+        StatusCode::OK,
+        Json(CreateMinorAccountResponse {
+            pubkey: None,
+            claim_url: None,
+            expires_at: None,
+            account_state: ProvisionedAccountState::AccountDeleted,
             replayed: true,
         }),
     )
@@ -254,10 +272,36 @@ fn validate_replay(
 
 async fn replay_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    row: ServiceProvisioningOperationRow,
+    replay: ServiceProvisioningOperationReplay,
     tenant_id: i64,
     fingerprint: &str,
 ) -> Result<Response, ProvisioningError> {
+    let row = match replay {
+        ServiceProvisioningOperationReplay::Complete(row) => row,
+        ServiceProvisioningOperationReplay::Compacted(tombstone) => {
+            let keys = RetentionDigestKeyring::from_env().map_err(|error| {
+                ProvisioningError::Unavailable(
+                    "retention_digest_keys_unavailable",
+                    error.to_string(),
+                )
+            })?;
+            let matches = keycast_core::repositories::verify_provisioning_fingerprint(
+                &keys,
+                &tombstone,
+                tenant_id,
+                fingerprint,
+            )
+            .map_err(map_repo_error)?;
+            if tombstone.tenant_id != tenant_id || !matches {
+                return Err(ProvisioningError::Conflict(
+                    "provisioning_operation_conflict",
+                    "provisioning_operation_id is already bound to different request parameters"
+                        .to_string(),
+                ));
+            }
+            return Ok(deleted_response());
+        }
+    };
     validate_replay(&row, tenant_id, fingerprint)?;
     ClaimTokenRepository::lock_for_user_in_tx(tx, row.user_pubkey.trim(), tenant_id)
         .await

@@ -16,6 +16,7 @@ pub mod nostr_rpc;
 pub mod oauth;
 pub mod openid_configuration;
 pub mod policies;
+pub mod retention;
 pub mod routes;
 pub mod service_deletion;
 pub mod service_provisioning;
