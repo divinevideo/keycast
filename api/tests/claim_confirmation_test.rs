@@ -407,6 +407,38 @@ async fn confirm_with_unknown_token_is_unrecognized() {
     );
 }
 
+/// A claimer who mistyped their address gets no mail, so "Resend" cannot help
+/// them -- it would just re-send to the same wrong address. The interstitial has
+/// to offer a way back to the form. Without this the un-cooldowned submit path
+/// exists for a recovery route nobody can find.
+#[tokio::test]
+async fn interstitial_offers_a_way_back_to_correct_a_mistyped_email() {
+    common::assert_test_database_url();
+    let pool = common::setup_test_db().await;
+    let (auth_state, _producer_handle) = common::create_test_auth_state(pool.clone());
+    let (token, pubkey) = seed_valid_claim_token(&pool).await;
+    let claim_email = format!("new-{}@example.com", &pubkey[..12]);
+
+    let app = build_app(auth_state);
+    let body = format!(
+        "token={}&email={}&password=supersecret&password_confirmation=supersecret",
+        token, claim_email
+    );
+    let resp = app.oneshot(post_claim_form(&body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(body_bytes.to_vec()).unwrap();
+
+    assert!(
+        html.contains("wrong address"),
+        "interstitial must acknowledge a mistyped address, got: {html}"
+    );
+    assert!(
+        html.contains(&format!("/api/claim?token={token}")),
+        "interstitial must link back to the claim form carrying the same token, got: {html}"
+    );
+}
+
 /// The submit path is deliberately not cooldown-gated, so a claimer can fix a
 /// mistyped address immediately. The lifetime send cap is what stops that same
 /// property being used to mail an arbitrary third party repeatedly: once the

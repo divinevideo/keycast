@@ -1009,6 +1009,13 @@ fn claim_confirmation_sent_html(email: Option<&str>, token: &str) -> String {
         button:hover {{
             border-color: #27C58B;
         }}
+        p.secondary {{
+            margin: 20px 0 0 0;
+            font-size: 13px;
+        }}
+        a {{
+            color: #27C58B;
+        }}
     </style>
 </head>
 <body>
@@ -1020,6 +1027,7 @@ fn claim_confirmation_sent_html(email: Option<&str>, token: &str) -> String {
             <input type="hidden" name="token" value="{token}">
             <button type="submit">Resend Confirmation Email</button>
         </form>
+        <p class="secondary">Entered the wrong address? <a href="/api/claim?token={token}">Go back and re-enter your email</a>.</p>
     </div>
 </body>
 </html>"#,
