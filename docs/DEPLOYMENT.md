@@ -90,6 +90,7 @@ Cloud Run does not have readiness-probe-driven endpoint removal during shutdown.
 | `keycast-service-token` | `KEYCAST_SERVICE_TOKEN` |
 | `account-deletion-service-token-production` | `KEYCAST_DELETION_SERVICE_TOKEN` |
 | `email-marketing-service-token-production` | `KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN` |
+| environment-specific retention digest secret | `KEYCAST_RETENTION_DIGEST_KEYS` |
 
 The trusted account-deletion endpoint uses a dedicated credential rather than
 `keycast-service-token`. The production coordinator reads the Terraform-managed
@@ -106,6 +107,14 @@ in `openvine-co`, grant the Cloud Run runtime service account access, and config
 the same token for the marketing sync worker. Because Cloud Build binds this secret
 during revision creation, a missing secret or access grant fails the entire deploy;
 an unset variable only fails the marketing endpoints closed outside that deploy path.
+
+Retention compaction and replay of compacted operations additionally require a
+versioned `KEYCAST_RETENTION_DIGEST_KEYS` secret in the format documented in
+`docs/RETENTION.md`. Each environment must generate its own roots and retain old
+versions while any tombstone references them. Do not reuse or copy this secret
+between Keycast and another service. The compaction endpoint fails closed when
+the keyring is absent or malformed; provision the secret before enabling the
+Funnelcake retention reconciler.
 
 There is no Cloud Run Sentry secret or `sentry-cli` release step in the current Cloud Build file.
 
@@ -297,6 +306,9 @@ The base deployment reads these secrets:
 The trusted account-deletion endpoint additionally requires
 `KEYCAST_DELETION_SERVICE_TOKEN`. Each environment must inject it from a
 deletion-specific Kubernetes Secret; do not reuse `KEYCAST_SERVICE_TOKEN`.
+Retention compaction additionally requires `KEYCAST_RETENTION_DIGEST_KEYS` from
+an environment-specific Kubernetes Secret using the rotation format in
+`docs/RETENTION.md`.
 
 The email marketing sync endpoints additionally require
 `KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN`. Each environment must inject it from a
