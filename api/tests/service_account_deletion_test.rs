@@ -14,7 +14,9 @@ use axum::{
 };
 use chrono::Utc;
 use http_body_util::BodyExt;
+use keycast_api::api::http::routes::AuthState;
 use keycast_api::api::http::service_deletion::delete_account_service;
+use keycast_api::state::AccountGateState;
 use nostr_sdk::Keys;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -26,8 +28,12 @@ const DELETION_SERVICE_TOKEN: &str = "test-service-deletion-token";
 const BROAD_SERVICE_TOKEN: &str = "test-broad-service-token";
 
 fn build_app(pool: PgPool) -> Router {
-    use keycast_api::api::tenant::{Tenant, TenantExtractor};
     let (auth_state, _producer) = common::create_test_auth_state(pool);
+    build_app_from_state(auth_state)
+}
+
+fn build_app_from_state(auth_state: AuthState) -> Router {
+    use keycast_api::api::tenant::{Tenant, TenantExtractor};
     Router::new().route(
         "/admin/users/:pubkey/deletion",
         post(
@@ -153,7 +159,19 @@ async fn deletes_the_account_and_records_the_request() {
     let pubkey = create_user(&pool, TENANT_ID).await;
     let request_id = format!("req-delete-{pubkey}");
 
-    let app = build_app(pool.clone());
+    let (auth_state, _producer) = common::create_test_auth_state(pool.clone());
+    auth_state
+        .state
+        .account_status_cache
+        .insert(
+            (TENANT_ID, pubkey.clone()),
+            AccountGateState::Present {
+                status: "active".to_string(),
+                verified_minor: false,
+            },
+        )
+        .await;
+    let app = build_app_from_state(auth_state.clone());
     let resp = app
         .oneshot(deletion_request(
             &pubkey,
@@ -174,6 +192,15 @@ async fn deletes_the_account_and_records_the_request() {
     assert_eq!(body["deletion_request_id"], request_id);
 
     assert!(!user_exists(&pool, &pubkey).await, "user must be gone");
+    assert!(
+        auth_state
+            .state
+            .account_status_cache
+            .get(&(TENANT_ID, pubkey.clone()))
+            .await
+            .is_none(),
+        "committed deletion must invalidate the local account-status cache"
+    );
 
     // The idempotency row has to outlive the account it names.
     let stored: (String, String) = sqlx::query_as(

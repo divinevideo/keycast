@@ -178,6 +178,12 @@ pub struct Metrics {
     pub http_rpc_cache_misses: AtomicU64,
     /// HTTP RPC cache size
     pub http_rpc_cache_size: AtomicU64,
+    /// Account-status cache hits for warm HTTP RPC authorization gates.
+    pub http_rpc_account_status_cache_hits: AtomicU64,
+    /// Account-status cache misses that enter the coalesced load path.
+    pub http_rpc_account_status_cache_misses: AtomicU64,
+    /// Current approximate account-status cache entry count.
+    pub http_rpc_account_status_cache_size: AtomicU64,
     /// HTTP RPC requests successfully processed
     pub http_rpc_success: AtomicU64,
     /// HTTP RPC authorization errors
@@ -270,6 +276,9 @@ impl Metrics {
             http_rpc_cache_hits: AtomicU64::new(0),
             http_rpc_cache_misses: AtomicU64::new(0),
             http_rpc_cache_size: AtomicU64::new(0),
+            http_rpc_account_status_cache_hits: AtomicU64::new(0),
+            http_rpc_account_status_cache_misses: AtomicU64::new(0),
+            http_rpc_account_status_cache_size: AtomicU64::new(0),
             http_rpc_success: AtomicU64::new(0),
             http_rpc_auth_errors: AtomicU64::new(0),
             http_rpc_db_pool_size: AtomicU64::new(0),
@@ -485,6 +494,21 @@ impl Metrics {
 
     pub fn set_http_rpc_cache_size(&self, size: u64) {
         self.http_rpc_cache_size.store(size, Ordering::Relaxed);
+    }
+
+    pub fn inc_http_rpc_account_status_cache_hit(&self) {
+        self.http_rpc_account_status_cache_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_http_rpc_account_status_cache_miss(&self) {
+        self.http_rpc_account_status_cache_misses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_http_rpc_account_status_cache_size(&self, size: u64) {
+        self.http_rpc_account_status_cache_size
+            .store(size, Ordering::Relaxed);
     }
 
     pub fn inc_http_rpc_success(&self) {
@@ -925,6 +949,36 @@ impl Metrics {
         ));
 
         output.push_str(
+            "\n# HELP keycast_http_rpc_account_status_cache_hits_total HTTP RPC account-status cache hits\n",
+        );
+        output.push_str("# TYPE keycast_http_rpc_account_status_cache_hits_total counter\n");
+        output.push_str(&format!(
+            "keycast_http_rpc_account_status_cache_hits_total {}\n",
+            self.http_rpc_account_status_cache_hits
+                .load(Ordering::Relaxed)
+        ));
+
+        output.push_str(
+            "\n# HELP keycast_http_rpc_account_status_cache_misses_total HTTP RPC account-status cache misses\n",
+        );
+        output.push_str("# TYPE keycast_http_rpc_account_status_cache_misses_total counter\n");
+        output.push_str(&format!(
+            "keycast_http_rpc_account_status_cache_misses_total {}\n",
+            self.http_rpc_account_status_cache_misses
+                .load(Ordering::Relaxed)
+        ));
+
+        output.push_str(
+            "\n# HELP keycast_http_rpc_account_status_cache_size Current HTTP RPC account-status cache size\n",
+        );
+        output.push_str("# TYPE keycast_http_rpc_account_status_cache_size gauge\n");
+        output.push_str(&format!(
+            "keycast_http_rpc_account_status_cache_size {}\n",
+            self.http_rpc_account_status_cache_size
+                .load(Ordering::Relaxed)
+        ));
+
+        output.push_str(
             "\n# HELP keycast_http_rpc_success_total HTTP RPC requests successfully processed\n",
         );
         output.push_str("# TYPE keycast_http_rpc_success_total counter\n");
@@ -981,7 +1035,7 @@ impl Metrics {
         }
 
         output.push_str(
-            "\n# HELP keycast_http_rpc_status_check_duration_seconds HTTP RPC live user status check latency by outcome\n",
+            "\n# HELP keycast_http_rpc_status_check_duration_seconds HTTP RPC live user status cache-load latency by outcome\n",
         );
         output.push_str("# TYPE keycast_http_rpc_status_check_duration_seconds histogram\n");
         for (outcome, metric) in self
@@ -1417,6 +1471,20 @@ mod tests {
         ));
         assert!(output
             .contains("keycast_auth_email_send_failures_total{template=\"password_reset\"} 1"));
+    }
+
+    #[test]
+    fn test_http_rpc_account_status_cache_metrics_render_prometheus_series() {
+        let metrics = Metrics::new();
+
+        metrics.inc_http_rpc_account_status_cache_hit();
+        metrics.inc_http_rpc_account_status_cache_miss();
+        metrics.set_http_rpc_account_status_cache_size(7);
+
+        let output = metrics.to_prometheus();
+        assert!(output.contains("keycast_http_rpc_account_status_cache_hits_total 1"));
+        assert!(output.contains("keycast_http_rpc_account_status_cache_misses_total 1"));
+        assert!(output.contains("keycast_http_rpc_account_status_cache_size 7"));
     }
 
     #[test]

@@ -323,6 +323,13 @@ pub async fn delete_account_service(
         .await
         .map_err(|e| map_repo_error(RepositoryError::from(e)))?;
 
+    super::nostr_rpc::invalidate_account_status_cache(
+        &auth_state.state.account_status_cache,
+        &pubkey,
+        tenant_id,
+    )
+    .await;
+
     // Past this point the deletion is committed. Everything below is a
     // best-effort side effect: failing any of it must not turn a completed
     // deletion into an error the coordinator would retry.

@@ -6,7 +6,7 @@
 mod common;
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
@@ -19,9 +19,11 @@ use chrono::{Duration, Utc};
 use keycast_api::activity_log::ActivityLogger;
 use keycast_api::api::{
     http::{
+        admin::{set_user_status_admin, SetUserStatusRequest},
         auth::{sign_event, AuthError, SignEventRequest},
         nostr_rpc::{nostr_rpc, NostrRpcRequest, NostrRpcResponse, RpcError},
         routes::AuthState,
+        service_deletion::{delete_account_service, ServiceAccountDeletionRequest},
     },
     tenant::{Tenant, TenantExtractor},
 };
@@ -160,6 +162,7 @@ fn create_test_auth_state_with_activity_logger(
             key_manager,
             signer_handlers: None,
             http_handler_cache: new_http_handler_cache(),
+            account_status_cache: keycast_api::state::new_account_status_cache(),
             server_keys: Keys::generate(),
             tenant_cache,
             bcrypt: bcrypt.clone(),
@@ -1413,6 +1416,7 @@ async fn test_warm_cache_preload_handler_rejected_after_ucan_expiry() {
                 key_manager: key_manager.clone(),
                 signer_handlers: None,
                 http_handler_cache: new_http_handler_cache(),
+                account_status_cache: keycast_api::state::new_account_status_cache(),
                 server_keys: server_keys.clone(),
                 tenant_cache,
                 bcrypt: bcrypt.clone(),
@@ -1531,6 +1535,7 @@ async fn test_server_signed_non_preload_redirect_origin_rejected() {
                 key_manager: key_manager.clone(),
                 signer_handlers: None,
                 http_handler_cache: new_http_handler_cache(),
+                account_status_cache: keycast_api::state::new_account_status_cache(),
                 server_keys: server_keys.clone(),
                 tenant_cache,
                 bcrypt: bcrypt.clone(),
@@ -1801,10 +1806,17 @@ async fn test_suspended_user_allowed_nostr_rpc_sign() {
     .expect("suspended user should still be able to sign via RPC (keycast#373)");
 }
 
-/// Test: a saturated DB pool returns retryable 503 before the handler timeout.
+/// Cache misses fail closed, then warm mutating RPCs bypass the saturated pool.
 #[tokio::test]
 #[serial]
-async fn warm_status_check_pool_exhaustion_is_retryable_503() {
+async fn account_status_cache_removes_the_warm_pool_dependency() {
+    const SERVICE_TOKEN: &str = "status-cache-invalidation-test-token";
+    const DELETION_SERVICE_TOKEN: &str = "status-cache-deletion-test-token";
+    unsafe {
+        std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN);
+        std::env::set_var("KEYCAST_DELETION_SERVICE_TOKEN", DELETION_SERVICE_TOKEN);
+    };
+
     let pool = setup_single_connection_db().await;
     let tenant_id = create_test_tenant(&pool).await;
     let (user_keys, pubkey) = create_test_user();
@@ -1845,20 +1857,50 @@ async fn warm_status_check_pool_exhaustion_is_retryable_503() {
         get_public_key_request(),
     )
     .await
-    .expect("warm-up request should load the handler into cache");
+    .expect("warm-up request should cache only the handler");
 
-    let _held_connection = pool
+    let held_connection = pool
         .acquire()
         .await
-        .expect("single connection should be available before the RPC starts");
-
-    let unsigned = EventBuilder::text_note("pool saturated").build(user_keys.public_key());
-    let event_json = serde_json::to_value(&unsigned).expect("Failed to serialize unsigned event");
+        .expect("single connection should be available before the cache miss");
     let started = Instant::now();
-
     let err = invoke_nostr_rpc(
         create_test_tenant_extractor(tenant_id),
-        auth_state,
+        auth_state.clone(),
+        &auth_header,
+        None,
+        NostrRpcRequest {
+            method: "sign_event".to_string(),
+            params: vec![serde_json::to_value(
+                EventBuilder::text_note("uncached status").build(user_keys.public_key()),
+            )
+            .expect("serialize unsigned event")],
+        },
+    )
+    .await
+    .expect_err("an uncached status must not authorize when Postgres is unavailable");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < HTTP_RPC_HANDLER_TIMEOUT,
+        "pool acquire must fail before the handler timeout, took {elapsed:?}"
+    );
+    // The lower bound proves this was the configured pool-acquire timeout,
+    // rather than an unrelated path that happened to return 503 immediately.
+    assert!(
+        elapsed >= SQLX_ACQUIRE_TIMEOUT,
+        "uncached status check did not wait for the configured acquire timeout"
+    );
+    assert_eq!(
+        err.into_response().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    drop(held_connection);
+
+    let unsigned = EventBuilder::text_note("warm account status").build(user_keys.public_key());
+    let event_json = serde_json::to_value(&unsigned).expect("serialize unsigned event");
+    invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state.clone(),
         &auth_header,
         None,
         NostrRpcRequest {
@@ -1867,24 +1909,165 @@ async fn warm_status_check_pool_exhaustion_is_retryable_503() {
         },
     )
     .await
-    .expect_err("saturated status-check acquire should fail as unavailable");
+    .expect("successful status load should fill the account cache");
 
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < HTTP_RPC_HANDLER_TIMEOUT,
-        "pool acquire must fail before the handler timeout fires, took {elapsed:?}"
+    let mut admin_headers = HeaderMap::new();
+    admin_headers.insert(
+        "Authorization",
+        format!("Bearer {SERVICE_TOKEN}")
+            .parse()
+            .expect("valid service authorization header"),
     );
-    // Without a lower bound this passes for any acquire timeout under 8s, and
-    // also for a 503 raised instantly by some unrelated failure -- neither of
-    // which is what this test claims to cover. Waiting the full acquire budget
-    // is what identifies the pool timeout as the thing that fired.
-    assert!(
-        elapsed >= SQLX_ACQUIRE_TIMEOUT,
-        "saturated acquire should have waited the full {SQLX_ACQUIRE_TIMEOUT:?} \
-         acquire budget, but failed after {elapsed:?}"
+    let suspended = set_user_status_admin(
+        create_test_tenant_extractor(tenant_id),
+        State(auth_state.clone()),
+        admin_headers.clone(),
+        Path(pubkey.clone()),
+        Json(SetUserStatusRequest {
+            status: "suspended".to_string(),
+            reason: Some("cache invalidation test".to_string()),
+            actor: None,
+        }),
+    )
+    .await
+    .expect("suspending the user should invalidate the local account cache");
+    assert_eq!(suspended.0.status, "suspended");
+
+    let recipient = Keys::generate();
+    let err = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state.clone(),
+        &auth_header,
+        None,
+        NostrRpcRequest {
+            method: "nip44_encrypt".to_string(),
+            params: vec![json!(recipient.public_key().to_hex()), json!("denied")],
+        },
+    )
+    .await
+    .expect_err("local invalidation must make suspension effective immediately");
+    assert!(matches!(err, RpcError::AccountSuspended(_)));
+
+    let active = set_user_status_admin(
+        create_test_tenant_extractor(tenant_id),
+        State(auth_state.clone()),
+        admin_headers,
+        Path(pubkey.clone()),
+        Json(SetUserStatusRequest {
+            status: "active".to_string(),
+            reason: None,
+            actor: None,
+        }),
+    )
+    .await
+    .expect("reactivating the user should invalidate the restricted cache entry");
+    assert_eq!(active.0.status, "active");
+    invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state.clone(),
+        &auth_header,
+        None,
+        NostrRpcRequest {
+            method: "nip44_encrypt".to_string(),
+            params: vec![
+                json!(recipient.public_key().to_hex()),
+                json!("allowed again"),
+            ],
+        },
+    )
+    .await
+    .expect("local invalidation must make reactivation effective immediately");
+
+    let sender = Keys::generate();
+    let ciphertext = nip44::encrypt(
+        sender.secret_key(),
+        &user_keys.public_key(),
+        "pool-independent decrypt",
+        nip44::Version::V2,
+    )
+    .expect("sender-side encryption");
+
+    let held_connection = pool
+        .acquire()
+        .await
+        .expect("single connection should be available before warm RPCs start");
+
+    let requests = [
+        NostrRpcRequest {
+            method: "sign_event".to_string(),
+            params: vec![serde_json::to_value(
+                EventBuilder::text_note("pool saturated").build(user_keys.public_key()),
+            )
+            .expect("serialize unsigned event")],
+        },
+        NostrRpcRequest {
+            method: "nip44_encrypt".to_string(),
+            params: vec![
+                json!(sender.public_key().to_hex()),
+                json!("pool-independent encrypt"),
+            ],
+        },
+        NostrRpcRequest {
+            method: "nip44_decrypt".to_string(),
+            params: vec![json!(sender.public_key().to_hex()), json!(ciphertext)],
+        },
+    ];
+
+    for request in requests {
+        let method = request.method.clone();
+        let started = Instant::now();
+        invoke_nostr_rpc(
+            create_test_tenant_extractor(tenant_id),
+            auth_state.clone(),
+            &auth_header,
+            None,
+            request,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("warm {method} should not need the DB pool: {error:?}"));
+        assert!(
+            started.elapsed() < SQLX_ACQUIRE_TIMEOUT,
+            "warm {method} waited long enough to attempt a pool checkout"
+        );
+    }
+
+    drop(held_connection);
+    let mut deletion_headers = HeaderMap::new();
+    deletion_headers.insert(
+        "Authorization",
+        format!("Bearer {DELETION_SERVICE_TOKEN}")
+            .parse()
+            .expect("valid deletion authorization header"),
     );
-    let response = err.into_response();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let _deletion = delete_account_service(
+        create_test_tenant_extractor(tenant_id),
+        State(auth_state.clone()),
+        deletion_headers,
+        Path(pubkey),
+        Json(ServiceAccountDeletionRequest {
+            deletion_request_id: format!("status-cache-delete-{}", Uuid::new_v4()),
+        }),
+    )
+    .await
+    .expect("account deletion should commit and invalidate local status state");
+
+    let err = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state,
+        &auth_header,
+        None,
+        NostrRpcRequest {
+            method: "sign_event".to_string(),
+            params: vec![serde_json::to_value(
+                EventBuilder::text_note("must not sign after deletion")
+                    .build(user_keys.public_key()),
+            )
+            .expect("serialize unsigned event")],
+        },
+    )
+    .await
+    .expect_err("a warm RPC must refuse immediately after account deletion");
+    assert!(matches!(err, RpcError::Auth(AuthError::InvalidToken)));
 }
 
 /// Test: suspended user can still call get_public_key via nostr_rpc

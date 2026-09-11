@@ -99,6 +99,7 @@ async fn create_test_auth_state(pool: PgPool, key_manager: Arc<Box<dyn KeyManage
             key_manager,
             signer_handlers: None,
             http_handler_cache: new_http_handler_cache(),
+            account_status_cache: keycast_api::state::new_account_status_cache(),
             server_keys: Keys::generate(),
             tenant_cache,
             bcrypt: bcrypt.clone(),

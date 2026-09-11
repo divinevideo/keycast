@@ -11,10 +11,33 @@ use nostr_sdk::Keys;
 use once_cell::sync::OnceCell;
 use sqlx::PgPool;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 
 /// Tenant cache: domain -> Tenant (preloaded at startup, rarely changes)
 pub type TenantCache = Cache<String, Arc<Tenant>>;
+
+pub const ACCOUNT_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
+const ACCOUNT_STATUS_CACHE_CAPACITY: u64 = 100_000;
+pub type AccountStatusCacheKey = (i64, String);
+
+#[derive(Clone, Debug)]
+pub enum AccountGateState {
+    Present {
+        status: String,
+        verified_minor: bool,
+    },
+    Missing,
+}
+
+pub type AccountStatusCache = Cache<AccountStatusCacheKey, AccountGateState>;
+
+pub fn new_account_status_cache() -> AccountStatusCache {
+    Cache::builder()
+        .max_capacity(ACCOUNT_STATUS_CACHE_CAPACITY)
+        .time_to_live(ACCOUNT_STATUS_CACHE_TTL)
+        .build()
+}
 
 #[derive(Error, Debug)]
 pub enum StateError {
@@ -34,6 +57,8 @@ pub struct KeycastState {
     /// Keyed by [u8; 32] for both bunker_pubkey and authorization_handle
     /// Caches authorization metadata (expires_at, revoked_at) for spam protection
     pub http_handler_cache: HttpHandlerCache,
+    /// Short-lived account restrictions and minor-safety state for warm HTTP RPCs.
+    pub account_status_cache: AccountStatusCache,
     /// Server keys for signing UCANs for users without personal keys
     pub server_keys: Keys,
     /// Tenant cache: domain -> Tenant (preloaded at startup for zero-latency lookups)
