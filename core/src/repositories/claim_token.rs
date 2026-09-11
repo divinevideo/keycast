@@ -3,7 +3,8 @@ use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::repositories::RepositoryError;
 use crate::types::claim_token::{
-    ClaimToken, ClaimTokenState, ClaimTokenStats, CLAIM_TOKEN_EXPIRY_DAYS,
+    ClaimToken, ClaimTokenState, ClaimTokenStats, CLAIM_CONFIRMATION_SEND_LIMIT,
+    CLAIM_TOKEN_EXPIRY_DAYS,
 };
 
 macro_rules! claim_token_columns {
@@ -20,6 +21,12 @@ pub enum StagePendingOutcome {
     Staged,
     /// Token was used, admin-invalidated, expired, or unknown — nothing staged.
     TokenNotStageable,
+    /// Token is still valid, but it has already sent
+    /// `CLAIM_CONFIRMATION_SEND_LIMIT` confirmation emails, so nothing was
+    /// staged and nothing may be sent. Distinct from `TokenNotStageable` so the
+    /// claimer gets a page that explains the budget rather than a generic
+    /// "link no longer valid".
+    SendLimitReached,
 }
 
 /// Send-related state for a staged pending claim, read by the resend endpoint
@@ -449,18 +456,26 @@ impl ClaimTokenRepository {
     ) -> Result<StagePendingOutcome, RepositoryError> {
         // Guarded write: only stage when the token is still valid. Re-checks
         // validity under the row lock so an invalidation cannot be overwritten.
+        //
+        // `confirmation_send_count` is incremented here, in the same statement
+        // that claims the send, and the cap is part of the predicate. That makes
+        // the budget check atomic: concurrent submits cannot each read a
+        // count below the cap and then both send, because only one of them can
+        // win the row update for a given count.
         let updated = sqlx::query(
             "UPDATE account_claim_tokens
              SET pending_email = $1,
                  pending_password_hash = $2,
                  confirmation_token = $3,
                  confirmation_expires_at = $4,
-                 confirmation_sent_at = NOW()
+                 confirmation_sent_at = NOW(),
+                 confirmation_send_count = confirmation_send_count + 1
              WHERE token = $5
                AND tenant_id = $6
                AND used_at IS NULL
                AND invalidated_at IS NULL
-               AND expires_at > NOW()",
+               AND expires_at > NOW()
+               AND confirmation_send_count < $7",
         )
         .bind(pending_email)
         .bind(pending_password_hash)
@@ -468,14 +483,68 @@ impl ClaimTokenRepository {
         .bind(confirmation_expires_at)
         .bind(token)
         .bind(tenant_id)
+        .bind(CLAIM_CONFIRMATION_SEND_LIMIT)
         .execute(&self.pool)
         .await?;
 
-        if updated.rows_affected() == 0 {
-            Ok(StagePendingOutcome::TokenNotStageable)
-        } else {
-            Ok(StagePendingOutcome::Staged)
+        if updated.rows_affected() > 0 {
+            return Ok(StagePendingOutcome::Staged);
         }
+
+        // Zero rows means either the token is no longer stageable or it is
+        // still valid but out of send budget. Only the failure path pays for
+        // this second read, and it deliberately drops the cap from the
+        // predicate so a still-valid-but-exhausted token is distinguishable.
+        let still_valid: Option<(i32,)> = sqlx::query_as(
+            "SELECT confirmation_send_count
+             FROM account_claim_tokens
+             WHERE token = $1
+               AND tenant_id = $2
+               AND used_at IS NULL
+               AND invalidated_at IS NULL
+               AND expires_at > NOW()",
+        )
+        .bind(token)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match still_valid {
+            Some((count,)) if count >= CLAIM_CONFIRMATION_SEND_LIMIT => {
+                Ok(StagePendingOutcome::SendLimitReached)
+            }
+            // Either no valid row at all, or it became stageable again between
+            // the two statements; treat both as not-stageable so the caller
+            // re-classifies the token and shows a state-specific page.
+            _ => Ok(StagePendingOutcome::TokenNotStageable),
+        }
+    }
+
+    /// Look up the claim token string and confirmation expiry for a given
+    /// confirmation token, with no validity guard at all.
+    ///
+    /// Used only to classify a failed confirm into a precise error page, which
+    /// is why it deliberately matches rows the other methods exclude (used,
+    /// invalidated, expired): the whole point is to tell the claimer *why* the
+    /// link did not work. Returns `None` when no row carries this confirmation
+    /// token — unknown, already consumed (a successful confirm nulls it), or
+    /// superseded by a rotation.
+    pub async fn confirmation_classification(
+        &self,
+        confirmation_token: &str,
+        tenant_id: i64,
+    ) -> Result<Option<(String, Option<DateTime<Utc>>)>, RepositoryError> {
+        sqlx::query_as(
+            "SELECT token, confirmation_expires_at
+             FROM account_claim_tokens
+             WHERE confirmation_token = $1
+               AND tenant_id = $2",
+        )
+        .bind(confirmation_token)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
     }
 
     /// Read the send-related state of a staged pending claim, for the resend
@@ -513,25 +582,42 @@ impl ClaimTokenRepository {
         .map_err(Into::into)
     }
 
-    /// Record a claim-confirmation (re)send: bumps `confirmation_sent_at` to
-    /// start a fresh resend cooldown, and — when `rotated` is `Some` because
-    /// the prior confirmation token had expired — replaces
-    /// `confirmation_token`/`confirmation_expires_at` with a freshly minted
-    /// pair. Guarded by the same still-valid predicate as
+    /// Claim a resend slot for a staged pending claim, returning `true` when
+    /// the caller may actually send.
+    ///
+    /// This is a single atomic check-and-set: the cooldown and the lifetime
+    /// send cap are both predicates on the same `UPDATE` that bumps
+    /// `confirmation_sent_at` and increments `confirmation_send_count`. An
+    /// earlier version read the cooldown and wrote in two statements, which let
+    /// concurrent resends each pass the read and each send — bounded only by
+    /// how many arrived at once. Doing it in one statement means exactly one
+    /// concurrent request can win a given slot.
+    ///
+    /// When `rotated` is `Some` (because the prior confirmation token had
+    /// already expired) the freshly minted token/expiry pair replaces the old
+    /// one in the same write.
+    ///
+    /// Guarded by the same still-valid predicate as
     /// `pending_claim_send_state`/`stage_pending_claim`, so a claim token that
     /// died between the read and this write (e.g. a concurrent admin
     /// invalidation) leaves the row untouched rather than reviving it.
+    /// A `false` return therefore covers every reason not to send — in
+    /// cooldown, out of budget, or no longer valid — which is what keeps the
+    /// resend endpoint's response enumeration-safe.
     pub async fn touch_claim_confirmation(
         &self,
         token: &str,
         tenant_id: i64,
         rotated: Option<(&str, DateTime<Utc>)>,
-    ) -> Result<(), RepositoryError> {
-        match rotated {
+        cooldown_minutes: i64,
+    ) -> Result<bool, RepositoryError> {
+        let cooldown_minutes = i32::try_from(cooldown_minutes).unwrap_or(i32::MAX);
+        let updated = match rotated {
             Some((new_confirmation_token, new_confirmation_expires_at)) => {
                 sqlx::query(
                     "UPDATE account_claim_tokens
                      SET confirmation_sent_at = NOW(),
+                         confirmation_send_count = confirmation_send_count + 1,
                          confirmation_token = $1,
                          confirmation_expires_at = $2
                      WHERE token = $3
@@ -539,33 +625,47 @@ impl ClaimTokenRepository {
                        AND pending_email IS NOT NULL
                        AND used_at IS NULL
                        AND invalidated_at IS NULL
-                       AND expires_at > NOW()",
+                       AND expires_at > NOW()
+                       AND confirmation_send_count < $5
+                       AND (confirmation_sent_at IS NULL
+                            OR confirmation_sent_at
+                               < NOW() - make_interval(mins => $6))",
                 )
                 .bind(new_confirmation_token)
                 .bind(new_confirmation_expires_at)
                 .bind(token)
                 .bind(tenant_id)
+                .bind(CLAIM_CONFIRMATION_SEND_LIMIT)
+                .bind(cooldown_minutes)
                 .execute(&self.pool)
-                .await?;
+                .await?
             }
             None => {
                 sqlx::query(
                     "UPDATE account_claim_tokens
-                     SET confirmation_sent_at = NOW()
+                     SET confirmation_sent_at = NOW(),
+                         confirmation_send_count = confirmation_send_count + 1
                      WHERE token = $1
                        AND tenant_id = $2
                        AND pending_email IS NOT NULL
                        AND used_at IS NULL
                        AND invalidated_at IS NULL
-                       AND expires_at > NOW()",
+                       AND expires_at > NOW()
+                       AND confirmation_send_count < $3
+                       AND (confirmation_sent_at IS NULL
+                            OR confirmation_sent_at
+                               < NOW() - make_interval(mins => $4))",
                 )
                 .bind(token)
                 .bind(tenant_id)
+                .bind(CLAIM_CONFIRMATION_SEND_LIMIT)
+                .bind(cooldown_minutes)
                 .execute(&self.pool)
-                .await?;
+                .await?
             }
-        }
-        Ok(())
+        };
+
+        Ok(updated.rows_affected() > 0)
     }
 
     /// Classify a token string into one of the ClaimTokenState variants by
