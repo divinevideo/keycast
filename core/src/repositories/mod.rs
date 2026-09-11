@@ -7,6 +7,7 @@ mod atproto_oauth_session;
 mod auth_event;
 mod authorization;
 mod claim_token;
+mod email_marketing;
 mod error;
 mod oauth_authorization;
 mod oauth_code;
@@ -29,6 +30,7 @@ pub use atproto_oauth_session::{
 pub use auth_event::{AuthEventRecord, AuthEventRepository, AuthEventRow};
 pub use authorization::AuthorizationRepository;
 pub use claim_token::ClaimTokenRepository;
+pub use email_marketing::EmailMarketingConsent;
 pub use error::RepositoryError;
 pub use oauth_authorization::{CreateOAuthAuthorizationParams, OAuthAuthorizationRepository};
 pub use oauth_code::{

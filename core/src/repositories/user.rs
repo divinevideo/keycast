@@ -435,6 +435,12 @@ struct RotatedIdentityRow {
     suspended_at: Option<DateTime<Utc>>,
     verified_minor: bool,
     verified_minor_at: Option<DateTime<Utc>>,
+    email_marketing_consent: String,
+    email_marketing_consent_at: Option<DateTime<Utc>>,
+    email_marketing_consent_source: Option<String>,
+    email_marketing_consent_app_version: Option<String>,
+    email_marketing_global_optout: Option<bool>,
+    email_marketing_optout_observed_at: Option<DateTime<Utc>>,
 }
 
 /// Outcome of atomically consuming a claim token and claiming the account.
@@ -1161,6 +1167,39 @@ impl UserRepository {
         tenant_id: i64,
     ) -> Result<FinalizeEmailOutcome, RepositoryError> {
         let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+
+        // Capture the outgoing address BEFORE the UPDATE below overwrites it. Ordering is
+        // load-bearing: afterwards `email` is already the new value and old_email would be
+        // meaningless, leaving the sync service unable to find the existing contact. It would then
+        // create a duplicate and leave the previous address subscribed indefinitely.
+        //
+        // The guards mirror the UPDATE's exactly, so a change that is not actually ready records
+        // nothing. Only opted-in accounts: those are the only contacts we created. In the same
+        // transaction, so a failed finalize leaves no row claiming a move happened.
+        sqlx::query(
+            // The floor is snapshotted here, not looked up later. A lookup against the old address
+            // does not survive a second change: the row would say "B -> C" while the email platform
+            // no longer knows B, so the opt-out would be invisible and the sync would subscribe
+            // somebody who had asked not to be emailed.
+            "INSERT INTO email_marketing_email_changes
+                 (tenant_id, pubkey, old_email, new_email, changed_at, global_optout)
+             SELECT tenant_id, pubkey, email, pending_email, $1, email_marketing_global_optout
+             FROM users
+             WHERE pubkey = $2 AND tenant_id = $3
+               AND pending_email IS NOT NULL
+               AND pending_email_old_confirmed_at IS NOT NULL
+               AND pending_email_new_confirmed_at IS NOT NULL
+               AND email IS NOT NULL
+               AND email IS DISTINCT FROM pending_email
+               AND email_marketing_consent = 'opted_in'",
+        )
+        .bind(now)
+        .bind(pubkey)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+
         let result = sqlx::query(
             "UPDATE users
              SET email = pending_email,
@@ -1181,17 +1220,29 @@ impl UserRepository {
         .bind(now)
         .bind(pubkey)
         .bind(tenant_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await;
 
         match result {
-            Ok(r) if r.rows_affected() > 0 => Ok(FinalizeEmailOutcome::Finalized),
-            Ok(_) => Ok(FinalizeEmailOutcome::NotReady),
+            Ok(r) if r.rows_affected() > 0 => {
+                tx.commit().await?;
+                Ok(FinalizeEmailOutcome::Finalized)
+            }
+            Ok(_) => {
+                // Not ready: roll back so the tombstone-style row cannot survive a change that
+                // never happened.
+                tx.rollback().await?;
+                Ok(FinalizeEmailOutcome::NotReady)
+            }
             Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+                tx.rollback().await?;
                 self.clear_pending_email_change(pubkey, tenant_id).await?;
                 Ok(FinalizeEmailOutcome::EmailTaken)
             }
-            Err(e) => Err(e.into()),
+            Err(e) => {
+                tx.rollback().await?;
+                Err(e.into())
+            }
         }
     }
 
@@ -1804,24 +1855,6 @@ impl UserRepository {
     // Key change methods
     // =========================================================================
 
-    /// Orphan user's identity (clear email/password for key change).
-    pub async fn orphan_identity(
-        &self,
-        pubkey: &str,
-        tenant_id: i64,
-    ) -> Result<(), RepositoryError> {
-        sqlx::query(
-            "UPDATE users SET email = NULL, password_hash = NULL, updated_at = $1
-             WHERE pubkey = $2 AND tenant_id = $3",
-        )
-        .bind(Utc::now())
-        .bind(pubkey)
-        .bind(tenant_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
     /// Finalize OAuth registration atomically.
     ///
     /// Creates user and personal key records, then deletes the one-time oauth code.
@@ -2114,7 +2147,10 @@ impl UserRepository {
         // replacement row would default to `active` and hand the actor back both
         // Nostr and ActivityPub signing.
         let old_identity: RotatedIdentityRow = sqlx::query_as(
-            "SELECT username, status, suspended_reason, suspended_at, verified_minor, verified_minor_at \
+            "SELECT username, status, suspended_reason, suspended_at, verified_minor, verified_minor_at, \
+                    email_marketing_consent, email_marketing_consent_at, \
+                    email_marketing_consent_source, email_marketing_consent_app_version, \
+                    email_marketing_global_optout, email_marketing_optout_observed_at \
              FROM users WHERE pubkey = $1 AND tenant_id = $2",
         )
         .bind(old_pubkey)
@@ -2122,9 +2158,17 @@ impl UserRepository {
         .fetch_one(&mut **tx)
         .await?;
 
-        // Orphan old identity (transfer email/password/username to NULL)
+        // Orphan old identity (transfer email/password/username to NULL). Consent
+        // and the suppression floor move with the live account; leaving them on
+        // this row would keep a null-email consent event on the sync cursor.
         sqlx::query(
-            "UPDATE users SET email = NULL, password_hash = NULL, username = NULL, updated_at = $1
+            "UPDATE users SET email = NULL, password_hash = NULL, username = NULL, updated_at = $1,
+                 email_marketing_consent = 'never_asked',
+                 email_marketing_consent_at = NULL,
+                 email_marketing_consent_source = NULL,
+                 email_marketing_consent_app_version = NULL,
+                 email_marketing_global_optout = NULL,
+                 email_marketing_optout_observed_at = NULL
              WHERE pubkey = $2 AND tenant_id = $3",
         )
         .bind(now)
@@ -2138,8 +2182,11 @@ impl UserRepository {
         sqlx::query(
             "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, username, \
                                 status, suspended_reason, suspended_at, verified_minor, verified_minor_at, \
+                                email_marketing_consent, email_marketing_consent_at, \
+                                email_marketing_consent_source, email_marketing_consent_app_version, \
+                                email_marketing_global_optout, email_marketing_optout_observed_at, \
                                 created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
         )
         .bind(new_pubkey)
         .bind(tenant_id)
@@ -2152,8 +2199,29 @@ impl UserRepository {
         .bind(old_identity.suspended_at)
         .bind(old_identity.verified_minor)
         .bind(old_identity.verified_minor_at)
+        .bind(old_identity.email_marketing_consent)
+        .bind(old_identity.email_marketing_consent_at)
+        .bind(old_identity.email_marketing_consent_source)
+        .bind(old_identity.email_marketing_consent_app_version)
+        .bind(old_identity.email_marketing_global_optout)
+        .bind(old_identity.email_marketing_optout_observed_at)
         .bind(now)
         .bind(now)
+        .execute(&mut **tx)
+        .await?;
+
+        // Undrained email-change rows have to follow the account. The deletion fold and its
+        // cleanup both match on pubkey, so a row left pointing at the retired identity is invisible
+        // to them: the old address is never tombstoned, and the row outlives the account it belongs
+        // to. That also reintroduces the drain-order dependence the fold exists to remove, because
+        // a surviving row can recreate a contact after its tombstone has been acted on.
+        sqlx::query(
+            "UPDATE email_marketing_email_changes SET pubkey = $1
+             WHERE pubkey = $2 AND tenant_id = $3",
+        )
+        .bind(new_pubkey)
+        .bind(old_pubkey)
+        .bind(tenant_id)
         .execute(&mut **tx)
         .await?;
 
@@ -3027,6 +3095,67 @@ impl UserRepository {
             .execute(&mut **tx)
             .await?;
 
+        // 4b. Record the address so the sync service can remove the contact from the email
+        // platform. keycast hard-deletes, so once the row below is gone there is nothing left for a
+        // cursor-based sync to notice, and the person would keep receiving marketing after deleting
+        // their account.
+        //
+        // Only for accounts that actually opted in: those are the only contacts we created, and we
+        // should not act on records we do not own. Inside the transaction deliberately, so a
+        // rolled-back deletion cannot leave a tombstone that removes a live account's contact.
+        sqlx::query(
+            "INSERT INTO email_marketing_deletions (tenant_id, email, deleted_at)
+             SELECT tenant_id, email, NOW() FROM users
+             WHERE pubkey = $1 AND tenant_id = $2
+               AND email IS NOT NULL
+               AND email_marketing_consent = 'opted_in'",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .execute(&mut **tx)
+        .await?;
+
+        // 4c. Fold any undrained email changes into the deletion.
+        //
+        // An unacknowledged change row means the sync service has not moved the contact yet, so the
+        // email platform still holds one at the OLD address while the account's current address does
+        // not exist there. Tombstoning only the current address therefore removes nothing and leaves
+        // the old one subscribed for an account that is gone.
+        //
+        // Resolving it here rather than in the consumer is deliberate. The alternative is a drain
+        // order the consumer has to honour forever, which is exactly the kind of invariant that
+        // survives review and then quietly fails: the first implementation of this contract ran the
+        // two queues concurrently. After this, the queue names every address that may need removing
+        // and the order a consumer drains in cannot produce a wrong answer.
+        //
+        // Not gated on consent, unlike 4b. A change row only exists because the account was opted in
+        // when the address changed, so a contact was created at that address; a later withdrawal
+        // does not make it disappear.
+        sqlx::query(
+            "INSERT INTO email_marketing_deletions (tenant_id, email, deleted_at)
+             SELECT DISTINCT c.tenant_id, c.old_email, NOW()
+             FROM email_marketing_email_changes c
+             WHERE c.pubkey = $1 AND c.tenant_id = $2
+               AND NOT EXISTS (
+                   SELECT 1 FROM email_marketing_deletions d
+                   WHERE d.tenant_id = c.tenant_id AND d.email = c.old_email
+               )",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .execute(&mut **tx)
+        .await?;
+
+        // The rows themselves must not outlive the account: replayed after deletion, a change row
+        // would move a contact for somebody who no longer exists.
+        sqlx::query(
+            "DELETE FROM email_marketing_email_changes WHERE pubkey = $1 AND tenant_id = $2",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .execute(&mut **tx)
+        .await?;
+
         // 5. Delete user (cascades to personal_keys, oauth_authorizations -> refresh_tokens,
         //    email_verification_tokens, password_reset_tokens, user_profiles,
         //    account_claim_tokens)
@@ -3075,6 +3204,7 @@ pub enum AccountDeletionOutcome {
 #[cfg(all(test, feature = "integration-tests"))]
 mod tests {
     use super::*;
+    use chrono::{DateTime, Utc};
     use nostr_sdk::Keys;
     use sqlx::postgres::PgPoolOptions;
     use sqlx::PgPool;
@@ -3096,6 +3226,358 @@ mod tests {
 
     fn test_suffix() -> String {
         uuid::Uuid::new_v4().to_string()[..8].to_string()
+    }
+
+    /// Deleting an opted-in account must leave the address behind for the sync service. keycast
+    /// hard-deletes, so without this there is nothing for a cursor-based sync to notice and the
+    /// person keeps receiving marketing after deleting their account.
+    #[tokio::test]
+    async fn test_account_deletion_leaves_a_tombstone_for_opted_in_accounts() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let email = format!("leaver-{}@example.test", test_suffix());
+        let pubkey = seed_consented_user(&pool, &email, "opted_in").await;
+
+        repo.delete_account(&pubkey, 1).await.unwrap();
+
+        let recorded: Option<String> =
+            sqlx::query_scalar("SELECT email FROM email_marketing_deletions WHERE email = $1")
+                .bind(&email)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded.as_deref(), Some(email.as_str()));
+
+        sqlx::query("DELETE FROM email_marketing_deletions WHERE email = $1")
+            .bind(&email)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// We only remove contacts we created. Someone who never opted in has no contact of ours to
+    /// delete, and writing a tombstone would have the sync act on a record it does not own.
+    #[tokio::test]
+    async fn test_account_deletion_leaves_no_tombstone_when_never_opted_in() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let email = format!("browser-{}@example.test", test_suffix());
+        let pubkey = seed_consented_user(&pool, &email, "never_asked").await;
+
+        repo.delete_account(&pubkey, 1).await.unwrap();
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM email_marketing_deletions WHERE email = $1")
+                .bind(&email)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// A declined answer is an answer, but it is not a contact we created, so it gets no tombstone
+    /// either. Only opted_in produces one.
+    #[tokio::test]
+    async fn test_account_deletion_leaves_no_tombstone_when_declined() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let email = format!("declined-{}@example.test", test_suffix());
+        let pubkey = seed_consented_user(&pool, &email, "declined").await;
+
+        repo.delete_account(&pubkey, 1).await.unwrap();
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM email_marketing_deletions WHERE email = $1")
+                .bind(&email)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    async fn seed_consented_user(pool: &PgPool, email: &str, consent: &str) -> String {
+        let pubkey = Keys::generate().public_key().to_hex();
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, email_marketing_consent,
+                                created_at, updated_at)
+             VALUES ($1, 1, $2, $3, NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .bind(email)
+        .bind(consent)
+        .execute(pool)
+        .await
+        .unwrap();
+        pubkey
+    }
+
+    /// keycast overwrites users.email in place, so the sync service only ever sees the new address.
+    /// The old one has to be captured before the overwrite or the sync cannot find the existing
+    /// contact, creates a duplicate, and leaves the previous address subscribed.
+    #[tokio::test]
+    async fn test_finalizing_an_email_change_records_the_old_address() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let old_email = format!("before-{}@example.test", test_suffix());
+        let new_email = format!("after-{}@example.test", test_suffix());
+        let pubkey =
+            seed_user_with_confirmed_email_change(&pool, &old_email, &new_email, "opted_in").await;
+
+        let outcome = repo
+            .finalize_email_change_if_ready(&pubkey, 1)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, FinalizeEmailOutcome::Finalized));
+
+        let (recorded_old, recorded_new): (String, String) = sqlx::query_as(
+            "SELECT old_email, new_email FROM email_marketing_email_changes WHERE pubkey = $1",
+        )
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // The ordering guard: if the INSERT ran after the UPDATE, old_email would already be the
+        // new address and the row would be useless.
+        assert_eq!(
+            recorded_old, old_email,
+            "old_email captured after the overwrite"
+        );
+        assert_eq!(recorded_new, new_email);
+
+        cleanup_email_change(&pool, &pubkey).await;
+    }
+
+    /// We only move contacts we created, so an account that never opted in records nothing.
+    #[tokio::test]
+    async fn test_email_change_records_nothing_when_never_opted_in() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let old_email = format!("nc-before-{}@example.test", test_suffix());
+        let new_email = format!("nc-after-{}@example.test", test_suffix());
+        let pubkey =
+            seed_user_with_confirmed_email_change(&pool, &old_email, &new_email, "never_asked")
+                .await;
+
+        repo.finalize_email_change_if_ready(&pubkey, 1)
+            .await
+            .unwrap();
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM email_marketing_email_changes WHERE pubkey = $1",
+        )
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
+
+        cleanup_email_change(&pool, &pubkey).await;
+    }
+
+    /// A change that is not ready must record nothing. The INSERT's guards mirror the UPDATE's, and
+    /// the whole thing is one transaction, so a NotReady outcome leaves no row behind claiming a
+    /// move happened.
+    #[tokio::test]
+    async fn test_email_change_records_nothing_when_not_ready() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let old_email = format!("nr-before-{}@example.test", test_suffix());
+        let new_email = format!("nr-after-{}@example.test", test_suffix());
+        let pubkey =
+            seed_user_with_confirmed_email_change(&pool, &old_email, &new_email, "opted_in").await;
+
+        // Only one side confirmed: the change is not ready to finalize.
+        sqlx::query("UPDATE users SET pending_email_new_confirmed_at = NULL WHERE pubkey = $1")
+            .bind(&pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let outcome = repo
+            .finalize_email_change_if_ready(&pubkey, 1)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, FinalizeEmailOutcome::NotReady));
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM email_marketing_email_changes WHERE pubkey = $1",
+        )
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "an unfinalized change must leave no row");
+
+        cleanup_email_change(&pool, &pubkey).await;
+    }
+
+    /// The floor is snapshotted onto the email-change row when the change is finalized.
+    ///
+    /// Looking it up later against the old address does not survive a second change: the row would
+    /// say "B -> C" while the email platform no longer knows B, so an opt-out would be invisible and
+    /// the sync would subscribe somebody who had asked not to be emailed.
+    #[tokio::test]
+    async fn test_email_change_snapshots_the_suppression_floor() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let old_email = format!("snap-before-{}@example.test", test_suffix());
+        let new_email = format!("snap-after-{}@example.test", test_suffix());
+        let pubkey =
+            seed_user_with_confirmed_email_change(&pool, &old_email, &new_email, "opted_in").await;
+
+        sqlx::query("UPDATE users SET email_marketing_global_optout = TRUE WHERE pubkey = $1")
+            .bind(&pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        repo.finalize_email_change_if_ready(&pubkey, 1)
+            .await
+            .unwrap();
+
+        let snapshot: Option<bool> = sqlx::query_scalar(
+            "SELECT global_optout FROM email_marketing_email_changes WHERE pubkey = $1",
+        )
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            snapshot,
+            Some(true),
+            "an opt-out must be captured at change time, not reconstructed later"
+        );
+
+        cleanup_email_change(&pool, &pubkey).await;
+    }
+
+    /// Never observed stays never observed. A NULL snapshot is not "not opted out": it tells the
+    /// consumer it has no answer and must fall back rather than assume one.
+    #[tokio::test]
+    async fn test_email_change_snapshot_is_null_when_the_floor_was_never_observed() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let old_email = format!("snapnull-before-{}@example.test", test_suffix());
+        let new_email = format!("snapnull-after-{}@example.test", test_suffix());
+        let pubkey =
+            seed_user_with_confirmed_email_change(&pool, &old_email, &new_email, "opted_in").await;
+
+        repo.finalize_email_change_if_ready(&pubkey, 1)
+            .await
+            .unwrap();
+
+        let snapshot: Option<bool> = sqlx::query_scalar(
+            "SELECT global_optout FROM email_marketing_email_changes WHERE pubkey = $1",
+        )
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            snapshot, None,
+            "unobserved must not be recorded as not-opted-out"
+        );
+
+        cleanup_email_change(&pool, &pubkey).await;
+    }
+
+    async fn seed_user_with_confirmed_email_change(
+        pool: &PgPool,
+        old_email: &str,
+        new_email: &str,
+        consent: &str,
+    ) -> String {
+        let pubkey = Keys::generate().public_key().to_hex();
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, email_verified, email_marketing_consent,
+                                pending_email, pending_email_old_confirmed_at,
+                                pending_email_new_confirmed_at, pending_email_expires_at,
+                                created_at, updated_at)
+             VALUES ($1, 1, $2, true, $3, $4, NOW(), NOW(), NOW() + interval '1 hour',
+                     NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .bind(old_email)
+        .bind(consent)
+        .bind(new_email)
+        .execute(pool)
+        .await
+        .unwrap();
+        pubkey
+    }
+
+    /// A Nostr key rotation must take the consent event and the suppression floor with the live
+    /// account. Leaving them on the orphaned row would drop tombstones and keep a null-email
+    /// record on the sync cursor.
+    #[tokio::test]
+    async fn test_change_key_carries_marketing_consent_and_clears_the_orphan() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let email = format!("rotate-{}@example.test", test_suffix());
+        let old_pubkey = seed_consented_user(&pool, &email, "opted_in").await;
+        sqlx::query(
+            "UPDATE users SET email_verified = true, password_hash = 'hashed',
+                 email_marketing_consent_at = NOW(),
+                 email_marketing_global_optout = true,
+                 email_marketing_optout_observed_at = NOW()
+             WHERE pubkey = $1",
+        )
+        .bind(&old_pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let new_pubkey = Keys::generate().public_key().to_hex();
+
+        repo.change_key_transaction(&old_pubkey, &new_pubkey, 1, &email, "hashed", b"secret")
+            .await
+            .unwrap();
+
+        let (consent, floor): (String, Option<bool>) = sqlx::query_as(
+            "SELECT email_marketing_consent, email_marketing_global_optout FROM users WHERE pubkey = $1",
+        )
+        .bind(&new_pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(consent, "opted_in");
+        assert_eq!(floor, Some(true));
+
+        let (old_consent, old_at): (String, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT email_marketing_consent, email_marketing_consent_at FROM users WHERE pubkey = $1",
+        )
+        .bind(&old_pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(old_consent, "never_asked");
+        assert!(old_at.is_none());
+
+        sqlx::query("DELETE FROM personal_keys WHERE user_pubkey = $1")
+            .bind(&new_pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM users WHERE pubkey = ANY($1)")
+            .bind(vec![old_pubkey, new_pubkey])
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    async fn cleanup_email_change(pool: &PgPool, pubkey: &str) {
+        sqlx::query("DELETE FROM email_marketing_email_changes WHERE pubkey = $1")
+            .bind(pubkey)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(pubkey)
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     fn plan_mentions_index(plan: &serde_json::Value, index_name: &str) -> bool {

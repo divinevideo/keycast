@@ -89,6 +89,7 @@ Cloud Run does not have readiness-probe-driven endpoint removal during shutdown.
 | `keycast-redis-url` | `REDIS_URL` |
 | `keycast-service-token` | `KEYCAST_SERVICE_TOKEN` |
 | `account-deletion-service-token-production` | `KEYCAST_DELETION_SERVICE_TOKEN` |
+| `email-marketing-service-token-production` | `KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN` |
 
 The trusted account-deletion endpoint uses a dedicated credential rather than
 `keycast-service-token`. The production coordinator reads the Terraform-managed
@@ -98,6 +99,13 @@ the same value into `openvine-co` and grant the Cloud Run runtime service accoun
 Secret Manager access. Until the mirrored secret exists and a new revision is
 deployed, the endpoint fails closed while unrelated service-token routes remain
 available.
+
+The email marketing sync endpoints likewise use a dedicated credential. Before
+deploying them, an operator must create `email-marketing-service-token-production`
+in `openvine-co`, grant the Cloud Run runtime service account access, and configure
+the same token for the marketing sync worker. Because Cloud Build binds this secret
+during revision creation, a missing secret or access grant fails the entire deploy;
+an unset variable only fails the marketing endpoints closed outside that deploy path.
 
 There is no Cloud Run Sentry secret or `sentry-cli` release step in the current Cloud Build file.
 
@@ -289,6 +297,10 @@ The base deployment reads these secrets:
 The trusted account-deletion endpoint additionally requires
 `KEYCAST_DELETION_SERVICE_TOKEN`. Each environment must inject it from a
 deletion-specific Kubernetes Secret; do not reuse `KEYCAST_SERVICE_TOKEN`.
+
+The email marketing sync endpoints additionally require
+`KEYCAST_EMAIL_MARKETING_SERVICE_TOKEN`. Each environment must inject it from a
+marketing-specific Kubernetes Secret; do not reuse `KEYCAST_SERVICE_TOKEN`.
 
 The migration job also reads:
 
