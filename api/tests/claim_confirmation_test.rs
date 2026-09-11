@@ -16,6 +16,7 @@ use chrono::Utc;
 use http_body_util::BodyExt;
 use keycast_api::api::http::{claim, routes::AuthState};
 use keycast_api::ucan_auth::did_to_nostr_pubkey;
+use keycast_core::types::claim_token::CLAIM_CONFIRMATION_SEND_LIMIT;
 use nostr_sdk::{Keys, ToBech32};
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -403,6 +404,126 @@ async fn confirm_with_unknown_token_is_unrecognized() {
     assert!(
         html.contains("Link not recognized"),
         "response must show the unrecognized-link page, got: {html}"
+    );
+}
+
+/// The submit path is deliberately not cooldown-gated, so a claimer can fix a
+/// mistyped address immediately. The lifetime send cap is what stops that same
+/// property being used to mail an arbitrary third party repeatedly: once the
+/// budget is spent the claimer gets a page explaining it, and no further
+/// confirmation mail can be sent for this claim token.
+#[tokio::test]
+async fn submit_stops_sending_once_the_lifetime_budget_is_spent() {
+    common::assert_test_database_url();
+    let pool = common::setup_test_db().await;
+    let (auth_state, _producer_handle) = common::create_test_auth_state(pool.clone());
+    let (token, pubkey) = seed_valid_claim_token(&pool).await;
+    let claim_email = format!("new-{}@example.com", &pubkey[..12]);
+
+    let app = build_app(auth_state);
+    let body = format!(
+        "token={}&email={}&password=supersecret&password_confirmation=supersecret",
+        token, claim_email
+    );
+
+    // Spend the budget. Every one of these is a legitimate re-submit as far as
+    // the handler is concerned, so all must succeed.
+    for attempt in 0..CLAIM_CONFIRMATION_SEND_LIMIT {
+        let resp = app.clone().oneshot(post_claim_form(&body)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "submit {attempt} should still be within budget"
+        );
+    }
+
+    let confirmation_token_before = read_confirmation_token(&pool, &token).await;
+
+    // One past the cap: refused, with the budget-specific page.
+    let resp = app.clone().oneshot(post_claim_form(&body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(body_bytes.to_vec()).unwrap();
+    assert!(
+        html.contains("Too many confirmation emails"),
+        "response must show the send-budget page, got: {html}"
+    );
+
+    // Crucially, the refused submit must not have re-staged a fresh
+    // confirmation token -- otherwise a caller past the cap could still mint
+    // working links even though no mail was sent.
+    assert_eq!(
+        confirmation_token_before,
+        read_confirmation_token(&pool, &token).await,
+        "an over-budget submit must not rotate the staged confirmation token"
+    );
+}
+
+/// The cap covers the resend path too, not just submit -- otherwise the budget
+/// could be topped up indefinitely through /api/claim/resend. The response
+/// stays the generic interstitial so the endpoint remains enumeration-safe even
+/// when refusing.
+#[tokio::test]
+async fn resend_stops_sending_once_the_lifetime_budget_is_spent() {
+    common::assert_test_database_url();
+    let pool = common::setup_test_db().await;
+    let (auth_state, _producer_handle) = common::create_test_auth_state(pool.clone());
+    let (token, pubkey) = seed_valid_claim_token(&pool).await;
+    let claim_email = format!("new-{}@example.com", &pubkey[..12]);
+
+    let app = build_app(auth_state);
+    let body = format!(
+        "token={}&email={}&password=supersecret&password_confirmation=supersecret",
+        token, claim_email
+    );
+    let stage_resp = app.clone().oneshot(post_claim_form(&body)).await.unwrap();
+    assert_eq!(stage_resp.status(), StatusCode::OK);
+
+    // Drive the counter to the cap directly; stepping through the real cooldown
+    // this many times would mean manipulating time repeatedly, and the point
+    // under test is the cap, not the cooldown.
+    sqlx::query(
+        "UPDATE account_claim_tokens \
+         SET confirmation_send_count = $1, confirmation_sent_at = NOW() - INTERVAL '1 hour' \
+         WHERE token = $2",
+    )
+    .bind(CLAIM_CONFIRMATION_SEND_LIMIT)
+    .bind(&token)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let sent_at_before = read_confirmation_sent_at(&pool, &token)
+        .await
+        .expect("confirmation_sent_at must be set");
+
+    // Past cooldown but out of budget: still refused, and silently so.
+    let resp = app.oneshot(post_claim_resend(&token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(body_bytes.to_vec()).unwrap();
+    assert!(
+        html.contains("Check Your Email") || html.contains("Check your email"),
+        "an over-budget resend must still return the generic interstitial, got: {html}"
+    );
+
+    let sent_at_after = read_confirmation_sent_at(&pool, &token)
+        .await
+        .expect("confirmation_sent_at must still be set");
+    assert_eq!(
+        sent_at_before, sent_at_after,
+        "an over-budget resend must not claim a send slot"
+    );
+
+    let count: (i32,) =
+        sqlx::query_as("SELECT confirmation_send_count FROM account_claim_tokens WHERE token = $1")
+            .bind(&token)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        count.0, CLAIM_CONFIRMATION_SEND_LIMIT,
+        "an over-budget resend must not increment the counter past the cap"
     );
 }
 

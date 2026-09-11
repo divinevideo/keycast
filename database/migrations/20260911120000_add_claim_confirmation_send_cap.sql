@@ -1,0 +1,26 @@
+-- Cap how many confirmation emails a single claim token can ever send.
+--
+-- POST /api/claim deliberately has no resend cooldown, so a claimer who
+-- mistyped their address can correct it immediately rather than waiting out a
+-- timer. That same property made the submit path an uncapped outbound-email
+-- primitive: the holder of a valid claim token could re-submit in a loop with
+-- an arbitrary unregistered address and repeatedly send Divine-branded mail to
+-- someone else's inbox, bounded only by bcrypt cost.
+--
+-- A lifetime counter per claim token closes that without reintroducing a timer
+-- on the correction path. The cap (CLAIM_CONFIRMATION_SEND_LIMIT, see
+-- core/src/types/claim_token.rs) is set far above what a real claimer needs --
+-- one send, a few more if they mistyped or resent -- so exhausting it means
+-- either abuse or a genuinely stuck user, and the latter is recoverable by
+-- support issuing a fresh claim token.
+--
+-- A lifetime count rather than a sliding window is deliberate: a windowed
+-- limit is waitable-out, and slow-drip mail to a victim's inbox is still the
+-- harm being prevented.
+--
+-- NOT NULL DEFAULT 0 is metadata-only on PostgreSQL 11+, so this does not
+-- rewrite the table. Existing rows read as 0 and therefore start with their
+-- full budget, which is correct: any claim token outstanding when this ships
+-- predates the counter and has sent at most a handful.
+ALTER TABLE account_claim_tokens
+    ADD COLUMN confirmation_send_count INTEGER NOT NULL DEFAULT 0;

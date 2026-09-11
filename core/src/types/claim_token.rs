@@ -19,6 +19,25 @@ pub const CLAIM_TOKEN_EXPIRY_DAYS: i64 = 14;
 /// confirmation token is a short-lived proof-of-control minted at submit.
 pub const CLAIM_CONFIRMATION_EXPIRY_HOURS: i64 = 24;
 
+/// Maximum confirmation emails a single claim token may ever send, across both
+/// the submit path (`POST /api/claim`) and the resend path
+/// (`POST /api/claim/resend`).
+///
+/// Submit is intentionally not cooldown-gated so a claimer who mistyped their
+/// address can correct it immediately. That makes the send itself the thing
+/// worth bounding: without a cap, a claim-token holder could re-submit in a
+/// loop against an arbitrary unregistered address and use Divine's sender
+/// reputation to bomb a third party's inbox.
+///
+/// 10 is far beyond a real claim — one send, plus a few if the address was
+/// mistyped or the mail went astray — so hitting it means abuse or a genuinely
+/// stuck claimer. The latter is recoverable: support regenerates the claim
+/// token, which starts a fresh budget.
+///
+/// Deliberately a lifetime count, not a sliding window. A window is waitable
+/// out, and a slow drip of unwanted mail is still the harm.
+pub const CLAIM_CONFIRMATION_SEND_LIMIT: i32 = 10;
+
 /// Account claim token for preloaded users to claim their accounts
 #[derive(Debug, FromRow)]
 pub struct ClaimToken {
