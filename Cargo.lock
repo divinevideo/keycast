@@ -3514,6 +3514,7 @@ dependencies = [
  "google-cloud-kms",
  "hex",
  "hkdf 0.12.4",
+ "hmac 0.12.1",
  "lazy_static",
  "moka",
  "nostr 0.44.2",
