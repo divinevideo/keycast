@@ -33,7 +33,7 @@ WHERE NOT EXISTS (
 );
 
 CREATE INDEX idx_service_provisioning_operations_tenant_pubkey
-    ON service_provisioning_operations (tenant_id, user_pubkey);
+    ON service_provisioning_operations (tenant_id, (user_pubkey::text));
 
 CREATE INDEX idx_service_provisioning_operations_deleted_at
     ON service_provisioning_operations (deleted_at)

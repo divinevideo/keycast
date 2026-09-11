@@ -232,6 +232,14 @@ async fn provisioning_compaction_uses_local_deletion_clock_and_returns_deleted_t
         deleted_at.is_some(),
         "self-service repository deletion stamps the local clock"
     );
+    let before_compaction = provisioning_app(state.clone()).oneshot(json_request(
+        "/admin/create-minor-account", SERVICE_TOKEN,
+        serde_json::json!({"provisioning_operation_id": operation_id, "username": username, "display_name": "Synthetic"}),
+    )).await.unwrap();
+    let before_compaction = json(before_compaction).await;
+    assert_eq!(before_compaction["account_state"], "account_deleted");
+    assert!(before_compaction.get("pubkey").is_none());
+    assert_eq!(before_compaction["replayed"], true);
     sqlx::query("UPDATE service_provisioning_operations SET deleted_at = NOW() - INTERVAL '31 days' WHERE provisioning_operation_id = $1")
         .bind(&operation_id).execute(&pool).await.unwrap();
 

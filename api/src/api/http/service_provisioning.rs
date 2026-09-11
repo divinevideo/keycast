@@ -34,7 +34,7 @@ pub struct CreateMinorAccountRequest {
     pub display_name: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProvisionedAccountState {
     Unclaimed,
@@ -303,6 +303,9 @@ async fn replay_in_tx(
         }
     };
     validate_replay(&row, tenant_id, fingerprint)?;
+    if row.deleted_at.is_some() {
+        return Ok(deleted_response());
+    }
     ClaimTokenRepository::lock_for_user_in_tx(tx, row.user_pubkey.trim(), tenant_id)
         .await
         .map_err(map_repo_error)?;

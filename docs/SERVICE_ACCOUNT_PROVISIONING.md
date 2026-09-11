@@ -33,9 +33,10 @@ tenant, terminal `account_deleted` outcome, completion time, and versioned keyed
 digests of the canonical request fingerprint and account binding. It retains no
 result pubkey.
 
-An exact replay after compaction returns `200` with
+An exact replay after the account is deleted returns `200` with
 `account_state: "account_deleted"`, `replayed: true`, and no `pubkey`, claim URL,
-or expiry. Different request parameters remain a `409
+or expiry. That terminal result applies during the 30-day complete-row window and
+after compaction. Different request parameters remain a `409
 provisioning_operation_conflict`. The replay never creates an account or claim
 credential.
 
