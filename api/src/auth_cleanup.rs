@@ -1,5 +1,6 @@
 //! Periodic cleanup for abandoned authentication state and bounded-retention service queues.
 
+use keycast_core::{metrics::METRICS, repositories::AdminAuditEventRepository};
 use sqlx::PgPool;
 
 /// Remove expired email-marketing queue rows independently of the sync consumer.
@@ -132,6 +133,32 @@ pub fn spawn_cleanup_task(pool: PgPool) -> tokio::task::JoinHandle<()> {
                 Err(error) => tracing::error!(
                     "Cleanup task: failed to delete expired email-marketing queue rows: {}",
                     error
+                ),
+            }
+
+            let retention_repo = AdminAuditEventRepository::new(pool.clone());
+            let now = chrono::Utc::now();
+            match retention_repo.count_overdue_retention_rows(now).await {
+                Ok((deletions, provisioning)) => METRICS.set_retention_overdue(
+                    deletions.try_into().unwrap_or_default(),
+                    provisioning.try_into().unwrap_or_default(),
+                ),
+                Err(error) => {
+                    tracing::error!(error = %error, "Retention task: failed to scan overdue rows")
+                }
+            }
+            match retention_repo
+                .delete_expired_deletion_events(now, 1_000)
+                .await
+            {
+                Ok(deleted) if deleted > 0 => tracing::info!(
+                    deleted,
+                    "Retention task: deleted expired service-deletion audit events"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::error!(
+                    error = %error,
+                    "Retention task: failed to delete expired service-deletion audit events"
                 ),
             }
         }
