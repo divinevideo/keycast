@@ -58,6 +58,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Check deployment configuration
+        run: bun run test:deploy-preflight
+
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:

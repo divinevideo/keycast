@@ -288,7 +288,7 @@ If neither is set, requests from unknown domains are rejected.
 Production runs on Google Cloud in `us-central1`. The deploy pipeline is a single command:
 
 ```bash
-bun run deploy   # gcloud builds submit --config=cloudbuild.yaml
+bun run deploy
 ```
 
 [`cloudbuild.yaml`](./cloudbuild.yaml) builds the container image, runs database migrations as a job (`keycast --migrate`, using SQLx's embedded migrator), and rolls out the new revision. Migrations run before the new revision takes traffic so the schema always matches the running code.
