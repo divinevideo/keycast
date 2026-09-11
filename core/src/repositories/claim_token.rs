@@ -609,9 +609,8 @@ impl ClaimTokenRepository {
         token: &str,
         tenant_id: i64,
         rotated: Option<(&str, DateTime<Utc>)>,
-        cooldown_minutes: i64,
+        cooldown_minutes: i32,
     ) -> Result<bool, RepositoryError> {
-        let cooldown_minutes = i32::try_from(cooldown_minutes).unwrap_or(i32::MAX);
         let updated = match rotated {
             Some((new_confirmation_token, new_confirmation_expires_at)) => {
                 sqlx::query(
