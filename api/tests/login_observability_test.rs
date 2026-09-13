@@ -26,6 +26,7 @@ use keycast_api::{
     BcryptAdmission,
 };
 use keycast_core::{
+    bcrypt_admission::{BcryptOperation, BcryptWorkload},
     encryption::{KeyManager, KeyManagerError},
     secret_pool::SecretPool,
 };
@@ -340,6 +341,67 @@ async fn successful_login_resets_the_failure_budget() {
         password_attempt(app.clone(), &email, password).await.0,
         StatusCode::OK
     );
+    for _ in 0..keycast_core::login_attempts::LOGIN_FREE_FAILURES {
+        assert_eq!(
+            password_attempt(app.clone(), &email, "wrong-password")
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        password_attempt(app, &email, "wrong-password").await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    cleanup_by_email(&pool, &email).await;
+}
+
+#[tokio::test]
+async fn overload_rejection_does_not_consume_the_failure_budget() {
+    let pool = setup_pool().await;
+    let auth_state = create_test_auth_state(pool.clone()).await;
+    let email = format!("overload-{}@example.com", Uuid::new_v4());
+    let pubkey = Keys::generate().public_key().to_hex();
+    let password_hash = hash("correct-password", 4).unwrap();
+
+    cleanup_by_email(&pool, &email).await;
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
+         VALUES ($1, 1, $2, $3, true, NOW(), NOW())",
+    )
+    .bind(&pubkey)
+    .bind(&email)
+    .bind(&password_hash)
+    .execute(&pool)
+    .await
+    .expect("create login subject");
+
+    // Hold the only bcrypt permit so the next password comparison is shed.
+    let held_permit = auth_state
+        .state
+        .bcrypt
+        .reserve(BcryptWorkload::Login, BcryptOperation::Verify)
+        .await
+        .expect("hold the only bcrypt permit");
+
+    let app = Router::new().route(
+        "/auth/login",
+        post(move |headers: HeaderMap, body: String| {
+            let auth_state = auth_state.clone();
+            async move { login(create_test_tenant(), State(auth_state), headers, body).await }
+        }),
+    );
+
+    assert_eq!(
+        password_attempt(app.clone(), &email, "wrong-password")
+            .await
+            .0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    drop(held_permit);
+
+    // The shed request must not have spent a failure: the free budget is intact.
     for _ in 0..keycast_core::login_attempts::LOGIN_FREE_FAILURES {
         assert_eq!(
             password_attempt(app.clone(), &email, "wrong-password")

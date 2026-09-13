@@ -10,7 +10,7 @@ use axum::{
 };
 use base64::Engine;
 use chrono::{Duration, Utc};
-use keycast_core::bcrypt_admission::{BcryptAdmissionError, BcryptWorkload};
+use keycast_core::bcrypt_admission::{BcryptAdmissionError, BcryptOperation, BcryptWorkload};
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
     CreateOAuthAuthorizationParams, OAuthAuthorizationRepository, OAuthCodeData,
@@ -3622,6 +3622,52 @@ pub async fn oauth_login(
             .clone()
             .ok_or(OAuthError::ServiceUnavailable)?,
     );
+    // Check before CPU admission so an already-limited subject keeps its 429
+    // even when the bcrypt pool is saturated.
+    match login_limiter.check(tenant_id, &req.email).await {
+        Ok(Some(retry_after)) => {
+            super::auth_observability::record_auth_event_and_log(
+                pool,
+                &headers,
+                None,
+                super::auth_observability::AuthEvent {
+                    tenant_id,
+                    endpoint,
+                    event_type: "login",
+                    outcome: "failure",
+                    reason_code: Some("rate_limited"),
+                    http_status: 429,
+                    email: Some(&req.email),
+                    pubkey: None,
+                    client_id: Some(&req.client_id),
+                    redirect_origin: None,
+                    metadata_json: serde_json::json!({}),
+                },
+            )
+            .await;
+            return Err(OAuthError::TooManyRequests { retry_after });
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::error!("Password-login limiter check failed: {error}");
+            return Err(OAuthError::ServiceUnavailable);
+        }
+    }
+
+    // CPU admission precedes the attempt reservation so local overload cannot
+    // spend an account's budget without a password comparison.
+    let bcrypt_permit = if user.is_some() {
+        Some(
+            auth_state
+                .state
+                .bcrypt
+                .reserve(BcryptWorkload::Login, BcryptOperation::Verify)
+                .await
+                .map_err(bcrypt_oauth_error)?,
+        )
+    } else {
+        None
+    };
     let login_reservation = match login_limiter.reserve(tenant_id, &req.email).await {
         Ok(LoginAttemptAdmission::Reserved(reservation)) => reservation,
         Ok(LoginAttemptAdmission::Limited { retry_after }) => {
@@ -3682,11 +3728,10 @@ pub async fn oauth_login(
         }
     };
 
-    let valid = match auth_state
-        .state
-        .bcrypt
+    // Reserved for every registered account above; fail closed if it is missing.
+    let bcrypt_permit = bcrypt_permit.ok_or(OAuthError::ServiceUnavailable)?;
+    let valid = match bcrypt_permit
         .verify(
-            BcryptWorkload::Login,
             SecretString::from(req.password.clone()),
             password_hash.clone(),
         )

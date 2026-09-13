@@ -9,6 +9,14 @@ use redis::RedisResult;
 use std::fmt;
 use uuid::Uuid;
 
+const CHECK_SCRIPT: &str = r#"
+local retry_ms = redis.call('PTTL', KEYS[1])
+if retry_ms > 0 then
+    return math.max(1, math.floor((retry_ms + 999) / 1000))
+end
+return 0
+"#;
+
 const RESERVE_SCRIPT: &str = r#"
 local failures_key = KEYS[1]
 local reservations_key = KEYS[2]
@@ -185,6 +193,20 @@ impl LoginAttemptLimiter {
         Self { redis }
     }
 
+    /// Read the current block for a tenant and normalized email without reserving.
+    ///
+    /// Used before CPU admission so an already-limited subject keeps its `429`
+    /// even when bcrypt capacity is exhausted.
+    pub async fn check(&self, tenant_id: i64, normalized_email: &str) -> RedisResult<Option<u32>> {
+        let subject = LoginAttemptSubject::new(tenant_id, normalized_email);
+        let blocked_key = format!("{}:blocked", subject.storage_key());
+        let retry_after: i64 = self
+            .redis
+            .invoke_script(CHECK_SCRIPT, &[blocked_key], &[])
+            .await?;
+        Ok((retry_after > 0).then(|| retry_after.clamp(1, i64::from(u32::MAX)) as u32))
+    }
+
     /// Reserve one attempt for a tenant and normalized email.
     pub async fn reserve(
         &self,
@@ -327,6 +349,30 @@ return 1
             LoginAttemptAdmission::Limited { retry_after: 5 }
         ));
         limiter.reset(1, email).await.expect("cleanup subject");
+    }
+
+    #[tokio::test]
+    async fn check_reports_block_without_reserving() {
+        let limiter = test_limiter().await;
+        let email = "check@example.com";
+
+        assert_eq!(
+            limiter.check(1, email).await.expect("check before block"),
+            None
+        );
+
+        limiter
+            .block_for_test(1, email, 30)
+            .await
+            .expect("install block");
+        let retry_after = limiter.check(1, email).await.expect("check during block");
+        assert!(retry_after.is_some_and(|seconds| (1..=30).contains(&seconds)));
+
+        limiter.reset(1, email).await.expect("cleanup subject");
+        assert_eq!(
+            limiter.check(1, email).await.expect("check after reset"),
+            None
+        );
     }
 
     #[tokio::test]

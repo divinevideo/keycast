@@ -1279,6 +1279,55 @@ pub async fn login(
             .clone()
             .ok_or_else(login_limiter_unavailable)?,
     );
+    // Check before CPU admission so an already-limited subject keeps its 429
+    // even when the bcrypt pool is saturated.
+    match login_limiter.check(tenant_id, &req.email).await {
+        Ok(Some(retry_after)) => {
+            super::auth_observability::record_auth_event_and_log(
+                pool,
+                &headers,
+                None,
+                super::auth_observability::AuthEvent {
+                    tenant_id,
+                    endpoint,
+                    event_type: "login",
+                    outcome: "failure",
+                    reason_code: Some("rate_limited"),
+                    http_status: 429,
+                    email: Some(&req.email),
+                    pubkey: None,
+                    client_id: None,
+                    redirect_origin: Some(&redirect_origin),
+                    metadata_json: serde_json::json!({}),
+                },
+            )
+            .await;
+            return Err(AuthError::TooManyRequests {
+                message: LOGIN_RATE_LIMIT_MESSAGE.to_string(),
+                retry_after,
+            });
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::error!("Password-login limiter check failed: {error}");
+            return Err(login_limiter_unavailable());
+        }
+    }
+
+    // CPU admission precedes the attempt reservation so local overload cannot
+    // spend an account's budget without a password comparison.
+    let bcrypt_permit = if user.is_some() {
+        Some(
+            auth_state
+                .state
+                .bcrypt
+                .reserve(BcryptWorkload::Login, BcryptOperation::Verify)
+                .await
+                .map_err(bcrypt_auth_error)?,
+        )
+    } else {
+        None
+    };
     let login_reservation = match login_limiter.reserve(tenant_id, &req.email).await {
         Ok(LoginAttemptAdmission::Reserved(reservation)) => reservation,
         Ok(LoginAttemptAdmission::Limited { retry_after }) => {
@@ -1349,11 +1398,10 @@ pub async fn login(
         }
     };
 
-    let valid = match auth_state
-        .state
-        .bcrypt
+    // Reserved for every registered account above; fail closed if it is missing.
+    let bcrypt_permit = bcrypt_permit.ok_or_else(login_limiter_unavailable)?;
+    let valid = match bcrypt_permit
         .verify(
-            BcryptWorkload::Login,
             SecretString::from(req.password.clone()),
             password_hash.clone(),
         )
