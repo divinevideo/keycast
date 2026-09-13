@@ -93,11 +93,21 @@ impl KeyManager for TestKeyManager {
     }
 }
 
-fn create_test_auth_state(pool: PgPool) -> keycast_api::api::http::routes::AuthState {
+async fn create_test_auth_state(pool: PgPool) -> keycast_api::api::http::routes::AuthState {
     let bcrypt = BcryptAdmission::new(1, std::time::Duration::from_secs(1));
     let secret_pool = SecretPool::new(1);
     let tenant_cache = Cache::builder().max_capacity(10).build();
     let key_manager: Arc<Box<dyn KeyManager>> = Arc::new(Box::new(TestKeyManager));
+    let redis_url =
+        std::env::var("TEST_REDIS_URL").unwrap_or_else(|_| "redis://localhost:16379".to_string());
+    let client = redis::Client::open(redis_url).expect("valid test Redis URL");
+    let connection = redis::aio::ConnectionManager::new(client)
+        .await
+        .expect("connect to test Redis");
+    let redis = keycast_api::PrefixedRedis::new(
+        connection,
+        Some(format!("headless-auth:{}", Uuid::new_v4())),
+    );
 
     keycast_api::api::http::routes::AuthState {
         state: Arc::new(KeycastState {
@@ -108,7 +118,7 @@ fn create_test_auth_state(pool: PgPool) -> keycast_api::api::http::routes::AuthS
             server_keys: Keys::generate(),
             tenant_cache,
             bcrypt: bcrypt.clone(),
-            redis: None,
+            redis: Some(redis),
             secret_pool: secret_pool.receiver(),
             activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),
         }),
@@ -333,7 +343,7 @@ async fn test_headless_login_fails_unverified_email() {
 #[tokio::test]
 async fn test_headless_login_records_auth_event_and_echoes_request_id_on_failure() {
     let pool = setup_pool().await;
-    let auth_state = create_test_auth_state(pool.clone());
+    let auth_state = create_test_auth_state(pool.clone()).await;
     let test_email = format!("headless-missing-{}@example.com", Uuid::new_v4());
     let request_id = format!("trace-{}", Uuid::new_v4());
 
@@ -520,7 +530,7 @@ async fn test_headless_authorize_rejects_third_party_bearer_token() {
     .await
     .expect("third-party UCAN");
 
-    let response = build_headless_authorize_app(create_test_auth_state(pool.clone()))
+    let response = build_headless_authorize_app(create_test_auth_state(pool.clone()).await)
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -595,7 +605,7 @@ async fn test_headless_authorize_accepts_first_party_bearer_token() {
     .await
     .expect("first-party UCAN");
 
-    let response = build_headless_authorize_app(create_test_auth_state(pool.clone()))
+    let response = build_headless_authorize_app(create_test_auth_state(pool.clone()).await)
         .oneshot(
             Request::builder()
                 .method("POST")

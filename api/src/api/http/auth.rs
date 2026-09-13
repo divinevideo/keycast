@@ -18,6 +18,7 @@ use crate::key_egress_limiter::{
     KeyEgressAdmission, KeyEgressLimiter, KeyEgressReservation, KEY_EGRESS_FINALIZATION_DEADLINE,
     KEY_EGRESS_RESERVED_WORK_DEADLINE,
 };
+use crate::login_attempt_limiter::{LoginAttemptAdmission, LoginAttemptLimiter};
 use crate::nip98;
 use keycast_core::bcrypt_admission::{
     BcryptAdmission, BcryptAdmissionError, BcryptOperation, BcryptPermit, BcryptWorkload,
@@ -72,6 +73,8 @@ pub(crate) const EMAIL_NOT_VERIFIED_MESSAGE: &str =
 pub(crate) const KEY_EGRESS_DENIED_CODE: &str = "KEY_EGRESS_DENIED";
 pub(crate) const KEY_EGRESS_DENIED_MESSAGE: &str = "Operation denied by policy";
 pub(crate) const TOO_MANY_ATTEMPTS_CODE: &str = "TOO_MANY_ATTEMPTS";
+pub(crate) const LOGIN_RATE_LIMIT_MESSAGE: &str =
+    "Too many login attempts. Please wait before trying again or reset your password.";
 /// `auth_events.endpoint` for the two raw-key egress routes.
 pub(crate) const EXPORT_KEY_ENDPOINT: &str = "/api/user/export-key";
 pub(crate) const CHANGE_KEY_ENDPOINT: &str = "/api/user/change-key";
@@ -768,6 +771,13 @@ fn retryable_service_unavailable(
     }
 }
 
+fn login_limiter_unavailable() -> AuthError {
+    retryable_service_unavailable(
+        "Login is temporarily unavailable. Please try again shortly.",
+        Some(1),
+    )
+}
+
 fn bcrypt_auth_error(error: BcryptAdmissionError) -> AuthError {
     match error {
         BcryptAdmissionError::Bcrypt(error) => AuthError::PasswordHash(error),
@@ -1257,13 +1267,114 @@ pub async fn login(
         "Login attempt"
     );
 
-    // Fetch user with password hash and email_verified status from this tenant
+    // Query first so database failures cannot strand an attempt lease. The
+    // limiter still runs before either credential branch returns.
     let user_repo = UserRepository::new(pool.clone());
     let user = user_repo.find_with_password(&req.email, tenant_id).await?;
+
+    let login_limiter = LoginAttemptLimiter::new(
+        auth_state
+            .state
+            .redis
+            .clone()
+            .ok_or_else(login_limiter_unavailable)?,
+    );
+    // Check before CPU admission so an already-limited subject keeps its 429
+    // even when the bcrypt pool is saturated.
+    match login_limiter.check(tenant_id, &req.email).await {
+        Ok(Some(retry_after)) => {
+            super::auth_observability::record_auth_event_and_log(
+                pool,
+                &headers,
+                None,
+                super::auth_observability::AuthEvent {
+                    tenant_id,
+                    endpoint,
+                    event_type: "login",
+                    outcome: "failure",
+                    reason_code: Some("rate_limited"),
+                    http_status: 429,
+                    email: Some(&req.email),
+                    pubkey: None,
+                    client_id: None,
+                    redirect_origin: Some(&redirect_origin),
+                    metadata_json: serde_json::json!({}),
+                },
+            )
+            .await;
+            return Err(AuthError::TooManyRequests {
+                message: LOGIN_RATE_LIMIT_MESSAGE.to_string(),
+                retry_after,
+            });
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::error!("Password-login limiter check failed: {error}");
+            return Err(login_limiter_unavailable());
+        }
+    }
+
+    // CPU admission precedes the attempt reservation so local overload cannot
+    // spend an account's budget without a password comparison.
+    let bcrypt_operation = if user.is_some() {
+        BcryptOperation::Verify
+    } else {
+        BcryptOperation::Dummy
+    };
+    let bcrypt_permit = auth_state
+        .state
+        .bcrypt
+        .reserve(BcryptWorkload::Login, bcrypt_operation)
+        .await
+        .map_err(bcrypt_auth_error)?;
+    let login_reservation = match login_limiter.reserve(tenant_id, &req.email).await {
+        Ok(LoginAttemptAdmission::Reserved(reservation)) => reservation,
+        Ok(LoginAttemptAdmission::Limited { retry_after }) => {
+            super::auth_observability::record_auth_event_and_log(
+                pool,
+                &headers,
+                None,
+                super::auth_observability::AuthEvent {
+                    tenant_id,
+                    endpoint,
+                    event_type: "login",
+                    outcome: "failure",
+                    reason_code: Some("rate_limited"),
+                    http_status: 429,
+                    email: Some(&req.email),
+                    pubkey: None,
+                    client_id: None,
+                    redirect_origin: Some(&redirect_origin),
+                    metadata_json: serde_json::json!({}),
+                },
+            )
+            .await;
+            return Err(AuthError::TooManyRequests {
+                message: LOGIN_RATE_LIMIT_MESSAGE.to_string(),
+                retry_after,
+            });
+        }
+        Err(error) => {
+            tracing::error!("Password-login limiter admission failed: {error}");
+            return Err(login_limiter_unavailable());
+        }
+    };
 
     let (public_key, password_hash, email_verified, user_status) = match user {
         Some(u) => u,
         None => {
+            // Burn an equivalent comparison so an unregistered address cannot
+            // be told apart by response latency or in-flight contention.
+            if let Err(error) = bcrypt_permit.burn_dummy(bcrypt::DEFAULT_COST).await {
+                if let Err(release_error) = login_reservation.release().await {
+                    tracing::error!("Password-login reservation release failed: {release_error}");
+                }
+                return Err(bcrypt_auth_error(error));
+            }
+            login_reservation.record_failure().await.map_err(|error| {
+                tracing::error!("Password-login failure recording failed: {error}");
+                login_limiter_unavailable()
+            })?;
             super::auth_observability::record_auth_event_and_log(
                 pool,
                 &headers,
@@ -1294,17 +1405,26 @@ pub async fn login(
         }
     };
 
-    let valid = auth_state
-        .state
-        .bcrypt
+    let valid = match bcrypt_permit
         .verify(
-            BcryptWorkload::Login,
             SecretString::from(req.password.clone()),
             password_hash.clone(),
         )
         .await
-        .map_err(bcrypt_auth_error)?;
+    {
+        Ok(valid) => valid,
+        Err(error) => {
+            if let Err(release_error) = login_reservation.release().await {
+                tracing::error!("Password-login reservation release failed: {release_error}");
+            }
+            return Err(bcrypt_auth_error(error));
+        }
+    };
     if !valid {
+        login_reservation.record_failure().await.map_err(|error| {
+            tracing::error!("Password-login failure recording failed: {error}");
+            login_limiter_unavailable()
+        })?;
         super::auth_observability::record_auth_event_and_log(
             pool,
             &headers,
@@ -1334,6 +1454,11 @@ pub async fn login(
         METRICS.inc_login_failure();
         return Err(AuthError::InvalidCredentials);
     }
+
+    login_reservation.clear().await.map_err(|error| {
+        tracing::error!("Password-login limiter reset failed: {error}");
+        login_limiter_unavailable()
+    })?;
 
     // Check if email is verified
     if !email_verified {
@@ -2816,12 +2941,13 @@ pub async fn forgot_password(
 /// Reset password with token
 pub async fn reset_password(
     tenant: crate::api::tenant::TenantExtractor,
-    State(pool): State<PgPool>,
-    Extension(bcrypt): Extension<BcryptAdmission>,
+    State(auth_state): State<super::routes::AuthState>,
     headers: HeaderMap,
     Json(req): Json<ResetPasswordRequest>,
 ) -> Result<Json<ResetPasswordResponse>, AuthError> {
     let tenant_id = tenant.0.id;
+    let pool = &auth_state.state.db;
+    let bcrypt = &auth_state.state.bcrypt;
     let endpoint = "/api/auth/reset-password";
     tracing::info!(
         "Password reset attempt with token: {}... for tenant: {}",
@@ -2836,7 +2962,7 @@ pub async fn reset_password(
             Some(data) => data,
             None => {
                 super::auth_observability::record_auth_event_and_log(
-                    &pool,
+                    pool,
                     &headers,
                     None,
                     super::auth_observability::AuthEvent {
@@ -2862,16 +2988,14 @@ pub async fn reset_password(
     )
     .bind(&public_key)
     .bind(tenant_id)
-    .fetch_optional(&pool)
-    .await
-    .ok()
-    .flatten();
+    .fetch_optional(pool)
+    .await?;
 
     // Check if token is expired
     if let Some(expires) = expires_at {
         if expires < Utc::now() {
             super::auth_observability::record_auth_event_and_log(
-                &pool,
+                pool,
                 &headers,
                 None,
                 super::auth_observability::AuthEvent {
@@ -2905,6 +3029,23 @@ pub async fn reset_password(
         .await
         .map_err(bcrypt_auth_error)?;
 
+    if let Some(account_email) = account_email.as_deref() {
+        let login_limiter = LoginAttemptLimiter::new(
+            auth_state
+                .state
+                .redis
+                .clone()
+                .ok_or_else(login_limiter_unavailable)?,
+        );
+        login_limiter
+            .reset(tenant_id, account_email)
+            .await
+            .map_err(|error| {
+                tracing::error!("Password-login recovery reset failed: {error}");
+                login_limiter_unavailable()
+            })?;
+    }
+
     // Update password, clear reset token, and mark email as verified
     // (user proved email ownership by receiving and using the reset link)
     let user_repo = UserRepository::new(pool.clone());
@@ -2913,7 +3054,7 @@ pub async fn reset_password(
         .await?;
 
     super::auth_observability::record_auth_event_and_log(
-        &pool,
+        pool,
         &headers,
         None,
         super::auth_observability::AuthEvent {
@@ -7833,7 +7974,7 @@ mod tests {
     #[tokio::test]
     async fn test_login_missing_personal_keys_returns_conflict() {
         let pool = create_test_db().await;
-        let auth_state = create_test_auth_state(pool.clone());
+        let auth_state = create_test_auth_state_with_redis(pool.clone()).await;
         let pubkey = Keys::generate().public_key().to_hex();
         let email = format!("missing-keys-{}@example.com", Uuid::new_v4());
         let password = "testpassword123";
