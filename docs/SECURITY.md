@@ -26,11 +26,13 @@ headless login endpoints. Repeated failures introduce an escalating delay and re
 with `Retry-After`; only failures in the latest 15-minute window contribute to the delay.
 Successful login clears the budget. Completing the existing password reset flow also clears
 it, providing recovery when a user cannot wait for the current delay. The limiter applies
-the same response to registered and unregistered email addresses. Bcrypt CPU admission
-precedes the attempt reservation, so a request shed by local overload does not consume the
-account's budget; a subject that is already limited keeps its `429` before admission. Login
-fails closed with a retryable service-unavailable response when the shared Redis coordination
-store is unavailable.
+the same response to registered and unregistered email addresses. Every attempt passes through
+bcrypt CPU admission before the attempt reservation, and an unregistered address burns an
+equivalent comparison, so a request shed by local overload does not consume the account's
+budget and registration status is not distinguishable by response latency or in-flight
+contention. A subject that is already limited keeps its `429` before admission. Login fails
+closed with a retryable service-unavailable response when the shared Redis coordination store
+is unavailable.
 
 ### In Memory (During Signing)
 - ✅ **Immediate zeroization**: Keys zeroed from memory after each signing operation using `zeroize` crate

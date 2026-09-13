@@ -393,8 +393,16 @@ async fn overload_rejection_does_not_consume_the_failure_budget() {
         }),
     );
 
+    let missing_email = format!("overload-missing-{}@example.com", Uuid::new_v4());
     assert_eq!(
         password_attempt(app.clone(), &email, "wrong-password")
+            .await
+            .0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    // An unregistered address is shed the same way under overload.
+    assert_eq!(
+        password_attempt(app.clone(), &missing_email, "wrong-password")
             .await
             .0,
         StatusCode::SERVICE_UNAVAILABLE

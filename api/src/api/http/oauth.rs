@@ -3656,18 +3656,17 @@ pub async fn oauth_login(
 
     // CPU admission precedes the attempt reservation so local overload cannot
     // spend an account's budget without a password comparison.
-    let bcrypt_permit = if user.is_some() {
-        Some(
-            auth_state
-                .state
-                .bcrypt
-                .reserve(BcryptWorkload::Login, BcryptOperation::Verify)
-                .await
-                .map_err(bcrypt_oauth_error)?,
-        )
+    let bcrypt_operation = if user.is_some() {
+        BcryptOperation::Verify
     } else {
-        None
+        BcryptOperation::Dummy
     };
+    let bcrypt_permit = auth_state
+        .state
+        .bcrypt
+        .reserve(BcryptWorkload::Login, bcrypt_operation)
+        .await
+        .map_err(bcrypt_oauth_error)?;
     let login_reservation = match login_limiter.reserve(tenant_id, &req.email).await {
         Ok(LoginAttemptAdmission::Reserved(reservation)) => reservation,
         Ok(LoginAttemptAdmission::Limited { retry_after }) => {
@@ -3701,6 +3700,14 @@ pub async fn oauth_login(
     let (public_key, password_hash, email_verified, user_status) = match user {
         Some(user) => user,
         None => {
+            // Burn an equivalent comparison so an unregistered address cannot
+            // be told apart by response latency or in-flight contention.
+            if let Err(error) = bcrypt_permit.burn_dummy(bcrypt::DEFAULT_COST).await {
+                if let Err(release_error) = login_reservation.release().await {
+                    tracing::error!("Password-login reservation release failed: {release_error}");
+                }
+                return Err(bcrypt_oauth_error(error));
+            }
             login_reservation.record_failure().await.map_err(|error| {
                 tracing::error!("Password-login failure recording failed: {error}");
                 OAuthError::ServiceUnavailable
@@ -3728,8 +3735,6 @@ pub async fn oauth_login(
         }
     };
 
-    // Reserved for every registered account above; fail closed if it is missing.
-    let bcrypt_permit = bcrypt_permit.ok_or(OAuthError::ServiceUnavailable)?;
     let valid = match bcrypt_permit
         .verify(
             SecretString::from(req.password.clone()),
