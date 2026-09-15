@@ -226,46 +226,6 @@ impl ServiceProvisioningOperationRepository {
         .map_err(Into::into)
     }
 
-    /// Start the conservative deletion clock for operations whose account is
-    /// already gone but whose deletion never stamped one.
-    ///
-    /// Deployments run migrations before the new revision serves, so a revision
-    /// that predates [`Self::mark_account_deleted_in_tx`] can delete an account
-    /// after the migration backfill ran. Nothing else repairs those rows:
-    /// compaction requires a clock and the overdue counter ignores a NULL one,
-    /// so the full record would otherwise be retained indefinitely without an
-    /// alert. This stamps detection time, never an inferred earlier deletion
-    /// time, and the row then follows the normal 30-day retention path.
-    pub async fn initialize_orphaned_deletion_clocks(
-        &self,
-        as_of: DateTime<Utc>,
-        batch_size: i64,
-    ) -> Result<u64, RepositoryError> {
-        sqlx::query(
-            "UPDATE service_provisioning_operations AS operation
-             SET deleted_at = $1
-             WHERE operation.provisioning_operation_id IN (
-                 SELECT orphan.provisioning_operation_id
-                 FROM service_provisioning_operations AS orphan
-                 WHERE orphan.deleted_at IS NULL
-                   AND NOT EXISTS (
-                       SELECT 1 FROM users
-                       WHERE users.tenant_id = orphan.tenant_id
-                         AND users.pubkey = orphan.user_pubkey
-                   )
-                 ORDER BY orphan.created_at, orphan.provisioning_operation_id
-                 LIMIT $2
-                 FOR UPDATE SKIP LOCKED
-             )",
-        )
-        .bind(as_of)
-        .bind(batch_size)
-        .execute(&self.pool)
-        .await
-        .map(|result| result.rows_affected())
-        .map_err(Into::into)
-    }
-
     pub async fn compact_for_account(
         &self,
         tenant_id: i64,

@@ -1,9 +1,6 @@
 //! Periodic cleanup for abandoned authentication state and bounded-retention service queues.
 
-use keycast_core::{
-    metrics::METRICS,
-    repositories::{AdminAuditEventRepository, ServiceProvisioningOperationRepository},
-};
+use keycast_core::{metrics::METRICS, repositories::AdminAuditEventRepository};
 use sqlx::PgPool;
 
 /// Remove expired email-marketing queue rows independently of the sync consumer.
@@ -141,25 +138,6 @@ pub fn spawn_cleanup_task(pool: PgPool) -> tokio::task::JoinHandle<()> {
 
             let retention_repo = AdminAuditEventRepository::new(pool.clone());
             let now = chrono::Utc::now();
-            // A revision that predates the retention stamp can delete an account
-            // during a mixed-version rollout, leaving its provisioning operation
-            // with no deletion clock. Start that conservative clock here, since
-            // nothing else visits the row until a compaction request names it.
-            match ServiceProvisioningOperationRepository::new(pool.clone())
-                .initialize_orphaned_deletion_clocks(now, 1_000)
-                .await
-            {
-                Ok(stamped) if stamped > 0 => tracing::warn!(
-                    stamped,
-                    "Retention task: started conservative deletion clocks for provisioning \
-                     operations whose account disappeared without one"
-                ),
-                Ok(_) => {}
-                Err(error) => tracing::error!(
-                    error = %error,
-                    "Retention task: failed to initialize orphaned provisioning deletion clocks"
-                ),
-            }
             match retention_repo.count_overdue_retention_rows(now).await {
                 Ok((deletions, provisioning)) => METRICS.set_retention_overdue(
                     deletions.try_into().unwrap_or_default(),

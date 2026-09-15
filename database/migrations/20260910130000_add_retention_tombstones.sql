@@ -32,6 +32,29 @@ WHERE NOT EXISTS (
       AND users.pubkey = operation.user_pubkey
 );
 
+-- Deployments run migrations before the new revision serves, so a revision that
+-- predates the application-level stamp can delete an account during a
+-- mixed-version rollout. The database starts the same conservative clock at
+-- deletion time, whatever revision issues the delete, so no orphaned operation
+-- is left without a clock. The application stamp remains in place; COALESCE
+-- keeps this idempotent.
+CREATE FUNCTION public.stamp_provisioning_deletion_clock() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    UPDATE public.service_provisioning_operations
+    SET deleted_at = COALESCE(deleted_at, NOW())
+    WHERE tenant_id = OLD.tenant_id
+      AND user_pubkey::text = OLD.pubkey::text;
+    RETURN NULL;
+END;
+$$;
+
+CREATE TRIGGER users_stamp_provisioning_deletion_clock
+    AFTER DELETE ON public.users
+    FOR EACH ROW
+    EXECUTE FUNCTION public.stamp_provisioning_deletion_clock();
+
 CREATE INDEX idx_service_provisioning_operations_tenant_pubkey
     ON service_provisioning_operations (tenant_id, (user_pubkey::text));
 

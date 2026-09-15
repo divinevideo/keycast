@@ -17,7 +17,7 @@ use keycast_api::api::http::{
 use keycast_core::repositories::{
     AdminAuditEventRecord, AdminAuditEventRepository, RetentionCompactionStatus,
     ServiceAccountDeletionOutcome, ServiceAccountDeletionRecord, ServiceAccountDeletionRepository,
-    ServiceProvisioningOperationRepository, UserRepository,
+    UserRepository,
 };
 use keycast_core::retention::RetentionDigestKeyring;
 use nostr_sdk::Keys;
@@ -314,27 +314,40 @@ async fn provisioning_compaction_uses_local_deletion_clock_and_returns_deleted_t
         .bind(&operation_id).execute(&pool).await.unwrap();
 }
 
-/// A revision that predates the stamping code can delete an account during a
-/// mixed-version rollout, leaving an operation whose deletion clock is NULL.
-/// The new revision must answer the exact replay terminally and must repair the
-/// clock so the record stays on the normal retention path instead of living
-/// forever as an ineligible row with no overdue alert.
+/// A revision that predates the application-level stamp can delete an account
+/// during a mixed-version rollout. The migration installs a delete trigger that
+/// records the same conservative clock whatever revision issues the delete, so
+/// the operation stays on the normal retention path instead of living forever
+/// as an ineligible row with no overdue alert. The new revision must also
+/// answer the exact replay terminally for that case.
 #[tokio::test]
 #[serial]
-async fn mixed_version_deletion_stays_terminal_and_starts_a_conservative_clock() {
+async fn mixed_version_deletion_stays_terminal_and_is_stamped_by_the_trigger() {
     env();
     let pool = common::setup_test_db().await;
     let (state, _producer) = common::create_test_auth_state(pool.clone());
     let (operation_id, username, pubkey) = provision_account(&state).await;
 
     // The migration ran while the account existed, so its operation has no
-    // clock; an older revision then deletes the user row without stamping one.
+    // clock; an older revision then deletes the user row without running any
+    // stamping code. The database trigger must still start the clock.
     sqlx::query("DELETE FROM users WHERE pubkey = $1 AND tenant_id = $2")
         .bind(&pubkey)
         .bind(TENANT_ID)
         .execute(&pool)
         .await
         .unwrap();
+    let deleted_at: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT deleted_at FROM service_provisioning_operations WHERE provisioning_operation_id = $1",
+    )
+    .bind(&operation_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        deleted_at.is_some(),
+        "the delete trigger stamps the clock for a revision that cannot"
+    );
 
     let replay = provisioning_app(state.clone())
         .oneshot(json_request(
@@ -355,7 +368,9 @@ async fn mixed_version_deletion_stays_terminal_and_starts_a_conservative_clock()
         "a deleted account must not hand back its pubkey"
     );
 
-    let first = retention_app(state.clone())
+    // The trigger stamps deletion time, so compaction before the 30-day window
+    // is ineligible and compacts once the window has passed.
+    let early = retention_app(state.clone())
         .oneshot(json_request(
             "/admin/retention/compaction",
             DELETION_TOKEN,
@@ -364,22 +379,9 @@ async fn mixed_version_deletion_stays_terminal_and_starts_a_conservative_clock()
         .await
         .unwrap();
     assert_eq!(
-        json(first).await["provisioning"][0]["status"],
-        "not_yet_eligible",
-        "compaction starts the clock instead of staying ineligible forever"
+        json(early).await["provisioning"][0]["status"],
+        "not_yet_eligible"
     );
-    let deleted_at: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
-        "SELECT deleted_at FROM service_provisioning_operations WHERE provisioning_operation_id = $1",
-    )
-    .bind(&operation_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert!(
-        deleted_at.is_some(),
-        "compaction starts the conservative clock"
-    );
-
     sqlx::query("UPDATE service_provisioning_operations SET deleted_at = NOW() - INTERVAL '31 days' WHERE provisioning_operation_id = $1")
         .bind(&operation_id)
         .execute(&pool)
@@ -421,9 +423,11 @@ async fn mixed_version_deletion_stays_terminal_and_starts_a_conservative_clock()
         .unwrap();
 }
 
+/// If a deletion ever escapes the database trigger, compaction must start the
+/// conservative clock instead of reporting the record ineligible forever.
 #[tokio::test]
 #[serial]
-async fn retention_sweep_starts_the_clock_once_for_an_orphaned_operation() {
+async fn compaction_backstops_an_orphaned_operation_with_no_clock() {
     env();
     let pool = common::setup_test_db().await;
     let (state, _producer) = common::create_test_auth_state(pool.clone());
@@ -435,40 +439,57 @@ async fn retention_sweep_starts_the_clock_once_for_an_orphaned_operation() {
         .execute(&pool)
         .await
         .unwrap();
-
-    let repository = ServiceProvisioningOperationRepository::new(pool.clone());
-    let as_of = Utc::now();
-    let stamped = repository
-        .initialize_orphaned_deletion_clocks(as_of, 100)
+    // Simulate a deletion that bypassed the trigger, for example a disabled
+    // trigger or a restore that recreated the operation row.
+    sqlx::query("UPDATE service_provisioning_operations SET deleted_at = NULL WHERE provisioning_operation_id = $1")
+        .bind(&operation_id)
+        .execute(&pool)
         .await
         .unwrap();
-    assert!(stamped >= 1, "the sweep stamps the orphaned operation");
-    let clock: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
-        "SELECT deleted_at FROM service_provisioning_operations WHERE provisioning_operation_id = $1",
-    )
-    .bind(&operation_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert!(clock.is_some(), "the sweep starts the conservative clock");
 
-    repository
-        .initialize_orphaned_deletion_clocks(as_of + Duration::seconds(1), 100)
+    let first = retention_app(state.clone())
+        .oneshot(json_request(
+            "/admin/retention/compaction",
+            DELETION_TOKEN,
+            serde_json::json!({"provisioning": {"pubkey": pubkey}}),
+        ))
         .await
         .unwrap();
-    let clock_after: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
-        "SELECT deleted_at FROM service_provisioning_operations WHERE provisioning_operation_id = $1",
-    )
-    .bind(&operation_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
     assert_eq!(
-        clock_after, clock,
-        "a later sweep must not refresh an existing clock"
+        json(first).await["provisioning"][0]["status"],
+        "not_yet_eligible"
+    );
+    let deleted_at: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT deleted_at FROM service_provisioning_operations WHERE provisioning_operation_id = $1",
+    )
+    .bind(&operation_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        deleted_at.is_some(),
+        "compaction repairs the missing conservative clock"
     );
 
-    sqlx::query("DELETE FROM service_provisioning_operations WHERE provisioning_operation_id = $1")
+    sqlx::query("UPDATE service_provisioning_operations SET deleted_at = NOW() - INTERVAL '31 days' WHERE provisioning_operation_id = $1")
+        .bind(&operation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let compacted = retention_app(state)
+        .oneshot(json_request(
+            "/admin/retention/compaction",
+            DELETION_TOKEN,
+            serde_json::json!({"provisioning": {"pubkey": pubkey}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        json(compacted).await["provisioning"][0]["status"],
+        "compacted"
+    );
+
+    sqlx::query("DELETE FROM service_provisioning_operation_tombstones WHERE provisioning_operation_id = $1")
         .bind(&operation_id)
         .execute(&pool)
         .await

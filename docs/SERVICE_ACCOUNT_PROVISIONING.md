@@ -23,14 +23,15 @@ mint at most one replacement token.
 
 Every successful account-deletion transaction stamps `deleted_at` on applicable
 provisioning operations. This includes the user-facing deletion path, so Keycast
-does not infer deletion time or rely on an external assertion. Existing operations
-whose account was already absent when the migration ran start a conservative new
-30-day clock at migration time.
-
-A deletion performed by a revision that predates the stamping code cannot stamp
-the clock. Keycast detects those orphaned operations in its periodic retention
-task and when a compaction request names them, and starts the same conservative
-30-day clock at detection time. Detection never infers an earlier deletion time.
+does not infer deletion time or rely on an external assertion. The migration also
+installs a trigger on `users` deletion that stamps the same clock in the
+database, so a revision that predates the application-level stamp cannot leave
+an untimestamped operation behind during a mixed-version rollout. Existing
+operations whose account was already absent when the migration ran start a
+conservative new 30-day clock at migration time. Compaction also starts that
+clock if it ever finds an orphaned operation, so the record never becomes
+permanently ineligible. Every repair uses detection or deletion time and never an
+inferred earlier one.
 
 After 30 days, the deletion coordinator may request compaction. Keycast replaces
 the complete row transactionally with a tombstone containing the operation ID,
