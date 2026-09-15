@@ -7,6 +7,7 @@ pub mod divine_names;
 pub mod email_service;
 pub mod handlers;
 pub mod key_egress_limiter;
+pub mod login_attempt_limiter;
 pub mod nip98;
 pub mod redis;
 mod replay_reservation;

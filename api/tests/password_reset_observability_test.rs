@@ -162,21 +162,30 @@ async fn test_reset_password_records_success_event_and_updates_hash() {
     .expect("Should create resettable user");
 
     let app = {
-        let pool = pool.clone();
+        let (auth_state, _producer) = common::create_test_auth_state(pool.clone());
+        let mut auth_state = auth_state;
+        let redis_url = std::env::var("TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://localhost:16379".to_string());
+        let client = redis::Client::open(redis_url).expect("valid test Redis URL");
+        let connection = redis::aio::ConnectionManager::new(client)
+            .await
+            .expect("connect to test Redis");
+        Arc::get_mut(&mut auth_state.state)
+            .expect("unique test state")
+            .redis = Some(keycast_api::PrefixedRedis::new(
+            connection,
+            Some(format!("password-reset:{}", Uuid::new_v4())),
+        ));
         Router::new()
             .route(
                 "/auth/reset-password",
                 post(
                     move |headers: HeaderMap, Json(req): Json<ResetPasswordRequest>| {
-                        let pool = pool.clone();
+                        let auth_state = auth_state.clone();
                         async move {
                             reset_password(
                                 create_test_tenant(),
-                                State(pool),
-                                axum::Extension(keycast_api::BcryptAdmission::new(
-                                    1,
-                                    std::time::Duration::from_secs(1),
-                                )),
+                                State(auth_state),
                                 headers,
                                 Json(req),
                             )

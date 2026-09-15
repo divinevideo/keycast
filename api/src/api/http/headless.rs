@@ -22,9 +22,10 @@ use serde::{Deserialize, Serialize};
 use super::auth::{
     generate_secure_token, normalize_registration_email, EMAIL_ALREADY_EXISTS_CODE,
     EMAIL_ALREADY_EXISTS_MESSAGE, EMAIL_VERIFICATION_EXPIRY_HOURS, INVALID_EMAIL_CODE,
-    INVALID_EMAIL_MESSAGE,
+    INVALID_EMAIL_MESSAGE, LOGIN_RATE_LIMIT_MESSAGE, TOO_MANY_ATTEMPTS_CODE,
 };
 use super::oauth::{extract_origin, parse_policy_scope};
+use crate::login_attempt_limiter::{LoginAttemptAdmission, LoginAttemptLimiter};
 
 // ============================================================================
 // Headless Registration
@@ -431,13 +432,108 @@ pub async fn headless_login(
         }
     };
 
-    // Fetch user with password hash
+    // Query first so database failures cannot strand an attempt lease. The
+    // limiter still runs before either credential branch returns.
     let user_repo = UserRepository::new(pool.clone());
     let user = user_repo.find_with_password(&req.email, tenant_id).await?;
+
+    let login_limiter = LoginAttemptLimiter::new(
+        auth_state
+            .state
+            .redis
+            .clone()
+            .ok_or_else(login_limiter_unavailable)?,
+    );
+    // Check before CPU admission so an already-limited subject keeps its 429
+    // even when the bcrypt pool is saturated.
+    match login_limiter.check(tenant_id, &req.email).await {
+        Ok(Some(retry_after)) => {
+            super::auth_observability::record_auth_event_and_log(
+                pool,
+                &headers,
+                None,
+                super::auth_observability::AuthEvent {
+                    tenant_id,
+                    endpoint,
+                    event_type: "login",
+                    outcome: "failure",
+                    reason_code: Some("rate_limited"),
+                    http_status: 429,
+                    email: Some(&req.email),
+                    pubkey: None,
+                    client_id: Some(&req.client_id),
+                    redirect_origin: Some(&redirect_origin),
+                    metadata_json: serde_json::json!({}),
+                },
+            )
+            .await;
+            return Err(HeadlessError::TooManyRequests { retry_after });
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::error!("Password-login limiter check failed: {error}");
+            return Err(login_limiter_unavailable());
+        }
+    }
+
+    // CPU admission precedes the attempt reservation so local overload cannot
+    // spend an account's budget without a password comparison.
+    let bcrypt_operation = if user.is_some() {
+        BcryptOperation::Verify
+    } else {
+        BcryptOperation::Dummy
+    };
+    let bcrypt_permit = auth_state
+        .state
+        .bcrypt
+        .reserve(BcryptWorkload::Login, bcrypt_operation)
+        .await
+        .map_err(bcrypt_headless_error)?;
+    let login_reservation = match login_limiter.reserve(tenant_id, &req.email).await {
+        Ok(LoginAttemptAdmission::Reserved(reservation)) => reservation,
+        Ok(LoginAttemptAdmission::Limited { retry_after }) => {
+            super::auth_observability::record_auth_event_and_log(
+                pool,
+                &headers,
+                None,
+                super::auth_observability::AuthEvent {
+                    tenant_id,
+                    endpoint,
+                    event_type: "login",
+                    outcome: "failure",
+                    reason_code: Some("rate_limited"),
+                    http_status: 429,
+                    email: Some(&req.email),
+                    pubkey: None,
+                    client_id: Some(&req.client_id),
+                    redirect_origin: Some(&redirect_origin),
+                    metadata_json: serde_json::json!({}),
+                },
+            )
+            .await;
+            return Err(HeadlessError::TooManyRequests { retry_after });
+        }
+        Err(error) => {
+            tracing::error!("Password-login limiter admission failed: {error}");
+            return Err(login_limiter_unavailable());
+        }
+    };
 
     let (public_key, password_hash, email_verified, _user_status) = match user {
         Some(u) => u,
         None => {
+            // Burn an equivalent comparison so an unregistered address cannot
+            // be told apart by response latency or in-flight contention.
+            if let Err(error) = bcrypt_permit.burn_dummy(bcrypt::DEFAULT_COST).await {
+                if let Err(release_error) = login_reservation.release().await {
+                    tracing::error!("Password-login reservation release failed: {release_error}");
+                }
+                return Err(bcrypt_headless_error(error));
+            }
+            login_reservation.record_failure().await.map_err(|error| {
+                tracing::error!("Password-login failure recording failed: {error}");
+                login_limiter_unavailable()
+            })?;
             super::auth_observability::record_auth_event_and_log(
                 pool,
                 &headers,
@@ -468,18 +564,27 @@ pub async fn headless_login(
         }
     };
 
-    let valid = auth_state
-        .state
-        .bcrypt
+    let valid = match bcrypt_permit
         .verify(
-            BcryptWorkload::Login,
             SecretString::from(req.password.clone()),
             password_hash.clone(),
         )
         .await
-        .map_err(bcrypt_headless_error)?;
+    {
+        Ok(valid) => valid,
+        Err(error) => {
+            if let Err(release_error) = login_reservation.release().await {
+                tracing::error!("Password-login reservation release failed: {release_error}");
+            }
+            return Err(bcrypt_headless_error(error));
+        }
+    };
 
     if !valid {
+        login_reservation.record_failure().await.map_err(|error| {
+            tracing::error!("Password-login failure recording failed: {error}");
+            login_limiter_unavailable()
+        })?;
         super::auth_observability::record_auth_event_and_log(
             pool,
             &headers,
@@ -509,6 +614,11 @@ pub async fn headless_login(
         METRICS.inc_login_failure();
         return Err(HeadlessError::Unauthorized);
     }
+
+    login_reservation.clear().await.map_err(|error| {
+        tracing::error!("Password-login limiter reset failed: {error}");
+        login_limiter_unavailable()
+    })?;
 
     // Check if email is verified
     if !email_verified {
@@ -1383,6 +1493,9 @@ pub enum HeadlessError {
         message: String,
         retry_after: Option<u32>,
     },
+    TooManyRequests {
+        retry_after: u32,
+    },
 }
 
 impl IntoResponse for HeadlessError {
@@ -1465,6 +1578,17 @@ impl IntoResponse for HeadlessError {
                 }
                 return response;
             }
+            HeadlessError::TooManyRequests { retry_after } => {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("Retry-After", retry_after.to_string())],
+                    Json(serde_json::json!({
+                        "error": LOGIN_RATE_LIMIT_MESSAGE,
+                        "code": TOO_MANY_ATTEMPTS_CODE,
+                    })),
+                )
+                    .into_response();
+            }
         };
 
         (
@@ -1475,6 +1599,13 @@ impl IntoResponse for HeadlessError {
             })),
         )
             .into_response()
+    }
+}
+
+fn login_limiter_unavailable() -> HeadlessError {
+    HeadlessError::ServiceUnavailable {
+        message: "Login is temporarily unavailable. Please try again shortly.".to_string(),
+        retry_after: Some(1),
     }
 }
 
@@ -1504,7 +1635,7 @@ impl From<keycast_core::repositories::RepositoryError> for HeadlessError {
 
 #[cfg(test)]
 mod tests {
-    use super::{bcrypt_headless_error, BcryptAdmissionError};
+    use super::{bcrypt_headless_error, BcryptAdmissionError, HeadlessError};
     use axum::{http::StatusCode, response::IntoResponse};
 
     #[test]
@@ -1512,6 +1643,13 @@ mod tests {
         let response = bcrypt_headless_error(BcryptAdmissionError::AtCapacity).into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()["Retry-After"], "1");
+    }
+
+    #[test]
+    fn login_limit_maps_to_429_with_retry_after() {
+        let response = HeadlessError::TooManyRequests { retry_after: 7 }.into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["Retry-After"], "7");
     }
 
     #[cfg(feature = "integration-tests")]

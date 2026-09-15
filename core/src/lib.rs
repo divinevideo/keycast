@@ -9,6 +9,7 @@ pub mod database;
 pub mod encryption;
 pub mod env_config;
 pub mod instance;
+pub mod login_attempts;
 pub mod metrics;
 pub mod oauth_scopes;
 pub mod repositories;
