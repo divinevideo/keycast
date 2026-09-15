@@ -401,7 +401,7 @@ impl ServiceProvisioningOperationRepository {
         .bind(fingerprint_digest)
         .bind(binding_digest)
         .bind(keys.current_version())
-        .bind(deleted_at)
+        .bind(row.created_at)
         .bind(as_of)
         .execute(&mut *tx)
         .await?;

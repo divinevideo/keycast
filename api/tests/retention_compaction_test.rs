@@ -243,6 +243,13 @@ async fn provisioning_compaction_uses_local_deletion_clock_and_returns_deleted_t
     )).await.unwrap();
     let created: CreateMinorAccountResponse = serde_json::from_value(json(created).await).unwrap();
     let pubkey = created.pubkey.expect("new account has a pubkey");
+    let operation_completed_at: chrono::DateTime<Utc> = sqlx::query_scalar(
+        "SELECT created_at FROM service_provisioning_operations WHERE provisioning_operation_id = $1",
+    )
+    .bind(&operation_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
 
     UserRepository::new(pool.clone())
         .delete_account(&pubkey, TENANT_ID)
@@ -278,6 +285,17 @@ async fn provisioning_compaction_uses_local_deletion_clock_and_returns_deleted_t
     assert_eq!(
         json(compacted).await["provisioning"][0]["status"],
         "compacted"
+    );
+    let tombstone_completed_at: chrono::DateTime<Utc> = sqlx::query_scalar(
+        "SELECT completed_at FROM service_provisioning_operation_tombstones WHERE provisioning_operation_id = $1",
+    )
+    .bind(&operation_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        tombstone_completed_at, operation_completed_at,
+        "compaction preserves the operation completion time instead of the deletion eligibility clock"
     );
 
     let replay = provisioning_app(state.clone()).oneshot(json_request(
