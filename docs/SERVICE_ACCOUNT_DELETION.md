@@ -151,16 +151,23 @@ with the deletion is the authoritative record regardless, so a failed audit
 insert cannot lose the fact that a deletion happened.
 
 No credentials, tokens, encrypted keys, or signed payloads are recorded, in the
-audit row or in logs.
+audit row or in logs. Deletion-specific audit rows expire after one year unless
+an active legal hold expressly covers the deletion request or account binding.
 
 ## Operational notes
 
 - `KEYCAST_DELETION_SERVICE_TOKEN` must be configured, or every call returns
   `service_auth_unavailable`. It must not reuse `KEYCAST_SERVICE_TOKEN`;
   rotating either credential does not grant the other credential's authority.
-- `service_account_deletions` grows one row per deletion request and is never
-  pruned automatically. It is the audit and idempotency trail — do not add a
-  retention job without deciding how long replayed requests must stay
-  answerable.
+- Complete `service_account_deletions` rows remain until the coordinator requests
+  compaction at least 30 days after completion. Keycast never compacts them on its
+  own timer. It alerts when an eligible row remains complete for more than 24
+  hours.
+- `POST /api/admin/retention/compaction` uses the same deletion-scoped bearer and
+  accepts an exact deletion request ID plus full pubkey. It reports `compacted`,
+  `already_compacted`, `not_yet_eligible`, `held`, `not_found`, or `conflict` and
+  marks only the first two as durable acknowledgements.
+- A compacted exact retry returns the original outcome with `replayed: true`.
+  Reusing its request ID for another tenant or pubkey remains a conflict.
 - The table intentionally has **no** foreign key to `users`: it records that an
   account was removed, so it has to outlive the account it names.

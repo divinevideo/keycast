@@ -15,7 +15,9 @@ use axum::{
 use http_body_util::BodyExt;
 use keycast_api::api::http::{
     routes::AuthState,
-    service_provisioning::{create_minor_account, CreateMinorAccountResponse},
+    service_provisioning::{
+        create_minor_account, CreateMinorAccountResponse, ProvisionedAccountState,
+    },
 };
 use keycast_core::{
     repositories::{
@@ -148,9 +150,14 @@ async fn replays_before_claim_after_claim_and_after_deletion() {
     assert!(claimed.claim_url.is_none());
     assert!(claimed.expires_at.is_none());
 
-    sqlx::query("DELETE FROM users WHERE pubkey = $1")
-        .bind(&first.pubkey)
-        .execute(&pool)
+    UserRepository::new(pool.clone())
+        .delete_account(
+            first
+                .pubkey
+                .as_deref()
+                .expect("created account has a pubkey"),
+            1,
+        )
         .await
         .unwrap();
     let deleted = build_app(state, 1)
@@ -158,8 +165,13 @@ async fn replays_before_claim_after_claim_and_after_deletion() {
         .await
         .unwrap();
     let deleted = response_typed(deleted).await;
-    assert_eq!(deleted.pubkey, first.pubkey);
+    assert_eq!(
+        deleted.account_state,
+        ProvisionedAccountState::AccountDeleted
+    );
+    assert!(deleted.pubkey.is_none());
     assert!(deleted.claim_url.is_none());
+    assert!(deleted.replayed);
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE username = $1")
         .bind(&username)
         .fetch_one(&pool)

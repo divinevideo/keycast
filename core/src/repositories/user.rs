@@ -3156,6 +3156,18 @@ impl UserRepository {
         .execute(&mut **tx)
         .await?;
 
+        // 4d. Preserve the deletion clock on any retry-safe provisioning operation
+        // before the user row disappears. This applies equally to self-service
+        // and coordinator-driven deletion, so compaction never has to trust an
+        // inferred or externally asserted timestamp.
+        super::ServiceProvisioningOperationRepository::mark_account_deleted_in_tx(
+            tx,
+            tenant_id,
+            pubkey,
+            Utc::now(),
+        )
+        .await?;
+
         // 5. Delete user (cascades to personal_keys, oauth_authorizations -> refresh_tokens,
         //    email_verification_tokens, password_reset_tokens, user_profiles,
         //    account_claim_tokens)

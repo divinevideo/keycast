@@ -21,6 +21,7 @@ aws-sdk-kms = { version = "1", optional = true }
 aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
 hex = "0.4"
 hkdf = "0.12"
+hmac = "0.12"
 lazy_static = "1.5.0"
 moka = { version = "0.12", features = ["future"] }
 nostr = { workspace = true }

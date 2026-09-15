@@ -12,9 +12,10 @@ use chrono::{DateTime, Utc};
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
     AccountDeletionOutcome, RepositoryError, ServiceAccountDeletionOutcome,
-    ServiceAccountDeletionRecord, ServiceAccountDeletionRepository, ServiceAccountDeletionRow,
-    UserRepository,
+    ServiceAccountDeletionRecord, ServiceAccountDeletionReplay, ServiceAccountDeletionRepository,
+    ServiceAccountDeletionRow, UserRepository,
 };
+use keycast_core::retention::RetentionDigestKeyring;
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 
@@ -143,7 +144,7 @@ fn map_service_token_error(err: ApiError) -> ServiceDeletionError {
 /// broader credential also authorizes unrelated administration and signing
 /// operations, while the coordinator needs authority only to complete an
 /// already-committed account deletion.
-fn authorize_deletion_service_token(headers: &HeaderMap) -> Result<(), ApiError> {
+pub(crate) fn authorize_deletion_service_token(headers: &HeaderMap) -> Result<(), ApiError> {
     authorize_configured_service_token(
         headers,
         "KEYCAST_DELETION_SERVICE_TOKEN",
@@ -195,32 +196,64 @@ fn validate_request_id(raw: &str) -> Result<String, ServiceDeletionError> {
 /// that is still live; deleting the newly named account would honour a request
 /// that was never made for it. Neither is recoverable, so this is terminal.
 fn replay(
-    existing: ServiceAccountDeletionRow,
+    existing: ServiceAccountDeletionReplay,
     tenant_id: i64,
     pubkey: &str,
 ) -> Result<Json<ServiceAccountDeletionResponse>, ServiceDeletionError> {
-    if existing.tenant_id != tenant_id || existing.user_pubkey.trim() != pubkey {
-        return Err(ServiceDeletionError::Conflict(
-            "deletion_request_id_reused",
-            "deletion_request_id is already bound to a different account".to_string(),
-        ));
-    }
+    let (deletion_request_id, outcome, completed_at) = match existing {
+        ServiceAccountDeletionReplay::Complete(existing) => {
+            if existing.tenant_id != tenant_id || existing.user_pubkey.trim() != pubkey {
+                return Err(ServiceDeletionError::Conflict(
+                    "deletion_request_id_reused",
+                    "deletion_request_id is already bound to a different account".to_string(),
+                ));
+            }
+            (
+                existing.deletion_request_id,
+                existing.outcome,
+                existing.completed_at,
+            )
+        }
+        ServiceAccountDeletionReplay::Compacted(existing) => {
+            let keys = RetentionDigestKeyring::from_env().map_err(|error| {
+                ServiceDeletionError::Unavailable(
+                    "retention_digest_keys_unavailable",
+                    error.to_string(),
+                )
+            })?;
+            let matches = keycast_core::repositories::verify_deletion_binding(
+                &keys, &existing, tenant_id, pubkey,
+            )
+            .map_err(map_repo_error)?;
+            if !matches {
+                return Err(ServiceDeletionError::Conflict(
+                    "deletion_request_id_reused",
+                    "deletion_request_id is already bound to a different account".to_string(),
+                ));
+            }
+            (
+                existing.deletion_request_id,
+                existing.outcome,
+                existing.completed_at,
+            )
+        }
+    };
 
     tracing::info!(
         event = "service_account_deletion_replayed",
         tenant_id = tenant_id,
         user_pubkey = %pubkey,
-        deletion_request_id = %existing.deletion_request_id,
-        outcome = %existing.outcome,
+        deletion_request_id = %deletion_request_id,
+        outcome = %outcome,
         "Replayed a completed deletion request"
     );
 
     Ok(Json(ServiceAccountDeletionResponse {
-        deletion_request_id: existing.deletion_request_id,
+        deletion_request_id,
         pubkey: pubkey.to_string(),
-        outcome: existing.outcome,
+        outcome,
         replayed: true,
-        completed_at: existing.completed_at,
+        completed_at,
     }))
 }
 
