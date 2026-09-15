@@ -21,18 +21,6 @@ CREATE INDEX idx_service_account_deletion_tombstones_completed_at
 ALTER TABLE service_provisioning_operations
     ADD COLUMN deleted_at TIMESTAMPTZ;
 
--- Accounts deleted before this migration have no trustworthy local deletion
--- timestamp. Start a conservative new retention clock instead of inferring an
--- earlier date and making their operation rows immediately disposable.
-UPDATE service_provisioning_operations AS operation
-SET deleted_at = NOW()
-WHERE NOT EXISTS (
-    SELECT 1
-    FROM users
-    WHERE users.tenant_id = operation.tenant_id
-      AND users.pubkey = operation.user_pubkey
-);
-
 CREATE INDEX idx_service_provisioning_operations_tenant_pubkey
     ON service_provisioning_operations (tenant_id, (user_pubkey::text));
 
@@ -93,10 +81,10 @@ CREATE INDEX idx_retention_legal_holds_active_scope
 -- is left without a clock. The application stamp remains in place; COALESCE
 -- keeps this idempotent.
 --
--- Last in the file deliberately: CREATE TRIGGER takes SHARE ROW EXCLUSIVE on
--- users, which blocks every write to the hottest table in the schema until the
--- migration commits. Creating it after the other DDL keeps that hold to the
--- trigger statement alone.
+-- Created after the other DDL deliberately: CREATE TRIGGER takes SHARE ROW
+-- EXCLUSIVE on users, which blocks every write to the hottest table in the
+-- schema until the migration commits. Creating it after the index builds keeps
+-- that hold short; only the one-pass backfill below follows it.
 CREATE FUNCTION public.stamp_provisioning_deletion_clock() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
@@ -113,3 +101,22 @@ CREATE TRIGGER users_stamp_provisioning_deletion_clock
     AFTER DELETE ON public.users
     FOR EACH ROW
     EXECUTE FUNCTION public.stamp_provisioning_deletion_clock();
+
+-- Accounts deleted before the trigger existed have no trustworthy local
+-- deletion timestamp. Start a conservative new retention clock instead of
+-- inferring an earlier date and making their operation rows immediately
+-- disposable.
+--
+-- This runs after CREATE TRIGGER deliberately. The trigger's SHARE ROW
+-- EXCLUSIVE lock on users is held to COMMIT, so no further deletion can commit
+-- between this statement and the end of the migration; the backfill therefore
+-- sees every deletion that ran while the migration was still installing the
+-- trigger, and no operation can be left without a clock afterwards.
+UPDATE service_provisioning_operations AS operation
+SET deleted_at = NOW()
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM users
+    WHERE users.tenant_id = operation.tenant_id
+      AND users.pubkey = operation.user_pubkey
+);
