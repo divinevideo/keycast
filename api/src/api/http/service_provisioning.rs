@@ -309,10 +309,19 @@ async fn replay_in_tx(
     ClaimTokenRepository::lock_for_user_in_tx(tx, row.user_pubkey.trim(), tenant_id)
         .await
         .map_err(map_repo_error)?;
-    let claimable = UserRepository::is_unclaimed_minor_in_tx(tx, &row.user_pubkey, tenant_id)
+    let claimable = match UserRepository::is_unclaimed_minor_in_tx(tx, &row.user_pubkey, tenant_id)
         .await
         .map_err(map_repo_error)?
-        .unwrap_or(false);
+    {
+        Some(claimable) => claimable,
+        None => {
+            // The account row is gone but the operation carries no deletion
+            // clock: a pre-migration revision deleted it during a mixed-version
+            // rollout. The result is still terminal, so an exact replay must not
+            // report the deleted account as claimed or hand back its pubkey.
+            return Ok(deleted_response());
+        }
+    };
     if !claimable {
         return Ok(claimed_response(row.user_pubkey.trim().to_string()));
     }

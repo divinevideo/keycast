@@ -27,6 +27,11 @@ does not infer deletion time or rely on an external assertion. Existing operatio
 whose account was already absent when the migration ran start a conservative new
 30-day clock at migration time.
 
+A deletion performed by a revision that predates the stamping code cannot stamp
+the clock. Keycast detects those orphaned operations in its periodic retention
+task and when a compaction request names them, and starts the same conservative
+30-day clock at detection time. Detection never infers an earlier deletion time.
+
 After 30 days, the deletion coordinator may request compaction. Keycast replaces
 the complete row transactionally with a tombstone containing the operation ID,
 tenant, terminal `account_deleted` outcome, completion time, and versioned keyed
