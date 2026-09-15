@@ -431,7 +431,7 @@ async fn compaction_backstops_an_orphaned_operation_with_no_clock() {
     env();
     let pool = common::setup_test_db().await;
     let (state, _producer) = common::create_test_auth_state(pool.clone());
-    let (operation_id, _username, pubkey) = provision_account(&state).await;
+    let (operation_id, username, pubkey) = provision_account(&state).await;
 
     sqlx::query("DELETE FROM users WHERE pubkey = $1 AND tenant_id = $2")
         .bind(&pubkey)
@@ -446,6 +446,27 @@ async fn compaction_backstops_an_orphaned_operation_with_no_clock() {
         .execute(&pool)
         .await
         .unwrap();
+
+    // The replay must stay terminal for the missing-clock state, before
+    // compaction repairs the clock.
+    let replay = provisioning_app(state.clone())
+        .oneshot(json_request(
+            "/admin/create-minor-account",
+            SERVICE_TOKEN,
+            serde_json::json!({
+                "provisioning_operation_id": operation_id,
+                "username": username,
+                "display_name": "Synthetic",
+            }),
+        ))
+        .await
+        .unwrap();
+    let replay = json(replay).await;
+    assert_eq!(replay["account_state"], "account_deleted");
+    assert!(
+        replay.get("pubkey").is_none(),
+        "a deleted account must not hand back its pubkey"
+    );
 
     let first = retention_app(state.clone())
         .oneshot(json_request(
