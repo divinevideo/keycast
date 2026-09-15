@@ -5352,6 +5352,13 @@ pub async fn delete_account(
             AuthError::Database(sqlx::Error::Protocol(e.to_string()))
         })?;
 
+    super::nostr_rpc::invalidate_account_status_cache(
+        &auth_state.state.account_status_cache,
+        &user_pubkey,
+        tenant_id,
+    )
+    .await;
+
     // Signal signer daemon to remove bunker connections
     if let Some(tx) = &auth_state.auth_tx {
         use keycast_core::authorization_channel::AuthorizationCommand;
@@ -5765,8 +5772,8 @@ mod tests {
 
     #[cfg(feature = "integration-tests")]
     use super::{
-        generate_ucan_token, login, update_profile, verify_email, verify_email_get, ProfileData,
-        VerifyEmailQuery, VerifyEmailRequest,
+        delete_account, generate_ucan_token, login, update_profile, verify_email, verify_email_get,
+        ProfileData, VerifyEmailQuery, VerifyEmailRequest,
     };
     #[cfg(feature = "integration-tests")]
     use crate::api::http::routes::{public_verify_email_route, AuthState};
@@ -5849,6 +5856,7 @@ mod tests {
                 key_manager,
                 signer_handlers: None,
                 http_handler_cache: crate::handlers::http_rpc_handler::new_http_handler_cache(),
+                account_status_cache: crate::state::new_account_status_cache(),
                 server_keys: Keys::generate(),
                 tenant_cache,
                 bcrypt,
@@ -5955,6 +5963,7 @@ mod tests {
                 key_manager,
                 signer_handlers: None,
                 http_handler_cache: new_http_handler_cache(),
+                account_status_cache: crate::state::new_account_status_cache(),
                 server_keys: Keys::generate(),
                 tenant_cache,
                 bcrypt,
@@ -7827,6 +7836,67 @@ mod tests {
 
         cleanup_verify_email_test_data(&pool, &first_pubkey, "unused").await;
         cleanup_verify_email_test_data(&pool, &second_pubkey, "unused").await;
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn user_account_deletion_invalidates_cached_account_status() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+        let keys = Keys::generate();
+        let pubkey = keys.public_key().to_hex();
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
+             VALUES ($1, $2, NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .bind(1_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+        auth_state
+            .state
+            .account_status_cache
+            .insert(
+                (1_i64, pubkey.clone()),
+                crate::state::AccountGateState::Present {
+                    status: "active".to_string(),
+                    verified_minor: false,
+                },
+            )
+            .await;
+
+        let token = generate_ucan_token(
+            &keys,
+            1_i64,
+            "delete@example.com",
+            "http://localhost:3000",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+
+        let response = delete_account(create_test_tenant(), State(auth_state.clone()), headers)
+            .await
+            .expect("user-signed account deletion must succeed");
+
+        assert!(response.success);
+        assert!(
+            auth_state
+                .state
+                .account_status_cache
+                .get(&(1_i64, pubkey))
+                .await
+                .is_none(),
+            "committed user deletion must remove the cached account status"
+        );
     }
 
     #[cfg(feature = "integration-tests")]

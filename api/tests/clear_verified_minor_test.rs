@@ -63,6 +63,7 @@ fn create_test_auth_state(pool: PgPool) -> AuthState {
             key_manager,
             signer_handlers: None,
             http_handler_cache: new_http_handler_cache(),
+            account_status_cache: keycast_api::state::new_account_status_cache(),
             server_keys: Keys::generate(),
             tenant_cache,
             bcrypt: bcrypt.clone(),
@@ -126,8 +127,20 @@ async fn test_clear_verified_minor_clears_and_returns_status() {
     common::assert_test_database_url();
     unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
     let pool = common::setup_test_db().await;
-    let app = build_app(create_test_auth_state(pool.clone()));
+    let auth_state = create_test_auth_state(pool.clone());
     let pubkey = create_verified_minor_user(&pool).await;
+    auth_state
+        .state
+        .account_status_cache
+        .insert(
+            (TENANT_ID, pubkey.clone()),
+            keycast_api::state::AccountGateState::Present {
+                status: "active".to_string(),
+                verified_minor: true,
+            },
+        )
+        .await;
+    let app = build_app(auth_state.clone());
 
     let resp = app
         .oneshot(
@@ -146,6 +159,15 @@ async fn test_clear_verified_minor_clears_and_returns_status() {
     let status: UserStatusResponse = serde_json::from_slice(&body).unwrap();
     assert!(!status.verified_minor);
     assert!(status.verified_minor_at.is_none());
+    assert!(
+        auth_state
+            .state
+            .account_status_cache
+            .get(&(TENANT_ID, pubkey))
+            .await
+            .is_none(),
+        "clearing verified_minor must invalidate the local account-status cache"
+    );
 }
 
 #[tokio::test]
