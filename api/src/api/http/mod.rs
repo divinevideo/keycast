@@ -14,6 +14,7 @@ pub mod html_safety;
 pub mod metrics;
 pub mod nostr_rpc;
 pub mod oauth;
+pub mod og_diviner;
 pub mod openid_configuration;
 pub mod policies;
 pub mod retention;

@@ -493,6 +493,59 @@ pub struct UserRepository {
 }
 
 impl UserRepository {
+    /// Whether a user completed Divine signup on or before the supplied cutoff.
+    ///
+    /// `users.created_at` is authoritative for ordinary registrations, but not
+    /// for preloaded accounts: those rows are created before their owner claims
+    /// them. Claim-token consumption and first-party mobile authorization are
+    /// therefore independent signup evidence with their own timestamps.
+    pub async fn is_og_diviner(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+        cutoff: DateTime<Utc>,
+    ) -> Result<bool, RepositoryError> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1
+                FROM users u
+                WHERE u.pubkey = $1
+                  AND u.tenant_id = $2
+                  AND (
+                    (
+                      u.created_at < $3
+                      AND u.email_verified = TRUE
+                      AND u.password_hash IS NOT NULL
+                      AND NOT EXISTS (
+                        SELECT 1 FROM account_claim_tokens ct
+                        WHERE ct.user_pubkey = u.pubkey
+                          AND ct.tenant_id = u.tenant_id
+                      )
+                    )
+                    OR EXISTS (
+                      SELECT 1 FROM account_claim_tokens ct
+                      WHERE ct.user_pubkey = u.pubkey
+                        AND ct.tenant_id = u.tenant_id
+                        AND ct.used_at < $3
+                    )
+                    OR EXISTS (
+                      SELECT 1 FROM oauth_authorizations oa
+                      WHERE oa.user_pubkey = u.pubkey
+                        AND oa.tenant_id = u.tenant_id
+                        AND oa.client_id = 'divine-mobile'
+                        AND oa.created_at < $3
+                    )
+                  )
+            )",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .bind(cutoff)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Create a new UserRepository with the given connection pool.
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
