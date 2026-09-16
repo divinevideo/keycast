@@ -3594,8 +3594,9 @@ mod tests {
 
     /// Smallest cost advantage the trigram plan must hold over the best plan that cannot use it.
     ///
-    /// Measured at 8x or better across empty, populated, and index-bloated databases. Before
-    /// #335 the fixture ran at 1.0x to 1.5x, close enough that ambient rows decided the winner.
+    /// Measured at 8x or better across empty, populated, and index-bloated databases under this
+    /// fixture's planner settings. Before #335 the fixture ran at 1.0x to 1.5x, close enough that
+    /// ambient rows decided the winner.
     const MIN_TRIGRAM_PLAN_COST_ADVANTAGE: f64 = 4.0;
 
     fn plan_mentions_index(plan: &serde_json::Value, index_name: &str) -> bool {
@@ -4268,9 +4269,10 @@ mod tests {
         );
 
         // GIN indexes are only reachable through a bitmap scan, so switching bitmap scans off
-        // prices the best plan the database can offer without the trigram index. Pinning the gap
-        // keeps the assertion above honest: it reads a planner preference, and a preference held
-        // by the 1.0x to 1.5x this fixture used to run at is not evidence the index does any work.
+        // prices the best plan the database can offer without the trigram index while the
+        // fixture's sequential scans stay off. Pinning the gap keeps the assertion above honest:
+        // it reads a planner preference, and a preference held by the 1.0x to 1.5x this fixture
+        // used to run at is not evidence the index does any work.
         sqlx::query("SET LOCAL enable_bitmapscan = off")
             .execute(&mut *transaction)
             .await
@@ -4294,8 +4296,8 @@ mod tests {
         let cost_advantage = fallback_cost / trigram_cost;
         assert!(
             cost_advantage >= MIN_TRIGRAM_PLAN_COST_ADVANTAGE,
-            "the trigram index should beat every plan that cannot use it by at least \
-             {MIN_TRIGRAM_PLAN_COST_ADVANTAGE}x, got {cost_advantage:.2}x \
+            "with sequential scans off, the trigram index should beat every plan that cannot use \
+             it by at least {MIN_TRIGRAM_PLAN_COST_ADVANTAGE}x, got {cost_advantage:.2}x \
              ({trigram_cost} against {fallback_cost})"
         );
     }
