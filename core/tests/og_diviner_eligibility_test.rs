@@ -64,6 +64,7 @@ async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
     let ordinary = pubkey('1');
     let unclaimed = pubkey('2');
     let claimed_late = pubkey('3');
+    let claimed_early = pubkey('a');
     let mobile_authorized = pubkey('4');
     let ordinary_completed_late = pubkey('6');
     let ordinary_at_cutoff = pubkey('7');
@@ -72,6 +73,7 @@ async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
         ordinary.as_str(),
         unclaimed.as_str(),
         claimed_late.as_str(),
+        claimed_early.as_str(),
         mobile_authorized.as_str(),
         ordinary_completed_late.as_str(),
         ordinary_at_cutoff.as_str(),
@@ -127,6 +129,7 @@ async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
     for key in [
         &unclaimed,
         &claimed_late,
+        &claimed_early,
         &mobile_authorized,
         &mobile_at_cutoff,
     ] {
@@ -141,7 +144,11 @@ async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
         .unwrap();
     }
 
-    for (key, used_at) in [(&unclaimed, None), (&claimed_late, Some(cutoff))] {
+    for (key, used_at) in [
+        (&unclaimed, None),
+        (&claimed_late, Some(cutoff)),
+        (&claimed_early, Some(cutoff - chrono::Duration::seconds(1))),
+    ] {
         sqlx::query(
             "INSERT INTO account_claim_tokens
              (token, user_pubkey, tenant_id, expires_at, used_at, created_at)
@@ -196,7 +203,7 @@ async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
     // when one of them fails.
     purge(&pool, &keys).await;
 
-    let [ordinary_eligible, unclaimed_eligible, claimed_late_eligible, mobile_authorized_eligible, completed_late_eligible, at_cutoff_eligible, mobile_at_cutoff_eligible] =
+    let [ordinary_eligible, unclaimed_eligible, claimed_late_eligible, claimed_early_eligible, mobile_authorized_eligible, completed_late_eligible, at_cutoff_eligible, mobile_at_cutoff_eligible] =
         observed[..]
     else {
         panic!("expected one observation per fixture");
@@ -214,6 +221,10 @@ async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
     assert!(
         !claimed_late_eligible,
         "a preloaded account claimed at or after the cutoff does not qualify"
+    );
+    assert!(
+        claimed_early_eligible,
+        "a preloaded account claimed before the cutoff qualifies on the claim timestamp"
     );
     assert!(
         mobile_authorized_eligible,
