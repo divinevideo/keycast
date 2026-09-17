@@ -7,8 +7,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use chrono::{TimeZone, Utc};
-use keycast_core::repositories::UserRepository;
+use keycast_core::repositories::{og_diviner_cutoff, UserRepository};
 use nostr_sdk::PublicKey;
 use serde::Serialize;
 use sqlx::PgPool;
@@ -31,16 +30,10 @@ pub async fn get_og_diviner_eligibility(
             .into_response();
     };
 
-    // Product policy closes the cohort at midnight US Eastern time following
-    // August 17, 2026. Eastern daylight time was UTC-04:00 on that date.
-    let cutoff = Utc
-        .with_ymd_and_hms(2026, 8, 18, 4, 0, 0)
-        .single()
-        .expect("OG Diviner cutoff is a valid UTC timestamp");
     let repository = UserRepository::new(pool);
 
     match repository
-        .is_og_diviner(&pubkey.to_hex(), tenant.0.id, cutoff)
+        .is_og_diviner(&pubkey.to_hex(), tenant.0.id, og_diviner_cutoff())
         .await
     {
         Ok(eligible) => {

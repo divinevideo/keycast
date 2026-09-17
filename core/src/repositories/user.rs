@@ -3,9 +3,10 @@
 
 use crate::repositories::RepositoryError;
 use crate::types::user::{User, UserAtprotoState, UserStatus};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use nostr_sdk::PublicKey;
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
+use std::sync::OnceLock;
 
 pub type StatusTransition = (
     UserStatus,
@@ -490,6 +491,23 @@ fn classify_conditional_write(existed: i64, updated: i64) -> ConditionalWrite {
 #[derive(Debug, Clone)]
 pub struct UserRepository {
     pool: PgPool,
+}
+
+/// The instant the Divine signup cohort behind the OG Diviner chit closed.
+///
+/// Product policy closes the cohort at midnight US Eastern time following
+/// August 17, 2026. Eastern daylight time was UTC-04:00 on that date.
+///
+/// This is business policy, so it lives beside the query that applies it rather
+/// than in a request handler. Callers read this instead of restating the
+/// literal, so the HTTP route and the tests cannot drift apart.
+pub fn og_diviner_cutoff() -> DateTime<Utc> {
+    static CUTOFF: OnceLock<DateTime<Utc>> = OnceLock::new();
+    *CUTOFF.get_or_init(|| {
+        Utc.with_ymd_and_hms(2026, 8, 18, 4, 0, 0)
+            .single()
+            .expect("OG Diviner cutoff is a valid UTC timestamp")
+    })
 }
 
 impl UserRepository {

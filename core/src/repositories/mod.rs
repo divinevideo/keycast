@@ -59,8 +59,8 @@ pub use service_provisioning_operation::{
 pub use stored_key::StoredKeyRepository;
 pub use team::TeamRepository;
 pub use user::{
-    AccountDeletionOutcome, AccountStatusRow, AccountStatusWithMinorRow, AdminUserDetails,
-    AdminUserLookup, AdminUserMatchKind, ClaimConsumeOutcome, ConditionalWrite,
+    og_diviner_cutoff, AccountDeletionOutcome, AccountStatusRow, AccountStatusWithMinorRow,
+    AdminUserDetails, AdminUserLookup, AdminUserMatchKind, ClaimConsumeOutcome, ConditionalWrite,
     DeleteAccountResult, FinalizeEmailOutcome, FullAdminStatusRow, PendingEmailChange,
     PendingEmailSide, UserRepository, VerificationTokenData, VerifiedMinorRow,
 };

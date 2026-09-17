@@ -3,8 +3,7 @@
 // ABOUTME: Verifies OG Diviner eligibility uses the frozen signup policy.
 // ABOUTME: Guards the cutoff and excludes preloaded-but-unclaimed accounts.
 
-use chrono::{TimeZone, Utc};
-use keycast_core::repositories::UserRepository;
+use keycast_core::repositories::{og_diviner_cutoff, UserRepository};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -25,7 +24,9 @@ fn pubkey(seed: char) -> String {
 async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
     let pool = pool().await;
     let repository = UserRepository::new(pool.clone());
-    let cutoff = Utc.with_ymd_and_hms(2026, 8, 18, 4, 0, 0).unwrap();
+    // The real policy value, not a restatement of it: if the cutoff moves, this
+    // test moves with it instead of silently testing a date nothing ships.
+    let cutoff = og_diviner_cutoff();
     let ordinary = pubkey('1');
     let unclaimed = pubkey('2');
     let claimed_late = pubkey('3');
