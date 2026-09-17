@@ -522,6 +522,16 @@ impl UserRepository {
     /// those rows are created before their owner claims them. Claim-token
     /// consumption and first-party mobile authorization are therefore
     /// independent signup evidence with their own timestamps.
+    ///
+    /// "Completed" here means `email_verified` with a password hash and no
+    /// claim-token row. That is a fourth spelling of account completeness in
+    /// this codebase -- [`Self::is_unclaimed`] uses `email IS NULL`,
+    /// [`Self::is_unclaimed_minor_in_tx`] adds `verified_minor` and a NULL
+    /// password hash, and `OAuthCodeRepository::materialize_pending_registration`
+    /// uses a third combination. They are not interchangeable, and this is the
+    /// only one whose disagreement is silent: it returns a wrong boolean rather
+    /// than an error. If what "claimed" means ever changes, this predicate has
+    /// to be revisited with the other three.
     pub async fn is_og_diviner(
         &self,
         pubkey: &str,
