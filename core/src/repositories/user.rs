@@ -532,6 +532,14 @@ impl UserRepository {
             "SELECT EXISTS (
                 SELECT 1
                 FROM users u
+                LEFT JOIN LATERAL (
+                  SELECT
+                    count(*) > 0 AS preloaded,
+                    bool_or(ct.used_at < $3) AS claimed_before_cutoff
+                  FROM account_claim_tokens ct
+                  WHERE ct.user_pubkey = u.pubkey
+                    AND ct.tenant_id = u.tenant_id
+                ) claim ON TRUE
                 WHERE u.pubkey = $1
                   AND u.tenant_id = $2
                   AND (
@@ -539,18 +547,9 @@ impl UserRepository {
                       u.created_at < $3
                       AND u.email_verified = TRUE
                       AND u.password_hash IS NOT NULL
-                      AND NOT EXISTS (
-                        SELECT 1 FROM account_claim_tokens ct
-                        WHERE ct.user_pubkey = u.pubkey
-                          AND ct.tenant_id = u.tenant_id
-                      )
+                      AND NOT claim.preloaded
                     )
-                    OR EXISTS (
-                      SELECT 1 FROM account_claim_tokens ct
-                      WHERE ct.user_pubkey = u.pubkey
-                        AND ct.tenant_id = u.tenant_id
-                        AND ct.used_at < $3
-                    )
+                    OR claim.claimed_before_cutoff
                     OR EXISTS (
                       SELECT 1 FROM oauth_authorizations oa
                       WHERE oa.user_pubkey = u.pubkey
