@@ -513,18 +513,31 @@ pub fn og_diviner_cutoff() -> DateTime<Utc> {
 impl UserRepository {
     /// Whether a user belongs to the Divine signup cohort frozen at the supplied cutoff.
     ///
-    /// An ordinary registration qualifies when it was initiated before the
-    /// cutoff and the account has since been completed. Email verification did
-    /// not historically retain its own immutable completion timestamp, so this
+    /// A web registration qualifies when its durable user row was created
+    /// before the cutoff and the account has since been completed. Web creates
+    /// that row when registration starts, and email verification did not
+    /// historically retain its own immutable completion timestamp, so this
     /// deliberately does not require completion before the cutoff.
     ///
     /// `users.created_at` is not authoritative for preloaded accounts because
     /// those rows are created before their owner claims them. Claim-token
     /// consumption and first-party mobile authorization are therefore
-    /// independent signup evidence with their own timestamps.
+    /// independent signup evidence with their own timestamps. Headless/mobile
+    /// registration does not create its user row until verification, and its
+    /// pending initiation row is deleted after materialization. Historical
+    /// initiation time therefore cannot be recovered for completed mobile
+    /// registrations; their materialization/authorization time is the durable
+    /// boundary. Product accepts the resulting boundary ambiguity (at most the
+    /// 24-hour verification window) rather than widening this frozen cohort.
     ///
-    /// "Completed" here means `email_verified` with a password hash and no
-    /// claim-token row. That is a fourth spelling of account completeness in
+    /// Eligibility is historical and remains true if an otherwise-qualified
+    /// account is later suspended or banned. Enforcement of current account
+    /// status belongs to authorization paths, not this cohort classifier.
+    ///
+    /// "Completed" here means `email_verified` with a password hash. The
+    /// `vine_id` column, not the continued existence of a claim-token row, is
+    /// the authoritative marker that an account was preloaded. This is a fourth
+    /// spelling of account completeness in
     /// this codebase -- [`Self::is_unclaimed`] uses `email IS NULL`,
     /// [`Self::is_unclaimed_minor_in_tx`] adds `verified_minor` and a NULL
     /// password hash, and `OAuthCodeRepository::materialize_pending_registration`
@@ -544,7 +557,7 @@ impl UserRepository {
                 FROM users u
                 LEFT JOIN LATERAL (
                   SELECT
-                    count(*) > 0 AS preloaded,
+                    count(*) > 0 AS has_claim_token,
                     bool_or(ct.used_at < $3) AS claimed_before_cutoff
                   FROM account_claim_tokens ct
                   WHERE ct.user_pubkey = u.pubkey
@@ -557,7 +570,8 @@ impl UserRepository {
                       u.created_at < $3
                       AND u.email_verified = TRUE
                       AND u.password_hash IS NOT NULL
-                      AND NOT claim.preloaded
+                      AND u.vine_id IS NULL
+                      AND NOT claim.has_claim_token
                     )
                     OR claim.claimed_before_cutoff
                     OR EXISTS (
