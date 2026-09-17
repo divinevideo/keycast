@@ -69,6 +69,8 @@ async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
     let ordinary_completed_late = pubkey('6');
     let ordinary_at_cutoff = pubkey('7');
     let mobile_at_cutoff = pubkey('8');
+    let preloaded_mobile_authorized = pubkey('f');
+    let preloaded_mobile_at_cutoff = pubkey('0');
     let preloaded_without_token = pubkey('b');
     let claimed_after_cutoff_token_deleted = pubkey('c');
     let suspended_ordinary = pubkey('d');
@@ -82,6 +84,8 @@ async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
         ordinary_completed_late.as_str(),
         ordinary_at_cutoff.as_str(),
         mobile_at_cutoff.as_str(),
+        preloaded_mobile_authorized.as_str(),
+        preloaded_mobile_at_cutoff.as_str(),
         preloaded_without_token.as_str(),
         claimed_after_cutoff_token_deleted.as_str(),
         suspended_ordinary.as_str(),
@@ -218,24 +222,40 @@ async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
         .await
         .unwrap();
 
-    for (key, bunker, created_at) in [
+    for (key, bunker, created_at, vine_id) in [
         (
             &mobile_authorized,
             pubkey('5'),
             cutoff - chrono::Duration::seconds(1),
+            None,
         ),
-        (&mobile_at_cutoff, pubkey('9'), cutoff),
+        (&mobile_at_cutoff, pubkey('9'), cutoff, None),
+        (
+            &preloaded_mobile_authorized,
+            pubkey('b'),
+            cutoff - chrono::Duration::seconds(1),
+            Some("vine-mobile-before-cutoff"),
+        ),
+        (
+            &preloaded_mobile_at_cutoff,
+            pubkey('c'),
+            cutoff,
+            Some("vine-mobile-at-cutoff"),
+        ),
     ] {
         // This matches completed headless materialization: the user and first
         // mobile authorization are created together at verification time.
+        // Preloaded fixtures have no claim token and cannot use the ordinary
+        // signup branch, isolating authorization evidence and its cutoff.
         sqlx::query(
             "INSERT INTO users
-             (pubkey, tenant_id, email, email_verified, password_hash, created_at, updated_at)
-             VALUES ($1, 1, $2, TRUE, 'hash', $3, $3)",
+             (pubkey, tenant_id, email, email_verified, password_hash, created_at, updated_at, vine_id)
+             VALUES ($1, 1, $2, TRUE, 'hash', $3, $3, $4)",
         )
         .bind(key)
         .bind(format!("mobile-{key}@example.invalid"))
         .bind(created_at)
+        .bind(vine_id)
         .execute(&pool)
         .await
         .unwrap();
@@ -271,7 +291,7 @@ async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
     // when one of them fails.
     purge(&pool, &keys).await;
 
-    let [ordinary_eligible, unclaimed_eligible, claimed_late_eligible, claimed_early_eligible, mobile_authorized_eligible, completed_late_eligible, at_cutoff_eligible, mobile_at_cutoff_eligible, preloaded_without_token_eligible, deleted_claim_token_eligible, suspended_ordinary_eligible, banned_claimed_early_eligible] =
+    let [ordinary_eligible, unclaimed_eligible, claimed_late_eligible, claimed_early_eligible, mobile_authorized_eligible, completed_late_eligible, at_cutoff_eligible, mobile_at_cutoff_eligible, preloaded_mobile_authorized_eligible, preloaded_mobile_at_cutoff_eligible, preloaded_without_token_eligible, deleted_claim_token_eligible, suspended_ordinary_eligible, banned_claimed_early_eligible] =
         observed[..]
     else {
         panic!("expected one observation per fixture");
@@ -282,6 +302,14 @@ async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
         "an unverified account is not yet complete, so it does not qualify"
     );
     assert!(ordinary_eligible, "pre-cutoff completed signup qualifies");
+    assert!(
+        preloaded_mobile_authorized_eligible,
+        "a preloaded account without claim tokens qualifies through pre-cutoff mobile authorization"
+    );
+    assert!(
+        !preloaded_mobile_at_cutoff_eligible,
+        "mobile authorization at the cutoff does not qualify a preloaded account"
+    );
     assert!(
         !unclaimed_eligible,
         "a preloaded account nobody claimed does not qualify"
