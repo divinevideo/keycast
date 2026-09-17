@@ -7,6 +7,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
     Form,
 };
+use chrono::{Duration, Utc};
 use nostr_sdk::Keys;
 use secrecy::SecretString;
 use serde::Deserialize;
@@ -26,7 +27,8 @@ fn password_visibility_toggle_html(field_id: &str) -> String {
     )
 }
 
-/// Get server keys from SERVER_NSEC environment variable
+/// Get server keys from SERVER_NSEC environment variable, for signing the
+/// session UCAN issued when a claim confirmation completes.
 fn get_server_keys() -> Result<Keys, ClaimError> {
     let server_nsec = std::env::var("SERVER_NSEC")
         .map_err(|_| ClaimError::Internal("SERVER_NSEC not configured".to_string()))?;
@@ -41,12 +43,22 @@ pub struct ClaimQuery {
 }
 
 /// Form data for POST /claim
-#[derive(Debug, Deserialize)]
+///
+/// Does not derive `Debug`: the `password`/`password_confirmation` fields
+/// hold plaintext, and no call site formats this struct, so there is nothing
+/// for a derived impl to serve except an accidental future leak into logs.
+#[derive(Deserialize)]
 pub struct ClaimForm {
     pub token: String,
     pub email: String,
     pub password: String,
     pub password_confirmation: String,
+}
+
+/// Form data for POST /api/claim/resend
+#[derive(Debug, Deserialize)]
+pub struct ClaimResendForm {
+    pub token: String,
 }
 
 /// GET /claim?token=...
@@ -381,78 +393,182 @@ pub async fn claim_post(
             }
         })?;
 
-    // Consume the token and claim the account atomically (#280 review): the
-    // classification above is a point-in-time read, so an admin invalidation
-    // (e.g. clear-verified-minor revoking this account's outstanding link) can
-    // land between it and this point. The single-transaction consume re-checks
-    // validity under the row lock and only mutates the user if it wins, so a
-    // revoked link can never complete a claim.
-    use keycast_core::repositories::ClaimConsumeOutcome;
-    let outcome = user_repo
-        .claim_account_consuming_token(&form.token, tenant_id, &form.email, &password_hash)
-        .await
-        .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?;
+    // Stage the pending claim instead of completing it: email, password hash,
+    // and a fresh confirmation token sit on the claim-token row until the
+    // claimer proves control of the address via the emailed confirmation link
+    // (see claim_confirm_get below). The guarded write re-checks validity under
+    // the row lock, same as the old consume did, so a concurrent admin
+    // invalidation (e.g. clear-verified-minor revoking this account's
+    // outstanding link) still cannot land a claim.
+    let confirmation_token = super::auth::generate_secure_token();
+    let confirmation_expires_at = Utc::now()
+        + Duration::hours(keycast_core::types::claim_token::CLAIM_CONFIRMATION_EXPIRY_HOURS);
 
-    match outcome {
-        ClaimConsumeOutcome::Claimed { user_pubkey } if user_pubkey == claim_token.user_pubkey => {}
-        ClaimConsumeOutcome::Claimed { user_pubkey } => {
-            return Err(ClaimError::Internal(format!(
-                "Claimed pubkey mismatch: token row {} vs classified {}",
-                user_pubkey, claim_token.user_pubkey
-            )));
+    use keycast_core::repositories::StagePendingOutcome;
+    match claim_token_repo
+        .stage_pending_claim(
+            &form.token,
+            tenant_id,
+            &form.email,
+            &password_hash,
+            &confirmation_token,
+            confirmation_expires_at,
+        )
+        .await
+        .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?
+    {
+        StagePendingOutcome::Staged => {}
+        StagePendingOutcome::TokenNotStageable => {
+            // Token died between classification and staging (e.g. an admin
+            // invalidation landed in between) - re-classify so the user gets
+            // the state-specific error page.
+            return Err(reclassify_to_error(&claim_token_repo, &form.token, tenant_id).await?);
         }
-        ClaimConsumeOutcome::TokenNotConsumable => {
-            // Token died between classification and consume — re-classify so
-            // the user gets the state-specific error page.
-            return Err(
-                match claim_token_repo
-                    .classify(&form.token, tenant_id)
-                    .await
-                    .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?
-                {
-                    ClaimTokenState::AlreadyClaimed(_) => ClaimError::TokenAlreadyClaimed,
-                    ClaimTokenState::AdminInvalidated(_) => ClaimError::TokenAdminInvalidated,
-                    ClaimTokenState::Replaced { .. } => ClaimError::TokenReplaced,
-                    ClaimTokenState::Expired(_) => ClaimError::TokenExpired,
-                    ClaimTokenState::Unrecognized => ClaimError::TokenUnrecognized,
-                    // A token that failed the consume cannot classify Valid
-                    // (used/invalidated/expired are one-way); treat as internal.
-                    ClaimTokenState::Valid(_) => ClaimError::Internal(
-                        "Token consume failed but token classifies as valid".to_string(),
-                    ),
-                },
+        StagePendingOutcome::SendLimitReached => {
+            // The link is still valid but has spent its lifetime confirmation
+            // budget. Nothing was staged and nothing is sent; the claimer needs
+            // a fresh claim token from support.
+            tracing::warn!(
+                "Claim confirmation send budget exhausted: pubkey={}",
+                &claim_token.user_pubkey
             );
+            return Err(ClaimError::ConfirmationSendLimitReached);
         }
-        ClaimConsumeOutcome::UserNotClaimable => {
-            return Err(ClaimError::TokenAlreadyClaimed);
+    }
+
+    // Best-effort send; a send failure should not strand a staged claim
+    // silently, so surface it to the claimer instead of showing a
+    // "check your email" page for an email that was never sent.
+    match crate::email_service::EmailService::new() {
+        Ok(email_service) => {
+            if let Err(e) = email_service
+                .send_claim_confirmation(&form.email, &confirmation_token)
+                .await
+            {
+                tracing::error!(
+                    "Failed to send claim confirmation to {}: {}",
+                    &form.email,
+                    e
+                );
+                return Err(ClaimError::Internal(
+                    "Could not send confirmation email".to_string(),
+                ));
+            }
+        }
+        Err(e) => {
+            tracing::error!("Email service unavailable: {}", e);
+            return Err(ClaimError::Internal(
+                "Could not send confirmation email".to_string(),
+            ));
         }
     }
 
     tracing::info!(
-        "Account claimed: pubkey={}, email={}",
-        &claim_token.user_pubkey[..8],
-        &form.email
+        "Claim staged: pubkey={}, confirmation email sent",
+        &claim_token.user_pubkey
     );
 
-    // Generate session UCAN and set cookie
-    let user_pubkey = nostr_sdk::PublicKey::from_hex(&claim_token.user_pubkey)
+    Ok(Html(claim_confirmation_sent_html(Some(&form.email), &form.token)).into_response())
+}
+
+/// Re-classify a claim token that failed a guarded write (stage_pending_claim
+/// now; claim_account_consuming_token previously) between the initial
+/// `classify` call and the write itself, most commonly an admin invalidation
+/// landing in between. Maps the token's current terminal state to the
+/// state-specific error page so the claimer isn't shown a generic failure.
+/// Shared by `claim_post` and `claim_confirm_get`.
+async fn reclassify_to_error(
+    claim_token_repo: &ClaimTokenRepository,
+    token: &str,
+    tenant_id: i64,
+) -> Result<ClaimError, ClaimError> {
+    use keycast_core::types::claim_token::ClaimTokenState;
+    Ok(
+        match claim_token_repo
+            .classify(token, tenant_id)
+            .await
+            .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?
+        {
+            ClaimTokenState::AlreadyClaimed(_) => ClaimError::TokenAlreadyClaimed,
+            ClaimTokenState::AdminInvalidated(_) => ClaimError::TokenAdminInvalidated,
+            ClaimTokenState::Replaced { .. } => ClaimError::TokenReplaced,
+            ClaimTokenState::Expired(_) => ClaimError::TokenExpired,
+            ClaimTokenState::Unrecognized => ClaimError::TokenUnrecognized,
+            // A token that failed the guarded write cannot classify Valid
+            // (used/invalidated/expired are one-way); treat as internal.
+            ClaimTokenState::Valid(_) => {
+                ClaimError::Internal("Token write failed but token classifies as valid".to_string())
+            }
+        },
+    )
+}
+
+/// GET /api/claim/confirm?token=<confirmation_token>
+/// Completes a staged claim when the claimer clicks the emailed confirmation
+/// link: consumes the confirmation token (writing the staged email/password
+/// onto the user atomically, per `confirm_claim_consuming_token`), issues the
+/// session UCAN, and renders the "Account Claimed!" success page. This is
+/// the second half of the flow `claim_post` starts.
+pub async fn claim_confirm_get(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    Query(params): Query<ClaimQuery>,
+) -> Result<Response, ClaimError> {
+    let tenant_id = tenant.0.id;
+    let pool = &auth_state.state.db;
+    let user_repo = UserRepository::new(pool.clone());
+    let claim_token_repo = ClaimTokenRepository::new(pool.clone());
+
+    use keycast_core::repositories::ClaimConsumeOutcome;
+    let user_pubkey_hex = match user_repo
+        .confirm_claim_consuming_token(&params.token, tenant_id)
+        .await
+        .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?
+    {
+        ClaimConsumeOutcome::Claimed { user_pubkey } => user_pubkey,
+        ClaimConsumeOutcome::EmailTaken => return Err(ClaimError::ConfirmationEmailTaken),
+        ClaimConsumeOutcome::UserNotClaimable => return Err(ClaimError::TokenAlreadyClaimed),
+        // No consumable row for this confirmation token: unknown, already
+        // consumed, superseded by a resend rotation, the 24h confirmation
+        // window itself expired, or the underlying claim token died
+        // (admin-invalidated/replaced/expired) during that window.
+        // classify_confirmation_failure tells these apart for a precise
+        // error page.
+        ClaimConsumeOutcome::TokenNotConsumable => {
+            return Err(
+                classify_confirmation_failure(&claim_token_repo, &params.token, tenant_id).await?,
+            );
+        }
+    };
+
+    // Session + success page: moved here, split into named helpers, from
+    // claim_post's former single-step tail, back when claim_post completed
+    // the claim directly instead of staging it for this confirm step.
+    let user_pubkey = nostr_sdk::PublicKey::from_hex(&user_pubkey_hex)
         .map_err(|e| ClaimError::Internal(format!("Invalid pubkey: {}", e)))?;
 
-    // Fetch account status for UCAN fact (normally active at claim time)
+    // confirm_claim_consuming_token already wrote the staged email onto the
+    // user row; read it back rather than threading a second copy through,
+    // so the UCAN's email fact and the DB can never disagree.
+    let email = user_repo
+        .get_email(&user_pubkey_hex, tenant_id)
+        .await
+        .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?;
+
+    // Fetch account status for the UCAN fact (normally active at claim time).
     let claim_user_status = user_repo
-        .get_user_status(&claim_token.user_pubkey, tenant_id)
+        .get_user_status(&user_pubkey_hex, tenant_id)
         .await
         .ok()
         .flatten()
         .map(|(s, _, _)| s);
 
-    // Load server keys for UCAN signing
     let server_keys = get_server_keys()?;
 
-    let token = super::auth::generate_server_signed_ucan(
+    let session_token = super::auth::generate_server_signed_ucan(
         &user_pubkey,
         tenant_id,
-        &form.email,
+        &email,
         "claim",
         None,
         &server_keys,
@@ -463,25 +579,163 @@ pub async fn claim_post(
     .await
     .map_err(|e| ClaimError::Internal(format!("Failed to generate session: {:?}", e)))?;
 
-    // Set session cookie
     let cookie_value = format!(
         "keycast_session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={}",
-        token,
+        session_token,
         60 * 60 * 24 * 7 // 7 days
     );
 
-    // Get user info for success page
-    let user_repo = UserRepository::new(pool.clone());
     let (username, display_name) = user_repo
-        .get_claim_info(&claim_token.user_pubkey, tenant_id)
+        .get_claim_info(&user_pubkey_hex, tenant_id)
         .await
         .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?
         .unwrap_or((None, None));
+    let display_name_str = display_name.unwrap_or_else(|| username.unwrap_or_default());
 
-    let display_name_str = display_name.unwrap_or_else(|| username.clone().unwrap_or_default());
+    tracing::info!("Claim confirmed: pubkey={}", &user_pubkey_hex);
 
-    // Show success page with app download instructions
-    let html = format!(
+    Ok((
+        [(header::SET_COOKIE, cookie_value)],
+        Html(claim_success_html(&display_name_str)),
+    )
+        .into_response())
+}
+
+/// POST /api/claim/resend
+/// Resends the claim-confirmation email for a staged claim. Cooldown-gated
+/// (`CLAIM_RESEND_COOLDOWN_MINUTES`) and enumeration-safe: the response is
+/// always the same generic "Check your email" interstitial, whether the
+/// token is unknown, has no staged claim, is within cooldown, or a fresh
+/// email just went out — a caller cannot distinguish these from the response
+/// alone. Rotates the confirmation token only when the previously-issued one
+/// has expired (past its own 24h confirmation window); otherwise re-sends the
+/// existing token so an unclicked earlier link keeps working.
+pub async fn claim_resend_post(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    Form(form): Form<ClaimResendForm>,
+) -> Result<Response, ClaimError> {
+    let tenant_id = tenant.0.id;
+    let pool = &auth_state.state.db;
+    let claim_token_repo = ClaimTokenRepository::new(pool.clone());
+
+    // The read below only supplies the recipient and the token to re-send. It
+    // does NOT decide whether to send: `touch_claim_confirmation` is a single
+    // atomic check-and-set whose predicate carries both the cooldown and the
+    // lifetime send cap, so concurrent resends cannot each pass a cooldown read
+    // and each send. Only the request that wins the row update sends.
+    if let Some(state) = claim_token_repo
+        .pending_claim_send_state(&form.token, tenant_id)
+        .await
+        .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?
+    {
+        // Rotate the confirmation token only if the previous one expired;
+        // otherwise resend the same one so an already-delivered, unclicked
+        // link keeps working. Mint the candidate before the guarded write so
+        // the rotation lands in that same statement; if the write loses (still
+        // in cooldown, out of budget, token died) the freshly minted value is
+        // simply discarded unused.
+        let rotated = if state.confirmation_expired {
+            Some((
+                super::auth::generate_secure_token(),
+                Utc::now()
+                    + Duration::hours(
+                        keycast_core::types::claim_token::CLAIM_CONFIRMATION_EXPIRY_HOURS,
+                    ),
+            ))
+        } else {
+            None
+        };
+
+        let claimed_slot = claim_token_repo
+            .touch_claim_confirmation(
+                &form.token,
+                tenant_id,
+                rotated.as_ref().map(|(t, e)| (t.as_str(), *e)),
+                super::auth::CLAIM_RESEND_COOLDOWN_MINUTES,
+            )
+            .await
+            .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?;
+
+        if claimed_slot {
+            let confirmation_token = match &rotated {
+                Some((fresh, _)) => fresh.clone(),
+                None => state.confirmation_token,
+            };
+
+            // Best-effort send: log and continue rather than fail the
+            // response. Failing here would leak, via a 500 vs 200, whether a
+            // pending claim exists for this token -- and a claimer who
+            // retries a failed send has nothing better to do than resend
+            // again anyway.
+            match crate::email_service::EmailService::new() {
+                Ok(email_service) => {
+                    if let Err(e) = email_service
+                        .send_claim_confirmation(&state.to_email, &confirmation_token)
+                        .await
+                    {
+                        tracing::error!("Failed to resend claim confirmation: {}", e);
+                    }
+                }
+                Err(e) => tracing::error!("Email service unavailable for claim resend: {}", e),
+            }
+        }
+    }
+
+    // Enumeration-safe: identical generic interstitial regardless of token
+    // state (unknown, no pending claim, in cooldown, or just resent).
+    Ok(Html(claim_confirmation_sent_html(None, &form.token)).into_response())
+}
+
+/// Classify a `TokenNotConsumable` outcome from `confirm_claim_consuming_token`
+/// into a precise error page. That outcome collapses several distinct
+/// causes: the confirmation token is unknown; was already consumed (a
+/// successful consume nulls `confirmation_token`, so a re-click of the same
+/// link lands here too -- the intended idempotent behavior); was superseded
+/// by a resend that rotated it to a fresh token once the old one's
+/// confirmation window expired, so the old value no longer matches any row;
+/// the 24h confirmation window itself expired; or the underlying claim token
+/// died (admin-invalidated, replaced, or expired) sometime during that
+/// window.
+async fn classify_confirmation_failure(
+    claim_token_repo: &ClaimTokenRepository,
+    confirmation_token: &str,
+    tenant_id: i64,
+) -> Result<ClaimError, ClaimError> {
+    let row = claim_token_repo
+        .confirmation_classification(confirmation_token, tenant_id)
+        .await
+        .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?;
+
+    let Some((claim_token, confirmation_expires_at)) = row else {
+        // No row: unrecognized token, already consumed (idempotent re-click
+        // behavior, intentional), or superseded by a resend that rotated an
+        // expired confirmation token to a fresh value.
+        return Ok(ClaimError::ConfirmationUnrecognized);
+    };
+
+    let confirmation_expired = match confirmation_expires_at {
+        Some(expires_at) => expires_at <= Utc::now(),
+        // Defensive: stage_pending_claim always sets confirmation_expires_at
+        // alongside confirmation_token, so this shouldn't happen. Treat a
+        // missing expiry as expired rather than falling through to a claim
+        // token that may still classify as Valid.
+        None => true,
+    };
+    if confirmation_expired {
+        return Ok(ClaimError::ConfirmationExpired);
+    }
+
+    // The confirmation window is still valid, so the failure must be the
+    // underlying claim token itself. Re-classify it for a precise page.
+    reclassify_to_error(claim_token_repo, &claim_token, tenant_id).await
+}
+
+/// Success page shown after `claim_confirm_get` completes a claim. Moved here
+/// verbatim from claim_post's former single-step tail, extracted into its own
+/// function so the handler above stays readable.
+fn claim_success_html(display_name: &str) -> String {
+    format!(
         r#"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -667,11 +921,119 @@ pub async fn claim_post(
     </div>
 </body>
 </html>"#,
-        display_name = escape_html(&display_name_str),
+        display_name = escape_html(display_name),
         brand = BRAND_NAME,
-    );
+    )
+}
 
-    Ok(([(header::SET_COOKIE, cookie_value)], Html(html)).into_response())
+/// Interstitial shown after a claim is staged (POST /claim) or after a resend
+/// request (POST /claim/resend). `email` is the destination address
+/// to display; `None` renders enumeration-safe generic copy so the resend
+/// endpoint never reveals whether a given address has a pending claim.
+/// `token` is the original claim token, always available at both call sites,
+/// and is threaded into the resend form's hidden field so the resend request
+/// has something to act on.
+fn claim_confirmation_sent_html(email: Option<&str>, token: &str) -> String {
+    let message = match email {
+        Some(address) => format!(
+            "We sent a confirmation link to <strong>{}</strong>. Click the link in that email to finish claiming your account.",
+            escape_html(address)
+        ),
+        None => "If a pending claim exists for that address, we've sent another confirmation link. Check your email.".to_string(),
+    };
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Check Your Email</title>
+    <style>
+        * {{ box-sizing: border-box; }}
+        body {{
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            background: #072218;
+            min-height: 100vh;
+            margin: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }}
+        .container {{
+            background: #0F2E23;
+            border: 1px solid #1C4033;
+            border-radius: 12px;
+            padding: 40px;
+            max-width: 400px;
+            width: 100%;
+            text-align: center;
+            box-shadow: 0 8px 32px rgba(39, 197, 139, 0.08);
+        }}
+        .icon {{
+            width: 56px;
+            height: 56px;
+            background: rgba(39, 197, 139, 0.15);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 20px;
+            font-size: 28px;
+        }}
+        h1 {{
+            margin: 0 0 8px 0;
+            color: #F9F7F6;
+            font-size: 22px;
+            font-weight: 600;
+        }}
+        p {{
+            color: #BEB3A7;
+            font-size: 14px;
+            margin: 0 0 24px 0;
+            line-height: 1.5;
+        }}
+        button {{
+            width: 100%;
+            padding: 12px;
+            background: transparent;
+            color: #27C58B;
+            border: 1px solid #1C4033;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: border-color 0.2s;
+        }}
+        button:hover {{
+            border-color: #27C58B;
+        }}
+        p.secondary {{
+            margin: 20px 0 0 0;
+            font-size: 13px;
+        }}
+        a {{
+            color: #27C58B;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="icon">&#9993;</div>
+        <h1>Check Your Email</h1>
+        <p>{message}</p>
+        <form method="POST" action="/api/claim/resend">
+            <input type="hidden" name="token" value="{token}">
+            <button type="submit">Resend Confirmation Email</button>
+        </form>
+        <p class="secondary">Entered the wrong address? <a href="/api/claim?token={token}">Go back and re-enter your email</a>.</p>
+    </div>
+</body>
+</html>"#,
+        message = message,
+        token = escape_attr(token),
+    )
 }
 
 /// Claim-specific errors
@@ -687,6 +1049,26 @@ pub enum ClaimError {
     TokenReplaced,
     /// Token is past `expires_at`, no newer valid token, no admin invalidation.
     TokenExpired,
+    /// No `account_claim_tokens` row matches the confirmation token: unknown;
+    /// already consumed (a successful confirm nulls it, so a re-click of the
+    /// same link intentionally lands here too); or superseded by a resend
+    /// that rotated the token (the old value was replaced with a fresh one
+    /// after its confirmation window expired, so it no longer matches any
+    /// row).
+    ConfirmationUnrecognized,
+    /// A row matches the confirmation token but its 24h confirmation window
+    /// has passed.
+    ConfirmationExpired,
+    /// The claim token is still valid but has already sent
+    /// `CLAIM_CONFIRMATION_SEND_LIMIT` confirmation emails in its lifetime, so
+    /// no further confirmation mail may be sent for it. Reached only by abuse
+    /// or by a genuinely stuck claimer; recovery is a regenerated claim token.
+    ConfirmationSendLimitReached,
+    /// The confirm-time equivalent of `EmailExists`: the staged email was
+    /// claimed by another account between staging and the claimer clicking
+    /// the confirmation link. Distinct from `EmailExists` because there is no
+    /// form to resubmit at confirm time (this is an emailed GET link).
+    ConfirmationEmailTaken,
     UserNotFound,
     PasswordMismatch,
     WeakPassword,
@@ -705,7 +1087,7 @@ impl IntoResponse for ClaimError {
             ),
             ClaimError::TokenAlreadyClaimed => (
                 "Account already claimed",
-                "This account has already been claimed. If you set it up, sign in at divine.video. If you didn't, contact support — someone else may have used this link.",
+                "This account has already been claimed. If you set it up, sign in at divine.video. If you didn't, contact support, since someone else may have used this link.",
             ),
             ClaimError::TokenAdminInvalidated => (
                 "Link has been deactivated",
@@ -717,7 +1099,23 @@ impl IntoResponse for ClaimError {
             ),
             ClaimError::TokenExpired => (
                 "Link has expired",
-                "Claim links are valid for 7 days. This one is past its expiration. Contact the person who sent it, or email support@divine.video, for a fresh link.",
+                "Claim links are valid for 14 days. This one is past its expiration. Contact the person who sent it, or email support@divine.video, for a fresh link.",
+            ),
+            ClaimError::ConfirmationUnrecognized => (
+                "Link not recognized",
+                "We don't recognize this confirmation link. It may have already been used. If you set up your account, sign in at divine.video.",
+            ),
+            ClaimError::ConfirmationExpired => (
+                "Confirmation link expired",
+                "Confirmation links are valid for 24 hours. Open your original claim link again to restart, or email support@divine.video for a fresh one.",
+            ),
+            ClaimError::ConfirmationEmailTaken => (
+                "Email no longer available",
+                "The email address you entered was just claimed by another account. Open your claim link again and use a different address, or email support@divine.video for help.",
+            ),
+            ClaimError::ConfirmationSendLimitReached => (
+                "Too many confirmation emails",
+                "This claim link has sent as many confirmation emails as it can. Email support@divine.video and we'll send you a fresh claim link.",
             ),
             ClaimError::UserNotFound => (
                 "Account Not Found",
