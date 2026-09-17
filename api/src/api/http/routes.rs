@@ -236,9 +236,8 @@ pub fn api_routes(
         .route("/policies/:slug", get(policies::get_policy))
         .with_state(pool.clone());
 
-    // Public, single-account lookup for the app-defined OG Beta Tester chit.
-    // The immutable response is CDN-cacheable and never exposes signup time or
-    // the complete eligible cohort.
+    // Public, single-account lookup for the OG Diviner chit. Returns one
+    // boolean, so it never exposes signup time or the complete eligible cohort.
     let og_diviner_route = Router::new()
         .route(
             "/public/users/:pubkey/og-diviner",
