@@ -1,6 +1,6 @@
 #![cfg(feature = "integration-tests")]
 
-// ABOUTME: Verifies OG Diviner eligibility uses completed signup evidence.
+// ABOUTME: Verifies OG Diviner eligibility uses the frozen signup policy.
 // ABOUTME: Guards the cutoff and excludes preloaded-but-unclaimed accounts.
 
 use chrono::{TimeZone, Utc};
@@ -30,7 +30,18 @@ async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
     let unclaimed = pubkey('2');
     let claimed_late = pubkey('3');
     let mobile_authorized = pubkey('4');
-    let keys = [&ordinary, &unclaimed, &claimed_late, &mobile_authorized];
+    let ordinary_completed_late = pubkey('6');
+    let ordinary_at_cutoff = pubkey('7');
+    let mobile_at_cutoff = pubkey('8');
+    let keys = [
+        &ordinary,
+        &unclaimed,
+        &claimed_late,
+        &mobile_authorized,
+        &ordinary_completed_late,
+        &ordinary_at_cutoff,
+        &mobile_at_cutoff,
+    ];
 
     for key in keys {
         sqlx::query("DELETE FROM account_claim_tokens WHERE user_pubkey = $1")
@@ -61,7 +72,43 @@ async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
     .await
     .unwrap();
 
-    for key in [&unclaimed, &claimed_late, &mobile_authorized] {
+    sqlx::query(
+        "INSERT INTO users
+         (pubkey, tenant_id, email, email_verified, password_hash, created_at, updated_at)
+         VALUES
+         ($1, 1, 'completed-late@example.invalid', FALSE, 'hash', $3, $2),
+         ($4, 1, 'at-cutoff@example.invalid', TRUE, 'hash', $2, $2)",
+    )
+    .bind(&ordinary_completed_late)
+    .bind(cutoff)
+    .bind(cutoff - chrono::Duration::seconds(1))
+    .bind(&ordinary_at_cutoff)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    assert!(!repository
+        .is_og_diviner(&ordinary_completed_late, 1, cutoff)
+        .await
+        .unwrap());
+
+    sqlx::query(
+        "UPDATE users
+         SET email_verified = TRUE, updated_at = $1
+         WHERE pubkey = $2 AND tenant_id = 1",
+    )
+    .bind(cutoff + chrono::Duration::seconds(1))
+    .bind(&ordinary_completed_late)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    for key in [
+        &unclaimed,
+        &claimed_late,
+        &mobile_authorized,
+        &mobile_at_cutoff,
+    ] {
         sqlx::query(
             "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
              VALUES ($1, 1, $2, $2)",
@@ -105,6 +152,22 @@ async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
     .await
     .unwrap();
 
+    sqlx::query(
+        "INSERT INTO oauth_authorizations
+         (user_pubkey, redirect_origin, client_id, bunker_public_key,
+          secret_hash, relays, created_at, updated_at, tenant_id,
+          handle_expires_at)
+         VALUES ($1, 'https://divine.video', 'divine-mobile', $2,
+                 'hash', '[]', $3, $3, 1, $4)",
+    )
+    .bind(&mobile_at_cutoff)
+    .bind(pubkey('9'))
+    .bind(cutoff)
+    .bind(cutoff + chrono::Duration::days(1))
+    .execute(&pool)
+    .await
+    .unwrap();
+
     assert!(repository
         .is_og_diviner(&ordinary, 1, cutoff)
         .await
@@ -119,6 +182,18 @@ async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
         .unwrap());
     assert!(repository
         .is_og_diviner(&mobile_authorized, 1, cutoff)
+        .await
+        .unwrap());
+    assert!(repository
+        .is_og_diviner(&ordinary_completed_late, 1, cutoff)
+        .await
+        .unwrap());
+    assert!(!repository
+        .is_og_diviner(&ordinary_at_cutoff, 1, cutoff)
+        .await
+        .unwrap());
+    assert!(!repository
+        .is_og_diviner(&mobile_at_cutoff, 1, cutoff)
         .await
         .unwrap());
 

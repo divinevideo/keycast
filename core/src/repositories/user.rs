@@ -493,12 +493,17 @@ pub struct UserRepository {
 }
 
 impl UserRepository {
-    /// Whether a user completed Divine signup on or before the supplied cutoff.
+    /// Whether a user belongs to the Divine signup cohort frozen at the supplied cutoff.
     ///
-    /// `users.created_at` is authoritative for ordinary registrations, but not
-    /// for preloaded accounts: those rows are created before their owner claims
-    /// them. Claim-token consumption and first-party mobile authorization are
-    /// therefore independent signup evidence with their own timestamps.
+    /// An ordinary registration qualifies when it was initiated before the
+    /// cutoff and the account has since been completed. Email verification did
+    /// not historically retain its own immutable completion timestamp, so this
+    /// deliberately does not require completion before the cutoff.
+    ///
+    /// `users.created_at` is not authoritative for preloaded accounts because
+    /// those rows are created before their owner claims them. Claim-token
+    /// consumption and first-party mobile authorization are therefore
+    /// independent signup evidence with their own timestamps.
     pub async fn is_og_diviner(
         &self,
         pubkey: &str,

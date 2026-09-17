@@ -31,6 +31,8 @@ pub async fn get_og_diviner_eligibility(
             .into_response();
     };
 
+    // Product policy closes the cohort at midnight US Eastern time following
+    // August 17, 2026. Eastern daylight time was UTC-04:00 on that date.
     let cutoff = Utc
         .with_ymd_and_hms(2026, 8, 18, 4, 0, 0)
         .single()
