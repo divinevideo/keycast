@@ -4,8 +4,11 @@
 // ABOUTME: Guards the cutoff and excludes preloaded-but-unclaimed accounts.
 
 use keycast_core::repositories::{og_diviner_cutoff, UserRepository};
+use serial_test::serial;
 use sqlx::PgPool;
 use uuid::Uuid;
+
+const TENANT_ID: i64 = 1;
 
 async fn pool() -> PgPool {
     let url = std::env::var("DATABASE_URL")
@@ -16,11 +19,42 @@ async fn pool() -> PgPool {
         .expect("connect to test database")
 }
 
+/// Fixture pubkeys carry a prefix unique to this test.
+///
+/// Generic fillers are shared across the suite -- `api/tests/`
+/// `divine_name_promotion_timeout_test.rs` binds `"1".repeat(64)` against this
+/// same database in the same run -- so a row leaked from here would collide on
+/// the users primary key and fail an unrelated crate's test.
 fn pubkey(seed: char) -> String {
-    std::iter::repeat_n(seed, 64).collect()
+    format!("06d1{}", std::iter::repeat_n(seed, 60).collect::<String>())
+}
+
+/// Removes every fixture row, scoped to this test's tenant.
+async fn purge(pool: &PgPool, keys: &[&str]) {
+    for key in keys {
+        sqlx::query("DELETE FROM account_claim_tokens WHERE user_pubkey = $1 AND tenant_id = $2")
+            .bind(key)
+            .bind(TENANT_ID)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM oauth_authorizations WHERE user_pubkey = $1 AND tenant_id = $2")
+            .bind(key)
+            .bind(TENANT_ID)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM users WHERE pubkey = $1 AND tenant_id = $2")
+            .bind(key)
+            .bind(TENANT_ID)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
 }
 
 #[tokio::test]
+#[serial]
 async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
     let pool = pool().await;
     let repository = UserRepository::new(pool.clone());
@@ -35,32 +69,16 @@ async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
     let ordinary_at_cutoff = pubkey('7');
     let mobile_at_cutoff = pubkey('8');
     let keys = [
-        &ordinary,
-        &unclaimed,
-        &claimed_late,
-        &mobile_authorized,
-        &ordinary_completed_late,
-        &ordinary_at_cutoff,
-        &mobile_at_cutoff,
+        ordinary.as_str(),
+        unclaimed.as_str(),
+        claimed_late.as_str(),
+        mobile_authorized.as_str(),
+        ordinary_completed_late.as_str(),
+        ordinary_at_cutoff.as_str(),
+        mobile_at_cutoff.as_str(),
     ];
 
-    for key in keys {
-        sqlx::query("DELETE FROM account_claim_tokens WHERE user_pubkey = $1")
-            .bind(key)
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query("DELETE FROM oauth_authorizations WHERE user_pubkey = $1")
-            .bind(key)
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query("DELETE FROM users WHERE pubkey = $1")
-            .bind(key)
-            .execute(&pool)
-            .await
-            .unwrap();
-    }
+    purge(&pool, &keys).await;
 
     sqlx::query(
         "INSERT INTO users
@@ -88,10 +106,12 @@ async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
     .await
     .unwrap();
 
-    assert!(!repository
-        .is_og_diviner(&ordinary_completed_late, 1, cutoff)
+    // Observed while the row is still unverified; asserted after teardown so a
+    // failure here cannot leak fixtures into the shared test database.
+    let completed_late_while_unverified = repository
+        .is_og_diviner(&ordinary_completed_late, TENANT_ID, cutoff)
         .await
-        .unwrap());
+        .unwrap();
 
     sqlx::query(
         "UPDATE users
@@ -137,82 +157,78 @@ async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
         .unwrap();
     }
 
-    sqlx::query(
-        "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, client_id, bunker_public_key,
-          secret_hash, relays, created_at, updated_at, tenant_id,
-          handle_expires_at)
-         VALUES ($1, 'https://divine.video', 'divine-mobile', $2,
-                 'hash', '[]', $3, $3, 1, $4)",
-    )
-    .bind(&mobile_authorized)
-    .bind(pubkey('5'))
-    .bind(cutoff - chrono::Duration::seconds(1))
-    .bind(cutoff + chrono::Duration::days(1))
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    sqlx::query(
-        "INSERT INTO oauth_authorizations
-         (user_pubkey, redirect_origin, client_id, bunker_public_key,
-          secret_hash, relays, created_at, updated_at, tenant_id,
-          handle_expires_at)
-         VALUES ($1, 'https://divine.video', 'divine-mobile', $2,
-                 'hash', '[]', $3, $3, 1, $4)",
-    )
-    .bind(&mobile_at_cutoff)
-    .bind(pubkey('9'))
-    .bind(cutoff)
-    .bind(cutoff + chrono::Duration::days(1))
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    assert!(repository
-        .is_og_diviner(&ordinary, 1, cutoff)
+    for (key, bunker, created_at) in [
+        (
+            &mobile_authorized,
+            pubkey('5'),
+            cutoff - chrono::Duration::seconds(1),
+        ),
+        (&mobile_at_cutoff, pubkey('9'), cutoff),
+    ] {
+        sqlx::query(
+            "INSERT INTO oauth_authorizations
+             (user_pubkey, redirect_origin, client_id, bunker_public_key,
+              secret_hash, relays, created_at, updated_at, tenant_id,
+              handle_expires_at)
+             VALUES ($1, 'https://divine.video', 'divine-mobile', $2,
+                     'hash', '[]', $3, $3, 1, $4)",
+        )
+        .bind(key)
+        .bind(bunker)
+        .bind(created_at)
+        .bind(cutoff + chrono::Duration::days(1))
+        .execute(&pool)
         .await
-        .unwrap());
-    assert!(!repository
-        .is_og_diviner(&unclaimed, 1, cutoff)
-        .await
-        .unwrap());
-    assert!(!repository
-        .is_og_diviner(&claimed_late, 1, cutoff)
-        .await
-        .unwrap());
-    assert!(repository
-        .is_og_diviner(&mobile_authorized, 1, cutoff)
-        .await
-        .unwrap());
-    assert!(repository
-        .is_og_diviner(&ordinary_completed_late, 1, cutoff)
-        .await
-        .unwrap());
-    assert!(!repository
-        .is_og_diviner(&ordinary_at_cutoff, 1, cutoff)
-        .await
-        .unwrap());
-    assert!(!repository
-        .is_og_diviner(&mobile_at_cutoff, 1, cutoff)
-        .await
-        .unwrap());
-
-    for key in keys {
-        sqlx::query("DELETE FROM account_claim_tokens WHERE user_pubkey = $1")
-            .bind(key)
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query("DELETE FROM oauth_authorizations WHERE user_pubkey = $1")
-            .bind(key)
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query("DELETE FROM users WHERE pubkey = $1")
-            .bind(key)
-            .execute(&pool)
-            .await
-            .unwrap();
+        .unwrap();
     }
+
+    let mut observed = Vec::new();
+    for key in keys {
+        observed.push(
+            repository
+                .is_og_diviner(key, TENANT_ID, cutoff)
+                .await
+                .unwrap(),
+        );
+    }
+
+    // Teardown before the assertions, so the shared database is left clean even
+    // when one of them fails.
+    purge(&pool, &keys).await;
+
+    let [ordinary_eligible, unclaimed_eligible, claimed_late_eligible, mobile_authorized_eligible, completed_late_eligible, at_cutoff_eligible, mobile_at_cutoff_eligible] =
+        observed[..]
+    else {
+        panic!("expected one observation per fixture");
+    };
+
+    assert!(
+        !completed_late_while_unverified,
+        "an unverified account is not yet complete, so it does not qualify"
+    );
+    assert!(ordinary_eligible, "pre-cutoff completed signup qualifies");
+    assert!(
+        !unclaimed_eligible,
+        "a preloaded account nobody claimed does not qualify"
+    );
+    assert!(
+        !claimed_late_eligible,
+        "a preloaded account claimed at or after the cutoff does not qualify"
+    );
+    assert!(
+        mobile_authorized_eligible,
+        "a pre-cutoff first-party mobile authorization qualifies"
+    );
+    assert!(
+        completed_late_eligible,
+        "completing verification after the cutoff does not forfeit a pre-cutoff signup"
+    );
+    assert!(
+        !at_cutoff_eligible,
+        "the cutoff is exclusive: a signup exactly at it does not qualify"
+    );
+    assert!(
+        !mobile_at_cutoff_eligible,
+        "the cutoff is exclusive for mobile authorizations too"
+    );
 }
