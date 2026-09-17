@@ -251,7 +251,7 @@ sudo supervisorctl restart keycast-signer
 **Deploy:**
 ```bash
 # 1. Build and push image
-gcloud builds submit --config cloudbuild.yaml
+bun run deploy
 
 # 2. Deploy signer service
 gcloud run services replace signer-service-deploy.yaml \
