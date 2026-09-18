@@ -527,8 +527,13 @@ impl UserRepository {
     /// pending initiation row is deleted after materialization. Historical
     /// initiation time therefore cannot be recovered for completed mobile
     /// registrations; their materialization/authorization time is the durable
-    /// boundary. Product accepts the resulting boundary ambiguity (at most the
-    /// 24-hour verification window) rather than widening this frozen cohort.
+    /// boundary. A pre-cutoff pubkey-only row may also have been created for a
+    /// team member rather than by a web registration. If it is later completed
+    /// through mobile materialization, historical data cannot distinguish it
+    /// from a pre-cutoff web signup. Eligibility deliberately preserves the
+    /// durable-row rule and may include those accounts; excluding them would
+    /// also exclude indistinguishable legitimate web registrations. This
+    /// ambiguity is not limited to the 24-hour verification window.
     ///
     /// Eligibility is historical and remains true if an otherwise-qualified
     /// account is later suspended or banned. Enforcement of current account
