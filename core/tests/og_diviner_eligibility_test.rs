@@ -71,6 +71,7 @@ async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
     let mobile_at_cutoff = pubkey('8');
     let preloaded_mobile_authorized = pubkey('f');
     let preloaded_mobile_at_cutoff = pubkey('0');
+    let preloaded_other_client = pubkey('9');
     let preloaded_without_token = pubkey('b');
     let claimed_after_cutoff_token_deleted = pubkey('c');
     let suspended_ordinary = pubkey('d');
@@ -86,6 +87,7 @@ async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
         mobile_at_cutoff.as_str(),
         preloaded_mobile_authorized.as_str(),
         preloaded_mobile_at_cutoff.as_str(),
+        preloaded_other_client.as_str(),
         preloaded_without_token.as_str(),
         claimed_after_cutoff_token_deleted.as_str(),
         suspended_ordinary.as_str(),
@@ -277,6 +279,43 @@ async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
         .unwrap();
     }
 
+    // Pins the client_id filter itself. Every other authorization fixture is a
+    // divine-mobile row, so dropping `AND oa.client_id = 'divine-mobile'` from
+    // the disjunct leaves them all unchanged and the suite green -- while any
+    // third-party OAuth client's pre-cutoff authorization would start granting
+    // the chit. This account is preloaded and has no claim token, so the
+    // authorization is its only candidate evidence, and it is the wrong client.
+    sqlx::query(
+        "INSERT INTO users
+         (pubkey, tenant_id, email, email_verified, password_hash, created_at,
+          updated_at, vine_id)
+         VALUES ($1, 1, $2, TRUE, 'hash', $3, $3, 'vine-other-client')",
+    )
+    .bind(&preloaded_other_client)
+    .bind(format!(
+        "other-client-{preloaded_other_client}@example.invalid"
+    ))
+    .bind(cutoff - chrono::Duration::days(30))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO oauth_authorizations
+         (user_pubkey, redirect_origin, client_id, bunker_public_key,
+          secret_hash, relays, created_at, updated_at, tenant_id,
+          handle_expires_at)
+         VALUES ($1, 'https://divine.video', 'divine-crossposter', $2,
+                 'hash', '[]', $3, $3, 1, $4)",
+    )
+    .bind(&preloaded_other_client)
+    .bind(pubkey('e'))
+    .bind(cutoff - chrono::Duration::seconds(1))
+    .bind(cutoff + chrono::Duration::days(1))
+    .execute(&pool)
+    .await
+    .unwrap();
+
     let mut observed = Vec::new();
     for key in keys {
         observed.push(
@@ -291,7 +330,7 @@ async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
     // when one of them fails.
     purge(&pool, &keys).await;
 
-    let [ordinary_eligible, unclaimed_eligible, claimed_late_eligible, claimed_early_eligible, mobile_authorized_eligible, completed_late_eligible, at_cutoff_eligible, mobile_at_cutoff_eligible, preloaded_mobile_authorized_eligible, preloaded_mobile_at_cutoff_eligible, preloaded_without_token_eligible, deleted_claim_token_eligible, suspended_ordinary_eligible, banned_claimed_early_eligible] =
+    let [ordinary_eligible, unclaimed_eligible, claimed_late_eligible, claimed_early_eligible, mobile_authorized_eligible, completed_late_eligible, at_cutoff_eligible, mobile_at_cutoff_eligible, preloaded_mobile_authorized_eligible, preloaded_mobile_at_cutoff_eligible, preloaded_other_client_eligible, preloaded_without_token_eligible, deleted_claim_token_eligible, suspended_ordinary_eligible, banned_claimed_early_eligible] =
         observed[..]
     else {
         panic!("expected one observation per fixture");
@@ -349,6 +388,11 @@ async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
     assert!(
         suspended_ordinary_eligible,
         "suspension does not rewrite historical cohort membership"
+    );
+    assert!(
+        !preloaded_other_client_eligible,
+        "a pre-cutoff authorization from a client other than divine-mobile is \
+         not signup evidence, so it does not qualify"
     );
     assert!(
         banned_claimed_early_eligible,
