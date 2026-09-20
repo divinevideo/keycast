@@ -19,6 +19,29 @@ use std::{
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+// Bound Redis itself, including reconnect/auth refresh, so a live but unresponsive socket
+// cannot prevent fallback or hold a recovery response while releasing capacity.
+const REDIS_OPERATION_TIMEOUT: Duration = Duration::from_millis(250);
+
+async fn invoke_email_script<T: redis::FromRedisValue>(
+    redis: &PrefixedRedis,
+    script: &'static str,
+    keys: &[String],
+    arguments: &[String],
+) -> RedisResult<T> {
+    tokio::time::timeout(
+        REDIS_OPERATION_TIMEOUT,
+        redis.invoke_script(script, keys, arguments),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(redis::RedisError::from(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "email admission Redis operation timed out",
+        )))
+    })
+}
+
 const ADMIT_SCRIPT: &str = r#"
 local id = ARGV[1]
 local destination_count = tonumber(ARGV[2])
@@ -357,9 +380,8 @@ impl EmailDeliveryReservation {
             return;
         };
         let arguments = vec![id, slots.to_string()];
-        if let Err(error) = redis
-            .invoke_script::<i64>(RELEASE_SCRIPT, &[in_flight_key], &arguments)
-            .await
+        if let Err(error) =
+            invoke_email_script::<i64>(&redis, RELEASE_SCRIPT, &[in_flight_key], &arguments).await
         {
             tracing::warn!(error = %error, "Failed to release email provider reservation");
         }
@@ -524,7 +546,7 @@ impl EmailDeliveryService {
             self.config.reservation_ttl(slots).as_millis().to_string(),
         ];
         let decision: RedisResult<(i64, i64)> =
-            redis.invoke_script(ADMIT_SCRIPT, &keys, &arguments).await;
+            invoke_email_script(redis, ADMIT_SCRIPT, &keys, &arguments).await;
         let (admitted, reason) = match decision {
             Ok(decision) => decision,
             Err(error) => {
@@ -671,9 +693,13 @@ impl EmailDeliveryService {
             AdmissionBackend::Unrestricted => return false,
         };
         let args = vec![self.config.destination_window.as_millis().to_string()];
-        match redis
-            .invoke_script::<i64>(AUDIT_ONCE_SCRIPT, std::slice::from_ref(&key), &args)
-            .await
+        match invoke_email_script::<i64>(
+            redis,
+            AUDIT_ONCE_SCRIPT,
+            std::slice::from_ref(&key),
+            &args,
+        )
+        .await
         {
             Ok(created) => created == 1,
             Err(_) => self.reserve_local_suppression_audit(key),
@@ -1155,6 +1181,129 @@ mod integration_tests {
             Arc::new(DevEmailSender::new()),
             config,
         )
+    }
+
+    // Pause a real, established Redis connection without closing either socket. An injected
+    // error cannot reproduce a live connection whose responses stop arriving.
+    async fn pausable_service() -> (
+        EmailDeliveryService,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let redis_url = env::var("TEST_REDIS_URL").expect("dedicated test Redis URL");
+        let url = reqwest::Url::parse(&redis_url).unwrap();
+        let upstream =
+            tokio::net::TcpStream::connect((url.host_str().unwrap(), url.port().unwrap_or(6379)))
+                .await
+                .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (pause, paused) = tokio::sync::oneshot::channel();
+        let (ready, ready_rx) = tokio::sync::oneshot::channel();
+        let proxy = tokio::spawn(async move {
+            let (mut downstream, _) = listener.accept().await.unwrap();
+            let mut upstream = upstream;
+            tokio::select! {
+                _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream) => panic!("Redis proxy disconnected before pause"),
+                _ = paused => {},
+            }
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop((upstream, downstream));
+        });
+        let client = redis::Client::open(format!("redis://{address}{}", url.path())).unwrap();
+        let connection = ConnectionManager::new(client).await.unwrap();
+        let service = EmailDeliveryService::new(
+            PrefixedRedis::new(
+                connection,
+                Some(format!("stalled-email:{}", Uuid::new_v4())),
+            ),
+            Arc::new(DevEmailSender::new()),
+            EmailDeliveryConfig::default(),
+        );
+        (service, pause, ready_rx, proxy)
+    }
+
+    #[tokio::test]
+    async fn stalled_redis_admission_reaches_local_fallback() {
+        let (service, pause, paused, proxy) = pausable_service().await;
+        pause.send(()).unwrap();
+        paused.await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            service.admit(EmailAdmissionRequest {
+                tenant_id: 1,
+                purpose: EmailDeliveryPurpose::PasswordReset,
+                destinations: &["stalled@example.com"],
+                account: None,
+                source: None,
+                delivery_slots: 1,
+            }),
+        )
+        .await;
+        proxy.abort();
+        let reservation = result
+            .expect("stalled Redis must reach local fallback within the deadline")
+            .unwrap();
+        assert!(matches!(
+            reservation.backend,
+            ReservationBackend::Local { .. }
+        ));
+        reservation.release().await;
+    }
+
+    #[tokio::test]
+    async fn stalled_redis_release_returns_within_deadline() {
+        let (service, pause, paused, proxy) = pausable_service().await;
+        let reservation = service
+            .admit(EmailAdmissionRequest {
+                tenant_id: 1,
+                purpose: EmailDeliveryPurpose::PasswordReset,
+                destinations: &["release@example.com"],
+                account: None,
+                source: None,
+                delivery_slots: 1,
+            })
+            .await
+            .unwrap();
+        pause.send(()).unwrap();
+        paused.await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), reservation.release()).await;
+        proxy.abort();
+        result.expect("stalled release must not hold the recovery response indefinitely");
+    }
+
+    #[tokio::test]
+    async fn stalled_redis_audit_uses_local_deduplication() {
+        let (service, pause, paused, proxy) = pausable_service().await;
+        pause.send(()).unwrap();
+        paused.await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            let first = service
+                .should_record_anonymous_suppression(
+                    1,
+                    EmailDeliveryPurpose::PasswordReset,
+                    "audit@example.com",
+                    EmailAdmissionRefusal::DestinationCooldown,
+                )
+                .await;
+            let second = service
+                .should_record_anonymous_suppression(
+                    1,
+                    EmailDeliveryPurpose::PasswordReset,
+                    "audit@example.com",
+                    EmailAdmissionRefusal::DestinationCooldown,
+                )
+                .await;
+            (first, second)
+        })
+        .await;
+        proxy.abort();
+        assert_eq!(
+            result.expect("stalled Redis audit must fall back within the deadline"),
+            (true, false)
+        );
     }
 
     #[tokio::test]

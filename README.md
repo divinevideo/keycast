@@ -288,7 +288,8 @@ If neither is set, requests from unknown domains are rejected.
 Alert on any sustained
 `keycast_email_delivery_admissions_total{decision="fallback",reason="admission_unavailable"}`
 increase. Recovery remains available through bounded per-instance admission, but cluster-wide
-coordination is degraded until Redis recovers.
+coordination is degraded until Redis recovers. Email admission, suppression-audit, and
+reservation-release Redis operations have a 250 ms deadline, including connection refresh.
 
 ### Other common variables
 
