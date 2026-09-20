@@ -12,7 +12,8 @@ use tower::{timeout::error::Elapsed, ServiceBuilder};
 
 use crate::api::http::{
     admin, ap, atproto, atproto_oauth, auth, claim, email_marketing, expensive_work, headless,
-    metrics, nostr_rpc, oauth, policies, retention, service_deletion, service_provisioning, teams,
+    metrics, nostr_rpc, oauth, og_diviner, policies, retention, service_deletion,
+    service_provisioning, teams,
 };
 use crate::state::KeycastState;
 use axum::response::Json as AxumJson;
@@ -235,6 +236,15 @@ pub fn api_routes(
         .route("/policies/:slug", get(policies::get_policy))
         .with_state(pool.clone());
 
+    // Public, single-account lookup for the OG Diviner chit. Returns one
+    // boolean, so it never exposes signup time or the complete eligible cohort.
+    let og_diviner_route = Router::new()
+        .route(
+            "/public/users/:pubkey/og-diviner",
+            get(og_diviner::get_og_diviner_eligibility),
+        )
+        .with_state(pool.clone());
+
     // Headless auth routes (embedded flow for web + native mobile apps)
     // Public CORS - token exchange still requires PKCE for security
     let headless_routes = Router::new()
@@ -423,6 +433,7 @@ pub fn api_routes(
         .merge(team_routes.layer(auth_cors.clone())) // Team routes need credentials
         .merge(discovery_route.layer(public_cors.clone()))
         .merge(policy_routes.layer(public_cors.clone())) // Public - available to third-party OAuth apps
+        .merge(og_diviner_route.layer(public_cors.clone()))
         .merge(headless_routes.layer(public_cors.clone())) // Public CORS - embedded flow for web + mobile (PKCE protects token exchange)
         .merge(admin_routes) // Admin routes for preloaded accounts (has auth_cors)
         .merge(service_admin_routes) // Service-token admin routes (no CORS, server-to-server)

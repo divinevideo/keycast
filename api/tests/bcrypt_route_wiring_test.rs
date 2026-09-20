@@ -76,4 +76,22 @@ async fn bcrypt_handlers_are_wired_through_api_routes() {
             "{path} must reach JSON extraction instead of failing on a missing bcrypt extension"
         );
     }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/public/users/not-a-pubkey/og-diviner")
+                .header("host", "localhost")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "the OG Diviner route must reach pubkey validation instead of returning 404"
+    );
 }
