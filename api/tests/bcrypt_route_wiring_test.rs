@@ -54,6 +54,11 @@ async fn bcrypt_handlers_are_wired_through_api_routes() {
     );
 
     for path in [
+        "/auth/register",
+        "/headless/register",
+        "/headless/resend-pin",
+        "/oauth/register",
+        "/oauth/token",
         "/auth/reset-password",
         "/user/verify-password",
         "/user/change-password",
@@ -76,7 +81,7 @@ async fn bcrypt_handlers_are_wired_through_api_routes() {
         assert_eq!(
             response.status(),
             StatusCode::BAD_REQUEST,
-            "{path} must reach JSON extraction instead of failing on a missing bcrypt extension"
+            "{path} must reach JSON extraction instead of failing on a missing handler extension"
         );
     }
 }

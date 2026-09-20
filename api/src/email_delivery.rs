@@ -725,6 +725,12 @@ impl EmailDeliveryService {
         }
     }
 
+    /// Share the configured sender with email flows whose admission policies are independent.
+    #[must_use]
+    pub fn sender(&self) -> Arc<dyn EmailSender> {
+        self.sender.clone()
+    }
+
     #[must_use]
     pub fn captured_emails(&self) -> Vec<crate::email_service::CapturedEmail> {
         self.sender.get_captured_emails()

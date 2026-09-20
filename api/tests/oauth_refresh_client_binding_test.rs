@@ -183,6 +183,7 @@ async fn refresh_for_tenant(
     let result = oauth::token(
         test_tenant_with_id(tenant_id),
         State(auth_state),
+        axum::Extension(common::test_email_sender()),
         oauth::TokenRequestBody(oauth::TokenRequest {
             grant_type: Some("refresh_token".to_string()),
             code: None,

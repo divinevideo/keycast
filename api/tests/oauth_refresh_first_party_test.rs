@@ -330,6 +330,7 @@ fn build_oauth_app(pool: PgPool) -> Router {
                     token(
                         create_test_tenant(),
                         State(auth_state),
+                        axum::Extension(common::test_email_sender()),
                         TokenRequestBody(req),
                     )
                     .await

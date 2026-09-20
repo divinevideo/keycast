@@ -45,6 +45,7 @@ async fn redeem_code(pool: &PgPool, code: &str, presented_client_id: &str) -> Re
     let result = oauth::token(
         common::test_tenant(),
         State(auth_state),
+        axum::Extension(common::test_email_sender()),
         oauth::TokenRequestBody(oauth::TokenRequest {
             grant_type: Some("authorization_code".to_string()),
             code: Some(code.to_string()),

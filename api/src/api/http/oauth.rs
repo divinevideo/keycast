@@ -1,6 +1,7 @@
 // ABOUTME: OAuth 2.0 authorization flow handlers for third-party app access
 // ABOUTME: Implements authorization code flow that issues bunker URLs for NIP-46 remote signing
 
+use crate::email_service::EmailSender;
 use axum::{
     async_trait,
     extract::{FromRequest, Query, Request, State},
@@ -24,6 +25,7 @@ use nostr_sdk::{Keys, ToBech32};
 use rand::Rng;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 // Import constants and helpers from auth module
 use super::auth::{
@@ -2508,13 +2510,16 @@ pub async fn authorize_post(
 pub async fn token(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
+    axum::Extension(email_sender): axum::Extension<Arc<dyn EmailSender>>,
     TokenRequestBody(req): TokenRequestBody,
 ) -> Result<Response, OAuthError> {
     let tenant_id = tenant.0.id;
     let grant_type = req.grant_type.as_deref().unwrap_or("authorization_code");
 
     match grant_type {
-        "authorization_code" => handle_authorization_code_grant(tenant_id, auth_state, req).await,
+        "authorization_code" => {
+            handle_authorization_code_grant(tenant_id, auth_state, email_sender, req).await
+        }
         "refresh_token" => handle_refresh_token_grant(tenant_id, auth_state, req).await,
         _ => Err(OAuthError::InvalidRequest(format!(
             "Invalid grant_type '{}'. Supported: authorization_code, refresh_token.",
@@ -2953,6 +2958,7 @@ async fn handle_refresh_token_grant_inner(
 async fn handle_authorization_code_grant(
     tenant_id: i64,
     auth_state: super::routes::AuthState,
+    email_sender: Arc<dyn EmailSender>,
     req: TokenRequest,
 ) -> Result<Response, OAuthError> {
     let pool = &auth_state.state.db;
@@ -3130,27 +3136,17 @@ async fn handle_authorization_code_grant(
         );
 
         // Send verification email (optional - don't fail if email service unavailable)
-        match crate::email_service::EmailService::new() {
-            Ok(email_service) => {
-                if let Err(e) = email_service
-                    .send_verification_email(pending_email_val, &verification_token, None)
-                    .await
-                {
-                    tracing::error!(
-                        "Failed to send verification email to {}: {}",
-                        pending_email_val,
-                        e
-                    );
-                } else {
-                    tracing::info!("Sent verification email to {}", pending_email_val);
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Email service unavailable, skipping verification email: {}",
-                    e
-                );
-            }
+        if let Err(e) = email_sender
+            .send_verification_email(pending_email_val, &verification_token, None)
+            .await
+        {
+            tracing::error!(
+                "Failed to send verification email to {}: {}",
+                pending_email_val,
+                e
+            );
+        } else {
+            tracing::info!("Sent verification email to {}", pending_email_val);
         }
 
         pending_email_val.clone()
@@ -3936,6 +3932,7 @@ pub struct OAuthRegisterRequest {
 pub async fn oauth_register(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
+    axum::Extension(email_sender): axum::Extension<Arc<dyn EmailSender>>,
     Json(mut req): Json<OAuthRegisterRequest>,
 ) -> Result<impl IntoResponse, OAuthError> {
     let pool = &auth_state.state.db;
@@ -4106,24 +4103,14 @@ pub async fn oauth_register(
     );
 
     // Send verification email (required - user must verify before OAuth flow completes)
-    match crate::email_service::EmailService::new() {
-        Ok(email_service) => {
-            if let Err(e) = email_service
-                .send_verification_email(&req.email, &verification_token, None)
-                .await
-            {
-                tracing::error!("Failed to send verification email to {}: {}", req.email, e);
-                // Continue even if email fails - user can resend later
-            } else {
-                tracing::info!("Sent verification email to {}", req.email);
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Email service unavailable, skipping verification email: {}",
-                e
-            );
-        }
+    if let Err(e) = email_sender
+        .send_verification_email(&req.email, &verification_token, None)
+        .await
+    {
+        tracing::error!("Failed to send verification email to {}: {}", req.email, e);
+        // Continue even if email fails - user can resend later
+    } else {
+        tracing::info!("Sent verification email to {}", req.email);
     }
 
     // DO NOT issue UCAN or set session cookie - user must verify email first
@@ -5411,6 +5398,9 @@ mod tests {
         let response = match oauth_register(
             create_unit_test_tenant(),
             axum::extract::State(create_lazy_auth_state()),
+            axum::Extension(std::sync::Arc::new(
+                crate::email_service::DevEmailSender::new(),
+            )),
             axum::Json(OAuthRegisterRequest {
                 email: "person@-example.com".to_string(),
                 password: "testpassword123".to_string(),

@@ -1,6 +1,7 @@
 // ABOUTME: Admin endpoints for preloaded accounts, claim token generation, and support admin management
 // ABOUTME: Used for Vine import and support workflows
 
+use crate::email_service::EmailSender;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
@@ -9,6 +10,7 @@ use chrono::{Duration, Utc};
 use nostr_sdk::{FromBech32, Keys};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 
 use super::routes::AuthState;
 use crate::api::error::{ApiError, ApiResult};
@@ -613,6 +615,7 @@ pub struct BatchCreateClaimTokensResponse {
 pub async fn batch_create_claim_tokens(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
+    axum::Extension(email_sender): axum::Extension<Arc<dyn EmailSender>>,
     auth: UcanAuth,
     Json(req): Json<BatchCreateClaimTokensRequest>,
 ) -> ApiResult<Json<BatchCreateClaimTokensResponse>> {
@@ -657,17 +660,7 @@ pub async fn batch_create_claim_tokens(
     let user_repo = UserRepository::new(pool.clone());
     let claim_token_repo = ClaimTokenRepository::new(pool.clone());
 
-    // Create email service once outside the loop
-    let email_service =
-        req.delivery_email
-            .as_ref()
-            .and_then(|_| match crate::email_service::EmailService::new() {
-                Ok(svc) => Some(svc),
-                Err(e) => {
-                    tracing::error!("Failed to create email service: {}", e);
-                    None
-                }
-            });
+    let email_service = req.delivery_email.as_ref().map(|_| email_sender);
 
     let mut tokens = Vec::new();
     let mut skipped = Vec::new();

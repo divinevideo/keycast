@@ -1,6 +1,7 @@
 // ABOUTME: Personal authentication handlers for email/password registration and login
 // ABOUTME: Implements UCAN-based authentication and NIP-46 bunker URL generation
 
+use crate::email_service::EmailSender;
 use axum::{
     extract::{Extension, Query, State},
     http::{HeaderMap, StatusCode},
@@ -10,6 +11,7 @@ use axum::{
 use bcrypt::DEFAULT_COST;
 use chrono::{Duration, Utc};
 use secrecy::{ExposeSecret, SecretString};
+use std::sync::Arc;
 
 use super::admin::{is_full_admin, is_support_admin};
 use crate::api::extractors::UcanAuth;
@@ -1066,6 +1068,7 @@ async fn nostr_auth_login(
 pub async fn register(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
+    axum::Extension(email_sender): axum::Extension<Arc<dyn EmailSender>>,
     _headers: HeaderMap,
     Json(mut req): Json<RegisterRequest>,
 ) -> Result<impl axum::response::IntoResponse, AuthError> {
@@ -1159,24 +1162,14 @@ pub async fn register(
     METRICS.inc_registration();
 
     // Send verification email (required - user must verify before login)
-    match crate::email_service::EmailService::new() {
-        Ok(email_service) => {
-            if let Err(e) = email_service
-                .send_verification_email(&req.email, &verification_token, None)
-                .await
-            {
-                tracing::error!("Failed to send verification email to {}: {}", req.email, e);
-                // Continue even if email fails - user can resend later
-            } else {
-                tracing::info!("Sent verification email to {}", req.email);
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Email service unavailable, skipping verification email: {}",
-                e
-            );
-        }
+    if let Err(e) = email_sender
+        .send_verification_email(&req.email, &verification_token, None)
+        .await
+    {
+        tracing::error!("Failed to send verification email to {}: {}", req.email, e);
+        // Continue even if email fails - user can resend later
+    } else {
+        tracing::info!("Sent verification email to {}", req.email);
     }
 
     tracing::info!(
@@ -5994,6 +5987,9 @@ mod tests {
         let registration = tokio::spawn(super::register(
             create_unit_test_tenant(),
             State(auth_state),
+            axum::Extension(std::sync::Arc::new(
+                crate::email_service::DevEmailSender::new(),
+            )),
             HeaderMap::new(),
             Json(super::RegisterRequest {
                 email: format!("bcrypt-pool-order-{}@example.test", Uuid::new_v4()),
@@ -6046,6 +6042,9 @@ mod tests {
         let result = super::register(
             create_unit_test_tenant(),
             State(auth_state),
+            axum::Extension(std::sync::Arc::new(
+                crate::email_service::DevEmailSender::new(),
+            )),
             HeaderMap::new(),
             Json(super::RegisterRequest {
                 email: email.clone(),
@@ -6163,6 +6162,9 @@ mod tests {
         let response = match super::register(
             create_unit_test_tenant(),
             axum::extract::State(create_lazy_auth_state()),
+            axum::Extension(std::sync::Arc::new(
+                crate::email_service::DevEmailSender::new(),
+            )),
             axum::http::HeaderMap::new(),
             axum::Json(super::RegisterRequest {
                 email: "person@gmail..com".to_string(),

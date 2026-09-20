@@ -85,6 +85,7 @@ pub fn api_routes(
         Router::new()
     };
 
+    let email_sender = email_delivery.sender();
     let auth_state = AuthState { state, auth_tx };
 
     // Routes that need restricted CORS (first-party only + credentials)
@@ -462,6 +463,7 @@ pub fn api_routes(
     bounded_routes
         .merge(nostr_rpc_routes.layer(public_cors.clone()))
         .merge(development_email_routes)
+        .layer(axum::Extension(email_sender))
         .fallback(api_not_found) // Return 404 for unmatched API routes
 }
 
