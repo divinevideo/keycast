@@ -1705,7 +1705,6 @@ impl OAuthCodeRepository {
 #[cfg(all(test, feature = "integration-tests"))]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
     fn assert_localhost_db() {
         let url = std::env::var("DATABASE_URL").unwrap_or_default();
@@ -2155,9 +2154,6 @@ mod tests {
             .unwrap();
     }
 
-    // Serialized against `test_delete_expired_and_consumed_removes_dead_rows`: that cleanup is
-    // global by design, so an expired fixture is fair game for it while both run concurrently.
-    #[serial]
     #[tokio::test]
     async fn test_find_by_device_code_returns_expired_rows_for_the_caller_to_judge() {
         let pool = setup_pool().await;
@@ -2934,9 +2930,6 @@ mod tests {
     /// on the caller's earlier snapshot. Without this, a window closing between the caller's check
     /// and the reservation would let a bcrypt comparison run against a dead registration and be
     /// reported as a wrong PIN.
-    // Serialized against `test_delete_expired_and_consumed_removes_dead_rows`: that cleanup is
-    // global by design, so an expired fixture is fair game for it while both run concurrently.
-    #[serial]
     #[tokio::test]
     async fn test_reserve_pin_attempt_refuses_an_expired_registration() {
         let pool = setup_pool().await;
@@ -4546,12 +4539,10 @@ mod tests {
             .unwrap();
     }
 
-    // Serialized against `test_delete_expired_and_consumed_removes_dead_rows`: that cleanup is
-    // global by design, so an expired fixture is fair game for it while both run concurrently.
-    #[serial]
-    #[tokio::test]
-    async fn test_delete_expired_and_consumed_removes_dead_rows() {
-        let pool = setup_pool().await;
+    // The cleanup is table-wide, so it must not share a database with tests
+    // that inspect their own expired or consumed registration fixtures.
+    #[sqlx::test(migrations = "../database/migrations")]
+    async fn test_delete_expired_and_consumed_removes_dead_rows(pool: PgPool) {
         let repo = OAuthCodeRepository::new(pool.clone());
 
         // Live row (kept).
@@ -4631,7 +4622,10 @@ mod tests {
             .unwrap();
 
         let removed = repo.delete_expired_and_consumed().await.unwrap();
-        assert!(removed >= 2, "expired and consumed rows should be deleted");
+        assert_eq!(
+            removed, 2,
+            "only expired and consumed pending rows should be deleted"
+        );
 
         // find_by_device_code filters expired, so query the raw row for the expired case.
         let expired_still_present: Option<(String,)> =
