@@ -501,3 +501,8 @@ pub fn test_tenant() -> TenantExtractor {
 // Unit tests for the safety guard moved to a separate test file
 // to avoid race conditions with set_var affecting parallel tests.
 // The safety guard is tested implicitly when running integration tests.
+
+#[allow(dead_code)]
+pub fn test_email_sender() -> std::sync::Arc<dyn keycast_api::email_service::EmailSender> {
+    std::sync::Arc::new(keycast_api::email_service::DevEmailSender::new())
+}

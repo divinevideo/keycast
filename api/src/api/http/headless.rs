@@ -1,6 +1,7 @@
 // ABOUTME: Headless authentication handlers for native mobile apps (Flutter, etc.)
 // ABOUTME: Pure JSON API - no cookies, no HTML, returns access_token directly
 
+use crate::email_service::EmailSender;
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
@@ -18,6 +19,7 @@ use nostr_sdk::Keys;
 use rand::Rng;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use super::auth::{
     generate_secure_token, normalize_registration_email, EMAIL_ALREADY_EXISTS_CODE,
@@ -118,6 +120,7 @@ fn bcrypt_headless_error(error: BcryptAdmissionError) -> HeadlessError {
 pub async fn headless_register(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
+    axum::Extension(email_sender): axum::Extension<Arc<dyn EmailSender>>,
     Json(mut req): Json<HeadlessRegisterRequest>,
 ) -> Result<impl IntoResponse, HeadlessError> {
     let pool = &auth_state.state.db;
@@ -294,25 +297,15 @@ pub async fn headless_register(
     // Send verification email. Only start the resend cooldown after confirmed delivery; otherwise
     // the user must be able to request an immediate replacement.
     let mut email_delivered = false;
-    match crate::email_service::EmailService::new() {
-        Ok(email_service) => {
-            if let Err(e) = email_service
-                .send_verification_email(&req.email, &verification_token, Some(&pin))
-                .await
-            {
-                tracing::error!("Failed to send verification email to {}: {}", req.email, e);
-                // Continue - user can request resend later
-            } else {
-                email_delivered = true;
-                tracing::info!("Sent verification email to {}", req.email);
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Email service unavailable, skipping verification email: {}",
-                e
-            );
-        }
+    if let Err(e) = email_sender
+        .send_verification_email(&req.email, &verification_token, Some(&pin))
+        .await
+    {
+        tracing::error!("Failed to send verification email: {}", e);
+        // Continue - user can request resend later
+    } else {
+        email_delivered = true;
+        tracing::info!("Sent verification email");
     }
     if email_delivered {
         oauth_code_repo
@@ -1295,6 +1288,7 @@ pub struct HeadlessResendPinResponse {
 pub async fn headless_resend_pin(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
+    axum::Extension(email_sender): axum::Extension<Arc<dyn EmailSender>>,
     Json(req): Json<HeadlessResendPinRequest>,
 ) -> Result<impl IntoResponse, HeadlessError> {
     let pool = &auth_state.state.db;
@@ -1404,23 +1398,12 @@ pub async fn headless_resend_pin(
 
     // Re-send the link + PIN. If delivery fails, roll back the mutation so the previous credential
     // remains valid and the resend cooldown is not armed by an undelivered replacement.
-    let send_result = match crate::email_service::EmailService::new() {
-        Ok(email_service) => {
-            email_service
-                .send_verification_email(&email, &new_token, Some(&new_pin))
-                .await
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Email service unavailable, skipping PIN resend email: {}",
-                e
-            );
-            Err(e)
-        }
-    };
+    let send_result = email_sender
+        .send_verification_email(&email, &new_token, Some(&new_pin))
+        .await;
 
     if let Err(e) = send_result {
-        tracing::error!("Failed to resend verification email to {}: {}", email, e);
+        tracing::error!("Failed to resend verification email: {}", e);
         // Guarded on the token and hash this call wrote, and serialized with redemption, so neither
         // a later resend nor an in-progress token exchange is rolled back out from under the user.
         let restored = oauth_code_repo
@@ -1635,6 +1618,56 @@ impl From<keycast_core::repositories::RepositoryError> for HeadlessError {
 
 #[cfg(test)]
 mod tests {
+
+    // Keep failure-path tests independent of the shared production sender.
+    struct UnavailableSender;
+
+    #[async_trait::async_trait]
+    impl crate::email_service::EmailSender for UnavailableSender {
+        async fn send_verification_email(
+            &self,
+            _email: &str,
+            _token: &str,
+            _pin: Option<&str>,
+        ) -> Result<(), crate::email_service::EmailSendError> {
+            Err(crate::email_service::EmailSendError::Unavailable)
+        }
+        async fn send_password_reset_email(
+            &self,
+            _email: &str,
+            _token: &str,
+        ) -> Result<(), crate::email_service::EmailSendError> {
+            Err(crate::email_service::EmailSendError::Unavailable)
+        }
+        async fn send_claim_email(
+            &self,
+            _email: &str,
+            _url: &str,
+        ) -> Result<(), crate::email_service::EmailSendError> {
+            Err(crate::email_service::EmailSendError::Unavailable)
+        }
+        async fn send_email_change_confirmation(
+            &self,
+            _email: &str,
+            _token: &str,
+        ) -> Result<(), crate::email_service::EmailSendError> {
+            Err(crate::email_service::EmailSendError::Unavailable)
+        }
+        async fn send_email_change_notification(
+            &self,
+            _old: &str,
+            _new: &str,
+            _confirm: &str,
+            _cancel: &str,
+        ) -> Result<(), crate::email_service::EmailSendError> {
+            Err(crate::email_service::EmailSendError::Unavailable)
+        }
+    }
+
+    fn test_email_sender() -> std::sync::Arc<dyn crate::email_service::EmailSender> {
+        crate::email_service::create_email_sender()
+            .unwrap_or_else(|_| std::sync::Arc::new(UnavailableSender))
+    }
     use super::{bcrypt_headless_error, BcryptAdmissionError, HeadlessError};
     use axum::{http::StatusCode, response::IntoResponse};
 
@@ -1778,6 +1811,7 @@ mod tests {
         let response = match super::headless_register(
             create_unit_test_tenant(),
             axum::extract::State(create_lazy_auth_state()),
+            axum::Extension(test_email_sender()),
             axum::Json(super::HeadlessRegisterRequest {
                 email: "person@gmail..com".to_string(),
                 password: "testpassword123".to_string(),
@@ -1866,6 +1900,7 @@ mod tests {
                 let response = super::headless_register(
                     create_unit_test_tenant(),
                     axum::extract::State(auth_state),
+                    axum::Extension(test_email_sender()),
                     axum::Json(super::HeadlessRegisterRequest {
                         email,
                         password: password.to_string(),
@@ -2061,6 +2096,7 @@ mod tests {
         let result = super::headless_register(
             create_unit_test_tenant(),
             axum::extract::State(auth_state),
+            axum::Extension(test_email_sender()),
             axum::Json(super::HeadlessRegisterRequest {
                 email: email.clone(),
                 password: "testpassword123".to_string(),
@@ -2106,6 +2142,7 @@ mod tests {
         let response = super::headless_register(
             create_unit_test_tenant(),
             axum::extract::State(auth_state),
+            axum::Extension(test_email_sender()),
             axum::Json(super::HeadlessRegisterRequest {
                 email: email.clone(),
                 password: "testpassword123".to_string(),
@@ -2168,6 +2205,7 @@ mod tests {
         let response = super::headless_register(
             create_unit_test_tenant(),
             axum::extract::State(auth_state),
+            axum::Extension(test_email_sender()),
             axum::Json(super::HeadlessRegisterRequest {
                 email: email.clone(),
                 password: "testpassword123".to_string(),
@@ -3077,6 +3115,7 @@ mod tests {
         match super::headless_resend_pin(
             create_unit_test_tenant(),
             axum::extract::State(auth_state),
+            axum::Extension(test_email_sender()),
             axum::Json(super::HeadlessResendPinRequest {
                 device_code: device_code.to_string(),
             }),

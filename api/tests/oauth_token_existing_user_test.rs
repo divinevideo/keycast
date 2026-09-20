@@ -189,6 +189,7 @@ async fn oauth_token_exchanges_plain_existing_user_code() {
     let response = match token(
         create_test_tenant(),
         State(auth_state.clone()),
+        axum::Extension(common::test_email_sender()),
         TokenRequestBody(TokenRequest {
             grant_type: Some("authorization_code".to_string()),
             code: Some(code.clone()),
@@ -209,6 +210,7 @@ async fn oauth_token_exchanges_plain_existing_user_code() {
     let replay = match token(
         create_test_tenant(),
         State(auth_state),
+        axum::Extension(common::test_email_sender()),
         TokenRequestBody(TokenRequest {
             grant_type: Some("authorization_code".to_string()),
             code: Some(code.clone()),
@@ -313,6 +315,7 @@ async fn oauth_token_issuance_failure_leaves_pending_registration_rearmable() {
     let response = match token(
         create_test_tenant(),
         State(auth_state),
+        axum::Extension(common::test_email_sender()),
         TokenRequestBody(TokenRequest {
             grant_type: Some("authorization_code".to_string()),
             code: Some(exchange_code.clone()),

@@ -4,6 +4,7 @@ pub mod atproto_provisioning;
 pub mod auth_cleanup;
 pub mod brand;
 pub mod divine_names;
+pub mod email_delivery;
 pub mod email_service;
 pub mod handlers;
 pub mod key_egress_limiter;
