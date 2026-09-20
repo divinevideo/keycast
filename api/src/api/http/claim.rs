@@ -55,6 +55,12 @@ pub struct ClaimForm {
     pub password_confirmation: String,
 }
 
+/// Form data for POST /api/claim/confirm.
+#[derive(Deserialize)]
+pub struct ClaimConfirmationForm {
+    pub token: String,
+}
+
 /// Form data for POST /api/claim/resend
 #[derive(Debug, Deserialize)]
 pub struct ClaimResendForm {
@@ -322,7 +328,7 @@ pub async fn claim_get(
 }
 
 /// POST /claim
-/// Process claim - sets email/password, marks token as used, redirects to dashboard
+/// Stage the entered credentials and send an email confirmation link.
 pub async fn claim_post(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
@@ -396,7 +402,7 @@ pub async fn claim_post(
     // Stage the pending claim instead of completing it: email, password hash,
     // and a fresh confirmation token sit on the claim-token row until the
     // claimer proves control of the address via the emailed confirmation link
-    // (see claim_confirm_get below). The guarded write re-checks validity under
+    // (see claim_confirm_post below). The guarded write re-checks validity under
     // the row lock, same as the old consume did, so a concurrent admin
     // invalidation (e.g. clear-verified-minor revoking this account's
     // outstanding link) still cannot land a claim.
@@ -476,7 +482,7 @@ pub async fn claim_post(
 /// `classify` call and the write itself, most commonly an admin invalidation
 /// landing in between. Maps the token's current terminal state to the
 /// state-specific error page so the claimer isn't shown a generic failure.
-/// Shared by `claim_post` and `claim_confirm_get`.
+/// Used by `claim_post` when staging loses a token-validity race.
 async fn reclassify_to_error(
     claim_token_repo: &ClaimTokenRepository,
     token: &str,
@@ -504,15 +510,36 @@ async fn reclassify_to_error(
 }
 
 /// GET /api/claim/confirm?token=<confirmation_token>
-/// Completes a staged claim when the claimer clicks the emailed confirmation
-/// link: consumes the confirmation token (writing the staged email/password
-/// onto the user atomically, per `confirm_claim_consuming_token`), issues the
-/// session UCAN, and renders the "Account Claimed!" success page. This is
-/// the second half of the flow `claim_post` starts.
+/// Show a confirmation form without changing the account or consuming the link.
+/// The form requires an explicit submission to finish the claim.
 pub async fn claim_confirm_get(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
     Query(params): Query<ClaimQuery>,
+) -> Result<Response, ClaimError> {
+    let claim_token_repo = ClaimTokenRepository::new(auth_state.state.db.clone());
+    if let Some(error) = confirmation_error(&claim_token_repo, &params.token, tenant.0.id).await? {
+        return Err(error);
+    }
+
+    Ok((
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::REFERRER_POLICY, "no-referrer"),
+        ],
+        Html(claim_confirmation_html(&params.token)),
+    )
+        .into_response())
+}
+
+/// POST /api/claim/confirm
+/// Complete a staged claim after the recipient submits the confirmation form.
+/// Token consumption and credential updates remain one atomic operation; the
+/// preview is not an authorization decision and every guard is checked again.
+pub async fn claim_confirm_post(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    Form(form): Form<ClaimConfirmationForm>,
 ) -> Result<Response, ClaimError> {
     let tenant_id = tenant.0.id;
     let pool = &auth_state.state.db;
@@ -521,7 +548,7 @@ pub async fn claim_confirm_get(
 
     use keycast_core::repositories::ClaimConsumeOutcome;
     let user_pubkey_hex = match user_repo
-        .confirm_claim_consuming_token(&params.token, tenant_id)
+        .confirm_claim_consuming_token(&form.token, tenant_id)
         .await
         .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?
     {
@@ -532,11 +559,13 @@ pub async fn claim_confirm_get(
         // consumed, superseded by a resend rotation, the 24h confirmation
         // window itself expired, or the underlying claim token died
         // (admin-invalidated/replaced/expired) during that window.
-        // classify_confirmation_failure tells these apart for a precise
+        // confirmation_error tells these apart for a precise
         // error page.
         ClaimConsumeOutcome::TokenNotConsumable => {
             return Err(
-                classify_confirmation_failure(&claim_token_repo, &params.token, tenant_id).await?,
+                confirmation_error(&claim_token_repo, &form.token, tenant_id)
+                    .await?
+                    .unwrap_or(ClaimError::ConfirmationUnrecognized),
             );
         }
     };
@@ -687,21 +716,14 @@ pub async fn claim_resend_post(
     Ok(Html(claim_confirmation_sent_html(None, &form.token)).into_response())
 }
 
-/// Classify a `TokenNotConsumable` outcome from `confirm_claim_consuming_token`
-/// into a precise error page. That outcome collapses several distinct
-/// causes: the confirmation token is unknown; was already consumed (a
-/// successful consume nulls `confirmation_token`, so a re-click of the same
-/// link lands here too -- the intended idempotent behavior); was superseded
-/// by a resend that rotated it to a fresh token once the old one's
-/// confirmation window expired, so the old value no longer matches any row;
-/// the 24h confirmation window itself expired; or the underlying claim token
-/// died (admin-invalidated, replaced, or expired) sometime during that
-/// window.
-async fn classify_confirmation_failure(
+/// Read confirmation validity for the preview and classify failed POSTs into
+/// their existing error pages. A valid preview leaves all token state intact;
+/// the consuming transaction independently checks validity on submission.
+async fn confirmation_error(
     claim_token_repo: &ClaimTokenRepository,
     confirmation_token: &str,
     tenant_id: i64,
-) -> Result<ClaimError, ClaimError> {
+) -> Result<Option<ClaimError>, ClaimError> {
     let row = claim_token_repo
         .confirmation_classification(confirmation_token, tenant_id)
         .await
@@ -711,7 +733,7 @@ async fn classify_confirmation_failure(
         // No row: unrecognized token, already consumed (idempotent re-click
         // behavior, intentional), or superseded by a resend that rotated an
         // expired confirmation token to a fresh value.
-        return Ok(ClaimError::ConfirmationUnrecognized);
+        return Ok(Some(ClaimError::ConfirmationUnrecognized));
     };
 
     let confirmation_expired = match confirmation_expires_at {
@@ -723,15 +745,27 @@ async fn classify_confirmation_failure(
         None => true,
     };
     if confirmation_expired {
-        return Ok(ClaimError::ConfirmationExpired);
+        return Ok(Some(ClaimError::ConfirmationExpired));
     }
 
-    // The confirmation window is still valid, so the failure must be the
-    // underlying claim token itself. Re-classify it for a precise page.
-    reclassify_to_error(claim_token_repo, &claim_token, tenant_id).await
+    use keycast_core::types::claim_token::ClaimTokenState;
+    Ok(
+        match claim_token_repo
+            .classify(&claim_token, tenant_id)
+            .await
+            .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?
+        {
+            ClaimTokenState::Valid(_) => None,
+            ClaimTokenState::AlreadyClaimed(_) => Some(ClaimError::TokenAlreadyClaimed),
+            ClaimTokenState::AdminInvalidated(_) => Some(ClaimError::TokenAdminInvalidated),
+            ClaimTokenState::Replaced { .. } => Some(ClaimError::TokenReplaced),
+            ClaimTokenState::Expired(_) => Some(ClaimError::TokenExpired),
+            ClaimTokenState::Unrecognized => Some(ClaimError::TokenUnrecognized),
+        },
+    )
 }
 
-/// Success page shown after `claim_confirm_get` completes a claim. Moved here
+/// Success page shown after `claim_confirm_post` completes a claim. Moved here
 /// verbatim from claim_post's former single-step tail, extracted into its own
 /// function so the handler above stays readable.
 fn claim_success_html(display_name: &str) -> String {
@@ -936,19 +970,50 @@ fn claim_success_html(display_name: &str) -> String {
 fn claim_confirmation_sent_html(email: Option<&str>, token: &str) -> String {
     let message = match email {
         Some(address) => format!(
-            "We sent a confirmation link to <strong>{}</strong>. Click the link in that email to finish claiming your account.",
+            "We sent a confirmation link to <strong>{}</strong>. Open the link in that email and confirm to finish claiming your account.",
             escape_html(address)
         ),
         None => "If a pending claim exists for that address, we've sent another confirmation link. Check your email.".to_string(),
     };
 
+    let content = format!(
+        r#"        <div class="icon">&#9993;</div>
+        <h1>Check Your Email</h1>
+        <p>{message}</p>
+        <form method="POST" action="/api/claim/resend">
+            <input type="hidden" name="token" value="{token}">
+            <button type="submit">Resend Confirmation Email</button>
+        </form>
+        <p class="secondary">Entered the wrong address? <a href="/api/claim?token={token}">Go back and re-enter your email</a>.</p>"#,
+        message = message,
+        token = escape_attr(token),
+    );
+    claim_confirmation_page_html("Check Your Email", &content)
+}
+
+fn claim_confirmation_html(token: &str) -> String {
+    let content = format!(
+        r#"<div class="icon">&#9993;</div>
+        <h1>Confirm Your Email</h1>
+        <p>Confirm this email address to finish claiming your account.</p>
+        <form method="POST" action="/api/claim/confirm">
+            <input type="hidden" name="token" value="{token}">
+            <button type="submit">Confirm and Claim Account</button>
+        </form>
+        <p class="secondary">If you didn't start this claim, you can close this page.</p>"#,
+        token = escape_attr(token),
+    );
+    claim_confirmation_page_html("Confirm Your Email", &content)
+}
+
+fn claim_confirmation_page_html(title: &str, content: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Check Your Email</title>
+    <title>{title}</title>
     <style>
         * {{ box-sizing: border-box; }}
         body {{
@@ -1020,19 +1085,12 @@ fn claim_confirmation_sent_html(email: Option<&str>, token: &str) -> String {
 </head>
 <body>
     <div class="container">
-        <div class="icon">&#9993;</div>
-        <h1>Check Your Email</h1>
-        <p>{message}</p>
-        <form method="POST" action="/api/claim/resend">
-            <input type="hidden" name="token" value="{token}">
-            <button type="submit">Resend Confirmation Email</button>
-        </form>
-        <p class="secondary">Entered the wrong address? <a href="/api/claim?token={token}">Go back and re-enter your email</a>.</p>
+{content}
     </div>
 </body>
 </html>"#,
-        message = message,
-        token = escape_attr(token),
+        title = title,
+        content = content,
     )
 }
 

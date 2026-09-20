@@ -361,7 +361,7 @@ async fn complete_pending_oauth_registration_uses_one_connection() {
 }
 
 /// Account claim confirmation -> api/src/api/http/claim.rs
-/// (`claim_confirm_get`). The claim is staged on the seed pool first --
+/// (`claim_confirm_post`). The claim is staged on the seed pool first --
 /// staging isn't the transaction-bearing operation under test here, the
 /// atomic confirm-and-consume is (the single-step
 /// `claim_account_consuming_token` this probe used to exercise was removed

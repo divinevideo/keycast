@@ -24,7 +24,7 @@ fn generate_token() -> String {
 /// single-step `claim_account_consuming_token`) and return the freshly
 /// minted confirmation token. The confirm-step tests below feed that
 /// confirmation token to `confirm_claim_consuming_token`, mirroring the real
-/// claim_post -> claim_confirm_get two-step flow.
+/// claim_post -> claim_confirm_post two-step flow.
 async fn stage_claim(
     claim_repo: &ClaimTokenRepository,
     token: &str,
@@ -138,7 +138,7 @@ async fn test_valid_token_consumed_and_account_claimed() {
 /// must be untouched.
 ///
 /// Staged before the two-step split, this test's "claim flow tries to
-/// proceed" step is now `confirm_claim_consuming_token` (`claim_confirm_get`)
+/// proceed" step is now `confirm_claim_consuming_token` (`claim_confirm_post`)
 /// rather than the single-step consume: staging happens first (mirroring
 /// `claim_post`, which itself re-checks validity and would already refuse a
 /// dead token), so the window this test targets -- a concurrent admin

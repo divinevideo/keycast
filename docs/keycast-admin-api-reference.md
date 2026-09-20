@@ -273,7 +273,7 @@ Decrypt a NIP-44 encrypted message.
 
 Claiming an account is a two-step, email-confirmed flow: submitting the claim
 form stages the entered email/password and sends a confirmation link, and the
-claim only completes when that link is clicked.
+claim only completes when the recipient submits the confirmation form opened by that link.
 
 ### GET /api/claim
 
@@ -309,13 +309,42 @@ token=abc123xyz&email=user@example.com&password=secret123&password_confirmation=
 
 ### GET /api/claim/confirm
 
-Complete the claim: consumes the confirmation token from the emailed link,
-writes the staged email/password onto the user account, and issues the
-session.
+Display a confirmation form for a valid emailed link. GET and HEAD leave the
+account, pending credentials, and claim token unchanged and do not issue a session.
+The recipient must press **Confirm and Claim Account** to complete the claim.
 
 **Request:**
 ```http
 GET /api/claim/confirm?token=<confirmation_token>
+```
+
+**Response:** 200, HTML "Confirm Your Email" form. No session cookie is set.
+
+![Claim confirmation form](images/claim-confirmation.png)
+
+The screenshot uses a synthetic local account at a 390 × 844 viewport. To
+refresh it, submit a local claim form with the development email sender, open
+its confirmation link, and capture the page before pressing the confirmation
+button. Verify that the account remains pending before the button is pressed
+and completes afterward. Capture page content only, without the browser's URL bar.
+
+**Errors:**
+| Status | Description |
+|--------|-------------|
+| 400 | Confirmation link unrecognized/expired, or the underlying claim token is no longer valid |
+
+### POST /api/claim/confirm
+
+Complete the claim after the recipient submits the form: atomically re-check
+validity, consume the confirmation token, write the staged email/password onto the
+account, and mark the email verified. Only a successful submission issues a session.
+
+**Request:**
+```http
+POST /api/claim/confirm
+Content-Type: application/x-www-form-urlencoded
+
+token=<confirmation_token>
 ```
 
 **Response:** 200, HTML "Account Claimed" success page, with `Set-Cookie: keycast_session=...` establishing the session.

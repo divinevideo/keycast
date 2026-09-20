@@ -1,5 +1,5 @@
 // ABOUTME: HTTP-layer tests for the staged-claim submit + confirm + resend paths
-// ABOUTME: POST /claim stages + emails; GET /claim/confirm completes the claim; POST /claim/resend re-sends, cooldown-gated
+// ABOUTME: GET /claim/confirm previews without mutation; POST /claim/confirm completes the staged claim
 
 #![cfg(feature = "integration-tests")]
 
@@ -44,6 +44,7 @@ fn test_tenant() -> keycast_api::api::tenant::TenantExtractor {
 fn build_app(auth_state: AuthState) -> Router {
     let post_state = auth_state.clone();
     let get_state = auth_state.clone();
+    let confirm_state = auth_state.clone();
     let resend_state = auth_state.clone();
     Router::new()
         .route(
@@ -68,6 +69,21 @@ fn build_app(auth_state: AuthState) -> Router {
                             test_tenant(),
                             State(state),
                             axum::extract::Query(params),
+                        )
+                        .await
+                    }
+                },
+            )
+            .post(
+                move |axum::extract::Form(form): axum::extract::Form<
+                    claim::ClaimConfirmationForm,
+                >| {
+                    let state = confirm_state.clone();
+                    async move {
+                        claim::claim_confirm_post(
+                            test_tenant(),
+                            State(state),
+                            axum::extract::Form(form),
                         )
                         .await
                     }
@@ -102,6 +118,13 @@ fn post_claim_form(body: &str) -> Request<Body> {
 fn get_claim_confirm(token: &str) -> Request<Body> {
     Request::get(format!("/api/claim/confirm?token={}", token))
         .body(Body::empty())
+        .unwrap()
+}
+
+fn post_claim_confirm(token: &str) -> Request<Body> {
+    Request::post("/api/claim/confirm")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(format!("token={token}")))
         .unwrap()
 }
 
@@ -307,6 +330,85 @@ async fn post_claim_stages_and_sends_without_mutating_user() {
     );
 }
 
+async fn assert_confirmation_preview_is_read_only(method: &str) {
+    let pool = common::setup_test_db().await;
+    let (auth_state, _producer_handle) = common::create_test_auth_state(pool.clone());
+    let (token, pubkey) = seed_valid_claim_token(&pool).await;
+    let claim_email = format!("preview-{}@example.com", pubkey);
+    let app = build_app(auth_state);
+    let body = format!(
+        "token={}&email={}&password=supersecret&password_confirmation=supersecret",
+        token, claim_email
+    );
+    let staged = app.clone().oneshot(post_claim_form(&body)).await.unwrap();
+    assert_eq!(staged.status(), StatusCode::OK);
+    let confirmation_token = read_confirmation_token(&pool, &token).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(format!("/api/claim/confirm?token={confirmation_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let user: (Option<String>, Option<String>, bool) = sqlx::query_as(
+        "SELECT email, password_hash, email_verified FROM users WHERE pubkey = $1 AND tenant_id = $2",
+    )
+    .bind(&pubkey)
+    .bind(TENANT_ID)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        user,
+        (None, None, false),
+        "opening the confirmation link must leave account credentials unchanged"
+    );
+    let row = read_claim_token_row(&pool, &token).await;
+    assert!(
+        row.used_at.is_none(),
+        "opening the link must not consume it"
+    );
+    assert_eq!(
+        row.confirmation_token.as_deref(),
+        Some(confirmation_token.as_str())
+    );
+    assert_eq!(row.pending_email.as_deref(), Some(claim_email.as_str()));
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!response.headers().contains_key(header::SET_COOKIE));
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    if method == "GET" {
+        assert!(html.contains(r#"method="POST" action="/api/claim/confirm""#));
+        assert!(html.contains(&format!(r#"name="token" value="{confirmation_token}""#)));
+        assert!(html.contains("Confirm and Claim Account"));
+    } else {
+        assert!(html.is_empty(), "HEAD must not return a response body");
+    }
+}
+
+#[tokio::test]
+async fn get_confirmation_link_leaves_claim_pending() {
+    assert_confirmation_preview_is_read_only("GET").await;
+}
+
+#[tokio::test]
+async fn head_confirmation_link_leaves_claim_pending() {
+    assert_confirmation_preview_is_read_only("HEAD").await;
+}
+
 #[tokio::test]
 async fn confirm_completes_claim_and_sets_session() {
     common::assert_test_database_url();
@@ -334,8 +436,33 @@ async fn confirm_completes_claim_and_sets_session() {
 
     let confirmation_token = read_confirmation_token(&pool, &token).await;
 
-    let resp = app
+    // Opening the mailed link only displays the action; submitting that
+    // form completes the claim and issues the session.
+    let preview = app
+        .clone()
         .oneshot(get_claim_confirm(&confirmation_token))
+        .await
+        .unwrap();
+    assert_eq!(preview.status(), StatusCode::OK);
+    assert!(read_user_email(&pool, &pubkey).await.is_none());
+    let preview_html = String::from_utf8(
+        preview
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    let form_token = preview_html
+        .split(r#"name="token" value=""#)
+        .nth(1)
+        .and_then(|value| value.split('"').next())
+        .expect("confirmation form must carry its token");
+    let resp = app
+        .clone()
+        .oneshot(post_claim_confirm(form_token))
         .await
         .unwrap();
 
@@ -384,6 +511,104 @@ async fn confirm_completes_claim_and_sets_session() {
         read_claim_token_used_at(&pool, &token).await.is_some(),
         "confirming a claim must mark the claim token used"
     );
+
+    let replay = app
+        .oneshot(post_claim_confirm(&confirmation_token))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+    assert!(!replay.headers().contains_key(header::SET_COOKIE));
+}
+
+#[tokio::test]
+async fn confirmation_submission_rechecks_changes_after_preview() {
+    let pool = common::setup_test_db().await;
+    let (auth_state, _producer_handle) = common::create_test_auth_state(pool.clone());
+    let app = build_app(auth_state);
+
+    for (change, expected_message) in [
+        ("invalidated", "Link has been deactivated"),
+        ("expired", "Confirmation link expired"),
+        ("superseded", "Link not recognized"),
+    ] {
+        let (token, pubkey) = seed_valid_claim_token(&pool).await;
+        let body = format!(
+            "token={token}&email=preview-{pubkey}@example.com&password=supersecret&password_confirmation=supersecret"
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(post_claim_form(&body))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let confirmation_token = read_confirmation_token(&pool, &token).await;
+        assert_eq!(
+            app.clone()
+                .oneshot(get_claim_confirm(&confirmation_token))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        // The user can leave this form open while the pending claim changes.
+        // Neither a reload nor submitting that old form may complete it.
+        match change {
+            "invalidated" => {
+                sqlx::query(
+                    "UPDATE account_claim_tokens SET invalidated_at = NOW() WHERE token = $1",
+                )
+                .bind(&token)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            "expired" => {
+                sqlx::query("UPDATE account_claim_tokens SET confirmation_expires_at = NOW() - INTERVAL '1 minute' WHERE token = $1")
+                    .bind(&token).execute(&pool).await.unwrap();
+            }
+            "superseded" => {
+                sqlx::query(
+                    "UPDATE account_claim_tokens SET confirmation_token = $1 WHERE token = $2",
+                )
+                .bind(format!("replacement-{pubkey}"))
+                .bind(&token)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        for request in [
+            get_claim_confirm(&confirmation_token),
+            post_claim_confirm(&confirmation_token),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{change}");
+            assert!(
+                !response.headers().contains_key(header::SET_COOKIE),
+                "{change}"
+            );
+            let html = String::from_utf8(
+                response
+                    .into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(html.contains(expected_message), "{change}: {html}");
+        }
+        assert!(read_user_email(&pool, &pubkey).await.is_none(), "{change}");
+        assert!(
+            read_claim_token_used_at(&pool, &token).await.is_none(),
+            "{change}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -393,18 +618,20 @@ async fn confirm_with_unknown_token_is_unrecognized() {
     let (auth_state, _producer_handle) = common::create_test_auth_state(pool.clone());
 
     let app = build_app(auth_state);
-    let resp = app
-        .oneshot(get_claim_confirm("does-not-exist"))
-        .await
-        .unwrap();
+    for request in [
+        get_claim_confirm("does-not-exist"),
+        post_claim_confirm("does-not-exist"),
+    ] {
+        let resp = app.clone().oneshot(request).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8(body_bytes.to_vec()).unwrap();
-    assert!(
-        html.contains("Link not recognized"),
-        "response must show the unrecognized-link page, got: {html}"
-    );
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8(body_bytes.to_vec()).unwrap();
+        assert!(
+            html.contains("Link not recognized"),
+            "response must show the unrecognized-link page, got: {html}"
+        );
+    }
 }
 
 /// A claimer who mistyped their address gets no mail, so "Resend" cannot help
@@ -787,27 +1014,29 @@ async fn confirm_with_expired_confirmation_window_shows_expired_page() {
     .await
     .expect("backdate confirmation_expires_at");
 
-    let resp = app
-        .oneshot(get_claim_confirm(&confirmation_token))
-        .await
-        .unwrap();
+    for request in [
+        get_claim_confirm(&confirmation_token),
+        post_claim_confirm(&confirmation_token),
+    ] {
+        let resp = app.clone().oneshot(request).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8(body_bytes.to_vec()).unwrap();
-    assert!(
-        html.contains("Confirmation link expired"),
-        "response must show the confirmation-expired page, got: {html}"
-    );
-    assert!(
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8(body_bytes.to_vec()).unwrap();
+        assert!(
+            html.contains("Confirmation link expired"),
+            "response must show the confirmation-expired page, got: {html}"
+        );
+        assert!(
         !html.contains("Link not recognized"),
         "an expired confirmation window is a distinct failure from an unrecognized link, got: {html}"
     );
 
-    assert!(
-        read_user_email(&pool, &pubkey).await.is_none(),
-        "an expired confirmation must not mutate the user row"
-    );
+        assert!(
+            read_user_email(&pool, &pubkey).await.is_none(),
+            "an expired confirmation must not mutate the user row"
+        );
+    }
 }
 
 /// When the staged email was claimed by another account between staging and
@@ -839,7 +1068,7 @@ async fn confirm_with_email_taken_by_another_account_shows_dedicated_page() {
     seed_other_user_with_email(&pool, &claim_email).await;
 
     let resp = app
-        .oneshot(get_claim_confirm(&confirmation_token))
+        .oneshot(post_claim_confirm(&confirmation_token))
         .await
         .unwrap();
 

@@ -116,7 +116,7 @@ impl ClaimTokenRepository {
     /// Returns the updated token, or None if token not found or already used.
     ///
     /// NOTE: the claim flow itself must NOT use this — it re-checks only
-    /// `used_at`, not `invalidated_at`/`expires_at`. `claim_confirm_get`
+    /// `used_at`, not `invalidated_at`/`expires_at`. `claim_confirm_post`
     /// consumes tokens via `UserRepository::confirm_claim_consuming_token`,
     /// which is atomic with full validity (#280 review). Kept for
     /// tests/fixtures.
@@ -523,8 +523,8 @@ impl ClaimTokenRepository {
     /// Look up the claim token string and confirmation expiry for a given
     /// confirmation token, with no validity guard at all.
     ///
-    /// Used only to classify a failed confirm into a precise error page, which
-    /// is why it deliberately matches rows the other methods exclude (used,
+    /// Used to validate the read-only preview and classify a failed confirm.
+    /// It deliberately matches rows the consuming method excludes (used,
     /// invalidated, expired): the whole point is to tell the claimer *why* the
     /// link did not work. Returns `None` when no row carries this confirmation
     /// token — unknown, already consumed (a successful confirm nulls it), or
