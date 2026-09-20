@@ -2,6 +2,12 @@
 set -euo pipefail
 
 repo_root=$(git rev-parse --show-toplevel)
+# Git hooks export repository-local variables. Without clearing them, `git -C`
+# below still targets the invoking repository instead of the temporary fixture.
+while IFS= read -r git_variable; do
+	unset "$git_variable"
+done < <(git rev-parse --local-env-vars)
+
 source_guard="$repo_root/scripts/check-cloudbuild-context.sh"
 fake_bin="$repo_root/tests/fixtures/bin"
 result_file=$(mktemp)
