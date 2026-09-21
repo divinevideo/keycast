@@ -2,8 +2,8 @@
 // ABOUTME: Used when Vine-imported users claim their Keycast accounts
 
 use axum::{
-    extract::{Query, State},
-    http::{header, StatusCode},
+    extract::{Extension, Query, State},
+    http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     Form,
 };
@@ -15,6 +15,7 @@ use serde::Deserialize;
 use super::html_safety::{escape_attr, escape_html};
 use super::routes::AuthState;
 use crate::brand::BRAND_NAME;
+use crate::email_delivery::{EmailAdmissionRequest, EmailDeliveryPurpose, EmailDeliveryService};
 use keycast_core::{
     bcrypt_admission::{BcryptAdmissionError, BcryptWorkload},
     repositories::{ClaimTokenRepository, UserRepository},
@@ -332,6 +333,8 @@ pub async fn claim_get(
 pub async fn claim_post(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
+    Extension(email_delivery): Extension<EmailDeliveryService>,
+    headers: HeaderMap,
     Form(mut form): Form<ClaimForm>,
 ) -> Result<Response, ClaimError> {
     let tenant_id = tenant.0.id;
@@ -410,8 +413,27 @@ pub async fn claim_post(
     let confirmation_expires_at = Utc::now()
         + Duration::hours(keycast_core::types::claim_token::CLAIM_CONFIRMATION_EXPIRY_HOURS);
 
+    let source = email_delivery.coarse_source(&headers);
+    let reservation = email_delivery
+        .admit(EmailAdmissionRequest {
+            tenant_id,
+            purpose: EmailDeliveryPurpose::ClaimConfirmation,
+            destinations: &[&form.email],
+            account: Some(&claim_token.user_pubkey),
+            source: source.as_deref(),
+            delivery_slots: 1,
+        })
+        .await
+        .map_err(|denied| {
+            tracing::warn!(
+                reason = denied.reason.as_str(),
+                "Claim confirmation email suppressed"
+            );
+            ClaimError::ServiceUnavailable
+        })?;
+
     use keycast_core::repositories::StagePendingOutcome;
-    match claim_token_repo
+    let stage_outcome = claim_token_repo
         .stage_pending_claim(
             &form.token,
             tenant_id,
@@ -421,13 +443,21 @@ pub async fn claim_post(
             confirmation_expires_at,
         )
         .await
-        .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?
-    {
+        .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)));
+    let stage_outcome = match stage_outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            reservation.release().await;
+            return Err(error);
+        }
+    };
+    match stage_outcome {
         StagePendingOutcome::Staged => {}
         StagePendingOutcome::TokenNotStageable => {
             // Token died between classification and staging (e.g. an admin
             // invalidation landed in between) - re-classify so the user gets
             // the state-specific error page.
+            reservation.release().await;
             return Err(reclassify_to_error(&claim_token_repo, &form.token, tenant_id).await?);
         }
         StagePendingOutcome::SendLimitReached => {
@@ -438,6 +468,7 @@ pub async fn claim_post(
                 "Claim confirmation send budget exhausted: pubkey={}",
                 &claim_token.user_pubkey
             );
+            reservation.release().await;
             return Err(ClaimError::ConfirmationSendLimitReached);
         }
     }
@@ -445,28 +476,15 @@ pub async fn claim_post(
     // Best-effort send; a send failure should not strand a staged claim
     // silently, so surface it to the claimer instead of showing a
     // "check your email" page for an email that was never sent.
-    match crate::email_service::EmailService::new() {
-        Ok(email_service) => {
-            if let Err(e) = email_service
-                .send_claim_confirmation(&form.email, &confirmation_token)
-                .await
-            {
-                tracing::error!(
-                    "Failed to send claim confirmation to {}: {}",
-                    &form.email,
-                    e
-                );
-                return Err(ClaimError::Internal(
-                    "Could not send confirmation email".to_string(),
-                ));
-            }
-        }
-        Err(e) => {
-            tracing::error!("Email service unavailable: {}", e);
-            return Err(ClaimError::Internal(
-                "Could not send confirmation email".to_string(),
-            ));
-        }
+    let delivery_outcome = email_delivery
+        .send_claim_confirmation(&form.email, &confirmation_token)
+        .await;
+    reservation.release().await;
+    if let Err(e) = delivery_outcome {
+        tracing::error!("Failed to send claim confirmation: {}", e);
+        return Err(ClaimError::Internal(
+            "Could not send confirmation email".to_string(),
+        ));
     }
 
     tracing::info!(
@@ -642,6 +660,8 @@ pub async fn claim_confirm_post(
 pub async fn claim_resend_post(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
+    Extension(email_delivery): Extension<EmailDeliveryService>,
+    headers: HeaderMap,
     Form(form): Form<ClaimResendForm>,
 ) -> Result<Response, ClaimError> {
     let tenant_id = tenant.0.id;
@@ -676,6 +696,28 @@ pub async fn claim_resend_post(
             None
         };
 
+        let source = email_delivery.coarse_source(&headers);
+        let reservation = match email_delivery
+            .admit(EmailAdmissionRequest {
+                tenant_id,
+                purpose: EmailDeliveryPurpose::ClaimConfirmation,
+                destinations: &[&state.to_email],
+                account: Some(&state.user_pubkey),
+                source: source.as_deref(),
+                delivery_slots: 1,
+            })
+            .await
+        {
+            Ok(reservation) => reservation,
+            Err(denied) => {
+                tracing::warn!(
+                    reason = denied.reason.as_str(),
+                    "Claim confirmation resend suppressed"
+                );
+                return Ok(Html(claim_confirmation_sent_html(None, &form.token)).into_response());
+            }
+        };
+
         let claimed_slot = claim_token_repo
             .touch_claim_confirmation(
                 &form.token,
@@ -684,7 +726,14 @@ pub async fn claim_resend_post(
                 super::auth::CLAIM_RESEND_COOLDOWN_MINUTES,
             )
             .await
-            .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?;
+            .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)));
+        let claimed_slot = match claimed_slot {
+            Ok(claimed_slot) => claimed_slot,
+            Err(error) => {
+                reservation.release().await;
+                return Err(error);
+            }
+        };
 
         if claimed_slot {
             let confirmation_token = match &rotated {
@@ -697,18 +746,14 @@ pub async fn claim_resend_post(
             // pending claim exists for this token -- and a claimer who
             // retries a failed send has nothing better to do than resend
             // again anyway.
-            match crate::email_service::EmailService::new() {
-                Ok(email_service) => {
-                    if let Err(e) = email_service
-                        .send_claim_confirmation(&state.to_email, &confirmation_token)
-                        .await
-                    {
-                        tracing::error!("Failed to resend claim confirmation: {}", e);
-                    }
-                }
-                Err(e) => tracing::error!("Email service unavailable for claim resend: {}", e),
+            if let Err(e) = email_delivery
+                .send_claim_confirmation(&state.to_email, &confirmation_token)
+                .await
+            {
+                tracing::error!("Failed to resend claim confirmation: {}", e);
             }
         }
+        reservation.release().await;
     }
 
     // Enumeration-safe: identical generic interstitial regardless of token

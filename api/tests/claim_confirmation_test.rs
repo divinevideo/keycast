@@ -16,6 +16,10 @@ use chrono::Utc;
 use http_body_util::BodyExt;
 use keycast_api::api::http::{claim, routes::AuthState};
 use keycast_api::ucan_auth::did_to_nostr_pubkey;
+use keycast_api::{
+    email_delivery::{EmailAdmissionRefusal, EmailDeliveryService},
+    email_service::DevEmailSender,
+};
 use keycast_core::types::claim_token::CLAIM_CONFIRMATION_SEND_LIMIT;
 use nostr_sdk::{Keys, ToBech32};
 use sqlx::PgPool;
@@ -42,6 +46,13 @@ fn test_tenant() -> keycast_api::api::tenant::TenantExtractor {
 /// mount the real handlers directly and hand them a manually-built
 /// `TenantExtractor`, bypassing the Host-header/DB tenant lookup entirely.
 fn build_app(auth_state: AuthState) -> Router {
+    build_app_with_delivery(
+        auth_state,
+        EmailDeliveryService::unrestricted_for_tests(Arc::new(DevEmailSender::new())),
+    )
+}
+
+fn build_app_with_delivery(auth_state: AuthState, email_delivery: EmailDeliveryService) -> Router {
     let post_state = auth_state.clone();
     let get_state = auth_state.clone();
     let confirm_state = auth_state.clone();
@@ -50,11 +61,23 @@ fn build_app(auth_state: AuthState) -> Router {
         .route(
             "/api/claim",
             post(
-                move |axum::extract::Form(form): axum::extract::Form<claim::ClaimForm>| {
+                move |
+                    headers: axum::http::HeaderMap,
+                    axum::extract::Extension(email_delivery): axum::extract::Extension<
+                        EmailDeliveryService,
+                    >,
+                    axum::extract::Form(form): axum::extract::Form<claim::ClaimForm>,
+                | {
                     let state = post_state.clone();
                     async move {
-                        claim::claim_post(test_tenant(), State(state), axum::extract::Form(form))
-                            .await
+                        claim::claim_post(
+                            test_tenant(),
+                            State(state),
+                            axum::extract::Extension(email_delivery),
+                            headers,
+                            axum::extract::Form(form),
+                        )
+                        .await
                     }
                 },
             ),
@@ -93,12 +116,20 @@ fn build_app(auth_state: AuthState) -> Router {
         .route(
             "/api/claim/resend",
             post(
-                move |axum::extract::Form(form): axum::extract::Form<claim::ClaimResendForm>| {
+                move |
+                    headers: axum::http::HeaderMap,
+                    axum::extract::Extension(email_delivery): axum::extract::Extension<
+                        EmailDeliveryService,
+                    >,
+                    axum::extract::Form(form): axum::extract::Form<claim::ClaimResendForm>,
+                | {
                     let state = resend_state.clone();
                     async move {
                         claim::claim_resend_post(
                             test_tenant(),
                             State(state),
+                            axum::extract::Extension(email_delivery),
+                            headers,
                             axum::extract::Form(form),
                         )
                         .await
@@ -106,6 +137,7 @@ fn build_app(auth_state: AuthState) -> Router {
                 },
             ),
         )
+        .layer(axum::extract::Extension(email_delivery))
 }
 
 fn post_claim_form(body: &str) -> Request<Body> {
@@ -328,6 +360,33 @@ async fn post_claim_stages_and_sends_without_mutating_user() {
         row.confirmation_token.is_some(),
         "a confirmation token must be staged for the emailed confirm link"
     );
+}
+
+#[tokio::test]
+async fn denied_delivery_leaves_claim_unstaged() {
+    common::assert_test_database_url();
+    let pool = common::setup_test_db().await;
+    let (auth_state, _producer_handle) = common::create_test_auth_state(pool.clone());
+    let (token, pubkey) = seed_valid_claim_token(&pool).await;
+    let email = format!("new-{}@example.com", &pubkey[..12]);
+    let app = build_app_with_delivery(
+        auth_state,
+        EmailDeliveryService::denying_for_tests(
+            Arc::new(DevEmailSender::new()),
+            EmailAdmissionRefusal::GlobalVolume,
+        ),
+    );
+
+    let body = format!(
+        "token={token}&email={email}&password=supersecret&password_confirmation=supersecret"
+    );
+    let response = app.oneshot(post_claim_form(&body)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let row = read_claim_token_row(&pool, &token).await;
+    assert!(row.pending_email.is_none());
+    assert!(row.confirmation_token.is_none());
+    assert!(read_user_email(&pool, &pubkey).await.is_none());
 }
 
 async fn assert_confirmation_preview_is_read_only(method: &str) {
@@ -835,6 +894,51 @@ async fn resend_within_cooldown_does_not_bump() {
     assert_eq!(
         confirmation_token_before, confirmation_token_after,
         "a resend within cooldown must not rotate the confirmation token"
+    );
+}
+
+#[tokio::test]
+async fn denied_resend_delivery_leaves_confirmation_state_unchanged() {
+    common::assert_test_database_url();
+    let pool = common::setup_test_db().await;
+    let (auth_state, _producer_handle) = common::create_test_auth_state(pool.clone());
+    let (token, pubkey) = seed_valid_claim_token(&pool).await;
+    let claim_email = format!("new-{}@example.com", &pubkey[..12]);
+    let body = format!(
+        "token={}&email={}&password=supersecret&password_confirmation=supersecret",
+        token, claim_email
+    );
+
+    let stage_app = build_app(auth_state.clone());
+    let response = stage_app.oneshot(post_claim_form(&body)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    sqlx::query(
+        "UPDATE account_claim_tokens SET confirmation_sent_at = NOW() - INTERVAL '6 minutes' WHERE token = $1",
+    )
+    .bind(&token)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let sent_at_before = read_confirmation_sent_at(&pool, &token).await;
+    let confirmation_token_before = read_confirmation_token(&pool, &token).await;
+
+    let resend_app = build_app_with_delivery(
+        auth_state,
+        EmailDeliveryService::denying_for_tests(
+            Arc::new(DevEmailSender::new()),
+            EmailAdmissionRefusal::GlobalVolume,
+        ),
+    );
+    let response = resend_app.oneshot(post_claim_resend(&token)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert_eq!(
+        read_confirmation_sent_at(&pool, &token).await,
+        sent_at_before
+    );
+    assert_eq!(
+        read_confirmation_token(&pool, &token).await,
+        confirmation_token_before
     );
 }
 

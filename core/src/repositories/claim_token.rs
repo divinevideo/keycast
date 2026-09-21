@@ -39,6 +39,7 @@ pub enum StagePendingOutcome {
 /// expiry.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct PendingClaimSendState {
+    pub user_pubkey: String,
     pub to_email: String,
     pub confirmation_sent_at: Option<DateTime<Utc>>,
     pub confirmation_token: String,
@@ -563,7 +564,8 @@ impl ClaimTokenRepository {
         tenant_id: i64,
     ) -> Result<Option<PendingClaimSendState>, RepositoryError> {
         sqlx::query_as::<_, PendingClaimSendState>(
-            "SELECT pending_email AS to_email,
+            "SELECT user_pubkey,
+                    pending_email AS to_email,
                     confirmation_sent_at,
                     confirmation_token,
                     (confirmation_expires_at <= NOW()) AS confirmation_expired
