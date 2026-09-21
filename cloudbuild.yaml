@@ -4,14 +4,21 @@ steps:
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'build'
-      - '--build-arg'
-      - 'BUILD_VERSION=${BUILD_ID}'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/${PROJECT_ID}/docker/keycast:${COMMIT_SHA}-${BUILD_ID}'
       - '-t'
       - 'us-central1-docker.pkg.dev/${PROJECT_ID}/docker/keycast:latest'
       - '.'
     timeout: 1200s
 
-  # Push the Docker image
+  # Preserve every build, including rebuilds of the same commit. Cloud Build
+  # assigns a new BUILD_ID per build, so concurrent builds never share this tag.
+  # Only the convenience :latest pointer is reused.
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'us-central1-docker.pkg.dev/${PROJECT_ID}/docker/keycast:${COMMIT_SHA}-${BUILD_ID}'
+
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'push'
@@ -46,7 +53,7 @@ steps:
       - 'run'
       - 'deploy'
       - 'keycast'
-      - '--image=us-central1-docker.pkg.dev/${PROJECT_ID}/docker/keycast:latest'
+      - '--image=us-central1-docker.pkg.dev/${PROJECT_ID}/docker/keycast:${COMMIT_SHA}-${BUILD_ID}'
       - '--region=us-central1'
       - '--platform=managed'
       - '--allow-unauthenticated'
@@ -177,6 +184,7 @@ steps:
         echo "🎉 All smoke tests passed!"
 
 images:
+  - 'us-central1-docker.pkg.dev/${PROJECT_ID}/docker/keycast:${COMMIT_SHA}-${BUILD_ID}'
   - 'us-central1-docker.pkg.dev/${PROJECT_ID}/docker/keycast:latest'
 
 options:
