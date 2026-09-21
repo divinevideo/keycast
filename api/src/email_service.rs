@@ -158,7 +158,7 @@ pub trait EmailSender: Send + Sync {
         &self,
         to_email: &str,
         confirm_token: &str,
-    ) -> Result<(), String>;
+    ) -> Result<(), EmailSendError>;
 
     /// Send a confirmation link to the proposed NEW address during an email change.
     /// The implementation builds the URL from its configured base URL (mirrors
@@ -376,7 +376,7 @@ impl EmailSender for DevEmailSender {
         &self,
         to_email: &str,
         confirm_token: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), EmailSendError> {
         let confirm_url = build_claim_confirmation_url(&self.base_url, confirm_token);
 
         tracing::info!("");
@@ -758,7 +758,7 @@ impl EmailSender for SendGridEmailSender {
         &self,
         to_email: &str,
         confirm_token: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), EmailSendError> {
         let confirm_url = build_claim_confirmation_url(&self.base_url, confirm_token);
         let subject = format!("Confirm your email to claim your {} account", BRAND_NAME);
         let intro = format!(
@@ -984,7 +984,7 @@ impl EmailService {
         &self,
         to_email: &str,
         confirm_token: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), EmailSendError> {
         self.inner
             .send_claim_confirmation(to_email, confirm_token)
             .await

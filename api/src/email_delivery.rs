@@ -991,6 +991,14 @@ mod tests {
             self.send().await
         }
 
+        async fn send_claim_confirmation(
+            &self,
+            _to_email: &str,
+            _confirm_token: &str,
+        ) -> Result<(), EmailSendError> {
+            self.send().await
+        }
+
         async fn send_email_change_confirmation(
             &self,
             _to_new_email: &str,
