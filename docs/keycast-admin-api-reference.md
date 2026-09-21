@@ -305,7 +305,7 @@ token=abc123xyz&email=user@example.com&password=secret123&password_confirmation=
 **Errors:**
 | Status | Description |
 |--------|-------------|
-| 400 | Invalid/expired/replaced/deactivated token, passwords don't match, weak password, invalid email, or email already registered |
+| 400 | Invalid/expired/replaced/deactivated token, passwords don't match, weak password, invalid email, email already registered, or confirmation send budget exhausted |
 
 ### GET /api/claim/confirm
 
