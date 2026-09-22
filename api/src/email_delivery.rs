@@ -280,6 +280,7 @@ fn env_duration_millis(name: &str, default: Duration) -> Result<Duration, String
 /// Low-cardinality purpose labels shared by audit and metrics.
 #[derive(Clone, Copy, Debug)]
 pub enum EmailDeliveryPurpose {
+    ClaimConfirmation,
     PasswordReset,
     Verification,
     EmailChange,
@@ -291,6 +292,7 @@ impl EmailDeliveryPurpose {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::ClaimConfirmation => "claim_confirmation",
             Self::PasswordReset => "password_reset",
             Self::Verification => "verification",
             Self::EmailChange => "email_change",
@@ -749,6 +751,17 @@ impl EmailDeliveryService {
         .await
     }
 
+    pub async fn send_claim_confirmation(
+        &self,
+        email: &str,
+        token: &str,
+    ) -> Result<EmailProviderOutcome, EmailSendError> {
+        self.run_provider_call(EmailDeliveryPurpose::ClaimConfirmation, async {
+            self.sender.send_claim_confirmation(email, token).await
+        })
+        .await
+    }
+
     pub async fn send_password_reset(
         &self,
         email: &str,
@@ -987,6 +1000,14 @@ mod tests {
             &self,
             _to_email: &str,
             _claim_url: &str,
+        ) -> Result<(), EmailSendError> {
+            self.send().await
+        }
+
+        async fn send_claim_confirmation(
+            &self,
+            _to_email: &str,
+            _confirm_token: &str,
         ) -> Result<(), EmailSendError> {
             self.send().await
         }

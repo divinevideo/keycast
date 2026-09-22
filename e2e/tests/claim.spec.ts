@@ -1,6 +1,7 @@
 import { test, expect } from "@playwright/test";
 import { parseCookieValue } from "../helpers/auth";
 import { registerAdmin } from "../helpers/admin";
+import { getClaimConfirmationToken } from "../helpers/db";
 
 test.describe("Account claim flow", () => {
   test("preloaded user can claim via browser form", async ({
@@ -60,7 +61,41 @@ test.describe("Account claim flow", () => {
     await page.fill('input[name="password_confirmation"]', claimPassword);
     await page.click('button[type="submit"]');
 
-    // 7. Verify the success page renders with the session cookie set
+    // 7. Submit only stages the claim: interstitial, no session, login still refused.
+    await expect(page.locator("h1")).toContainText("Check Your Email", {
+      timeout: 15000,
+    });
+    expect(
+      (await page.context().cookies()).find((c) => c.name === "keycast_session"),
+    ).toBeFalsy();
+    const loginBeforeConfirm = await request.post("/api/auth/login", {
+      data: { email: claimEmail, password: claimPassword },
+    });
+    expect(loginBeforeConfirm.status()).not.toBe(200);
+
+    const claimToken = claimUrl.searchParams.get("token");
+    if (!claimToken) {
+      throw new Error("claim URL missing token");
+    }
+    const confirmationToken = await getClaimConfirmationToken(claimToken);
+    const confirmUrl = new URL("/api/claim/confirm", apiUrl);
+    confirmUrl.searchParams.set("token", confirmationToken);
+    await page.goto(confirmUrl.toString());
+
+    // 8. Opening the mailed link only previews: still no session, still no login.
+    await expect(page.locator("h1")).toContainText("Confirm Your Email", {
+      timeout: 15000,
+    });
+    expect(
+      (await page.context().cookies()).find((c) => c.name === "keycast_session"),
+    ).toBeFalsy();
+    const loginBeforeSubmit = await request.post("/api/auth/login", {
+      data: { email: claimEmail, password: claimPassword },
+    });
+    expect(loginBeforeSubmit.status()).not.toBe(200);
+
+    // 9. Submitting the confirmation form completes the claim and sets the session.
+    await page.click('form[action="/api/claim/confirm"] button[type="submit"]');
     await expect(page.locator("h1")).toContainText("Account Claimed!", {
       timeout: 15000,
     });
@@ -69,7 +104,7 @@ test.describe("Account claim flow", () => {
     const kcCookie = cookies.find((c) => c.name === "keycast_session");
     expect(kcCookie).toBeTruthy();
 
-    // 8. Verify the user can now log in with email/password
+    // 10. Verify the user can now log in with email/password
     const loginRes = await request.post("/api/auth/login", {
       data: { email: claimEmail, password: claimPassword },
     });

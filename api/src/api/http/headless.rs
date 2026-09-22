@@ -1646,6 +1646,13 @@ mod tests {
         ) -> Result<(), crate::email_service::EmailSendError> {
             Err(crate::email_service::EmailSendError::Unavailable)
         }
+        async fn send_claim_confirmation(
+            &self,
+            _email: &str,
+            _token: &str,
+        ) -> Result<(), crate::email_service::EmailSendError> {
+            Err(crate::email_service::EmailSendError::Unavailable)
+        }
         async fn send_email_change_confirmation(
             &self,
             _email: &str,

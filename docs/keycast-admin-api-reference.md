@@ -271,6 +271,10 @@ Decrypt a NIP-44 encrypted message.
 
 ## Claim Flow (User-facing)
 
+Claiming an account is a two-step, email-confirmed flow: submitting the claim
+form stages the entered email/password and sends a confirmation link, and the
+claim only completes when the recipient submits the confirmation form opened by that link.
+
 ### GET /api/claim
 
 Display the claim form for a user to set email/password.
@@ -284,7 +288,9 @@ GET /api/claim?token=abc123xyz...
 
 ### POST /api/claim
 
-Process the claim - sets email/password and logs user in.
+Stage the claim: validates the token and inputs, checks the email isn't
+already taken, and stores the entered email/password hash on the claim-token
+row pending confirmation. Sends a confirmation email to the entered address.
 
 **Request:**
 ```http
@@ -294,13 +300,77 @@ Content-Type: application/x-www-form-urlencoded
 token=abc123xyz&email=user@example.com&password=secret123&password_confirmation=secret123
 ```
 
-**Response:** Redirect to dashboard with session cookie set
+**Response:** 200, HTML "Check your email" interstitial. No session cookie is set at this step.
 
 **Errors:**
 | Status | Description |
 |--------|-------------|
-| 400 | Invalid/expired token, passwords don't match, weak password, invalid email |
-| 409 | Email already registered |
+| 400 | Invalid/expired/replaced/deactivated token, passwords don't match, weak password, invalid email, email already registered, or confirmation send budget exhausted |
+
+### GET /api/claim/confirm
+
+Display a confirmation form for a valid emailed link. GET and HEAD leave the
+account, pending credentials, and claim token unchanged and do not issue a session.
+The recipient must press **Confirm and Claim Account** to complete the claim.
+
+**Request:**
+```http
+GET /api/claim/confirm?token=<confirmation_token>
+```
+
+**Response:** 200, HTML "Confirm Your Email" form. No session cookie is set.
+
+![Claim confirmation form](images/claim-confirmation.png)
+
+The screenshot uses a synthetic local account at a 390 × 844 viewport. To
+refresh it, submit a local claim form with the development email sender, open
+its confirmation link, and capture the page before pressing the confirmation
+button. Verify that the account remains pending before the button is pressed
+and completes afterward. Capture page content only, without the browser's URL bar.
+
+**Errors:**
+| Status | Description |
+|--------|-------------|
+| 400 | Confirmation link unrecognized/expired, or the underlying claim token is no longer valid |
+
+### POST /api/claim/confirm
+
+Complete the claim after the recipient submits the form: atomically re-check
+validity, consume the confirmation token, write the staged email/password onto the
+account, and mark the email verified. Only a successful submission issues a session.
+
+**Request:**
+```http
+POST /api/claim/confirm
+Content-Type: application/x-www-form-urlencoded
+
+token=<confirmation_token>
+```
+
+**Response:** 200, HTML "Account Claimed" success page, with `Set-Cookie: keycast_session=...` establishing the session.
+
+**Errors:**
+| Status | Description |
+|--------|-------------|
+| 400 | Confirmation link unrecognized/expired, staged email taken by another account, or the underlying claim token died before confirmation |
+
+### POST /api/claim/resend
+
+Re-send the confirmation email for a staged claim. Cooldown-gated (5
+minutes) and enumeration-safe: the response is always the same generic
+"check your email" interstitial regardless of whether the token is unknown,
+has no staged claim, is within cooldown, or a fresh email was just sent, so a
+caller cannot use the response to probe for a pending claim.
+
+**Request:**
+```http
+POST /api/claim/resend
+Content-Type: application/x-www-form-urlencoded
+
+token=abc123xyz
+```
+
+**Response:** 200, HTML "Check your email" interstitial.
 
 ---
 

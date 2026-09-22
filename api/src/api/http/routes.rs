@@ -206,7 +206,7 @@ pub fn api_routes(
         .route("/user/change-password", post(auth::change_password))
         .route("/user/change-email", post(auth::change_email))
         .layer(axum::Extension(auth_state.state.bcrypt.clone()))
-        .layer(axum::Extension(email_delivery))
+        .layer(axum::Extension(email_delivery.clone()))
         .layer(auth_cors.clone())
         .with_state(pool.clone());
 
@@ -396,6 +396,12 @@ pub fn api_routes(
     // Users claim preloaded accounts by setting email/password
     let claim_routes = Router::new()
         .route("/claim", get(claim::claim_get).post(claim::claim_post))
+        .route(
+            "/claim/confirm",
+            get(claim::claim_confirm_get).post(claim::claim_confirm_post),
+        )
+        .route("/claim/resend", post(claim::claim_resend_post))
+        .layer(axum::Extension(email_delivery.clone()))
         .with_state(auth_state.clone());
 
     // Prometheus metrics endpoint (public, no auth required)

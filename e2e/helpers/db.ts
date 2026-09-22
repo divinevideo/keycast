@@ -79,6 +79,36 @@ export async function getVerificationToken(email: string): Promise<string> {
   throw new Error(`Could not find verification token for ${email}`);
 }
 
+export async function getClaimConfirmationToken(claimToken: string): Promise<string> {
+  for (let i = 0; i < 10; i++) {
+    try {
+      const token = await withDb(async (db) => {
+        const result = await db.query(
+          "SELECT confirmation_token FROM account_claim_tokens WHERE token = $1",
+          [claimToken],
+        );
+        if (result.rows.length > 0 && result.rows[0].confirmation_token) {
+          return result.rows[0].confirmation_token as string;
+        }
+        return null;
+      });
+
+      if (token) {
+        return token;
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes("ECONNRESET")) {
+        throw error;
+      }
+    }
+
+    await new Promise((r) => setTimeout(r, 300));
+  }
+
+  throw new Error("Could not find claim confirmation token");
+}
+
 export async function markUserAtprotoReady(
   pubkey: string,
   did: string,
