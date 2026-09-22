@@ -5,6 +5,7 @@ use crate::repositories::{oauth_code::OAuthCodeData, RepositoryError};
 use crate::types::oauth_authorization::OAuthAuthorization;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+use std::collections::HashMap;
 
 /// Parameters for creating a new OAuth authorization.
 #[derive(Debug, Clone)]
@@ -590,6 +591,55 @@ impl OAuthAuthorizationRepository {
         .fetch_all(&self.pool)
         .await
         .map_err(Into::into)
+    }
+
+    /// When each of these accounts last used the app, and how much, for marketing enrichment.
+    ///
+    /// `last_activity` is stamped when an authorization signs something over NIP-46, so it tracks
+    /// app use rather than sign-ins: somebody can hold a session for months without returning, and
+    /// this does not call that activity.
+    ///
+    /// Aggregated per user because activity is recorded per authorization. The most recent wins --
+    /// one device going quiet while another stays busy is not a lapsed user -- and the counts are
+    /// summed. Revoked rows are excluded: revocation is a sign-out, not use. Nothing is excluded
+    /// for expiry, which is what makes this usable on the lapsed population it exists to find; an
+    /// expired session still records when the person was last here.
+    ///
+    /// Users with no unrevoked authorization are absent from the map rather than present with a
+    /// zero date, so a caller can tell "never opened the app" from "opened it long ago".
+    ///
+    /// One statement for the whole batch: the caller looks up as many as a thousand addresses, and
+    /// asking per user would turn that into a thousand round trips.
+    pub async fn activity_by_pubkeys(
+        &self,
+        user_pubkeys: &[String],
+        tenant_id: i64,
+    ) -> Result<HashMap<String, (Option<DateTime<Utc>>, i64)>, RepositoryError> {
+        if user_pubkeys.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows: Vec<(String, Option<DateTime<Utc>>, Option<i64>)> = sqlx::query_as(
+            "SELECT
+                oa.user_pubkey,
+                MAX(oa.last_activity) as last_activity,
+                SUM(oa.activity_count)::bigint as activity_count
+             FROM oauth_authorizations oa
+             JOIN users u ON oa.user_pubkey = u.pubkey
+             WHERE oa.user_pubkey = ANY($1)
+               AND u.tenant_id = $2
+               AND oa.revoked_at IS NULL
+             GROUP BY oa.user_pubkey",
+        )
+        .bind(user_pubkeys)
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(pubkey, last_activity, count)| (pubkey, (last_activity, count.unwrap_or(0))))
+            .collect())
     }
 }
 

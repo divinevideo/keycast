@@ -155,6 +155,38 @@ async fn create_user_with_personal_key(pool: &PgPool, email: &str) -> String {
     pubkey
 }
 
+/// An authorization for this user, with a chosen last-activity time and count.
+/// `revoked` covers the case the lapsed-user metric depends on: a revoked row must
+/// not contribute, but an unrevoked one must survive its session expiring.
+async fn create_authorization(
+    pool: &PgPool,
+    user_pubkey: &str,
+    last_activity_days_ago: i64,
+    activity_count: i32,
+    revoked: bool,
+) {
+    let bunker = Keys::generate().public_key().to_hex();
+    sqlx::query(
+        "INSERT INTO oauth_authorizations
+         (user_pubkey, redirect_origin, bunker_public_key, secret_hash, relays, tenant_id,
+          authorization_handle, handle_expires_at, last_activity, activity_count,
+          revoked_at, created_at, updated_at)
+         VALUES ($1, 'https://app.example.com', $2, 'test_hash', '[]', $3,
+                 $4, NOW() + INTERVAL '30 days', NOW() - ($5 || ' days')::INTERVAL, $6,
+                 CASE WHEN $7 THEN NOW() ELSE NULL END, NOW(), NOW())",
+    )
+    .bind(user_pubkey)
+    .bind(&bunker)
+    .bind(TENANT_ID)
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(last_activity_days_ago.to_string())
+    .bind(activity_count)
+    .bind(revoked)
+    .execute(pool)
+    .await
+    .expect("Failed to create test authorization");
+}
+
 fn post_batch_lookup(emails: &[&str], token: &str) -> Request<Body> {
     Request::post("/admin/users/batch-lookup")
         .header("authorization", format!("Bearer {}", token))
@@ -207,6 +239,104 @@ async fn test_batch_lookup_returns_matching_user() {
     assert!(user.email_verified);
     assert!(!user.has_personal_key);
     assert!(!user.created_at.is_empty());
+}
+
+#[tokio::test]
+async fn test_batch_lookup_reports_last_active_and_activity_count() {
+    // What marketing segments on: how recently somebody used the app, and how much. Activity is
+    // recorded per authorization, so the user-level answer is the most recent across them and the
+    // total of their counts -- one device going quiet while another stays busy must not read as
+    // the person having lapsed.
+    common::assert_test_database_url();
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+    let pool = common::setup_test_db().await;
+    let app = build_app(create_test_auth_state(pool.clone()));
+
+    let email = format!("active-{}@example.com", uuid::Uuid::new_v4());
+    let pubkey = create_test_user_with_email(&pool, &email).await;
+    create_authorization(&pool, &pubkey, 40, 7, false).await;
+    create_authorization(&pool, &pubkey, 3, 5, false).await;
+
+    let resp = app
+        .oneshot(post_batch_lookup(&[&email], SERVICE_TOKEN))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let result = parse_response(resp).await;
+    let user = result.results.get(&email).unwrap();
+
+    let last_active = user
+        .last_active
+        .as_deref()
+        .expect("an authorization with activity should report a last-active time");
+    let parsed =
+        chrono::DateTime::parse_from_rfc3339(last_active).expect("last_active should be RFC3339");
+    let days_ago = (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc)).num_days();
+    assert!(
+        (2..=4).contains(&days_ago),
+        "expected the most recent authorization (3 days), got {days_ago} days ago"
+    );
+    assert_eq!(user.activity_count, 12);
+}
+
+#[tokio::test]
+async fn test_batch_lookup_last_active_ignores_revoked_authorizations() {
+    // A revoked authorization is a sign-out, not use. Counting it would make somebody who signed
+    // out yesterday and has not returned since look like an active user.
+    common::assert_test_database_url();
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+    let pool = common::setup_test_db().await;
+    let app = build_app(create_test_auth_state(pool.clone()));
+
+    let email = format!("revoked-{}@example.com", uuid::Uuid::new_v4());
+    let pubkey = create_test_user_with_email(&pool, &email).await;
+    create_authorization(&pool, &pubkey, 90, 4, false).await;
+    create_authorization(&pool, &pubkey, 1, 99, true).await;
+
+    let resp = app
+        .oneshot(post_batch_lookup(&[&email], SERVICE_TOKEN))
+        .await
+        .unwrap();
+
+    let result = parse_response(resp).await;
+    let user = result.results.get(&email).unwrap();
+
+    let parsed = chrono::DateTime::parse_from_rfc3339(user.last_active.as_deref().unwrap())
+        .expect("last_active should be RFC3339");
+    let days_ago = (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc)).num_days();
+    assert!(
+        days_ago >= 89,
+        "expected the unrevoked 90-day-old row, got {days_ago}"
+    );
+    assert_eq!(
+        user.activity_count, 4,
+        "revoked activity must not be counted"
+    );
+}
+
+#[tokio::test]
+async fn test_batch_lookup_reports_no_last_active_when_never_used() {
+    // Somebody who claimed an account and never opened the app. Absent rather than an epoch date,
+    // so a HubSpot segment on "last active before X" does not sweep them up as long-lapsed users.
+    common::assert_test_database_url();
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+    let pool = common::setup_test_db().await;
+    let app = build_app(create_test_auth_state(pool.clone()));
+
+    let email = format!("never-{}@example.com", uuid::Uuid::new_v4());
+    create_test_user_with_email(&pool, &email).await;
+
+    let resp = app
+        .oneshot(post_batch_lookup(&[&email], SERVICE_TOKEN))
+        .await
+        .unwrap();
+
+    let result = parse_response(resp).await;
+    let user = result.results.get(&email).unwrap();
+
+    assert!(user.last_active.is_none());
+    assert_eq!(user.activity_count, 0);
 }
 
 #[tokio::test]

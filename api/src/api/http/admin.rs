@@ -3072,6 +3072,13 @@ pub struct BatchLookupUser {
     pub email_verified: bool,
     pub has_personal_key: bool,
     pub created_at: String,
+    /// When this account last used the app, or absent if it never has. Stamped by NIP-46 signing,
+    /// so holding a session without returning does not count. Absent rather than an epoch date so
+    /// a consumer can tell "never opened it" from "opened it long ago".
+    pub last_active: Option<String>,
+    /// Total signing activity across the account's unrevoked authorizations. Separates somebody
+    /// who signed up and used it twice from a heavy user who drifted away.
+    pub activity_count: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3106,6 +3113,12 @@ pub async fn batch_lookup_users(
 
     let users = user_repo.find_users_by_emails(&deduped, tenant_id).await?;
 
+    // One aggregate for the whole batch rather than a lookup per user: this endpoint accepts up to
+    // a thousand addresses.
+    let oauth_repo = OAuthAuthorizationRepository::new(auth_state.state.db.clone());
+    let pubkeys: Vec<String> = users.iter().map(|u| u.pubkey.clone()).collect();
+    let activity = oauth_repo.activity_by_pubkeys(&pubkeys, tenant_id).await?;
+
     let mut results = std::collections::HashMap::new();
     let mut found_emails: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -3117,11 +3130,18 @@ pub async fn batch_lookup_users(
                 lower,
                 BatchLookupUser {
                     email: email.clone(),
-                    pubkey: user.pubkey,
                     status: user.status.as_str().to_string(),
                     email_verified: user.email_verified.unwrap_or(false),
                     has_personal_key: user.has_personal_key,
                     created_at: user.created_at.to_rfc3339(),
+                    last_active: activity
+                        .get(&user.pubkey)
+                        .and_then(|(at, _)| at.map(|at| at.to_rfc3339())),
+                    activity_count: activity
+                        .get(&user.pubkey)
+                        .map(|(_, count)| *count)
+                        .unwrap_or(0),
+                    pubkey: user.pubkey,
                 },
             );
         }
