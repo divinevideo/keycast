@@ -608,7 +608,9 @@ impl OAuthAuthorizationRepository {
     /// user who re-authorized and then drifted away as never having used the app at all. Expiry is
     /// kept for the same reason; an expired session is what lapsing looks like.
     ///
-    /// Aggregated per user: the most recent activity wins, and counts are summed into a total. Only
+    /// Aggregated per user: the most recent activity wins, and counts are summed into a total. The
+    /// total is a lower bound, since the activity loggers drop records under backpressure rather
+    /// than slow signing down. Only
     /// OAuth authorizations record activity; admin preload-UCAN signing and team authorizations do
     /// not, and are not counted.
     ///

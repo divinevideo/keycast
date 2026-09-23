@@ -438,8 +438,15 @@ async fn test_batch_lookup_counts_revoked_authorizations() {
 
 #[tokio::test]
 async fn test_batch_lookup_reports_no_last_active_when_never_used() {
-    // Somebody who claimed an account and never opened the app. Absent rather than an epoch date,
-    // so a HubSpot segment on "last active before X" does not sweep them up as long-lapsed users.
+    // Somebody with no recorded activity. An explicit JSON null rather than an epoch date, so a
+    // HubSpot segment on "last active before X" does not sweep them up as long-lapsed users.
+    //
+    // Null, not an omitted field, and the difference is load-bearing for the consumer: the
+    // marketing sync clears its property on null but leaves it untouched when the field is
+    // missing, because a missing field is what an older keycast sends. Deserializing into
+    // BatchLookupUser cannot see that difference -- `is_none()` holds either way -- so the raw JSON
+    // is checked too. Without it, skipping None fields on serialization would pass every test here
+    // and the sync would stop clearing anything.
     common::assert_test_database_url();
     unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
     let pool = common::setup_test_db().await;
@@ -453,9 +460,19 @@ async fn test_batch_lookup_reports_no_last_active_when_never_used() {
         .await
         .unwrap();
 
-    let result = parse_response(resp).await;
-    let user = result.results.get(&email).unwrap();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let raw: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let raw_user = raw["results"][&email]
+        .as_object()
+        .expect("the user should be in the results");
+    assert_eq!(
+        raw_user.get("last_active"),
+        Some(&serde_json::Value::Null),
+        "last_active must be present as an explicit null, not omitted"
+    );
 
+    let result: BatchLookupResponse = serde_json::from_slice(&body).unwrap();
+    let user = result.results.get(&email).unwrap();
     assert!(user.last_active.is_none());
     assert_eq!(user.activity_count, 0);
 }
