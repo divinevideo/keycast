@@ -600,9 +600,9 @@ impl OAuthAuthorizationRepository {
     /// first-party clients use, NIP-04/NIP-44 encrypt and decrypt, and NIP-17 wrap and unwrap. Not
     /// by sign-in, so holding a session without doing anything does not count as activity.
     ///
-    /// Every authorization counts, revoked or expired. Revocation only sets `revoked_at` -- it does
-    /// not touch `last_activity` -- so a revoked row's timestamp is a time the person really used
-    /// the app, never the time they signed out. That matters because revocation is routine: a
+    /// Every authorization counts, revoked or expired. Revocation never writes `last_activity`, so
+    /// a revoked row's timestamp is a time the person really used the app, never the time they
+    /// signed out. That matters because revocation is routine: a
     /// client re-authorizing with its stored handle gets a new row starting at NULL and 0, and the
     /// old row, carrying all the history, is revoked. Excluding revoked rows would report a heavy
     /// user who re-authorized and then drifted away as never having used the app at all. Expiry is
@@ -612,9 +612,8 @@ impl OAuthAuthorizationRepository {
     /// total is approximate. It is usually an undercount, because the activity loggers drop records
     /// when their queue is full, when a flush keeps failing, or at shutdown. It is occasionally an
     /// overcount, because a failed flush is retried, and one whose commit succeeded but whose reply
-    /// was lost is applied twice. Only
-    /// OAuth authorizations record activity; admin preload-UCAN signing and team authorizations do
-    /// not, and are not counted.
+    /// was lost is applied twice. Only OAuth authorizations record activity; admin preload-UCAN
+    /// signing and team authorizations do not, and are not counted.
     ///
     /// Neither value goes down in normal use. Both reset on key rotation, which deletes every
     /// authorization for the old key: the account's email then maps to a new pubkey with none, so

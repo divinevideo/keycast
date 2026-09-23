@@ -401,8 +401,8 @@ async fn test_batch_lookup_survives_silent_reauth() {
 
 #[tokio::test]
 async fn test_batch_lookup_counts_revoked_authorizations() {
-    // Revocation sets revoked_at and nothing else, so a revoked row's last_activity is a time the
-    // person really used the app, not the time they signed out. Excluding revoked rows would drop
+    // Revocation never writes last_activity, so a revoked row's last_activity is a time the person
+    // really used the app, not the time they signed out. Excluding revoked rows would drop
     // that history: somebody who signed out of every device and never came back would report no
     // activity at all, which reads as "never opened the app" -- the opposite of who this is for.
     common::assert_test_database_url();
