@@ -609,8 +609,10 @@ impl OAuthAuthorizationRepository {
     /// kept for the same reason; an expired session is what lapsing looks like.
     ///
     /// Aggregated per user: the most recent activity wins, and counts are summed into a total. The
-    /// total is a lower bound, since the activity loggers drop records under backpressure rather
-    /// than slow signing down. Only
+    /// total is approximate. It is usually an undercount, because the activity loggers drop records
+    /// when their queue is full, when a flush keeps failing, or at shutdown. It is occasionally an
+    /// overcount, because a failed flush is retried, and one whose commit succeeded but whose reply
+    /// was lost is applied twice. Only
     /// OAuth authorizations record activity; admin preload-UCAN signing and team authorizations do
     /// not, and are not counted.
     ///

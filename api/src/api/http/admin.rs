@@ -3078,9 +3078,10 @@ pub struct BatchLookupUser {
     /// See `OAuthAuthorizationRepository::activity_by_pubkeys` for what counts.
     pub last_active: Option<String>,
     /// Count of those operations across all the account's authorizations, for as long as it has
-    /// held its current key. A lower bound: the activity loggers drop records under backpressure
-    /// rather than slow signing down. Separates somebody who signed up and used it twice from a
-    /// heavy user who drifted away.
+    /// held its current key. Approximate: usually an undercount, because the activity loggers
+    /// drop records when their queue is full, when a flush keeps failing, or at shutdown, and
+    /// occasionally an overcount, because a failed flush is retried and may already have committed.
+    /// Separates somebody who signed up and used it twice from a heavy user who drifted away.
     pub activity_count: i64,
 }
 
