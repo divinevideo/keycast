@@ -1611,9 +1611,10 @@ pub async fn get_user_lookup(
     let suggested_users = deduplicate_suggested_users(&lookup.users, suggested_users);
 
     let oauth_repo = OAuthAuthorizationRepository::new(pool.clone());
-    // One activity query for every account shown. On failure the lookup still answers, without
-    // dates, the same way a failed session read above leaves the count at zero: support needs to
-    // see the account more than the date.
+    // One activity query for every account shown. On failure the lookup still answers, and the page
+    // shows "Never" for every account, the same way a failed session read in
+    // enrich_user_lookup_details leaves the count at zero: support needs to see the account more
+    // than the date. The warning is what tells that apart from real inactivity.
     let pubkeys: Vec<String> = lookup
         .users
         .iter()
@@ -1623,6 +1624,7 @@ pub async fn get_user_lookup(
     let activity = oauth_repo
         .activity_by_pubkeys(&pubkeys, tenant_id)
         .await
+        .inspect_err(|e| tracing::warn!("User lookup activity query failed: {}", e))
         .unwrap_or_default();
     let total = lookup.users.len();
     let authoritative_match = lookup.authoritative_match;
