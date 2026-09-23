@@ -3137,6 +3137,8 @@ pub async fn batch_lookup_users(
         if let Some(email) = &user.email {
             let lower = email.to_lowercase();
             found_emails.insert(lower.clone());
+            let (last_active, activity_count) =
+                activity.get(&user.pubkey).copied().unwrap_or((None, 0));
             results.insert(
                 lower,
                 BatchLookupUser {
@@ -3145,13 +3147,8 @@ pub async fn batch_lookup_users(
                     email_verified: user.email_verified.unwrap_or(false),
                     has_personal_key: user.has_personal_key,
                     created_at: user.created_at.to_rfc3339(),
-                    last_active: activity
-                        .get(&user.pubkey)
-                        .and_then(|(at, _)| at.map(|at| at.to_rfc3339())),
-                    activity_count: activity
-                        .get(&user.pubkey)
-                        .map(|(_, count)| *count)
-                        .unwrap_or(0),
+                    last_active: last_active.map(|at| at.to_rfc3339()),
+                    activity_count,
                     pubkey: user.pubkey,
                 },
             );
