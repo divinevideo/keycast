@@ -3072,6 +3072,21 @@ pub struct BatchLookupUser {
     pub email_verified: bool,
     pub has_personal_key: bool,
     pub created_at: String,
+    /// When this account last performed a remote signing or crypto operation through any of its
+    /// OAuth authorizations, revoked ones included. `null` when there is no recorded activity,
+    /// rather than an epoch date, so a consumer can tell "no recorded activity" from "active long
+    /// ago". Stamped when the activity is written to the database: normally within a second or so
+    /// of the request, later if the database was unavailable. See
+    /// `OAuthAuthorizationRepository::activity_by_pubkeys` for what counts.
+    pub last_active: Option<String>,
+    /// Count of the requests that recorded that activity, across all the account's authorizations,
+    /// for as long as it has held its current key. A NIP-17 batch wrap or unwrap counts once,
+    /// however many messages it carries. Approximate: when it is off, it is usually an undercount,
+    /// because the activity loggers drop records when their queue is full, when a flush keeps
+    /// failing, or at shutdown, and occasionally an overcount, because a failed flush is retried
+    /// and may already have committed. Separates somebody who signed up and used it twice from a
+    /// heavy user who drifted away.
+    pub activity_count: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3106,6 +3121,15 @@ pub async fn batch_lookup_users(
 
     let users = user_repo.find_users_by_emails(&deduped, tenant_id).await?;
 
+    // One aggregate for the whole batch rather than a lookup per user: this endpoint accepts up to
+    // a thousand addresses.
+    let oauth_repo = OAuthAuthorizationRepository::new(auth_state.state.db.clone());
+    let pubkeys: Vec<String> = users.iter().map(|u| u.pubkey.clone()).collect();
+    // A failure here fails the whole request rather than degrading to "no activity": the marketing
+    // sync clears its last-active property on null, so a degraded answer would wipe the date for
+    // every contact in the batch on one transient database error.
+    let activity = oauth_repo.activity_by_pubkeys(&pubkeys, tenant_id).await?;
+
     let mut results = std::collections::HashMap::new();
     let mut found_emails: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -3113,15 +3137,19 @@ pub async fn batch_lookup_users(
         if let Some(email) = &user.email {
             let lower = email.to_lowercase();
             found_emails.insert(lower.clone());
+            let (last_active, activity_count) =
+                activity.get(&user.pubkey).copied().unwrap_or((None, 0));
             results.insert(
                 lower,
                 BatchLookupUser {
                     email: email.clone(),
-                    pubkey: user.pubkey,
                     status: user.status.as_str().to_string(),
                     email_verified: user.email_verified.unwrap_or(false),
                     has_personal_key: user.has_personal_key,
                     created_at: user.created_at.to_rfc3339(),
+                    last_active: last_active.map(|at| at.to_rfc3339()),
+                    activity_count,
+                    pubkey: user.pubkey,
                 },
             );
         }

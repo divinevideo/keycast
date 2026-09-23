@@ -5,6 +5,7 @@ use crate::repositories::{oauth_code::OAuthCodeData, RepositoryError};
 use crate::types::oauth_authorization::OAuthAuthorization;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+use std::collections::HashMap;
 
 /// Parameters for creating a new OAuth authorization.
 #[derive(Debug, Clone)]
@@ -590,6 +591,72 @@ impl OAuthAuthorizationRepository {
         .fetch_all(&self.pool)
         .await
         .map_err(Into::into)
+    }
+
+    /// When each of these accounts last used the app, and how much, for marketing enrichment.
+    ///
+    /// `last_activity` and `activity_count` are stamped by any remote signing or crypto operation
+    /// an authorization performs: NIP-46 over the bunker, the `/api/nostr` HTTP RPC path the
+    /// first-party clients use, NIP-04/NIP-44 encrypt and decrypt, and NIP-17 wrap and unwrap. Not
+    /// by sign-in, so holding a session without doing anything does not count as activity.
+    ///
+    /// Every authorization counts, revoked or expired. Revocation never writes `last_activity`, so
+    /// a revoked row's timestamp is a time the person really used the app, never the time they
+    /// signed out. That matters because revocation is routine: a
+    /// client re-authorizing with its stored handle gets a new row starting at NULL and 0, and the
+    /// old row, carrying all the history, is revoked. Excluding revoked rows would report a heavy
+    /// user who re-authorized and then drifted away as never having used the app at all. Expiry is
+    /// kept for the same reason; an expired session is what lapsing looks like.
+    ///
+    /// Aggregated per user: the most recent activity wins, and counts are summed into a total. The
+    /// count is of requests, not items: a NIP-17 batch wrap or unwrap adds one however many
+    /// messages it carries. The total is approximate. When it is off, it is usually an undercount,
+    /// because the activity loggers drop records when their queue is full, when a flush keeps
+    /// failing, or at shutdown. It is occasionally an overcount, because a failed flush is retried,
+    /// and one whose commit succeeded but whose reply was lost is applied twice. Only OAuth
+    /// authorizations record activity; admin preload-UCAN signing and team authorizations do not,
+    /// and are not counted.
+    ///
+    /// Neither value goes down in normal use. Both reset on key rotation, which deletes every
+    /// authorization for the old key: the account's email then maps to a new pubkey with none, so
+    /// it reads as having no recorded activity until the new key signs something.
+    ///
+    /// A user with no authorizations is absent from the map; one whose authorizations have never
+    /// signed anything is present as `(None, 0)`. Callers treat both the same way -- no recorded
+    /// activity -- and neither produces a date, so "no recorded activity" stays distinguishable from
+    /// "active long ago".
+    ///
+    /// One statement for the whole batch: the caller looks up as many as a thousand addresses, and
+    /// asking per user would turn that into a thousand round trips.
+    pub async fn activity_by_pubkeys(
+        &self,
+        user_pubkeys: &[String],
+        tenant_id: i64,
+    ) -> Result<HashMap<String, (Option<DateTime<Utc>>, i64)>, RepositoryError> {
+        if user_pubkeys.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows: Vec<(String, Option<DateTime<Utc>>, Option<i64>)> = sqlx::query_as(
+            "SELECT
+                oa.user_pubkey,
+                MAX(oa.last_activity) as last_activity,
+                SUM(oa.activity_count)::bigint as activity_count
+             FROM oauth_authorizations oa
+             JOIN users u ON oa.user_pubkey = u.pubkey
+             WHERE oa.user_pubkey = ANY($1)
+               AND u.tenant_id = $2
+             GROUP BY oa.user_pubkey",
+        )
+        .bind(user_pubkeys)
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(pubkey, last_activity, count)| (pubkey, (last_activity, count.unwrap_or(0))))
+            .collect())
     }
 }
 
