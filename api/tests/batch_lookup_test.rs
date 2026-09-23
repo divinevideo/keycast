@@ -155,9 +155,9 @@ async fn create_user_with_personal_key(pool: &PgPool, email: &str) -> String {
     pubkey
 }
 
-/// An authorization for this user, with a chosen last-activity time and count.
-/// `revoked` covers the case the lapsed-user metric depends on: a revoked row must
-/// not contribute, but an unrevoked one must survive its session expiring.
+/// An authorization for this user, with a chosen last-activity time, count, and whether it has
+/// been revoked. Its handle expires thirty days out; see `create_authorization_with_expiry` for
+/// one that has already expired.
 async fn create_authorization(
     pool: &PgPool,
     user_pubkey: &str,
@@ -309,9 +309,9 @@ async fn test_batch_lookup_reports_last_active_and_activity_count() {
 async fn test_batch_lookup_last_active_survives_an_expired_authorization() {
     // The decision this whole field rests on, and the one most likely to be tidied away. Somebody
     // who stopped using the app months ago has an authorization whose handle expired long since --
-    // that is what lapsing looks like. Excluding expired rows the way the active-session queries do
-    // would blank last_active for precisely the people this exists to find, and every other test
-    // here would stay green, because they all build unexpired fixtures.
+    // that is what lapsing looks like. Filtering on expiry would blank last_active for precisely
+    // the people this exists to find, and every other test here would stay green, because they all
+    // build unexpired fixtures.
     common::assert_test_database_url();
     unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
     let pool = common::setup_test_db().await;
@@ -342,10 +342,69 @@ async fn test_batch_lookup_last_active_survives_an_expired_authorization() {
     assert_eq!(user.activity_count, 31);
 }
 
+/// A freshly created authorization that has not signed anything yet: last_activity NULL and
+/// activity_count 0, which is how every new row starts.
+async fn create_unused_authorization(pool: &PgPool, user_pubkey: &str) {
+    let bunker = Keys::generate().public_key().to_hex();
+    sqlx::query(
+        "INSERT INTO oauth_authorizations
+         (user_pubkey, redirect_origin, bunker_public_key, secret_hash, relays, tenant_id,
+          authorization_handle, handle_expires_at, created_at, updated_at)
+         VALUES ($1, 'https://app.example.com', $2, 'test_hash', '[]', $3,
+                 $4, NOW() + INTERVAL '30 days', NOW(), NOW())",
+    )
+    .bind(user_pubkey)
+    .bind(&bunker)
+    .bind(TENANT_ID)
+    .bind(uuid::Uuid::new_v4().to_string())
+    .execute(pool)
+    .await
+    .expect("Failed to create unused authorization");
+}
+
 #[tokio::test]
-async fn test_batch_lookup_last_active_ignores_revoked_authorizations() {
-    // A revoked authorization is a sign-out, not use. Counting it would make somebody who signed
-    // out yesterday and has not returned since look like an active user.
+async fn test_batch_lookup_survives_silent_reauth() {
+    // The ordinary path, not an edge case. A client re-authorizing with its stored handle gets a
+    // new authorization, starting at NULL and 0, and the old one -- carrying all the history -- is
+    // revoked. If revoked rows were excluded, a heavy user who re-authorized and then drifted away
+    // would report no activity and a count of zero.
+    common::assert_test_database_url();
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+    let pool = common::setup_test_db().await;
+    let app = build_app(create_test_auth_state(pool.clone()));
+
+    let email = format!("reauth-{}@example.com", uuid::Uuid::new_v4());
+    let pubkey = create_test_user_with_email(&pool, &email).await;
+    create_authorization(&pool, &pubkey, 10, 5000, true).await;
+    create_unused_authorization(&pool, &pubkey).await;
+
+    let resp = app
+        .oneshot(post_batch_lookup(&[&email], SERVICE_TOKEN))
+        .await
+        .unwrap();
+
+    let result = parse_response(resp).await;
+    let user = result.results.get(&email).unwrap();
+
+    let last_active = user
+        .last_active
+        .as_deref()
+        .expect("history on the revoked row must survive the rotation");
+    let parsed = chrono::DateTime::parse_from_rfc3339(last_active).unwrap();
+    let days_ago = (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc)).num_days();
+    assert!(
+        (9..=11).contains(&days_ago),
+        "expected 10 days ago, got {days_ago}"
+    );
+    assert_eq!(user.activity_count, 5000);
+}
+
+#[tokio::test]
+async fn test_batch_lookup_counts_revoked_authorizations() {
+    // Revocation sets revoked_at and nothing else, so a revoked row's last_activity is a time the
+    // person really used the app, not the time they signed out. Excluding revoked rows would drop
+    // that history: somebody who signed out of every device and never came back would report no
+    // activity at all, which reads as "never opened the app" -- the opposite of who this is for.
     common::assert_test_database_url();
     unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
     let pool = common::setup_test_db().await;
@@ -368,12 +427,12 @@ async fn test_batch_lookup_last_active_ignores_revoked_authorizations() {
         .expect("last_active should be RFC3339");
     let days_ago = (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc)).num_days();
     assert!(
-        days_ago >= 89,
-        "expected the unrevoked 90-day-old row, got {days_ago}"
+        days_ago <= 2,
+        "expected the revoked row's activity a day ago, got {days_ago}"
     );
     assert_eq!(
-        user.activity_count, 4,
-        "revoked activity must not be counted"
+        user.activity_count, 103,
+        "revoked authorizations' activity counts toward the lifetime total"
     );
 }
 

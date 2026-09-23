@@ -595,18 +595,26 @@ impl OAuthAuthorizationRepository {
 
     /// When each of these accounts last used the app, and how much, for marketing enrichment.
     ///
-    /// `last_activity` is stamped when an authorization signs something over NIP-46, so it tracks
-    /// app use rather than sign-ins: somebody can hold a session for months without returning, and
-    /// this does not call that activity.
+    /// `last_activity` and `activity_count` are stamped by any remote signing or crypto operation
+    /// an authorization performs: NIP-46 over the bunker, the `/api/nostr` HTTP RPC path the
+    /// first-party clients use, NIP-04/NIP-44 encrypt and decrypt, and NIP-17 wrap and unwrap. Not
+    /// by sign-in, so holding a session without doing anything does not count as activity.
     ///
-    /// Aggregated per user because activity is recorded per authorization. The most recent wins --
-    /// one device going quiet while another stays busy is not a lapsed user -- and the counts are
-    /// summed. Revoked rows are excluded: revocation is a sign-out, not use. Nothing is excluded
-    /// for expiry, which is what makes this usable on the lapsed population it exists to find; an
-    /// expired session still records when the person was last here.
+    /// Every authorization counts, revoked or expired. Revocation only sets `revoked_at` -- it does
+    /// not touch `last_activity` -- so a revoked row's timestamp is a time the person really used
+    /// the app, never the time they signed out. That matters because revocation is routine: a
+    /// client re-authorizing with its stored handle gets a new row starting at NULL and 0, and the
+    /// old row, carrying all the history, is revoked. Excluding revoked rows would report a heavy
+    /// user who re-authorized and then drifted away as never having used the app at all. Expiry is
+    /// kept for the same reason; an expired session is what lapsing looks like.
     ///
-    /// Users with no unrevoked authorization are absent from the map rather than present with a
-    /// zero date, so a caller can tell "never opened the app" from "opened it long ago".
+    /// Aggregated per user: the most recent activity wins, and counts are summed into a lifetime
+    /// total. Both can therefore only go down if rows are deleted, which happens on key rotation.
+    ///
+    /// A user with no authorizations is absent from the map; one whose authorizations have never
+    /// signed anything is present as `(None, 0)`. Callers treat both the same way -- no recorded
+    /// activity -- and neither produces a date, so "no recorded activity" stays distinguishable from
+    /// "active long ago".
     ///
     /// One statement for the whole batch: the caller looks up as many as a thousand addresses, and
     /// asking per user would turn that into a thousand round trips.
@@ -628,7 +636,6 @@ impl OAuthAuthorizationRepository {
              JOIN users u ON oa.user_pubkey = u.pubkey
              WHERE oa.user_pubkey = ANY($1)
                AND u.tenant_id = $2
-               AND oa.revoked_at IS NULL
              GROUP BY oa.user_pubkey",
         )
         .bind(user_pubkeys)
