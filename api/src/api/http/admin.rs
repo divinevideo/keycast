@@ -934,10 +934,10 @@ async fn enrich_user_lookup_details(
         .await
         .unwrap_or_default();
 
-    // From every authorization, revoked and expired included, not just the live sessions counted
-    // above. Re-authorizing with a stored handle revokes the old authorization, which holds the
-    // activity history, so reading live sessions alone showed "Never" for people who had used the
-    // app (#422). This is the same definition the marketing batch lookup uses.
+    // From every authorization, revoked ones included, not just the unrevoked ones counted above.
+    // Re-authorizing with a saved authorization handle revokes the old authorization, which holds
+    // the activity history, so reading unrevoked ones alone showed "Never" for people who had used
+    // the app (#422). This is the same definition the marketing batch lookup uses.
     let last_active = activity
         .get(&details.pubkey)
         .and_then(|(at, _)| *at)

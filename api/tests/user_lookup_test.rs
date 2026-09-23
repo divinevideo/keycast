@@ -605,7 +605,8 @@ async fn lookup_last_active_counts_a_revoked_authorization() {
 
 #[tokio::test]
 async fn lookup_last_active_counts_an_expired_authorization() {
-    // Somebody who stopped using the app has an authorization that expired. That is the person
+    // Somebody who stopped using the app has an authorization that expired. The old query already
+    // counted expired rows; this guards against a later filter on expiry dropping the person
     // support most needs to see a date for.
     let pool = common::setup_test_db().await;
     let username = format!("expireduser{}", Uuid::new_v4().simple());
