@@ -176,9 +176,10 @@ async fn create_authorization(
     .await
 }
 
-/// As above, but able to produce an authorization whose handle has already expired. That is the
-/// ordinary state of somebody who stopped using the app, so it is the case the lapsed-user metric
-/// has to keep reporting on.
+/// As above, but able to produce an authorization that has already expired. That is the ordinary
+/// state of somebody who stopped using the app, so it is the case the lapsed-user metric has to
+/// keep reporting on. Both expiry columns are set in the past, so a filter on either one turns the
+/// expired-authorization test red.
 async fn create_authorization_with_expiry(
     pool: &PgPool,
     user_pubkey: &str,
@@ -191,11 +192,12 @@ async fn create_authorization_with_expiry(
     sqlx::query(
         "INSERT INTO oauth_authorizations
          (user_pubkey, redirect_origin, bunker_public_key, secret_hash, relays, tenant_id,
-          authorization_handle, handle_expires_at, last_activity, activity_count,
+          authorization_handle, handle_expires_at, expires_at, last_activity, activity_count,
           revoked_at, created_at, updated_at)
          VALUES ($1, 'https://app.example.com', $2, 'test_hash', '[]', $3,
                  $4,
                  CASE WHEN $8 THEN NOW() - INTERVAL '1 day' ELSE NOW() + INTERVAL '30 days' END,
+                 CASE WHEN $8 THEN NOW() - INTERVAL '1 day' ELSE NULL END,
                  NOW() - ($5 || ' days')::INTERVAL, $6,
                  CASE WHEN $7 THEN NOW() ELSE NULL END, NOW(), NOW())",
     )
