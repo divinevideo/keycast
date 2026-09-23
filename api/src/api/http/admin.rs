@@ -3073,16 +3073,19 @@ pub struct BatchLookupUser {
     pub has_personal_key: bool,
     pub created_at: String,
     /// When this account last performed a remote signing or crypto operation through any of its
-    /// OAuth authorizations, revoked ones included. `null` when there is no recorded activity, rather
-    /// than an epoch date, so a consumer can tell "no recorded activity" from "active long ago".
-    /// See `OAuthAuthorizationRepository::activity_by_pubkeys` for what counts.
+    /// OAuth authorizations, revoked ones included. `null` when there is no recorded activity,
+    /// rather than an epoch date, so a consumer can tell "no recorded activity" from "active long
+    /// ago". Stamped when the activity is written to the database: normally within a second or so
+    /// of the request, later if the database was unavailable. See
+    /// `OAuthAuthorizationRepository::activity_by_pubkeys` for what counts.
     pub last_active: Option<String>,
     /// Count of the requests that recorded that activity, across all the account's authorizations,
     /// for as long as it has held its current key. A NIP-17 batch wrap or unwrap counts once,
-    /// however many messages it carries. Approximate: usually an undercount, because the activity loggers
-    /// drop records when their queue is full, when a flush keeps failing, or at shutdown, and
-    /// occasionally an overcount, because a failed flush is retried and may already have committed.
-    /// Separates somebody who signed up and used it twice from a heavy user who drifted away.
+    /// however many messages it carries. Approximate: when it is off, it is usually an undercount,
+    /// because the activity loggers drop records when their queue is full, when a flush keeps
+    /// failing, or at shutdown, and occasionally an overcount, because a failed flush is retried
+    /// and may already have committed. Separates somebody who signed up and used it twice from a
+    /// heavy user who drifted away.
     pub activity_count: i64,
 }
 

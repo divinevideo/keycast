@@ -308,8 +308,9 @@ async fn test_batch_lookup_reports_last_active_and_activity_count() {
 #[tokio::test]
 async fn test_batch_lookup_attributes_activity_to_each_user_in_a_batch() {
     // Activity comes from one query for the whole batch and is matched back to each user by
-    // pubkey. Every other test sends one address, so matching it to the wrong user would pass them
-    // all -- and in HubSpot it would put one person's last-active date on somebody else.
+    // pubkey. No other test puts more than one user with recorded activity in a batch, so matching
+    // it to the wrong user would pass them all -- and in HubSpot it would put one person's
+    // last-active date on somebody else.
     common::assert_test_database_url();
     unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
     let pool = common::setup_test_db().await;
