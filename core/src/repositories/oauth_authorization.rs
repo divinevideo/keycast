@@ -593,7 +593,8 @@ impl OAuthAuthorizationRepository {
         .map_err(Into::into)
     }
 
-    /// When each of these accounts last used the app, and how much, for marketing enrichment.
+    /// When each of these accounts last used the app, and how much. Used by the marketing batch
+    /// lookup and by the support user lookup, so both report the same date.
     ///
     /// `last_activity` and `activity_count` are stamped by any remote signing or crypto operation
     /// an authorization performs: NIP-46 over the bunker, the `/api/nostr` HTTP RPC path the
@@ -602,9 +603,9 @@ impl OAuthAuthorizationRepository {
     ///
     /// Every authorization counts, revoked or expired. Revocation never writes `last_activity`, so
     /// a revoked row's timestamp is a time the person really used the app, never the time they
-    /// signed out. That matters because revocation is routine: a
-    /// client re-authorizing with its stored handle gets a new row starting at NULL and 0, and the
-    /// old row, carrying all the history, is revoked. Excluding revoked rows would report a heavy
+    /// signed out. That matters because revocation is routine: a client re-authorizing with its
+    /// stored handle gets a new row starting at NULL and 0, and the old row, carrying all the
+    /// history, is revoked. Excluding revoked rows would report a heavy
     /// user who re-authorized and then drifted away as never having used the app at all. Expiry is
     /// kept for the same reason; an expired session is what lapsing looks like.
     ///
@@ -626,8 +627,8 @@ impl OAuthAuthorizationRepository {
     /// activity -- and neither produces a date, so "no recorded activity" stays distinguishable from
     /// "active long ago".
     ///
-    /// One statement for the whole batch: the caller looks up as many as a thousand addresses, and
-    /// asking per user would turn that into a thousand round trips.
+    /// One statement for the whole batch: the marketing batch lookup asks about as many as a
+    /// thousand accounts at once, and asking per user would turn that into a thousand round trips.
     pub async fn activity_by_pubkeys(
         &self,
         user_pubkeys: &[String],

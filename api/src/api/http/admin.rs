@@ -919,14 +919,15 @@ pub struct UserLookupDetails {
     pub last_active: Option<String>,
 }
 
-/// Latest activity per pubkey, from `activity_by_pubkeys`. Keyed by pubkey so one query covers
-/// every account a lookup returns.
-type LastActivityByPubkey = std::collections::HashMap<String, (Option<chrono::DateTime<Utc>>, i64)>;
+/// Activity per pubkey from `activity_by_pubkeys`: the latest time and the request count. Keyed by
+/// pubkey so one query covers every account a lookup returns. The support lookup uses only the
+/// time.
+type ActivityByPubkey = std::collections::HashMap<String, (Option<chrono::DateTime<Utc>>, i64)>;
 
 async fn enrich_user_lookup_details(
     details: AdminUserDetails,
     oauth_repo: &OAuthAuthorizationRepository,
-    activity: &LastActivityByPubkey,
+    activity: &ActivityByPubkey,
     tenant_id: i64,
 ) -> UserLookupDetails {
     let sessions = oauth_repo
