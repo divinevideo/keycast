@@ -3077,8 +3077,9 @@ pub struct BatchLookupUser {
     /// than an epoch date, so a consumer can tell "no recorded activity" from "active long ago".
     /// See `OAuthAuthorizationRepository::activity_by_pubkeys` for what counts.
     pub last_active: Option<String>,
-    /// Count of those operations across all the account's authorizations, for as long as it has
-    /// held its current key. Approximate: usually an undercount, because the activity loggers
+    /// Count of the requests that recorded that activity, across all the account's authorizations,
+    /// for as long as it has held its current key. A NIP-17 batch wrap or unwrap counts once,
+    /// however many messages it carries. Approximate: usually an undercount, because the activity loggers
     /// drop records when their queue is full, when a flush keeps failing, or at shutdown, and
     /// occasionally an overcount, because a failed flush is retried and may already have committed.
     /// Separates somebody who signed up and used it twice from a heavy user who drifted away.
@@ -3121,6 +3122,9 @@ pub async fn batch_lookup_users(
     // a thousand addresses.
     let oauth_repo = OAuthAuthorizationRepository::new(auth_state.state.db.clone());
     let pubkeys: Vec<String> = users.iter().map(|u| u.pubkey.clone()).collect();
+    // A failure here fails the whole request rather than degrading to "no activity": the marketing
+    // sync clears its last-active property on null, so a degraded answer would wipe the date for
+    // every contact in the batch on one transient database error.
     let activity = oauth_repo.activity_by_pubkeys(&pubkeys, tenant_id).await?;
 
     let mut results = std::collections::HashMap::new();
