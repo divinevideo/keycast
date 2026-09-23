@@ -334,6 +334,9 @@ async fn lookup_returns_literal_and_fuzzy_email_matches_together() {
         .expect("literal email fragment should remain a primary result");
     assert_eq!(partial.match_kind, AdminUserMatchKind::Partial);
     assert!(!partial.authoritative);
+    // Activity for every account comes from one query, matched back by pubkey. This account has
+    // no authorizations while the suggestion below does, so it must not borrow the suggestion's.
+    assert!(partial.last_active.is_none());
 
     let fuzzy = resp
         .suggestions
