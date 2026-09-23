@@ -306,6 +306,65 @@ async fn test_batch_lookup_reports_last_active_and_activity_count() {
 }
 
 #[tokio::test]
+async fn test_batch_lookup_attributes_activity_to_each_user_in_a_batch() {
+    // Activity comes from one query for the whole batch and is matched back to each user by
+    // pubkey. Every other test sends one address, so matching it to the wrong user would pass them
+    // all -- and in HubSpot it would put one person's last-active date on somebody else.
+    common::assert_test_database_url();
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+    let pool = common::setup_test_db().await;
+    let app = build_app(create_test_auth_state(pool.clone()));
+
+    let recent_email = format!("batch-recent-{}@example.com", uuid::Uuid::new_v4());
+    let recent_pubkey = create_test_user_with_email(&pool, &recent_email).await;
+    create_authorization(&pool, &recent_pubkey, 10, 4, false).await;
+
+    let lapsed_email = format!("batch-lapsed-{}@example.com", uuid::Uuid::new_v4());
+    let lapsed_pubkey = create_test_user_with_email(&pool, &lapsed_email).await;
+    create_authorization(&pool, &lapsed_pubkey, 60, 9, false).await;
+
+    let never_email = format!("batch-never-{}@example.com", uuid::Uuid::new_v4());
+    create_test_user_with_email(&pool, &never_email).await;
+
+    let resp = app
+        .oneshot(post_batch_lookup(
+            &[&recent_email, &lapsed_email, &never_email],
+            SERVICE_TOKEN,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let result = parse_response(resp).await;
+    let days_ago = |email: &str| {
+        let last_active = result.results[email]
+            .last_active
+            .as_deref()
+            .unwrap_or_else(|| panic!("{email} should report a last-active time"));
+        let parsed = chrono::DateTime::parse_from_rfc3339(last_active)
+            .expect("last_active should be RFC3339");
+        (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc)).num_days()
+    };
+
+    let recent_days = days_ago(&recent_email);
+    assert!(
+        (9..=11).contains(&recent_days),
+        "recent user: {recent_days} days ago"
+    );
+    assert_eq!(result.results[&recent_email].activity_count, 4);
+
+    let lapsed_days = days_ago(&lapsed_email);
+    assert!(
+        (59..=61).contains(&lapsed_days),
+        "lapsed user: {lapsed_days} days ago"
+    );
+    assert_eq!(result.results[&lapsed_email].activity_count, 9);
+
+    assert!(result.results[&never_email].last_active.is_none());
+    assert_eq!(result.results[&never_email].activity_count, 0);
+}
+
+#[tokio::test]
 async fn test_batch_lookup_last_active_survives_an_expired_authorization() {
     // The decision this whole field rests on, and the one most likely to be tidied away. Somebody
     // who stopped using the app months ago has an authorization whose handle expired long since --
