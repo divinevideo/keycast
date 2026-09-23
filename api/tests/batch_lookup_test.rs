@@ -441,6 +441,11 @@ async fn test_batch_lookup_reports_no_last_active_when_never_used() {
     // Somebody with no recorded activity. An explicit JSON null rather than an epoch date, so a
     // HubSpot segment on "last active before X" does not sweep them up as long-lapsed users.
     //
+    // Two shapes reach this through different paths: an account with no authorizations is absent
+    // from the activity map, while one that authorized a client and never signed anything is in it
+    // as (None, 0). The second is the usual never-used account, and only it exercises the mapping
+    // of a present-but-empty entry.
+    //
     // Null, not an omitted field, and the difference is load-bearing for the consumer: the
     // marketing sync clears its property on null but leaves it untouched when the field is
     // missing, because a missing field is what an older keycast sends. Deserializing into
@@ -452,29 +457,37 @@ async fn test_batch_lookup_reports_no_last_active_when_never_used() {
     let pool = common::setup_test_db().await;
     let app = build_app(create_test_auth_state(pool.clone()));
 
-    let email = format!("never-{}@example.com", uuid::Uuid::new_v4());
-    create_test_user_with_email(&pool, &email).await;
+    let no_auth_email = format!("never-noauth-{}@example.com", uuid::Uuid::new_v4());
+    create_test_user_with_email(&pool, &no_auth_email).await;
+    let unused_auth_email = format!("never-unused-{}@example.com", uuid::Uuid::new_v4());
+    let unused_auth_pubkey = create_test_user_with_email(&pool, &unused_auth_email).await;
+    create_unused_authorization(&pool, &unused_auth_pubkey).await;
 
     let resp = app
-        .oneshot(post_batch_lookup(&[&email], SERVICE_TOKEN))
+        .oneshot(post_batch_lookup(
+            &[&no_auth_email, &unused_auth_email],
+            SERVICE_TOKEN,
+        ))
         .await
         .unwrap();
 
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let raw: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let raw_user = raw["results"][&email]
-        .as_object()
-        .expect("the user should be in the results");
-    assert_eq!(
-        raw_user.get("last_active"),
-        Some(&serde_json::Value::Null),
-        "last_active must be present as an explicit null, not omitted"
-    );
-
     let result: BatchLookupResponse = serde_json::from_slice(&body).unwrap();
-    let user = result.results.get(&email).unwrap();
-    assert!(user.last_active.is_none());
-    assert_eq!(user.activity_count, 0);
+    for email in [&no_auth_email, &unused_auth_email] {
+        let raw_user = raw["results"][email]
+            .as_object()
+            .unwrap_or_else(|| panic!("{email} should be in the results"));
+        assert_eq!(
+            raw_user.get("last_active"),
+            Some(&serde_json::Value::Null),
+            "{email}: last_active must be present as an explicit null, not omitted"
+        );
+
+        let user = result.results.get(email).unwrap();
+        assert!(user.last_active.is_none(), "{email}");
+        assert_eq!(user.activity_count, 0, "{email}");
+    }
 }
 
 #[tokio::test]
