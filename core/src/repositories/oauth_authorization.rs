@@ -608,8 +608,13 @@ impl OAuthAuthorizationRepository {
     /// user who re-authorized and then drifted away as never having used the app at all. Expiry is
     /// kept for the same reason; an expired session is what lapsing looks like.
     ///
-    /// Aggregated per user: the most recent activity wins, and counts are summed into a lifetime
-    /// total. Both can therefore only go down if rows are deleted, which happens on key rotation.
+    /// Aggregated per user: the most recent activity wins, and counts are summed into a total. Only
+    /// OAuth authorizations record activity; admin preload-UCAN signing and team authorizations do
+    /// not, and are not counted.
+    ///
+    /// Neither value goes down in normal use. Both reset on key rotation, which deletes every
+    /// authorization for the old key: the account's email then maps to a new pubkey with none, so
+    /// it reads as having no recorded activity until the new key signs something.
     ///
     /// A user with no authorizations is absent from the map; one whose authorizations have never
     /// signed anything is present as `(None, 0)`. Callers treat both the same way -- no recorded

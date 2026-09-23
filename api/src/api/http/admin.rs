@@ -3072,13 +3072,14 @@ pub struct BatchLookupUser {
     pub email_verified: bool,
     pub has_personal_key: bool,
     pub created_at: String,
-    /// When this account last performed a remote signing or crypto operation, on any path and any
-    /// authorization including revoked ones. `null` when there is no recorded activity, rather
+    /// When this account last performed a remote signing or crypto operation through any of its
+    /// OAuth authorizations, revoked ones included. `null` when there is no recorded activity, rather
     /// than an epoch date, so a consumer can tell "no recorded activity" from "active long ago".
     /// See `OAuthAuthorizationRepository::activity_by_pubkeys` for what counts.
     pub last_active: Option<String>,
-    /// Lifetime count of those operations across all the account's authorizations. Separates
-    /// somebody who signed up and used it twice from a heavy user who drifted away.
+    /// Count of those operations across all the account's authorizations, for as long as it has
+    /// held its current key. Separates somebody who signed up and used it twice from a heavy user
+    /// who drifted away.
     pub activity_count: i64,
 }
 
