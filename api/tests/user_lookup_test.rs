@@ -1,5 +1,6 @@
 // ABOUTME: HTTP-handler tests for the support-admin user-lookup endpoint (get_user_lookup)
-// ABOUTME: Locks the response contract for minor/age-review terminal status + the auth gate (#309)
+// ABOUTME: Locks the response contract for minor/age-review terminal status + the auth gate (#309),
+// ABOUTME: and that Last active counts revoked authorizations (#422)
 
 #![cfg(feature = "integration-tests")]
 
@@ -577,8 +578,8 @@ fn days_since(last_active: &str) -> i64 {
 #[tokio::test]
 async fn lookup_last_active_counts_a_revoked_authorization() {
     // Re-authorizing with a stored handle revokes the old authorization, which carries the
-    // activity history, and starts a new one with none. Reading only live sessions showed
-    // "Last active: Never" for somebody who had used the app, which is what #422 fixes.
+    // activity history, and starts a new one with none. Reading only unrevoked authorizations
+    // showed "Last active: Never" for somebody who had used the app, which is what #422 fixes.
     let pool = common::setup_test_db().await;
     let username = format!("revokeduser{}", Uuid::new_v4().simple());
     let pubkey = seed_user(&pool, &username).await;
@@ -599,6 +600,33 @@ async fn lookup_last_active_counts_a_revoked_authorization() {
         user.active_sessions, 0,
         "the active-sessions count still excludes revoked authorizations"
     );
+
+    cleanup_user(&pool, &pubkey).await;
+}
+
+#[tokio::test]
+async fn lookup_last_active_survives_reauthorization() {
+    // The case #422 was filed for: a client re-authorized, so the old authorization with the
+    // history is revoked and a live one with no activity replaces it. The account has one live
+    // session and must still show when it was last used.
+    let pool = common::setup_test_db().await;
+    let username = format!("reauthuser{}", Uuid::new_v4().simple());
+    let pubkey = seed_user(&pool, &username).await;
+    seed_authorization(&pool, &pubkey, Some(10), true, false).await;
+    seed_authorization(&pool, &pubkey, None, false, false).await;
+
+    let user = lookup_by_username(&pool, &username).await;
+
+    let last_active = user
+        .last_active
+        .as_deref()
+        .expect("the revoked authorization's history must survive re-authorization");
+    let days = days_since(last_active);
+    assert!(
+        (9..=11).contains(&days),
+        "expected about 10 days ago, got {days}"
+    );
+    assert_eq!(user.active_sessions, 1);
 
     cleanup_user(&pool, &pubkey).await;
 }
