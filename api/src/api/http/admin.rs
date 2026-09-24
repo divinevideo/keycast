@@ -919,9 +919,15 @@ pub struct UserLookupDetails {
     pub last_active: Option<String>,
 }
 
+/// Activity per pubkey from `activity_by_pubkeys`: the latest time and the request count. Keyed by
+/// pubkey so one query covers every account a lookup returns. The support lookup uses only the
+/// time.
+type ActivityByPubkey = std::collections::HashMap<String, (Option<chrono::DateTime<Utc>>, i64)>;
+
 async fn enrich_user_lookup_details(
     details: AdminUserDetails,
     oauth_repo: &OAuthAuthorizationRepository,
+    activity: &ActivityByPubkey,
     tenant_id: i64,
 ) -> UserLookupDetails {
     let sessions = oauth_repo
@@ -929,11 +935,14 @@ async fn enrich_user_lookup_details(
         .await
         .unwrap_or_default();
 
-    let last_active = sessions
-        .iter()
-        .filter_map(|session| session.5.as_deref())
-        .max()
-        .map(String::from);
+    // From every authorization, revoked ones included, not just the unrevoked ones counted above.
+    // Re-authorizing with a saved authorization handle revokes the old authorization, which holds
+    // the activity history, so reading unrevoked ones alone showed "Never" for people who had used
+    // the app (#422). This is the same definition the marketing batch lookup uses.
+    let last_active = activity
+        .get(&details.pubkey)
+        .and_then(|(at, _)| *at)
+        .map(|at| at.to_rfc3339());
 
     UserLookupDetails {
         pubkey: details.pubkey,
@@ -1603,18 +1612,34 @@ pub async fn get_user_lookup(
     let suggested_users = deduplicate_suggested_users(&lookup.users, suggested_users);
 
     let oauth_repo = OAuthAuthorizationRepository::new(pool.clone());
+    // One activity query for every account shown. On failure the lookup still answers, and the page
+    // shows "Never" for every account, the same way a failed session read in
+    // enrich_user_lookup_details leaves the count at zero: support needs to see the account more
+    // than the date. The warning is what tells that apart from real inactivity.
+    let pubkeys: Vec<String> = lookup
+        .users
+        .iter()
+        .chain(suggested_users.iter())
+        .map(|details| details.pubkey.clone())
+        .collect();
+    let activity = oauth_repo
+        .activity_by_pubkeys(&pubkeys, tenant_id)
+        .await
+        .inspect_err(|e| tracing::warn!("User lookup activity query failed: {}", e))
+        .unwrap_or_default();
     let total = lookup.users.len();
     let authoritative_match = lookup.authoritative_match;
     let authoritative_count = lookup.authoritative_count;
     let mut results = Vec::with_capacity(total);
 
     for details in lookup.users {
-        results.push(enrich_user_lookup_details(details, &oauth_repo, tenant_id).await);
+        results.push(enrich_user_lookup_details(details, &oauth_repo, &activity, tenant_id).await);
     }
 
     let mut suggestions = Vec::with_capacity(suggested_users.len());
     for details in suggested_users {
-        suggestions.push(enrich_user_lookup_details(details, &oauth_repo, tenant_id).await);
+        suggestions
+            .push(enrich_user_lookup_details(details, &oauth_repo, &activity, tenant_id).await);
     }
 
     Ok(Json(UserLookupResponse {

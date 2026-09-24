@@ -1,5 +1,6 @@
 // ABOUTME: HTTP-handler tests for the support-admin user-lookup endpoint (get_user_lookup)
-// ABOUTME: Locks the response contract for minor/age-review terminal status + the auth gate (#309)
+// ABOUTME: Locks the response contract for minor/age-review terminal status + the auth gate (#309),
+// ABOUTME: and that Last active counts revoked authorizations (#422)
 
 #![cfg(feature = "integration-tests")]
 
@@ -334,6 +335,9 @@ async fn lookup_returns_literal_and_fuzzy_email_matches_together() {
         .expect("literal email fragment should remain a primary result");
     assert_eq!(partial.match_kind, AdminUserMatchKind::Partial);
     assert!(!partial.authoritative);
+    // Activity for every account comes from one query, matched back by pubkey. This account has
+    // no authorizations while the suggestion below does, so it must not borrow the suggestion's.
+    assert!(partial.last_active.is_none());
 
     let fuzzy = resp
         .suggestions
@@ -488,4 +492,183 @@ async fn lookup_rejects_non_admin() {
     .await;
 
     assert!(result.is_err(), "non-admin must be denied the user lookup");
+}
+
+// -----------------------------------------------------------------------------
+// Last active (#422)
+// -----------------------------------------------------------------------------
+
+/// A user found by username, with nothing else attached.
+async fn seed_user(pool: &PgPool, username: &str) -> String {
+    let pubkey = Keys::generate().public_key().to_hex();
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, username, created_at, updated_at) \
+         VALUES ($1, $2, $3, NOW(), NOW())",
+    )
+    .bind(&pubkey)
+    .bind(TENANT_ID)
+    .bind(username)
+    .execute(pool)
+    .await
+    .unwrap();
+    pubkey
+}
+
+/// An authorization last used `last_activity_days_ago` days ago, or never when `None`. Revoked
+/// and expired are independent, because keycast produces both routinely: re-authorizing with a
+/// stored handle revokes the old row, and people who stop using the app let theirs expire.
+async fn seed_authorization(
+    pool: &PgPool,
+    user_pubkey: &str,
+    last_activity_days_ago: Option<i64>,
+    revoked: bool,
+    expired: bool,
+) {
+    sqlx::query(
+        "INSERT INTO oauth_authorizations
+            (user_pubkey, redirect_origin, client_id, bunker_public_key, secret_hash, relays,
+             tenant_id, handle_expires_at, expires_at, last_activity, activity_count, revoked_at,
+             created_at, updated_at)
+         VALUES ($1, 'https://lookup.test', 'Lookup test', $2, 'hash', '[]', $3,
+                 CASE WHEN $6 THEN NOW() - INTERVAL '1 day' ELSE NOW() + INTERVAL '30 days' END,
+                 CASE WHEN $6 THEN NOW() - INTERVAL '1 day' ELSE NULL END,
+                 NOW() - ($4::bigint * INTERVAL '1 day'),
+                 CASE WHEN $4::bigint IS NULL THEN 0 ELSE 3 END,
+                 CASE WHEN $5 THEN NOW() ELSE NULL END,
+                 NOW(), NOW())",
+    )
+    .bind(user_pubkey)
+    .bind(Keys::generate().public_key().to_hex())
+    .bind(TENANT_ID)
+    .bind(last_activity_days_ago)
+    .bind(revoked)
+    .bind(expired)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn lookup_by_username(
+    pool: &PgPool,
+    username: &str,
+) -> keycast_api::api::http::admin::UserLookupDetails {
+    let resp = get_user_lookup(
+        create_test_tenant(),
+        State(create_test_auth_state(pool.clone())),
+        AuthConfig::support_admin().into_auth(),
+        Query(UserLookupQuery {
+            q: username.to_string(),
+        }),
+    )
+    .await
+    .expect("support admin lookup should succeed")
+    .0;
+    resp.results
+        .into_iter()
+        .next()
+        .expect("the seeded user should be a result")
+}
+
+fn days_since(last_active: &str) -> i64 {
+    let at = chrono::DateTime::parse_from_rfc3339(last_active)
+        .expect("last_active should be an RFC 3339 timestamp, like created_at");
+    (Utc::now() - at.with_timezone(&Utc)).num_days()
+}
+
+#[tokio::test]
+async fn lookup_last_active_counts_a_revoked_authorization() {
+    // Re-authorizing with a stored handle revokes the old authorization, which carries the
+    // activity history, and starts a new one with none. Reading only unrevoked authorizations
+    // showed "Last active: Never" for somebody who had used the app, which is what #422 fixes.
+    let pool = common::setup_test_db().await;
+    let username = format!("revokeduser{}", Uuid::new_v4().simple());
+    let pubkey = seed_user(&pool, &username).await;
+    seed_authorization(&pool, &pubkey, Some(10), true, false).await;
+
+    let user = lookup_by_username(&pool, &username).await;
+
+    let last_active = user
+        .last_active
+        .as_deref()
+        .expect("a revoked authorization's activity is still activity");
+    let days = days_since(last_active);
+    assert!(
+        (9..=11).contains(&days),
+        "expected about 10 days ago, got {days}"
+    );
+    assert_eq!(
+        user.active_sessions, 0,
+        "the active-sessions count still excludes revoked authorizations"
+    );
+
+    cleanup_user(&pool, &pubkey).await;
+}
+
+#[tokio::test]
+async fn lookup_last_active_survives_reauthorization() {
+    // The case #422 was filed for: a client re-authorized, so the old authorization with the
+    // history is revoked and a live one with no activity replaces it. The account has one live
+    // session and must still show when it was last used.
+    let pool = common::setup_test_db().await;
+    let username = format!("reauthuser{}", Uuid::new_v4().simple());
+    let pubkey = seed_user(&pool, &username).await;
+    seed_authorization(&pool, &pubkey, Some(10), true, false).await;
+    seed_authorization(&pool, &pubkey, None, false, false).await;
+
+    let user = lookup_by_username(&pool, &username).await;
+
+    let last_active = user
+        .last_active
+        .as_deref()
+        .expect("the revoked authorization's history must survive re-authorization");
+    let days = days_since(last_active);
+    assert!(
+        (9..=11).contains(&days),
+        "expected about 10 days ago, got {days}"
+    );
+    assert_eq!(user.active_sessions, 1);
+
+    cleanup_user(&pool, &pubkey).await;
+}
+
+#[tokio::test]
+async fn lookup_last_active_counts_an_expired_authorization() {
+    // Somebody who stopped using the app has an authorization that expired. The old query already
+    // counted expired rows; this guards against a later filter on expiry dropping the person
+    // support most needs to see a date for.
+    let pool = common::setup_test_db().await;
+    let username = format!("expireduser{}", Uuid::new_v4().simple());
+    let pubkey = seed_user(&pool, &username).await;
+    seed_authorization(&pool, &pubkey, Some(20), false, true).await;
+
+    let user = lookup_by_username(&pool, &username).await;
+
+    let last_active = user
+        .last_active
+        .as_deref()
+        .expect("an expired authorization's activity is still activity");
+    let days = days_since(last_active);
+    assert!(
+        (19..=21).contains(&days),
+        "expected about 20 days ago, got {days}"
+    );
+
+    cleanup_user(&pool, &pubkey).await;
+}
+
+#[tokio::test]
+async fn lookup_last_active_is_absent_when_nothing_was_ever_signed() {
+    // "Never" must still mean never: an authorization that exists but has not signed anything
+    // has no activity to report.
+    let pool = common::setup_test_db().await;
+    let username = format!("unuseduser{}", Uuid::new_v4().simple());
+    let pubkey = seed_user(&pool, &username).await;
+    seed_authorization(&pool, &pubkey, None, false, false).await;
+
+    let user = lookup_by_username(&pool, &username).await;
+
+    assert!(user.last_active.is_none());
+    assert_eq!(user.active_sessions, 1);
+
+    cleanup_user(&pool, &pubkey).await;
 }
