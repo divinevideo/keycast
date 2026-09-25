@@ -665,7 +665,7 @@ impl OAuthAuthorizationRepository {
 mod tests {
     use super::*;
     use crate::repositories::{OAuthCodeRepository, StoreOAuthCodeParams};
-    use sqlx::postgres::PgPoolOptions;
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use tokio::time::{sleep, Duration as TokioDuration};
 
     fn assert_localhost_db() {
@@ -685,9 +685,53 @@ mod tests {
             .expect("Failed to connect to database")
     }
 
+    /// A pool whose sessions carry a unique application name, so lock waits are observable
+    /// without matching sessions from concurrently running tests.
+    async fn setup_tagged_pool() -> (PgPool, String) {
+        assert_localhost_db();
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string());
+        let application_name = format!("keycast-test-{}", uuid::Uuid::new_v4());
+        let options = database_url
+            .parse::<PgConnectOptions>()
+            .unwrap()
+            .application_name(&application_name);
+        let pool = PgPoolOptions::new()
+            .connect_with(options)
+            .await
+            .expect("Failed to connect to database");
+        (pool, application_name)
+    }
+
+    async fn wait_until_lock_blocked(pool: &PgPool, application_name: &str, query_fragment: &str) {
+        let deadline = tokio::time::Instant::now() + TokioDuration::from_secs(5);
+        loop {
+            let is_waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pg_stat_activity activity
+                    WHERE activity.application_name = $1
+                      AND cardinality(pg_blocking_pids(activity.pid)) > 0
+                      AND strpos(activity.query, $2) > 0
+                )",
+            )
+            .bind(application_name)
+            .bind(query_fragment)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if is_waiting {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "query containing {query_fragment:?} did not reach the exchange-row lock"
+            );
+            sleep(TokioDuration::from_millis(10)).await;
+        }
+    }
+
     async fn insert_redeemed_code(
         pool: &PgPool,
-        expires_at: DateTime<Utc>,
     ) -> (String, OAuthCodeData, CreateOAuthAuthorizationParams) {
         use nostr_sdk::Keys;
         use uuid::Uuid;
@@ -718,7 +762,7 @@ mod tests {
                 scope: "policy:social",
                 code_challenge: Some("challenge"),
                 code_challenge_method: Some("S256"),
-                expires_at,
+                expires_at: Utc::now() + chrono::Duration::minutes(10),
                 previous_auth_id: None,
                 state: Some("state"),
                 is_headless: true,
@@ -751,9 +795,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_from_redeemed_code_serializes_release_before_insert() {
-        let pool = setup_pool().await;
-        let (code, auth_code, params) =
-            insert_redeemed_code(&pool, Utc::now() + chrono::Duration::minutes(10)).await;
+        let (pool, application_name) = setup_tagged_pool().await;
+        let (code, auth_code, params) = insert_redeemed_code(&pool).await;
 
         let mut blocker = pool.begin().await.unwrap();
         sqlx::query("SELECT code FROM oauth_codes WHERE code = $1 FOR UPDATE")
@@ -770,27 +813,12 @@ mod tests {
                 .release_redeemed_code(1, &release_code, &release_data)
                 .await
         });
-        let deadline = tokio::time::Instant::now() + TokioDuration::from_secs(5);
-        loop {
-            let release_is_waiting: bool = sqlx::query_scalar(
-                "SELECT EXISTS(
-                    SELECT 1 FROM pg_stat_activity activity
-                    WHERE cardinality(pg_blocking_pids(activity.pid)) > 0
-                      AND activity.query LIKE '%UPDATE oauth_codes SET consumed_at = NULL%'
-                )",
-            )
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            if release_is_waiting {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "release did not reach the exchange-row lock"
-            );
-            sleep(TokioDuration::from_millis(10)).await;
-        }
+        wait_until_lock_blocked(
+            &pool,
+            &application_name,
+            "UPDATE oauth_codes SET consumed_at = NULL",
+        )
+        .await;
 
         let authorization_repo = OAuthAuthorizationRepository::new(pool.clone());
         let create_code = code.clone();
@@ -800,6 +828,9 @@ mod tests {
                 .create_from_redeemed_code(params, &create_code, &create_data)
                 .await
         });
+        // Postgres queues only sessions already waiting; a claim arriving after the blocker
+        // commits could lock the row before the woken release runs.
+        wait_until_lock_blocked(&pool, &application_name, "locked_claim").await;
         blocker.commit().await.unwrap();
 
         assert!(release.await.unwrap().unwrap());
@@ -811,9 +842,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_from_redeemed_code_rechecks_expiry_after_lock_wait() {
-        let pool = setup_pool().await;
-        let (code, auth_code, params) =
-            insert_redeemed_code(&pool, Utc::now() + chrono::Duration::milliseconds(200)).await;
+        let (pool, application_name) = setup_tagged_pool().await;
+        let (code, auth_code, params) = insert_redeemed_code(&pool).await;
 
         let mut blocker = pool.begin().await.unwrap();
         sqlx::query("SELECT code FROM oauth_codes WHERE code = $1 FOR UPDATE")
@@ -828,7 +858,15 @@ mod tests {
             repo.create_from_redeemed_code(params, &create_code, &auth_code)
                 .await
         });
-        sleep(TokioDuration::from_millis(300)).await;
+        wait_until_lock_blocked(&pool, &application_name, "locked_claim").await;
+
+        // The waiter's statement began before this instant, so only a post-lock clock read sees
+        // the claim as expired.
+        sqlx::query("UPDATE oauth_codes SET expires_at = clock_timestamp() WHERE code = $1")
+            .bind(&code)
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
         blocker.commit().await.unwrap();
 
         assert!(
@@ -847,8 +885,7 @@ mod tests {
             .connect(&database_url)
             .await
             .unwrap();
-        let (code, auth_code, params) =
-            insert_redeemed_code(&pool, Utc::now() + chrono::Duration::minutes(10)).await;
+        let (code, auth_code, params) = insert_redeemed_code(&pool).await;
 
         let id = OAuthAuthorizationRepository::new(pool)
             .create_from_redeemed_code(params, &code, &auth_code)
