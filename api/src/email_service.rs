@@ -383,21 +383,13 @@ impl EmailSender for DevEmailSender {
         tracing::info!("==================================================");
         tracing::info!("  CLAIM CONFIRMATION EMAIL");
         tracing::info!("==================================================");
-        tracing::info!("  To: {}", to_email);
         tracing::info!(
             "  Subject: Confirm your email to claim your {} account",
             BRAND_NAME
         );
         tracing::info!("");
-        tracing::info!("  Confirm link:");
-        tracing::info!("  {}", confirm_url);
         tracing::info!("==================================================");
         tracing::info!("");
-
-        eprintln!(
-            "\n\x1b[36m[DEV EMAIL]\x1b[0m Claim confirmation link for {}: \x1b[4m{}\x1b[0m\n",
-            to_email, confirm_url
-        );
 
         if let Ok(mut captured) = self.captured.lock() {
             captured.push(CapturedEmail {
