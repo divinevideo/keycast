@@ -12,7 +12,13 @@ use sqlx::PgPool;
 
 #[sqlx::test(migrations = "../database/migrations")]
 async fn confirm_completes_claim_and_consumes_token(pool: PgPool) {
-    let repo = UserRepository::new(pool.clone());
+    let single = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(2))
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let repo = UserRepository::new(single);
     let ct_repo = ClaimTokenRepository::new(pool.clone());
     let (token, pubkey) = seed_valid_claim_token(&pool).await;
     let expires = Utc::now() + Duration::hours(CLAIM_CONFIRMATION_EXPIRY_HOURS);
@@ -51,6 +57,70 @@ async fn confirm_completes_claim_and_consumes_token(pool: PgPool) {
     assert_eq!(email.as_deref(), Some("new@example.com"));
     assert!(verified);
     assert!(used.is_some());
+
+    let (event_type, event_email, hash, metadata): (
+        String,
+        Option<String>,
+        String,
+        serde_json::Value,
+    ) = sqlx::query_as(
+        "SELECT event_type, email, email_hash, metadata_json FROM auth_events WHERE pubkey = $1",
+    )
+    .bind(&pubkey)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(event_type, "account_claim");
+    assert!(event_email.is_none());
+    assert_eq!(hash.len(), 64);
+    assert_eq!(metadata, serde_json::json!({}));
+    assert_eq!(
+        repo.confirm_claim_consuming_token("conf-1", TENANT_ID)
+            .await
+            .unwrap(),
+        ClaimConsumeOutcome::TokenNotConsumable
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_events WHERE pubkey = $1")
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[sqlx::test(migrations = "../database/migrations")]
+async fn failed_audit_rolls_back_claim(pool: PgPool) {
+    let repo = UserRepository::new(pool.clone());
+    let ct_repo = ClaimTokenRepository::new(pool.clone());
+    let (token, pubkey) = seed_valid_claim_token(&pool).await;
+    ct_repo
+        .stage_pending_claim(
+            &token,
+            TENANT_ID,
+            "new@example.com",
+            "hash",
+            "audit-fails",
+            Utc::now() + Duration::hours(24),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "ALTER TABLE auth_events ADD CONSTRAINT reject_claim CHECK (event_type <> 'account_claim')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(repo
+        .confirm_claim_consuming_token("audit-fails", TENANT_ID)
+        .await
+        .is_err());
+    let email: Option<String> = sqlx::query_scalar("SELECT email FROM users WHERE pubkey = $1")
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(email.is_none());
+    assert!(ct_repo.find_valid(&token).await.unwrap().is_some());
 }
 
 #[sqlx::test(migrations = "../database/migrations")]

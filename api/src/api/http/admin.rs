@@ -745,12 +745,7 @@ pub async fn batch_create_claim_tokens(
         // Send email if requested
         if let (Some(email), Some(svc)) = (&req.delivery_email, &email_service) {
             if let Err(e) = svc.send_claim_email(email, &claim_url).await {
-                tracing::warn!(
-                    "Failed to send claim email for vine_id={} to {}: {}",
-                    vine_id,
-                    email,
-                    e
-                );
+                tracing::warn!("Failed to send claim email for vine_id={}", vine_id);
                 errors.push(format!("vine_id {}: email delivery failed: {}", vine_id, e));
             }
         } else if req.delivery_email.is_some() && email_service.is_none() {

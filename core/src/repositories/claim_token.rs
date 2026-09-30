@@ -66,25 +66,11 @@ impl ClaimTokenRepository {
         created_by_pubkey: Option<&str>,
         tenant_id: i64,
     ) -> Result<ClaimToken, RepositoryError> {
-        let now = Utc::now();
-        let expires_at = now + Duration::days(CLAIM_TOKEN_EXPIRY_DAYS);
-
-        sqlx::query_as::<_, ClaimToken>(concat!(
-            "INSERT INTO account_claim_tokens
-             (token, user_pubkey, expires_at, created_at, created_by_pubkey, tenant_id)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             RETURNING ",
-            claim_token_columns!()
-        ))
-        .bind(token)
-        .bind(user_pubkey)
-        .bind(expires_at)
-        .bind(now)
-        .bind(created_by_pubkey)
-        .bind(tenant_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(Into::into)
+        let mut tx = self.pool.begin().await?;
+        let claim_token =
+            Self::create_in_tx(&mut tx, token, user_pubkey, created_by_pubkey, tenant_id).await?;
+        tx.commit().await?;
+        Ok(claim_token)
     }
 
     /// Find a valid (not expired, not used, not admin-invalidated) claim token.
@@ -216,7 +202,7 @@ impl ClaimTokenRepository {
     ) -> Result<ClaimToken, RepositoryError> {
         let now = Utc::now();
         let expires_at = now + Duration::days(CLAIM_TOKEN_EXPIRY_DAYS);
-        sqlx::query_as::<_, ClaimToken>(concat!(
+        let claim_token = sqlx::query_as::<_, ClaimToken>(concat!(
             "INSERT INTO account_claim_tokens
              (token, user_pubkey, expires_at, created_at, created_by_pubkey, tenant_id)
              VALUES ($1, $2, $3, $4, $5, $6)
@@ -230,8 +216,35 @@ impl ClaimTokenRepository {
         .bind(created_by_pubkey)
         .bind(tenant_id)
         .fetch_one(&mut **tx)
-        .await
-        .map_err(Into::into)
+        .await?;
+        Self::audit_creation_in_tx(tx, &claim_token, 0).await?;
+        Ok(claim_token)
+    }
+
+    async fn audit_creation_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        token: &ClaimToken,
+        invalidated_prior: u64,
+    ) -> Result<(), RepositoryError> {
+        if let Some(actor) = &token.created_by_pubkey {
+            super::AdminAuditEventRepository::record_in_transaction(
+                tx,
+                super::AdminAuditEventRecord {
+                    tenant_id: token.tenant_id,
+                    actor_pubkey: actor.clone(),
+                    action: "claim_token_created".to_string(),
+                    target_resource_type: "user".to_string(),
+                    target_resource_id: Some(token.user_pubkey.clone()),
+                    target_client_id: None,
+                    metadata_json: serde_json::json!({
+                        "expires_at": token.expires_at,
+                        "invalidated_prior": invalidated_prior,
+                    }),
+                },
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// Return the current token or mint one replacement while the caller holds
@@ -395,6 +408,7 @@ impl ClaimTokenRepository {
         .fetch_one(&mut *tx)
         .await?;
 
+        Self::audit_creation_in_tx(&mut tx, &new_token, invalidated_count).await?;
         tx.commit().await?;
         Ok((new_token, invalidated_count))
     }
