@@ -3,7 +3,7 @@
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
 
 use crate::repositories::RepositoryError;
 
@@ -45,6 +45,17 @@ impl AdminAuditEventRepository {
         &self,
         record: AdminAuditEventRecord,
     ) -> Result<AdminAuditEventRow, RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let row = Self::record_in_transaction(&mut tx, record).await?;
+        tx.commit().await?;
+        Ok(row)
+    }
+
+    /// Record an admin action atomically with its protected write.
+    pub async fn record_in_transaction(
+        tx: &mut Transaction<'_, Postgres>,
+        record: AdminAuditEventRecord,
+    ) -> Result<AdminAuditEventRow, RepositoryError> {
         sqlx::query_as::<_, AdminAuditEventRow>(
             "INSERT INTO admin_audit_events (
                 tenant_id,
@@ -73,7 +84,7 @@ impl AdminAuditEventRepository {
         .bind(record.target_resource_id)
         .bind(record.target_client_id)
         .bind(record.metadata_json)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut **tx)
         .await
         .map_err(Into::into)
     }

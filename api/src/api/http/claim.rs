@@ -557,16 +557,41 @@ pub async fn claim_confirm_get(
 pub async fn claim_confirm_post(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
+    headers: HeaderMap,
     Form(form): Form<ClaimConfirmationForm>,
 ) -> Result<Response, ClaimError> {
     let tenant_id = tenant.0.id;
     let pool = &auth_state.state.db;
     let user_repo = UserRepository::new(pool.clone());
     let claim_token_repo = ClaimTokenRepository::new(pool.clone());
+    let mut committed_audit = None;
 
     use keycast_core::repositories::ClaimConsumeOutcome;
     let user_pubkey_hex = match user_repo
-        .confirm_claim_consuming_token(&form.token, tenant_id)
+        .confirm_claim_consuming_token(&form.token, tenant_id, |pubkey, email| {
+            let mut record = super::auth_observability::auth_event_record(
+                &headers,
+                None,
+                super::auth_observability::AuthEvent {
+                    tenant_id,
+                    endpoint: "/api/claim/confirm",
+                    event_type: "account_claim",
+                    outcome: "success",
+                    reason_code: None,
+                    // This event attests the committed claim, not the HTTP
+                    // response: session generation can still fail afterwards.
+                    http_status: None,
+                    email: Some(email),
+                    pubkey: Some(pubkey),
+                    client_id: None,
+                    redirect_origin: None,
+                    metadata_json: serde_json::json!({}),
+                },
+            );
+            record.email = None;
+            committed_audit = Some(record.clone());
+            record
+        })
         .await
         .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?
     {
@@ -587,6 +612,10 @@ pub async fn claim_confirm_post(
             );
         }
     };
+
+    if let Some(record) = committed_audit {
+        super::auth_observability::log_auth_event_record(&headers, None, &record);
+    }
 
     // Session + success page: moved here, split into named helpers, from
     // claim_post's former single-step tail, back when claim_post completed
