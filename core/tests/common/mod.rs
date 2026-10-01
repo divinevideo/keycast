@@ -10,6 +10,31 @@ use uuid::Uuid;
 pub const TENANT_ID: i64 = 1;
 
 #[allow(dead_code)]
+pub fn claim_audit_record(
+    pubkey: &str,
+    email: &str,
+) -> keycast_core::repositories::AuthEventRecord {
+    use sha2::{Digest, Sha256};
+    keycast_core::repositories::AuthEventRecord {
+        tenant_id: TENANT_ID,
+        request_id: "repository-test".to_string(),
+        endpoint: "/api/claim/confirm".to_string(),
+        event_type: "account_claim".to_string(),
+        outcome: "success".to_string(),
+        reason_code: None,
+        http_status: None,
+        email: None,
+        email_hash: format!("{:x}", Sha256::digest(email.as_bytes())),
+        pubkey: Some(pubkey.to_string()),
+        pubkey_prefix: None,
+        client_id: None,
+        redirect_origin: None,
+        user_agent: None,
+        metadata_json: serde_json::json!({}),
+    }
+}
+
+#[allow(dead_code)]
 pub fn unique_pubkey() -> String {
     Uuid::new_v4().simple().to_string().repeat(2)
 }

@@ -25,6 +25,33 @@ use zeroize::Zeroizing;
 #[allow(dead_code)]
 pub type AuthEventRow = (String, String, String, Option<String>, String, Option<i32>);
 
+#[allow(dead_code)]
+pub fn claim_audit_record(
+    pubkey: &str,
+    email: &str,
+) -> keycast_core::repositories::AuthEventRecord {
+    use keycast_api::api::http::auth_observability::{auth_event_record, AuthEvent};
+    let mut record = auth_event_record(
+        &axum::http::HeaderMap::new(),
+        None,
+        AuthEvent {
+            tenant_id: 1,
+            endpoint: "/api/claim/confirm",
+            event_type: "account_claim",
+            outcome: "success",
+            reason_code: None,
+            http_status: None,
+            email: Some(email),
+            pubkey: Some(pubkey),
+            client_id: None,
+            redirect_origin: None,
+            metadata_json: serde_json::json!({}),
+        },
+    );
+    record.email = None;
+    record
+}
+
 /// CRITICAL: Validates that DATABASE_URL points to a local/dev database only.
 /// This prevents accidental execution of tests against production databases.
 ///

@@ -12,7 +12,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use http_body_util::BodyExt;
 use keycast_api::api::http::{claim, routes::AuthState};
 use keycast_api::ucan_auth::did_to_nostr_pubkey;
@@ -98,7 +98,8 @@ fn build_app_with_delivery(auth_state: AuthState, email_delivery: EmailDeliveryS
                 },
             )
             .post(
-                move |axum::extract::Form(form): axum::extract::Form<
+                move |headers: axum::http::HeaderMap,
+                      axum::extract::Form(form): axum::extract::Form<
                     claim::ClaimConfirmationForm,
                 >| {
                     let state = confirm_state.clone();
@@ -106,6 +107,7 @@ fn build_app_with_delivery(auth_state: AuthState, email_delivery: EmailDeliveryS
                         claim::claim_confirm_post(
                             test_tenant(),
                             State(state),
+                            headers,
                             axum::extract::Form(form),
                         )
                         .await
@@ -519,11 +521,14 @@ async fn confirm_completes_claim_and_sets_session() {
         .nth(1)
         .and_then(|value| value.split('"').next())
         .expect("confirmation form must carry its token");
-    let resp = app
-        .clone()
-        .oneshot(post_claim_confirm(form_token))
-        .await
-        .unwrap();
+    let mut confirm_request = post_claim_confirm(form_token);
+    confirm_request
+        .headers_mut()
+        .insert("x-request-id", "claim-context-test".parse().unwrap());
+    confirm_request
+        .headers_mut()
+        .insert("user-agent", "ClaimAuditTest/1.0".parse().unwrap());
+    let resp = app.clone().oneshot(confirm_request).await.unwrap();
 
     assert_eq!(resp.status(), StatusCode::OK);
     let set_cookie = resp
@@ -571,12 +576,78 @@ async fn confirm_completes_claim_and_sets_session() {
         "confirming a claim must mark the claim token used"
     );
 
+    let audit: keycast_core::repositories::AuthEventRow = sqlx::query_as(
+        "SELECT id, occurred_at, request_id, tenant_id, endpoint, event_type, outcome,
+         reason_code, http_status, email, email_hash, pubkey, pubkey_prefix, client_id,
+         redirect_origin, user_agent, metadata_json FROM auth_events WHERE pubkey = $1 AND event_type = 'account_claim'",
+    ).bind(&pubkey).fetch_one(&pool).await.unwrap();
+    assert_eq!(audit.request_id, "claim-context-test");
+    assert_eq!(audit.user_agent.as_deref(), Some("ClaimAuditTest/1.0"));
+    assert_eq!(audit.pubkey_prefix.as_deref(), Some(&pubkey[..12]));
+    assert_eq!(
+        audit.email_hash,
+        keycast_api::api::http::auth_observability::hash_email(Some(&claim_email))
+    );
+    assert!(audit.email.is_none());
+    assert!(
+        audit.http_status.is_none(),
+        "claim event does not predict the later HTTP response"
+    );
+
     let replay = app
         .oneshot(post_claim_confirm(&confirmation_token))
         .await
         .unwrap();
     assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
     assert!(!replay.headers().contains_key(header::SET_COOKIE));
+}
+
+#[sqlx::test(migrations = "../database/migrations")]
+async fn committed_claim_audit_does_not_claim_http_success_when_session_fails(pool: PgPool) {
+    common::assert_test_database_url();
+    let pubkey = "g".repeat(64); // Synthetic malformed key forces post-commit session failure.
+    sqlx::query("INSERT INTO users (pubkey, tenant_id) VALUES ($1, 1)")
+        .bind(&pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let repo = keycast_core::repositories::ClaimTokenRepository::new(pool.clone());
+    repo.create("session-failure-claim", &pubkey, None, 1)
+        .await
+        .unwrap();
+    repo.stage_pending_claim(
+        "session-failure-claim",
+        1,
+        "session-failure@example.com",
+        "hash",
+        "session-failure-confirm",
+        Utc::now() + Duration::hours(24),
+    )
+    .await
+    .unwrap();
+    let single = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(2))
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let (state, _producer) = common::create_test_auth_state(single);
+    let mut request = post_claim_confirm("session-failure-confirm");
+    request
+        .headers_mut()
+        .insert("x-request-id", "failed-session-request".parse().unwrap());
+    let response = build_app(state).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        read_user_email(&pool, &pubkey).await.as_deref(),
+        Some("session-failure@example.com")
+    );
+    let (request_id, outcome, status): (String, String, Option<i32>) = sqlx::query_as(
+        "SELECT request_id, outcome, http_status FROM auth_events WHERE pubkey = $1 AND event_type = 'account_claim'",
+    ).bind(&pubkey).fetch_one(&pool).await.unwrap();
+    assert_eq!(request_id, "failed-session-request");
+    assert_eq!(outcome, "success");
+    assert_eq!(status, None);
 }
 
 #[tokio::test]

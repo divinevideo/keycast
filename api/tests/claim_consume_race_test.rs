@@ -115,7 +115,7 @@ async fn test_valid_token_consumed_and_account_claimed() {
     let confirmation_token = stage_claim(&claim_repo, &token, &email_for(&pubkey), "hash").await;
 
     let outcome = UserRepository::new(pool.clone())
-        .confirm_claim_consuming_token(&confirmation_token, TENANT_ID)
+        .confirm_claim_consuming_token(&confirmation_token, TENANT_ID, common::claim_audit_record)
         .await
         .expect("consume+claim");
 
@@ -176,7 +176,7 @@ async fn test_invalidated_token_not_consumed_user_untouched() {
     // The claimer clicks the confirmation link — and must be refused with no
     // side effects.
     let outcome = UserRepository::new(pool.clone())
-        .confirm_claim_consuming_token(&confirmation_token, TENANT_ID)
+        .confirm_claim_consuming_token(&confirmation_token, TENANT_ID, common::claim_audit_record)
         .await
         .expect("consume attempt");
 
@@ -214,7 +214,7 @@ async fn test_expired_token_not_consumed() {
     .expect("expire token");
 
     let outcome = UserRepository::new(pool.clone())
-        .confirm_claim_consuming_token(&confirmation_token, TENANT_ID)
+        .confirm_claim_consuming_token(&confirmation_token, TENANT_ID, common::claim_audit_record)
         .await
         .expect("consume attempt");
 
@@ -241,13 +241,13 @@ async fn test_used_token_not_consumed_again() {
 
     let repo = UserRepository::new(pool.clone());
     let first = repo
-        .confirm_claim_consuming_token(&confirmation_token, TENANT_ID)
+        .confirm_claim_consuming_token(&confirmation_token, TENANT_ID, common::claim_audit_record)
         .await
         .expect("first confirm");
     assert!(matches!(first, ClaimConsumeOutcome::Claimed { .. }));
 
     let second = repo
-        .confirm_claim_consuming_token(&confirmation_token, TENANT_ID)
+        .confirm_claim_consuming_token(&confirmation_token, TENANT_ID, common::claim_audit_record)
         .await
         .expect("second confirm attempt");
     assert!(matches!(second, ClaimConsumeOutcome::TokenNotConsumable));
@@ -279,7 +279,7 @@ async fn test_unclaimable_user_rolls_back_token_consume() {
     let confirmation_token = stage_claim(&claim_repo, &token, &email_for(&pubkey), "hash").await;
 
     let outcome = UserRepository::new(pool.clone())
-        .confirm_claim_consuming_token(&confirmation_token, TENANT_ID)
+        .confirm_claim_consuming_token(&confirmation_token, TENANT_ID, common::claim_audit_record)
         .await
         .expect("consume attempt");
 
@@ -321,7 +321,7 @@ async fn test_concurrent_invalidate_vs_claim_exactly_one_wins() {
         let ct = confirmation_token.clone();
         let claim_task = tokio::spawn(async move {
             user_repo
-                .confirm_claim_consuming_token(&ct, TENANT_ID)
+                .confirm_claim_consuming_token(&ct, TENANT_ID, common::claim_audit_record)
                 .await
                 .expect("consume attempt")
         });

@@ -35,7 +35,7 @@ async fn confirm_completes_claim_and_consumes_token(pool: PgPool) {
         .unwrap();
 
     let outcome = repo
-        .confirm_claim_consuming_token("conf-1", TENANT_ID)
+        .confirm_claim_consuming_token("conf-1", TENANT_ID, common::claim_audit_record)
         .await
         .unwrap();
     assert_eq!(
@@ -75,7 +75,7 @@ async fn confirm_completes_claim_and_consumes_token(pool: PgPool) {
     assert_eq!(hash.len(), 64);
     assert_eq!(metadata, serde_json::json!({}));
     assert_eq!(
-        repo.confirm_claim_consuming_token("conf-1", TENANT_ID)
+        repo.confirm_claim_consuming_token("conf-1", TENANT_ID, common::claim_audit_record)
             .await
             .unwrap(),
         ClaimConsumeOutcome::TokenNotConsumable
@@ -111,7 +111,7 @@ async fn failed_audit_rolls_back_claim(pool: PgPool) {
     .await
     .unwrap();
     assert!(repo
-        .confirm_claim_consuming_token("audit-fails", TENANT_ID)
+        .confirm_claim_consuming_token("audit-fails", TENANT_ID, common::claim_audit_record)
         .await
         .is_err());
     let email: Option<String> = sqlx::query_scalar("SELECT email FROM users WHERE pubkey = $1")
@@ -149,7 +149,7 @@ async fn confirm_refuses_after_admin_invalidation(pool: PgPool) {
         .unwrap();
 
     let outcome = repo
-        .confirm_claim_consuming_token("conf-2", TENANT_ID)
+        .confirm_claim_consuming_token("conf-2", TENANT_ID, common::claim_audit_record)
         .await
         .unwrap();
     assert_eq!(outcome, ClaimConsumeOutcome::TokenNotConsumable);
@@ -198,7 +198,7 @@ async fn confirm_refuses_after_confirmation_window_expires(pool: PgPool) {
     .unwrap();
 
     let outcome = repo
-        .confirm_claim_consuming_token("conf-expired-window", TENANT_ID)
+        .confirm_claim_consuming_token("conf-expired-window", TENANT_ID, common::claim_audit_record)
         .await
         .unwrap();
     assert_eq!(outcome, ClaimConsumeOutcome::TokenNotConsumable);
@@ -234,7 +234,7 @@ async fn confirm_maps_duplicate_email_to_email_taken(pool: PgPool) {
         .unwrap();
 
     let outcome = repo
-        .confirm_claim_consuming_token("conf-3", TENANT_ID)
+        .confirm_claim_consuming_token("conf-3", TENANT_ID, common::claim_audit_record)
         .await
         .unwrap();
     assert_eq!(outcome, ClaimConsumeOutcome::EmailTaken);

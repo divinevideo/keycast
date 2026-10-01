@@ -2692,11 +2692,17 @@ impl UserRepository {
     /// email/password onto the user, atomically. Re-checks token validity under
     /// the row lock (#280) so an invalidation or expiry during the confirmation
     /// window cannot complete a claim.
-    pub async fn confirm_claim_consuming_token(
+    /// The caller constructs the audit from the locked staged email and account;
+    /// insertion is part of this transaction, before any session work occurs.
+    pub async fn confirm_claim_consuming_token<F>(
         &self,
         confirmation_token: &str,
         tenant_id: i64,
-    ) -> Result<ClaimConsumeOutcome, RepositoryError> {
+        build_audit: F,
+    ) -> Result<ClaimConsumeOutcome, RepositoryError>
+    where
+        F: FnOnce(&str, &str) -> super::AuthEventRecord,
+    {
         let mut tx = self.pool.begin().await?;
 
         // Consume iff the token is still valid AND this confirmation token is the
@@ -2768,29 +2774,9 @@ impl UserRepository {
                 Ok(ClaimConsumeOutcome::UserNotClaimable)
             }
             Ok(_) => {
-                use sha2::{Digest, Sha256};
                 super::AuthEventRepository::record_in_transaction(
                     &mut tx,
-                    super::AuthEventRecord {
-                        tenant_id,
-                        request_id: uuid::Uuid::new_v4().to_string(),
-                        endpoint: "/api/claim/confirm".to_string(),
-                        event_type: "account_claim".to_string(),
-                        outcome: "success".to_string(),
-                        reason_code: None,
-                        http_status: Some(200),
-                        email: None,
-                        email_hash: format!(
-                            "{:x}",
-                            Sha256::digest(pending_email.trim().to_lowercase().as_bytes())
-                        ),
-                        pubkey: Some(user_pubkey.clone()),
-                        pubkey_prefix: None,
-                        client_id: None,
-                        redirect_origin: None,
-                        user_agent: None,
-                        metadata_json: serde_json::json!({}),
-                    },
+                    build_audit(&user_pubkey, &pending_email),
                 )
                 .await?;
                 tx.commit().await?;

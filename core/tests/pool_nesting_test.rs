@@ -400,7 +400,11 @@ async fn confirm_claim_consuming_token_uses_one_connection() {
         "UserRepository::confirm_claim_consuming_token",
         |pool| async move {
             UserRepository::new(pool)
-                .confirm_claim_consuming_token(&probe_confirmation_token, TENANT_ID)
+                .confirm_claim_consuming_token(
+                    &probe_confirmation_token,
+                    TENANT_ID,
+                    common::claim_audit_record,
+                )
                 .await
         },
     )
