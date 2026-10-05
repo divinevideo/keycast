@@ -2692,11 +2692,17 @@ impl UserRepository {
     /// email/password onto the user, atomically. Re-checks token validity under
     /// the row lock (#280) so an invalidation or expiry during the confirmation
     /// window cannot complete a claim.
-    pub async fn confirm_claim_consuming_token(
+    /// The caller constructs the audit from the locked staged email and account;
+    /// insertion is part of this transaction, before any session work occurs.
+    pub async fn confirm_claim_consuming_token<F>(
         &self,
         confirmation_token: &str,
         tenant_id: i64,
-    ) -> Result<ClaimConsumeOutcome, RepositoryError> {
+        build_audit: F,
+    ) -> Result<ClaimConsumeOutcome, RepositoryError>
+    where
+        F: FnOnce(&str, &str) -> super::AuthEventRecord,
+    {
         let mut tx = self.pool.begin().await?;
 
         // Consume iff the token is still valid AND this confirmation token is the
@@ -2768,6 +2774,11 @@ impl UserRepository {
                 Ok(ClaimConsumeOutcome::UserNotClaimable)
             }
             Ok(_) => {
+                super::AuthEventRepository::record_in_transaction(
+                    &mut tx,
+                    build_audit(&user_pubkey, &pending_email),
+                )
+                .await?;
                 tx.commit().await?;
                 Ok(ClaimConsumeOutcome::Claimed { user_pubkey })
             }

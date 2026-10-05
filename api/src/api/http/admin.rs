@@ -523,10 +523,7 @@ pub async fn create_claim_token(
     let pool = &auth_state.state.db;
 
     if !is_support_admin(&auth).await {
-        tracing::warn!(
-            "Claim token request denied for pubkey: {}",
-            &auth.pubkey[..8]
-        );
+        tracing::warn!("Claim token request denied for pubkey: {}", &auth.pubkey);
         return Err(ApiError::forbidden("Admin access required"));
     }
 
@@ -567,9 +564,10 @@ pub async fn create_claim_token(
     let claim_url = format!("{}/api/claim?token={}", app_url, token);
 
     tracing::info!(
-        "Claim token created for vine_id={}, by admin={}",
+        "Claim token created for vine_id={}, pubkey={}, by admin={}",
         req.vine_id,
-        &auth.pubkey[..8]
+        user_pubkey,
+        &auth.pubkey
     );
 
     Ok(Json(CreateClaimTokenResponse {
@@ -625,7 +623,7 @@ pub async fn batch_create_claim_tokens(
     if !is_support_admin(&auth).await {
         tracing::warn!(
             "Batch claim token request denied for pubkey: {}",
-            &auth.pubkey[..8]
+            &auth.pubkey
         );
         return Err(ApiError::forbidden("Admin access required"));
     }
@@ -745,12 +743,7 @@ pub async fn batch_create_claim_tokens(
         // Send email if requested
         if let (Some(email), Some(svc)) = (&req.delivery_email, &email_service) {
             if let Err(e) = svc.send_claim_email(email, &claim_url).await {
-                tracing::warn!(
-                    "Failed to send claim email for vine_id={} to {}: {}",
-                    vine_id,
-                    email,
-                    e
-                );
+                tracing::warn!("Failed to send claim email for vine_id={}: {}", vine_id, e);
                 errors.push(format!("vine_id {}: email delivery failed: {}", vine_id, e));
             }
         } else if req.delivery_email.is_some() && email_service.is_none() {
@@ -769,7 +762,7 @@ pub async fn batch_create_claim_tokens(
         tokens.len(),
         skipped.len(),
         errors.len(),
-        &auth.pubkey[..8]
+        &auth.pubkey
     );
 
     Ok(Json(BatchCreateClaimTokensResponse {
