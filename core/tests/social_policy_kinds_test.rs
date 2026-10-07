@@ -1,21 +1,25 @@
 #![cfg(feature = "integration-tests")]
-// ABOUTME: Tests the event kinds the seeded `social` policy lets an app sign,
-// ABOUTME: loaded from a migrated database the way signing loads them.
+// ABOUTME: Tests the event kinds the seeded `social` policy lets an app sign, and
+// ABOUTME: how its consent text describes them, from a migrated database.
 
 use keycast_core::traits::CustomPermission;
 use keycast_core::types::policy::Policy;
 use nostr_sdk::{Keys, Kind, Tag, Timestamp, UnsignedEvent};
 use sqlx::PgPool;
 
-async fn social_policy(pool: &PgPool) -> Vec<Box<dyn CustomPermission>> {
-    let policy = sqlx::query_as::<_, Policy>(
+async fn social_policy_row(pool: &PgPool) -> Policy {
+    sqlx::query_as::<_, Policy>(
         "SELECT id, name, team_id, created_at, updated_at, slug, display_name, description
          FROM policies WHERE slug = 'social' AND team_id IS NULL",
     )
     .fetch_one(pool)
     .await
-    .expect("the social policy is seeded");
-    policy
+    .expect("the social policy is seeded")
+}
+
+async fn social_policy(pool: &PgPool) -> Vec<Box<dyn CustomPermission>> {
+    social_policy_row(pool)
+        .await
         .permissions(pool)
         .await
         .expect("social policy permissions load")
@@ -106,4 +110,22 @@ async fn linked_accounts_migration_leaves_an_unrestricted_permission_alone(pool:
         assert_eq!(social_messaging_config(&pool).await, unrestricted);
         assert!(allows(&social_policy(&pool).await, 30023));
     }
+}
+
+// The consent screen lists what a social app can do; linked accounts get their own line.
+#[sqlx::test(migrations = "../database/migrations")]
+async fn social_policy_consent_text_names_linked_accounts(pool: PgPool) {
+    let displays = social_policy_row(&pool)
+        .await
+        .permission_displays(&pool)
+        .await
+        .expect("social policy displays load");
+    let abilities: Vec<&str> = displays
+        .iter()
+        .flat_map(|d| d.description.split(", "))
+        .collect();
+    assert!(
+        abilities.contains(&"Update your linked accounts"),
+        "consent text: {abilities:?}"
+    );
 }
