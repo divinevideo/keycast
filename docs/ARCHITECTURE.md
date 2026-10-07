@@ -184,8 +184,8 @@ user_authorizations
 
 ```
 permissions (global templates)
-  ├─ identifier (e.g., "allowed_kinds_social")
-  └─ config (JSON: {"allowed_kinds": [0, 1, 3, 7]})
+  ├─ identifier (e.g., "allowed_kinds_social_messaging")
+  └─ config (JSON: {"allowed_kinds": [0, 1, 3, 4, 7, 44, 1059, 9735, 22242, 10011]})
 
 policies (per-tenant)
   ├─ name (e.g., "Standard Social (Default)")
@@ -201,17 +201,17 @@ policy_permissions (many-to-many)
 1. Permissions are reusable templates (no tenant_id)
 2. Policies are per-tenant, link to permissions
 3. Authorizations reference a policy
-4. When signing request comes via NIP-46:
+4. When a signing request arrives (NIP-46, HTTP RPC, or session signing):
    - Signer checks authorization's policy
    - Evaluates all linked permissions
-   - Allows/denies based on rules
+   - Allows only if every linked permission allows the event
 
 **Example:**
-- Permission: `allowed_kinds_social` = [0, 1, 3, 7]
-- Policy: "Standard Social" links to social + messaging permissions
+- Permission: `allowed_kinds_social_messaging` = [0, 1, 3, 4, 7, 44, 1059, 9735, 22242, 10011]
+- Policy: "Standard Social" links to that one permission
 - Authorization has policy_id = Standard Social
-- Can sign kinds 0, 1, 3, 4, 7, 44 (social + messaging)
-- Cannot sign kind 9734 (zaps) ❌
+- Can sign those kinds, including 10011 (linked accounts)
+- Cannot sign kind 5 (deletions) ❌
 
 ---
 
@@ -505,11 +505,13 @@ signing_activity (audit log)
 ```json
 {
   "Standard Social": [
-    {"allowed_kinds": [0, 1, 3, 7]},  // Social
-    {"allowed_kinds": [4, 44, 1059]}  // Messaging
+    {"allowed_kinds": [0, 1, 3, 4, 7, 44, 1059, 9735, 22242, 10011]}
   ]
 }
 ```
+
+Every permission must allow an event, so a policy's allowed kinds go in one
+permission: two `allowed_kinds` permissions would only allow kinds on both lists.
 
 Request to sign kind 9734 (zap) → ❌ Denied
 
