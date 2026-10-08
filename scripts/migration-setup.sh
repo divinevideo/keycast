@@ -22,7 +22,7 @@ SOURCE_DB_SECRET="keycast-database-url"
 TARGET_DB_SECRET="keycast-db-url-production"
 
 # Cloud SQL instance (source only - target uses in-cluster CNPG)
-SOURCE_SQL_INSTANCE="openvine-co:us-central1:keycast-db-plus"
+SOURCE_SQL_INSTANCE="openvine-co:us-east1:keycast-db-east"
 
 # KMS keys
 SOURCE_KMS_KEY="projects/openvine-co/locations/global/keyRings/keycast-keys/cryptoKeys/master-key"

@@ -28,7 +28,7 @@ steps:
   # Runs AFTER build+push so the job pulls the freshly-pushed :latest, ensuring
   # its embedded migrations match what the new Cloud Run revision will run.
   # The job runs ./keycast --migrate (sqlx::migrate!) as service account
-  # keycast-migrator@openvine-co.iam.gsa.com, connecting to keycast-db-plus via
+  # keycast-migrator@openvine-co.iam.gsa.com, connecting to keycast-db-east via
   # Cloud SQL Auth Proxy + IAM auth. sqlx tracks applied versions in the
   # _sqlx_migrations table and uses an advisory lock; safe to invoke on every
   # deploy. --wait blocks until the execution completes; non-zero exit fails
@@ -71,7 +71,7 @@ steps:
       - '--use-http2'
       - '--startup-probe=httpGet.path=/healthz/startup,httpGet.port=3000,initialDelaySeconds=0,periodSeconds=3,failureThreshold=20,timeoutSeconds=2'
       - '--liveness-probe=httpGet.path=/livez,httpGet.port=3000,periodSeconds=30,timeoutSeconds=5,failureThreshold=3'
-      - '--add-cloudsql-instances=openvine-co:us-central1:keycast-db-plus'
+      - '--add-cloudsql-instances=openvine-co:us-east1:keycast-db-east'
       - '--network=default'
       - '--subnet=default'
       - '--vpc-egress=private-ranges-only'

@@ -75,7 +75,7 @@ The deploy commands derive `COMMIT_SHA` from `git rev-parse HEAD`; Cloud Build s
 | HTTP/2 | enabled |
 | Startup probe | `GET /healthz/startup` on port 3000 |
 | Liveness probe | `GET /livez` on port 3000 |
-| Cloud SQL | `openvine-co:us-central1:keycast-db-plus` |
+| Cloud SQL | `openvine-co:us-east1:keycast-db-east` |
 | VPC egress | private ranges only |
 
 Cloud Run does not have readiness-probe-driven endpoint removal during shutdown. The production Cloud Run env vars set the shutdown budget to fit Cloud Run's shorter SIGTERM-to-SIGKILL window.
@@ -170,7 +170,7 @@ Authorizations load on demand. After a rollout the handler cache is empty, so a 
 | Resource | Name |
 |----------|------|
 | Cloud Run service | `keycast` |
-| Cloud SQL | `keycast-db-plus`; connection configured by Cloud Build, engine details managed outside this repo |
+| Cloud SQL | `keycast-db-east` (us-east1); connection configured by Cloud Build, engine details managed outside this repo |
 | Cloud KMS | key ring `keycast-keys`, key `master-key`, location `global` |
 | Redis | URL injected from the `keycast-redis-url` Secret Manager secret; instance details managed outside this repo |
 | Artifact Registry | `us-central1-docker.pkg.dev/openvine-co/docker` |
@@ -394,10 +394,10 @@ Production Cloud SQL has automated backups and PITR configured outside this repo
 
 ```bash
 gcloud sql backups list \
-  --instance=keycast-db-plus \
+  --instance=keycast-db-east \
   --project=openvine-co
 
-gcloud sql instances clone keycast-db-plus keycast-db-restored \
+gcloud sql instances clone keycast-db-east keycast-db-restored \
   --point-in-time="2024-01-15T10:00:00Z" \
   --project=openvine-co
 ```
