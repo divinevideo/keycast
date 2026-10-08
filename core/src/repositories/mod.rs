@@ -32,7 +32,9 @@ pub use authorization::AuthorizationRepository;
 pub use claim_token::{ClaimTokenRepository, PendingClaimSendState, StagePendingOutcome};
 pub use email_marketing::EmailMarketingConsent;
 pub use error::RepositoryError;
-pub use oauth_authorization::{CreateOAuthAuthorizationParams, OAuthAuthorizationRepository};
+pub use oauth_authorization::{
+    CreateOAuthAuthorizationParams, OAuthAuthorizationRepository, RememberedAuthorization,
+};
 pub use oauth_code::{
     FinalizedPendingRegistration, MaterializePendingRegistrationOutcome, OAuthCodeData,
     OAuthCodeRepository, PinAttemptRelease, PinAttemptReservation, PinResendSnapshot,

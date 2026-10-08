@@ -241,7 +241,15 @@ async fn seed_reauth_authorization(pool: &PgPool) -> SeededReauthAuthorization {
             bunker_public_key,
             secret_hash,
             relays: "[]".to_string(),
-            policy_id: None,
+            // Token exchange always records the approved policy.
+            policy_id: Some(
+                sqlx::query_scalar(
+                    "SELECT id FROM policies WHERE slug = 'full' AND team_id IS NULL",
+                )
+                .fetch_one(pool)
+                .await
+                .expect("seeded full policy"),
+            ),
             is_first_party: true,
             client_pubkey: None,
             authorization_handle: Some(authorization_handle.clone()),

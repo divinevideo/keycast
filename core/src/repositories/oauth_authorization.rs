@@ -7,6 +7,15 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use std::collections::HashMap;
 
+/// An active authorization a person already approved, as the authorize flow
+/// needs it to decide whether a returning app can skip the consent screen.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct RememberedAuthorization {
+    pub id: i32,
+    pub is_first_party: bool,
+    pub policy_id: Option<i32>,
+}
+
 /// Parameters for creating a new OAuth authorization.
 #[derive(Debug, Clone)]
 pub struct CreateOAuthAuthorizationParams {
@@ -105,21 +114,29 @@ impl OAuthAuthorizationRepository {
         .map_err(Into::into)
     }
 
-    pub async fn find_first_party_by_handle(
+    /// Find the active authorization a sign-in handle belongs to, scoped to this
+    /// user and to the app origin and tenant it was issued to.
+    pub async fn find_remembered_by_handle(
         &self,
         authorization_handle: &str,
         user_pubkey: &str,
-    ) -> Result<Option<(i32, bool)>, RepositoryError> {
-        sqlx::query_as::<_, (i32, bool)>(
-            "SELECT id, is_first_party FROM oauth_authorizations
+        redirect_origin: &str,
+        tenant_id: i64,
+    ) -> Result<Option<RememberedAuthorization>, RepositoryError> {
+        sqlx::query_as::<_, RememberedAuthorization>(
+            "SELECT id, is_first_party, policy_id FROM oauth_authorizations
              WHERE authorization_handle = $1
                AND user_pubkey = $2
+               AND redirect_origin = $3
+               AND tenant_id = $4
                AND revoked_at IS NULL
                AND (expires_at IS NULL OR expires_at > NOW())
                AND handle_expires_at > NOW()",
         )
         .bind(authorization_handle)
         .bind(user_pubkey)
+        .bind(redirect_origin)
+        .bind(tenant_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(Into::into)
@@ -434,27 +451,27 @@ impl OAuthAuthorizationRepository {
         Ok(exists.is_some())
     }
 
-    pub async fn active_first_party_for_origin(
+    /// List a user's active authorizations for an app's origin, newest first.
+    pub async fn active_for_origin(
         &self,
         user_pubkey: &str,
         redirect_origin: &str,
         tenant_id: i64,
-    ) -> Result<Option<bool>, RepositoryError> {
-        sqlx::query_scalar(
-            "SELECT is_first_party FROM oauth_authorizations
+    ) -> Result<Vec<RememberedAuthorization>, RepositoryError> {
+        sqlx::query_as::<_, RememberedAuthorization>(
+            "SELECT id, is_first_party, policy_id FROM oauth_authorizations
              WHERE user_pubkey = $1
                AND redirect_origin = $2
                AND tenant_id = $3
                AND revoked_at IS NULL
                AND (expires_at IS NULL OR expires_at > NOW())
                AND handle_expires_at > NOW()
-             ORDER BY created_at DESC
-             LIMIT 1",
+             ORDER BY created_at DESC",
         )
         .bind(user_pubkey)
         .bind(redirect_origin)
         .bind(tenant_id)
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await
         .map_err(Into::into)
     }

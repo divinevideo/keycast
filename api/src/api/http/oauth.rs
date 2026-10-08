@@ -16,8 +16,8 @@ use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
     CreateOAuthAuthorizationParams, OAuthAuthorizationRepository, OAuthCodeData,
     OAuthCodeRepository, PersonalKeysRepository, PolicyRepository, RefreshTokenRepository,
-    RepositoryError, StoreOAuthCodeParams, StoreOAuthCodeWithRegistrationParams,
-    StoredPendingRegistration, UserRepository,
+    RememberedAuthorization, RepositoryError, StoreOAuthCodeParams,
+    StoreOAuthCodeWithRegistrationParams, StoredPendingRegistration, UserRepository,
 };
 use keycast_core::secret_pool::SecretPoolError;
 use keycast_core::types::refresh_token::{generate_refresh_token, hash_refresh_token};
@@ -702,7 +702,8 @@ pub async fn auth_status(
 }
 
 /// GET /oauth/authorize
-/// Shows login form if not authenticated, or auto-approves if already authorized, or shows approval page
+/// Shows login form if not authenticated, auto-approves if already authorized for this app
+/// with the same policy, or shows the approval page
 pub async fn authorize_get(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
@@ -778,97 +779,67 @@ pub async fn authorize_get(
 
     let mut has_existing_authorization = false;
 
-    // Check for silent re-authentication via authorization_handle (primary mechanism)
-    if let Some(ref pubkey) = user_pubkey {
-        let (previous_auth_id, inherited_first_party): (Option<i32>, bool) =
-            if let Some(ref handle) = params.authorization_handle {
-                tracing::info!(
-                    "Auto-approve check via authorization_handle for user {}",
-                    pubkey
+    // A returning app skips the consent screen only when it asks for the policy
+    // the person already approved for that same app, because the new
+    // authorization takes the policy this request asks for. Any other request
+    // (a different, unknown or missing policy, or only a handle issued to
+    // another app) is shown the usual screens.
+    let requested_policy = match (&user_pubkey, params.scope.as_deref()) {
+        (Some(_), Some(scope)) => match resolve_policy_from_scope(pool, scope).await {
+            Ok(policy_id) => Some((scope, policy_id)),
+            Err(OAuthError::InvalidRequest(_)) => None,
+            Err(e) => {
+                tracing::warn!(
+                    "Could not resolve requested policy, will not auto-approve: {:?}",
+                    e
                 );
+                None
+            }
+        },
+        _ => None,
+    };
+    // The scope to store on the code when this remembered authorization covers
+    // the request: exactly the one that was checked.
+    let approved_scope = |remembered: &RememberedAuthorization| {
+        requested_policy
+            .filter(|(_, policy_id)| remembered.policy_id == Some(*policy_id))
+            .map(|(scope, _)| scope)
+    };
 
-                // Look up by handle, scoped to this user
-                let repo = OAuthAuthorizationRepository::new(pool.clone());
-                match repo.find_first_party_by_handle(handle, pubkey).await? {
-                    Some((id, is_first_party)) => (Some(id), is_first_party),
-                    None => (None, false),
-                }
-            } else {
-                (None, false)
-            };
-
-        tracing::info!(
-            "Authorization handle lookup: found={}",
-            previous_auth_id.is_some()
-        );
-        has_existing_authorization = previous_auth_id.is_some();
-
-        // Skip auto-approve if prompt=consent (always show approval screen)
-        if previous_auth_id.is_some() && !force_consent {
+    // Check for silent re-authentication via authorization_handle. When the handle's
+    // authorization covers this request, the new sign-in replaces it and it is revoked
+    // at exchange; a sign-in approved any other way leaves it in place.
+    if let Some(ref pubkey) = user_pubkey {
+        let redirect_origin = extract_origin(&params.redirect_uri)?;
+        let remembered = if let Some(ref handle) = params.authorization_handle {
             tracing::info!(
-                "Auto-approving via authorization_handle for user {}",
+                "Auto-approve check via authorization_handle for user {}",
                 pubkey
             );
 
-            // Auto-approve: generate code and send directly to parent window
-            let code: String = rand::thread_rng()
-                .sample_iter(&rand::distributions::Alphanumeric)
-                .take(32)
-                .map(char::from)
-                .collect();
+            // Look up by handle, scoped to this user and to the app it was issued to
+            let repo = OAuthAuthorizationRepository::new(pool.clone());
+            repo.find_remembered_by_handle(handle, pubkey, &redirect_origin, tenant_id)
+                .await?
+        } else {
+            None
+        };
 
-            let expires_at = Utc::now() + Duration::minutes(10);
-            let scope = params.scope.as_deref().unwrap_or("sign_event");
+        tracing::info!(
+            "Authorization handle lookup: found={}",
+            remembered.is_some()
+        );
+        has_existing_authorization = remembered.is_some();
 
-            store_oauth_code(
-                pool,
-                tenant_id,
-                &code,
-                pubkey,
-                &params.client_id,
-                &params.redirect_uri,
-                scope,
-                params.code_challenge.as_deref(),
-                params.code_challenge_method.as_deref(),
-                expires_at,
-                previous_auth_id,
-                params.state.as_deref(),
-                inherited_first_party,
-            )
-            .await?;
-
-            // Auto-approve: redirect to redirect_uri with code (standard OAuth pattern)
-            // Include state in redirect if provided
-            let redirect_url = if let Some(ref state) = params.state {
-                format!("{}?code={}&state={}", params.redirect_uri, code, state)
-            } else {
-                format!("{}?code={}", params.redirect_uri, code)
-            };
-            return Ok(Redirect::to(&redirect_url).into_response());
-        } else if previous_auth_id.is_some() && force_consent {
-            tracing::info!("prompt=consent: skipping auto-approve, showing approval screen");
-        }
-    }
-
-    // Origin-based auto-approve fallback: if no handle was provided (or handle was invalid),
-    // check if the user already has an active authorization for this origin.
-    if let Some(ref pubkey) = user_pubkey {
-        let redirect_origin = extract_origin(&params.redirect_uri)?;
-        let repo = OAuthAuthorizationRepository::new(pool.clone());
-        let active_origin_first_party = repo
-            .active_first_party_for_origin(pubkey, &redirect_origin, tenant_id)
-            .await?;
-
-        if let Some(is_first_party) = active_origin_first_party {
-            has_existing_authorization = true;
-
-            if !force_consent {
+        // Skip auto-approve if prompt=consent (always show approval screen)
+        match remembered.as_ref().map(|r| (r, approved_scope(r))) {
+            Some((remembered, Some(scope))) if !force_consent => {
                 tracing::info!(
-                    "Auto-approving via active origin authorization for user {} origin {}",
-                    pubkey,
-                    redirect_origin
+                    "Auto-approving via authorization_handle for user {}",
+                    pubkey
                 );
 
+                // Auto-approve: generate code and send directly to parent window
                 let code: String = rand::thread_rng()
                     .sample_iter(&rand::distributions::Alphanumeric)
                     .take(32)
@@ -876,7 +847,6 @@ pub async fn authorize_get(
                     .collect();
 
                 let expires_at = Utc::now() + Duration::minutes(10);
-                let scope = params.scope.as_deref().unwrap_or("sign_event");
 
                 store_oauth_code(
                     pool,
@@ -889,12 +859,14 @@ pub async fn authorize_get(
                     params.code_challenge.as_deref(),
                     params.code_challenge_method.as_deref(),
                     expires_at,
-                    None,
+                    Some(remembered.id),
                     params.state.as_deref(),
-                    is_first_party,
+                    remembered.is_first_party,
                 )
                 .await?;
 
+                // Auto-approve: redirect to redirect_uri with code (standard OAuth pattern)
+                // Include state in redirect if provided
                 let redirect_url = if let Some(ref state) = params.state {
                     format!("{}?code={}&state={}", params.redirect_uri, code, state)
                 } else {
@@ -902,6 +874,73 @@ pub async fn authorize_get(
                 };
                 return Ok(Redirect::to(&redirect_url).into_response());
             }
+            Some((_, Some(_))) => {
+                tracing::info!("prompt=consent: skipping auto-approve, showing approval screen");
+            }
+            Some((_, None)) => {
+                tracing::info!(
+                    "Request does not match the policy approved with this handle, not auto-approving via the handle"
+                );
+            }
+            None => {}
+        }
+    }
+
+    // Origin-based fallback: check every active authorization this person has for
+    // this origin, which covers requests with no usable handle and handles whose
+    // authorization has a different policy.
+    if let Some(ref pubkey) = user_pubkey {
+        let redirect_origin = extract_origin(&params.redirect_uri)?;
+        let repo = OAuthAuthorizationRepository::new(pool.clone());
+        let active = repo
+            .active_for_origin(pubkey, &redirect_origin, tenant_id)
+            .await?;
+
+        if !active.is_empty() {
+            has_existing_authorization = true;
+        }
+
+        let approved = active.iter().find_map(|remembered| {
+            approved_scope(remembered).map(|scope| (remembered.is_first_party, scope))
+        });
+        if let (Some((is_first_party, scope)), false) = (approved, force_consent) {
+            tracing::info!(
+                "Auto-approving via active origin authorization for user {} origin {}",
+                pubkey,
+                redirect_origin
+            );
+
+            let code: String = rand::thread_rng()
+                .sample_iter(&rand::distributions::Alphanumeric)
+                .take(32)
+                .map(char::from)
+                .collect();
+
+            let expires_at = Utc::now() + Duration::minutes(10);
+
+            store_oauth_code(
+                pool,
+                tenant_id,
+                &code,
+                pubkey,
+                &params.client_id,
+                &params.redirect_uri,
+                scope,
+                params.code_challenge.as_deref(),
+                params.code_challenge_method.as_deref(),
+                expires_at,
+                None,
+                params.state.as_deref(),
+                is_first_party,
+            )
+            .await?;
+
+            let redirect_url = if let Some(ref state) = params.state {
+                format!("{}?code={}&state={}", params.redirect_uri, code, state)
+            } else {
+                format!("{}?code={}", params.redirect_uri, code)
+            };
+            return Ok(Redirect::to(&redirect_url).into_response());
         }
     }
 
