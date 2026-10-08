@@ -18,6 +18,7 @@ mod registered_client;
 mod service_account_deletion;
 mod service_provisioning_operation;
 mod stored_key;
+mod support_admin;
 mod team;
 mod user;
 
@@ -59,6 +60,7 @@ pub use service_provisioning_operation::{
     ServiceProvisioningOperationTombstone,
 };
 pub use stored_key::StoredKeyRepository;
+pub use support_admin::{SupportAdminRepository, SupportAdminRow};
 pub use team::TeamRepository;
 pub use user::{
     og_diviner_cutoff, AccountDeletionOutcome, AccountStatusRow, AccountStatusWithMinorRow,
