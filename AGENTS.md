@@ -189,7 +189,7 @@ results influence work.
 - Use transaction-scoped advisory locks only. Session-scoped advisory locks are incompatible with transaction-mode connection pooling.
 - Run CPU-heavy request/response work on a bounded blocking path with explicit admission control. `spawn_blocking` alone prevents async-runtime starvation but does not bound CPU concurrency.
 - Test transaction-owning handler paths with `max_connections(1)` so nested acquisition fails deterministically rather than depending on load. A burst sized at the pool maximum does not prove this because pre-transaction work can stagger acquisition and hide the extra connection.
-- Put ephemeral, self-healing state such as rate-limit counters in Redis with a TTL. Put durable security state such as access-control lists and credentials in Postgres; Redis-only support-admin storage in issue #249 is the cautionary case.
+- Put ephemeral, self-healing state such as rate-limit counters in Redis with a TTL. Put durable security state such as access-control lists and credentials in Postgres; support admins were once stored only in Redis, where a flush silently revoked every grant, until issue #249 moved them to the `support_admins` table.
 
 ## OAuth, Signing, And Identity Rules
 

@@ -1,7 +1,7 @@
 import { type Page, type TestInfo, expect, test } from "@playwright/test";
 import { parseCookieValue, registerAndVerify } from "../helpers/auth";
 import { withDb } from "../helpers/db";
-import { addSupportAdmin, clearSupportAdmins } from "../helpers/redis";
+import { addSupportAdmin, clearSupportAdmins } from "../helpers/support-admins";
 
 const PASSWORD = "TestPass123!";
 const LITERAL_PUBLISH_EMAIL = "socialpublishcommunity@gmail.com";

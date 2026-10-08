@@ -1,11 +1,7 @@
 import { test, expect } from "@playwright/test";
 import { registerAndVerify, parseCookieValue } from "../helpers/auth";
 import { getAdminTenantId, registerAdmin } from "../helpers/admin";
-import {
-  addSupportAdmin,
-  removeSupportAdmin,
-  clearSupportAdmins,
-} from "../helpers/redis";
+import { addSupportAdmin, clearSupportAdmins } from "../helpers/support-admins";
 import { withDb } from "../helpers/db";
 
 test.describe("Support admin management", () => {
@@ -99,7 +95,7 @@ test.describe("Support admin management", () => {
     expect(listBody2.admins).toEqual([]);
   });
 
-  test("support admin via Redis gets role: support", async ({ request }) => {
+  test("granted support admin gets role: support", async ({ request }) => {
     const email = `e2e-support-${Date.now()}@test.local`;
     const { cookie } = await registerAndVerify(request, email, "TestPass123!");
     const sessionCookie = `keycast_session=${parseCookieValue(cookie)}`;
@@ -111,7 +107,7 @@ test.describe("Support admin management", () => {
     const account = await accountRes.json();
     const pubkey = account.public_key;
 
-    // Add to Redis support_admins set
+    // Grant support admin in Postgres
     await addSupportAdmin(pubkey);
 
     const res = await request.get("/api/admin/status", {
@@ -134,7 +130,7 @@ test.describe("Support admin management", () => {
     const { cookie } = await registerAndVerify(request, email, "TestPass123!");
     const sessionCookie = `keycast_session=${parseCookieValue(cookie)}`;
 
-    // Get pubkey and add to Redis
+    // Get pubkey and grant support admin
     const accountRes = await request.get("/api/user/account", {
       headers: { Cookie: sessionCookie },
     });
