@@ -20,7 +20,7 @@ use keycast_api::activity_log::ActivityLogger;
 use keycast_api::api::{
     http::{
         admin::{set_user_status_admin, SetUserStatusRequest},
-        auth::{sign_event, AuthError, SignEventRequest},
+        auth::{generate_server_signed_ucan, sign_event, AuthError, SignEventRequest},
         nostr_rpc::{nostr_rpc, NostrRpcRequest, NostrRpcResponse, RpcError},
         routes::AuthState,
         service_deletion::{delete_account_service, ServiceAccountDeletionRequest},
@@ -2167,6 +2167,8 @@ struct WrapRpcAccount {
     user_keys: Keys,
     pubkey: String,
     auth_id: i32,
+    redirect_origin: String,
+    bunker_pubkey: String,
     token: String,
     auth_state: AuthState,
 }
@@ -2227,6 +2229,8 @@ async fn setup_wrap_rpc_account_with_activity_logger(
         user_keys,
         pubkey,
         auth_id,
+        redirect_origin,
+        bunker_pubkey,
         token,
         auth_state,
     }
@@ -2687,4 +2691,204 @@ async fn test_revoked_authorization_denied_nip17_wrap_batch() {
     .expect_err("revoked authorization cannot wrap a batch");
 
     assert!(matches!(err, RpcError::Auth(AuthError::InvalidToken)));
+}
+
+/// A bunker token is served only when its authorization belongs to the token
+/// subject. A token for another user of the same app that names this
+/// bunker_pubkey gets the same InvalidToken as an unknown bunker_pubkey for
+/// get_public_key, sign_event and nip44_decrypt, and is not cached.
+#[tokio::test]
+#[serial]
+async fn test_bunker_token_requires_authorization_owner() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let owner = setup_wrap_rpc_account(&pool, tenant_id, None, None).await;
+    let other = setup_wrap_rpc_account(&pool, tenant_id, None, None).await;
+    // The other account has also authorized the owner's app.
+    create_test_oauth_authorization(
+        &pool,
+        tenant_id,
+        &other.pubkey,
+        &owner.redirect_origin,
+        None,
+        None,
+        None,
+    )
+    .await;
+    let auth_state = owner.auth_state.clone();
+
+    let response = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state.clone(),
+        &format!("Bearer {}", owner.token),
+        None,
+        get_public_key_request(),
+    )
+    .await
+    .expect("the owner's token is served");
+    assert_eq!(response.result, Some(Value::String(owner.pubkey.clone())));
+
+    // The token's subject is the other account; its bunker_pubkey names the
+    // owner's authorization.
+    let other_token = build_self_signed_ucan(
+        &other.user_keys,
+        tenant_id,
+        &owner.redirect_origin,
+        Some(&owner.bunker_pubkey),
+    )
+    .await;
+    let other_header = format!("Bearer {}", other_token);
+    let sender = Keys::generate();
+    let ciphertext = nip44::encrypt(
+        sender.secret_key(),
+        &owner.user_keys.public_key(),
+        "addressed to the owner",
+        nip44::Version::V2,
+    )
+    .expect("sender-side encryption");
+    let requests = [
+        get_public_key_request(),
+        NostrRpcRequest {
+            method: "sign_event".to_string(),
+            params: vec![serde_json::to_value(
+                EventBuilder::text_note("not from the owner").build(owner.user_keys.public_key()),
+            )
+            .expect("serialize unsigned event")],
+        },
+        NostrRpcRequest {
+            method: "nip44_decrypt".to_string(),
+            params: vec![json!(sender.public_key().to_hex()), json!(ciphertext)],
+        },
+    ];
+    for request in requests {
+        let method = request.method.clone();
+        let err = invoke_nostr_rpc(
+            create_test_tenant_extractor(tenant_id),
+            auth_state.clone(),
+            &other_header,
+            None,
+            request,
+        )
+        .await
+        .expect_err("a token for another account must not use this authorization");
+        assert!(
+            matches!(err, RpcError::Auth(AuthError::InvalidToken)),
+            "{method}: expected InvalidToken, got {err:?}"
+        );
+    }
+    let other_cache_key = *blake3::hash(other_token.as_bytes()).as_bytes();
+    assert!(
+        auth_state
+            .state
+            .http_handler_cache
+            .get(&other_cache_key)
+            .await
+            .is_none(),
+        "a rejected token must not be cached"
+    );
+
+    let unknown_bunker_token = build_self_signed_ucan(
+        &other.user_keys,
+        tenant_id,
+        &owner.redirect_origin,
+        Some(&Keys::generate().public_key().to_hex()),
+    )
+    .await;
+    let err = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state,
+        &format!("Bearer {}", unknown_bunker_token),
+        None,
+        get_public_key_request(),
+    )
+    .await
+    .expect_err("an unknown bunker_pubkey must be rejected");
+    assert!(
+        matches!(err, RpcError::Auth(AuthError::InvalidToken)),
+        "expected InvalidToken, got {err:?}"
+    );
+}
+
+/// Bunker tokens from the OAuth code exchange and refresh grant are server-signed
+/// with the authorization owner as audience. They are served for the owner and
+/// rejected when the audience is another account.
+#[tokio::test]
+#[serial]
+async fn test_server_signed_bunker_token_requires_authorization_owner() {
+    // Server keys must match SERVER_NSEC, which validate_ucan_token reads.
+    let server_keys = Keys::generate();
+    std::env::set_var(
+        "SERVER_NSEC",
+        server_keys
+            .secret_key()
+            .to_bech32()
+            .expect("server nsec bech32"),
+    );
+
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let owner = setup_wrap_rpc_account(&pool, tenant_id, None, None).await;
+    let other = setup_wrap_rpc_account(&pool, tenant_id, None, None).await;
+    // The other account has also authorized the owner's app.
+    create_test_oauth_authorization(
+        &pool,
+        tenant_id,
+        &other.pubkey,
+        &owner.redirect_origin,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    let owner_token = generate_server_signed_ucan(
+        &owner.user_keys.public_key(),
+        tenant_id,
+        "owner@example.com",
+        &owner.redirect_origin,
+        Some(&owner.bunker_pubkey),
+        &server_keys,
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("mint the owner's access token");
+    let response = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        owner.auth_state.clone(),
+        &format!("Bearer {}", owner_token),
+        None,
+        get_public_key_request(),
+    )
+    .await
+    .expect("a server-signed token for the owner is served");
+    assert_eq!(response.result, Some(Value::String(owner.pubkey.clone())));
+
+    let other_token = generate_server_signed_ucan(
+        &other.user_keys.public_key(),
+        tenant_id,
+        "other@example.com",
+        &owner.redirect_origin,
+        Some(&owner.bunker_pubkey),
+        &server_keys,
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("mint a token for the other account");
+    let err = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        owner.auth_state.clone(),
+        &format!("Bearer {}", other_token),
+        None,
+        get_public_key_request(),
+    )
+    .await
+    .expect_err("a token for another account must not use this authorization");
+    assert!(
+        matches!(err, RpcError::Auth(AuthError::InvalidToken)),
+        "expected InvalidToken, got {err:?}"
+    );
 }

@@ -14,9 +14,7 @@ use base64::prelude::*;
 use chrono::{DateTime, Utc};
 use keycast_core::creator_binding::MAX_CREATOR_BINDING_PAYLOAD_BYTES;
 use keycast_core::metrics::METRICS;
-use keycast_core::repositories::{
-    OAuthAuthorizationRepository, PersonalKeysRepository, PolicyRepository, UserRepository,
-};
+use keycast_core::repositories::{PersonalKeysRepository, PolicyRepository, UserRepository};
 use keycast_core::signing_session::{parse_cache_key, CacheKey, SigningSession};
 use keycast_core::traits::CustomPermission;
 use nostr_sdk::{Event, JsonUtil, Keys, PublicKey, UnsignedEvent};
@@ -791,31 +789,167 @@ fn enforce_minor_dm_rumor(
         })
 }
 
-/// Load an HttpRpcHandler on-demand from DB and cache it
-/// Called when http_handler_cache misses for the given bunker_pubkey
-/// Loads authorization metadata, user keys, AND permissions - all cached in handler
-async fn load_handler_on_demand(
+mod bunker_authorization {
+    //! Bunker-token authorizations and the check that ties them to the token subject.
+    //!
+    //! These types live in their own module so the rest of `nostr_rpc` cannot
+    //! build an [`OwnedAuthorization`] directly.
+    //! [`BunkerAuthorization::authorize_subject`] is the only way to get one, and
+    //! `build_handler_for_owned_authorization` requires one.
+
+    use super::{map_repo_error, AuthError, RpcError};
+    use chrono::{DateTime, Utc};
+    use keycast_core::repositories::OAuthAuthorizationRepository;
+
+    /// An oauth_authorization row found by bunker pubkey, without key material.
+    pub(super) struct BunkerAuthorization {
+        auth_id: i32,
+        owner_pubkey: String,
+        auth_handle: Option<String>,
+        expires_at: Option<DateTime<Utc>>,
+        revoked_at: Option<DateTime<Utc>>,
+        policy_id: Option<i32>,
+        bunker_pubkey_hex: String,
+    }
+
+    /// A [`BunkerAuthorization`] whose owner matched the subject passed to
+    /// [`BunkerAuthorization::authorize_subject`].
+    pub(super) struct OwnedAuthorization(BunkerAuthorization);
+
+    /// Load the tenant's oauth_authorization for a bunker pubkey.
+    pub(super) async fn load(
+        pool: &sqlx::PgPool,
+        bunker_pubkey_hex: &str,
+        tenant_id: i64,
+    ) -> Result<BunkerAuthorization, RpcError> {
+        let auth_data = OAuthAuthorizationRepository::new(pool.clone())
+            .find_by_bunker_pubkey_for_tenant(bunker_pubkey_hex, tenant_id)
+            .await
+            .map_err(|e| map_repo_error("loading authorization", e))?;
+
+        let (auth_id, owner_pubkey, auth_handle, expires_at, revoked_at, policy_id) =
+            auth_data.ok_or(RpcError::Auth(AuthError::InvalidToken))?;
+
+        Ok(BunkerAuthorization {
+            auth_id,
+            owner_pubkey,
+            auth_handle,
+            expires_at,
+            revoked_at,
+            policy_id,
+            bunker_pubkey_hex: bunker_pubkey_hex.to_string(),
+        })
+    }
+
+    impl BunkerAuthorization {
+        /// Check that the authorization belongs to the token subject.
+        ///
+        /// `token_subject_hex` must be the audience returned by
+        /// `validate_ucan_token`. A mismatch returns the same `InvalidToken` as
+        /// an unknown bunker pubkey, so callers cannot tell the two apart.
+        pub(super) fn authorize_subject(
+            self,
+            token_subject_hex: &str,
+        ) -> Result<OwnedAuthorization, RpcError> {
+            if self.owner_pubkey != token_subject_hex {
+                tracing::warn!(
+                    event = "rpc.bunker_subject_mismatch",
+                    owner_pubkey = %self.owner_pubkey,
+                    subject_pubkey = %token_subject_hex,
+                    bunker_pubkey = %self.bunker_pubkey_hex,
+                    "Bunker authorization does not belong to the token subject"
+                );
+                return Err(RpcError::Auth(AuthError::InvalidToken));
+            }
+            Ok(OwnedAuthorization(self))
+        }
+    }
+
+    impl OwnedAuthorization {
+        pub(super) fn auth_id(&self) -> i32 {
+            self.0.auth_id
+        }
+
+        pub(super) fn owner_pubkey(&self) -> &str {
+            &self.0.owner_pubkey
+        }
+
+        pub(super) fn auth_handle(&self) -> Option<&str> {
+            self.0.auth_handle.as_deref()
+        }
+
+        pub(super) fn expires_at(&self) -> Option<DateTime<Utc>> {
+            self.0.expires_at
+        }
+
+        pub(super) fn revoked_at(&self) -> Option<DateTime<Utc>> {
+            self.0.revoked_at
+        }
+
+        pub(super) fn policy_id(&self) -> Option<i32> {
+            self.0.policy_id
+        }
+
+        pub(super) fn bunker_pubkey_hex(&self) -> &str {
+            &self.0.bunker_pubkey_hex
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn authorization_owned_by(owner_pubkey: &str) -> BunkerAuthorization {
+            BunkerAuthorization {
+                auth_id: 1,
+                owner_pubkey: owner_pubkey.to_string(),
+                auth_handle: None,
+                expires_at: None,
+                revoked_at: None,
+                policy_id: None,
+                bunker_pubkey_hex: "c".repeat(64),
+            }
+        }
+
+        #[test]
+        fn authorize_subject_accepts_the_owner() {
+            let owner = "a".repeat(64);
+            let owned = authorization_owned_by(&owner)
+                .authorize_subject(&owner)
+                .expect("the owner is its own subject");
+            assert_eq!(owned.owner_pubkey(), owner);
+        }
+
+        #[test]
+        fn authorize_subject_rejects_a_non_owner() {
+            let owner = "a".repeat(64);
+            let other = "b".repeat(64);
+            let result = authorization_owned_by(&owner).authorize_subject(&other);
+            assert!(
+                matches!(result, Err(RpcError::Auth(AuthError::InvalidToken))),
+                "a subject that does not own the authorization must be rejected"
+            );
+        }
+    }
+}
+
+use bunker_authorization::OwnedAuthorization;
+
+/// Build the HttpRpcHandler for an authorization that belongs to the token subject.
+///
+/// Requiring an [`OwnedAuthorization`] means this loads key material only after
+/// `authorize_subject` has passed.
+async fn build_handler_for_owned_authorization(
     auth_state: &AuthState,
     pool: &sqlx::PgPool,
-    bunker_pubkey_hex: &str,
+    owned: OwnedAuthorization,
     tenant_id: i64,
     dpop_cnf_jkt: Option<String>,
 ) -> Result<Arc<HttpRpcHandler>, RpcError> {
     let key_manager = auth_state.state.key_manager.as_ref();
 
-    // Query oauth_authorization for this bunker_pubkey, scoped to tenant
-    // Includes: expires_at, revoked_at (for validity), policy_id (for permissions)
-    let oauth_auth_repo = OAuthAuthorizationRepository::new(pool.clone());
-    let auth_data = oauth_auth_repo
-        .find_by_bunker_pubkey_for_tenant(bunker_pubkey_hex, tenant_id)
-        .await
-        .map_err(|e| map_repo_error("loading authorization", e))?;
-
-    let (auth_id, user_pubkey, auth_handle_opt, expires_at, revoked_at, policy_id) =
-        auth_data.ok_or(RpcError::Auth(AuthError::InvalidToken))?;
-
     // Load permissions for this authorization's policy (if any)
-    let permissions: Vec<Box<dyn CustomPermission>> = if let Some(pid) = policy_id {
+    let permissions: Vec<Box<dyn CustomPermission>> = if let Some(pid) = owned.policy_id() {
         let policy_repo = PolicyRepository::new(pool.clone());
         let db_permissions = policy_repo
             .get_permissions(pid)
@@ -832,10 +966,11 @@ async fn load_handler_on_demand(
         vec![]
     };
 
-    // Get user's encrypted secret key, scoped to tenant
+    // Get the owner's encrypted secret key, scoped to tenant. The owner is the
+    // token subject, so this decrypts the caller's own key.
     let personal_keys_repo = PersonalKeysRepository::new(pool.clone());
     let encrypted_secret: Vec<u8> = personal_keys_repo
-        .find_encrypted_key_for_tenant(&user_pubkey, tenant_id)
+        .find_encrypted_key_for_tenant(owned.owner_pubkey(), tenant_id)
         .await
         .map_err(|e| map_repo_error("loading personal key", e))?
         .ok_or_else(|| RpcError::Internal("Personal keys not found".to_string()))?;
@@ -851,11 +986,11 @@ async fn load_handler_on_demand(
     let user_keys = Keys::new(secret_key.into());
 
     // Parse cache keys
-    let bunker_key = parse_cache_key(bunker_pubkey_hex)
+    let bunker_key = parse_cache_key(owned.bunker_pubkey_hex())
         .map_err(|e| RpcError::Internal(format!("Invalid bunker_pubkey: {}", e)))?;
 
     // For authorization_handle, use it if present, otherwise use bunker_pubkey as fallback
-    let auth_handle = if let Some(ref handle) = auth_handle_opt {
+    let auth_handle = if let Some(handle) = owned.auth_handle() {
         parse_cache_key(handle)
             .map_err(|e| RpcError::Internal(format!("Invalid authorization_handle: {}", e)))?
     } else {
@@ -868,9 +1003,9 @@ async fn load_handler_on_demand(
     // Create handler with cached authorization metadata, permissions, and cache keys
     let handler = Arc::new(HttpRpcHandler::new(
         session,
-        auth_id as i64,
-        expires_at,
-        revoked_at,
+        owned.auth_id() as i64,
+        owned.expires_at(),
+        owned.revoked_at(),
         permissions,
         true, // OAuth authorization
         bunker_key,
@@ -882,6 +1017,25 @@ async fn load_handler_on_demand(
     // This allows skipping UCAN verification entirely on cache hits
 
     Ok(handler)
+}
+
+/// Build the HttpRpcHandler for a bunker token after an `http_handler_cache` miss.
+///
+/// The caller caches the handler under BLAKE3(token). `token_subject_hex` must be
+/// the audience returned by `validate_ucan_token`; the authorization named by
+/// `bunker_pubkey_hex` is used only if it belongs to that subject.
+async fn load_handler_on_demand(
+    auth_state: &AuthState,
+    pool: &sqlx::PgPool,
+    bunker_pubkey_hex: &str,
+    token_subject_hex: &str,
+    tenant_id: i64,
+    dpop_cnf_jkt: Option<String>,
+) -> Result<Arc<HttpRpcHandler>, RpcError> {
+    let owned = bunker_authorization::load(pool, bunker_pubkey_hex, tenant_id)
+        .await?
+        .authorize_subject(token_subject_hex)?;
+    build_handler_for_owned_authorization(auth_state, pool, owned, tenant_id, dpop_cnf_jkt).await
 }
 
 /// Construct the absolute htu (HTTP Target URI) from request headers per RFC 9449.
@@ -1050,7 +1204,8 @@ async fn load_preloaded_user_handler(
 ///
 /// SLOW PATH (cache miss): Full UCAN verification → DB load → cache insert
 /// Three authentication modes are supported:
-/// 1. OAuth tokens: bunker_pubkey in UCAN → load from oauth_authorizations
+/// 1. OAuth tokens: bunker_pubkey in UCAN → load from oauth_authorizations, which
+///    must belong to the token subject
 /// 2. Preloaded users: server-signed UCAN without bunker_pubkey → load personal key directly
 /// 3. Session UCANs: user-signed without bunker_pubkey → rejected (use OAuth flow)
 ///
@@ -1128,19 +1283,19 @@ async fn get_handler(
 
     // Determine which authentication mode to use
     let handler = if let Some(bunker_key_hex) = bunker_pubkey {
-        // MODE 1: OAuth token with bunker_pubkey - load from oauth_authorizations (tenant-scoped)
+        // MODE 1: OAuth token with bunker_pubkey - load from oauth_authorizations (tenant-scoped).
+        // `user_pubkey` is the authenticated subject from the verified UCAN; the
+        // callee rejects the request unless it owns this bunker authorization.
         let h = load_handler_on_demand(
             auth_state,
             pool,
             &bunker_key_hex,
+            &user_pubkey,
             tenant_id,
             dpop_cnf_jkt.clone(),
         )
         .await?;
-        tracing::debug!(
-            "RPC: Loaded OAuth handler for bunker {}",
-            &bunker_key_hex[..8]
-        );
+        tracing::debug!("RPC: Loaded OAuth handler for bunker {}", bunker_key_hex);
         h
     } else if is_server_signed(&ucan) {
         // MODE 2: Preloaded user - server-signed UCAN without bunker_pubkey
