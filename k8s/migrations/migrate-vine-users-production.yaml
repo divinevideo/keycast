@@ -74,7 +74,7 @@ spec:
         - name: cloud-sql-proxy
           image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.14.3
           args:
-            - "openvine-co:us-central1:keycast-db-plus"
+            - "openvine-co:us-east1:keycast-db-east"
             - "--port=5431"
             - "--auto-iam-authn"
             - "--structured-logs"
