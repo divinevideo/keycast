@@ -871,6 +871,58 @@ pub(crate) async fn extract_user_from_token(
     Ok(pubkey)
 }
 
+/// Extract the user from a UCAN that may manage the account's authorizations.
+///
+/// An OAuth access token (server-signed, with a `bunker_pubkey` fact) acts for one
+/// authorization and its policy, so it cannot create, list, revoke, or disconnect the
+/// account's authorizations unless that authorization is first-party. User-signed
+/// sessions and server-signed sessions without a `bunker_pubkey` fact are accepted.
+pub(crate) async fn extract_user_for_authorization_management(
+    headers: &HeaderMap,
+    tenant_id: i64,
+) -> Result<String, AuthError> {
+    let bearer = match headers.get("Authorization") {
+        Some(value) => {
+            let value = value.to_str().map_err(|_| AuthError::InvalidToken)?;
+            value.starts_with("Bearer ").then(|| value.to_string())
+        }
+        None => None,
+    };
+    let auth_header = bearer
+        .or_else(|| extract_ucan_from_cookie(headers).map(|token| format!("Bearer {}", token)))
+        .ok_or(AuthError::MissingToken)?;
+
+    let (user_pubkey, redirect_origin, bunker_pubkey, ucan) =
+        crate::ucan_auth::validate_ucan_token(&auth_header, tenant_id)
+            .await
+            .map_err(|_| AuthError::InvalidToken)?;
+
+    let issuer = crate::ucan_auth::did_to_nostr_pubkey(ucan.issuer())
+        .map_err(|_| AuthError::InvalidToken)?
+        .to_hex();
+    let is_user_signed = issuer == user_pubkey;
+    let is_first_party = ucan
+        .facts()
+        .iter()
+        .find_map(|fact| fact.get("first_party").and_then(|value| value.as_bool()))
+        .unwrap_or(false);
+
+    if bunker_pubkey.is_some() && !is_user_signed && !is_first_party {
+        tracing::warn!(
+            event = "authorization_management_denied",
+            tenant_id = tenant_id,
+            user_pubkey = %user_pubkey,
+            redirect_origin = %redirect_origin,
+            "Denied: OAuth access token is not first-party"
+        );
+        return Err(AuthError::Forbidden(
+            "This token cannot manage the account's app connections".to_string(),
+        ));
+    }
+
+    Ok(user_pubkey)
+}
+
 /// Extract user public key, redirect_origin, and bunker_pubkey from UCAN token in Authorization header or cookie
 /// redirect_origin identifies which app/authorization this token is for
 /// bunker_pubkey uniquely identifies the authorization for direct cache lookup (optional)
@@ -1644,7 +1696,7 @@ pub async fn create_bunker(
     Json(req): Json<CreateBunkerRequest>,
 ) -> Result<Json<CreateBunkerResponse>, AuthError> {
     let tenant_id = tenant.0.id;
-    let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
+    let user_pubkey = extract_user_for_authorization_management(&headers, tenant_id).await?;
     let pool = &auth_state.state.db;
 
     // Validate origin if provided (HTTPS, or http:// for localhost variants)
@@ -3516,7 +3568,7 @@ pub async fn list_sessions(
 ) -> Result<Json<BunkerSessionsResponse>, AuthError> {
     // Extract user from UCAN (supports both cookie and Bearer token)
     let tenant_id = tenant.0.id;
-    let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
+    let user_pubkey = extract_user_for_authorization_management(&headers, tenant_id).await?;
     tracing::info!(
         "Listing bunker sessions for user: {} in tenant: {}",
         user_pubkey,
@@ -3578,7 +3630,7 @@ pub async fn revoke_session(
     let pool = &auth_state.state.db;
     // Extract user from UCAN (supports both cookie and Bearer token)
     let tenant_id = tenant.0.id;
-    let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
+    let user_pubkey = extract_user_for_authorization_management(&headers, tenant_id).await?;
     tracing::info!(
         "Revoking bunker session for user: {} in tenant: {}",
         user_pubkey,
@@ -3650,7 +3702,7 @@ pub async fn disconnect_client(
     Json(req): Json<DisconnectClientRequest>,
 ) -> Result<Json<DisconnectClientResponse>, AuthError> {
     let tenant_id = tenant.0.id;
-    let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
+    let user_pubkey = extract_user_for_authorization_management(&headers, tenant_id).await?;
     tracing::info!(
         "Disconnecting NIP-46 client for user: {} in tenant: {}",
         user_pubkey,
@@ -3713,7 +3765,7 @@ pub async fn list_permissions(
     headers: HeaderMap,
 ) -> Result<Json<PermissionsResponse>, AuthError> {
     let tenant_id = tenant.0.id;
-    let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
+    let user_pubkey = extract_user_for_authorization_management(&headers, tenant_id).await?;
     tracing::info!(
         "Listing permissions for user: {} in tenant: {}",
         user_pubkey,

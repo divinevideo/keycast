@@ -4693,7 +4693,7 @@ pub async fn connect_post(
     }
 
     // Extract user public key from JWT token in Authorization header
-    let user_pubkey = super::auth::extract_user_from_token(&headers, tenant_id)
+    let user_pubkey = super::auth::extract_user_for_authorization_management(&headers, tenant_id)
         .await
         .map_err(|_| OAuthError::Unauthorized)?;
 

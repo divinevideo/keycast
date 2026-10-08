@@ -548,6 +548,8 @@ Exchange authorization code for bunker URL.
 
 ### Session Management Endpoints
 
+These endpoints, `POST /api/user/bunker/create`, and `POST /api/oauth/connect` accept a login session or a first-party (headless flow) access token. Access tokens issued to other OAuth clients get `403 Forbidden` (`401` on `/api/oauth/connect`).
+
 #### `GET /api/user/sessions`
 
 List all active bunker sessions for authenticated user.
