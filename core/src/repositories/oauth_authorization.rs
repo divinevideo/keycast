@@ -404,7 +404,8 @@ impl OAuthAuthorizationRepository {
         Ok(result.rows_affected())
     }
 
-    /// Find policy_id for an active authorization by user and redirect origin.
+    /// Find policy_id for the newest active (not revoked or expired) authorization
+    /// by user and redirect origin.
     /// Returns None if no authorization found, Some(None) if no policy set.
     pub async fn find_policy_id_by_origin(
         &self,
@@ -418,7 +419,10 @@ impl OAuthAuthorizationRepository {
              WHERE user_pubkey = $1
              AND redirect_origin = $2
              AND tenant_id = $3
-             AND (expires_at IS NULL OR expires_at > NOW())",
+             AND revoked_at IS NULL
+             AND (expires_at IS NULL OR expires_at > NOW())
+             ORDER BY created_at DESC
+             LIMIT 1",
         )
         .bind(user_pubkey)
         .bind(redirect_origin)
@@ -472,27 +476,6 @@ impl OAuthAuthorizationRepository {
         .bind(redirect_origin)
         .bind(tenant_id)
         .fetch_all(&self.pool)
-        .await
-        .map_err(Into::into)
-    }
-
-    /// Find the most recent bunker pubkey for a user.
-    pub async fn find_latest_bunker_pubkey(
-        &self,
-        user_pubkey: &str,
-        tenant_id: i64,
-    ) -> Result<Option<String>, RepositoryError> {
-        sqlx::query_scalar(
-            "SELECT oa.bunker_public_key
-             FROM oauth_authorizations oa
-             JOIN users u ON oa.user_pubkey = u.pubkey
-             WHERE oa.user_pubkey = $1 AND u.tenant_id = $2
-             ORDER BY oa.created_at DESC
-             LIMIT 1",
-        )
-        .bind(user_pubkey)
-        .bind(tenant_id)
-        .fetch_optional(&self.pool)
         .await
         .map_err(Into::into)
     }

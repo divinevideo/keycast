@@ -470,27 +470,27 @@ paths:
     post:
       summary: Sign Nostr event (Fast HTTP signing)
       description: |
-        Sign a Nostr event via HTTP - **10-50x faster than NIP-46**.
+        Sign a Nostr event with the authenticated user's key, without a NIP-46 round trip.
+
+        ## Which authorization applies
+        - **OAuth access tokens** name the authorization they were issued for. That
+          authorization must belong to the token's user, be in this tenant, and be
+          neither revoked nor expired. Otherwise the request gets `403`.
+        - **Tokens that name no authorization** (login sessions) use the newest active
+          authorization for the token's origin. If there is none, the request gets `403`.
+
+        ## Policy
+        The event is checked against the policy of that authorization before signing.
+        An authorization without a policy may sign any event kind. An event the policy
+        does not allow gets `401`.
+
+        Accounts flagged as verified minors have restrictions on signing
+        direct-message kinds (4, 13, 14, 15 and 1059). A refused request gets `403`.
 
         ## Performance
-        - **Fast path** (~10ms): Uses cached authorization handlers in unified mode
-        - **Slow path** (~50-100ms): Decrypts key from database using KMS
-
-        ## ⚠️ Security Warning
-        **This endpoint currently has NO permission validation**. Any authenticated user can sign any event kind with any content. Permission checks are coming in a future release.
-
-        ## Supported Event Kinds
-        Currently accepts all Nostr event kinds (0-65535), including:
-        - `kind: 0` - User metadata
-        - `kind: 1` - Short text note
-        - `kind: 3` - Contact list
-        - `kind: 4` - Encrypted direct message
-        - `kind: 5` - Deletion
-        - `kind: 1984` - Reporting
-        - `kind: 9734-9735` - Zaps
-        - `kind: 10000+` - Replaceable events
-        - `kind: 20000+` - Ephemeral events
-        - `kind: 30000+` - Parameterized replaceable events
+        - **Cached signer** (~10ms): used when a signer for the token's authorization
+          is already loaded
+        - **Otherwise** (~50-100ms): decrypts the user's key from the database
       tags:
         - Signing
       security:
@@ -526,19 +526,29 @@ paths:
               schema:
                 $ref: '#/components/schemas/SignEventResponse'
         '401':
-          description: Unauthorized (invalid or missing JWT)
+          description: Missing or invalid token, or the authorization's policy does not allow this event
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: |
+            The token's authorization cannot be used (it belongs to another user or
+            tenant, or is revoked, expired, or unknown), there is no active
+            authorization for the token's origin, or the verified-minor direct-message
+            rules refuse the event
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '404':
-          description: User not found or key not available
+          description: No signing key stored for this user
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-        '500':
-          description: Signing failed (KMS error, invalid key, etc.)
+        '503':
+          description: Temporary failure loading or using the key, or `event` could not be parsed as an unsigned event
           content:
             application/json:
               schema:

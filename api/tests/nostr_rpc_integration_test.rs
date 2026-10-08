@@ -801,6 +801,7 @@ async fn test_sign_event_blocked_by_policy() {
         tenant_id,
         &pubkey,
         &redirect_origin,
+        None,
         &unsigned_kind4,
     )
     .await;
@@ -819,6 +820,7 @@ async fn test_sign_event_blocked_by_policy() {
         tenant_id,
         &pubkey,
         &redirect_origin,
+        None,
         &unsigned_kind1,
     )
     .await;

@@ -3830,8 +3830,10 @@ pub struct SignEventResponse {
     pub signed_event: serde_json::Value,
 }
 
-/// Look up authorization by (user_pubkey, redirect_origin, tenant_id)
-/// Returns the OAuth authorization if found, None otherwise
+/// Find the policy of the newest active authorization for (user_pubkey,
+/// redirect_origin, tenant_id). Signing uses it for tokens that name no
+/// authorization.
+/// Returns the policy_id (None means full access), or an error if there is none.
 pub async fn get_authorization_for_origin(
     pool: &PgPool,
     user_pubkey: &str,
@@ -3853,6 +3855,35 @@ pub async fn get_authorization_for_origin(
     }
 }
 
+/// Find the policy of the authorization a token was issued for. It must belong
+/// to this user and still be active. The token's origin is not consulted; the
+/// authorization's own policy applies.
+pub async fn get_authorization_for_token(
+    pool: &PgPool,
+    user_pubkey: &str,
+    bunker_pubkey: &str,
+    tenant_id: i64,
+) -> Result<Option<i32>, AuthError> {
+    // Returns policy_id (or None if full access)
+    let oauth_auth_repo = OAuthAuthorizationRepository::new(pool.clone());
+    let authorization = oauth_auth_repo
+        .find_by_bunker_pubkey_for_tenant(bunker_pubkey, tenant_id)
+        .await?;
+
+    match authorization {
+        Some((_, owner, _, expires_at, revoked_at, policy_id))
+            if owner == user_pubkey
+                && revoked_at.is_none()
+                && expires_at.is_none_or(|at| at > Utc::now()) =>
+        {
+            Ok(policy_id)
+        }
+        _ => Err(AuthError::Forbidden(
+            "This app's authorization is no longer active. Sign in to the app again.".to_string(),
+        )),
+    }
+}
+
 /// Validate that the user has permission to sign this event
 /// Returns () if successful, or an error if unauthorized
 pub async fn validate_signing_permissions(
@@ -3860,12 +3891,19 @@ pub async fn validate_signing_permissions(
     tenant_id: i64,
     user_pubkey: &str,
     redirect_origin: &str,
+    bunker_pubkey: Option<&str>,
     event: &UnsignedEvent,
 ) -> Result<(), AuthError> {
-    // Get the policy_id from the user's OAuth authorization for this origin
+    // An OAuth token names the authorization it was issued for, so it signs
+    // under that authorization's policy. A token without one (a login session)
+    // uses the newest active authorization for its origin.
     // NULL policy_id means "full power" - no restrictions
-    let policy_id =
-        get_authorization_for_origin(pool, user_pubkey, redirect_origin, tenant_id).await?;
+    let policy_id = match bunker_pubkey {
+        Some(bunker_pubkey) => {
+            get_authorization_for_token(pool, user_pubkey, bunker_pubkey, tenant_id).await?
+        }
+        None => get_authorization_for_origin(pool, user_pubkey, redirect_origin, tenant_id).await?,
+    };
 
     // NULL policy_id means full power - allow everything
     let policy_id = match policy_id {
@@ -4130,7 +4168,7 @@ pub async fn sign_event(
     Json(req): Json<SignEventRequest>,
 ) -> Result<Json<SignEventResponse>, AuthError> {
     let tenant_id = tenant.0.id;
-    let (user_pubkey, redirect_origin, _bunker_pubkey) =
+    let (user_pubkey, redirect_origin, bunker_pubkey) =
         extract_user_and_origin_from_token(&headers, tenant_id).await?;
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
@@ -4154,6 +4192,7 @@ pub async fn sign_event(
         tenant_id,
         &user_pubkey,
         &redirect_origin,
+        bunker_pubkey.as_deref(),
         &unsigned_event,
     )
     .await?;
@@ -4173,50 +4212,44 @@ pub async fn sign_event(
             false
         };
 
-    // FAST PATH: Try to use cached signer handler if in unified mode
-    if let Some(ref handlers) = auth_state.state.signer_handlers {
+    // FAST PATH: sign through the cached handler for the token's own
+    // authorization (checked above). Tokens without one take the slow path.
+    if let (Some(handlers), Some(bunker_key)) =
+        (&auth_state.state.signer_handlers, bunker_pubkey.as_deref())
+    {
         tracing::info!(
             "Attempting fast path signing for user: {} in tenant: {}",
             user_pubkey,
             tenant_id
         );
 
-        // Query for user's bunker public key from any OAuth authorization
-        let oauth_auth_repo = OAuthAuthorizationRepository::new(pool.clone());
-        let bunker_pubkey = oauth_auth_repo
-            .find_latest_bunker_pubkey(&user_pubkey, tenant_id)
-            .await?;
+        if let Some(handler) = handlers.get(bunker_key).await {
+            tracing::info!("✅ Using cached handler for user {}", user_pubkey);
 
-        if let Some(bunker_key) = bunker_pubkey {
-            if let Some(handler) = handlers.get(&bunker_key).await {
-                tracing::info!("✅ Using cached handler for user {}", user_pubkey);
-
-                // DM containment on the fast path returns a clean 403 here; the
-                // signer handler also gates as a backstop, but its error would
-                // map to a 503 through the Internal wrapper below.
-                if verified_minor {
-                    enforce_minor_dm_sign(&handler.get_keys(), &unsigned_event, &user_pubkey)?;
-                }
-
-                let signed_event = handler
-                    .sign_event_direct(unsigned_event)
-                    .await
-                    .map_err(|e| AuthError::Internal(format!("Signing failed: {}", e)))?;
-
-                let signed_json = serde_json::to_value(&signed_event).map_err(|e| {
-                    AuthError::Internal(format!("JSON serialization failed: {}", e))
-                })?;
-
-                tracing::info!(
-                    "Fast path: Successfully signed event {} for user: {}",
-                    signed_event.id,
-                    user_pubkey
-                );
-
-                return Ok(Json(SignEventResponse {
-                    signed_event: signed_json,
-                }));
+            // DM containment on the fast path returns a clean 403 here; the
+            // signer handler also gates as a backstop, but its error would
+            // map to a 503 through the Internal wrapper below.
+            if verified_minor {
+                enforce_minor_dm_sign(&handler.get_keys(), &unsigned_event, &user_pubkey)?;
             }
+
+            let signed_event = handler
+                .sign_event_direct(unsigned_event)
+                .await
+                .map_err(|e| AuthError::Internal(format!("Signing failed: {}", e)))?;
+
+            let signed_json = serde_json::to_value(&signed_event)
+                .map_err(|e| AuthError::Internal(format!("JSON serialization failed: {}", e)))?;
+
+            tracing::info!(
+                "Fast path: Successfully signed event {} for user: {}",
+                signed_event.id,
+                user_pubkey
+            );
+
+            return Ok(Json(SignEventResponse {
+                signed_event: signed_json,
+            }));
         }
     }
 
@@ -6200,8 +6233,9 @@ mod tests {
 
     #[cfg(feature = "integration-tests")]
     use super::{
-        delete_account, generate_ucan_token, login, update_profile, verify_email, verify_email_get,
-        ProfileData, VerifyEmailQuery, VerifyEmailRequest,
+        delete_account, generate_ucan_token, get_authorization_for_token, login, update_profile,
+        verify_email, verify_email_get, AuthError, ProfileData, VerifyEmailQuery,
+        VerifyEmailRequest,
     };
     #[cfg(feature = "integration-tests")]
     use crate::api::http::routes::{public_verify_email_route, AuthState};
@@ -8439,24 +8473,14 @@ mod tests {
         .await
         .unwrap();
 
-        // Verify we can query bunker_public_key (fast path lookup - finds any valid authorization)
-        let result: Option<String> = sqlx::query_scalar(
-            "SELECT oa.bunker_public_key
-             FROM oauth_authorizations oa
-             JOIN users u ON oa.user_pubkey = u.pubkey
-             WHERE oa.user_pubkey = $1 AND u.tenant_id = 1
-             ORDER BY oa.created_at DESC
-             LIMIT 1",
-        )
-        .bind(&user_pubkey)
-        .fetch_optional(&pool)
-        .await
-        .unwrap();
-
+        // The fast path signs through the handler for the token's own
+        // authorization, which is active and has no policy (full access)
+        let policy_id = get_authorization_for_token(&pool, &user_pubkey, &bunker_pubkey, 1)
+            .await
+            .expect("the token's authorization is active");
         assert_eq!(
-            result,
-            Some(bunker_pubkey),
-            "Should find bunker pubkey for fast path"
+            policy_id, None,
+            "an authorization without a policy has full access"
         );
 
         // Verify handler can sign
@@ -8546,8 +8570,7 @@ mod tests {
 
     #[cfg(feature = "integration-tests")]
     #[tokio::test]
-    async fn test_fallback_when_handler_not_cached() {
-        // Test that system falls back to slow path when handler not in cache
+    async fn token_naming_an_unknown_authorization_is_refused() {
         let pool = create_test_db().await;
         let user_keys = Keys::generate();
         let user_pubkey = user_keys.public_key().to_hex();
@@ -8559,24 +8582,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Query for bunker_pubkey should return None
-        let bunker_pubkey: Option<String> = sqlx::query_scalar(
-            "SELECT oa.bunker_public_key
-             FROM oauth_authorizations oa
-             JOIN users u ON oa.user_pubkey = u.pubkey
-             WHERE oa.user_pubkey = $1 AND u.tenant_id = 1",
-        )
-        .bind(&user_pubkey)
-        .fetch_optional(&pool)
-        .await
-        .unwrap();
-
+        // A token naming an authorization that doesn't exist can't sign
+        let unknown_bunker = Keys::generate().public_key().to_hex();
+        let result = get_authorization_for_token(&pool, &user_pubkey, &unknown_bunker, 1).await;
         assert!(
-            bunker_pubkey.is_none(),
-            "Should not find OAuth authorization for fallback"
+            matches!(result, Err(AuthError::Forbidden(_))),
+            "a token without an authorization is refused"
         );
-
-        println!("✅ Fallback detection test passed");
     }
 
     #[tokio::test]

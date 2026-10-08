@@ -325,6 +325,7 @@ async fn test_null_policy_grants_full_access() {
         tenant_id,
         &pubkey,
         &redirect_origin,
+        None,
         &unsigned_event,
     )
     .await;
@@ -381,6 +382,7 @@ async fn test_policy_enforces_kind_restrictions() {
         tenant_id,
         &pubkey,
         &redirect_origin,
+        None,
         &kind1_event,
     )
     .await;
@@ -395,6 +397,7 @@ async fn test_policy_enforces_kind_restrictions() {
         tenant_id,
         &pubkey,
         &redirect_origin,
+        None,
         &kind4_event,
     )
     .await;
@@ -607,4 +610,259 @@ async fn test_ucan_with_bunker_pubkey_returns_some() {
         bunker_pubkey_hex,
         "bunker_pubkey should match"
     );
+}
+
+// ============================================================================
+// The policy that applies is the one the person approved for this token
+// ============================================================================
+
+/// Insert an authorization for `origin` created `age_minutes` ago, optionally
+/// revoked, and return its bunker public key (the key OAuth tokens carry).
+async fn authorization_aged(
+    pool: &PgPool,
+    tenant_id: i64,
+    user_pubkey: &str,
+    origin: &str,
+    policy_id: Option<i32>,
+    age_minutes: i64,
+    revoked: bool,
+) -> String {
+    let bunker = Keys::generate().public_key().to_hex();
+    let created_at = Utc::now() - Duration::minutes(age_minutes);
+    sqlx::query(
+        "INSERT INTO oauth_authorizations
+         (user_pubkey, redirect_origin, bunker_public_key, secret_hash, relays, policy_id,
+          tenant_id, revoked_at, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, $3, 'test_hash', '[]', $4, $5, $6, NOW() + INTERVAL '30 days', $7, $7)",
+    )
+    .bind(user_pubkey)
+    .bind(origin)
+    .bind(&bunker)
+    .bind(policy_id)
+    .bind(tenant_id)
+    .bind(revoked.then(Utc::now))
+    .bind(created_at)
+    .execute(pool)
+    .await
+    .expect("authorization inserted");
+    bunker
+}
+
+async fn signing_setup() -> (PgPool, i64, Keys, String, String, i32) {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (keys, pubkey) = create_test_user();
+    insert_user(&pool, tenant_id, &pubkey).await;
+    let origin = format!("https://app-{}.example.com", Uuid::new_v4());
+    let notes_only = create_test_policy(
+        &pool,
+        tenant_id,
+        vec![("allowed_kinds", json!({"allowed_kinds": [1]}))],
+    )
+    .await;
+    (pool, tenant_id, keys, pubkey, origin, notes_only)
+}
+
+fn direct_message(keys: &Keys) -> UnsignedEvent {
+    EventBuilder::new(Kind::EncryptedDirectMessage, "Secret").build(keys.public_key())
+}
+
+#[tokio::test]
+async fn a_token_signs_under_its_own_authorizations_policy() {
+    let (pool, tenant_id, keys, pubkey, origin, notes_only) = signing_setup().await;
+    // A broader approval for the same app exists and is newer.
+    authorization_aged(&pool, tenant_id, &pubkey, &origin, None, 1, false).await;
+    let token_bunker = authorization_aged(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &origin,
+        Some(notes_only),
+        60,
+        false,
+    )
+    .await;
+
+    let result = keycast_api::api::http::auth::validate_signing_permissions(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &origin,
+        Some(&token_bunker),
+        &direct_message(&keys),
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(keycast_api::api::http::auth::AuthError::InvalidCredentials)
+        ),
+        "the token's own policy allows only notes, got {result:?}"
+    );
+    let note = keycast_api::api::http::auth::validate_signing_permissions(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &origin,
+        Some(&token_bunker),
+        &EventBuilder::text_note("hello").build(keys.public_key()),
+    )
+    .await;
+    assert!(note.is_ok(), "a note is allowed, got {note:?}");
+}
+
+#[tokio::test]
+async fn a_token_whose_authorization_was_revoked_cannot_sign() {
+    let (pool, tenant_id, keys, pubkey, origin, _) = signing_setup().await;
+    let token_bunker = authorization_aged(&pool, tenant_id, &pubkey, &origin, None, 60, true).await;
+    authorization_aged(&pool, tenant_id, &pubkey, &origin, None, 1, false).await;
+
+    let result = keycast_api::api::http::auth::validate_signing_permissions(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &origin,
+        Some(&token_bunker),
+        &EventBuilder::text_note("hello").build(keys.public_key()),
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(keycast_api::api::http::auth::AuthError::Forbidden(_))
+        ),
+        "got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_token_whose_authorization_expired_cannot_sign() {
+    let (pool, tenant_id, keys, pubkey, origin, _) = signing_setup().await;
+    let token_bunker =
+        authorization_aged(&pool, tenant_id, &pubkey, &origin, None, 60, false).await;
+    sqlx::query(
+        "UPDATE oauth_authorizations SET expires_at = NOW() - INTERVAL '1 minute'
+         WHERE bunker_public_key = $1",
+    )
+    .bind(&token_bunker)
+    .execute(&pool)
+    .await
+    .expect("authorization expired");
+    authorization_aged(&pool, tenant_id, &pubkey, &origin, None, 1, false).await;
+
+    let result = keycast_api::api::http::auth::validate_signing_permissions(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &origin,
+        Some(&token_bunker),
+        &EventBuilder::text_note("hello").build(keys.public_key()),
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(keycast_api::api::http::auth::AuthError::Forbidden(_))
+        ),
+        "got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_token_naming_someone_elses_authorization_cannot_sign() {
+    let (pool, tenant_id, keys, pubkey, origin, _) = signing_setup().await;
+    authorization_aged(&pool, tenant_id, &pubkey, &origin, None, 60, false).await;
+    let (_, other) = create_test_user();
+    insert_user(&pool, tenant_id, &other).await;
+    let others_bunker =
+        authorization_aged(&pool, tenant_id, &other, &origin, None, 60, false).await;
+
+    let result = keycast_api::api::http::auth::validate_signing_permissions(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &origin,
+        Some(&others_bunker),
+        &EventBuilder::text_note("hello").build(keys.public_key()),
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(keycast_api::api::http::auth::AuthError::Forbidden(_))
+        ),
+        "got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_token_naming_an_authorization_in_another_tenant_cannot_sign() {
+    let (pool, tenant_id, keys, pubkey, origin, _) = signing_setup().await;
+    let other_tenant = create_test_tenant(&pool).await;
+    let other_tenants_bunker =
+        authorization_aged(&pool, other_tenant, &pubkey, &origin, None, 60, false).await;
+
+    let result = keycast_api::api::http::auth::validate_signing_permissions(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &origin,
+        Some(&other_tenants_bunker),
+        &EventBuilder::text_note("hello").build(keys.public_key()),
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(keycast_api::api::http::auth::AuthError::Forbidden(_))
+        ),
+        "got {result:?}"
+    );
+}
+
+// Without a bunker key (a login session), revoked approvals never apply and the
+// newest active approval for the app does.
+#[tokio::test]
+async fn without_a_token_authorization_the_newest_active_one_applies() {
+    let (pool, tenant_id, keys, pubkey, origin, notes_only) = signing_setup().await;
+    // Inserted oldest first, so only an explicit "newest first" finds the right one.
+    authorization_aged(&pool, tenant_id, &pubkey, &origin, None, 60, false).await;
+    authorization_aged(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &origin,
+        Some(notes_only),
+        30,
+        false,
+    )
+    .await;
+    authorization_aged(&pool, tenant_id, &pubkey, &origin, None, 1, true).await;
+
+    let result = keycast_api::api::http::auth::validate_signing_permissions(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &origin,
+        None,
+        &direct_message(&keys),
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(keycast_api::api::http::auth::AuthError::InvalidCredentials)
+        ),
+        "the newest active approval allows only notes, got {result:?}"
+    );
+    let note = keycast_api::api::http::auth::validate_signing_permissions(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &origin,
+        None,
+        &EventBuilder::text_note("hello").build(keys.public_key()),
+    )
+    .await;
+    assert!(note.is_ok(), "a note is allowed, got {note:?}");
 }

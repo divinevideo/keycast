@@ -1092,3 +1092,138 @@ async fn minor_user_sign_fast_path_denial_is_forbidden_not_503() {
         "fast-path gate must refuse BEFORE the handler signs"
     );
 }
+
+// Auth state whose /user/sign fast path uses these cached signers.
+fn auth_state_with_signers(
+    pool: &PgPool,
+    key_manager: FileKeyManager,
+    handlers: SignerHandlersCache,
+) -> AuthState {
+    let mut auth_state = create_test_auth_state(
+        pool.clone(),
+        Arc::new(Box::new(key_manager) as Box<dyn KeyManager>),
+    );
+    auth_state.state = Arc::new(KeycastState {
+        db: pool.clone(),
+        key_manager: auth_state.state.key_manager.clone(),
+        signer_handlers: Some(handlers),
+        http_handler_cache: new_http_handler_cache(),
+        account_status_cache: keycast_api::state::new_account_status_cache(),
+        server_keys: Keys::generate(),
+        tenant_cache: Cache::builder().max_capacity(10).build(),
+        bcrypt: BcryptAdmission::new(1, std::time::Duration::from_secs(1)),
+        redis: None,
+        secret_pool: SecretPool::new(1).receiver(),
+        activity_logger: keycast_api::activity_log::ActivityLogger::disabled(),
+    });
+    auth_state
+}
+
+// /user/sign's fast path signs through the token's own authorization, not the
+// person's newest authorization for some other app.
+#[tokio::test]
+#[serial]
+async fn user_sign_fast_path_uses_the_tokens_own_authorization() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let key_manager = FileKeyManager::new().expect("key manager");
+    let account = setup_account(&pool, tenant_id, &key_manager, false).await;
+    let other_app = format!("https://other-app-{}.example.com", Uuid::new_v4());
+    let newer_bunker =
+        create_oauth_authorization(&pool, tenant_id, &account.pubkey, &other_app).await;
+
+    let own_used = Arc::new(AtomicBool::new(false));
+    let other_used = Arc::new(AtomicBool::new(false));
+    let handlers: SignerHandlersCache = Cache::builder().max_capacity(10).build();
+    handlers
+        .insert(
+            account.bunker_pubkey.clone(),
+            Arc::new(RecordingSignerHandler {
+                keys: account.keys.clone(),
+                signed: own_used.clone(),
+            }),
+        )
+        .await;
+    handlers
+        .insert(
+            newer_bunker,
+            Arc::new(RecordingSignerHandler {
+                keys: account.keys.clone(),
+                signed: other_used.clone(),
+            }),
+        )
+        .await;
+
+    let auth_state = auth_state_with_signers(&pool, key_manager, handlers);
+
+    invoke_user_sign(
+        tenant_id,
+        auth_state,
+        &account.token,
+        unsigned_dm_json(1, &account.keys, &[]),
+    )
+    .await
+    .expect("a note signs");
+    assert!(
+        own_used.load(Ordering::SeqCst),
+        "the token's own signer signs"
+    );
+    assert!(
+        !other_used.load(Ordering::SeqCst),
+        "another app's signer is not used"
+    );
+}
+
+// A token naming another person's authorization can't sign through that
+// person's cached signer, even when the token's own app has full access.
+#[tokio::test]
+#[serial]
+async fn user_sign_refuses_a_token_naming_another_persons_authorization() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let key_manager = FileKeyManager::new().expect("key manager");
+    let caller = setup_account(&pool, tenant_id, &key_manager, false).await;
+    let other = setup_account(&pool, tenant_id, &key_manager, false).await;
+
+    // The caller's own app has an active, full-access authorization, so the
+    // request is refused only because the token names someone else's.
+    let callers_app = format!("https://callers-app-{}.example.com", Uuid::new_v4());
+    create_oauth_authorization(&pool, tenant_id, &caller.pubkey, &callers_app).await;
+    let token = build_self_signed_ucan(
+        &caller.keys,
+        tenant_id,
+        &callers_app,
+        Some(&other.bunker_pubkey),
+    )
+    .await;
+
+    let other_used = Arc::new(AtomicBool::new(false));
+    let handlers: SignerHandlersCache = Cache::builder().max_capacity(10).build();
+    handlers
+        .insert(
+            other.bunker_pubkey.clone(),
+            Arc::new(RecordingSignerHandler {
+                keys: other.keys.clone(),
+                signed: other_used.clone(),
+            }),
+        )
+        .await;
+    let auth_state = auth_state_with_signers(&pool, key_manager, handlers);
+
+    let result = invoke_user_sign(
+        tenant_id,
+        auth_state,
+        &token,
+        unsigned_dm_json(1, &caller.keys, &[]),
+    )
+    .await;
+    assert!(
+        matches!(&result, Err(AuthError::Forbidden(message))
+            if message == "This app's authorization is no longer active. Sign in to the app again."),
+        "refused as not the caller's authorization, got {result:?}"
+    );
+    assert!(
+        !other_used.load(Ordering::SeqCst),
+        "the other person's signer is never used"
+    );
+}
