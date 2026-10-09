@@ -14,7 +14,9 @@ use base64::prelude::*;
 use chrono::{DateTime, Utc};
 use keycast_core::creator_binding::MAX_CREATOR_BINDING_PAYLOAD_BYTES;
 use keycast_core::metrics::METRICS;
-use keycast_core::repositories::{PersonalKeysRepository, PolicyRepository, UserRepository};
+use keycast_core::repositories::{
+    OAuthAuthorizationRepository, PersonalKeysRepository, PolicyRepository, UserRepository,
+};
 use keycast_core::signing_session::{parse_cache_key, CacheKey, SigningSession};
 use keycast_core::traits::CustomPermission;
 use nostr_sdk::{Event, JsonUtil, Keys, PublicKey, UnsignedEvent};
@@ -797,7 +799,7 @@ mod bunker_authorization {
     //! [`BunkerAuthorization::authorize_subject`] is the only way to get one, and
     //! `build_handler_for_owned_authorization` requires one.
 
-    use super::{map_repo_error, AuthError, RpcError};
+    use super::{authorization_is_active, map_repo_error, AuthError, RpcError};
     use chrono::{DateTime, Utc};
     use keycast_core::repositories::OAuthAuthorizationRepository;
 
@@ -890,6 +892,11 @@ mod bunker_authorization {
             self.0.policy_id
         }
 
+        /// False once the authorization is revoked or past its expiry.
+        pub(super) fn is_active(&self) -> bool {
+            authorization_is_active(self.0.revoked_at, self.0.expires_at)
+        }
+
         pub(super) fn bunker_pubkey_hex(&self) -> &str {
             &self.0.bunker_pubkey_hex
         }
@@ -921,6 +928,29 @@ mod bunker_authorization {
         }
 
         #[test]
+        fn owned_authorization_is_inactive_once_revoked_or_expired() {
+            let owner = "a".repeat(64);
+            let active = authorization_owned_by(&owner)
+                .authorize_subject(&owner)
+                .expect("owner");
+            assert!(active.is_active());
+
+            let mut revoked = authorization_owned_by(&owner);
+            revoked.revoked_at = Some(Utc::now());
+            assert!(!revoked
+                .authorize_subject(&owner)
+                .expect("owner")
+                .is_active());
+
+            let mut expired = authorization_owned_by(&owner);
+            expired.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+            assert!(!expired
+                .authorize_subject(&owner)
+                .expect("owner")
+                .is_active());
+        }
+
+        #[test]
         fn authorize_subject_rejects_a_non_owner() {
             let owner = "a".repeat(64);
             let other = "b".repeat(64);
@@ -935,17 +965,75 @@ mod bunker_authorization {
 
 use bunker_authorization::OwnedAuthorization;
 
+/// Whether an authorization with this revocation and expiry may still be used.
+fn authorization_is_active(
+    revoked_at: Option<DateTime<Utc>>,
+    expires_at: Option<DateTime<Utc>>,
+) -> bool {
+    revoked_at.is_none() && expires_at.is_none_or(|expires| expires >= Utc::now())
+}
+
+/// How long a cached OAuth handler uses its loaded revocation and expiry before
+/// [`cached_authorization_still_active`] reads them again. This bounds how long a
+/// revocation made on another instance takes to apply here.
+const AUTHORIZATION_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Recheck a cached OAuth handler's authorization against the database, at most
+/// once per [`AUTHORIZATION_RECHECK_INTERVAL`] per handler.
+///
+/// Returns false when the authorization is revoked, expired, or no longer exists
+/// in this tenant. Other handlers have no authorization row and always pass.
+async fn cached_authorization_still_active(
+    handler: &HttpRpcHandler,
+    pool: &sqlx::PgPool,
+    tenant_id: i64,
+) -> Result<bool, RpcError> {
+    if !handler.is_oauth() || !handler.claim_authorization_recheck(AUTHORIZATION_RECHECK_INTERVAL) {
+        return Ok(true);
+    }
+    let Ok(authorization_id) = i32::try_from(handler.authorization_id()) else {
+        return Ok(false);
+    };
+    let validity = OAuthAuthorizationRepository::new(pool.clone())
+        .find_validity_for_tenant(authorization_id, tenant_id)
+        .await
+        .map_err(|e| {
+            handler.mark_authorization_recheck_due();
+            map_repo_error("rechecking authorization", e)
+        })?;
+    Ok(validity
+        .is_some_and(|(revoked_at, expires_at)| authorization_is_active(revoked_at, expires_at)))
+}
+
+/// The earlier of two optional expiries; `None` means no expiry.
+fn earliest_expiry(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 /// Build the HttpRpcHandler for an authorization that belongs to the token subject.
 ///
 /// Requiring an [`OwnedAuthorization`] means this loads key material only after
 /// `authorize_subject` has passed.
+///
+/// `ucan_expires_at` is the token's `exp`. Cache hits skip UCAN validation, so the
+/// handler expires at the earlier of the authorization expiry and the token expiry.
 async fn build_handler_for_owned_authorization(
     auth_state: &AuthState,
     pool: &sqlx::PgPool,
     owned: OwnedAuthorization,
     tenant_id: i64,
+    ucan_expires_at: Option<DateTime<Utc>>,
     dpop_cnf_jkt: Option<String>,
 ) -> Result<Arc<HttpRpcHandler>, RpcError> {
+    // A revoked or expired authorization cannot sign, so reject it before the
+    // policy and key queries and the key decrypt.
+    if !owned.is_active() {
+        return Err(RpcError::Auth(AuthError::InvalidToken));
+    }
+
     let key_manager = auth_state.state.key_manager.as_ref();
 
     // Load permissions for this authorization's policy (if any)
@@ -1004,7 +1092,7 @@ async fn build_handler_for_owned_authorization(
     let handler = Arc::new(HttpRpcHandler::new(
         session,
         owned.auth_id() as i64,
-        owned.expires_at(),
+        earliest_expiry(owned.expires_at(), ucan_expires_at),
         owned.revoked_at(),
         permissions,
         true, // OAuth authorization
@@ -1030,12 +1118,21 @@ async fn load_handler_on_demand(
     bunker_pubkey_hex: &str,
     token_subject_hex: &str,
     tenant_id: i64,
+    ucan_expires_at: Option<DateTime<Utc>>,
     dpop_cnf_jkt: Option<String>,
 ) -> Result<Arc<HttpRpcHandler>, RpcError> {
     let owned = bunker_authorization::load(pool, bunker_pubkey_hex, tenant_id)
         .await?
         .authorize_subject(token_subject_hex)?;
-    build_handler_for_owned_authorization(auth_state, pool, owned, tenant_id, dpop_cnf_jkt).await
+    build_handler_for_owned_authorization(
+        auth_state,
+        pool,
+        owned,
+        tenant_id,
+        ucan_expires_at,
+        dpop_cnf_jkt,
+    )
+    .await
 }
 
 /// Construct the absolute htu (HTTP Target URI) from request headers per RFC 9449.
@@ -1238,6 +1335,16 @@ async fn get_handler(
         let htu = construct_htu(headers);
         enforce_cached_dpop_binding(&handler, headers, &htu).await?;
 
+        // The cached revocation state is from load time; reread it periodically.
+        if !cached_authorization_still_active(&handler, pool, tenant_id).await? {
+            auth_state
+                .state
+                .http_handler_cache
+                .invalidate(&blake3_key)
+                .await;
+            return Err(RpcError::Auth(AuthError::InvalidToken));
+        }
+
         // Cache hit! Skip full UCAN verification
         METRICS.inc_http_rpc_cache_hit();
         tracing::trace!("RPC: Cache hit (BLAKE3)");
@@ -1253,8 +1360,8 @@ async fn get_handler(
             .await
             .map_err(|_| RpcError::Auth(AuthError::InvalidToken))?;
 
-    // Extract UCAN expiry (unix seconds → DateTime<Utc>) so cached preload
-    // handlers can be invalidated once the UCAN lifetime ends.
+    // Extract UCAN expiry (unix seconds → DateTime<Utc>) so cached handlers
+    // can be invalidated once the UCAN lifetime ends.
     let ucan_expires_at: Option<DateTime<Utc>> =
         DateTime::<Utc>::from_timestamp(*ucan.expires_at() as i64, 0);
 
@@ -1292,6 +1399,7 @@ async fn get_handler(
             &bunker_key_hex,
             &user_pubkey,
             tenant_id,
+            ucan_expires_at,
             dpop_cnf_jkt.clone(),
         )
         .await?;
@@ -2141,5 +2249,21 @@ mod tests {
             results[0]["gift_wrap"]["id"], results[3]["gift_wrap"]["id"],
             "duplicate recipients get distinct ephemeral outer wraps"
         );
+    }
+
+    #[test]
+    fn earliest_expiry_picks_the_earlier_of_two() {
+        let sooner = Utc::now();
+        let later = sooner + chrono::Duration::hours(1);
+        assert_eq!(earliest_expiry(Some(sooner), Some(later)), Some(sooner));
+        assert_eq!(earliest_expiry(Some(later), Some(sooner)), Some(sooner));
+    }
+
+    #[test]
+    fn earliest_expiry_ignores_a_missing_expiry() {
+        let at = Utc::now();
+        assert_eq!(earliest_expiry(None, Some(at)), Some(at));
+        assert_eq!(earliest_expiry(Some(at), None), Some(at));
+        assert_eq!(earliest_expiry(None, None), None);
     }
 }

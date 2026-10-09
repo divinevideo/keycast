@@ -33,6 +33,7 @@ use keycast_api::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
 use keycast_api::BcryptAdmission;
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::KeyManager;
+use keycast_core::repositories::OAuthAuthorizationRepository;
 use keycast_core::request_bounds::{HTTP_RPC_HANDLER_TIMEOUT, SQLX_ACQUIRE_TIMEOUT};
 use keycast_core::secret_pool::SecretPool;
 use keycast_core::signing_session::{parse_cache_key, SigningSession};
@@ -1496,6 +1497,242 @@ async fn test_warm_cache_preload_handler_rejected_after_ucan_expiry() {
     );
 }
 
+/// A cached OAuth handler stops at the UCAN's exp, not only at the
+/// authorization's expiry. OAuth authorizations are created without an
+/// expires_at, so the token exp is the only lifetime a cache hit can check.
+#[tokio::test]
+#[serial]
+async fn test_warm_cache_oauth_handler_rejected_after_ucan_expiry() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (user_keys, pubkey_hex) = create_test_user();
+    let key_manager: Arc<Box<dyn KeyManager>> =
+        Arc::new(Box::new(FileKeyManager::new().expect("key manager")));
+
+    insert_user(&pool, tenant_id, &pubkey_hex).await;
+    create_personal_key(&pool, tenant_id, &pubkey_hex, &user_keys, &**key_manager).await;
+
+    let redirect_origin = format!("https://ucan-exp-{}.example.com", Uuid::new_v4());
+    let (_auth_id, bunker_pubkey) = create_test_oauth_authorization(
+        &pool,
+        tenant_id,
+        &pubkey_hex,
+        &redirect_origin,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    // 2s lifetime: valid for the first request, short enough to wait out.
+    let token = build_self_signed_ucan_with_lifetime(
+        &user_keys,
+        tenant_id,
+        &redirect_origin,
+        Some(&bunker_pubkey),
+        2,
+    )
+    .await;
+    let auth_header = format!("Bearer {}", token);
+    let cache_key = *blake3::hash(token.as_bytes()).as_bytes();
+    let auth_state = create_test_auth_state(pool.clone(), key_manager);
+
+    // First call: cache miss -> UCAN validates -> handler cached.
+    let response = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state.clone(),
+        &auth_header,
+        None,
+        get_public_key_request(),
+    )
+    .await
+    .expect("First OAuth request should succeed");
+    assert_eq!(response.result, Some(Value::String(pubkey_hex.clone())));
+
+    let cached = auth_state
+        .state
+        .http_handler_cache
+        .get(&cache_key)
+        .await
+        .expect("Handler should be in cache after first request");
+    assert!(
+        cached.is_valid(),
+        "Cached handler should still be valid before UCAN expiry"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    assert!(
+        !cached.is_valid(),
+        "Cached handler should be invalid once UCAN exp has passed"
+    );
+
+    // Second call: cache hit -> handler.is_valid() is false -> InvalidToken.
+    let err = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state.clone(),
+        &auth_header,
+        None,
+        get_public_key_request(),
+    )
+    .await
+    .expect_err("Cached request after UCAN expiry must be rejected");
+    match err {
+        RpcError::Auth(AuthError::InvalidToken) => {}
+        other => panic!("expected InvalidToken, got: {:?}", other),
+    }
+
+    assert!(
+        auth_state
+            .state
+            .http_handler_cache
+            .get(&cache_key)
+            .await
+            .is_none(),
+        "Invalid cached handler must be evicted"
+    );
+}
+
+/// A revoked or expired authorization is rejected before its key is loaded.
+/// The user has no personal key row, so reaching the key lookup would fail
+/// with an internal error rather than InvalidToken.
+#[tokio::test]
+#[serial]
+async fn test_inactive_authorization_rejected_before_key_load() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (user_keys, pubkey_hex) = create_test_user();
+    let key_manager: Arc<Box<dyn KeyManager>> =
+        Arc::new(Box::new(FileKeyManager::new().expect("key manager")));
+    insert_user(&pool, tenant_id, &pubkey_hex).await;
+    let auth_state = create_test_auth_state(pool.clone(), key_manager);
+
+    let cases = [
+        ("revoked", None, Some(Utc::now() - Duration::minutes(1))),
+        ("expired", Some(Utc::now() - Duration::minutes(1)), None),
+    ];
+    for (label, expires_at, revoked_at) in cases {
+        let redirect_origin = format!("https://{}-{}.example.com", label, Uuid::new_v4());
+        let (_auth_id, bunker_pubkey) = create_test_oauth_authorization(
+            &pool,
+            tenant_id,
+            &pubkey_hex,
+            &redirect_origin,
+            None,
+            expires_at,
+            revoked_at,
+        )
+        .await;
+        let token = build_self_signed_ucan(
+            &user_keys,
+            tenant_id,
+            &redirect_origin,
+            Some(&bunker_pubkey),
+        )
+        .await;
+
+        let err = invoke_nostr_rpc(
+            create_test_tenant_extractor(tenant_id),
+            auth_state.clone(),
+            &format!("Bearer {}", token),
+            None,
+            get_public_key_request(),
+        )
+        .await
+        .expect_err("an inactive authorization must be rejected");
+        match err {
+            RpcError::Auth(AuthError::InvalidToken) => {}
+            other => panic!("{label}: expected InvalidToken, got: {:?}", other),
+        }
+    }
+}
+
+/// A cached OAuth handler stops working once its authorization is revoked,
+/// without waiting for the cache entry to go idle.
+#[tokio::test]
+#[serial]
+async fn test_warm_cache_oauth_handler_rejected_after_revocation() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (user_keys, pubkey_hex) = create_test_user();
+    let key_manager: Arc<Box<dyn KeyManager>> =
+        Arc::new(Box::new(FileKeyManager::new().expect("key manager")));
+
+    insert_user(&pool, tenant_id, &pubkey_hex).await;
+    create_personal_key(&pool, tenant_id, &pubkey_hex, &user_keys, &**key_manager).await;
+
+    let redirect_origin = format!("https://revoke-{}.example.com", Uuid::new_v4());
+    let (auth_id, bunker_pubkey) = create_test_oauth_authorization(
+        &pool,
+        tenant_id,
+        &pubkey_hex,
+        &redirect_origin,
+        None,
+        None,
+        None,
+    )
+    .await;
+    let token = build_self_signed_ucan(
+        &user_keys,
+        tenant_id,
+        &redirect_origin,
+        Some(&bunker_pubkey),
+    )
+    .await;
+    let auth_header = format!("Bearer {}", token);
+    let cache_key = *blake3::hash(token.as_bytes()).as_bytes();
+    let auth_state = create_test_auth_state(pool.clone(), key_manager);
+
+    let call = || {
+        invoke_nostr_rpc(
+            create_test_tenant_extractor(tenant_id),
+            auth_state.clone(),
+            &auth_header,
+            None,
+            get_public_key_request(),
+        )
+    };
+
+    call().await.expect("first request should succeed");
+    let cached = auth_state
+        .state
+        .http_handler_cache
+        .get(&cache_key)
+        .await
+        .expect("Handler should be in cache after first request");
+
+    // The recheck passes while the authorization is active.
+    cached.mark_authorization_recheck_due();
+    call()
+        .await
+        .expect("cached request should succeed while the authorization is active");
+
+    OAuthAuthorizationRepository::new(pool.clone())
+        .revoke(auth_id)
+        .await
+        .expect("revoke authorization");
+
+    // The next recheck sees the revocation.
+    cached.mark_authorization_recheck_due();
+    let err = call()
+        .await
+        .expect_err("cached request after revocation must be rejected");
+    match err {
+        RpcError::Auth(AuthError::InvalidToken) => {}
+        other => panic!("expected InvalidToken, got: {:?}", other),
+    }
+
+    assert!(
+        auth_state
+            .state
+            .http_handler_cache
+            .get(&cache_key)
+            .await
+            .is_none(),
+        "Revoked cached handler must be evicted"
+    );
+}
+
 /// Daniel review: signing path must accept *real* preload UCANs only.
 ///
 /// Before the fix, MODE 2 routed any server-signed UCAN without a bunker_pubkey
@@ -1578,6 +1815,17 @@ async fn build_self_signed_ucan(
     redirect_origin: &str,
     bunker_pubkey: Option<&str>,
 ) -> String {
+    build_self_signed_ucan_with_lifetime(user_keys, tenant_id, redirect_origin, bunker_pubkey, 3600)
+        .await
+}
+
+async fn build_self_signed_ucan_with_lifetime(
+    user_keys: &Keys,
+    tenant_id: i64,
+    redirect_origin: &str,
+    bunker_pubkey: Option<&str>,
+    lifetime_secs: u64,
+) -> String {
     let user_did = nostr_pubkey_to_did(&user_keys.public_key());
     let key_material = NostrKeyMaterial::from_keys(user_keys.clone());
     let mut facts = json!({
@@ -1592,7 +1840,7 @@ async fn build_self_signed_ucan(
     let ucan = UcanBuilder::default()
         .issued_by(&key_material)
         .for_audience(&user_did)
-        .with_lifetime(3600)
+        .with_lifetime(lifetime_secs)
         .with_fact(facts)
         .build()
         .expect("Failed to build UCAN")

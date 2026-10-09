@@ -18,9 +18,11 @@ pub const HTTP_RPC_HANDLER_TIMEOUT: Duration = Duration::from_secs(8);
 /// surface as a retryable 503 before the HTTP RPC handler's 504 backstop fires.
 ///
 /// 1.5s is sized for the warm mutating RPC, which is the path #291's evidence
-/// is actually about: one acquire for the account-status check, no KMS, and the
-/// rest of the 8s left for the work. It governs saturation and first-connection
-/// establishment; a settled pool acquires in well under a millisecond.
+/// is actually about: one acquire for the account-status check, plus one for the
+/// OAuth authorization recheck at most every five seconds per cached handler,
+/// no KMS, and the rest of the 8s left for the work. It governs saturation and
+/// first-connection establishment; a settled pool acquires in well under a
+/// millisecond.
 ///
 /// Read this as a per-step bound and nothing more. Per-step timeouts do not
 /// compose into a path bound, and the cold handler load is the case that shows

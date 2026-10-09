@@ -14,7 +14,8 @@ use nostr_sdk::{
 };
 use once_cell::sync::Lazy;
 use secrecy::SecretString;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 
@@ -159,7 +160,9 @@ static UNWRAP_CRYPTO_PERMITS: Lazy<Arc<Semaphore>> =
 /// - Permission rules for policy-based access control
 /// - Cache keys for dual-path lookups
 ///
-/// All validation is done in-memory without DB hits after initial load.
+/// Validation uses the cached state. The caller periodically rechecks an OAuth
+/// authorization's revocation and expiry against the database; see
+/// [`HttpRpcHandler::claim_authorization_recheck`].
 pub struct HttpRpcHandler {
     /// The underlying signing session (pure crypto - just Keys)
     signing: Arc<SigningSession>,
@@ -191,6 +194,10 @@ pub struct HttpRpcHandler {
 
     /// Optional DPoP JWK thumbprint bound via UCAN cnf.jkt
     dpop_cnf_jkt: Option<String>,
+
+    /// When the authorization's revocation and expiry were last read from the
+    /// database. `None` means a recheck is due.
+    authorization_checked_at: Mutex<Option<Instant>>,
 }
 
 impl HttpRpcHandler {
@@ -219,7 +226,33 @@ impl HttpRpcHandler {
             bunker_pubkey,
             authorization_handle,
             dpop_cnf_jkt,
+            authorization_checked_at: Mutex::new(Some(Instant::now())),
         }
+    }
+
+    /// Claim the authorization recheck if `interval` has passed since the last one.
+    ///
+    /// Returns true for one caller per interval. A caller that cannot complete
+    /// the recheck must call [`Self::mark_authorization_recheck_due`] so the
+    /// next request retries it.
+    pub fn claim_authorization_recheck(&self, interval: Duration) -> bool {
+        let mut checked_at = self
+            .authorization_checked_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if checked_at.is_some_and(|at| at.elapsed() < interval) {
+            return false;
+        }
+        *checked_at = Some(Instant::now());
+        true
+    }
+
+    /// Make the next [`Self::claim_authorization_recheck`] succeed.
+    pub fn mark_authorization_recheck_due(&self) {
+        *self
+            .authorization_checked_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     /// Check if authorization is still valid (cached check - no DB hit)
@@ -791,6 +824,30 @@ mod tests {
             }
         }))
         .expect("valid creator binding")
+    }
+
+    #[test]
+    fn authorization_recheck_is_claimed_once_per_interval() {
+        let handler = create_test_handler(None, None);
+        let interval = Duration::from_secs(60);
+        assert!(
+            !handler.claim_authorization_recheck(interval),
+            "a freshly loaded handler is not due"
+        );
+        assert!(handler.claim_authorization_recheck(Duration::ZERO));
+        assert!(
+            !handler.claim_authorization_recheck(interval),
+            "the claim resets the interval"
+        );
+    }
+
+    #[test]
+    fn authorization_recheck_due_after_mark() {
+        let handler = create_test_handler(None, None);
+        let interval = Duration::from_secs(60);
+        handler.mark_authorization_recheck_due();
+        assert!(handler.claim_authorization_recheck(interval));
+        assert!(!handler.claim_authorization_recheck(interval));
     }
 
     #[test]

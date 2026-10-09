@@ -549,6 +549,26 @@ impl OAuthAuthorizationRepository {
         .map_err(Into::into)
     }
 
+    /// Find an authorization's (revoked_at, expires_at), scoped to a tenant.
+    /// Returns None if the tenant has no authorization with this id.
+    #[allow(clippy::type_complexity)]
+    pub async fn find_validity_for_tenant(
+        &self,
+        authorization_id: i32,
+        tenant_id: i64,
+    ) -> Result<Option<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)>, RepositoryError> {
+        sqlx::query_as(
+            "SELECT revoked_at, expires_at
+             FROM oauth_authorizations
+             WHERE id = $1 AND tenant_id = $2",
+        )
+        .bind(authorization_id)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// List active authorizations with policy info for a user.
     /// Returns tuples of (app_name, policy_id, policy_name, policy_slug, policy_display_name,
     /// policy_description, created_at, bunker_public_key, last_activity, activity_count).
