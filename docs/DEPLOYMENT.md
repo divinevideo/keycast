@@ -388,6 +388,23 @@ kubectl rollout restart deployment/keycast -n identity
 
 ---
 
+## Support admin grants (one-time seed)
+
+Support admin grants live in the Postgres `support_admins` table. Before that table existed they lived only in a per-deployment Redis set, which the server no longer reads. The `20261009120000_add_support_admins` migration creates the table empty, so each deployment's existing support admins have to be copied across once:
+
+1. Before deploying, open the support-admin list in the admin UI and record each pubkey (64-character lowercase hex).
+2. After the migration job has run, insert them into the deployment's tenant. The seeded tenant `1` is `login.divine.video`.
+
+   ```sql
+   INSERT INTO support_admins (tenant_id, pubkey)
+   VALUES (1, '<pubkey hex>'), (1, '<pubkey hex>')
+   ON CONFLICT DO NOTHING;
+   ```
+
+Until the rows exist, support admins keep sessions they already hold, but a new support admin login is refused. Anyone missed can be re-added from the admin UI, which now writes to the table.
+
+---
+
 ## Database backups
 
 Production Cloud SQL has automated backups and PITR configured outside this repo. Useful commands:

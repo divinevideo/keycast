@@ -19,7 +19,7 @@ use keycast_core::repositories::{
     test_redirect_pattern, AdminAuditEventRecord, AdminAuditEventRepository, AdminUserDetails,
     AdminUserLookup, AdminUserMatchKind, AuthEventRepository, ClaimTokenRepository,
     FullAdminStatusRow, OAuthAuthorizationRepository, RegisteredClient, RegisteredClientRepository,
-    RepositoryError, UserRepository, VerifiedMinorRow,
+    RepositoryError, SupportAdminRepository, UserRepository, VerifiedMinorRow,
 };
 use keycast_core::types::claim_token::generate_claim_token;
 use keycast_core::types::user::UserStatus;
@@ -29,9 +29,6 @@ const ADMIN_TOKEN_EXPIRY_DAYS: i64 = 30;
 
 /// Preloaded user signing token expiry in days
 const PRELOAD_TOKEN_EXPIRY_DAYS: i64 = 30;
-
-/// Redis key for the support admins set
-const SUPPORT_ADMINS_KEY: &str = "support_admins";
 
 /// Maximum delay for optional external-name promotion during an admin lookup.
 ///
@@ -57,38 +54,40 @@ pub fn is_full_admin(auth: &UcanAuth) -> bool {
     false
 }
 
-/// Support admin or above: pubkey is in Redis support_admins set, or a full admin.
+/// Support admin or above: a full admin, a session minted with the support
+/// role, or a pubkey granted support admin in this tenant's `support_admins`.
 /// Support admins can access user lookup and read-only support tools.
-pub async fn is_support_admin(auth: &UcanAuth) -> bool {
+///
+/// A database failure is an error rather than `false`, so an outage surfaces
+/// as a 5xx instead of silently denying support staff.
+pub async fn is_support_admin(
+    pool: &sqlx::PgPool,
+    tenant_id: i64,
+    auth: &UcanAuth,
+) -> Result<bool, ApiError> {
     if is_full_admin(auth) {
-        return true;
+        return Ok(true);
     }
     if auth.admin_role.as_deref() == Some("support") {
-        return true;
+        return Ok(true);
     }
-    // Check Redis
-    if let Ok(state) = crate::state::get_keycast_state() {
-        if let Some(redis) = &state.redis {
-            match redis.sismember(SUPPORT_ADMINS_KEY, &auth.pubkey).await {
-                Ok(true) => return true,
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::warn!("Redis SISMEMBER failed for support admin check: {}", e);
-                }
-            }
-        }
-    }
-    false
+    Ok(SupportAdminRepository::new(pool.clone())
+        .is_support_admin(tenant_id, &auth.pubkey)
+        .await?)
 }
 
 /// Determine the admin role string for a user (for status response).
-async fn admin_role_for(auth: &UcanAuth) -> Option<&str> {
+async fn admin_role_for(
+    pool: &sqlx::PgPool,
+    tenant_id: i64,
+    auth: &UcanAuth,
+) -> Result<Option<&'static str>, ApiError> {
     if is_full_admin(auth) {
-        Some("full")
-    } else if is_support_admin(auth).await {
-        Some("support")
+        Ok(Some("full"))
+    } else if is_support_admin(pool, tenant_id, auth).await? {
+        Ok(Some("support"))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -113,10 +112,11 @@ pub struct AdminStatusResponse {
 /// Check if the current user has admin privileges.
 /// Returns { is_admin: true/false, role: "full"|"support"|null }.
 pub async fn get_admin_status(
-    _tenant: crate::api::tenant::TenantExtractor,
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
     auth: UcanAuth,
 ) -> ApiResult<Json<AdminStatusResponse>> {
-    let role = admin_role_for(&auth).await;
+    let role = admin_role_for(&auth_state.state.db, tenant.0.id, &auth).await?;
     Ok(Json(AdminStatusResponse {
         is_admin: role.is_some(),
         role: role.map(String::from),
@@ -482,7 +482,7 @@ pub async fn get_claim_token(
     let tenant_id = tenant.0.id;
     let pool = &auth_state.state.db;
 
-    if !is_support_admin(&auth).await {
+    if !is_support_admin(&auth_state.state.db, tenant_id, &auth).await? {
         return Err(ApiError::forbidden("Admin access required"));
     }
 
@@ -522,7 +522,7 @@ pub async fn create_claim_token(
     let tenant_id = tenant.0.id;
     let pool = &auth_state.state.db;
 
-    if !is_support_admin(&auth).await {
+    if !is_support_admin(&auth_state.state.db, tenant_id, &auth).await? {
         tracing::warn!("Claim token request denied for pubkey: {}", &auth.pubkey);
         return Err(ApiError::forbidden("Admin access required"));
     }
@@ -620,7 +620,7 @@ pub async fn batch_create_claim_tokens(
     let tenant_id = tenant.0.id;
     let pool = &auth_state.state.db;
 
-    if !is_support_admin(&auth).await {
+    if !is_support_admin(&auth_state.state.db, tenant_id, &auth).await? {
         tracing::warn!(
             "Batch claim token request denied for pubkey: {}",
             &auth.pubkey
@@ -800,7 +800,7 @@ pub async fn invalidate_claim_token(
     let tenant_id = tenant.0.id;
     let pool = &auth_state.state.db;
 
-    if !is_support_admin(&auth).await {
+    if !is_support_admin(&auth_state.state.db, tenant_id, &auth).await? {
         tracing::warn!("Claim token invalidate denied (not support admin)");
         return Err(ApiError::forbidden("Admin access required"));
     }
@@ -855,7 +855,7 @@ pub async fn get_claim_token_stats(
     let tenant_id = tenant.0.id;
     let pool = &auth_state.state.db;
 
-    if !is_support_admin(&auth).await {
+    if !is_support_admin(&auth_state.state.db, tenant_id, &auth).await? {
         return Err(ApiError::forbidden("Admin access required"));
     }
 
@@ -1526,7 +1526,7 @@ pub async fn get_user_lookup(
     let tenant_id = tenant.0.id;
     let pool = &auth_state.state.db;
 
-    if !is_support_admin(&auth).await {
+    if !is_support_admin(&auth_state.state.db, tenant_id, &auth).await? {
         return Err(ApiError::forbidden("Admin access required"));
     }
 
@@ -1721,7 +1721,7 @@ pub async fn get_auth_debug(
     auth: UcanAuth,
     Query(query): Query<AuthDebugQuery>,
 ) -> ApiResult<Json<AuthDebugResponse>> {
-    if !is_support_admin(&auth).await {
+    if !is_support_admin(&auth_state.state.db, tenant.0.id, &auth).await? {
         return Err(ApiError::forbidden("Admin access required"));
     }
 
@@ -1970,7 +1970,7 @@ fn diagnose_auth_debug(
 }
 
 // ============================================================================
-// Support Admin Management (Redis-backed)
+// Support Admin Management
 // ============================================================================
 
 #[derive(Debug, Serialize)]
@@ -1994,37 +1994,13 @@ pub async fn list_support_admins(
         return Err(ApiError::forbidden("Full admin access required"));
     }
 
-    let state = crate::state::get_keycast_state()
-        .map_err(|_| ApiError::Internal("State not initialized".to_string()))?;
-
-    let redis = state
-        .redis
-        .as_ref()
-        .ok_or_else(|| ApiError::Internal("Redis not available".to_string()))?;
-
-    let pubkeys: Vec<String> = redis
-        .smembers(SUPPORT_ADMINS_KEY)
-        .await
-        .map_err(|e| ApiError::Internal(format!("Redis error: {}", e)))?;
-
-    // Look up emails for all pubkeys in one query
-    let tenant_id = tenant.0.id;
-    let pool = &auth_state.state.db;
-    let rows: Vec<(String, Option<String>)> =
-        sqlx::query_as("SELECT pubkey, email FROM users WHERE pubkey = ANY($1) AND tenant_id = $2")
-            .bind(&pubkeys)
-            .bind(tenant_id)
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default();
-
-    let email_map: std::collections::HashMap<String, Option<String>> = rows.into_iter().collect();
-
-    let admins = pubkeys
+    let admins = SupportAdminRepository::new(auth_state.state.db.clone())
+        .list(tenant.0.id)
+        .await?
         .into_iter()
-        .map(|pk| SupportAdminEntry {
-            email: email_map.get(&pk).cloned().flatten(),
-            pubkey: pk,
+        .map(|row| SupportAdminEntry {
+            pubkey: row.pubkey,
+            email: row.email,
         })
         .collect();
 
@@ -2059,37 +2035,31 @@ pub async fn add_support_admin(
         return Err(ApiError::bad_request("Identifier is required"));
     }
 
-    // Resolve identifier to hex pubkey
-    let pubkey_hex = resolve_identifier(identifier, &auth_state, tenant.0.id).await?;
+    let tenant_id = tenant.0.id;
+    let pubkey_hex = resolve_identifier(identifier, &auth_state, tenant_id).await?;
 
-    let state = crate::state::get_keycast_state()
-        .map_err(|_| ApiError::Internal("State not initialized".to_string()))?;
-
-    let redis = state
-        .redis
-        .as_ref()
-        .ok_or_else(|| ApiError::Internal("Redis not available".to_string()))?;
-
-    let added: i64 = redis
-        .sadd(SUPPORT_ADMINS_KEY, &pubkey_hex)
-        .await
-        .map_err(|e| ApiError::Internal(format!("Redis error: {}", e)))?;
+    let added = SupportAdminRepository::new(auth_state.state.db.clone())
+        .add(tenant_id, &pubkey_hex, &auth.pubkey)
+        .await?;
 
     tracing::info!(
-        "Support admin added: {} (by admin {})",
-        &pubkey_hex[..8],
-        &auth.pubkey[..8]
+        tenant_id,
+        support_admin = %pubkey_hex,
+        admin = %auth.pubkey,
+        added,
+        "Support admin added"
     );
 
     Ok(Json(AddSupportAdminResponse {
         pubkey: pubkey_hex,
-        added: added > 0,
+        added,
     }))
 }
 
 /// Remove a support admin by pubkey. Full admin only.
 pub async fn remove_support_admin(
-    _tenant: crate::api::tenant::TenantExtractor,
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
     auth: UcanAuth,
     Path(pubkey): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -2097,27 +2067,23 @@ pub async fn remove_support_admin(
         return Err(ApiError::forbidden("Full admin access required"));
     }
 
-    let state = crate::state::get_keycast_state()
-        .map_err(|_| ApiError::Internal("State not initialized".to_string()))?;
-
-    let redis = state
-        .redis
-        .as_ref()
-        .ok_or_else(|| ApiError::Internal("Redis not available".to_string()))?;
-
-    let removed: i64 = redis
-        .srem(SUPPORT_ADMINS_KEY, &pubkey)
-        .await
-        .map_err(|e| ApiError::Internal(format!("Redis error: {}", e)))?;
+    // Grants are stored as lowercase hex, so match case-insensitively.
+    let pubkey = pubkey.to_ascii_lowercase();
+    let tenant_id = tenant.0.id;
+    let removed = SupportAdminRepository::new(auth_state.state.db.clone())
+        .remove(tenant_id, &pubkey)
+        .await?;
 
     tracing::info!(
-        "Support admin removed: {} (by admin {})",
-        &pubkey[..std::cmp::min(8, pubkey.len())],
-        &auth.pubkey[..8]
+        tenant_id,
+        support_admin = %pubkey,
+        admin = %auth.pubkey,
+        removed,
+        "Support admin removed"
     );
 
     Ok(Json(serde_json::json!({
-        "removed": removed > 0,
+        "removed": removed,
     })))
 }
 
@@ -2136,9 +2102,9 @@ async fn resolve_identifier(
 
     // 64-char hex -> validate as pubkey
     if identifier.len() == 64 && identifier.chars().all(|c| c.is_ascii_hexdigit()) {
-        nostr_sdk::PublicKey::from_hex(identifier)
+        let pubkey = nostr_sdk::PublicKey::from_hex(identifier)
             .map_err(|e| ApiError::bad_request(format!("Invalid hex pubkey: {}", e)))?;
-        return Ok(identifier.to_string());
+        return Ok(pubkey.to_hex());
     }
 
     // Contains @ -> email lookup

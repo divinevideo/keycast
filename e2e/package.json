@@ -15,7 +15,6 @@
   },
   "dependencies": {
     "@types/ws": "^8.18.1",
-    "ioredis": "^5.4.2",
     "ws": "^8.19.0"
   }
 }

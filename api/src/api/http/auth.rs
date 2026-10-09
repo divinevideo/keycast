@@ -13,7 +13,7 @@ use chrono::{Duration, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use std::sync::Arc;
 
-use super::admin::{is_full_admin, is_support_admin};
+use super::admin::is_full_admin;
 use crate::api::extractors::UcanAuth;
 use crate::brand::BRAND_NAME;
 use crate::email_delivery::{
@@ -33,8 +33,8 @@ use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
     AccountStatusWithMinorRow, AuthEventRepository, CreateOAuthAuthorizationParams,
     MaterializePendingRegistrationOutcome, OAuthAuthorizationRepository, OAuthCodeData,
-    OAuthCodeRepository, PersonalKeysRepository, PolicyRepository, UserRepository,
-    VerifiedMinorRow,
+    OAuthCodeRepository, PersonalKeysRepository, PolicyRepository, SupportAdminRepository,
+    UserRepository, VerifiedMinorRow,
 };
 use keycast_core::secret_pool::SecretPoolError;
 use keycast_core::traits::CustomPermission;
@@ -1028,6 +1028,7 @@ fn build_expected_url(headers: &HeaderMap, path: &str) -> Result<String, AuthErr
 
 /// Handle NIP-98 admin login (admin-only, no user record created)
 async fn nostr_auth_login(
+    pool: &PgPool,
     tenant_id: i64,
     headers: &HeaderMap,
     auth_header: &str,
@@ -1052,19 +1053,24 @@ async fn nostr_auth_login(
 
     let pubkey_hex = nip98_auth.pubkey.to_hex();
 
-    // Check if pubkey is a full admin or support admin (checks ALLOWED_PUBKEYS and Redis)
+    // Check if pubkey is a full admin (ALLOWED_PUBKEYS) or holds a support
+    // admin grant in this tenant
     let nip98_auth_check = UcanAuth {
         pubkey: pubkey_hex.clone(),
         admin_role: None,
     };
     let admin_role = if is_full_admin(&nip98_auth_check) {
         "full"
-    } else if is_support_admin(&nip98_auth_check).await {
+    } else if SupportAdminRepository::new(pool.clone())
+        .is_support_admin(tenant_id, &pubkey_hex)
+        .await?
+    {
         "support"
     } else {
         tracing::warn!(
-            "NIP-98 login denied for non-admin pubkey: {}",
-            &pubkey_hex[..8]
+            tenant_id,
+            pubkey = %pubkey_hex,
+            "NIP-98 login denied for non-admin pubkey"
         );
         return Err(AuthError::Forbidden(
             "Pubkey not authorized for admin access".to_string(),
@@ -1095,7 +1101,8 @@ async fn nostr_auth_login(
     tracing::info!(
         event = "nip98_admin_login",
         tenant_id = tenant_id,
-        pubkey = &pubkey_hex[..8],
+        pubkey = %pubkey_hex,
+        admin_role,
         "Admin logged in via NIP-98"
     );
 
@@ -1269,7 +1276,7 @@ pub async fn login(
     if let Some(auth_header) = headers.get("Authorization") {
         if let Ok(auth_str) = auth_header.to_str() {
             if auth_str.starts_with("Nostr ") {
-                return nostr_auth_login(tenant_id, &headers, auth_str).await;
+                return nostr_auth_login(&auth_state.state.db, tenant_id, &headers, auth_str).await;
             }
         }
     }
