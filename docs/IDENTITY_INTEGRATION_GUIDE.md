@@ -796,84 +796,26 @@ Once you have a bunker URL, use it for remote signing:
 #### Using nostr-tools
 
 ```javascript
-import { SimplePool, finalizeEvent, getPublicKey } from 'nostr-tools';
-import { Relay } from 'nostr-tools/relay';
+import { generateSecretKey } from 'nostr-tools/pure';
+import { BunkerSigner, parseBunkerInput } from 'nostr-tools/nip46';
 
-async function signEventViaBunker(bunkerUrl, unsignedEvent) {
-  // Parse bunker URL
-  const match = bunkerUrl.match(/^bunker:\/\/([0-9a-f]{64})\?relay=(.+)&secret=(.+)$/);
-  if (!match) throw new Error('Invalid bunker URL');
+// Keep this client key with the bunker URL. Keycast serves only the client
+// that connected with the secret; a different key is refused.
+const clientSecretKey = generateSecretKey();
 
-  const [, bunkerPubkey, relayUrl, secret] = match;
+const bunkerPointer = await parseBunkerInput(bunkerUrl);
+const signer = BunkerSigner.fromBunker(clientSecretKey, bunkerPointer);
 
-  // Connect to relay
-  const relay = await Relay.connect(relayUrl);
+// Sends `connect` with the secret from the bunker URL. Do this first:
+// every other request from a client that has not connected is refused.
+await signer.connect();
 
-  // Create NIP-46 signing request
-  const requestId = crypto.randomUUID();
-  const nip46Request = {
-    id: requestId,
-    method: 'sign_event',
-    params: [unsignedEvent]
-  };
-
-  // Wrap request in kind 24133 event
-  const requestEvent = {
-    kind: 24133,
-    created_at: Math.floor(Date.now() / 1000),
-    tags: [['p', bunkerPubkey]],
-    content: JSON.stringify(nip46Request),
-    pubkey: unsignedEvent.pubkey
-  };
-
-  // Sign the request (using connection secret as signing key)
-  // Note: Actual implementation would use NIP-04/NIP-44 encryption
-  const signedRequest = finalizeEvent(requestEvent, hexToBytes(secret));
-
-  // Publish signing request
-  await relay.publish(signedRequest);
-
-  // Wait for response
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      sub.close();
-      reject(new Error('Bunker signing timeout'));
-    }, 30000);
-
-    const sub = relay.subscribe([
-      {
-        kinds: [24133],
-        authors: [bunkerPubkey],
-        '#p': [unsignedEvent.pubkey],
-        since: Math.floor(Date.now() / 1000)
-      }
-    ], {
-      onevent(event) {
-        try {
-          const response = JSON.parse(event.content);
-          if (response.id === requestId && response.result) {
-            clearTimeout(timeout);
-            sub.close();
-            resolve(response.result); // Signed event
-          }
-        } catch (e) {
-          console.error('Error parsing response:', e);
-        }
-      }
-    });
-  });
-}
-
-// Usage
-const unsignedEvent = {
+const signedEvent = await signer.signEvent({
   kind: 1,
   created_at: Math.floor(Date.now() / 1000),
   tags: [],
-  content: 'Hello Nostr!',
-  pubkey: userPubkey
-};
-
-const signedEvent = await signEventViaBunker(bunkerUrl, unsignedEvent);
+  content: 'Hello Nostr!'
+});
 ```
 
 #### Using NDK

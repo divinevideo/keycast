@@ -496,6 +496,7 @@ The endpoint is unauthenticated and reads only in-process state, so a scrape doe
 | `keycast_nip46_queue_dropped_total` | counter | Requests dropped under backpressure |
 | `keycast_nip46_queue_closed_total` | counter | Requests rejected because the queue is closed during graceful shutdown |
 | `keycast_nip46_tombstone_responses_total` | counter | Error responses sent for revoked or expired authorizations |
+| `keycast_nip46_client_refused_total` | counter | Error responses sent to clients that are not bound to the authorization (they must `connect` with the secret first) |
 | `keycast_nip46_queue_depth` / `keycast_nip46_queue_capacity` | gauge | Current and configured relay queue occupancy |
 | `keycast_nip46_queue_wait_seconds` | summary | Relay queue wait time |
 | `keycast_nip46_workers_active` | gauge | Relay workers currently processing requests |

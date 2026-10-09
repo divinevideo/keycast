@@ -4278,8 +4278,8 @@ pub async fn connect_get(
     let (client_pubkey, params) = parse_nostrconnect_uri(&nostrconnect_uri)?;
 
     tracing::info!(
-        "nostr-login connect request - client: {}..., app: {}, relay: {}",
-        &client_pubkey[..8],
+        "nostr-login connect request - client: {}, app: {}, relay: {}",
+        client_pubkey,
         params.name.as_deref().unwrap_or("Unknown"),
         params.relay
     );
@@ -4646,6 +4646,13 @@ pub async fn connect_get(
     Ok(Html(html).into_response())
 }
 
+/// Parse a NIP-46 client pubkey into the lowercase hex the signer compares against.
+fn canonical_client_pubkey(raw: &str) -> Result<String, OAuthError> {
+    nostr_sdk::PublicKey::from_hex(raw)
+        .map(|pubkey| pubkey.to_hex())
+        .map_err(|_| OAuthError::InvalidRequest("Invalid client public key format".to_string()))
+}
+
 /// POST /oauth/connect
 /// User approves/denies the nostr-login connection
 pub async fn connect_post(
@@ -4655,10 +4662,11 @@ pub async fn connect_post(
     Form(form): Form<ConnectApprovalForm>,
 ) -> Result<Response, OAuthError> {
     let tenant_id = tenant.0.id;
+    let client_pubkey = canonical_client_pubkey(&form.client_pubkey)?;
 
     tracing::info!(
-        "nostr-login connect approval - client: {}..., approved: {}",
-        &form.client_pubkey[..8],
+        "nostr-login connect approval - client: {}, approved: {}",
+        client_pubkey,
         form.approved
     );
 
@@ -4705,7 +4713,7 @@ pub async fn connect_post(
         .ok_or(OAuthError::Unauthorized)?;
 
     // For nostr-login, redirect_origin is "nostrconnect://{client_pubkey}" (the secure identifier)
-    let redirect_origin = format!("nostrconnect://{}", form.client_pubkey);
+    let redirect_origin = format!("nostrconnect://{}", client_pubkey);
 
     // Hash the client-provided secret with bcrypt for storage.
     let secret_hash = auth_state
@@ -4741,7 +4749,7 @@ pub async fn connect_post(
     let bunker_public_key = bunker_keys.public_key();
 
     // Use a descriptive name for nostr-login connections
-    let client_id = format!("nostr-login-{}", &form.client_pubkey[..12]);
+    let client_id = format!("nostr-login-{}", &client_pubkey[..12]);
 
     // Create authorization
     let relays_json = serde_json::to_string(&vec![form.relay.clone()])
@@ -4767,7 +4775,7 @@ pub async fn connect_post(
             relays: relays_json.clone(),
             policy_id: None,
             is_first_party: false,
-            client_pubkey: Some(form.client_pubkey.clone()),
+            client_pubkey: Some(client_pubkey),
             authorization_handle: Some(authorization_handle.clone()),
             handle_expires_at,
         })
@@ -4923,6 +4931,17 @@ mod tests {
         let response = bcrypt_oauth_error(BcryptAdmissionError::AtCapacity).into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()["Retry-After"], "1");
+    }
+
+    #[test]
+    fn canonical_client_pubkey_lowercases_and_rejects_invalid_keys() {
+        let client = Keys::generate().public_key().to_hex();
+        assert_eq!(
+            canonical_client_pubkey(&client.to_ascii_uppercase()).unwrap(),
+            client
+        );
+        assert!(canonical_client_pubkey("abc").is_err());
+        assert!(canonical_client_pubkey(&"g".repeat(64)).is_err());
     }
 
     #[test]

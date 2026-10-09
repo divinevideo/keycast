@@ -99,6 +99,20 @@ async fn create_oauth_handler(
     (handler, user_keys)
 }
 
+/// Bind `client` to the handler's authorization, as a connect with the secret does.
+async fn bind_client(pool: &PgPool, handler: &Nip46Handler, client: &Keys) {
+    sqlx::query(
+        "UPDATE oauth_authorizations
+         SET connected_client_pubkey = $1, verified_client_pubkey = $1, connected_at = NOW()
+         WHERE id = $2",
+    )
+    .bind(client.public_key().to_hex())
+    .bind(handler.authorization_id())
+    .execute(pool)
+    .await
+    .expect("Failed to bind client");
+}
+
 fn dm_rumor(kind: u16, author: &Keys, recipients: &[PublicKey]) -> UnsignedEvent {
     let tags: Vec<Tag> = recipients.iter().map(|pk| Tag::public_key(*pk)).collect();
     EventBuilder::new(Kind::from(kind), "daemon gate test")
@@ -327,6 +341,7 @@ async fn daemon_relay_denied_minor_sign_produces_error_response_event() {
     let km = FileKeyManager::new().expect("key manager");
     let (handler, user_keys) = create_oauth_handler(&pool, &km, true).await; // verified_minor
     let client = Keys::generate();
+    bind_client(&pool, &handler, &client).await;
     let mallory = Keys::generate();
 
     // sign_event request for a kind-14 DM to a non-approved recipient (denied).
@@ -372,6 +387,7 @@ async fn daemon_relay_denied_minor_encrypt_produces_error_response_event() {
     let km = FileKeyManager::new().expect("key manager");
     let (handler, _user_keys) = create_oauth_handler(&pool, &km, true).await; // verified_minor
     let client = Keys::generate();
+    bind_client(&pool, &handler, &client).await;
     let mallory = Keys::generate();
 
     let request = serde_json::json!({
@@ -412,6 +428,7 @@ async fn daemon_relay_non_minor_sign_produces_result_response_event() {
     let km = FileKeyManager::new().expect("key manager");
     let (handler, user_keys) = create_oauth_handler(&pool, &km, false).await; // non-minor
     let client = Keys::generate();
+    bind_client(&pool, &handler, &client).await;
     let mallory = Keys::generate();
 
     // A non-minor may sign a DM to anyone: the happy path must still build a

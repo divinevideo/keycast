@@ -139,6 +139,8 @@ pub struct Metrics {
     pub nip46_requests_queue_closed: AtomicU64,
     /// NIP-46 tombstone responses sent (revoked/expired authorizations)
     pub nip46_tombstone_responses: AtomicU64,
+    /// NIP-46 error responses sent to clients not bound to the authorization
+    pub nip46_client_refusals: AtomicU64,
     /// Approximate relay queue depth after admission and worker receives
     pub nip46_queue_depth: AtomicU64,
     /// Configured relay queue capacity
@@ -275,6 +277,7 @@ impl Metrics {
             nip46_requests_queue_dropped: AtomicU64::new(0),
             nip46_requests_queue_closed: AtomicU64::new(0),
             nip46_tombstone_responses: AtomicU64::new(0),
+            nip46_client_refusals: AtomicU64::new(0),
             nip46_queue_depth: AtomicU64::new(0),
             nip46_queue_capacity: AtomicU64::new(0),
             nip46_queue_wait_count: AtomicU64::new(0),
@@ -404,6 +407,10 @@ impl Metrics {
     pub fn inc_nip46_tombstone_response(&self) {
         self.nip46_tombstone_responses
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_nip46_client_refused(&self) {
+        self.nip46_client_refusals.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn set_nip46_queue_depth(&self, depth: u64) {
@@ -919,6 +926,13 @@ impl Metrics {
         output.push_str(&format!(
             "keycast_nip46_tombstone_responses_total {}\n",
             self.nip46_tombstone_responses.load(Ordering::Relaxed)
+        ));
+
+        output.push_str("\n# HELP keycast_nip46_client_refused_total NIP-46 error responses sent to clients not bound to the authorization\n");
+        output.push_str("# TYPE keycast_nip46_client_refused_total counter\n");
+        output.push_str(&format!(
+            "keycast_nip46_client_refused_total {}\n",
+            self.nip46_client_refusals.load(Ordering::Relaxed)
         ));
 
         output.push_str("\n# HELP keycast_nip46_queue_depth Current queued NIP-46 requests\n# TYPE keycast_nip46_queue_depth gauge\n");

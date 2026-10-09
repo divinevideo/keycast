@@ -33,10 +33,14 @@ pub struct OAuthAuthorization {
     /// App's ephemeral pubkey for NIP-46 communication (NIP-46: `client-pubkey`)
     /// Set at authorization creation time for nostr-login flow
     pub client_pubkey: Option<String>,
-    /// The connected NIP-46 client's public key (set after successful connect)
-    /// Per NIP-46: after connect, this becomes the client identifier for security
+    /// The NIP-46 client bound to this authorization: set by a `connect` that
+    /// presents the secret, or at creation for an approved nostr-login client.
+    /// The relay signer serves it only while it equals the row's
+    /// `verified_client_pubkey`, which only those two paths set; a trigger
+    /// clears it whenever the binding changes any other way.
     pub connected_client_pubkey: Option<String>,
-    /// When the client connected (for audit purposes)
+    /// When a `connect` bound the client (for audit purposes). NULL for a
+    /// client bound at creation.
     pub connected_at: Option<DateTime<chrono::Utc>>,
     /// The date and time the authorization was created
     pub created_at: DateTime<chrono::Utc>,

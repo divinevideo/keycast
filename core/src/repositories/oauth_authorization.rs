@@ -143,6 +143,9 @@ impl OAuthAuthorizationRepository {
     }
 
     /// Create a new OAuth authorization and return its ID.
+    ///
+    /// When `client_pubkey` is set, the user approved that specific NIP-46
+    /// client, so the authorization starts bound to it as a verified client.
     pub async fn create(
         &self,
         params: CreateOAuthAuthorizationParams,
@@ -151,9 +154,10 @@ impl OAuthAuthorizationRepository {
         sqlx::query_scalar::<_, i32>(
             "INSERT INTO oauth_authorizations
              (tenant_id, user_pubkey, redirect_origin, client_id, bunker_public_key,
-              secret_hash, relays, policy_id, is_first_party, client_pubkey, authorization_handle,
+              secret_hash, relays, policy_id, is_first_party, client_pubkey,
+              connected_client_pubkey, verified_client_pubkey, authorization_handle,
               handle_expires_at, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $10, $11, $12, $13, $14)
              RETURNING id",
         )
         .bind(params.tenant_id)
@@ -213,8 +217,9 @@ impl OAuthAuthorizationRepository {
              INSERT INTO oauth_authorizations
                  (tenant_id, user_pubkey, redirect_origin, client_id, bunker_public_key,
                   secret_hash, relays, policy_id, is_first_party, client_pubkey,
-                  authorization_handle, handle_expires_at, created_at, updated_at)
-             SELECT $1, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $24
+                  connected_client_pubkey, verified_client_pubkey, authorization_handle,
+                  handle_expires_at, created_at, updated_at)
+             SELECT $1, $13, $14, $15, $16, $17, $18, $19, $20, $21, $21, $21, $22, $23, $24, $24
              FROM live_claim
              RETURNING id",
         )
@@ -391,7 +396,8 @@ impl OAuthAuthorizationRepository {
     ) -> Result<u64, RepositoryError> {
         let result = sqlx::query(
             "UPDATE oauth_authorizations
-             SET connected_client_pubkey = NULL, connected_at = NULL, updated_at = NOW()
+             SET connected_client_pubkey = NULL, verified_client_pubkey = NULL,
+                 connected_at = NULL, updated_at = NOW()
              WHERE bunker_public_key = $1 AND user_pubkey = $2
                AND revoked_at IS NULL
                AND user_pubkey IN (SELECT pubkey FROM users WHERE tenant_id = $3)",
@@ -918,6 +924,70 @@ mod tests {
             authorization.is_first_party,
             "refresh rotation must be able to recover first-party session authority"
         );
+    }
+
+    #[tokio::test]
+    async fn test_create_binds_declared_client() {
+        use nostr_sdk::Keys;
+        use uuid::Uuid;
+
+        let pool = setup_pool().await;
+        let repo = OAuthAuthorizationRepository::new(pool.clone());
+
+        let user = Keys::generate().public_key().to_hex();
+        sqlx::query("INSERT INTO users (pubkey, tenant_id, created_at, updated_at) VALUES ($1, 1, NOW(), NOW()) ON CONFLICT (pubkey) DO NOTHING")
+            .bind(&user)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let declared_client = Keys::generate().public_key().to_hex();
+        let params = |client_pubkey: Option<String>| CreateOAuthAuthorizationParams {
+            tenant_id: 1,
+            user_pubkey: user.clone(),
+            redirect_origin: format!("https://declared-client-{}.example.com", Uuid::new_v4()),
+            client_id: "Declared Client".to_string(),
+            bunker_public_key: Keys::generate().public_key().to_hex(),
+            secret_hash: "$2b$10$test_hash".to_string(),
+            relays: "[]".to_string(),
+            policy_id: None,
+            is_first_party: false,
+            client_pubkey,
+            authorization_handle: None,
+            handle_expires_at: Utc::now() + chrono::Duration::days(30),
+        };
+
+        let declared_id = repo
+            .create(params(Some(declared_client.clone())))
+            .await
+            .unwrap();
+        let undeclared_id = repo.create(params(None)).await.unwrap();
+
+        let declared = repo.find(1, declared_id).await.unwrap();
+        assert_eq!(
+            declared.connected_client_pubkey,
+            Some(declared_client.clone()),
+            "an authorization approved for a client must start bound to it"
+        );
+        let undeclared = repo.find(1, undeclared_id).await.unwrap();
+        assert_eq!(
+            undeclared.connected_client_pubkey, None,
+            "an authorization without a declared client must start unbound"
+        );
+
+        for (id, expected) in [(declared_id, Some(declared_client)), (undeclared_id, None)] {
+            let verified: Option<String> = sqlx::query_scalar(
+                "SELECT verified_client_pubkey FROM oauth_authorizations WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                verified, expected,
+                "the approved client is the verified client"
+            );
+        }
     }
 
     #[tokio::test]

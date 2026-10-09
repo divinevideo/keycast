@@ -242,6 +242,16 @@ impl Nip46Handler {
         request_id: &serde_json::Value,
         client_pubkey: &str,
     ) -> SignerResult<serde_json::Value> {
+        // Only a connect carrying a secret may come from an unbound client;
+        // every other request must come from the bound client. An empty
+        // secret counts as none, which is how some clients send "no secret".
+        let provided_secret = request["params"][1]
+            .as_str()
+            .filter(|secret| !secret.is_empty());
+        if !(method == "connect" && provided_secret.is_some()) {
+            self.validate_client(client_pubkey).await?;
+        }
+
         Ok(match method {
             "sign_event" => {
                 // handle_sign_event already returns a full response with id
@@ -253,13 +263,13 @@ impl Nip46Handler {
             }),
             "connect" => {
                 // Process connect with client pubkey tracking (NIP-46 security)
-                if let Some(provided_secret) = request["params"][1].as_str() {
+                if let Some(provided_secret) = provided_secret {
                     match self.process_connect(client_pubkey, provided_secret).await {
                         Ok(result) => serde_json::json!({"id": request_id, "result": result}),
                         Err(e) => serde_json::json!({"id": request_id, "error": e.to_string()}),
                     }
                 } else {
-                    // No secret provided - still track client pubkey for future validation
+                    // No secret: the client check above admitted only the bound client
                     serde_json::json!({"id": request_id, "result": "ack"})
                 }
             }
@@ -765,7 +775,9 @@ impl Nip46Handler {
     ///
     /// # Errors
     ///
-    /// Returns error if secret is invalid or already used by a different client.
+    /// Returns error if the secret is invalid, the authorization is no longer
+    /// active, another client is already bound, or the authorization was
+    /// approved for a different client.
     pub async fn process_connect(
         &self,
         client_pubkey: &str,
@@ -792,38 +804,19 @@ impl Nip46Handler {
             return Err(SignerError::permission_denied("Invalid secret"));
         }
 
-        // Enforce one-client-per-authorization (NIP-46 spec: secrets are single-use)
-        // Check if a client is already connected
-        let existing_client: Option<String> = if self.is_oauth {
-            sqlx::query_scalar(
-                "SELECT connected_client_pubkey FROM oauth_authorizations
-                 WHERE id = $1 AND tenant_id = $2
-                   AND revoked_at IS NULL
-                   AND (expires_at IS NULL OR expires_at > NOW())",
-            )
-            .bind(self.authorization_id)
-            .bind(self.tenant_id)
-            .fetch_optional(&self.pool)
-            .await?
-            .flatten()
-        } else {
-            sqlx::query_scalar(
-                "SELECT connected_client_pubkey FROM authorizations
-                 WHERE id = $1 AND tenant_id = $2
-                   AND (expires_at IS NULL OR expires_at > NOW())",
-            )
-            .bind(self.authorization_id)
-            .bind(self.tenant_id)
-            .fetch_optional(&self.pool)
-            .await?
-            .flatten()
+        // One client per authorization (NIP-46 secrets are single-use). An
+        // authorization approved for a specific client accepts only that client.
+        let Some((bound_client, approved_client)) = self.binding_state().await? else {
+            return Err(SignerError::permission_denied(
+                "Authorization is no longer active",
+            ));
         };
 
-        match existing_client {
+        match bound_client {
             Some(existing) if existing == client_pubkey => {
                 // Same client reconnecting - allowed
                 tracing::debug!("Same client reconnecting: {}", client_pubkey);
-                Ok("ack".to_string())
+                return Ok("ack".to_string());
             }
             Some(existing) => {
                 // Different client trying to use same bunker - rejected
@@ -832,223 +825,143 @@ impl Nip46Handler {
                     existing,
                     client_pubkey
                 );
-                Err(SignerError::permission_denied(
+                return Err(SignerError::permission_denied(
                     "Secret already used by another client",
-                ))
+                ));
             }
-            None => {
-                // First connect - store client pubkey
-                tracing::info!(
-                    "First connect for auth {} (oauth={}), storing client pubkey: {}",
-                    self.authorization_id,
-                    self.is_oauth,
-                    client_pubkey
-                );
-                if self.is_oauth {
-                    sqlx::query(
-                        "UPDATE oauth_authorizations
-                         SET connected_client_pubkey = $1, connected_at = NOW()
-                         WHERE id = $2",
-                    )
-                    .bind(client_pubkey)
-                    .bind(self.authorization_id)
-                    .execute(&self.pool)
-                    .await?;
-                } else {
-                    sqlx::query(
-                        "UPDATE authorizations
-                         SET connected_client_pubkey = $1, connected_at = NOW()
-                         WHERE id = $2",
-                    )
-                    .bind(client_pubkey)
-                    .bind(self.authorization_id)
-                    .execute(&self.pool)
-                    .await?;
-                }
-
-                Ok("ack".to_string())
-            }
+            None => {}
         }
+
+        if approved_client.is_some_and(|approved| approved != client_pubkey) {
+            tracing::warn!(
+                "Connect for auth {} from a client other than the approved one: {}",
+                self.authorization_id,
+                client_pubkey
+            );
+            return Err(SignerError::permission_denied(
+                "Client not approved for this authorization",
+            ));
+        }
+
+        // First connect - bind this client. A binding that is not the verified
+        // client counts as none and is replaced. The UPDATE re-checks the
+        // binding and that the authorization is still active, so a concurrent
+        // connect from another client cannot overwrite the client that won.
+        let bound = if self.is_oauth {
+            sqlx::query(
+                "UPDATE oauth_authorizations
+                 SET connected_client_pubkey = $1, verified_client_pubkey = $1,
+                     connected_at = NOW()
+                 WHERE id = $2
+                   AND (connected_client_pubkey IS NULL
+                        OR connected_client_pubkey IS DISTINCT FROM verified_client_pubkey
+                        OR connected_client_pubkey = $1)
+                   AND revoked_at IS NULL
+                   AND (expires_at IS NULL OR expires_at > NOW())",
+            )
+            .bind(client_pubkey)
+            .bind(self.authorization_id)
+            .execute(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "UPDATE authorizations
+                 SET connected_client_pubkey = $1, connected_at = NOW()
+                 WHERE id = $2
+                   AND (connected_client_pubkey IS NULL OR connected_client_pubkey = $1)
+                   AND (expires_at IS NULL OR expires_at > NOW())",
+            )
+            .bind(client_pubkey)
+            .bind(self.authorization_id)
+            .execute(&self.pool)
+            .await?
+        };
+
+        if bound.rows_affected() == 0 {
+            tracing::warn!(
+                "Concurrent connect for auth {} bound another client first. Attempting: {}",
+                self.authorization_id,
+                client_pubkey
+            );
+            return Err(SignerError::permission_denied(
+                "Secret already used by another client",
+            ));
+        }
+
+        tracing::info!(
+            "First connect for auth {} (oauth={}), stored client pubkey: {}",
+            self.authorization_id,
+            self.is_oauth,
+            client_pubkey
+        );
+        Ok("ack".to_string())
     }
 
-    /// Validate that a client is authorized to make requests.
+    /// Check that `client_pubkey` is the client bound to this authorization.
     ///
-    /// Checks if the provided client pubkey matches the stored connected client.
+    /// A client is bound by a `connect` that presents the secret (see
+    /// [`Self::process_connect`]), or at creation when the authorization was
+    /// approved for a specific client.
     ///
     /// # Errors
     ///
-    /// Returns error if client pubkey doesn't match the connected client.
+    /// Returns `PermissionDenied` if the authorization is no longer active, or
+    /// if it is bound to no client or to a different client.
     pub async fn validate_client(&self, client_pubkey: &str) -> SignerResult<()> {
-        let bunker_pubkey = self.bunker_keys.public_key().to_hex();
-
-        // Check if this client is the connected client for any active authorization with this bunker pubkey
-        let is_valid: bool = if self.is_oauth {
-            sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM oauth_authorizations
-                 WHERE bunker_public_key = $1 AND connected_client_pubkey = $2
-                   AND revoked_at IS NULL
-                   AND (expires_at IS NULL OR expires_at > NOW()))",
-            )
-            .bind(&bunker_pubkey)
-            .bind(client_pubkey)
-            .fetch_one(&self.pool)
-            .await?
-        } else {
-            sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM authorizations
-                 WHERE bunker_public_key = $1 AND connected_client_pubkey = $2
-                   AND (expires_at IS NULL OR expires_at > NOW()))",
-            )
-            .bind(&bunker_pubkey)
-            .bind(client_pubkey)
-            .fetch_one(&self.pool)
-            .await?
+        let refusal = match self.binding_state().await? {
+            Some((Some(bound), _)) if bound == client_pubkey => return Ok(()),
+            Some(_) => "Unknown client - must connect first",
+            None => "Authorization is no longer active",
         };
 
-        if is_valid {
-            Ok(())
-        } else {
-            // Check if there's any active authorization with NULL connected_client_pubkey
-            // If so, this client hasn't connected yet
-            let has_unconnected: bool = if self.is_oauth {
-                sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM oauth_authorizations
-                     WHERE bunker_public_key = $1 AND connected_client_pubkey IS NULL
-                       AND revoked_at IS NULL
-                       AND (expires_at IS NULL OR expires_at > NOW()))",
-                )
-                .bind(&bunker_pubkey)
-                .fetch_one(&self.pool)
-                .await
-                .unwrap_or(false)
-            } else {
-                sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM authorizations
-                     WHERE bunker_public_key = $1 AND connected_client_pubkey IS NULL
-                       AND (expires_at IS NULL OR expires_at > NOW()))",
-                )
-                .bind(&bunker_pubkey)
-                .fetch_one(&self.pool)
-                .await
-                .unwrap_or(false)
-            };
-
-            if has_unconnected {
-                Err(SignerError::permission_denied(
-                    "Unknown client - must connect first",
-                ))
-            } else {
-                Err(SignerError::permission_denied(
-                    "Unknown client - not connected to any authorization",
-                ))
-            }
-        }
+        METRICS.inc_nip46_client_refused();
+        tracing::warn!(
+            "Refused NIP-46 request for auth {} (oauth={}) from client {}: {}",
+            self.authorization_id,
+            self.is_oauth,
+            client_pubkey,
+            refusal
+        );
+        Err(SignerError::permission_denied(refusal))
     }
 
-    /// Validate client and store on first request.
+    /// Read this authorization's client binding.
     ///
-    /// Provides graceful upgrade for existing connections. If no client is connected
-    /// yet, stores this client as the connected client. Subsequent requests must
-    /// come from the same client.
+    /// Returns `None` if the authorization is no longer active. Otherwise
+    /// returns the bound client and, for an authorization approved for a
+    /// specific client, that client in lowercase hex.
     ///
-    /// # Errors
-    ///
-    /// Returns error if a different client is already connected.
-    pub async fn validate_and_store_client(&self, client_pubkey: &str) -> SignerResult<()> {
-        let bunker_pubkey = self.bunker_keys.public_key().to_hex();
-
-        // Check if this client is already the connected client for an active auth
-        let is_valid: bool = if self.is_oauth {
-            sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM oauth_authorizations
-                 WHERE bunker_public_key = $1 AND connected_client_pubkey = $2
+    /// An OAuth binding counts only when it matches `verified_client_pubkey`,
+    /// the client that proved the secret or was approved at creation. Any
+    /// other binding is reported as no binding, so its client must connect
+    /// with the secret.
+    async fn binding_state(&self) -> SignerResult<Option<(Option<String>, Option<String>)>> {
+        let state = if self.is_oauth {
+            sqlx::query_as(
+                "SELECT CASE WHEN connected_client_pubkey = verified_client_pubkey
+                             THEN connected_client_pubkey END,
+                        lower(client_pubkey)
+                 FROM oauth_authorizations
+                 WHERE id = $1 AND tenant_id = $2
                    AND revoked_at IS NULL
-                   AND (expires_at IS NULL OR expires_at > NOW()))",
+                   AND (expires_at IS NULL OR expires_at > NOW())",
             )
-            .bind(&bunker_pubkey)
-            .bind(client_pubkey)
-            .fetch_one(&self.pool)
-            .await?
-        } else {
-            sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM authorizations
-                 WHERE bunker_public_key = $1 AND connected_client_pubkey = $2
-                   AND (expires_at IS NULL OR expires_at > NOW()))",
-            )
-            .bind(&bunker_pubkey)
-            .bind(client_pubkey)
-            .fetch_one(&self.pool)
-            .await?
-        };
-
-        if is_valid {
-            return Ok(());
-        }
-
-        // Check if there's an unconnected active authorization we can claim
-        let unconnected_id: Option<i32> = if self.is_oauth {
-            sqlx::query_scalar(
-                "SELECT id FROM oauth_authorizations
-                 WHERE bunker_public_key = $1 AND connected_client_pubkey IS NULL
-                   AND revoked_at IS NULL
-                   AND (expires_at IS NULL OR expires_at > NOW())
-                 LIMIT 1",
-            )
-            .bind(&bunker_pubkey)
+            .bind(self.authorization_id)
+            .bind(self.tenant_id)
             .fetch_optional(&self.pool)
             .await?
         } else {
-            sqlx::query_scalar(
-                "SELECT id FROM authorizations
-                 WHERE bunker_public_key = $1 AND connected_client_pubkey IS NULL
-                   AND (expires_at IS NULL OR expires_at > NOW())
-                 LIMIT 1",
+            sqlx::query_as(
+                "SELECT connected_client_pubkey, NULL::text FROM authorizations
+                 WHERE id = $1 AND tenant_id = $2
+                   AND (expires_at IS NULL OR expires_at > NOW())",
             )
-            .bind(&bunker_pubkey)
+            .bind(self.authorization_id)
+            .bind(self.tenant_id)
             .fetch_optional(&self.pool)
             .await?
         };
-
-        match unconnected_id {
-            Some(auth_id) => {
-                // First request without connect - store this client (graceful upgrade)
-                tracing::info!(
-                    "Storing client pubkey on first request (graceful upgrade) for auth {} (oauth={}): {}",
-                    auth_id,
-                    self.is_oauth,
-                    client_pubkey
-                );
-                if self.is_oauth {
-                    sqlx::query(
-                        "UPDATE oauth_authorizations
-                         SET connected_client_pubkey = $1, connected_at = NOW()
-                         WHERE id = $2",
-                    )
-                    .bind(client_pubkey)
-                    .bind(auth_id)
-                    .execute(&self.pool)
-                    .await?;
-                } else {
-                    sqlx::query(
-                        "UPDATE authorizations
-                         SET connected_client_pubkey = $1, connected_at = NOW()
-                         WHERE id = $2",
-                    )
-                    .bind(client_pubkey)
-                    .bind(auth_id)
-                    .execute(&self.pool)
-                    .await?;
-                }
-
-                Ok(())
-            }
-            None => {
-                // No unconnected authorization and client not recognized
-                Err(SignerError::permission_denied(
-                    "Unknown client - not connected to any authorization",
-                ))
-            }
-        }
+        Ok(state)
     }
 }
 
@@ -2173,66 +2086,8 @@ impl UnifiedSigner {
 
         tracing::info!("Processing NIP-46 method: {}", method);
 
-        // For OAuth authorizations, validate client pubkey for sensitive methods
-        // Per NIP-46: after connect, client_pubkey becomes the identifier for security
+        // The client binding is checked in dispatch_nip46_method.
         let client_pubkey = event.pubkey.to_hex();
-        let requires_validation = matches!(
-            method,
-            "sign_event" | "nip44_encrypt" | "nip44_decrypt" | "nip04_encrypt" | "nip04_decrypt"
-        );
-
-        if handler.is_oauth && requires_validation {
-            // Use validate_and_store_client for graceful upgrade:
-            // - If no client connected yet, stores this client and allows
-            // - If client matches stored, allows
-            // - If client doesn't match stored, rejects
-            if let Err(e) = handler.validate_and_store_client(&client_pubkey).await {
-                tracing::warn!("Client validation failed for {}: {}", client_pubkey, e);
-                let response = serde_json::json!({
-                    "id": request_id,
-                    "error": format!("Client not authorized: {}", e)
-                });
-
-                // Encrypt and send error response (CPU-bound, use spawn_blocking)
-                let response_str = response.to_string();
-                let encrypted_response = {
-                    let secret = bunker_secret.clone();
-                    let pubkey = event.pubkey;
-                    let text = response_str.clone();
-                    let use_44 = use_nip44;
-                    tokio::task::spawn_blocking(move || {
-                        if use_44 {
-                            nip44::encrypt(&secret, &pubkey, &text, nip44::Version::V2)
-                                .map_err(SignerError::from)
-                        } else {
-                            nip04::encrypt(&secret, &pubkey, &text).map_err(SignerError::from)
-                        }
-                    })
-                    .await
-                    .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
-                };
-
-                let response_event = {
-                    let keys = handler.bunker_keys.clone();
-                    let content = encrypted_response;
-                    let sender = event.pubkey;
-                    let event_id = event.id.to_hex();
-                    tokio::task::spawn_blocking(move || {
-                        EventBuilder::new(Kind::NostrConnect, content)
-                            .tags(vec![
-                                Tag::public_key(sender),
-                                Tag::parse(vec!["e".to_string(), event_id]).unwrap(),
-                            ])
-                            .sign_with_keys(&keys)
-                    })
-                    .await
-                    .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
-                };
-
-                client.send_event(&response_event).await?;
-                return Ok(());
-            }
-        }
 
         // Dispatch the method and build the encrypted response event. Expected
         // per-request denials (permission denied, bad params/key) become a clean

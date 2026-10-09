@@ -490,7 +490,10 @@ signing_activity (audit log)
 
 **NIP-46:**
 - Client proves knowledge of connection secret
-- First `connect` request validates secret
+- A `connect` carrying the secret binds the client's pubkey; nostr-login authorizations are bound to the approved client when they are created
+- For OAuth authorizations, only a binding made one of those two ways is trusted (it matches `verified_client_pubkey`); any other binding counts as none
+- Until a client is bound, and afterwards for any other client, every request (`get_public_key` included) is refused
+- `POST /api/user/sessions/disconnect` clears an OAuth binding, so the next `connect` with the secret binds again; team bindings are cleared only by deleting the authorization
 - Subsequent requests encrypted with NIP-44
 
 ### Permissions
