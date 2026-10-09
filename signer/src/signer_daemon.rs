@@ -340,7 +340,8 @@ impl Nip46Handler {
                     let pubkey = third_party_pubkey;
                     let text = ciphertext.to_string();
                     tokio::task::spawn_blocking(move || {
-                        nip44::decrypt(&secret, &pubkey, &text).map(SecretString::from)
+                        keycast_core::nip44::decrypt(&secret, &pubkey, &text)
+                            .map(SecretString::from)
                     })
                     .await
                     .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
@@ -422,7 +423,8 @@ impl Nip46Handler {
                     let pubkey = third_party_pubkey;
                     let text = ciphertext.to_string();
                     tokio::task::spawn_blocking(move || {
-                        nip04::decrypt(&secret, &pubkey, &text).map(SecretString::from)
+                        keycast_core::nip04::decrypt(&secret, &pubkey, &text)
+                            .map(SecretString::from)
                     })
                     .await
                     .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
@@ -1984,39 +1986,14 @@ impl UnifiedSigner {
             event.pubkey.to_hex()
         );
 
-        // Try NIP-44 first (new standard), fall back to NIP-04
         // CPU-bound crypto wrapped in spawn_blocking to avoid blocking async runtime
-        // Returns SecretString for automatic memory zeroization on drop
         let (decrypted, use_nip44): (SecretString, bool) = {
             let secret = bunker_secret.clone();
             let sender_pubkey = event.pubkey;
             let content = event.content.clone();
 
             tokio::task::spawn_blocking(move || {
-                match nip44::decrypt(&secret, &sender_pubkey, &content) {
-                    Ok(d) => {
-                        tracing::debug!("Successfully decrypted with NIP-44");
-                        Ok((SecretString::from(d), true))
-                    }
-                    Err(nip44_err) => {
-                        tracing::debug!("NIP-44 decrypt failed ({}), trying NIP-04...", nip44_err);
-                        match nip04::decrypt(&secret, &sender_pubkey, &content) {
-                            Ok(d) => {
-                                tracing::debug!("Successfully decrypted with NIP-04");
-                                Ok((SecretString::from(d), false))
-                            }
-                            Err(nip04_err) => {
-                                tracing::error!(
-                                    "Both NIP-44 and NIP-04 decrypt failed - NIP-44: {}, NIP-04: {} | From: {}",
-                                    nip44_err,
-                                    nip04_err,
-                                    sender_pubkey.to_hex()
-                                );
-                                Err(SignerError::from(nip04_err))
-                            }
-                        }
-                    }
-                }
+                decrypt_nip46_request(&secret, &sender_pubkey, &content)
             })
             .await
             .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
@@ -2128,6 +2105,41 @@ impl UnifiedSigner {
         METRICS.set_cache_size(handlers.entry_count());
 
         Ok(())
+    }
+}
+
+/// Decrypt a NIP-46 request: NIP-44 first (new standard), then NIP-04.
+///
+/// Returns the plaintext as a SecretString, zeroized on drop, and whether
+/// NIP-44 was used so the response can match.
+fn decrypt_nip46_request(
+    secret: &SecretKey,
+    sender_pubkey: &PublicKey,
+    content: &str,
+) -> Result<(SecretString, bool), SignerError> {
+    match keycast_core::nip44::decrypt(secret, sender_pubkey, content) {
+        Ok(d) => {
+            tracing::debug!("Successfully decrypted with NIP-44");
+            Ok((SecretString::from(d), true))
+        }
+        Err(nip44_err) => {
+            tracing::debug!("NIP-44 decrypt failed ({}), trying NIP-04...", nip44_err);
+            match keycast_core::nip04::decrypt(secret, sender_pubkey, content) {
+                Ok(d) => {
+                    tracing::debug!("Successfully decrypted with NIP-04");
+                    Ok((SecretString::from(d), false))
+                }
+                Err(nip04_err) => {
+                    tracing::error!(
+                        "Both NIP-44 and NIP-04 decrypt failed - NIP-44: {}, NIP-04: {} | From: {}",
+                        nip44_err,
+                        nip04_err,
+                        sender_pubkey.to_hex()
+                    );
+                    Err(SignerError::from(nip04_err))
+                }
+            }
+        }
     }
 }
 
@@ -2324,6 +2336,103 @@ impl UnifiedSigner {
             Ok(self.handlers.get(&bunker_key).await)
         } else {
             Ok(None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod request_decrypt_tests {
+    use super::*;
+
+    fn request_from(client: &Keys, bunker: &Keys, nip44: bool) -> String {
+        let plaintext = r#"{"id":"1","method":"ping","params":[]}"#;
+        if nip44 {
+            nip44::encrypt(
+                client.secret_key(),
+                &bunker.public_key(),
+                plaintext,
+                nip44::Version::V2,
+            )
+            .unwrap()
+        } else {
+            nip04::encrypt(client.secret_key(), &bunker.public_key(), plaintext).unwrap()
+        }
+    }
+
+    #[test]
+    fn decrypts_nip44_and_nip04_requests() {
+        let (client, bunker) = (Keys::generate(), Keys::generate());
+        for nip44 in [true, false] {
+            let content = request_from(&client, &bunker, nip44);
+            let (plaintext, used_nip44) =
+                decrypt_nip46_request(bunker.secret_key(), &client.public_key(), &content).unwrap();
+            assert!(plaintext.expose_secret().contains("ping"));
+            assert_eq!(used_nip44, nip44);
+        }
+    }
+
+    #[test]
+    fn checks_the_nip44_payload_size_before_decrypting() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (client, bunker) = (Keys::generate(), Keys::generate());
+        let mut payload = vec![7u8; 66];
+        payload[0] = 2;
+        let logs = Captured::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+
+        // The NIP-44 error is only logged before the NIP-04 fallback.
+        let result = tracing::subscriber::with_default(subscriber, || {
+            decrypt_nip46_request(
+                bunker.secret_key(),
+                &client.public_key(),
+                &STANDARD.encode(payload),
+            )
+        });
+        assert!(result.is_err());
+        let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("NIP-44 decrypt failed (invalid padding)"),
+            "{logs}"
+        );
+    }
+
+    #[test]
+    fn rejects_nip04_content_with_a_malformed_iv() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        let (client, bunker) = (Keys::generate(), Keys::generate());
+        let content = request_from(&client, &bunker, false);
+        let (ciphertext, _) = content.split_once("?iv=").unwrap();
+        for len in [0, 3, 32] {
+            let malformed = format!("{ciphertext}?iv={}", STANDARD.encode(vec![0u8; len]));
+            let result =
+                decrypt_nip46_request(bunker.secret_key(), &client.public_key(), &malformed);
+            assert!(
+                matches!(
+                    result,
+                    Err(SignerError::Nip04(nip04::Error::InvalidContentFormat))
+                ),
+                "{len}-byte IV"
+            );
         }
     }
 }

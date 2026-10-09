@@ -49,6 +49,9 @@ pub async fn validate_ucan_token(
     // Decode UCAN from token string (does not verify signature)
     let ucan = Ucan::try_from_token_string(token)?;
 
+    // Check the issuer's format first: check_signature expects a well-formed DID.
+    let issuer_pubkey = did_to_nostr_pubkey(ucan.issuer())?;
+
     // Verify signature cryptographically using Schnorr (BIP-340)
     let mut did_parser = create_nostr_did_parser();
     ucan.check_signature(&mut did_parser)
@@ -112,7 +115,6 @@ pub async fn validate_ucan_token(
     let user_pubkey = did_to_nostr_pubkey(ucan.audience())?;
 
     // Verify issuer is either the user (self-issued) or server (delegated)
-    let issuer_pubkey = did_to_nostr_pubkey(ucan.issuer())?;
     let issuer_pubkey_hex = issuer_pubkey.to_hex();
     let user_pubkey_hex = user_pubkey.to_hex();
     if issuer_pubkey_hex != user_pubkey_hex {
@@ -120,9 +122,9 @@ pub async fn validate_ucan_token(
         if issuer_pubkey_hex != server_pubkey {
             return Err(anyhow!(
                 "Invalid UCAN issuer: must be signed by user ({}) or server ({}), got {}",
-                &user_pubkey_hex[..8],
-                &server_pubkey[..8],
-                &issuer_pubkey_hex[..8]
+                user_pubkey_hex,
+                server_pubkey,
+                issuer_pubkey_hex
             ));
         }
     }
@@ -322,6 +324,65 @@ mod tests {
     async fn test_ucan_invalid_token_format() {
         let result = validate_ucan_token("Bearer invalid-token-string", 0).await;
         assert!(result.is_err());
+    }
+
+    /// Re-encode a signed token with its payload `iss` replaced, keeping the
+    /// original header and signature.
+    async fn token_with_issuer(issuer: &str) -> String {
+        let keys = Keys::generate();
+        let user_did = nostr_pubkey_to_did(&keys.public_key());
+        let key_material = NostrKeyMaterial::from_keys(keys);
+        let ucan = UcanBuilder::default()
+            .issued_by(&key_material)
+            .for_audience(&user_did)
+            .with_lifetime(3600)
+            .with_fact(serde_json::json!({
+                "tenant_id": 1,
+                "redirect_origin": "https://test.example.com"
+            }))
+            .build()
+            .unwrap()
+            .sign()
+            .await
+            .unwrap();
+        let token = ucan.encode().unwrap();
+        let parts: Vec<&str> = token.split('.').collect();
+
+        let mut payload: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+        payload["iss"] = serde_json::Value::String(issuer.to_string());
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+
+        format!("{}.{}.{}", parts[0], payload, parts[2])
+    }
+
+    #[tokio::test]
+    async fn malformed_issuer_did_is_rejected() {
+        let wrong_key_type = format!(
+            "did:key:z{}",
+            bs58::encode(
+                [0xed, 0x01]
+                    .iter()
+                    .chain([7u8; 32].iter())
+                    .copied()
+                    .collect::<Vec<_>>()
+            )
+            .into_string()
+        );
+        let issuers = [
+            "did:key:z".to_string(),
+            "did:key:z2".to_string(),
+            format!("did:key:z{}", bs58::encode([0xe7]).into_string()),
+            format!("did:key:z{}", bs58::encode([0xe7, 0x01]).into_string()),
+            wrong_key_type,
+            "did:web:example.com".to_string(),
+        ];
+
+        for issuer in issuers {
+            let token = token_with_issuer(&issuer).await;
+            let result = validate_ucan_token(&format!("Bearer {token}"), 1).await;
+            assert!(result.is_err(), "issuer {issuer:?} must be rejected");
+        }
     }
 
     #[tokio::test]

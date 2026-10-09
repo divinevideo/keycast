@@ -239,7 +239,7 @@ pub async fn verify_dpop_proof(
         .ok_or_else(|| anyhow!("DPoP proof must include iat"))?;
 
     let now = chrono::Utc::now().timestamp();
-    let age = (now - iat).unsigned_abs();
+    let age = now.abs_diff(iat);
     if age > DPOP_MAX_AGE_SECS {
         return Err(anyhow!(
             "DPoP proof expired: iat={}, now={}, age={}s (max {}s)",
@@ -331,6 +331,9 @@ fn verify_es256_signature(
     let y_bytes = URL_SAFE_NO_PAD
         .decode(y)
         .map_err(|_| anyhow!("DPoP EC JWK y is not valid base64url"))?;
+    if x_bytes.len() != 32 || y_bytes.len() != 32 {
+        return Err(anyhow!("DPoP JWK is not a valid P-256 key"));
+    }
 
     let point = EncodedPoint::from_affine_coordinates(
         x_bytes.as_slice().into(),
@@ -422,6 +425,16 @@ pub fn jwk_thumbprint(jwk: &serde_json::Map<String, Value>) -> Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(hash_bytes))
 }
 
+/// Short form of a `cnf.jkt` value for log lines.
+///
+/// The value comes from the token, so it is cut on a character boundary rather
+/// than a byte offset.
+pub fn jkt_log_prefix(jkt: &str) -> &str {
+    jkt.char_indices()
+        .nth(8)
+        .map_or(jkt, |(end, _)| &jkt[..end])
+}
+
 /// Extract `cnf.jkt` (JWK thumbprint) from UCAN facts if present
 pub fn extract_cnf_jkt_from_ucan(ucan: &ucan::Ucan) -> Option<String> {
     ucan.facts().iter().find_map(|fact| {
@@ -453,7 +466,7 @@ pub async fn enforce_dpop_binding(
         Some(_verified) => Ok(()),
         None => Err(anyhow!(
             "DPoP proof required: token is bound to key {}",
-            &expected_jkt[..8.min(expected_jkt.len())]
+            jkt_log_prefix(&expected_jkt)
         )),
     }
 }
@@ -627,6 +640,111 @@ mod tests {
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
         // The caller (enforce_dpop_binding) converts None + expected_jkt into an error
+    }
+
+    /// A proof whose header carries `jwk`, with a well-formed payload and an
+    /// arbitrary 64-byte signature.
+    fn proof_with_jwk(jwk: serde_json::Value, iat: i64) -> String {
+        let header = serde_json::json!({ "typ": "dpop+jwt", "alg": "ES256", "jwk": jwk });
+        let payload = serde_json::json!({
+            "htm": "POST",
+            "htu": "https://example.com/api/nostr",
+            "iat": iat,
+            "jti": format!("jwk-{}", uuid::Uuid::new_v4())
+        });
+        format!(
+            "{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap()),
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap()),
+            URL_SAFE_NO_PAD.encode([1u8; 64])
+        )
+    }
+
+    async fn verify_proof(proof: &str) -> Result<Option<VerifiedDpop>> {
+        let mut headers = HeaderMap::new();
+        headers.insert("DPoP", proof.parse().unwrap());
+        verify_dpop_proof(&headers, "POST", "https://example.com/api/nostr", None).await
+    }
+
+    #[tokio::test]
+    async fn malformed_jwk_coordinates_are_rejected() {
+        let valid = URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let now = chrono::Utc::now().timestamp();
+        for (x, y) in [
+            ("".to_string(), valid.clone()),
+            ("AA".to_string(), valid.clone()),
+            (valid.clone(), "AA".to_string()),
+            (URL_SAFE_NO_PAD.encode([7u8; 31]), valid.clone()),
+            (valid.clone(), URL_SAFE_NO_PAD.encode([7u8; 33])),
+        ] {
+            let jwk = serde_json::json!({ "kty": "EC", "crv": "P-256", "x": x, "y": y });
+            let error = verify_proof(&proof_with_jwk(jwk, now))
+                .await
+                .expect_err("malformed coordinates must be rejected");
+            assert!(
+                error.to_string().contains("not a valid P-256 key"),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn out_of_range_iat_is_rejected() {
+        let point = SigningKey::random(&mut OsRng)
+            .verifying_key()
+            .to_encoded_point(false);
+        let jwk = serde_json::json!({
+            "kty": "EC",
+            "crv": "P-256",
+            "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+            "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
+        });
+        for iat in [i64::MIN, i64::MAX] {
+            let error = verify_proof(&proof_with_jwk(jwk.clone(), iat))
+                .await
+                .expect_err("an out-of-range iat must be rejected");
+            assert!(error.to_string().contains("expired"), "{error}");
+        }
+    }
+
+    const NON_ASCII_JKT: &str = "aaaaaaa€bbbb";
+
+    #[test]
+    fn jkt_log_prefix_cuts_on_char_boundaries() {
+        assert_eq!(jkt_log_prefix(""), "");
+        assert_eq!(jkt_log_prefix("abc"), "abc");
+        assert_eq!(jkt_log_prefix("abcdefgh"), "abcdefgh");
+        assert_eq!(jkt_log_prefix("abcdefghijk"), "abcdefgh");
+        assert_eq!(jkt_log_prefix(NON_ASCII_JKT), "aaaaaaa€");
+    }
+
+    #[tokio::test]
+    async fn bound_ucan_with_non_ascii_jkt_and_no_proof_is_rejected() {
+        use crate::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
+        use nostr_sdk::Keys;
+        use ucan::builder::UcanBuilder;
+
+        let keys = Keys::generate();
+        let did = nostr_pubkey_to_did(&keys.public_key());
+        let ucan = UcanBuilder::default()
+            .issued_by(&NostrKeyMaterial::from_keys(keys))
+            .for_audience(&did)
+            .with_lifetime(3600)
+            .with_fact(serde_json::json!({ "cnf": { "jkt": NON_ASCII_JKT } }))
+            .build()
+            .unwrap()
+            .sign()
+            .await
+            .unwrap();
+
+        let result = enforce_dpop_binding(
+            &HeaderMap::new(),
+            &ucan,
+            "POST",
+            "https://example.com/api/nostr",
+        )
+        .await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

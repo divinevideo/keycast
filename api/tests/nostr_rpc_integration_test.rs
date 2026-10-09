@@ -3142,3 +3142,112 @@ async fn test_server_signed_bunker_token_requires_authorization_owner() {
         "expected InvalidToken, got {err:?}"
     );
 }
+
+/// Replace the payload `iss` of an encoded token, keeping its header and signature.
+fn with_issuer(token: &str, issuer: &str) -> String {
+    let parts: Vec<&str> = token.split('.').collect();
+    let mut payload: Value =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).expect("payload base64"))
+            .expect("payload JSON");
+    payload["iss"] = Value::String(issuer.to_string());
+    let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("payload JSON"));
+    format!("{}.{}.{}", parts[0], payload, parts[2])
+}
+
+#[tokio::test]
+#[serial]
+async fn test_malformed_token_fields_rejected_on_cache_miss() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let account = setup_wrap_rpc_account(&pool, tenant_id, None, None).await;
+
+    // The unmodified token is served, so the rejections below come from the
+    // malformed field rather than from the account setup.
+    let response = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        account.auth_state.clone(),
+        &format!("Bearer {}", account.token),
+        None,
+        get_public_key_request(),
+    )
+    .await
+    .expect("the unmodified token is served");
+    assert_eq!(response.result, Some(Value::String(account.pubkey.clone())));
+
+    for issuer in ["did:key:z", "did:key:z2"] {
+        let err = invoke_nostr_rpc(
+            create_test_tenant_extractor(tenant_id),
+            account.auth_state.clone(),
+            &format!("Bearer {}", with_issuer(&account.token, issuer)),
+            None,
+            get_public_key_request(),
+        )
+        .await
+        .expect_err("a token with a malformed issuer must be rejected");
+        assert!(
+            matches!(err, RpcError::Auth(AuthError::InvalidToken)),
+            "issuer {issuer:?}: expected InvalidToken, got {err:?}"
+        );
+    }
+
+    // A non-ASCII thumbprint. Install a subscriber so log lines are formatted.
+    let subscriber = tracing_subscriber::fmt().with_test_writer().finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let bound_token = build_dpop_bound_ucan(
+        &account.user_keys,
+        tenant_id,
+        "non-ascii-jkt@example.com",
+        &account.redirect_origin,
+        &account.bunker_pubkey,
+        "aaaaaaa€bbbb",
+    )
+    .await;
+    let err = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        account.auth_state.clone(),
+        &format!("Bearer {}", bound_token),
+        None,
+        get_public_key_request(),
+    )
+    .await
+    .expect_err("a DPoP-bound token without a proof must be rejected");
+    assert!(
+        matches!(err, RpcError::Auth(AuthError::InvalidToken)),
+        "expected InvalidToken, got {err:?}"
+    );
+
+    let short_coordinate_proof = dpop_proof_with_jwk(
+        json!({ "kty": "EC", "crv": "P-256", "x": "AA", "y": "AA" }),
+        "https://login.divine.video/api/nostr",
+    );
+    let err = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        account.auth_state.clone(),
+        &format!("Bearer {}", bound_token),
+        Some(&short_coordinate_proof),
+        get_public_key_request(),
+    )
+    .await
+    .expect_err("a proof with a malformed key must be rejected");
+    assert!(
+        matches!(err, RpcError::Auth(AuthError::InvalidToken)),
+        "expected InvalidToken, got {err:?}"
+    );
+}
+
+/// A DPoP proof for `htu` whose header carries `jwk`, signed with arbitrary bytes.
+fn dpop_proof_with_jwk(jwk: Value, htu: &str) -> String {
+    let header = json!({ "typ": "dpop+jwt", "alg": "ES256", "jwk": jwk });
+    let payload = json!({
+        "htm": "POST",
+        "htu": htu,
+        "iat": Utc::now().timestamp(),
+        "jti": format!("jwk-{}", Uuid::new_v4()),
+    });
+    format!(
+        "{}.{}.{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap()),
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap()),
+        URL_SAFE_NO_PAD.encode([1u8; 64])
+    )
+}

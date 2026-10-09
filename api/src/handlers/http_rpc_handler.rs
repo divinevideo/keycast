@@ -118,20 +118,22 @@ impl WrapError {
     }
 }
 
+/// The `JoinError` can carry a panic message, which the panic hook already
+/// logs; the response gets a fixed message instead.
+fn blocking_task_failed() -> HandlerError {
+    HandlerError::Internal("blocking task failed".to_string())
+}
+
 fn map_signing_error(error: SessionError) -> HandlerError {
     match error {
-        SessionError::BlockingTask(error) => {
-            HandlerError::Internal(format!("blocking task failed: {error}"))
-        }
+        SessionError::BlockingTask(_) => blocking_task_failed(),
         other => HandlerError::Signing(other.to_string()),
     }
 }
 
 fn map_encryption_error(error: SessionError) -> HandlerError {
     match error {
-        SessionError::BlockingTask(error) => {
-            HandlerError::Internal(format!("blocking task failed: {error}"))
-        }
+        SessionError::BlockingTask(_) => blocking_task_failed(),
         other => HandlerError::Encryption(other.to_string()),
     }
 }
@@ -562,7 +564,7 @@ impl HttpRpcHandler {
         })?;
 
         let recipient = *recipient;
-        tokio::task::spawn_blocking(move || {
+        keycast_core::panic_scope::spawn_blocking(move || {
             EventBuilder::gift_wrap_from_seal(&recipient, &signed_seal, Vec::<Tag>::new())
         })
         .await
@@ -621,8 +623,8 @@ impl HttpRpcHandler {
             // process-wide static is never closed, so this branch is unreachable.
             .map_err(|_| UnwrapError::Internal)?;
 
-        let unwrapped =
-            tokio::task::spawn_blocking(move || -> Result<UnwrappedGift, UnwrapError> {
+        let unwrapped = keycast_core::panic_scope::spawn_blocking(
+            move || -> Result<UnwrappedGift, UnwrapError> {
                 // Hold the global crypto permit for the lifetime of this blocking
                 // closure; it releases on return, i.e. when the crypto truly completes.
                 let _permit = permit;
@@ -647,9 +649,10 @@ impl HttpRpcHandler {
                         // seal/rumor json) both surface as a decrypt failure to the client.
                         _ => UnwrapError::DecryptFailed,
                     })
-            })
-            .await
-            .map_err(|_| UnwrapError::Internal)??;
+            },
+        )
+        .await
+        .map_err(|_| UnwrapError::Internal)??;
 
         // Enforce decrypt policy on the authenticated inner sender. Only
         // `encrypt_to_self` actually denies decrypt today; DM authorizations
@@ -677,10 +680,12 @@ impl HttpRpcHandler {
         let recipient = *recipient;
         let plaintext = plaintext.to_string();
 
-        tokio::task::spawn_blocking(move || nip04::encrypt(&secret, &recipient, &plaintext))
-            .await
-            .map_err(|e| HandlerError::Internal(format!("blocking task failed: {e}")))?
-            .map_err(|e| HandlerError::Encryption(e.to_string()))
+        keycast_core::panic_scope::spawn_blocking(move || {
+            nip04::encrypt(&secret, &recipient, &plaintext)
+        })
+        .await
+        .map_err(|_| blocking_task_failed())?
+        .map_err(|e| HandlerError::Encryption(e.to_string()))
     }
 
     /// Decrypt ciphertext using NIP-04 after checking validity and permissions
@@ -701,11 +706,11 @@ impl HttpRpcHandler {
         let sender = *sender;
         let ciphertext = ciphertext.to_string();
 
-        tokio::task::spawn_blocking(move || {
-            nip04::decrypt(&secret, &sender, &ciphertext).map(SecretString::from)
+        keycast_core::panic_scope::spawn_blocking(move || {
+            keycast_core::nip04::decrypt(&secret, &sender, &ciphertext).map(SecretString::from)
         })
         .await
-        .map_err(|e| HandlerError::Internal(format!("blocking task failed: {e}")))?
+        .map_err(|_| blocking_task_failed())?
         .map_err(|e| HandlerError::Encryption(e.to_string()))
     }
 }
@@ -747,6 +752,46 @@ pub async fn insert_handler_dual_key(cache: &HttpHandlerCache, handler: Arc<Http
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn nip04_decrypt_rejects_content_with_a_malformed_iv() {
+        let handler = create_test_handler(None, None);
+        let sender = Keys::generate();
+        let content = nip04::encrypt(
+            sender.secret_key(),
+            &handler.signing.keys().public_key(),
+            "hello",
+        )
+        .unwrap();
+        let (ciphertext, _) = content.split_once("?iv=").unwrap();
+
+        let result = handler
+            .nip04_decrypt(&sender.public_key(), &format!("{ciphertext}?iv=AAAA"))
+            .await;
+        assert!(
+            matches!(result, Err(HandlerError::Encryption(_))),
+            "got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blocking_task_panic_maps_to_a_fixed_message() {
+        let panicked = || async {
+            tokio::spawn(async { panic!("panic detail") })
+                .await
+                .unwrap_err()
+        };
+
+        for error in [
+            map_signing_error(SessionError::BlockingTask(panicked().await)),
+            map_encryption_error(SessionError::BlockingTask(panicked().await)),
+        ] {
+            match error {
+                HandlerError::Internal(message) => assert_eq!(message, "blocking task failed"),
+                other => panic!("expected Internal, got {other:?}"),
+            }
+        }
+    }
 
     fn create_test_handler(
         expires_at: Option<DateTime<Utc>>,

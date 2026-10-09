@@ -1302,3 +1302,140 @@ async fn test_connected_at_timestamp_set() {
         "connected_at should be set after connect"
     );
 }
+
+// ============================================================================
+// Decrypt requests with malformed content from the bound client
+// ============================================================================
+
+/// An OAuth handler with a bound client, as (handler, client, user keys).
+async fn handler_with_bound_client(pool: &PgPool) -> (Nip46Handler, Keys, Keys) {
+    let key_manager = FileKeyManager::new().expect("Failed to create key manager");
+    let tenant_id = 1;
+    let (oauth_auth, user_keys, secret) =
+        create_oauth_authorization_for_client_test(pool, tenant_id, &key_manager).await;
+    let handler = Nip46Handler::new_for_test(
+        user_keys.clone(),
+        user_keys.clone(),
+        oauth_auth.secret_hash.clone(),
+        oauth_auth.id,
+        tenant_id,
+        true,
+        pool.clone(),
+    );
+    let client = Keys::generate();
+    handler
+        .process_connect(&client.public_key().to_hex(), &secret)
+        .await
+        .expect("Connect should succeed");
+    (handler, client, user_keys)
+}
+
+/// Send one decrypt request from `client` and return the signer's outcome.
+async fn decrypt_outcome(
+    handler: &Nip46Handler,
+    client: &Keys,
+    method: &str,
+    peer: &PublicKey,
+    content: String,
+) -> Result<Event, keycast_signer::SignerError> {
+    let request_id = json!(format!("req-{method}-malformed"));
+    let request = json!({
+        "id": request_id,
+        "method": method,
+        "params": [peer.to_hex(), content],
+    });
+    handler
+        .build_nip46_response_event(
+            method,
+            &request,
+            &request_id,
+            &client.public_key().to_hex(),
+            client.public_key(),
+            EventId::all_zeros(),
+            true,
+        )
+        .await
+}
+
+#[tokio::test]
+async fn test_nip04_decrypt_rejects_content_with_a_malformed_iv() {
+    let pool = setup_test_db().await;
+    let (handler, client, user_keys) = handler_with_bound_client(&pool).await;
+    let peer = Keys::generate();
+    let content = nip04::encrypt(peer.secret_key(), &user_keys.public_key(), "to the key")
+        .expect("Failed to encrypt nip04 fixture");
+
+    let body = relay_request(
+        &handler,
+        &client,
+        "nip04_decrypt",
+        json!([peer.public_key().to_hex(), content]),
+    )
+    .await;
+    assert_eq!(body["result"], "to the key", "{body}");
+
+    let (ciphertext, _) = content.split_once("?iv=").unwrap();
+    let result = decrypt_outcome(
+        &handler,
+        &client,
+        "nip04_decrypt",
+        &peer.public_key(),
+        format!("{ciphertext}?iv=AAAA"),
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(keycast_signer::SignerError::Nip04(
+                nip04::Error::InvalidContentFormat
+            ))
+        ),
+        "got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_nip44_decrypt_rejects_a_payload_below_the_minimum_size() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use nostr_sdk::nips::nip44::v2::ErrorV2;
+
+    let pool = setup_test_db().await;
+    let (handler, client, user_keys) = handler_with_bound_client(&pool).await;
+    let peer = Keys::generate();
+    let content = nip44::encrypt(
+        peer.secret_key(),
+        &user_keys.public_key(),
+        "to the key",
+        nip44::Version::V2,
+    )
+    .expect("Failed to encrypt nip44 fixture");
+
+    let body = relay_request(
+        &handler,
+        &client,
+        "nip44_decrypt",
+        json!([peer.public_key().to_hex(), content]),
+    )
+    .await;
+    assert_eq!(body["result"], "to the key", "{body}");
+
+    let mut short = vec![7u8; 66];
+    short[0] = 2;
+    let result = decrypt_outcome(
+        &handler,
+        &client,
+        "nip44_decrypt",
+        &peer.public_key(),
+        STANDARD.encode(short),
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(keycast_signer::SignerError::Nip44(nip44::Error::V2(
+                ErrorV2::InvalidPadding
+            )))
+        ),
+        "got {result:?}"
+    );
+}

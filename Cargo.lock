@@ -3456,6 +3456,7 @@ dependencies = [
  "dashmap",
  "did-key",
  "dotenv",
+ "futures-util",
  "hex",
  "hkdf 0.12.4",
  "http-body-util",

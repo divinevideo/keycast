@@ -284,7 +284,7 @@ impl BcryptAdmission {
             inner: Arc::clone(&self.inner),
         };
 
-        tokio::task::spawn_blocking(move || {
+        crate::panic_scope::spawn_blocking(move || {
             let output = work();
             drop(permit);
             drop(metrics);
@@ -522,7 +522,7 @@ impl BcryptPermit {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        tokio::task::spawn_blocking(move || {
+        crate::panic_scope::spawn_blocking(move || {
             let result = work();
             drop(self);
             result

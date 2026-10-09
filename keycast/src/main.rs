@@ -1179,14 +1179,48 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
+/// Wrap the assembled router in the layers every request passes through.
+///
+/// Innermost first: panic containment, then request tracing, request ids and
+/// cache headers, so the 500 for a caught panic is still logged in its request
+/// span and carries a request id.
+fn with_request_layers(app: Router) -> Router {
+    app.layer(middleware::from_fn(
+        keycast_api::api::http::request_panics::contain_request_panics,
+    ))
+    // Add request tracing with trace_id for debugging
+    // TraceLayer creates a span for each request with method, uri, and trace_id
+    // All logs within the request will automatically include these fields
+    .layer(TraceLayer::new_for_http().make_span_with(request_span))
+    .layer(middleware::from_fn(
+        keycast_api::api::http::auth_observability::request_id_middleware,
+    ))
+    // Add Cache-Control headers for browser caching
+    .layer(middleware::from_fn(cache_control_middleware))
+}
+
+fn request_span(request: &Request<Body>) -> tracing::Span {
+    let trace_id = keycast_api::api::http::auth_observability::request_context(request)
+        .map(|context| context.request_id.clone())
+        .or_else(|| {
+            keycast_api::api::http::auth_observability::request_id_from_headers(request.headers())
+        })
+        .unwrap_or_else(|| "missing-request-id".to_string());
+
+    tracing::span!(
+        Level::INFO,
+        "request",
+        method = %request.method(),
+        uri = %request.uri(),
+        trace_id = %trace_id,
+    )
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Ensure panics in any thread (including spawned tasks) kill the process
-    // This prevents the server from running in a broken state
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        default_hook(info);
-        std::process::exit(1);
-    }));
+    // A panic while handling an HTTP request is answered with a 500 (see
+    // with_request_layers). Any other panic exits the process, so the instance
+    // restarts instead of running without the task that failed.
+    keycast_core::panic_scope::install_hook();
 
     dotenv().ok();
 
@@ -1725,36 +1759,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         },
     )));
 
-    // Add request tracing with trace_id for debugging
-    // TraceLayer creates a span for each request with method, uri, and trace_id
-    // All logs within the request will automatically include these fields
-    let app = app.layer(
-        TraceLayer::new_for_http().make_span_with(|request: &Request<Body>| {
-            let trace_id = keycast_api::api::http::auth_observability::request_context(request)
-                .map(|context| context.request_id.clone())
-                .or_else(|| {
-                    keycast_api::api::http::auth_observability::request_id_from_headers(
-                        request.headers(),
-                    )
-                })
-                .unwrap_or_else(|| "missing-request-id".to_string());
-
-            tracing::span!(
-                Level::INFO,
-                "request",
-                method = %request.method(),
-                uri = %request.uri(),
-                trace_id = %trace_id,
-            )
-        }),
-    );
-
-    let app = app.layer(middleware::from_fn(
-        keycast_api::api::http::auth_observability::request_id_middleware,
-    ));
-
-    // Add Cache-Control headers for browser caching
-    let app = app.layer(middleware::from_fn(cache_control_middleware));
+    let app = with_request_layers(app);
 
     // Try dual-stack [::] first (accepts both IPv4 and IPv6), fall back to 0.0.0.0
     let dual_stack_addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, api_port));
@@ -2399,6 +2404,98 @@ mod tests {
 
         let request_id = response.headers().get("x-request-id").unwrap();
         assert!(!request_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_request_layers_answer_a_panicking_handler_with_a_500() {
+        async fn panicking_handler() -> &'static str {
+            panic!("handler failure")
+        }
+
+        let logs = CapturedLogs::default();
+        let writer = logs.clone();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+
+        let app = with_request_layers(
+            Router::new()
+                .route("/api/panic", get(panicking_handler))
+                .route("/.well-known/panic", get(panicking_handler))
+                .route("/api/ok", get(|| async { "ok" })),
+        );
+
+        for uri in ["/api/panic", "/.well-known/panic"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("x-trace-id", "trace-panic")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{uri}"
+            );
+            assert_eq!(
+                response.headers().get("x-request-id").unwrap(),
+                "trace-panic",
+                "{uri}"
+            );
+            assert_eq!(
+                response.headers().get(header::CACHE_CONTROL).unwrap(),
+                "no-store",
+                "{uri}"
+            );
+        }
+
+        let logs = logs.contents();
+        assert!(
+            logs.lines()
+                .any(|line| line.contains("response failed")
+                    && line.contains("trace_id=trace-panic")),
+            "the 500 is logged as a failed response in its request span:\n{logs}"
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Formatted log output collected for assertions.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     #[tokio::test]

@@ -522,6 +522,7 @@ The endpoint is unauthenticated and reads only in-process state, so a scrape doe
 | `keycast_http_rpc_db_acquire_duration_seconds` | histogram | Database pool acquisition latency, labelled `operation` and `outcome` |
 | `keycast_http_rpc_db_pool_size` / `keycast_http_rpc_db_pool_idle` | gauge | Most recently observed SQLx pool size and idle connections |
 | `keycast_http_rpc_activity_dropped_total` | counter | OAuth activity updates dropped before reaching the database |
+| `keycast_http_request_panics_total` | counter | Panics in HTTP request work that failed only that request instead of exiting the process |
 | `keycast_registrations_total` | counter | User registrations |
 | `keycast_logins_total` | counter | Successful logins |
 | `keycast_login_failures_total` | counter | Failed logins |

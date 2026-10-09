@@ -1183,7 +1183,7 @@ async fn enforce_cached_dpop_binding(
         Ok(None) => {
             tracing::warn!(
                 "RPC: DPoP-bound token used without DPoP proof on cache hit (jkt={})",
-                &expected_jkt[..8.min(expected_jkt.len())]
+                crate::ucan_auth::jkt_log_prefix(expected_jkt)
             );
             Err(RpcError::Auth(AuthError::InvalidToken))
         }
@@ -1378,7 +1378,7 @@ async fn get_handler(
             Ok(None) => {
                 tracing::warn!(
                     "RPC: DPoP-bound token used without DPoP proof (jkt={})",
-                    &expected_jkt[..8.min(expected_jkt.len())]
+                    crate::ucan_auth::jkt_log_prefix(expected_jkt)
                 );
                 return Err(RpcError::Auth(AuthError::InvalidToken));
             }
@@ -1659,7 +1659,7 @@ async fn unwrap_gift_wrap_batch(
     for (idx, item) in items.iter().enumerate() {
         let handler = handler.clone();
         let item = item.clone();
-        set.spawn(async move {
+        set.spawn(keycast_core::panic_scope::propagate(async move {
             let event: Event = match serde_json::from_value(item) {
                 Ok(e) => e,
                 Err(_) => return (idx, error_slot("invalid_event")),
@@ -1675,7 +1675,7 @@ async fn unwrap_gift_wrap_batch(
                 Err(e) => error_slot(e.code()),
             };
             (idx, slot)
-        });
+        }));
     }
 
     // Pre-fill with internal-error slots so a task that fails to report a result
@@ -2111,6 +2111,22 @@ mod tests {
     #[tokio::test]
     async fn test_cache_hit_dpop_bound_missing_proof_rejected() {
         let handler = create_test_handler_with_dpop(Some("expected-thumbprint".to_string()));
+        let headers = HeaderMap::new();
+
+        let result =
+            enforce_cached_dpop_binding(&handler, &headers, "https://example.com/api/nostr").await;
+        assert!(matches!(
+            result,
+            Err(RpcError::Auth(AuthError::InvalidToken))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_cache_hit_dpop_bound_non_ascii_jkt_missing_proof_rejected() {
+        // Install a subscriber so log lines are formatted.
+        let subscriber = tracing_subscriber::fmt().with_test_writer().finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let handler = create_test_handler_with_dpop(Some("aaaaaaa€bbbb".to_string()));
         let headers = HeaderMap::new();
 
         let result =

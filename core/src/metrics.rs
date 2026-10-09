@@ -216,6 +216,9 @@ pub struct Metrics {
     /// OAuth activity updates that never reached the database: queue full,
     /// writer already stopped, or given up after repeated flush failures.
     pub http_rpc_activity_dropped: AtomicU64,
+    /// Panics in HTTP request work that failed only that request instead of
+    /// exiting the process.
+    pub http_request_panics: AtomicU64,
 
     // === Auth Metrics ===
     /// Total successful user registrations
@@ -315,6 +318,7 @@ impl Metrics {
             http_rpc_db_pool_size: AtomicU64::new(0),
             http_rpc_db_pool_idle: AtomicU64::new(0),
             http_rpc_activity_dropped: AtomicU64::new(0),
+            http_request_panics: AtomicU64::new(0),
             // Auth metrics
             registrations_total: AtomicU64::new(0),
             logins_total: AtomicU64::new(0),
@@ -644,6 +648,10 @@ impl Metrics {
     pub fn add_http_rpc_activity_dropped(&self, count: u64) {
         self.http_rpc_activity_dropped
             .fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn inc_http_request_panics(&self) {
+        self.http_request_panics.fetch_add(1, Ordering::Relaxed);
     }
 
     // === Auth metric methods ===
@@ -1204,6 +1212,15 @@ impl Metrics {
         output.push_str(&format!(
             "keycast_http_rpc_activity_dropped_total {}\n",
             self.http_rpc_activity_dropped.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(
+            "\n# HELP keycast_http_request_panics_total Panics in HTTP request work that failed only that request instead of exiting the process\n",
+        );
+        output.push_str("# TYPE keycast_http_request_panics_total counter\n");
+        output.push_str(&format!(
+            "keycast_http_request_panics_total {}\n",
+            self.http_request_panics.load(Ordering::Relaxed)
         ));
 
         // Auth metrics
@@ -1822,6 +1839,19 @@ mod tests {
         assert!(output.contains("keycast_retention_deletions_overdue 2"));
         assert!(output.contains("# TYPE keycast_retention_provisioning_overdue gauge"));
         assert!(output.contains("keycast_retention_provisioning_overdue 3"));
+    }
+
+    #[test]
+    fn test_http_request_panics_render() {
+        let metrics = Metrics::new();
+        let output = metrics.to_prometheus();
+        assert!(output.contains("# TYPE keycast_http_request_panics_total counter"));
+        assert!(output.contains("keycast_http_request_panics_total 0"));
+
+        metrics.inc_http_request_panics();
+        assert!(metrics
+            .to_prometheus()
+            .contains("keycast_http_request_panics_total 1"));
     }
 
     #[test]

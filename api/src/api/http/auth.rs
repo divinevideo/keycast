@@ -2944,7 +2944,7 @@ pub async fn resend_verification(
 
     // Keep the public response independent of provider latency while the shared service still
     // bounds and times the background provider call.
-    tokio::spawn(async move {
+    tokio::spawn(keycast_core::panic_scope::propagate(async move {
         let provider_outcome = email_delivery
             .send_verification(&email, &verification_token)
             .await;
@@ -2959,7 +2959,7 @@ pub async fn resend_verification(
             Some(&pubkey),
         )
         .await;
-    });
+    }));
 
     success_response
 }

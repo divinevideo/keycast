@@ -21,6 +21,7 @@ chrono = { workspace = true }
 config = { workspace = true }
 dashmap = "6.1"
 dotenv = { workspace = true }
+futures-util = "0.3"
 keycast_core = { path = "../core" }
 # UCAN for user-signed capability tokens
 ucan = "0.7.0-alpha.1"

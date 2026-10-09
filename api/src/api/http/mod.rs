@@ -17,6 +17,7 @@ pub mod oauth;
 pub mod og_diviner;
 pub mod openid_configuration;
 pub mod policies;
+pub mod request_panics;
 pub mod retention;
 pub mod routes;
 pub mod service_deletion;

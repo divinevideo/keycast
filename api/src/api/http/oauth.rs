@@ -5060,6 +5060,54 @@ mod tests {
         }))
     }
 
+    fn connect_approval_form(client_pubkey: &str, approved: bool) -> Form<ConnectApprovalForm> {
+        Form(ConnectApprovalForm {
+            client_pubkey: client_pubkey.to_string(),
+            relay: "wss://relay.example.com".to_string(),
+            secret: "connect-secret".to_string(),
+            perms: None,
+            approved,
+        })
+    }
+
+    #[tokio::test]
+    async fn connect_post_rejects_malformed_client_pubkey() {
+        // Install a subscriber so log lines are formatted.
+        let subscriber = tracing_subscriber::fmt().with_test_writer().finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Empty, short, non-ASCII, and non-hex values.
+        for client_pubkey in ["", "a", "abcdef1", "aaaaaaa€", &"g".repeat(64)] {
+            for approved in [false, true] {
+                let result = connect_post(
+                    create_unit_test_tenant(),
+                    State(create_lazy_auth_state()),
+                    axum::http::HeaderMap::new(),
+                    connect_approval_form(client_pubkey, approved),
+                )
+                .await;
+                assert!(
+                    matches!(result, Err(OAuthError::InvalidRequest(_))),
+                    "client_pubkey {client_pubkey:?} (approved: {approved}) must be rejected"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_post_denial_with_valid_client_pubkey_is_served() {
+        let client_pubkey = Keys::generate().public_key().to_hex();
+        let result = connect_post(
+            create_unit_test_tenant(),
+            State(create_lazy_auth_state()),
+            axum::http::HeaderMap::new(),
+            connect_approval_form(&client_pubkey, false),
+        )
+        .await;
+        let response = result.expect("a denial with a valid client pubkey is served");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
     async fn response_json(response: axum::response::Response) -> serde_json::Value {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await

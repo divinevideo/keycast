@@ -9,7 +9,7 @@ mod validation;
 pub use did::{did_to_nostr_pubkey, nostr_pubkey_to_did};
 pub use dpop::{
     enforce_dpop_binding, extract_cnf_jkt_from_ucan, is_replay_cache_unavailable_error,
-    verify_dpop_proof,
+    jkt_log_prefix, verify_dpop_proof,
 };
 pub use key_material::{NostrKeyMaterial, NostrVerifyKeyMaterial};
 pub use validation::{extract_user_from_ucan, is_server_signed, validate_ucan_token};

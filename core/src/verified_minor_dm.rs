@@ -69,7 +69,6 @@
 //! gate's job is narrower and achievable: Keycast will not produce a DM-shaped,
 //! normal-client-deliverable artifact addressed to a non-approved recipient.
 
-use nostr_sdk::nips::nip44;
 use nostr_sdk::{Keys, Kind, PublicKey, Tag, UnsignedEvent};
 use once_cell::sync::Lazy;
 
@@ -244,7 +243,9 @@ fn validate_seal(user_keys: &Keys, event: &UnsignedEvent) -> Result<(), MinorDmD
     validate_p_tags_approved(&user_pubkey, event.tags.as_slice())?;
     let candidates = [user_pubkey, PINNED_KEYS[0], PINNED_KEYS[1]];
     for candidate in &candidates {
-        if let Ok(plaintext) = nip44::decrypt(user_keys.secret_key(), candidate, &event.content) {
+        if let Ok(plaintext) =
+            crate::nip44::decrypt(user_keys.secret_key(), candidate, &event.content)
+        {
             return validate_sealed_rumor(&user_pubkey, &plaintext);
         }
     }

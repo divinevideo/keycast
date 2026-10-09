@@ -102,7 +102,7 @@ impl SigningSession {
             "signing_session.pubkey_canonicalized",
         );
 
-        tokio::task::spawn_blocking(move || {
+        crate::panic_scope::spawn_blocking(move || {
             // Run the async sign on the blocking thread pool
             // nostr-sdk's sign() is async but the actual Schnorr crypto is sync
             tokio::runtime::Handle::current().block_on(async { unsigned.sign(&keys).await })
@@ -120,7 +120,7 @@ impl SigningSession {
     pub async fn sign_canonical(&self, payload: Vec<u8>) -> Result<String, SessionError> {
         let keys = self.keys.clone();
 
-        tokio::task::spawn_blocking(move || {
+        crate::panic_scope::spawn_blocking(move || {
             let digest = Sha256::digest(&payload);
             let message = Message::from_digest_slice(&digest)
                 .map_err(|e| SessionError::Signing(e.to_string()))?;
@@ -141,7 +141,7 @@ impl SigningSession {
         let recipient = *recipient;
         let plaintext = plaintext.to_string();
 
-        tokio::task::spawn_blocking(move || {
+        crate::panic_scope::spawn_blocking(move || {
             nip44::encrypt(&secret, &recipient, &plaintext, nip44::Version::V2)
         })
         .await?
@@ -159,8 +159,8 @@ impl SigningSession {
         let sender = *sender;
         let ciphertext = ciphertext.to_string();
 
-        tokio::task::spawn_blocking(move || {
-            nip44::decrypt(&secret, &sender, &ciphertext).map(SecretString::from)
+        crate::panic_scope::spawn_blocking(move || {
+            crate::nip44::decrypt(&secret, &sender, &ciphertext).map(SecretString::from)
         })
         .await?
         .map_err(|e| SessionError::Encryption(e.to_string()))
@@ -170,6 +170,23 @@ impl SigningSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn nip44_decrypt_rejects_a_payload_below_the_minimum_size() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        let session = SigningSession::new(Keys::generate());
+        let mut payload = vec![7u8; 66];
+        payload[0] = 2;
+        let error = session
+            .nip44_decrypt(&Keys::generate().public_key(), &STANDARD.encode(payload))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, SessionError::Encryption(message) if message.contains("invalid padding")),
+            "{error}"
+        );
+    }
 
     #[test]
     fn test_parse_cache_key_valid() {

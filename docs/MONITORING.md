@@ -81,6 +81,12 @@ gcloud error-reporting events list --project=openvine-co
    - Alert when `storage_unavailable` grows: ATProto OAuth availability depends on Redis while it does
    - Labels are allowlisted and carry no identifiers or token material
 
+6. **Contained Request Panics** (from `GET /api/metrics`)
+   - `keycast_http_request_panics_total` counts panics in HTTP request work, including work a request runs on the blocking pool or in a subtask. Each fails only its request: a handler panic is answered with a 500, and other request work fails the way that request already handles an internal error. Work a request starts but does not wait for, such as the email sent after resend-verification has answered, is contained the same way: its panic is counted and logged, and no response fails
+   - Each one is also logged at `ERROR` with `event="request_panic"`, the panic location and message, inside the request span
+   - A panic outside request handling (the NIP-46 signer, cluster coordination, background writers) is logged with `event="fatal_panic"` and still exits the process
+   - Alert when the counter grows: the instance keeps serving, so a restart no longer signals the failure
+
 ## Health Checks
 
 ### API Health Endpoint
