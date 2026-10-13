@@ -16,7 +16,7 @@ use chrono::Utc;
 use http_body_util::BodyExt;
 use keycast_api::{
     api::http::{
-        admin::{clear_verified_minor_admin, ClearVerifiedMinorParams, UserStatusResponse},
+        admin::{clear_verified_minor_admin, UserStatusResponse, VerifiedMinorParams},
         routes::AuthState,
     },
     handlers::http_rpc_handler::new_http_handler_cache,
@@ -83,7 +83,7 @@ fn build_app(auth_state: AuthState) -> Router {
         delete(
             move |axum::extract::Path(pubkey): axum::extract::Path<String>,
                   headers: axum::http::HeaderMap,
-                  axum::extract::Query(params): axum::extract::Query<ClearVerifiedMinorParams>| {
+                  axum::extract::Query(params): axum::extract::Query<VerifiedMinorParams>| {
                 let state = del_state.clone();
                 let tenant = TenantExtractor(Arc::new(Tenant {
                     id: TENANT_ID,

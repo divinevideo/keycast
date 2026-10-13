@@ -335,7 +335,7 @@ pub fn api_routes(
         )
         .route(
             "/admin/users/:pubkey/verified-minor",
-            delete(admin::clear_verified_minor_admin),
+            put(admin::set_verified_minor_admin).delete(admin::clear_verified_minor_admin),
         )
         .route(
             "/admin/users/:pubkey/deletion",

@@ -19,7 +19,8 @@ use keycast_core::repositories::{
     test_redirect_pattern, AdminAuditEventRecord, AdminAuditEventRepository, AdminUserDetails,
     AdminUserLookup, AdminUserMatchKind, AuthEventRepository, ClaimTokenRepository,
     FullAdminStatusRow, OAuthAuthorizationRepository, RegisteredClient, RegisteredClientRepository,
-    RepositoryError, SupportAdminRepository, UserRepository, VerifiedMinorRow,
+    RepositoryError, SetVerifiedMinorOutcome, SupportAdminRepository, UserRepository,
+    VerifiedMinorRow,
 };
 use keycast_core::types::claim_token::generate_claim_token;
 use keycast_core::types::user::UserStatus;
@@ -2670,10 +2671,10 @@ pub async fn set_user_status_admin(
 
 // --- Clear verified_minor (service-token auth: age-up / revocation) ---
 
-/// Query params for the clear-verified_minor endpoint. Both optional; `actor`
-/// (the moderator's hex pubkey) drives the durable audit row.
+/// Query params for the set and clear verified_minor endpoints. Both optional;
+/// `actor` (the moderator's hex pubkey) drives the durable audit row.
 #[derive(Debug, Deserialize)]
-pub struct ClearVerifiedMinorParams {
+pub struct VerifiedMinorParams {
     pub actor: Option<String>,
     pub reason: Option<String>,
 }
@@ -2711,25 +2712,29 @@ fn sanitize_reason(raw: Option<String>) -> Option<String> {
     }
 }
 
-pub async fn clear_verified_minor_admin(
-    tenant: crate::api::tenant::TenantExtractor,
-    State(auth_state): State<AuthState>,
-    headers: HeaderMap,
-    Path(pubkey): Path<String>,
-    Query(params): Query<ClearVerifiedMinorParams>,
-) -> ApiResult<Json<UserStatusResponse>> {
-    authorize_service_token(&headers)?;
-    let tenant_id = tenant.0.id;
-
-    // Validate the optional actor as a 64-char hex pubkey so a T&S action never
-    // silently loses its audit trail to a malformed actor.
-    if let Some(actor) = params.actor.as_deref() {
+/// A T&S action must never silently lose its audit trail to a malformed actor.
+fn validate_actor(actor: Option<&str>) -> Result<(), ApiError> {
+    if let Some(actor) = actor {
         if actor.len() != 64 || !actor.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(ApiError::bad_request(
                 "actor must be a 64-character hex pubkey",
             ));
         }
     }
+    Ok(())
+}
+
+pub async fn clear_verified_minor_admin(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    headers: HeaderMap,
+    Path(pubkey): Path<String>,
+    Query(params): Query<VerifiedMinorParams>,
+) -> ApiResult<Json<UserStatusResponse>> {
+    authorize_service_token(&headers)?;
+    let tenant_id = tenant.0.id;
+
+    validate_actor(params.actor.as_deref())?;
 
     let reason_clean = sanitize_reason(params.reason);
 
@@ -2820,6 +2825,104 @@ pub async fn clear_verified_minor_admin(
             invalidated,
             "Invalidated outstanding claim tokens on verified_minor clear"
         );
+    }
+
+    let FullAdminStatusRow {
+        status,
+        suspended_reason,
+        suspended_at,
+        verified_minor,
+        verified_minor_at,
+    } = user_repo
+        .get_full_admin_status(&pubkey, tenant_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("User not found"))?;
+
+    Ok(Json(UserStatusResponse {
+        pubkey,
+        status: status.as_str().to_string(),
+        suspended_reason,
+        suspended_at,
+        verified_minor,
+        verified_minor_at,
+    }))
+}
+
+// --- Set verified_minor (service-token auth: age-review approval) ---
+
+/// Confer verified_minor on an existing account. relay-manager calls this when a
+/// moderator approves an age-review case as a 13-15 protected minor, so the
+/// approval is respected on later reports (DM gate, key-egress gate, auto-clear).
+///
+/// Unlike clear, this does not touch claim tokens: clearing invalidates them to
+/// close a revocation door, and setting opens no door.
+pub async fn set_verified_minor_admin(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    headers: HeaderMap,
+    Path(pubkey): Path<String>,
+    Query(params): Query<VerifiedMinorParams>,
+) -> ApiResult<Json<UserStatusResponse>> {
+    authorize_service_token(&headers)?;
+    let tenant_id = tenant.0.id;
+    validate_actor(params.actor.as_deref())?;
+    let reason_clean = sanitize_reason(params.reason);
+
+    let user_repo = UserRepository::new(auth_state.state.db.clone());
+    let outcome = user_repo.set_verified_minor(&pubkey, tenant_id).await?;
+    if outcome == SetVerifiedMinorOutcome::Unclaimed {
+        tracing::warn!(
+            event = "verified_minor_set_refused",
+            pubkey = %pubkey,
+            actor = ?params.actor,
+            "Refused verified_minor set on a credential-less account"
+        );
+        return Err(ApiError::conflict(
+            "account_unclaimed: account has no login credentials",
+        ));
+    }
+    super::nostr_rpc::invalidate_account_status_cache(
+        &auth_state.state.account_status_cache,
+        &pubkey,
+        tenant_id,
+    )
+    .await;
+
+    let transitioned = outcome == SetVerifiedMinorOutcome::Set;
+    tracing::info!(
+        event = "verified_minor_set",
+        pubkey = %pubkey,
+        actor = ?params.actor,
+        reason = ?reason_clean,
+        transitioned,
+        "Admin set verified_minor"
+    );
+
+    // Best-effort audit row, only for a real transition and only with an actor
+    // (actor_pubkey is NOT NULL). Same bar as the clear handler: a retry after a
+    // lost response must not assert a second state change.
+    if transitioned {
+        if let Some(actor) = params.actor.as_deref() {
+            let audit_repo = AdminAuditEventRepository::new(auth_state.state.db.clone());
+            if let Err(error) = audit_repo
+                .record(AdminAuditEventRecord {
+                    tenant_id,
+                    actor_pubkey: actor.to_string(),
+                    action: "set_verified_minor".to_string(),
+                    target_resource_type: "user".to_string(),
+                    target_resource_id: Some(pubkey.clone()),
+                    target_client_id: None,
+                    metadata_json: serde_json::json!({ "reason": reason_clean }),
+                })
+                .await
+            {
+                tracing::error!(
+                    pubkey = %pubkey,
+                    error = %error,
+                    "Failed to write admin_audit_events row for verified_minor set"
+                );
+            }
+        }
     }
 
     let FullAdminStatusRow {
