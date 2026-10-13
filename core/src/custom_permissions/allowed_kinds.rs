@@ -41,6 +41,7 @@ fn kind_to_friendly_name(kind: u16) -> &'static str {
         1059 => "Send and read private messages",
         9735 => "Send zaps",
         10002 => "Set your relay list",
+        10011 => "Update your linked accounts",
         30023 => "Write long-form articles",
         _ => "Other actions",
     }
