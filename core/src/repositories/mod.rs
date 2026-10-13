@@ -66,5 +66,6 @@ pub use user::{
     og_diviner_cutoff, AccountDeletionOutcome, AccountStatusRow, AccountStatusWithMinorRow,
     AdminUserDetails, AdminUserLookup, AdminUserMatchKind, ClaimConsumeOutcome, ConditionalWrite,
     DeleteAccountResult, FinalizeEmailOutcome, FullAdminStatusRow, PendingEmailChange,
-    PendingEmailSide, UserRepository, VerificationTokenData, VerifiedMinorRow,
+    PendingEmailSide, SetVerifiedMinorOutcome, UserRepository, VerificationTokenData,
+    VerifiedMinorRow,
 };

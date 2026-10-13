@@ -414,6 +414,20 @@ pub struct VerifiedMinorRow {
     pub verified_minor_at: Option<DateTime<Utc>>,
 }
 
+/// Outcome of [`UserRepository::set_verified_minor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetVerifiedMinorOutcome {
+    /// The flag went FALSE -> TRUE and `verified_minor_at` was stamped.
+    Set,
+    /// The flag was already TRUE. Nothing was written.
+    AlreadySet,
+    /// The row has neither an email nor a password hash. Refused without a write:
+    /// keycast reads `verified_minor AND email IS NULL AND password_hash IS NULL` as an
+    /// unclaimed minor, and create-minor-account re-issues claim links for those by
+    /// username, so flagging a credential-less row would make it claimable.
+    Unclaimed,
+}
+
 /// Status + suspension + verified-minor fields for `get_full_admin_status`
 /// (admin status endpoints).
 #[derive(Debug, FromRow)]
@@ -548,10 +562,12 @@ impl UserRepository {
     /// spelling of account completeness in
     /// this codebase -- [`Self::is_unclaimed`] uses `email IS NULL`,
     /// [`Self::is_unclaimed_minor_in_tx`] adds `verified_minor` and a NULL
-    /// password hash, and `OAuthCodeRepository::materialize_pending_registration`
-    /// uses a third combination. They are not interchangeable, and this is the
-    /// only one whose disagreement is silent: it returns a wrong boolean rather
-    /// than an error. If what "claimed" means ever changes, this predicate has
+    /// password hash, [`Self::set_verified_minor`] refuses on
+    /// `email IS NULL AND password_hash IS NULL` (its `Unclaimed` guard), and
+    /// `OAuthCodeRepository::materialize_pending_registration` uses a third
+    /// combination. They are not interchangeable, and this is the only one
+    /// whose disagreement is silent: it returns a wrong boolean rather than an
+    /// error. If what "claimed" means ever changes, this predicate has
     /// to be revisited with the other three.
     pub async fn is_og_diviner(
         &self,
@@ -2252,13 +2268,16 @@ impl UserRepository {
         // with the username and the AP key: a suspended or banned actor that rotates
         // its Nostr key must stay restricted on the new pubkey, otherwise the
         // replacement row would default to `active` and hand the actor back both
-        // Nostr and ActivityPub signing.
+        // Nostr and ActivityPub signing. `FOR UPDATE` so a restriction committed by a
+        // concurrent writer (set_verified_minor, a status change) is either copied here
+        // or lands on the row after it is orphaned; an unlocked read would copy a stale
+        // value onto the live account.
         let old_identity: RotatedIdentityRow = sqlx::query_as(
             "SELECT username, status, suspended_reason, suspended_at, verified_minor, verified_minor_at, \
                     email_marketing_consent, email_marketing_consent_at, \
                     email_marketing_consent_source, email_marketing_consent_app_version, \
                     email_marketing_global_optout, email_marketing_optout_observed_at \
-             FROM users WHERE pubkey = $1 AND tenant_id = $2",
+             FROM users WHERE pubkey = $1 AND tenant_id = $2 FOR UPDATE",
         )
         .bind(old_pubkey)
         .bind(tenant_id)
@@ -2420,6 +2439,58 @@ impl UserRepository {
         Ok(transitioned)
     }
 
+    /// Confer the verified_minor designation on an existing account (age-review
+    /// approval). The set-direction mirror of [`Self::clear_verified_minor`]. Runs in
+    /// one short transaction (no network or hashing inside): the row is read
+    /// `FOR UPDATE` first, so a concurrent set that commits while this one waits is
+    /// re-read as already set (`AlreadySet`) instead of racing the write. Distinguishes
+    /// a missing user, an already-set flag, a refused credential-less row, and a real
+    /// transition. Touches only the two minor columns plus updated_at, and only on a
+    /// transition.
+    pub async fn set_verified_minor(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<SetVerifiedMinorOutcome, RepositoryError> {
+        let mut tx = self.pool.begin().await?;
+
+        let existing: Option<(bool, bool)> = sqlx::query_as(
+            "SELECT verified_minor, (email IS NULL AND password_hash IS NULL) \
+             FROM users WHERE pubkey = $1 AND tenant_id = $2 FOR UPDATE",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some((already_set, credentialless)) = existing else {
+            return Err(RepositoryError::NotFound("user not found".to_string()));
+        };
+        if already_set {
+            tx.commit().await?;
+            return Ok(SetVerifiedMinorOutcome::AlreadySet);
+        }
+        // Same "no login credentials" spelling as the unclaimed-minor predicate
+        // (`email IS NULL AND password_hash IS NULL`, see `is_unclaimed_minor_in_tx`
+        // and `find_user_minor_status_by_username`); revisit this guard if it changes.
+        if credentialless {
+            tx.commit().await?;
+            return Ok(SetVerifiedMinorOutcome::Unclaimed);
+        }
+
+        sqlx::query(
+            "UPDATE users SET verified_minor = TRUE, verified_minor_at = $3, updated_at = $3 \
+             WHERE pubkey = $1 AND tenant_id = $2",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .bind(Utc::now())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(SetVerifiedMinorOutcome::Set)
+    }
+
     /// Combined status + verified_minor query for admin status endpoints.
     pub async fn get_full_admin_status(
         &self,
@@ -2441,7 +2512,13 @@ impl UserRepository {
     /// unclaimed approved-minors (retryable) from other accounts (conflict).
     /// Returns (pubkey, verified_minor, is_unclaimed) in a single query.
     /// NOTE: `is_unclaimed` relies on email+password_hash being NULL — must stay
-    /// in sync with the claim flow that sets both columns on completion.
+    /// in sync with the claim flow that sets both columns on completion. The
+    /// `Unclaimed` guard in `set_verified_minor` is a sibling of that predicate
+    /// (`email IS NULL AND password_hash IS NULL`, checked on rows not yet
+    /// flagged). It refuses to flag a credential-less row because flagging it
+    /// would make the row match `verified_minor AND email IS NULL AND
+    /// password_hash IS NULL`, so a change to that predicate must revisit the
+    /// guard too.
     pub async fn find_user_minor_status_by_username(
         &self,
         username: &str,
@@ -4898,6 +4975,316 @@ mod tests {
         assert!(!verified_minor);
 
         cleanup_user(&pool, &pubkey).await;
+    }
+
+    async fn insert_user_row(
+        pool: &PgPool,
+        pubkey: &str,
+        tenant_id: i64,
+        minor: bool,
+        has_email: bool,
+        has_password: bool,
+    ) {
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, verified_minor, verified_minor_at, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, CASE WHEN $5 THEN NOW() - INTERVAL '1 day' END, NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day')",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .bind(has_email.then(|| format!("{}@example.test", &pubkey[..16])))
+        .bind(has_password.then(|| "$2b$04$placeholderhashplaceholderhashplaceholderha".to_string()))
+        .bind(minor)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_set_verified_minor_sets_flag_and_timestamp() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let pubkey = Keys::generate().public_key().to_hex();
+        insert_user_row(&pool, &pubkey, 1, false, true, true).await;
+
+        let outcome = repo.set_verified_minor(&pubkey, 1).await.unwrap();
+        assert_eq!(outcome, SetVerifiedMinorOutcome::Set);
+
+        let row = repo.get_verified_minor(&pubkey, 1).await.unwrap().unwrap();
+        assert!(row.verified_minor);
+        assert!(row.verified_minor_at.is_some());
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_set_verified_minor_already_set_is_noop_and_keeps_timestamp() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let pubkey = Keys::generate().public_key().to_hex();
+        insert_user_row(&pool, &pubkey, 1, true, true, true).await;
+        let (before_at, before_updated): (Option<DateTime<Utc>>, DateTime<Utc>) = sqlx::query_as(
+            "SELECT verified_minor_at, updated_at FROM users WHERE pubkey = $1 AND tenant_id = 1",
+        )
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let outcome = repo.set_verified_minor(&pubkey, 1).await.unwrap();
+        assert_eq!(outcome, SetVerifiedMinorOutcome::AlreadySet);
+
+        let (after_at, after_updated): (Option<DateTime<Utc>>, DateTime<Utc>) = sqlx::query_as(
+            "SELECT verified_minor_at, updated_at FROM users WHERE pubkey = $1 AND tenant_id = 1",
+        )
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            before_at, after_at,
+            "original verified_minor_at must be preserved"
+        );
+        assert_eq!(
+            before_updated, after_updated,
+            "a no-op must not bump updated_at"
+        );
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_set_verified_minor_refuses_credentialless_row() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let pubkey = Keys::generate().public_key().to_hex();
+        insert_user_row(&pool, &pubkey, 1, false, false, false).await;
+        let before_updated: DateTime<Utc> =
+            sqlx::query_scalar("SELECT updated_at FROM users WHERE pubkey = $1 AND tenant_id = 1")
+                .bind(&pubkey)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let outcome = repo.set_verified_minor(&pubkey, 1).await.unwrap();
+        assert_eq!(outcome, SetVerifiedMinorOutcome::Unclaimed);
+        let after_updated: DateTime<Utc> =
+            sqlx::query_scalar("SELECT updated_at FROM users WHERE pubkey = $1 AND tenant_id = 1")
+                .bind(&pubkey)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            before_updated, after_updated,
+            "a refused set must not write"
+        );
+        let row = repo.get_verified_minor(&pubkey, 1).await.unwrap().unwrap();
+        assert!(
+            !row.verified_minor,
+            "a credential-less row must not be flagged"
+        );
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_set_verified_minor_onboarded_unclaimed_minor_is_already_set() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let pubkey = Keys::generate().public_key().to_hex();
+        insert_user_row(&pool, &pubkey, 1, true, false, false).await;
+
+        let outcome = repo.set_verified_minor(&pubkey, 1).await.unwrap();
+        assert_eq!(outcome, SetVerifiedMinorOutcome::AlreadySet);
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_set_verified_minor_is_tenant_scoped() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let pubkey = Keys::generate().public_key().to_hex();
+        insert_user_row(&pool, &pubkey, 1, false, true, true).await;
+
+        let err = repo.set_verified_minor(&pubkey, 999_999).await.unwrap_err();
+        assert!(matches!(err, RepositoryError::NotFound(_)));
+        let row = repo.get_verified_minor(&pubkey, 1).await.unwrap().unwrap();
+        assert!(
+            !row.verified_minor,
+            "another tenant's set must not touch this row"
+        );
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_set_verified_minor_unknown_pubkey_not_found() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let pubkey = Keys::generate().public_key().to_hex();
+        let err = repo.set_verified_minor(&pubkey, 1).await.unwrap_err();
+        assert!(matches!(err, RepositoryError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn test_set_verified_minor_leaves_status_untouched() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let pubkey = Keys::generate().public_key().to_hex();
+        insert_user_row(&pool, &pubkey, 1, false, true, true).await;
+        sqlx::query(
+            "UPDATE users SET status = 'suspended', suspended_reason = 'age_review', suspended_at = NOW() \
+             WHERE pubkey = $1 AND tenant_id = 1",
+        )
+        .bind(&pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let before_suspended_at: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT suspended_at FROM users WHERE pubkey = $1 AND tenant_id = 1",
+        )
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        repo.set_verified_minor(&pubkey, 1).await.unwrap();
+
+        let (status, reason, suspended_at): (String, Option<String>, Option<DateTime<Utc>>) =
+            sqlx::query_as(
+            "SELECT status, suspended_reason, suspended_at FROM users WHERE pubkey = $1 AND tenant_id = 1",
+        )
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "suspended");
+        assert_eq!(reason.as_deref(), Some("age_review"));
+        assert!(before_suspended_at.is_some());
+        assert_eq!(suspended_at, before_suspended_at);
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_set_verified_minor_email_only_row_is_not_credentialless() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let pubkey = Keys::generate().public_key().to_hex();
+        insert_user_row(&pool, &pubkey, 1, false, true, false).await;
+
+        let outcome = repo.set_verified_minor(&pubkey, 1).await.unwrap();
+        assert_eq!(outcome, SetVerifiedMinorOutcome::Set);
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    #[tokio::test]
+    async fn test_set_verified_minor_password_only_row_is_not_credentialless() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let pubkey = Keys::generate().public_key().to_hex();
+        insert_user_row(&pool, &pubkey, 1, false, false, true).await;
+
+        let outcome = repo.set_verified_minor(&pubkey, 1).await.unwrap();
+        assert_eq!(outcome, SetVerifiedMinorOutcome::Set);
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    /// A concurrent set that commits while ours is blocked on the row lock must read
+    /// as AlreadySet (and keep the first writer's timestamp), not as an error.
+    #[tokio::test]
+    async fn test_set_verified_minor_concurrent_set_reports_already_set() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let pubkey = Keys::generate().public_key().to_hex();
+        insert_user_row(&pool, &pubkey, 1, false, true, true).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        let tx_at: DateTime<Utc> = sqlx::query_scalar(
+            "UPDATE users SET verified_minor = TRUE, verified_minor_at = NOW(), updated_at = NOW() \
+             WHERE pubkey = $1 AND tenant_id = 1 RETURNING verified_minor_at",
+        )
+        .bind(&pubkey)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+
+        let racer = tokio::spawn({
+            let repo = UserRepository::new(pool.clone());
+            let pubkey = pubkey.clone();
+            async move { repo.set_verified_minor(&pubkey, 1).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!racer.is_finished(), "the racer must block on the row lock");
+        tx.commit().await.unwrap();
+
+        let outcome = racer.await.unwrap().unwrap();
+        assert_eq!(outcome, SetVerifiedMinorOutcome::AlreadySet);
+        let row = repo.get_verified_minor(&pubkey, 1).await.unwrap().unwrap();
+        assert_eq!(row.verified_minor_at, Some(tx_at));
+        cleanup_user(&pool, &pubkey).await;
+    }
+
+    /// A key rotation that starts while a verified_minor set holds the row must carry the
+    /// committed flag to the new identity, not a value it read before the set committed.
+    #[tokio::test]
+    async fn test_change_key_waits_for_concurrent_verified_minor_set() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let old_pubkey = Keys::generate().public_key().to_hex();
+        let new_pubkey = Keys::generate().public_key().to_hex();
+        insert_user_row(&pool, &old_pubkey, 1, false, true, true).await;
+        let email = format!("{}@example.test", &old_pubkey[..16]);
+
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(
+            "UPDATE users SET verified_minor = TRUE, verified_minor_at = NOW(), updated_at = NOW() \
+             WHERE pubkey = $1 AND tenant_id = 1",
+        )
+        .bind(&old_pubkey)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        let rotation = tokio::spawn({
+            let repo = UserRepository::new(pool.clone());
+            let (old_pubkey, new_pubkey, email) =
+                (old_pubkey.clone(), new_pubkey.clone(), email.clone());
+            async move {
+                repo.change_key_transaction(
+                    &old_pubkey,
+                    &new_pubkey,
+                    1,
+                    &email,
+                    "hashed",
+                    b"secret",
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !rotation.is_finished(),
+            "the rotation must block on the row lock"
+        );
+        tx.commit().await.unwrap();
+        rotation.await.unwrap().unwrap();
+
+        let row = repo
+            .get_verified_minor(&new_pubkey, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            row.verified_minor,
+            "the live account must keep the approval committed during rotation"
+        );
+
+        sqlx::query("DELETE FROM personal_keys WHERE user_pubkey = $1")
+            .bind(&new_pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM users WHERE pubkey = ANY($1)")
+            .bind(vec![old_pubkey, new_pubkey])
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     async fn create_bare_user(pool: &PgPool, pubkey: &str) {
