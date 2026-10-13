@@ -357,6 +357,38 @@ async fn test_clear_malformed_actor_400_and_flag_intact() {
 }
 
 #[tokio::test]
+async fn test_clear_uppercase_pubkey_is_400_and_row_untouched() {
+    common::assert_test_database_url();
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+    let pool = common::setup_test_db().await;
+    let app = build_app(create_test_auth_state(pool.clone()));
+    let pubkey = create_verified_minor_user(&pool).await;
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/admin/users/{}/verified-minor",
+                    pubkey.to_uppercase()
+                ))
+                .header("authorization", format!("Bearer {}", SERVICE_TOKEN))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let row: (bool,) = sqlx::query_as("SELECT verified_minor FROM users WHERE pubkey = $1")
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(row.0);
+}
+
+#[tokio::test]
 async fn test_clear_reason_sanitized_in_audit() {
     common::assert_test_database_url();
     unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };

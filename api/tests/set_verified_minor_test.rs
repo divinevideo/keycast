@@ -313,6 +313,72 @@ async fn test_set_onboarded_unclaimed_minor_is_200() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+/// Setting opens no revocation door, so it must leave a live claim link alone
+/// (clear invalidates it; set must not).
+#[tokio::test]
+async fn test_set_does_not_invalidate_claim_token() {
+    common::assert_test_database_url();
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+    let pool = common::setup_test_db().await;
+    let pubkey = create_user(&pool, true, false).await;
+    let token = format!("tok_{}", Keys::generate().public_key().to_hex());
+    sqlx::query(
+        "INSERT INTO account_claim_tokens (token, user_pubkey, expires_at, created_at, tenant_id) \
+         VALUES ($1, $2, NOW() + INTERVAL '7 days', NOW(), $3)",
+    )
+    .bind(&token)
+    .bind(&pubkey)
+    .bind(TENANT_ID)
+    .execute(&pool)
+    .await
+    .expect("create claim token");
+
+    let resp = put_set(
+        build_app(create_test_auth_state(pool.clone())),
+        &pubkey,
+        "",
+        Some(SERVICE_TOKEN),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let valid_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM account_claim_tokens \
+         WHERE token = $1 AND used_at IS NULL AND invalidated_at IS NULL AND expires_at > NOW()",
+    )
+    .bind(&token)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(valid_count.0, 1, "set must not touch claim tokens");
+}
+
+#[tokio::test]
+async fn test_set_uppercase_pubkey_is_400_and_row_untouched() {
+    common::assert_test_database_url();
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+    let pool = common::setup_test_db().await;
+    let pubkey = create_user(&pool, false, true).await;
+    let resp = put_set(
+        build_app(create_test_auth_state(pool.clone())),
+        &pubkey.to_uppercase(),
+        "",
+        Some(SERVICE_TOKEN),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(resp).await["error"],
+        "pubkey must be a 64-character lowercase hex pubkey"
+    );
+    let flagged: (bool,) = sqlx::query_as("SELECT verified_minor FROM users WHERE pubkey = $1")
+        .bind(&pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!flagged.0);
+}
+
 #[tokio::test]
 async fn test_set_unknown_pubkey_is_404_user_not_found() {
     common::assert_test_database_url();

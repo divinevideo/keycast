@@ -562,7 +562,8 @@ impl UserRepository {
     /// spelling of account completeness in
     /// this codebase -- [`Self::is_unclaimed`] uses `email IS NULL`,
     /// [`Self::is_unclaimed_minor_in_tx`] adds `verified_minor` and a NULL
-    /// password hash, and `OAuthCodeRepository::materialize_pending_registration`
+    /// password hash, [`Self::set_verified_minor`] refuses on `email IS NULL AND
+    /// password_hash IS NULL` (its `Unclaimed` guard), and `OAuthCodeRepository::materialize_pending_registration`
     /// uses a third combination. They are not interchangeable, and this is the
     /// only one whose disagreement is silent: it returns a wrong boolean rather
     /// than an error. If what "claimed" means ever changes, this predicate has
@@ -2465,6 +2466,9 @@ impl UserRepository {
             tx.commit().await?;
             return Ok(SetVerifiedMinorOutcome::AlreadySet);
         }
+        // Same "no login credentials" spelling as the unclaimed-minor predicate
+        // (`email IS NULL AND password_hash IS NULL`, see `is_unclaimed_minor_in_tx`
+        // and `find_user_minor_status_by_username`); revisit this guard if it changes.
         if credentialless {
             tx.commit().await?;
             return Ok(SetVerifiedMinorOutcome::Unclaimed);
@@ -2504,7 +2508,10 @@ impl UserRepository {
     /// unclaimed approved-minors (retryable) from other accounts (conflict).
     /// Returns (pubkey, verified_minor, is_unclaimed) in a single query.
     /// NOTE: `is_unclaimed` relies on email+password_hash being NULL — must stay
-    /// in sync with the claim flow that sets both columns on completion.
+    /// in sync with the claim flow that sets both columns on completion. The
+    /// `Unclaimed` guard in `set_verified_minor` restates the same predicate
+    /// (`verified_minor AND email IS NULL AND password_hash IS NULL`); revisit it
+    /// too if that changes.
     pub async fn find_user_minor_status_by_username(
         &self,
         username: &str,

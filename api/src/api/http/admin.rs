@@ -2724,6 +2724,18 @@ fn validate_actor(actor: Option<&str>) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// A path pubkey that is not 64 lowercase hex can never match a stored row, and
+/// the resulting 404 "user not found" reads to relay-manager as "not applicable"
+/// and is silently skipped. Reject it loudly instead.
+fn validate_pubkey_path(pubkey: &str) -> Result<(), ApiError> {
+    if pubkey.len() != 64 || !pubkey.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) {
+        return Err(ApiError::bad_request(
+            "pubkey must be a 64-character lowercase hex pubkey",
+        ));
+    }
+    Ok(())
+}
+
 pub async fn clear_verified_minor_admin(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
@@ -2735,6 +2747,7 @@ pub async fn clear_verified_minor_admin(
     let tenant_id = tenant.0.id;
 
     validate_actor(params.actor.as_deref())?;
+    validate_pubkey_path(&pubkey)?;
 
     let reason_clean = sanitize_reason(params.reason);
 
@@ -2866,6 +2879,7 @@ pub async fn set_verified_minor_admin(
     authorize_service_token(&headers)?;
     let tenant_id = tenant.0.id;
     validate_actor(params.actor.as_deref())?;
+    validate_pubkey_path(&pubkey)?;
     let reason_clean = sanitize_reason(params.reason);
 
     let user_repo = UserRepository::new(auth_state.state.db.clone());
