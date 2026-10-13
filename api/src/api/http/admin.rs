@@ -2836,7 +2836,7 @@ pub async fn clear_verified_minor_admin(
     } = user_repo
         .get_full_admin_status(&pubkey, tenant_id)
         .await?
-        .ok_or_else(|| ApiError::not_found("User not found"))?;
+        .ok_or_else(|| ApiError::not_found("user not found"))?;
 
     Ok(Json(UserStatusResponse {
         pubkey,
@@ -2934,7 +2934,7 @@ pub async fn set_verified_minor_admin(
     } = user_repo
         .get_full_admin_status(&pubkey, tenant_id)
         .await?
-        .ok_or_else(|| ApiError::not_found("User not found"))?;
+        .ok_or_else(|| ApiError::not_found("user not found"))?;
 
     Ok(Json(UserStatusResponse {
         pubkey,

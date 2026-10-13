@@ -285,10 +285,10 @@ async fn test_set_credentialless_row_is_409_account_unclaimed() {
     .await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     let body = body_json(resp).await;
-    assert!(body["error"]
-        .as_str()
-        .unwrap()
-        .starts_with("account_unclaimed"));
+    assert_eq!(
+        body["error"],
+        "account_unclaimed: account has no login credentials"
+    );
     let flagged: (bool,) = sqlx::query_as("SELECT verified_minor FROM users WHERE pubkey = $1")
         .bind(&pubkey)
         .fetch_one(&pool)
