@@ -55,6 +55,17 @@ jobs:
         ports:
           - 16379:6379
 
+      # Dedicated to the failover test, which demotes it to a replica.
+      redis-failover:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 16380:6379
+
     steps:
       - uses: actions/checkout@v6
 
@@ -87,6 +98,7 @@ jobs:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/keycast_test
           REDIS_URL: redis://localhost:16379
           TEST_REDIS_URL: redis://localhost:16379
+          REDIS_FAILOVER_TEST_URL: redis://localhost:16380
         run: |
           cargo test --workspace --verbose
           cargo test -p keycast_core --features integration-tests --lib --tests --verbose
