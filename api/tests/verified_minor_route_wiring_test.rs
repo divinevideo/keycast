@@ -26,8 +26,10 @@ async fn verified_minor_routes_are_wired_through_api_routes() {
     common::assert_test_database_url();
     // Service-token auth answers 500 when unconfigured; set it so 401 is the unauthenticated answer.
     unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", "wiring-test-token") };
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string());
     let pool = PgPoolOptions::new()
-        .connect_lazy("postgres://postgres:password@localhost/keycast_test")
+        .connect_lazy(&database_url)
         .expect("local test database URL should parse");
     let (auth_state, _producer) = common::create_test_auth_state(pool.clone());
     auth_state
