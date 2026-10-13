@@ -2268,13 +2268,16 @@ impl UserRepository {
         // with the username and the AP key: a suspended or banned actor that rotates
         // its Nostr key must stay restricted on the new pubkey, otherwise the
         // replacement row would default to `active` and hand the actor back both
-        // Nostr and ActivityPub signing.
+        // Nostr and ActivityPub signing. `FOR UPDATE` so a restriction committed by a
+        // concurrent writer (set_verified_minor, a status change) is either copied here
+        // or lands on the row after it is orphaned; an unlocked read would copy a stale
+        // value onto the live account.
         let old_identity: RotatedIdentityRow = sqlx::query_as(
             "SELECT username, status, suspended_reason, suspended_at, verified_minor, verified_minor_at, \
                     email_marketing_consent, email_marketing_consent_at, \
                     email_marketing_consent_source, email_marketing_consent_app_version, \
                     email_marketing_global_optout, email_marketing_optout_observed_at \
-             FROM users WHERE pubkey = $1 AND tenant_id = $2",
+             FROM users WHERE pubkey = $1 AND tenant_id = $2 FOR UPDATE",
         )
         .bind(old_pubkey)
         .bind(tenant_id)
@@ -5215,6 +5218,73 @@ mod tests {
         let row = repo.get_verified_minor(&pubkey, 1).await.unwrap().unwrap();
         assert_eq!(row.verified_minor_at, Some(tx_at));
         cleanup_user(&pool, &pubkey).await;
+    }
+
+    /// A key rotation that starts while a verified_minor set holds the row must carry the
+    /// committed flag to the new identity, not a value it read before the set committed.
+    #[tokio::test]
+    async fn test_change_key_waits_for_concurrent_verified_minor_set() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let old_pubkey = Keys::generate().public_key().to_hex();
+        let new_pubkey = Keys::generate().public_key().to_hex();
+        insert_user_row(&pool, &old_pubkey, 1, false, true, true).await;
+        let email = format!("{}@example.test", &old_pubkey[..16]);
+
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(
+            "UPDATE users SET verified_minor = TRUE, verified_minor_at = NOW(), updated_at = NOW() \
+             WHERE pubkey = $1 AND tenant_id = 1",
+        )
+        .bind(&old_pubkey)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        let rotation = tokio::spawn({
+            let repo = UserRepository::new(pool.clone());
+            let (old_pubkey, new_pubkey, email) =
+                (old_pubkey.clone(), new_pubkey.clone(), email.clone());
+            async move {
+                repo.change_key_transaction(
+                    &old_pubkey,
+                    &new_pubkey,
+                    1,
+                    &email,
+                    "hashed",
+                    b"secret",
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !rotation.is_finished(),
+            "the rotation must block on the row lock"
+        );
+        tx.commit().await.unwrap();
+        rotation.await.unwrap().unwrap();
+
+        let row = repo
+            .get_verified_minor(&new_pubkey, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            row.verified_minor,
+            "the live account must keep the approval committed during rotation"
+        );
+
+        sqlx::query("DELETE FROM personal_keys WHERE user_pubkey = $1")
+            .bind(&new_pubkey)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM users WHERE pubkey = ANY($1)")
+            .bind(vec![old_pubkey, new_pubkey])
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     async fn create_bare_user(pool: &PgPool, pubkey: &str) {
