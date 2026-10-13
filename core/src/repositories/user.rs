@@ -2435,59 +2435,52 @@ impl UserRepository {
     }
 
     /// Confer the verified_minor designation on an existing account (age-review
-    /// approval). The set-direction mirror of [`Self::clear_verified_minor`]: one
-    /// statement distinguishes a missing user, an already-set flag, a refused
-    /// credential-less row, and a real transition. Touches only the two minor columns
-    /// plus updated_at, and only on a transition.
+    /// approval). The set-direction mirror of [`Self::clear_verified_minor`]. Runs in
+    /// one short transaction (no network or hashing inside): the row is read
+    /// `FOR UPDATE` first, so a concurrent set that commits while this one waits is
+    /// re-read as already set (`AlreadySet`) instead of racing the write. Distinguishes
+    /// a missing user, an already-set flag, a refused credential-less row, and a real
+    /// transition. Touches only the two minor columns plus updated_at, and only on a
+    /// transition.
     pub async fn set_verified_minor(
         &self,
         pubkey: &str,
         tenant_id: i64,
     ) -> Result<SetVerifiedMinorOutcome, RepositoryError> {
-        let (user_exists, already_set, credentialless, transitioned): (bool, bool, bool, bool) =
-            sqlx::query_as(
-                "WITH existing AS ( \
-                     SELECT verified_minor, (email IS NULL AND password_hash IS NULL) AS credentialless \
-                     FROM users WHERE pubkey = $1 AND tenant_id = $2 FOR UPDATE \
-                 ), changed AS ( \
-                     UPDATE users \
-                     SET verified_minor = TRUE, verified_minor_at = $3, updated_at = $3 \
-                     WHERE pubkey = $1 AND tenant_id = $2 AND verified_minor = FALSE \
-                       AND NOT (email IS NULL AND password_hash IS NULL) \
-                     RETURNING 1 \
-                 ) \
-                 SELECT EXISTS (SELECT 1 FROM existing), \
-                        COALESCE((SELECT verified_minor FROM existing), FALSE), \
-                        COALESCE((SELECT credentialless FROM existing), FALSE), \
-                        EXISTS (SELECT 1 FROM changed)",
-            )
-            .bind(pubkey)
-            .bind(tenant_id)
-            .bind(Utc::now())
-            .fetch_one(&self.pool)
-            .await?;
+        let mut tx = self.pool.begin().await?;
 
-        if !user_exists {
+        let existing: Option<(bool, bool)> = sqlx::query_as(
+            "SELECT verified_minor, (email IS NULL AND password_hash IS NULL) \
+             FROM users WHERE pubkey = $1 AND tenant_id = $2 FOR UPDATE",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some((already_set, credentialless)) = existing else {
             return Err(RepositoryError::NotFound("user not found".to_string()));
+        };
+        if already_set {
+            tx.commit().await?;
+            return Ok(SetVerifiedMinorOutcome::AlreadySet);
         }
-        // `existing` locks the row (FOR UPDATE), so under READ COMMITTED a concurrent
-        // set that committed first is re-read as TRUE here and reported AlreadySet
-        // rather than falling through. `transitioned` is the only signal that a write
-        // happened.
-        Ok(if transitioned {
-            SetVerifiedMinorOutcome::Set
-        } else if already_set {
-            SetVerifiedMinorOutcome::AlreadySet
-        } else if credentialless {
-            SetVerifiedMinorOutcome::Unclaimed
-        } else {
-            // Not expected: `existing` holds the row lock, so the row cannot change
-            // between the probe and the update. Fail loudly rather than report a write
-            // that did not happen.
-            return Err(RepositoryError::Database(
-                "set_verified_minor: no outcome matched a present row".to_string(),
-            ));
-        })
+        if credentialless {
+            tx.commit().await?;
+            return Ok(SetVerifiedMinorOutcome::Unclaimed);
+        }
+
+        sqlx::query(
+            "UPDATE users SET verified_minor = TRUE, verified_minor_at = $3, updated_at = $3 \
+             WHERE pubkey = $1 AND tenant_id = $2",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .bind(Utc::now())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(SetVerifiedMinorOutcome::Set)
     }
 
     /// Combined status + verified_minor query for admin status endpoints.
