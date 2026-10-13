@@ -396,6 +396,51 @@ mod tests {
         registry.deregister().await.unwrap();
     }
 
+    /// Demotes the server, so it runs only against a dedicated instance named by
+    /// `REDIS_FAILOVER_TEST_URL`, never the shared test Redis.
+    #[tokio::test]
+    #[ignore = "demotes the server: requires a dedicated Redis via REDIS_FAILOVER_TEST_URL"]
+    async fn test_heartbeat_reconnects_after_read_only() {
+        let Ok(redis_url) = std::env::var("REDIS_FAILOVER_TEST_URL") else {
+            eprintln!("skipping: REDIS_FAILOVER_TEST_URL is not set");
+            return;
+        };
+        let mut registry = RedisRegistry::register_with_prefix(&redis_url, Some(&test_prefix()))
+            .await
+            .unwrap();
+        let before = registry_client_id(&mut registry).await;
+        let mut admin = redis::Client::open(redis_url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+
+        // Port 1 never answers, so the node stays a replica until promoted.
+        redis::cmd("REPLICAOF")
+            .arg("127.0.0.1")
+            .arg(1)
+            .query_async::<()>(&mut admin)
+            .await
+            .unwrap();
+        let while_replica = registry.heartbeat().await;
+        redis::cmd("REPLICAOF")
+            .arg("NO")
+            .arg("ONE")
+            .query_async::<()>(&mut admin)
+            .await
+            .unwrap();
+
+        assert!(while_replica.is_err(), "a replica refuses the heartbeat");
+        assert_ne!(
+            registry_client_id(&mut registry).await,
+            before,
+            "the heartbeat should reconnect after READONLY"
+        );
+        registry.heartbeat().await.unwrap();
+
+        registry.deregister().await.unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "requires Redis via TEST_REDIS_URL or local Redis on localhost:16379"]
     async fn test_registry_multiple_instances_unique_ids() {
