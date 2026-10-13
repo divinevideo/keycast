@@ -43,6 +43,19 @@ const TOKEN_FETCH_BASE_DELAY_MS: u64 = 100;
 /// Maximum jitter in milliseconds added to retry delay to avoid thundering herd.
 const TOKEN_FETCH_JITTER_MS: u64 = 50;
 
+/// Returns true when Redis rejected a write because this connection reaches a replica.
+///
+/// After a primary change, a long-lived connection can stay open to the demoted
+/// node. Every write then fails with `READONLY` while the socket stays healthy,
+/// and `ConnectionManager` does not treat that as a reason to reconnect. Callers
+/// rebuild the connection through [`ValkeyConnectionFactory`] so the new socket
+/// reaches the current primary. Redis rejects the command before running it,
+/// including writes inside a Lua script, so one retry on the new connection is safe.
+#[must_use]
+pub fn is_read_only_error(error: &redis::RedisError) -> bool {
+    error.kind() == redis::ErrorKind::ReadOnly
+}
+
 /// Token with cached expiry time.
 struct CachedToken {
     token: String,
@@ -340,6 +353,42 @@ mod tests {
         const fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<ValkeyConnectionFactory>();
     };
+
+    fn reply_error(reply: &[u8]) -> redis::RedisError {
+        redis::parse_redis_value(reply)
+            .expect("well-formed reply")
+            .extract_error()
+            .expect_err("reply should be an error")
+    }
+
+    #[test]
+    fn read_only_reply_from_a_replica_is_detected() {
+        let error = reply_error(b"-READONLY You can't write against a read only replica.\r\n");
+        assert!(is_read_only_error(&error));
+    }
+
+    #[test]
+    fn read_only_reply_from_a_lua_script_is_detected() {
+        let error = reply_error(
+            b"-READONLY You can't write against a read only replica. script: \
+              d8f2fad9f8e86a53d2a6ebd960b33c4972cacc37, on @user_script:1.\r\n",
+        );
+        assert!(is_read_only_error(&error));
+    }
+
+    #[test]
+    fn other_errors_are_not_read_only() {
+        assert!(!is_read_only_error(&reply_error(
+            b"-NOAUTH Authentication required.\r\n"
+        )));
+        assert!(!is_read_only_error(&reply_error(
+            b"-ERR unknown command 'foo'\r\n"
+        )));
+        assert!(!is_read_only_error(&redis::RedisError::from((
+            redis::ErrorKind::IoError,
+            "Connection refused",
+        ))));
+    }
 
     #[tokio::test]
     async fn test_factory_without_iam() {

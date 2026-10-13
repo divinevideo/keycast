@@ -1,27 +1,44 @@
 // ABOUTME: Wrapper around Redis connection that applies optional key prefix
 // ABOUTME: Enables multi-app GCP Memorystore deployments with isolated namespaces
 
-use cluster_hashring::ValkeyConnectionFactory;
+use cluster_hashring::{is_read_only_error, ValkeyConnectionFactory};
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, FromRedisValue, RedisResult, Script};
 use std::borrow::Cow;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 /// Redis connection wrapper with automatic key prefixing.
 ///
 /// Used for isolating keys in shared Redis instances (e.g., GCP Memorystore).
 /// When created with a [`ValkeyConnectionFactory`], supports automatic
-/// connection refresh for IAM token rotation.
+/// connection refresh for IAM token rotation and for a changed Redis primary.
 #[derive(Clone)]
 pub struct PrefixedRedis {
-    conn: Arc<RwLock<ConnectionManager>>,
+    conn: Arc<RwLock<CurrentConnection>>,
+    /// Serializes connection replacement so concurrent failures open one new connection.
+    refresh_lock: Arc<Mutex<()>>,
     factory: Option<Arc<ValkeyConnectionFactory>>,
     prefix: Option<String>,
     #[cfg(any(test, feature = "integration-tests"))]
     fail_writes: bool,
     #[cfg(any(test, feature = "integration-tests"))]
     fail_scripts: bool,
+}
+
+/// The live connection and how many times it has been replaced.
+struct CurrentConnection {
+    manager: ConnectionManager,
+    generation: u64,
+}
+
+impl CurrentConnection {
+    fn new(manager: ConnectionManager) -> Arc<RwLock<Self>> {
+        Arc::new(RwLock::new(Self {
+            manager,
+            generation: 0,
+        }))
+    }
 }
 
 impl std::fmt::Debug for PrefixedRedis {
@@ -43,7 +60,8 @@ impl PrefixedRedis {
     #[must_use]
     pub fn new(conn: ConnectionManager, prefix: Option<String>) -> Self {
         Self {
-            conn: Arc::new(RwLock::new(conn)),
+            conn: CurrentConnection::new(conn),
+            refresh_lock: Arc::new(Mutex::new(())),
             factory: None,
             prefix,
             #[cfg(any(test, feature = "integration-tests"))]
@@ -84,7 +102,8 @@ impl PrefixedRedis {
         prefix: Option<String>,
     ) -> Self {
         Self {
-            conn: Arc::new(RwLock::new(conn)),
+            conn: CurrentConnection::new(conn),
+            refresh_lock: Arc::new(Mutex::new(())),
             factory: Some(factory),
             prefix,
             #[cfg(any(test, feature = "integration-tests"))]
@@ -129,7 +148,17 @@ impl PrefixedRedis {
         msg.contains("noauth") || msg.contains("wrongpass")
     }
 
-    /// Execute operation with automatic connection refresh on auth failure.
+    /// Check if an error means the connection needs replacing before a retry.
+    ///
+    /// Covers expired credentials and a connection left on a demoted primary.
+    fn needs_new_connection(e: &redis::RedisError) -> bool {
+        Self::is_auth_error(e) || is_read_only_error(e)
+    }
+
+    /// Execute operation, replacing the connection and retrying once when it is stale.
+    ///
+    /// A connection is stale after an auth failure (expired IAM token) or a
+    /// `READONLY` reply (the node it reaches is no longer the primary).
     async fn with_refresh<T, F, Fut>(&self, op: F) -> RedisResult<T>
     where
         F: Fn(ConnectionManager) -> Fut,
@@ -143,32 +172,59 @@ impl PrefixedRedis {
             )));
         }
 
-        let conn = self.conn.read().await.clone();
+        let (conn, generation) = {
+            let current = self.conn.read().await;
+            (current.manager.clone(), current.generation)
+        };
         match op(conn).await {
             Ok(result) => Ok(result),
-            Err(e) if Self::is_auth_error(&e) => {
-                // Token may have expired, try refresh
-                if let Some(ref factory) = self.factory {
-                    tracing::debug!("Auth error detected, attempting connection refresh");
-                    match factory.get_connection_manager().await {
-                        Ok(new_conn) => {
-                            *self.conn.write().await = new_conn.clone();
-                            tracing::debug!(
-                                "Connection refreshed after auth error, retrying operation"
-                            );
-                            // Retry with new connection
-                            op(new_conn).await
-                        }
-                        Err(refresh_err) => {
-                            tracing::error!("Failed to refresh connection: {:?}", refresh_err);
-                            Err(e) // Return original error
-                        }
-                    }
+            Err(e) if self.factory.is_some() && Self::needs_new_connection(&e) => {
+                if is_read_only_error(&e) {
+                    tracing::warn!(
+                        "Redis rejected a write as READONLY; reconnecting to reach the current primary"
+                    );
                 } else {
-                    Err(e)
+                    tracing::debug!("Auth error detected, attempting connection refresh");
+                }
+                match self.replace_connection(generation).await {
+                    Some(new_conn) => {
+                        tracing::debug!("Connection refreshed, retrying operation");
+                        op(new_conn).await
+                    }
+                    None => Err(e), // Return original error
                 }
             }
             Err(e) => Err(e),
+        }
+    }
+
+    /// Replace the connection that failed at `failed_generation`.
+    ///
+    /// When another caller already replaced it, returns that newer connection
+    /// instead of opening another. Returns `None` when there is no factory or
+    /// the new connection cannot be opened.
+    async fn replace_connection(&self, failed_generation: u64) -> Option<ConnectionManager> {
+        let factory = self.factory.as_ref()?;
+        let _refreshing = self.refresh_lock.lock().await;
+
+        {
+            let current = self.conn.read().await;
+            if current.generation != failed_generation {
+                return Some(current.manager.clone());
+            }
+        }
+
+        match factory.get_connection_manager().await {
+            Ok(new_conn) => {
+                let mut current = self.conn.write().await;
+                current.manager = new_conn.clone();
+                current.generation += 1;
+                Some(new_conn)
+            }
+            Err(refresh_err) => {
+                tracing::error!("Failed to refresh connection: {:?}", refresh_err);
+                None
+            }
         }
     }
 
@@ -229,9 +285,12 @@ impl PrefixedRedis {
             return;
         }
 
+        let _refreshing = self.refresh_lock.lock().await;
         match factory.get_connection_manager().await {
             Ok(new_conn) => {
-                *self.conn.write().await = new_conn;
+                let mut current = self.conn.write().await;
+                current.manager = new_conn;
+                current.generation += 1;
                 tracing::debug!("Refreshed PrefixedRedis connection for IAM token rotation");
             }
             Err(e) => {
@@ -570,7 +629,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut active_conn = redis.conn.read().await.clone();
+        let mut active_conn = redis.conn.read().await.manager.clone();
         let client_id: i64 = redis::cmd("CLIENT")
             .arg("ID")
             .query_async(&mut active_conn)
@@ -596,5 +655,161 @@ mod tests {
         assert_eq!(result.as_deref(), Some("after"));
 
         redis.del("killed_connection").await.unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "integration-tests"))]
+mod integration_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn redis_url() -> String {
+        std::env::var("TEST_REDIS_URL").expect("TEST_REDIS_URL must name the dedicated test Redis")
+    }
+
+    async fn redis_with_factory() -> PrefixedRedis {
+        let factory = Arc::new(
+            ValkeyConnectionFactory::new(&redis_url(), false)
+                .await
+                .expect("connection factory"),
+        );
+        let conn = factory
+            .get_connection_manager()
+            .await
+            .expect("initial connection");
+        PrefixedRedis::new_with_factory(conn, factory, None)
+    }
+
+    fn read_only_error() -> redis::RedisError {
+        redis::RedisError::from((
+            redis::ErrorKind::ReadOnly,
+            "You can't write against a read only replica.",
+        ))
+    }
+
+    async fn client_id(mut conn: ConnectionManager) -> RedisResult<i64> {
+        redis::cmd("CLIENT").arg("ID").query_async(&mut conn).await
+    }
+
+    async fn current_client_id(redis: &PrefixedRedis) -> i64 {
+        client_id(redis.conn.read().await.manager.clone())
+            .await
+            .expect("CLIENT ID")
+    }
+
+    #[tokio::test]
+    async fn read_only_reply_replaces_connection_and_retries_once() {
+        let redis = redis_with_factory().await;
+        let original = current_client_id(&redis).await;
+
+        let attempts = AtomicUsize::new(0);
+        let retried_on = redis
+            .with_refresh(|conn| {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        return Err(read_only_error());
+                    }
+                    client_id(conn).await
+                }
+            })
+            .await
+            .expect("retry on a new connection should succeed");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_ne!(retried_on, original, "retry should use a new connection");
+        assert_eq!(current_client_id(&redis).await, retried_on);
+        assert_eq!(redis.conn.read().await.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_read_only_replies_open_one_new_connection() {
+        let redis = redis_with_factory().await;
+        let original = current_client_id(&redis).await;
+        let first_attempts = Arc::new(AtomicUsize::new(0));
+        let callers = 16;
+
+        let results: Vec<RedisResult<i64>> =
+            futures_util::future::join_all((0..callers).map(|_| {
+                let redis = redis.clone();
+                let first_attempts = Arc::clone(&first_attempts);
+                async move {
+                    let failed = AtomicUsize::new(0);
+                    redis
+                        .with_refresh(|conn| {
+                            let failed_before = failed.fetch_add(1, Ordering::SeqCst);
+                            let first_attempts = Arc::clone(&first_attempts);
+                            async move {
+                                if failed_before == 0 {
+                                    first_attempts.fetch_add(1, Ordering::SeqCst);
+                                    // Hold every first attempt until all callers have
+                                    // failed on the original connection.
+                                    while first_attempts.load(Ordering::SeqCst) < callers {
+                                        tokio::task::yield_now().await;
+                                    }
+                                    return Err(read_only_error());
+                                }
+                                client_id(conn).await
+                            }
+                        })
+                        .await
+                }
+            }))
+            .await;
+
+        let ids = results
+            .into_iter()
+            .map(|result| result.expect("every caller should succeed after the retry"))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), 1, "all callers should share one new connection");
+        assert!(!ids.contains(&original));
+        assert_eq!(redis.conn.read().await.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn read_only_reply_without_factory_is_returned_unchanged() {
+        let client = redis::Client::open(redis_url()).expect("valid Redis URL");
+        let conn = ConnectionManager::new(client)
+            .await
+            .expect("initial connection");
+        let redis = PrefixedRedis::new(conn, None);
+
+        let attempts = AtomicUsize::new(0);
+        let result: RedisResult<()> = redis
+            .with_refresh(|_conn| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async { Err(read_only_error()) }
+            })
+            .await;
+
+        assert_eq!(
+            result.expect_err("no factory means no retry").kind(),
+            redis::ErrorKind::ReadOnly
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn other_errors_keep_the_connection() {
+        let redis = redis_with_factory().await;
+        let original = current_client_id(&redis).await;
+
+        let attempts = AtomicUsize::new(0);
+        let result: RedisResult<()> = redis
+            .with_refresh(|_conn| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err(redis::RedisError::from((
+                        redis::ErrorKind::ResponseError,
+                        "ERR unknown command",
+                    )))
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(current_client_id(&redis).await, original);
+        assert_eq!(redis.conn.read().await.generation, 0);
     }
 }
