@@ -562,11 +562,12 @@ impl UserRepository {
     /// spelling of account completeness in
     /// this codebase -- [`Self::is_unclaimed`] uses `email IS NULL`,
     /// [`Self::is_unclaimed_minor_in_tx`] adds `verified_minor` and a NULL
-    /// password hash, [`Self::set_verified_minor`] refuses on `email IS NULL AND
-    /// password_hash IS NULL` (its `Unclaimed` guard), and `OAuthCodeRepository::materialize_pending_registration`
-    /// uses a third combination. They are not interchangeable, and this is the
-    /// only one whose disagreement is silent: it returns a wrong boolean rather
-    /// than an error. If what "claimed" means ever changes, this predicate has
+    /// password hash, [`Self::set_verified_minor`] refuses on
+    /// `email IS NULL AND password_hash IS NULL` (its `Unclaimed` guard), and
+    /// `OAuthCodeRepository::materialize_pending_registration` uses a third
+    /// combination. They are not interchangeable, and this is the only one
+    /// whose disagreement is silent: it returns a wrong boolean rather than an
+    /// error. If what "claimed" means ever changes, this predicate has
     /// to be revisited with the other three.
     pub async fn is_og_diviner(
         &self,
@@ -2509,9 +2510,12 @@ impl UserRepository {
     /// Returns (pubkey, verified_minor, is_unclaimed) in a single query.
     /// NOTE: `is_unclaimed` relies on email+password_hash being NULL — must stay
     /// in sync with the claim flow that sets both columns on completion. The
-    /// `Unclaimed` guard in `set_verified_minor` restates the same predicate
-    /// (`verified_minor AND email IS NULL AND password_hash IS NULL`); revisit it
-    /// too if that changes.
+    /// `Unclaimed` guard in `set_verified_minor` is a sibling of that predicate
+    /// (`email IS NULL AND password_hash IS NULL`, checked on rows not yet
+    /// flagged). It refuses to flag a credential-less row because flagging it
+    /// would make the row match `verified_minor AND email IS NULL AND
+    /// password_hash IS NULL`, so a change to that predicate must revisit the
+    /// guard too.
     pub async fn find_user_minor_status_by_username(
         &self,
         username: &str,
