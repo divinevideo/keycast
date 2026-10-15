@@ -54,12 +54,13 @@ pub enum HandlerStatus {
 struct GroupSigningContext {
     group_id: i32,
     admin_pubkey: String,
+    verified_minor: bool,
 }
 
 // Resolve ownership from the stored key/team as well as the grant: deleting a
 // grant must never turn a group key into an ordinary team authorization.
 const GROUP_AUTHORIZATION_STATE: &str = "
-    SELECT g.id, gg.admin_pubkey,
+    SELECT g.id, gg.admin_pubkey, u.verified_minor,
            COALESCE(g.mode = 'hosted' AND g.pubkey = $3
              AND k.pubkey = $3 AND k.team_id = g.id AND k.id = g.signing_key_id
              AND a.policy_id = g.policy_id
@@ -563,18 +564,22 @@ impl Nip46Handler {
         &self,
         connection: &mut PgConnection,
     ) -> SignerResult<Option<GroupSigningContext>> {
-        let rows: Vec<(i32, Option<String>, bool)> = sqlx::query_as(GROUP_AUTHORIZATION_STATE)
-            .bind(self.authorization_id)
-            .bind(self.tenant_id)
-            .bind(self.user_keys.public_key().to_hex())
-            .fetch_all(connection)
-            .await?;
+        let rows: Vec<(i32, Option<String>, Option<bool>, bool)> =
+            sqlx::query_as(GROUP_AUTHORIZATION_STATE)
+                .bind(self.authorization_id)
+                .bind(self.tenant_id)
+                .bind(self.user_keys.public_key().to_hex())
+                .fetch_all(connection)
+                .await?;
         match rows.as_slice() {
             [] => Ok(None),
-            [(group_id, Some(admin_pubkey), true)] => Ok(Some(GroupSigningContext {
-                group_id: *group_id,
-                admin_pubkey: admin_pubkey.clone(),
-            })),
+            [(group_id, Some(admin_pubkey), Some(verified_minor), true)] => {
+                Ok(Some(GroupSigningContext {
+                    group_id: *group_id,
+                    admin_pubkey: admin_pubkey.clone(),
+                    verified_minor: *verified_minor,
+                }))
+            }
             _ => Err(SignerError::permission_denied(
                 "Group authorization is no longer active",
             )),
@@ -649,9 +654,9 @@ impl Nip46Handler {
     }
 
     /// Check that the user's account is active (not suspended or banned).
-    /// Only applies to OAuth authorizations (personal keys tied to a user account).
-    /// Team authorizations don't have user rows — they're managed through team
-    /// admin, are not minor accounts, and return `false` for the flag.
+    /// Personal authorizations and hosted group grants resolve the acting account.
+    /// Ordinary administrative team authorizations have no acting-account binding
+    /// and retain their existing behavior.
     ///
     /// Returns the account's `verified_minor` flag (same row, no extra query)
     /// so callers can apply the DM containment gate (support-trust-safety#183).
@@ -672,7 +677,10 @@ impl Nip46Handler {
     /// restricted accounts is a separate decision.
     async fn user_gate_state(&self, deny_when_restricted: bool) -> SignerResult<bool> {
         if !self.is_oauth {
-            return Ok(false);
+            return Ok(self
+                .validate_group_authorization()
+                .await?
+                .is_some_and(|group| group.verified_minor));
         }
         let user_pubkey = self.user_keys.public_key().to_hex();
         let status: Option<(String, bool)> = sqlx::query_as(

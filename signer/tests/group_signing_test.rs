@@ -227,6 +227,65 @@ async fn three_admins_sign_independently_and_relay_round_trip() {
 }
 
 #[tokio::test]
+async fn group_grants_preserve_each_acting_accounts_communication_policy() {
+    let group = GroupFixture::new().await;
+    let protected = group.device(None).await;
+    let other = group.device(None).await;
+    sqlx::query("UPDATE users SET verified_minor = TRUE WHERE tenant_id = 1 AND pubkey = $1")
+        .bind(&protected.admin)
+        .execute(&group.pool)
+        .await
+        .unwrap();
+    let recipient = Keys::generate().public_key();
+    let dm = UnsignedEvent::new(
+        group.keys.public_key(),
+        Timestamp::now(),
+        Kind::from(4),
+        [Tag::public_key(recipient)],
+        "Synthetic communication policy fixture",
+    );
+    assert!(protected
+        .handler
+        .sign_event_direct(dm.clone())
+        .await
+        .is_err());
+    let response = request(
+        &protected,
+        "sign_event",
+        json!([serde_json::to_string(&dm).unwrap()]),
+    )
+    .await;
+    assert!(response["error"].is_string());
+    assert!(protected
+        .handler
+        .validate_permissions_for_encrypt("Synthetic fixture", &recipient)
+        .await
+        .is_err());
+    protected
+        .handler
+        .validate_permissions_for_encrypt("Synthetic fixture", &group.keys.public_key())
+        .await
+        .unwrap();
+    protected
+        .handler
+        .sign_event_direct(group.unsigned())
+        .await
+        .unwrap();
+    other.handler.sign_event_direct(dm.clone()).await.unwrap();
+    other
+        .handler
+        .validate_permissions_for_encrypt("Synthetic fixture", &recipient)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET verified_minor = FALSE WHERE tenant_id = 1 AND pubkey = $1")
+        .bind(&protected.admin)
+        .execute(&group.pool)
+        .await
+        .unwrap();
+    protected.handler.sign_event_direct(dm).await.unwrap();
+}
+
+#[tokio::test]
 async fn cached_handlers_refuse_removed_admin_and_obsolete_devices() {
     let group = GroupFixture::new().await;
     let old = group.device(None).await;
