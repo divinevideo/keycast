@@ -3275,6 +3275,19 @@ impl UserRepository {
             return Ok(AccountDeletionOutcome::AlreadyAbsent);
         }
 
+        // Recovery ciphertext belongs to this account, unlike the shared group
+        // identity. Delete restore receipts first to respect their backup FK.
+        sqlx::query("DELETE FROM group_backup_restores WHERE tenant_id=$1 AND admin_pubkey=$2")
+            .bind(tenant_id)
+            .bind(pubkey)
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("DELETE FROM group_backups WHERE tenant_id=$1 AND admin_pubkey=$2")
+            .bind(tenant_id)
+            .bind(pubkey)
+            .execute(&mut **tx)
+            .await?;
+
         // Retain membership tombstones and retire grants so account recreation
         // cannot resume a previous device installation or recovery relationship.
         sqlx::query("UPDATE group_memberships SET status='removed',version=version+1,installation_epoch=installation_epoch+1 WHERE tenant_id=$1 AND admin_pubkey=$2 AND status<>'removed'")

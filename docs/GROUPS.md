@@ -72,6 +72,11 @@ increments its lifecycle version and installation epoch, and revokes mapped
 grants atomically. Re-inviting the same person never revives their old grants.
 Legacy administrative team mutation routes cannot modify these identities.
 
+Account deletion retires that account's group memberships and grants; it does not
+transfer stewardship or delete the shared group identity. The last-admin guard
+above applies to membership removal, not account deletion. Keep another active
+admin before deleting an account if the group must remain accessible afterward.
+
 A finalized FROST group cannot add participants in place. Create a new identity
 and explicitly migrate public coordinates if the cryptographic roster changes.
 Removing access to coordination and recovery cannot erase a retained device full

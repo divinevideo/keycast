@@ -67,6 +67,65 @@ fn upload(group: i32, admin: &str, keys: &Keys, request: &str) -> UploadBackup {
 }
 
 #[sqlx::test(migrations = "../database/migrations")]
+async fn account_deletion_erases_only_its_recovery_ciphertext_and_receipts(pool: PgPool) {
+    let (group, admin, keys) = fixture(&pool).await;
+    let (other_group, other_admin, other_keys) = fixture(&pool).await;
+    sqlx::query("INSERT INTO group_memberships (tenant_id,group_id,admin_pubkey,status) VALUES (1,$1,$2,'active')")
+        .bind(group).bind(&other_admin).execute(&pool).await.unwrap();
+    let single = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let svc = BackupService::new(single.clone(), &TestKeyManager);
+    for (id, principal, key) in [
+        (group, &admin, &keys),
+        (other_group, &other_admin, &other_keys),
+    ] {
+        svc.upload(1, id, principal, upload(id, principal, key, "backup"))
+            .await
+            .unwrap();
+        svc.restore(
+            1,
+            id,
+            principal,
+            RestoreBackup {
+                request_id: "restore".into(),
+                backup_request_id: "backup".into(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let repo = keycast_core::repositories::UserRepository::new(single.clone());
+    assert!(repo.delete_account(&admin, 2).await.is_err());
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM group_backups WHERE tenant_id=1 AND admin_pubkey=$1",
+    )
+    .bind(&admin)
+    .fetch_one(&single)
+    .await
+    .unwrap();
+    assert_eq!(count, 1, "another tenant cannot erase recovery material");
+    repo.delete_account(&admin, 1).await.unwrap();
+    for table in ["group_backups", "group_backup_restores"] {
+        let query = format!("SELECT COUNT(*) FROM {table} WHERE tenant_id=1 AND admin_pubkey=$1");
+        let deleted: i64 = sqlx::query_scalar(&query)
+            .bind(&admin)
+            .fetch_one(&single)
+            .await
+            .unwrap();
+        let retained: i64 = sqlx::query_scalar(&query)
+            .bind(&other_admin)
+            .fetch_one(&single)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(retained, 1);
+    }
+}
+
+#[sqlx::test(migrations = "../database/migrations")]
 async fn durable_idempotent_recovery_and_current_membership(pool: PgPool) {
     let (group, admin, keys) = fixture(&pool).await;
     let single = PgPoolOptions::new()
