@@ -69,7 +69,7 @@ impl Session {
 async fn admission() -> Result<OwnedSemaphorePermit, FrostError> {
     WORK.clone()
         .try_acquire_owned()
-        .map_err(|_| FrostError::Invalid("coordinator busy; retry"))
+        .map_err(|_| FrostError::Busy)
 }
 
 async fn context(
@@ -226,7 +226,7 @@ impl FrostCoordinator {
         let (row, mut members) = context(&mut tx, tenant, group, admin).await?;
         if let Ok((Session::Dkg(state), stale)) = load(&mut tx, tenant, group, session_id).await {
             if stale || state.aborted || state.threshold != threshold {
-                return Err(FrostError::Invalid("session id already used or expired"));
+                return Err(FrostError::Conflict("session id already used or expired"));
             }
             if !current(&Session::Dkg(state.clone()), &row, &members) {
                 return Err(FrostError::Aborted);
@@ -235,14 +235,14 @@ impl FrostCoordinator {
             return Ok(state);
         }
         if row.pubkey.is_some() {
-            return Err(FrostError::Invalid(
+            return Err(FrostError::Conflict(
                 "group identity already generated; rotation requires a new group",
             ));
         }
         let pending: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM group_frost_sessions WHERE tenant_id=$1 AND group_id=$2 AND session_kind='dkg' AND NOT aborted AND expires_at > now())")
             .bind(tenant).bind(group).fetch_one(&mut *tx).await?;
         if pending {
-            return Err(FrostError::Invalid("another DKG ceremony is pending"));
+            return Err(FrostError::Conflict("another DKG ceremony is pending"));
         }
         let mut next = members
             .iter()
@@ -374,7 +374,7 @@ impl FrostCoordinator {
         if let Some(package) = &state.public_package {
             let pubkey = group_pubkey(package)?.to_hex();
             if row.pubkey.as_ref().is_some_and(|p| p != &pubkey) {
-                return Err(FrostError::Invalid("group public key changed"));
+                return Err(FrostError::Conflict("group public key changed"));
             }
             sqlx::query("UPDATE identity_groups SET pubkey=$3 WHERE tenant_id=$1 AND id=$2 AND pubkey IS NULL").bind(tenant).bind(group).bind(pubkey).execute(&mut *tx).await?;
         }
@@ -441,7 +441,7 @@ impl FrostCoordinator {
                     || prior.event != requested
                     || expected != requested_ids
                 {
-                    return Err(FrostError::Invalid("completed signing proposal differs"));
+                    return Err(FrostError::Conflict("completed signing proposal differs"));
                 }
                 tx.commit().await?;
                 return Ok(prior);
@@ -472,7 +472,7 @@ impl FrostCoordinator {
         let mut binding = dkg.binding.clone();
         binding.session_id = id.into();
         if binding.key_version != row.key_version || binding.roster_version != row.roster_version {
-            return Err(FrostError::Invalid("obsolete identity version"));
+            return Err(FrostError::Conflict("obsolete identity version"));
         }
         let proposed = tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -495,7 +495,7 @@ impl FrostCoordinator {
                 )
                 .await?;
                 tx.commit().await?;
-                return Err(FrostError::Invalid(
+                return Err(FrostError::Conflict(
                     "conflicting or expired signing session",
                 ));
             }
@@ -555,7 +555,7 @@ impl FrostCoordinator {
                     SigningMessage::Abort => false,
                 };
                 if !exact {
-                    return Err(FrostError::Invalid("completed signing message differs"));
+                    return Err(FrostError::Conflict("completed signing message differs"));
                 }
                 let original = completed.clone();
                 tx.commit().await?;
@@ -593,13 +593,13 @@ impl FrostCoordinator {
             } => {
                 if proposal_digest != state.proposal_digest()? {
                     state.aborted = true;
-                    Err(FrostError::Invalid("signing proposal differs"))
+                    Err(FrostError::Conflict("signing proposal differs"))
                 } else if let Some(prior) = state.commitments.get(&signer) {
                     if prior == &commitment {
                         Ok(())
                     } else {
                         state.aborted = true;
-                        Err(FrostError::Invalid("conflicting commitment"))
+                        Err(FrostError::Conflict("conflicting commitment"))
                     }
                 } else {
                     // Reserve BOTH nonce points independently. Reusing either scalar
@@ -615,7 +615,7 @@ impl FrostCoordinator {
                     }
                     if reused {
                         state.aborted = true;
-                        Err(FrostError::Invalid("nonce commitment already used"))
+                        Err(FrostError::Conflict("nonce commitment already used"))
                     } else {
                         state.commitments.insert(signer, commitment);
                         Ok(())
@@ -628,7 +628,7 @@ impl FrostCoordinator {
             } => {
                 if proposal_digest != state.proposal_digest()? {
                     state.aborted = true;
-                    Err(FrostError::Invalid("signing proposal differs"))
+                    Err(FrostError::Conflict("signing proposal differs"))
                 } else {
                     let (s, r) = tokio::task::spawn_blocking(move || {
                         let _permit = permit;
@@ -678,12 +678,25 @@ impl FrostCoordinator {
         if matches!(&state,Session::Dkg(d) if d.public_package.is_some())
             || matches!(&state,Session::Signing(s) if s.result.is_some())
         {
-            return Err(FrostError::Invalid("completed result cannot be aborted"));
+            return Err(FrostError::Conflict("completed result cannot be aborted"));
         }
         state.abort();
         save(&mut tx, &state).await?;
         audit(&mut tx, tenant, group, admin, id, "frost_abort", None).await?;
         tx.commit().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn capacity_exhaustion_is_retryable_and_recovers_after_release() {
+        let permits = WORK.clone().acquire_many_owned(4).await.unwrap();
+        assert!(matches!(admission().await, Err(FrostError::Busy)));
+        drop(permits);
+        assert!(admission().await.is_ok());
     }
 }

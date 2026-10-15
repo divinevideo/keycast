@@ -332,7 +332,7 @@ fn insert_message<K: Ord>(
 ) -> Result<(), FrostError> {
     if let Some(prior) = map.get(&key) {
         if prior.content != event.content {
-            return Err(FrostError::Invalid("conflicting duplicate"));
+            return Err(FrostError::Conflict("conflicting duplicate"));
         }
     } else {
         map.insert(key, event);
@@ -472,7 +472,7 @@ impl SigningState {
         if let Some(prior) = self.partials.get(&id) {
             if prior != &partial {
                 self.aborted = true;
-                return Err(FrostError::Invalid("conflicting partial signature"));
+                return Err(FrostError::Conflict("conflicting partial signature"));
             }
             return Ok(());
         }

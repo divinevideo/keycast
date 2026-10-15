@@ -57,7 +57,9 @@ fn error(e: FrostError) -> ApiError {
             ApiError::service_unavailable("FROST storage unavailable")
         }
         FrostError::Json(_) => ApiError::bad_request("Invalid FROST protocol payload"),
-        other => ApiError::conflict(other.to_string()),
+        FrostError::Invalid(_) => ApiError::bad_request(e.to_string()),
+        FrostError::Busy => ApiError::retryable_service_unavailable(e.to_string(), 1),
+        FrostError::Conflict(_) | FrostError::Aborted => ApiError::conflict(e.to_string()),
     }
 }
 
@@ -165,4 +167,33 @@ async fn abort(
         .await
         .map_err(error)?;
     Ok(Json(serde_json::json!({"aborted":true})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{http::StatusCode, response::IntoResponse};
+
+    #[test]
+    fn protocol_errors_follow_the_group_http_contract() {
+        assert_eq!(
+            error(FrostError::Invalid("invalid payload"))
+                .into_response()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            error(FrostError::Conflict("session differs"))
+                .into_response()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            error(FrostError::Aborted).into_response().status(),
+            StatusCode::CONFLICT
+        );
+        let busy = error(FrostError::Busy).into_response();
+        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(busy.headers()["retry-after"], "1");
+    }
 }

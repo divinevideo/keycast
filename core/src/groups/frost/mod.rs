@@ -9,6 +9,10 @@ pub use service::{FrostCoordinator, Session};
 pub enum FrostError {
     #[error("FROST protocol rejected: {0}")]
     Invalid(&'static str),
+    #[error("FROST state conflict: {0}")]
+    Conflict(&'static str),
+    #[error("FROST coordinator busy; retry")]
+    Busy,
     #[error("FROST operation forbidden")]
     Forbidden,
     #[error("FROST session not found")]
