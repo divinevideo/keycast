@@ -435,7 +435,7 @@ pub fn api_routes(
             delete(teams::delete_authorization),
         )
         .route("/teams/:id/policies", post(teams::add_policy))
-        .with_state(pool);
+        .with_state(pool.clone());
 
     // Combine routes
     // First-party routes have restricted CORS (prevent phishing)
@@ -459,6 +459,22 @@ pub fn api_routes(
         .merge(connect_routes.layer(public_cors.clone()))
         .merge(signing_routes.layer(public_cors.clone()))
         .merge(ap_routes.layer(public_cors.clone())) // AP RSA signing (gateway service-to-service)
+        .merge(
+            super::group_backups::router()
+                .with_state(pool.clone())
+                .layer(auth_cors.clone()),
+        )
+        .nest(
+            "/groups",
+            super::group_frost::router()
+                .with_state(pool.clone())
+                .layer(auth_cors.clone()),
+        )
+        .merge(
+            super::groups::router()
+                .with_state(pool.clone())
+                .layer(auth_cors.clone()),
+        )
         .merge(team_routes.layer(auth_cors.clone())) // Team routes need credentials
         .merge(discovery_route.layer(public_cors.clone()))
         .merge(policy_routes.layer(public_cors.clone())) // Public - available to third-party OAuth apps

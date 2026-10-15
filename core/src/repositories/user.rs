@@ -3250,6 +3250,13 @@ impl UserRepository {
         pubkey: &str,
         tenant_id: i64,
     ) -> Result<AccountDeletionOutcome, RepositoryError> {
+        // Keep group/account lock order consistent with group mutations. New
+        // group creation and invitation acceptance share this principal lock.
+        crate::groups::lock_group_account(tx, tenant_id, pubkey).await?;
+        let _: Vec<i32> = sqlx::query_scalar(
+            "SELECT g.id FROM identity_groups g JOIN group_memberships m ON m.group_id=g.id AND m.tenant_id=g.tenant_id WHERE m.tenant_id=$1 AND m.admin_pubkey=$2 ORDER BY g.id FOR UPDATE OF g",
+        ).bind(tenant_id).bind(pubkey).fetch_all(&mut **tx).await?;
+
         // Confirm the account exists in this tenant before deleting anything.
         // Several of the deletes below are keyed on user_pubkey alone, so
         // running them for an account this tenant does not own would destroy
@@ -3267,6 +3274,15 @@ impl UserRepository {
         if owned.is_none() {
             return Ok(AccountDeletionOutcome::AlreadyAbsent);
         }
+
+        // Retain membership tombstones and retire grants so account recreation
+        // cannot resume a previous device installation or recovery relationship.
+        sqlx::query("UPDATE group_memberships SET status='removed',version=version+1,installation_epoch=installation_epoch+1 WHERE tenant_id=$1 AND admin_pubkey=$2 AND status<>'removed'")
+            .bind(tenant_id).bind(pubkey).execute(&mut **tx).await?;
+        sqlx::query("UPDATE group_grants SET revoked_at=NOW() WHERE tenant_id=$1 AND admin_pubkey=$2 AND revoked_at IS NULL")
+            .bind(tenant_id).bind(pubkey).execute(&mut **tx).await?;
+        sqlx::query("INSERT INTO group_audit (tenant_id,group_id,admin_pubkey,action) SELECT tenant_id,group_id,admin_pubkey,'account_removed' FROM group_memberships WHERE tenant_id=$1 AND admin_pubkey=$2")
+            .bind(tenant_id).bind(pubkey).execute(&mut **tx).await?;
 
         // Count teams for logging
         let teams_removed: i64 =

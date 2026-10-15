@@ -486,7 +486,7 @@ async fn disagreement_confidential_delivery_and_immutable_roster(pool: PgPool) {
         3,
         2,
         frost_secp256k1_tr::keys::IdentifierList::Default,
-        &mut rand::rngs::OsRng,
+        rand::rngs::OsRng,
     )
     .unwrap();
     let conflicting = DkgPayload {

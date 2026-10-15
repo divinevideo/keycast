@@ -17,7 +17,8 @@ server validates the scalar/public share, identifier, public key and threshold.
 
 ## API and package version
 
-All routes use the existing tenant extractor and UCAN authentication:
+All routes use the existing tenant extractor and account-management UCAN authority
+(see [GROUPS.md](GROUPS.md)); delegated third-party signing tokens are refused:
 
 - `PUT /api/groups/:group_id/backups` uploads `{request_id,binding,material}`.
 - `GET /api/groups/:group_id/backups` returns current custody and `recoverable`.
@@ -37,6 +38,41 @@ under group/member locks immediately before committing recovery.
 rejected. Nonces, nonce seeds, pending session handles and session credentials do
 not belong in these packages. Package-bearing structs have no Debug implementation
 and zeroize secret strings and temporary plaintext buffers when dropped.
+
+Full-key bindings use `ciphersuite:"BIP-340"` and `tweak_version:"none"`;
+FROST bindings use `ciphersuite:"FROST-secp256k1-SHA256-TR-v1"` and
+`tweak_version:"untweaked-v1"`. For example, after reading the current versions:
+
+```json
+{
+  "request_id": "<stable-backup-request-id>",
+  "binding": {
+    "format_version": 1,
+    "tenant_id": 1,
+    "group_id": 42,
+    "group_pubkey": "<full-group-pubkey>",
+    "admin_pubkey": "<full-current-human-pubkey>",
+    "participant_id": 1,
+    "membership_version": 1,
+    "key_version": 1,
+    "roster_version": 1,
+    "ciphersuite": "FROST-secp256k1-SHA256-TR-v1",
+    "tweak_version": "untweaked-v1"
+  },
+  "material": {
+    "kind": "frost_share",
+    "key_package": "<hex-serialized-KeyPackage>",
+    "public_key_package": "<hex-serialized-PublicKeyPackage>"
+  }
+}
+```
+
+A full-key package instead uses `participant_id:null` and
+`material:{"kind":"full_key","secret_key":"<full-hex-group-secret>"}`.
+Never log the request/response body. Restore with
+`{"request_id":"<fresh-recovery-id>","backup_request_id":"<stable-backup-request-id>"}`;
+the response is `{binding,material,installation_epoch}`. Hosted status instead
+reports custody/recoverability and versions without exporting its key.
 
 Upload success follows the database commit. A failed storage or encryption request
 returns an error and must never be displayed as recoverable. Retrying an upload
