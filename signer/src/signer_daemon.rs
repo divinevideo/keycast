@@ -60,6 +60,22 @@ struct GroupSigningContext {
 // Resolve ownership from the stored key/team as well as the grant: deleting a
 // grant must never turn a group key into an ordinary team authorization.
 const GROUP_AUTHORIZATION_STATE: &str = "
+    WITH candidates AS (
+        SELECT gg.group_id AS id FROM group_grants gg
+        WHERE gg.authorization_id = $1 AND gg.tenant_id = $2
+        UNION
+        SELECT g.id FROM identity_groups g
+        WHERE g.tenant_id = $2 AND g.signing_key_id = (
+            SELECT a.stored_key_id FROM authorizations a
+            WHERE a.id = $1 AND a.tenant_id = $2)
+        UNION
+        SELECT k.team_id FROM authorizations a
+        JOIN stored_keys k ON k.id = a.stored_key_id AND k.tenant_id = $2
+        WHERE a.id = $1 AND a.tenant_id = $2
+        UNION
+        SELECT k.team_id FROM stored_keys k
+        WHERE k.tenant_id = $2 AND k.pubkey = $3
+    )
     SELECT g.id, gg.admin_pubkey, u.verified_minor,
            COALESCE(g.mode = 'hosted' AND g.pubkey = $3
              AND k.pubkey = $3 AND k.team_id = g.id AND k.id = g.signing_key_id
@@ -71,20 +87,16 @@ const GROUP_AUTHORIZATION_STATE: &str = "
              AND m.status = 'active' AND m.version = gg.membership_version
              AND m.installation_epoch = gg.installation_epoch
              AND u.status = 'active', false)
-    FROM identity_groups g
+    FROM candidates c
+    JOIN identity_groups g ON g.id = c.id AND g.tenant_id = $2
     LEFT JOIN authorizations a ON a.id = $1 AND a.tenant_id = $2
     LEFT JOIN stored_keys k ON k.id = a.stored_key_id AND k.tenant_id = $2
     LEFT JOIN group_grants gg ON gg.authorization_id = $1
         AND gg.tenant_id = $2 AND gg.group_id = g.id
     LEFT JOIN group_memberships m ON m.tenant_id = gg.tenant_id
-        AND m.group_id = gg.group_id AND m.admin_pubkey = gg.admin_pubkey
+        AND m.group_id = g.id AND m.admin_pubkey = gg.admin_pubkey
     LEFT JOIN users u ON u.tenant_id = m.tenant_id AND u.pubkey = m.admin_pubkey
-    WHERE g.tenant_id = $2 AND (
-        g.signing_key_id = a.stored_key_id OR g.id = k.team_id
-        OR gg.authorization_id IS NOT NULL
-        OR EXISTS (SELECT 1 FROM stored_keys cached_key
-                   WHERE cached_key.tenant_id = $2 AND cached_key.team_id = g.id
-                     AND cached_key.pubkey = $3))";
+    WHERE g.tenant_id = $2";
 
 /// NIP-46 handler for a single authorization
 ///

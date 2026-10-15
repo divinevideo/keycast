@@ -341,6 +341,7 @@ async fn cached_handlers_refuse_removed_admin_and_obsolete_devices() {
 async fn missing_revoked_or_stale_grants_never_fall_back_to_team_signing() {
     let group = GroupFixture::new().await;
     for alteration in [
+        "DELETE FROM authorizations WHERE id = $1",
         "DELETE FROM group_grants WHERE authorization_id = $1",
         "UPDATE group_grants SET revoked_at = NOW() WHERE authorization_id = $1",
         "UPDATE group_grants SET key_version = key_version + 1 WHERE authorization_id = $1",
