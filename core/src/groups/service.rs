@@ -298,7 +298,16 @@ impl<'a> GroupService<'a> {
     pub async fn accept(&self, tenant: i64, group: i32, admin: &str) -> Result<(), GroupError> {
         let mut tx = self.pool.begin().await?;
         lock_group_account(&mut tx, tenant, admin).await?;
-        lock_group(&mut tx, tenant, group).await?;
+        let current = lock_group(&mut tx, tenant, group).await?;
+        if current.mode == GroupMode::Frost && current.pubkey.is_some() {
+            let pinned:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM group_memberships WHERE tenant_id=$1 AND group_id=$2 AND admin_pubkey=$3 AND status='active' AND participant_id IS NOT NULL)")
+                .bind(tenant).bind(group).bind(admin).fetch_one(&mut *tx).await?;
+            if !pinned {
+                return Err(GroupError::Invalid(
+                    "a new threshold participant requires a new group identity",
+                ));
+            }
+        }
         let result=sqlx::query("UPDATE group_memberships m SET status='active' WHERE tenant_id=$1 AND group_id=$2 AND admin_pubkey=$3 AND status IN ('invited','active') AND EXISTS(SELECT 1 FROM users u WHERE u.tenant_id=$1 AND u.pubkey=$3 AND u.status='active')")
             .bind(tenant).bind(group).bind(admin).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {

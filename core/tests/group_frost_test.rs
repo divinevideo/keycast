@@ -59,7 +59,18 @@ async fn real_dkg_all_two_of_three_subsets_and_nostr_verification(pool: PgPool) 
         .connect_with((*pool.connect_options()).clone())
         .await
         .unwrap();
-    let f = completed_dkg(&single).await;
+    let pending = nostr::Keys::generate().public_key().to_hex();
+    let f = frost_fixture::completed_dkg_with_invitee(&single, Some(&pending)).await;
+    let kms = keycast_core::encryption::file_key_manager::FileKeyManager::new().unwrap();
+    let lifecycle = keycast_core::groups::GroupService::new(single.clone(), &kms);
+    assert!(
+        lifecycle.accept(1, f.group, &pending).await.is_err(),
+        "a pending invitation cannot activate outside the completed threshold roster"
+    );
+    lifecycle
+        .accept(1, f.group, &f.keys[0].public_key().to_hex())
+        .await
+        .unwrap();
     backup_all(&single, &f).await;
     let coordinator = FrostCoordinator::new(single.clone());
     let relay = LocalRelay::new(RelayBuilder::default());

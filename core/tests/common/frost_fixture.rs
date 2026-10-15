@@ -80,6 +80,10 @@ pub struct FrostFixture {
 /// A real dealerless 2-of-3 ceremony through the persisted coordinator and the
 /// native secret boundary. Every key and identity is synthetic and freshly random.
 pub async fn completed_dkg(pool: &PgPool) -> FrostFixture {
+    completed_dkg_with_invitee(pool, None).await
+}
+
+pub async fn completed_dkg_with_invitee(pool: &PgPool, invitee: Option<&str>) -> FrostFixture {
     let keys = (0..3).map(|_| Keys::generate()).collect::<Vec<_>>();
     let group: i32 = sqlx::query_scalar(
         "INSERT INTO teams (tenant_id,name) VALUES (1,'Synthetic threshold group') RETURNING id",
@@ -104,6 +108,14 @@ pub async fn completed_dkg(pool: &PgPool) -> FrostFixture {
             .await
             .unwrap();
         sqlx::query("INSERT INTO group_memberships (tenant_id,group_id,admin_pubkey,status) VALUES (1,$1,$2,'active')").bind(group).bind(admin).execute(pool).await.unwrap();
+    }
+    if let Some(invitee) = invitee {
+        sqlx::query("INSERT INTO users (tenant_id,pubkey) VALUES (1,$1)")
+            .bind(invitee)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO group_memberships (tenant_id,group_id,admin_pubkey,status) VALUES (1,$1,$2,'invited')").bind(group).bind(invitee).execute(pool).await.unwrap();
     }
     let coordinator = FrostCoordinator::new(pool.clone());
     let session = uuid::Uuid::new_v4().to_string();
