@@ -74,18 +74,24 @@ async fn durable_idempotent_recovery_and_current_membership(pool: PgPool) {
         .connect_with((*pool.connect_options()).clone())
         .await
         .unwrap();
+    let svc = BackupService::new(single.clone(), &TestKeyManager);
+    assert!(
+        matches!(svc.status(1,group,&admin).await, Ok(s) if !s.recoverable && s.backup_request_id.is_none())
+    );
+    svc.upload(1, group, &admin, upload(group, &admin, &keys, "first"))
+        .await
+        .unwrap();
+    svc.upload(1, group, &admin, upload(group, &admin, &keys, "first"))
+        .await
+        .unwrap();
+    drop(svc);
     let svc = BackupService::new(single, &TestKeyManager);
-    assert!(matches!(svc.status(1,group,&admin).await, Ok(s) if !s.recoverable));
-    svc.upload(1, group, &admin, upload(group, &admin, &keys, "first"))
-        .await
-        .unwrap();
-    svc.upload(1, group, &admin, upload(group, &admin, &keys, "first"))
-        .await
-        .unwrap();
-    assert!(svc.status(1, group, &admin).await.unwrap().recoverable);
+    let discovered = svc.status(1, group, &admin).await.unwrap();
+    assert!(discovered.recoverable);
+    let backup_request_id = discovered.backup_request_id.unwrap();
     let request = || RestoreBackup {
         request_id: "new-device".into(),
-        backup_request_id: "first".into(),
+        backup_request_id: backup_request_id.clone(),
     };
     let restored = svc.restore(1, group, &admin, request()).await.unwrap();
     assert_eq!(restored.installation_epoch, 2);
@@ -335,14 +341,16 @@ async fn actual_frost_share_recovers_without_reviving_pending_sessions(pool: PgP
         )
         .await
         .unwrap();
-    let result = svc
+    let replacement = BackupService::new(pool.clone(), &TestKeyManager);
+    let discovered = replacement.status(1, f.group, &admin).await.unwrap();
+    let result = replacement
         .restore(
             1,
             f.group,
             &admin,
             RestoreBackup {
                 request_id: "fresh-installation".into(),
-                backup_request_id: "actual-frost".into(),
+                backup_request_id: discovered.backup_request_id.unwrap(),
             },
         )
         .await
@@ -365,7 +373,9 @@ async fn actual_frost_share_recovers_without_reviving_pending_sessions(pool: PgP
             .unwrap();
     assert!(!dkg_aborted);
     if let BackupMaterial::FrostShare { key_package, .. } = &result.material {
-        Participant::restore(&hex::decode(key_package).unwrap(), &admin, &f.dkg).unwrap();
+        let recovered = Zeroizing::new(hex::decode(key_package).unwrap());
+        assert_eq!(&*recovered, &*key_bytes);
+        Participant::restore(&recovered, &admin, &f.dkg).unwrap();
     } else {
         panic!("expected share")
     };
@@ -413,7 +423,9 @@ async fn hosted_recovery_status_checks_real_custody_without_export(pool: PgPool)
         .await
         .unwrap();
     let svc = BackupService::new(pool.clone(), &TestKeyManager);
-    assert!(svc.status(1, group, &admin).await.unwrap().recoverable);
+    let hosted = svc.status(1, group, &admin).await.unwrap();
+    assert!(hosted.recoverable);
+    assert!(hosted.backup_request_id.is_none());
     assert!(matches!(
         svc.upload(
             1,
@@ -511,4 +523,44 @@ async fn audit_failure_prevents_upload_and_restore_acknowledgment(pool: PgPool) 
             .installation_epoch,
         2
     );
+}
+
+#[sqlx::test(migrations = "../database/migrations")]
+async fn status_discovers_latest_current_id_and_rejects_substituted_ciphertext(pool: PgPool) {
+    let (group, admin, keys) = fixture(&pool).await;
+    let svc = BackupService::new(pool.clone(), &TestKeyManager);
+    let first = svc
+        .upload(1, group, &admin, upload(group, &admin, &keys, "first"))
+        .await
+        .unwrap();
+    assert_eq!(first.backup_request_id.as_deref(), Some("first"));
+    let latest = svc
+        .upload(1, group, &admin, upload(group, &admin, &keys, "latest"))
+        .await
+        .unwrap();
+    assert_eq!(latest.backup_request_id.as_deref(), Some("latest"));
+    drop(svc);
+    let replacement = BackupService::new(pool.clone(), &TestKeyManager);
+    assert_eq!(
+        replacement
+            .status(1, group, &admin)
+            .await
+            .unwrap()
+            .backup_request_id
+            .as_deref(),
+        Some("latest")
+    );
+    sqlx::query("UPDATE group_backups target SET ciphertext=source.ciphertext,content_hash=source.content_hash FROM group_backups source WHERE target.group_id=$1 AND target.request_id='latest' AND source.group_id=$1 AND source.request_id='first'").bind(group).execute(&pool).await.unwrap();
+    assert!(matches!(
+        replacement.status(1, group, &admin).await,
+        Err(BackupError::Invalid)
+    ));
+    sqlx::query("UPDATE identity_groups SET key_version=key_version+1 WHERE id=$1")
+        .bind(group)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let obsolete = replacement.status(1, group, &admin).await.unwrap();
+    assert!(!obsolete.recoverable);
+    assert!(obsolete.backup_request_id.is_none());
 }

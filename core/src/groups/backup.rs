@@ -85,6 +85,7 @@ pub struct RestoredBackup {
 #[derive(Debug, Serialize)]
 pub struct BackupStatus {
     pub recoverable: bool,
+    pub backup_request_id: Option<String>,
     pub custody: String,
     pub key_version: i32,
     pub roster_version: i32,
@@ -103,6 +104,7 @@ struct Context {
 }
 #[derive(FromRow)]
 struct StoredBackup {
+    request_id: String,
     ciphertext: Vec<u8>,
     content_hash: Vec<u8>,
 }
@@ -160,7 +162,7 @@ impl<'a> BackupService<'a> {
             .await?;
         }
         tx.commit().await?;
-        Ok(status_for(&current, true))
+        Ok(status_for(&current, true, Some(request.request_id)))
     }
 
     pub async fn status(
@@ -192,11 +194,12 @@ impl<'a> BackupService<'a> {
                     && ctx.version == current.version
                     && ctx.key_version == current.key_version
                     && ctx.roster_version == current.roster_version,
+                None,
             ));
         }
-        let row = sqlx::query_as::<_,StoredBackup>("SELECT ciphertext,content_hash FROM group_backups WHERE tenant_id=$1 AND group_id=$2 AND admin_pubkey=$3 AND membership_version=$4 AND key_version=$5 AND roster_version=$6 ORDER BY created_at DESC,request_id DESC LIMIT 1")
+        let row = sqlx::query_as::<_,StoredBackup>("SELECT request_id,ciphertext,content_hash FROM group_backups WHERE tenant_id=$1 AND group_id=$2 AND admin_pubkey=$3 AND membership_version=$4 AND key_version=$5 AND roster_version=$6 ORDER BY created_at DESC,request_id DESC LIMIT 1")
             .bind(tenant).bind(group).bind(admin).bind(ctx.version).bind(ctx.key_version).bind(ctx.roster_version).fetch_optional(&self.pool).await?;
-        let recoverable = if let Some(row) = row {
+        let backup_request_id = if let Some(row) = row {
             let package = self.decode(&row).await?;
             check_binding(&ctx, tenant, group, admin, &package.binding)?;
             validate_package(&ctx, &package).await?;
@@ -209,17 +212,18 @@ impl<'a> BackupService<'a> {
                 &package.material,
             )
             .await?;
-            true
+            Some(package.request_id)
         } else {
-            false
+            None
         };
         let current = self.context(tenant, group, admin).await?;
         Ok(status_for(
             &current,
-            recoverable
+            backup_request_id.is_some()
                 && ctx.version == current.version
                 && ctx.key_version == current.key_version
                 && ctx.roster_version == current.roster_version,
+            backup_request_id,
         ))
     }
 
@@ -233,7 +237,7 @@ impl<'a> BackupService<'a> {
         valid_request_id(&request.request_id)?;
         valid_request_id(&request.backup_request_id)?;
         let ctx = self.context(tenant, group, admin).await?;
-        let row = sqlx::query_as::<_,StoredBackup>("SELECT ciphertext,content_hash FROM group_backups WHERE tenant_id=$1 AND group_id=$2 AND admin_pubkey=$3 AND request_id=$4")
+        let row = sqlx::query_as::<_,StoredBackup>("SELECT request_id,ciphertext,content_hash FROM group_backups WHERE tenant_id=$1 AND group_id=$2 AND admin_pubkey=$3 AND request_id=$4")
             .bind(tenant).bind(group).bind(admin).bind(&request.backup_request_id).fetch_optional(&self.pool).await?.ok_or(BackupError::Missing)?;
         let package = self.decode(&row).await?;
         if package.request_id != request.backup_request_id {
@@ -301,7 +305,12 @@ impl<'a> BackupService<'a> {
         if Sha256::digest(&*plaintext).as_slice() != row.content_hash {
             return Err(BackupError::Invalid);
         }
-        serde_json::from_slice(&plaintext).map_err(|_| BackupError::Invalid)
+        let package: UploadBackup =
+            serde_json::from_slice(&plaintext).map_err(|_| BackupError::Invalid)?;
+        if package.request_id != row.request_id {
+            return Err(BackupError::Invalid);
+        }
+        Ok(package)
     }
 }
 const CONTEXT_QUERY:&str = "SELECT g.mode,g.pubkey,g.signing_key_id,g.key_version,g.roster_version,m.version,m.participant_id,m.installation_epoch FROM identity_groups g JOIN group_memberships m ON m.tenant_id=g.tenant_id AND m.group_id=g.id JOIN users u ON u.tenant_id=m.tenant_id AND u.pubkey=m.admin_pubkey WHERE g.tenant_id=$1 AND g.id=$2 AND m.admin_pubkey=$3 AND m.status='active' AND u.status='active'";
@@ -335,9 +344,10 @@ fn valid_request_id(value: &str) -> Result<(), BackupError> {
         Ok(())
     }
 }
-fn status_for(ctx: &Context, recoverable: bool) -> BackupStatus {
+fn status_for(ctx: &Context, recoverable: bool, backup_request_id: Option<String>) -> BackupStatus {
     BackupStatus {
         recoverable,
+        backup_request_id: backup_request_id.filter(|_| recoverable),
         custody: ctx.mode.clone(),
         key_version: ctx.key_version,
         roster_version: ctx.roster_version,

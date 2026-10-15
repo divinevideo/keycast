@@ -21,7 +21,9 @@ All routes use the existing tenant extractor and account-management UCAN authori
 (see [GROUPS.md](GROUPS.md)); delegated third-party signing tokens are refused:
 
 - `PUT /api/groups/:group_id/backups` uploads `{request_id,binding,material}`.
-- `GET /api/groups/:group_id/backups` returns current custody and `recoverable`.
+- `GET /api/groups/:group_id/backups` returns current custody, `recoverable` and
+  `backup_request_id`, the latest validated package ID for the current member and
+  group versions. Hosted custody and missing current packages return a null ID.
 - `POST /api/groups/:group_id/backups/restore` accepts
   `{request_id,backup_request_id}` and returns the package and installation epoch.
 
@@ -69,12 +71,15 @@ FROST bindings use `ciphersuite:"FROST-secp256k1-SHA256-TR-v1"` and
 
 A full-key package instead uses `participant_id:null` and
 `material:{"kind":"full_key","secret_key":"<full-hex-group-secret>"}`.
-Never log the request/response body. Restore with
-`{"request_id":"<fresh-recovery-id>","backup_request_id":"<stable-backup-request-id>"}`;
+Never log the request/response body. On a replacement device, fetch backup status
+first and use its `backup_request_id`; the lost device's upload ID does not need
+to be retained locally. Restore with
+`{"request_id":"<fresh-recovery-id>","backup_request_id":"<ID-returned-by-status>"}`;
 the response is `{binding,material,installation_epoch}`. Hosted status instead
 reports custody/recoverability and versions without exporting its key.
 
-Upload success follows the database commit. A failed storage or encryption request
+Upload success follows the database commit and returns its committed
+`backup_request_id` in the status response. A failed storage or encryption request
 returns an error and must never be displayed as recoverable. Retrying an upload
 with the same request ID and identical contents preserves the original package;
 different contents conflict. Use a new ID for changed material. A roster, membership
