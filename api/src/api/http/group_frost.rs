@@ -20,6 +20,7 @@ use sqlx::PgPool;
 /// Merge under `/api/groups` (or the existing authenticated groups prefix).
 pub fn router() -> Router<PgPool> {
     Router::new()
+        .route("/:group_id/frost/identity", get(identity))
         .route("/:group_id/frost/dkg", post(create_dkg))
         .route("/:group_id/frost/signing", post(create_signing))
         .route("/:group_id/frost/sessions/:session_id", get(session))
@@ -32,6 +33,19 @@ pub fn router() -> Router<PgPool> {
             post(signing_message),
         )
         .route("/:group_id/frost/sessions/:session_id/abort", post(abort))
+}
+
+async fn identity(
+    tenant: TenantExtractor,
+    State(pool): State<PgPool>,
+    auth: GroupAuth,
+    Path(group): Path<i32>,
+) -> ApiResult<Json<DkgState>> {
+    FrostCoordinator::new(pool)
+        .identity(tenant.0.id, group, &auth.pubkey)
+        .await
+        .map(Json)
+        .map_err(error)
 }
 
 fn error(e: FrostError) -> ApiError {

@@ -29,6 +29,7 @@ and let every invitee accept before beginning DKG. The FROST router lives at
 
 | Method and suffix | Body / result |
 | --- | --- |
+| GET `/identity` | Confirmed public DKG descriptor for the current group identity; no prior session ID required |
 | POST `/dkg` | Fresh UUID `session_id`, `threshold`; returns DKG state |
 | POST `/signing` | Fresh UUID `session_id`, completed `dkg_session_id`, full unsigned `event`, immutable `signer_ids`; returns proposal |
 | GET `/sessions/:session_id` | Public protocol state and recipient ciphertexts |
@@ -142,6 +143,17 @@ epoch, invalidates pending sessions, and requires fresh proposals/approvals with
 current epochs. No personal key export or server signing participation is enabled.
 Server-recoverable copies of a threshold of shares are custodial material even
 though this coordinator has no share-signing API.
+
+A replacement device discovers its group through the regular authenticated group
+list and fetches `/api/groups/:group_id/frost/identity` using current account
+access. This endpoint returns the complete confirmed public DKG descriptor for
+the group's current key/roster versions and public key, even after the original
+ceremony expires or installation epochs change. It requires no lost device token
+or remembered ceremony ID. Pending, aborted, mismatched and unauthorized identities
+are rejected. Feed this descriptor and the authenticated restored key package to
+`Participant::restore`, then create a fresh signing session using the discovered
+DKG session ID and current participant epochs. The response contains public data
+and encrypted deliveries; it restores no pending approval or nonce state.
 
 ## Self-management and verified scope
 

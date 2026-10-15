@@ -179,6 +179,39 @@ impl FrostCoordinator {
         Self { pool }
     }
 
+    /// Discover immutable public identity data after device loss. No historical
+    /// ceremony ID, device credential, nonce or installation snapshot is needed.
+    pub async fn identity(
+        &self,
+        tenant: i64,
+        group: i32,
+        admin: &str,
+    ) -> Result<DkgState, FrostError> {
+        let permit = admission().await?;
+        let mut tx = self.pool.begin().await?;
+        let (row, _) = context(&mut tx, tenant, group, admin).await?;
+        let expected = row.pubkey.ok_or(FrostError::NotFound)?;
+        let value:serde_json::Value=sqlx::query_scalar("SELECT state FROM group_frost_sessions WHERE tenant_id=$1 AND group_id=$2 AND session_kind='dkg' AND NOT aborted AND state->>'type'='dkg' AND state->'state'->>'aborted'='false' AND jsonb_typeof(state->'state'->'public_package')='object' AND state->'state'->'binding'->>'key_version'=$3 AND state->'state'->'binding'->>'roster_version'=$4 ORDER BY created_at DESC,id LIMIT 1")
+            .bind(tenant).bind(group).bind(row.key_version.to_string()).bind(row.roster_version.to_string()).fetch_optional(&mut *tx).await?.ok_or(FrostError::NotFound)?;
+        let identity = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let Session::Dkg(state) = serde_json::from_value(value)? else {
+                return Err(FrostError::Invalid("invalid confirmed identity"));
+            };
+            if state.binding.tenant_id != tenant
+                || state.binding.group_id != group
+                || group_pubkey(state.confirmed_public_package()?)?.to_hex() != expected
+            {
+                return Err(FrostError::Invalid("confirmed identity binding differs"));
+            }
+            Ok(state)
+        })
+        .await
+        .map_err(|_| FrostError::Aborted)??;
+        tx.commit().await?;
+        Ok(identity)
+    }
+
     pub async fn create_dkg(
         &self,
         tenant: i64,

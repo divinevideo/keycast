@@ -638,3 +638,143 @@ async fn complete_approval_rejects_replaced_event_id_and_signer_set(pool: PgPool
     state.commitments.insert(60000, commitment);
     assert!(state.signing_package().is_err());
 }
+
+#[sqlx::test(migrations = "../database/migrations")]
+#[serial_test::serial(frost_coordinator)]
+async fn replacement_device_discovers_identity_from_group_id_and_signs(pool: PgPool) {
+    use keycast_core::groups::backup::{BackupMaterial, BackupService, RestoreBackup};
+    use keycast_core::groups::frost::client::Participant;
+    let single = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    let mut f = completed_dkg(&single).await;
+    backup_all(&single, &f).await;
+    let group = f.group;
+    let admin = f.keys[0].public_key().to_hex();
+    let peer = f.keys[1].public_key().to_hex();
+    let removed = f.keys[2].public_key().to_hex();
+    let expected_pubkey = event(&f).pubkey;
+    // The lost device no longer holds a live group-share handle.
+    drop(f.participants.remove(0));
+    // Recovery changes installation state; the old ceremony is expired and one
+    // original participant has since lost access. Its public identity stays fixed.
+    sqlx::query("UPDATE group_memberships SET status='removed',version=version+1 WHERE tenant_id=1 AND group_id=$1 AND admin_pubkey=$2").bind(group).bind(&removed).execute(&single).await.unwrap();
+    sqlx::query("UPDATE group_frost_sessions SET expires_at=now()-interval '1 hour' WHERE tenant_id=1 AND group_id=$1 AND session_kind='dkg'").bind(group).execute(&single).await.unwrap();
+    // A replacement client retains only its account, group ID and restored share;
+    // no ceremony/session ID or pending nonce handle is used for discovery.
+    let backups = BackupService::new(single.clone(), &frost_fixture::FixtureKms);
+    let status = backups.status(1, group, &admin).await.unwrap();
+    assert!(status.recoverable);
+    let recovered = backups
+        .restore(
+            1,
+            group,
+            &admin,
+            RestoreBackup {
+                request_id: uuid::Uuid::new_v4().to_string(),
+                backup_request_id: status
+                    .backup_request_id
+                    .expect("discoverable durable backup"),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered.installation_epoch, 2);
+    let BackupMaterial::FrostShare { key_package, .. } = &recovered.material else {
+        panic!("restored participant share");
+    };
+    let key_package = zeroize::Zeroizing::new(hex::decode(key_package).unwrap());
+    let replacement = FrostCoordinator::new(single.clone());
+    let discovered = replacement.identity(1, group, &admin).await.unwrap();
+    assert_eq!(
+        group_pubkey(discovered.confirmed_public_package().unwrap()).unwrap(),
+        expected_pubkey
+    );
+    let restored = Participant::restore(&key_package, &admin, &discovered).unwrap();
+    let ids = discovered
+        .roster
+        .iter()
+        .filter(|m| m.admin_pubkey == admin || m.admin_pubkey == peer)
+        .map(|m| m.participant_id)
+        .collect();
+    let mut signing = replacement
+        .create_signing(
+            1,
+            group,
+            &admin,
+            &uuid::Uuid::new_v4().to_string(),
+            &discovered.binding.session_id,
+            UnsignedEvent::new(
+                expected_pubkey,
+                Timestamp::from(1_800_000_001),
+                Kind::TextNote,
+                [],
+                "Synthetic replacement-device signature",
+            ),
+            ids,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        signing
+            .signers
+            .iter()
+            .find(|m| m.admin_pubkey == admin)
+            .unwrap()
+            .installation_epoch,
+        2
+    );
+    let (own_approval, own_commitment) = restored.approve(&signing, &discovered).unwrap();
+    let (peer_approval, peer_commitment) =
+        f.participants[0].approve(&signing, &discovered).unwrap();
+    for (actor, commitment) in [(&admin, own_commitment), (&peer, peer_commitment)] {
+        signing = replacement
+            .signing_message(
+                1,
+                group,
+                actor,
+                &signing.binding.session_id,
+                SigningMessage::Commitment {
+                    proposal_digest: signing.proposal_digest().unwrap(),
+                    commitment,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let own_partial = own_approval.sign(&restored, &signing).unwrap();
+    let peer_partial = peer_approval.sign(&f.participants[0], &signing).unwrap();
+    for (actor, partial) in [(&admin, own_partial), (&peer, peer_partial)] {
+        signing = replacement
+            .signing_message(
+                1,
+                group,
+                actor,
+                &signing.binding.session_id,
+                SigningMessage::Partial {
+                    proposal_digest: signing.proposal_digest().unwrap(),
+                    partial,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let result = signing.result.unwrap();
+    result.verify().unwrap();
+    assert_eq!(result.pubkey, expected_pubkey);
+    assert!(replacement
+        .identity(1, group, &nostr::Keys::generate().public_key().to_hex())
+        .await
+        .is_err());
+    assert!(replacement.identity(1, group, &removed).await.is_err());
+    assert!(replacement.identity(2, group, &admin).await.is_err());
+    // A group without an installed, confirmed identity exposes no ceremony as one.
+    sqlx::query("UPDATE identity_groups SET pubkey=NULL WHERE tenant_id=1 AND id=$1")
+        .bind(group)
+        .execute(&single)
+        .await
+        .unwrap();
+    assert!(replacement.identity(1, group, &admin).await.is_err());
+}

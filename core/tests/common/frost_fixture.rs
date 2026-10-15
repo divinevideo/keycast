@@ -12,7 +12,7 @@ use keycast_core::{
 use nostr::Keys;
 use sqlx::PgPool;
 
-struct FixtureKms;
+pub(super) struct FixtureKms;
 #[async_trait::async_trait]
 impl KeyManager for FixtureKms {
     async fn encrypt(&self, bytes: &[u8]) -> Result<Vec<u8>, KeyManagerError> {
