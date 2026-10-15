@@ -18,7 +18,7 @@ use keycast_core::types::oauth_authorization::OAuthAuthorization;
 use moka::future::Cache;
 use nostr_sdk::prelude::*;
 use secrecy::{ExposeSecret, SecretString};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -49,6 +49,41 @@ pub enum HandlerStatus {
     /// Authorization has expired - can only send error responses
     Expired,
 }
+
+#[derive(Debug, PartialEq, Eq)]
+struct GroupSigningContext {
+    group_id: i32,
+    admin_pubkey: String,
+}
+
+// Resolve ownership from the stored key/team as well as the grant: deleting a
+// grant must never turn a group key into an ordinary team authorization.
+const GROUP_AUTHORIZATION_STATE: &str = "
+    SELECT g.id, gg.admin_pubkey,
+           COALESCE(g.mode = 'hosted' AND g.pubkey = $3
+             AND k.pubkey = $3 AND k.team_id = g.id AND k.id = g.signing_key_id
+             AND a.policy_id = g.policy_id
+             AND a.connected_client_pubkey IS NOT NULL
+             AND (a.expires_at IS NULL OR a.expires_at > NOW())
+             AND gg.authorization_id IS NOT NULL AND gg.revoked_at IS NULL
+             AND gg.key_version = g.key_version
+             AND m.status = 'active' AND m.version = gg.membership_version
+             AND m.installation_epoch = gg.installation_epoch
+             AND u.status = 'active', false)
+    FROM identity_groups g
+    LEFT JOIN authorizations a ON a.id = $1 AND a.tenant_id = $2
+    LEFT JOIN stored_keys k ON k.id = a.stored_key_id AND k.tenant_id = $2
+    LEFT JOIN group_grants gg ON gg.authorization_id = $1
+        AND gg.tenant_id = $2 AND gg.group_id = g.id
+    LEFT JOIN group_memberships m ON m.tenant_id = gg.tenant_id
+        AND m.group_id = gg.group_id AND m.admin_pubkey = gg.admin_pubkey
+    LEFT JOIN users u ON u.tenant_id = m.tenant_id AND u.pubkey = m.admin_pubkey
+    WHERE g.tenant_id = $2 AND (
+        g.signing_key_id = a.stored_key_id OR g.id = k.team_id
+        OR gg.authorization_id IS NOT NULL
+        OR EXISTS (SELECT 1 FROM stored_keys cached_key
+                   WHERE cached_key.tenant_id = $2 AND cached_key.team_id = g.id
+                     AND cached_key.pubkey = $3))";
 
 /// NIP-46 handler for a single authorization
 ///
@@ -252,7 +287,7 @@ impl Nip46Handler {
             self.validate_client(client_pubkey).await?;
         }
 
-        Ok(match method {
+        let response = match method {
             "sign_event" => {
                 // handle_sign_event already returns a full response with id
                 self.handle_sign_event(request).await?
@@ -443,7 +478,10 @@ impl Nip46Handler {
                 tracing::warn!("Unsupported NIP-46 method: {}", method);
                 serde_json::json!({"id": request_id, "error": format!("Unsupported method: {}", method)})
             }
-        })
+        };
+        // Warm handlers never rely on cache invalidation for group membership.
+        self.validate_group_authorization().await?;
+        Ok(response)
     }
 
     /// The handler's status as of *now*, not as of when it was loaded.
@@ -509,6 +547,79 @@ impl Nip46Handler {
             Some(message) => Err(SignerError::permission_denied(message)),
             None => Ok(()),
         }
+    }
+
+    /// Re-read group membership and every version binding on each operation.
+    /// Personal OAuth authorizations retain their existing account semantics.
+    async fn validate_group_authorization(&self) -> SignerResult<Option<GroupSigningContext>> {
+        if self.is_oauth {
+            return Ok(None);
+        }
+        self.validate_group_on(&mut *self.pool.acquire().await?)
+            .await
+    }
+
+    async fn validate_group_on(
+        &self,
+        connection: &mut PgConnection,
+    ) -> SignerResult<Option<GroupSigningContext>> {
+        let rows: Vec<(i32, Option<String>, bool)> = sqlx::query_as(GROUP_AUTHORIZATION_STATE)
+            .bind(self.authorization_id)
+            .bind(self.tenant_id)
+            .bind(self.user_keys.public_key().to_hex())
+            .fetch_all(connection)
+            .await?;
+        match rows.as_slice() {
+            [] => Ok(None),
+            [(group_id, Some(admin_pubkey), true)] => Ok(Some(GroupSigningContext {
+                group_id: *group_id,
+                admin_pubkey: admin_pubkey.clone(),
+            })),
+            _ => Err(SignerError::permission_denied(
+                "Group authorization is no longer active",
+            )),
+        }
+    }
+
+    /// Recheck after key use, then durably record the exact event before release.
+    /// Group mutations lock the same group row. This short transaction contains
+    /// only storage operations; signing and KMS never hold a database connection.
+    async fn finish_group_signing(
+        &self,
+        expected: Option<GroupSigningContext>,
+        signed_event: &Event,
+    ) -> SignerResult<()> {
+        let Some(expected) = expected else {
+            if self.validate_group_authorization().await?.is_some() {
+                return Err(SignerError::permission_denied(
+                    "Group authorization changed",
+                ));
+            }
+            return Ok(());
+        };
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT id FROM identity_groups WHERE tenant_id = $1 AND id = $2 FOR SHARE")
+            .bind(self.tenant_id)
+            .bind(expected.group_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if self.validate_group_on(&mut tx).await?.as_ref() != Some(&expected) {
+            return Err(SignerError::permission_denied(
+                "Group authorization changed",
+            ));
+        }
+        self.ensure_authorization_active()?;
+        sqlx::query("INSERT INTO group_audit (tenant_id, group_id, admin_pubkey, action, event_id, session_id)
+                     VALUES ($1, $2, $3, 'sign_event', $4, $5)")
+            .bind(self.tenant_id)
+            .bind(expected.group_id)
+            .bind(expected.admin_pubkey)
+            .bind(signed_event.id.to_hex())
+            .bind(self.authorization_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Compute handler status from OAuth authorization database fields.
@@ -938,6 +1049,7 @@ impl Nip46Handler {
     /// other binding is reported as no binding, so its client must connect
     /// with the secret.
     async fn binding_state(&self) -> SignerResult<Option<(Option<String>, Option<String>)>> {
+        self.validate_group_authorization().await?;
         let state = if self.is_oauth {
             sqlx::query_as(
                 "SELECT CASE WHEN connected_client_pubkey = verified_client_pubkey
@@ -2158,12 +2270,14 @@ impl SigningHandler for Nip46Handler {
         );
 
         self.ensure_authorization_active()?;
+        self.validate_group_authorization().await?;
 
         // Check account status, minor DM gate, and policy permissions before signing
         self.check_user_sign_gates(&unsigned_event).await?;
         self.validate_permissions_for_sign(&unsigned_event).await?;
         // Recheck after the awaits: clock-derived expiry can fall due mid-request.
         self.ensure_authorization_active()?;
+        let group = self.validate_group_authorization().await?;
 
         // Canonicalize the pubkey to match the signer keys, matching SigningSession::sign_event behavior.
         // This prevents producing an event where event.pubkey disagrees with the keypair that signed it.
@@ -2180,6 +2294,7 @@ impl SigningHandler for Nip46Handler {
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
+        self.finish_group_signing(group, &signed_event).await?;
         tracing::debug!("Successfully signed event: {}", signed_event.id);
 
         self.spawn_update_activity();
@@ -2262,12 +2377,14 @@ impl Nip46Handler {
         );
 
         self.ensure_authorization_active()?;
+        self.validate_group_authorization().await?;
 
         // Check account status, minor DM gate, and policy permissions before signing
         self.check_user_sign_gates(&unsigned_event).await?;
         self.validate_permissions_for_sign(&unsigned_event).await?;
         // Recheck after the awaits: clock-derived expiry can fall due mid-request.
         self.ensure_authorization_active()?;
+        let group = self.validate_group_authorization().await?;
 
         // Sign the event with user keys (CPU-bound, use spawn_blocking)
         let signed_event = {
@@ -2289,6 +2406,7 @@ impl Nip46Handler {
             })?
         };
 
+        self.finish_group_signing(group, &signed_event).await?;
         tracing::debug!("Successfully signed event: {}", signed_event.id);
 
         self.spawn_update_activity();
