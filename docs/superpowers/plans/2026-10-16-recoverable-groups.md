@@ -55,7 +55,7 @@
 
 - [x] Run focused tests against isolated local Postgres/Redis/test relay and demonstrate standard event round trips.
 - [x] Run fmt, all-feature workspace clippy, relevant integration suites and personal recovery regressions.
-- [ ] Review diff, commit scoped changes, rebase fresh origin/main, push and open conventional-title PR using template; request mapped reviewers once.
+- [x] Review diff, commit scoped changes, rebase fresh origin/main, push and open conventional-title PR using template; request mapped reviewers once (PR #435; platform assigned dcadenas).
 - [ ] Inspect required checks to completion. Report each unexercised acceptance gate precisely.
 
 ## Evidence and decisions
@@ -67,11 +67,11 @@
 
 ## Verification evidence (2026-10-16)
 
-- Core integration-enabled library/tests: 378 passed, one pre-existing ignored test.
+- Core integration-enabled library/tests: 380 passed, one pre-existing ignored test.
 - API integration-enabled library/tests: 981 passed, six pre-existing ignored tests.
 - Signer integration-enabled library/tests: 116 passed; includes independent raw
   secp256k1 verification and stock relay read-back for three independent admins.
-- Group-specific suites: lifecycle 4, backup 8, FROST 5, real-UCAN HTTP 1 passed.
+- Group-specific suites: lifecycle 4, backup 9, FROST 6, real-UCAN HTTP 1 passed.
   FROST covers every 2-of-3 subset, a real stock relay, current backup prerequisite,
   concurrent nonce exclusion, transcript conflicts, exact proposals, device epochs,
   and immutable completed DKG/signature retries after expiry and membership removal.
@@ -100,3 +100,9 @@ registration/authentication/transport dependency in the documented contract.
 - Final pending-invite regression passed through real DKG and every original signer
   subset. Completed cryptographic membership cannot change via a prior invitation.
 - Redis cluster suite passed all12; final service-deletion regression passed9.
+
+- Replacement-device discovery passed: current backup ID and confirmed FROST identity
+  are discoverable with account authentication and group ID alone. The real recovery
+  chain restores the same participant and signs a fresh session after expiry/removal
+  of another original participant. Real-UCAN HTTP coverage exercises backup discovery
+  and restore plus pending/unauthorized identity rejection.

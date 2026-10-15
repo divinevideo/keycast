@@ -9,18 +9,20 @@ clients can operate without any Keycast dependency.
 ## Current status
 
 [VERIFIED] Backend implementation, migrations, contracts and local demonstrations
-are present on `feat/recoverable-groups`. Implementation anchor: `a9c80d4`.
+are present on `feat/recoverable-groups`. Implementation anchors: `e8b5161` (backup discovery) and `cce1669` (FROST identity discovery).
 Local verification is complete. The current branch's pull request is the source
 for remote CI/review state; merging and deployment require separate authorization.
 
 ## Verification
 
 [VERIFIED] `cargo test --workspace` passed. Integration-enabled library/test suites:
-core 378 passed/one existing ignored; API 981 passed/six existing ignored; signer
+core 380 passed/one existing ignored; API 981 passed/six existing ignored; signer
 116 passed. All 12 Redis cluster integration tests passed. Final focused group
-suites passed (lifecycle4, backups8, FROST5, real-UCAN HTTP1), including a pre-DKG
+suites passed (lifecycle4, backups9, FROST6, real-UCAN HTTP1), including a pre-DKG
 pending invitation that cannot alter the completed roster. Account service-deletion
-regressions passed9. Workspace all-target/all-feature clippy and formatting passed.
+regressions passed9. A replacement installation discovers its backup ID and
+confirmed public DKG descriptor from its authenticated account, restores the same
+participant, and signs with a fresh session without lost-device metadata. Workspace all-target/all-feature clippy and formatting passed.
 
 [VERIFIED] `e2e/scripts/group-flow.mjs` exercised actual HTTP registration/email
 verification and independent NIP-46 signing through the normal running daemon and

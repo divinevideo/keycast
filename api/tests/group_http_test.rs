@@ -315,5 +315,70 @@ async fn real_ucan_group_routes_cover_lifecycle_custody_and_fresh_enrollment() {
         .0,
         StatusCode::FORBIDDEN
     );
+    // A replacement device discovers the backup identifier from the account,
+    // rather than needing metadata retained on the lost installation.
+    let device_key = Keys::generate();
+    let (status, device_group) = call(
+        &app,
+        "POST",
+        "/groups",
+        Some(&token),
+        json!({
+            "request_id":uuid::Uuid::new_v4().to_string(),"name":"Synthetic device backup",
+            "mode":"device","pubkey":device_key.public_key().to_hex()
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let backup_path = format!("/groups/{}/backups", device_group["id"].as_i64().unwrap());
+    let (status, uploaded) = call(
+        &app,
+        "PUT",
+        &backup_path,
+        Some(&token),
+        json!({
+            "request_id":uuid::Uuid::new_v4().to_string(),
+            "binding":{"format_version":1,"tenant_id":1,"group_id":device_group["id"],
+                "group_pubkey":device_group["pubkey"],"admin_pubkey":admin.public_key().to_hex(),
+                "participant_id":null,"membership_version":1,"key_version":1,"roster_version":1,
+                "ciphersuite":"BIP-340","tweak_version":"none"},
+            "material":{"kind":"full_key","secret_key":device_key.secret_key().to_secret_hex()}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "backup upload must durably succeed");
+    assert_eq!(uploaded["recoverable"], true);
+    let (status, discovered) = call(&app, "GET", &backup_path, Some(&token), Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(discovered["backup_request_id"].is_string());
+    let (status,recovered)=call(&app,"POST",&format!("{backup_path}/restore"),Some(&token),json!({
+        "request_id":uuid::Uuid::new_v4().to_string(),"backup_request_id":discovered["backup_request_id"]
+    })).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "discovered identifier must support replacement restore"
+    );
+    let restored_keys = Keys::parse(recovered["material"]["secret_key"].as_str().unwrap()).unwrap();
+    assert_eq!(restored_keys.public_key(), device_key.public_key());
+    assert_eq!(recovered["installation_epoch"], 2);
+    let (status,pending)=call(&app,"POST","/groups",Some(&token),json!({
+        "request_id":uuid::Uuid::new_v4().to_string(),"name":"Synthetic pending threshold","mode":"frost"
+    })).await;
+    assert_eq!(status, StatusCode::OK);
+    let identity_path = format!("/groups/{}/frost/identity", pending["id"].as_i64().unwrap());
+    assert_ne!(
+        call(&app, "GET", &identity_path, Some(&token), Value::Null)
+            .await
+            .0,
+        StatusCode::OK,
+        "pending ceremony has no identity to restore"
+    );
+    assert_eq!(
+        call(&app, "GET", &identity_path, Some(&outsider), Value::Null)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
     producer.abort();
 }

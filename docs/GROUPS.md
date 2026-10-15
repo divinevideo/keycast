@@ -125,6 +125,14 @@ See [GROUP_RECOVERY.md](GROUP_RECOVERY.md) for backup API bindings, strict paylo
 idempotency, durable acknowledgment, replacement installation behavior and the
 database/encryption-key disaster-recovery procedure.
 
+For device-held keys/shares, a new installation calls the backup status endpoint
+to discover the current `backup_request_id`, then restores that ID with a fresh
+recovery request. It does not need the old installation's upload metadata. For
+threshold material it also calls `GET /api/groups/<id>/frost/identity` to discover
+the confirmed public ceremony descriptor and original DKG session ID before
+constructing a fresh signing session. Current membership and versions gate every
+step; no nonce or pending signing handle is restored.
+
 ## Optional threshold groups
 
 See [GROUP_FROST.md](GROUP_FROST.md). The coordinator protocol is versioned and
