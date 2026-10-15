@@ -53,8 +53,8 @@
 
 ## Final verification and delivery
 
-- [ ] Run focused tests against isolated local Postgres/Redis/test relay and demonstrate standard event round trips.
-- [ ] Run fmt, all-feature workspace clippy, relevant integration suites and personal recovery regressions.
+- [x] Run focused tests against isolated local Postgres/Redis/test relay and demonstrate standard event round trips.
+- [x] Run fmt, all-feature workspace clippy, relevant integration suites and personal recovery regressions.
 - [ ] Review diff, commit scoped changes, rebase fresh origin/main, push and open conventional-title PR using template; request mapped reviewers once.
 - [ ] Inspect required checks to completion. Report each unexercised acceptance gate precisely.
 
@@ -93,3 +93,10 @@ client discard/operator abort procedure; there is no native kill-and-rollback en
 harness in this change. Mobile UI, physical-device builds and another app's visible
 rendering are not backend acceptance claims. Self-managed clients have no Keycast
 registration/authentication/transport dependency in the documented contract.
+
+- Final normal-server hosted demonstration passed twice: normal registration/email
+  verification, three independent encrypted NIP-46 clients, JS verification and four
+  relay round-trips including replacement; all six old-device denial checks passed.
+- Final pending-invite regression passed through real DKG and every original signer
+  subset. Completed cryptographic membership cannot change via a prior invitation.
+- Redis cluster suite passed all12; final service-deletion regression passed9.
