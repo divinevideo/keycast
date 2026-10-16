@@ -49,16 +49,21 @@ Create the experiment in `tools/custody-spike/`, excluded from the root Cargo wo
 | `src/bin/custody-signer.rs`, `src/bin/custody-coordinator.rs` | Independently launched local services |
 | `tests/{intent,policy,interop,signing,recovery,nip46}_test.rs` | Actual assertions and process fault tests |
 
-Public types defined in Task 1: `IdentityBinding`, `DeviceGrant`, `PolicySnapshot`, `PolicyProposal`, `PolicyCertificate`, `IntentV1`, `ClientProof`, `VerifiedIntent`, `SigningProposal`, `PublicCommitment`, `PublicPartial`, `RecoveryCase`, `RecoveryEvidence`, `IncarnationCertificate`, `BackupBinding`, `CustodyError`. Task 6 defines `DomainKeyManager` as the per-domain wrapper over the existing
+Public types defined in Task 1: `IdentityBinding`, `DeviceGrant`, `PolicySnapshot`, `PolicyProposal`, `PolicyCertificate`, `IntentV1`, `ClientProof`, `VerifiedAuthorization`, `SigningProposal`, `PublicCommitment`, `PublicPartial`, `RecoveryCase`, `RecoveryEvidence`, `IncarnationCertificate`, `BackupBinding`, `CustodyError`. Task 6 defines `DomainKeyManager` as the per-domain wrapper over the existing
 `keycast_core::encryption::KeyManager` trait and the strict `EncryptedShareBackup`
-codec. Task 7 defines `TransportCredential` and `VerifiedClientRequest`; no client
-request gets that verified type through a public constructor. Public APIs return
+codec. Task 7 defines `TransportCredential` and the second verifier for the same opaque
+`VerifiedAuthorization` type. The type retains its proof kind and selection scope;
+only a guard-local verifier can construct it. It is never accepted as a serialized
+coordinator assertion. Native proof scope is the exact set/session; legacy NIP-46
+scope is the explicitly certified service pool plus a guard-verified internal
+set/session binding. No conversion may widen native scope or pretend a legacy
+client signed the native profile. Public APIs return
 `Result<T, CustodyError>`; use `nostr::UnsignedEvent`, `Event`, `PublicKey`. Secrets live only in opaque nonserializable handles except the strict, encrypted share-backup codec.
 
 ### Task 1: Pin the native transaction-approval contract
 
 **Files:** Create protocol/intent modules, crate manifest/lock, `tests/intent_test.rs`; modify root Cargo exclude list for the experiment only.
-**Produces:** `IntentV1::digest() -> [u8; 32]`; `verify_intent(&IntentV1, &ClientProof, &PolicySnapshot, &UnsignedEvent, now: i64) -> Result<VerifiedIntent, CustodyError>`. `VerifiedIntent` has a private constructor. Binding fields and canonical array order follow the design, in its listed order.
+**Produces:** `IntentV1::digest() -> [u8; 32]`; `verify_intent(&IntentV1, &ClientProof, &PolicySnapshot, &UnsignedEvent, now: i64) -> Result<VerifiedAuthorization, CustodyError>`. `VerifiedAuthorization` has private constructors and retains native evidence plus exact selection scope. Binding fields and canonical array order follow the design, in its listed order.
 
 - [ ] Write failing table-driven tests: each tenant/group/pubkey/event field, grant/epoch/device, participant set/session, crypto version and expiry alteration is denied; exact request passes; 121-second lifetime and 31-second skew fail; malformed/unknown fields fail. Include Unicode, escaped content, tag order and JavaScript-safe decimal-string versions.
 - [ ] Run `cargo test --manifest-path tools/custody-spike/Cargo.toml --test intent_test`; verify assertions fail before implementation.
@@ -94,8 +99,8 @@ request gets that verified type through a public constructor. Public APIs return
 ### Task 4: Run one-human service-quorum signing in separate processes
 
 **Files:** Create signer, transport and binary modules plus `tests/signing_test.rs`.
-**Consumes:** `VerifiedIntent`, `Participant`, `PolicyJournal`.
-**Produces:** `GuardedSigner::commit(&mut self, &VerifiedIntent) -> Result<PublicCommitment, CustodyError>`; `sign(&mut self, &SigningProposal) -> Result<PublicPartial, CustodyError>`; `aggregate(&SigningProposal, &[PublicPartial]) -> Result<Event, CustodyError>`.
+**Consumes:** `VerifiedAuthorization`, `Participant`, `PolicyJournal`.
+**Produces:** `GuardedSigner::commit(&mut self, &VerifiedAuthorization) -> Result<PublicCommitment, CustodyError>`; `sign(&mut self, &SigningProposal) -> Result<PublicPartial, CustodyError>`; `aggregate(&SigningProposal, &[PublicPartial]) -> Result<Event, CustodyError>`.
 
 - [ ] Write failing process tests: three distinct human admins each publish alone; one signer offline; coordinator plus one malicious signer proposes an altered event, wrong human/group, expired request or substituted policy; missing quorum and invalid shares fail.
 - [ ] Run `cargo test --manifest-path tools/custody-spike/Cargo.toml --test signing_test`; inspect failures.
@@ -118,12 +123,12 @@ request gets that verified type through a public constructor. Public APIs return
 
 **Files:** Create recovery module and `tests/recovery_test.rs`.
 **Consumes:** policy journal, independent epoch witness and per-domain crypto/store.
-**Produces:** `seal_share(&Participant, &BackupBinding, &DomainKeyManager) -> Result<EncryptedShareBackup, CustodyError>`; `restore_share(&EncryptedShareBackup, &RecoveryCase, &RecoveryEvidence, &IncarnationCertificate, &DomainKeyManager) -> Result<Participant, CustodyError>`; explicit replacement-device policy proposal. No public API returns plaintext shares.
+**Produces:** async `seal_share(&Participant, &BackupBinding, &DomainKeyManager) -> Result<EncryptedShareBackup, CustodyError>`; async `restore_share(&EncryptedShareBackup, &RecoveryCase, &RecoveryEvidence, &IncarnationCertificate, &DomainKeyManager) -> Result<Participant, CustodyError>`; explicit replacement-device policy proposal. No public API returns plaintext shares. Both operations await KeyManager outside any storage transaction. Recovery advances the certified policy epoch and records a request cutoff; original signed NIP-46 requests created at or before that cutoff may only retrieve a completed cached result, never start new work. Otherwise the client sends a newly signed request after the cutoff; native clients approve the new epoch.
 
 - [ ] Write failing tests: coordinator credentials plus one domain's KMS access cannot unwrap two shares; wrong tenant/group/participant/key/roster/suite rejected; ciphertext failure not acknowledged; retry preserves participant/pubkey; removed human denied; API-minted recovery proof denied.
 - [ ] Run recovery tests and inspect failures.
 - [ ] Implement strict encrypted packages and durable acknowledgment. Restore one participant directly inside its domain, retaining ID and fencing its former incarnation. Use synthetic independently held recovery approvals; do not label them a finished user account-recovery flow.
-- [ ] Perform real snapshot rollback of signer/policy storage while retaining an independent epoch witness. Old sessions/workers/traffic must fail; restored nodes must obtain all-domain freshness certification before signing. Roll back every authority/witness or make it unavailable and verify fail-closed behavior.
+- [ ] Perform real snapshot rollback of signer/policy storage while retaining an independent epoch witness. Old sessions/workers/traffic must fail; restored nodes must obtain all-domain freshness certification before signing. Roll back every authority/witness or make it unavailable and verify fail-closed behavior. Test old-policy native approvals and old signed NIP-46 requests cannot start fresh work after recovery, including the cutoff second; exact completed retries may return cached public results only.
 - [ ] Test archive plus retained encryption key restores the same public identity, missing/wrong key fails, nonce/session fields are absent, and no participant count increases. Remove disposable archives/keys after recording only non-secret results.
 - [ ] Commit implementation, restore demonstration and exact limits.
 
@@ -131,18 +136,18 @@ request gets that verified type through a public constructor. Public APIs return
 
 **Files:** Extend transport module, create `tests/nip46_test.rs` and client-contract section in experiment README. Production integration remains a subsequent approved change.
 **Consumes:** certified device grant, selected crypto, signer guard and independent per-grant bunker keys.
-**Produces:** `verify_nip46_request(&Event, &TransportCredential, &PolicySnapshot) -> Result<VerifiedClientRequest, CustodyError>`; adapter maps that proof to an internally bound signing proposal, with no coordinator-only authorization shortcut.
+**Produces:** `verify_nip46_request(&Event, &TransportCredential, &PolicySnapshot) -> Result<VerifiedAuthorization, CustodyError>`; this guard-local verifier retains original-request evidence and the certified pool scope in the same opaque authorization type consumed by Task 4. It validates the internally bound signing proposal without a coordinator-only authorization shortcut or a fabricated native proof.
 
 - [ ] Write failing tests using a real standard client: connect/get_public_key/sign_event; forged outer signature, wrong recipient/client/grant, replay after recovery, altered API-decoded plaintext and supplied author/ID mismatch. Verify legitimate requests with omitted author use the certified identity.
 - [ ] Run client tests and inspect failures.
-- [ ] Each guard verifies the original signed encrypted request and decrypts it independently. Keep device proof and certified grant as authority; transport key possession alone cannot enroll or sign. Define exact request/result idempotency and internally fixed session/set. Do not pretend legacy clients signed `IntentV1`.
+- [ ] Each guard verifies the original signed encrypted request and decrypts it independently. Keep device proof and certified grant as authority; transport key possession alone cannot enroll or sign. Require the independently certified NIP-46 grant to permit the named service pool. At each guard, bind the verified request digest to the exact internal session/set, then recheck both before releasing a partial. Define exact request/result idempotency; native evidence still requires its originally approved exact set/session. Do not pretend legacy clients signed `IntentV1`.
 - [ ] Test responses over a real relay and HTTP native-intent path with existing UCAN authentication. Inventory encryption/decryption, raw canonical signing and export paths. Unsupported methods return explicit errors and capabilities; reconstructing a key to fill a gap is forbidden.
 - [ ] Commit tested compatibility scope. Before production, approve required operation parity and any client re-enrollment behavior; event-only success is not complete product compatibility.
 
 ### Task 8: Review the evidence and prepare a production decision
 
 **Files:** Update experiment README and the design's decision record. Only after approval, prepare separate implementation changes at `core/src/custody/{mod,local,remote}.rs`, `core/src/signing_session.rs`, `core/src/bunker_key.rs`, `signer/src/signer_daemon.rs`, `api/src/handlers/http_rpc_handler.rs` and group integration points from merged PR #435.
-**Proposed interface:** `CustodyBackend::public_key(&IdentityBinding) -> Result<PublicKey, CustodyError>` and async `sign_event(&VerifiedIntent, &UnsignedEvent) -> Result<Event, CustodyError>`. Retain a local backend for existing identities; persist backend/profile per identity and deny cross-backend fallback. No new serving code is delivered by the current research task.
+**Proposed interface:** `CustodyBackend::public_key(&IdentityBinding) -> Result<PublicKey, CustodyError>` and async `sign_event(&VerifiedAuthorization, &UnsignedEvent) -> Result<Event, CustodyError>`. Retain a local backend for existing identities; persist backend/profile per identity and deny cross-backend fallback. No new serving code is delivered by the current research task.
 
 - [ ] Run all prototype tests, fmt, clippy and the real-relay demo; repeat only when changes/failures justify it. Record p50/p95 and throughput for warm/cold signing, one-node outage, relay loss and recovery; report measured environments rather than inventing a production SLO.
 - [ ] Independently review crypto/adapter, client proof, policy-fork safety, recovery and crash evidence. Collect an external security assessment for the exact proposed production dependencies and protocol.
