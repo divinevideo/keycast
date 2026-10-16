@@ -114,9 +114,15 @@ For standard NIP-46 compatibility, investigate verifying and independently
 decrypting the **original signed client request**, tied to a certified client
 pubkey and independent bunker key. The NIP-46 event signs ciphertext, so forwarding
 an API-decoded JSON body alongside that signature is not sufficient evidence.
-The adapter must prove plaintext/request binding at each guard, replay protection
+The adapter must prove plaintext/request binding at each guard, replay protection (120-second request lifetime and 30-second clock skew)
 and deterministic event construction before it is enabled. Standard clients do
 not sign our native intent profile; do not claim the profiles interchangeable.
+Both proof profiles produce an opaque guard-local authorization retaining its
+evidence and scope, never a trusted serialized coordinator flag. Native evidence
+requires the exact approved set/session. Legacy NIP-46 evidence requires a grant
+explicitly permitting the pinned service pool; each guard binds the original
+request digest to the actual internal session/set and rechecks it before partial
+release. This does not claim the client signed those internal fields.
 NIP-46 client requests omit the author pubkey legitimately: resolve it from the
 certified grant before hashing, and reject any conflicting supplied author/ID.
 
@@ -190,8 +196,14 @@ Workers atomically reserve each public commitment before use. Persist the spent
 reservation and public partial before releasing that partial. Validate the exact
 message, participant set and session; burn the session on uncertainty. A second
 worker/clone cannot activate the same participant/incarnation concurrently.
-Recovery rotates the incarnation, invalidates pending requests and obtains a
-fresh certified policy high-water mark from all domains before signing. Restoring
+Recovery rotates the incarnation, advances the certified policy epoch, invalidates
+pending internal requests and obtains a fresh certified policy high-water mark
+from all domains before signing. Old native policy approvals fail. For legacy
+NIP-46 requests, record a certified recovery cutoff: requests whose outer event
+creation time is at or before it can only retrieve a completed cached result.
+Starting new work requires a newly signed client request after the cutoff (the
+cutoff second is conservatively refused); a coordinator cannot edit that signed
+timestamp. This cutoff is checked together with the bounded request lifetime. Restoring
 an old database snapshot or a local file lock does not establish freshness.
 
 The prototype must prove a recovery fence anchored outside the restored snapshot,
