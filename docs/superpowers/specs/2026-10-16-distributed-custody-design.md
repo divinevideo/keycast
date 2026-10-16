@@ -197,13 +197,21 @@ reservation and public partial before releasing that partial. Validate the exact
 message, participant set and session; burn the session on uncertainty. A second
 worker/clone cannot activate the same participant/incarnation concurrently.
 Recovery rotates the incarnation, advances the certified policy epoch, invalidates
-pending internal requests and obtains a fresh certified policy high-water mark
-from all domains before signing. Old native policy approvals fail. For legacy
-NIP-46 requests, record a certified recovery cutoff: requests whose outer event
-creation time is at or before it can only retrieve a completed cached result.
-Starting new work requires a newly signed client request after the cutoff (the
-cutoff second is conservatively refused); a coordinator cannot edit that signed
-timestamp. This cutoff is checked together with the bounded request lifetime. Restoring
+pending internal session packets and obtains a fresh certified policy high-water
+mark from all domains before signing. Old native epoch approvals fail. A service-
+only restart/recovery does not prove an old standard NIP-46 request was approved
+after that recovery: under a still-current certified pool grant, an earlier signed
+exact-event request can remain valid for its bounded 120-second lifetime (with
+30-second clock skew). It may return a completed cached result or start an entirely
+new internal session with fresh nonces, never resume the former session. Current
+membership, grant and policy authorization are rechecked in either case. Timestamps
+do not establish a client recovery-epoch commitment.
+
+Human/device recovery is stricter: revoke the former device grant and rotate its
+certified bunker transport recipient. Old-recipient requests cannot use the new
+grant, whatever their timestamps. This is separate from restarting a service
+participant and does not force every active client to re-enroll on service restart.
+Restoring
 an old database snapshot or a local file lock does not establish freshness.
 
 The prototype must prove a recovery fence anchored outside the restored snapshot,
