@@ -42,5 +42,6 @@ secrecy = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+nostr-relay-builder = "=0.44.0"
 bcrypt = "0.17.1"
 serde_json = { workspace = true }

@@ -9,6 +9,7 @@ pub mod auth_observability;
 pub mod claim;
 pub mod email_marketing;
 pub mod expensive_work;
+pub mod groups;
 pub mod headless;
 pub mod html_safety;
 pub mod metrics;
@@ -25,3 +26,7 @@ pub mod service_provisioning;
 pub mod teams;
 
 pub use routes::*;
+
+pub mod group_backups;
+
+pub mod group_frost;

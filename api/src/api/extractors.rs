@@ -215,6 +215,36 @@ where
     }
 }
 
+/// Group custody uses the existing account-management authority, rather than
+/// allowing an app's delegated signing token to enroll devices or recover shares.
+pub struct GroupAuth {
+    pub pubkey: String,
+}
+
+#[async_trait]
+impl<S: Send + Sync> FromRequestParts<S> for GroupAuth {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let auth = UcanAuth::from_request_parts(parts, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let tenant_id = resolve_tenant_id_from_parts(parts)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let pubkey = crate::api::http::auth::extract_user_for_authorization_management(
+            &parts.headers,
+            tenant_id,
+        )
+        .await
+        .map_err(IntoResponse::into_response)?;
+        if pubkey != auth.pubkey {
+            return Err((StatusCode::UNAUTHORIZED, "Account principal differs").into_response());
+        }
+        Ok(Self { pubkey })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
