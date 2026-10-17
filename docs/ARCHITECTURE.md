@@ -610,3 +610,19 @@ policy_permissions ← INSERT (link to global permissions)
 ---
 
 This schema supports both simple personal use (peek) and complex team/organization scenarios with fine-grained access control.
+
+
+## Recoverable group identities
+
+The dedicated `/api/groups` API reuses teams, stored keys, policies and ordinary
+NIP-46 authorizations, while `group_memberships` and `group_grants` bind current
+human admins and device installations to the identity. Every hosted request,
+including cached signer handlers, rechecks durable group/version authority.
+`group_backups` stores encrypted version-bound full-key or FROST participant
+packages; hosted keys remain in `stored_keys`. Threshold coordination has separate
+versioned sessions and permanent public commitment reservations and never uses the
+complete-key parser for shares. Final published events remain ordinary Nostr.
+
+See [the client contract](GROUPS.md), [recovery operations](GROUP_RECOVERY.md), and
+[the optional threshold protocol](GROUP_FROST.md). Independent clients may operate
+entirely without Keycast registration, authentication, signing or storage.

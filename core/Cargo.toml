@@ -9,6 +9,7 @@ integration-tests = []
 aws = ["dep:aws-sdk-kms", "dep:aws-config"]
 
 [dependencies]
+frost-secp256k1-tr = "=2.2.0"
 aes-gcm = "0.10"
 async-trait = "0.1"
 async-channel = "2"
@@ -47,4 +48,5 @@ bcrypt = "0.17.1"
 subtle = "2.5"
 
 [dev-dependencies]
+nostr-relay-builder = "0.44"
 serial_test = "3.2"

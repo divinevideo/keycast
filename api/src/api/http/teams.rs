@@ -513,6 +513,18 @@ pub async fn verify_admin<'a>(
     team_id: i32,
     tenant_id: i64,
 ) -> ApiResult<()> {
+    let is_group: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM identity_groups WHERE tenant_id=$1 AND id=$2)",
+    )
+    .bind(tenant_id)
+    .bind(team_id)
+    .fetch_one(pool)
+    .await?;
+    if is_group {
+        return Err(ApiError::forbidden(
+            "Use the group API to manage group identities",
+        ));
+    }
     let pubkey =
         PublicKey::from_hex(pubkey_hex).map_err(|_| ApiError::bad_request("Invalid pubkey"))?;
 
