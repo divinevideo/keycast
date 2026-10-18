@@ -20,8 +20,8 @@
 - Share packages exclude live nonce state, nonce seeds, pending handles and session/bunker tokens. Replacement retains participant identity and changes installation incarnation.
 - Maximum native intent lifetime is 120 seconds; allowed clock skew is 30 seconds. Every secret-bearing type excludes Debug and generic serde export.
 - Use synthetic identities and loopback-only services. No live keys, cloud permissions, deployments, new repos, personal-account migrations or silent hosted fallback.
-- Preserve standard Nostr output and independent-mode operation. Keep proposed service custody separate from human-participant FROST in PR #435.
-- Every implementation PR targets main. The experiment can be self-contained on current main; actual group integration waits for an approved, merged group API or an explicitly combined PR, never a feature-branch stack.
+- Preserve standard Nostr output and independent-mode operation. Keep proposed service custody separate from human-participant FROST merged in PR #435.
+- Every implementation PR targets main. The experiment can be self-contained on current main; the group API merged in PR #435 is available as the integration baseline. Actual group integration still requires separate design/implementation approval; never stack on a feature branch.
 
 ## Review focus
 

@@ -169,7 +169,7 @@ New identities use dealerless generation across the three signer domains, with
 stable service participant IDs 1, 2 and 3, threshold 2, confidential authenticated
 round-two delivery and complete signed round-one agreement. Never create all
 shares on the public coordinator. Keep service participant IDs separate from
-human-admin IDs and from the human-participant FROST API in PR #435.
+human-admin IDs and from the human-participant FROST API merged in PR #435.
 
 Reference suite: `frost-secp256k1-tr = "=2.2.0"`, untweaked BIP-340/Nostr profile.
 FROSTR Rust source is a pinned candidate, not a selected dependency. Demonstrate

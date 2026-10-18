@@ -1,7 +1,7 @@
 # Distributed Keycast custody: FROSTR research
 
-Date: 2026-10-16. Status: source research and proposed direction, not an approved
-custody change. No external signer was installed or executed, no live state was
+Date: 2026-10-16; Keycast baseline refreshed 2026-10-17.
+Status: source research and proposed direction, not an approved custody change. No external signer was installed or executed, no live state was
 queried, and no production permissions or keys were accessed.
 
 ## Recommendation
@@ -22,11 +22,14 @@ and [gated plan](../superpowers/plans/2026-10-16-distributed-custody.md).
 
 ## Evidence baseline
 
-- Keycast main: `df350e30bcca683aa70465036f99eda9b7fab6fb`, fetched before inspection.
-- Group backend: [PR #435](https://github.com/divinevideo/keycast/pull/435), inspected
-  at `ac575486dd9022aa787b42e4363886da27f56ea8`. It was open during research and is
-  **not in this branch's main baseline**. Its human-participant FROST mode must not
-  be confused with the proposed service-participant custody mode.
+- Keycast main: `f91958549b275e5bc7a53ad0e3ca830992deca89`, the merge of
+  [PR #435](https://github.com/divinevideo/keycast/pull/435) on 2026-10-17.
+- Group backend: merged from `f4091f707476da9891f020ca5b813bd4697a3870`.
+  The original research inspected `ac575486dd9022aa787b42e4363886da27f56ea8`
+  against main `df350e30bcca683aa70465036f99eda9b7fab6fb`; the code facts below
+  were rechecked against the merged main baseline. Human-participant FROST is
+  implemented there and remains distinct from the proposed service-participant
+  custody mode.
 - Bifrost Rust: `fe379c98825945a48e87e31360e2e87c6982af32`, workspace version 0.5.0.
 - Bifrost TypeScript: `5c8348e5d597df459ce0b6960293289a2aabdc60`, package version 2.0.2.
 - Igloo server: `918cfa3daf21fd5f49e3379ab1da108145da61aa`, package version 1.2.0.
@@ -43,13 +46,20 @@ relevant evidence; no company-memory conclusion is inferred from it.
 | The signer loader decrypts personal/team stored keys and caches handlers. | More replicas improve availability but do not separate custody authority. |
 | `derive_bunker_keys` uses the identity secret as HKDF input. | New custody grants need independent transport keys. Existing bunker credentials require an explicit migration/re-enrollment strategy. |
 | UCAN and DPoP already authenticate HTTP requests; DPoP validates request method/URI, freshness and proof key. | Reuse HTTP authentication. An independently pinned device key and an event/context commitment are additionally needed for signer-side authorization. Do not call an ordinary DPoP proof an exact-body approval. |
-| The group proposal stores encrypted signing packages using KeyManager and current human membership. | It provides recoverability, not separation from the service that can decrypt those packages. |
+| The merged group backend stores encrypted signing packages using KeyManager and current human membership. | It provides recoverability, not separation from the service that can decrypt those packages. |
 
-Primary references: [signing session](https://github.com/divinevideo/keycast/blob/df350e30bcca683aa70465036f99eda9b7fab6fb/core/src/signing_session.rs),
-[signer](https://github.com/divinevideo/keycast/blob/df350e30bcca683aa70465036f99eda9b7fab6fb/signer/src/signer_daemon.rs),
-[bunker derivation](https://github.com/divinevideo/keycast/blob/df350e30bcca683aa70465036f99eda9b7fab6fb/core/src/bunker_key.rs),
-[DPoP](https://github.com/divinevideo/keycast/blob/df350e30bcca683aa70465036f99eda9b7fab6fb/api/src/ucan_auth/dpop.rs),
-[group recovery](https://github.com/divinevideo/keycast/blob/ac575486dd9022aa787b42e4363886da27f56ea8/docs/GROUP_RECOVERY.md).
+Primary references: [signing session](https://github.com/divinevideo/keycast/blob/f91958549b275e5bc7a53ad0e3ca830992deca89/core/src/signing_session.rs),
+[signer](https://github.com/divinevideo/keycast/blob/f91958549b275e5bc7a53ad0e3ca830992deca89/signer/src/signer_daemon.rs),
+[bunker derivation](https://github.com/divinevideo/keycast/blob/f91958549b275e5bc7a53ad0e3ca830992deca89/core/src/bunker_key.rs),
+[DPoP](https://github.com/divinevideo/keycast/blob/f91958549b275e5bc7a53ad0e3ca830992deca89/api/src/ucan_auth/dpop.rs),
+[group recovery](https://github.com/divinevideo/keycast/blob/f91958549b275e5bc7a53ad0e3ca830992deca89/docs/GROUP_RECOVERY.md).
+
+The merged signer resolves group ownership through indexed candidates and
+rechecks current grant/membership/account state, including the acting account's
+minor-account restrictions. That authorization hardening does not change the
+loader's complete-key custody boundary. Group backup restore still decrypts
+packages through KeyManager and rechecks current membership/version bindings;
+it does not supply independent service custody.
 
 Deployment documentation describes multiple replicas within a common custody
 boundary. This research does not assert a live instance count or verify deployed
@@ -63,12 +73,12 @@ before operations; replica count is not the security property under study.
 The inspected README labels the Rust stack beta and separates crypto, codecs,
 signer, routing, bridge and host storage. That separation is promising for an
 adapter. Its manifest uses `frost-secp256k1-tr-unofficial = "2.2.0"`, not the exact
-`frost-secp256k1-tr = "=2.2.0"` used by the group proposal. Matching version strings
-do not establish matching suites, package encodings or protocol behavior.
+`frost-secp256k1-tr = "=2.2.0"` used by the merged group backend. Matching version
+strings do not establish matching suites, package encodings or protocol behavior.
 
 The Cargo lock pins the unofficial package checksum to
 `e5279a0a375d505f5ec711521284d183ab6fea98edfdf798d65434b16c59a251`.
-The crates.io version API reports the official 2.2.0 checksum as
+The crates.io registry index records the official 2.2.0 checksum as
 `ff8a25b14bfd5d25deba5edce61ec99c3afb752a1d26630a196bba4cb1c4ca5e`.
 Both names and all transitive crypto dependencies need review; this study did not
 compare the complete implementations or validate a binary release.
@@ -76,7 +86,7 @@ compare the complete implementations or validate a binary release.
 Sources: [README](https://github.com/FROSTR-ORG/bifrost-rs/blob/fe379c98825945a48e87e31360e2e87c6982af32/README.md),
 [manifest](https://github.com/FROSTR-ORG/bifrost-rs/blob/fe379c98825945a48e87e31360e2e87c6982af32/Cargo.toml),
 [lock](https://github.com/FROSTR-ORG/bifrost-rs/blob/fe379c98825945a48e87e31360e2e87c6982af32/Cargo.lock),
-[official package metadata](https://crates.io/api/v1/crates/frost-secp256k1-tr/2.2.0),
+[official registry metadata](https://github.com/rust-lang/crates.io-index/blob/master/fr/os/frost-secp256k1-tr),
 [unofficial package metadata](https://crates.io/api/v1/crates/frost-secp256k1-tr-unofficial/2.2.0).
 
 ### Authorization boundary
@@ -118,7 +128,7 @@ interaction between FROSTR's nonce derivation and share restoration is a specifi
 review and crash-test gate, not an assumed compatibility property.
 
 Sources: [nonce lifecycle](https://github.com/FROSTR-ORG/bifrost-rs/blob/fe379c98825945a48e87e31360e2e87c6982af32/crates/bifrost-core/src/nonce.rs),
-[persisted signer state](https://github.com/FROSTR-ORG/bifrost-rs/blob/fe379c98825945a48e87e31360e2e87c6982af32/crates/bifrost-signer/src/lib.rs#L99),
+[persisted signer state](https://github.com/FROSTR-ORG/bifrost-rs/blob/fe379c98825945a48e87e31360e2e87c6982af32/crates/bifrost-signer/src/lib.rs#L231),
 [host store and lock](https://github.com/FROSTR-ORG/bifrost-rs/blob/fe379c98825945a48e87e31360e2e87c6982af32/crates/bifrost-app/src/runtime/store.rs).
 
 ### TypeScript and Igloo
