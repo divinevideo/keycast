@@ -3512,7 +3512,7 @@ dependencies = [
  "did-key",
  "hdrhistogram",
  "hex",
- "nostr 0.44.2",
+ "nostr 0.44.8",
  "nostr-sdk",
  "num_cpus",
  "parking_lot",
@@ -3559,7 +3559,7 @@ dependencies = [
  "keycast_core",
  "md5",
  "moka",
- "nostr 0.44.2",
+ "nostr 0.44.8",
  "nostr-sdk",
  "once_cell",
  "p256 0.13.2",
@@ -3613,7 +3613,7 @@ dependencies = [
  "hmac 0.12.1",
  "lazy_static",
  "moka",
- "nostr 0.44.2",
+ "nostr 0.44.8",
  "nostr-relay-builder",
  "nostr-sdk",
  "once_cell",
@@ -3652,7 +3652,7 @@ dependencies = [
  "keycast_core",
  "libc",
  "moka",
- "nostr 0.44.2",
+ "nostr 0.44.8",
  "nostr-connect",
  "nostr-relay-builder",
  "nostr-sdk",
@@ -4087,9 +4087,9 @@ dependencies = [
 
 [[package]]
 name = "nostr"
-version = "0.44.2"
+version = "0.44.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3aa5e3b6a278ed061835fe1ee293b71641e6bf8b401cfe4e1834bbf4ef0a34e1"
+checksum = "40ff7b77ef428b40aa2834a6acbae38a0e104c98b306208ca4b87a420d579a4b"
 dependencies = [
  "aes 0.8.4",
  "base64 0.22.1",
@@ -4108,6 +4108,7 @@ dependencies = [
  "serde_json",
  "unicode-normalization",
  "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -4141,7 +4142,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7462c9d8ae5ef6a28d66a192d399ad2530f1f2130b13186296dbb11bdef5b3d1"
 dependencies = [
  "lru",
- "nostr 0.44.2",
+ "nostr 0.44.8",
  "tokio",
 ]
 
@@ -4151,7 +4152,7 @@ version = "0.44.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ade30de16869618919c6b5efc8258f47b654a98b51541eb77f85e8ec5e3c83a6"
 dependencies = [
- "nostr 0.44.2",
+ "nostr 0.44.8",
 ]
 
 [[package]]
@@ -4165,7 +4166,7 @@ dependencies = [
  "atomic-destructor",
  "hex",
  "negentropy 0.5.0",
- "nostr 0.44.2",
+ "nostr 0.44.8",
  "nostr-database 0.44.0",
  "tokio",
  "tracing",
@@ -4189,9 +4190,9 @@ dependencies = [
 
 [[package]]
 name = "nostr-relay-pool"
-version = "0.44.0"
+version = "0.44.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b1073ccfbaea5549fb914a9d52c68dab2aecda61535e5143dd73e95445a804b"
+checksum = "c85c54d6ca9aae4ae2bf19a7663ba9db5f45f783f1d24aff55f006386b8b99a1"
 dependencies = [
  "async-utility",
  "async-wsocket 0.13.2",
@@ -4199,7 +4200,7 @@ dependencies = [
  "hex",
  "lru",
  "negentropy 0.5.0",
- "nostr 0.44.2",
+ "nostr 0.44.8",
  "nostr-database 0.44.0",
  "tokio",
  "tracing",
@@ -4212,10 +4213,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "471732576710e779b64f04c55e3f8b5292f865fea228436daf19694f0bf70393"
 dependencies = [
  "async-utility",
- "nostr 0.44.2",
+ "nostr 0.44.8",
  "nostr-database 0.44.0",
  "nostr-gossip",
- "nostr-relay-pool 0.44.0",
+ "nostr-relay-pool 0.44.3",
  "tokio",
  "tracing",
 ]
