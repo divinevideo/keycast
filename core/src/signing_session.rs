@@ -3,7 +3,7 @@
 // ABOUTME: All CPU-bound crypto runs on spawn_blocking to avoid blocking async runtime
 
 use nostr_sdk::nips::nip44;
-use nostr_sdk::secp256k1::{Message, SECP256K1};
+use nostr_sdk::secp256k1::{Keypair, Message, SECP256K1};
 use nostr_sdk::{Event, Keys, PublicKey, UnsignedEvent};
 use secrecy::SecretString;
 use sha2::{Digest, Sha256};
@@ -124,8 +124,8 @@ impl SigningSession {
             let digest = Sha256::digest(&payload);
             let message = Message::from_digest_slice(&digest)
                 .map_err(|e| SessionError::Signing(e.to_string()))?;
-            let keypair = keys.key_pair(SECP256K1);
-            let signature = SECP256K1.sign_schnorr_with_aux_rand(&message, keypair, &[0u8; 32]);
+            let keypair = Keypair::from_secret_key(SECP256K1, keys.secret_key());
+            let signature = SECP256K1.sign_schnorr_with_aux_rand(&message, &keypair, &[0u8; 32]);
             Ok(hex::encode(signature.as_ref()))
         })
         .await?
