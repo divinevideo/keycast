@@ -1,7 +1,8 @@
-use crate::valkey_auth::ValkeyConnectionFactory;
+use crate::valkey_auth::{is_read_only_error, ValkeyConnectionFactory};
 use crate::Error;
 use redis::aio::ConnectionManager;
-use redis::AsyncCommands;
+use redis::{AsyncCommands, RedisResult};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -79,9 +80,14 @@ impl RedisRegistry {
 
     pub async fn deregister(&mut self) -> Result<(), Error> {
         // ZREM signer_instances <instance_id>
-        self.conn
-            .zrem::<_, _, ()>(&self.instances_key, &self.instance_id)
-            .await?;
+        let instances_key = self.instances_key.clone();
+        let instance_id = self.instance_id.clone();
+        self.write_with_reconnect(|mut conn| {
+            let instances_key = instances_key.clone();
+            let instance_id = instance_id.clone();
+            async move { conn.zrem::<_, _, ()>(instances_key, instance_id).await }
+        })
+        .await?;
 
         tracing::info!(instance_id = %self.instance_id, "Deregistered instance from Redis");
         Ok(())
@@ -95,9 +101,17 @@ impl RedisRegistry {
         let timestamp = current_timestamp_ms();
 
         // ZADD signer_instances <timestamp> <instance_id> (updates score)
-        self.conn
-            .zadd::<_, _, _, ()>(&self.instances_key, &self.instance_id, timestamp)
-            .await?;
+        let instances_key = self.instances_key.clone();
+        let instance_id = self.instance_id.clone();
+        self.write_with_reconnect(|mut conn| {
+            let instances_key = instances_key.clone();
+            let instance_id = instance_id.clone();
+            async move {
+                conn.zadd::<_, _, _, ()>(instances_key, instance_id, timestamp)
+                    .await
+            }
+        })
+        .await?;
 
         Ok(())
     }
@@ -118,9 +132,12 @@ impl RedisRegistry {
         let cutoff = current_timestamp_ms() - (STALE_THRESHOLD_SECS * 1000);
 
         // ZREMRANGEBYSCORE signer_instances -inf <cutoff>
+        let instances_key = self.instances_key.clone();
         let count: u64 = self
-            .conn
-            .zrembyscore(&self.instances_key, "-inf", cutoff)
+            .write_with_reconnect(|mut conn| {
+                let instances_key = instances_key.clone();
+                async move { conn.zrembyscore(instances_key, "-inf", cutoff).await }
+            })
             .await?;
 
         if count > 0 {
@@ -155,6 +172,29 @@ impl RedisRegistry {
         self.conn = self.factory.get_connection_manager().await?;
         tracing::debug!(instance_id = %self.instance_id, "Refreshed Redis connection");
         Ok(())
+    }
+
+    /// Run a write, reconnecting and retrying once if Redis answers `READONLY`.
+    ///
+    /// The heartbeat must reach the current primary after a failover; otherwise
+    /// this instance ages out of every other instance's ring while its socket
+    /// stays open to the demoted node.
+    async fn write_with_reconnect<T, F, Fut>(&mut self, op: F) -> Result<T, Error>
+    where
+        F: Fn(ConnectionManager) -> Fut,
+        Fut: Future<Output = RedisResult<T>>,
+    {
+        match op(self.conn.clone()).await {
+            Err(error) if is_read_only_error(&error) => {
+                tracing::warn!(
+                    instance_id = %self.instance_id,
+                    "Redis rejected a write as READONLY; reconnecting to reach the current primary"
+                );
+                self.refresh_connection().await?;
+                Ok(op(self.conn.clone()).await?)
+            }
+            result => Ok(result?),
+        }
     }
 }
 
@@ -279,6 +319,124 @@ mod tests {
         registry.heartbeat().await.unwrap();
         let instances = registry.get_active_instances().await.unwrap();
         assert!(instances.contains(&registry.instance_id().to_string()));
+
+        registry.deregister().await.unwrap();
+    }
+
+    fn read_only_error() -> redis::RedisError {
+        redis::RedisError::from((
+            redis::ErrorKind::ReadOnly,
+            "You can't write against a read only replica.",
+        ))
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Redis via TEST_REDIS_URL or local Redis on localhost:16379"]
+    async fn test_registry_reconnects_and_retries_after_read_only() {
+        let redis_url = get_redis_url();
+        let prefix = test_prefix();
+
+        let mut registry = RedisRegistry::register_with_prefix(&redis_url, Some(&prefix))
+            .await
+            .unwrap();
+        let original_client_id = registry_client_id(&mut registry).await;
+
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let client_id: u64 = registry
+            .write_with_reconnect(|mut conn| {
+                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        return Err(read_only_error());
+                    }
+                    redis::cmd("CLIENT").arg("ID").query_async(&mut conn).await
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_ne!(
+            client_id, original_client_id,
+            "the retry should run on a new connection"
+        );
+        assert_eq!(registry_client_id(&mut registry).await, client_id);
+
+        registry.deregister().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Redis via TEST_REDIS_URL or local Redis on localhost:16379"]
+    async fn test_registry_keeps_connection_on_other_errors() {
+        let redis_url = get_redis_url();
+        let prefix = test_prefix();
+
+        let mut registry = RedisRegistry::register_with_prefix(&redis_url, Some(&prefix))
+            .await
+            .unwrap();
+        let original_client_id = registry_client_id(&mut registry).await;
+
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result: Result<(), Error> = registry
+            .write_with_reconnect(|_conn| {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async {
+                    Err(redis::RedisError::from((
+                        redis::ErrorKind::ResponseError,
+                        "ERR unknown command",
+                    )))
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(registry_client_id(&mut registry).await, original_client_id);
+
+        registry.deregister().await.unwrap();
+    }
+
+    /// Demotes the server, so it runs only against a dedicated instance named by
+    /// `REDIS_FAILOVER_TEST_URL`, never the shared test Redis.
+    #[tokio::test]
+    #[ignore = "demotes the server: requires a dedicated Redis via REDIS_FAILOVER_TEST_URL"]
+    async fn test_heartbeat_reconnects_after_read_only() {
+        let Ok(redis_url) = std::env::var("REDIS_FAILOVER_TEST_URL") else {
+            eprintln!("skipping: REDIS_FAILOVER_TEST_URL is not set");
+            return;
+        };
+        let mut registry = RedisRegistry::register_with_prefix(&redis_url, Some(&test_prefix()))
+            .await
+            .unwrap();
+        let before = registry_client_id(&mut registry).await;
+        let mut admin = redis::Client::open(redis_url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+
+        // Port 1 never answers, so the node stays a replica until promoted.
+        redis::cmd("REPLICAOF")
+            .arg("127.0.0.1")
+            .arg(1)
+            .query_async::<()>(&mut admin)
+            .await
+            .unwrap();
+        let while_replica = registry.heartbeat().await;
+        redis::cmd("REPLICAOF")
+            .arg("NO")
+            .arg("ONE")
+            .query_async::<()>(&mut admin)
+            .await
+            .unwrap();
+
+        assert!(while_replica.is_err(), "a replica refuses the heartbeat");
+        assert_ne!(
+            registry_client_id(&mut registry).await,
+            before,
+            "the heartbeat should reconnect after READONLY"
+        );
+        registry.heartbeat().await.unwrap();
 
         registry.deregister().await.unwrap();
     }
