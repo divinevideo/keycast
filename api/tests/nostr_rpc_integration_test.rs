@@ -3251,3 +3251,257 @@ fn dpop_proof_with_jwk(jwk: Value, htu: &str) -> String {
         URL_SAFE_NO_PAD.encode([1u8; 64])
     )
 }
+
+// Exercise actual permission conversion during handler construction and consent loading.
+#[tokio::test]
+#[serial]
+async fn challenge_policy_loading_rejects_unknown_and_invalid_permissions() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (keys, pubkey) = create_test_user();
+    let key_manager = FileKeyManager::new().unwrap();
+    insert_user(&pool, tenant_id, &pubkey).await;
+    create_personal_key(&pool, tenant_id, &pubkey, &keys, &key_manager).await;
+    let auth_state = create_test_auth_state(
+        pool.clone(),
+        Arc::new(Box::new(key_manager) as Box<dyn KeyManager>),
+    );
+    for (identifier, config) in [
+        ("unknown_permission", json!({})),
+        ("allowed_kinds", json!({"allowed_kinds":"invalid"})),
+        ("challenge_actions", json!({"unknown":true})),
+    ] {
+        let pid = create_kind_restricted_policy(&pool, vec![1]).await;
+        sqlx::query("UPDATE permissions SET identifier=$1, config=$2 WHERE id IN (SELECT permission_id FROM policy_permissions WHERE policy_id=$3)").bind(identifier).bind(config.to_string()).bind(pid).execute(&pool).await.unwrap();
+        let origin = format!("https://invalid-{}.example", Uuid::new_v4());
+        let (_, bunker) = create_test_oauth_authorization(
+            &pool,
+            tenant_id,
+            &pubkey,
+            &origin,
+            Some(pid),
+            None,
+            None,
+        )
+        .await;
+        let token = build_self_signed_ucan(&keys, tenant_id, &origin, Some(&bunker)).await;
+        assert!(
+            invoke_nostr_rpc(
+                create_test_tenant_extractor(tenant_id),
+                auth_state.clone(),
+                &format!("Bearer {token}"),
+                None,
+                get_public_key_request()
+            )
+            .await
+            .is_err(),
+            "malformed permission must prevent handler construction"
+        );
+        let slug = format!("synthetic-{}", Uuid::new_v4());
+        sqlx::query("UPDATE policies SET slug=$1 WHERE id=$2")
+            .bind(&slug)
+            .bind(pid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            keycast_api::api::http::policies::get_policy(State(pool.clone()), Path(slug))
+                .await
+                .is_err()
+        );
+        assert!(
+            keycast_api::api::http::policies::list_policies(State(pool.clone()))
+                .await
+                .is_err()
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+        assert!(matches!(
+            keycast_api::api::http::auth::list_permissions(
+                create_test_tenant_extractor(tenant_id),
+                State(pool.clone()),
+                headers
+            )
+            .await,
+            Err(AuthError::Internal(_))
+        ));
+        let policy = keycast_core::repositories::PolicyRepository::new(pool.clone())
+            .find(pid)
+            .await
+            .unwrap();
+        assert!(
+            policy.permission_displays(&pool).await.is_err(),
+            "malformed permission must prevent consent rendering"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn challenge_policy_http_signs_templates_and_denies_unrelated_operations() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (keys, pubkey) = create_test_user();
+    let key_manager = FileKeyManager::new().unwrap();
+    insert_user(&pool, tenant_id, &pubkey).await;
+    create_personal_key(&pool, tenant_id, &pubkey, &keys, &key_manager).await;
+    let pid = create_kind_restricted_policy(&pool, vec![1]).await;
+    sqlx::query("UPDATE permissions SET identifier='challenge_actions', config='{}' WHERE id IN (SELECT permission_id FROM policy_permissions WHERE policy_id=$1)").bind(pid).execute(&pool).await.unwrap();
+    let origin = format!("https://challenge-{}.example", Uuid::new_v4());
+    let (_, bunker) =
+        create_test_oauth_authorization(&pool, tenant_id, &pubkey, &origin, Some(pid), None, None)
+            .await;
+    let token = build_self_signed_ucan(&keys, tenant_id, &origin, Some(&bunker)).await;
+    let auth_state = create_test_auth_state(
+        pool.clone(),
+        Arc::new(Box::new(key_manager) as Box<dyn KeyManager>),
+    );
+    let authorization = format!("Bearer {token}");
+    let response = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state.clone(),
+        &authorization,
+        None,
+        get_public_key_request(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.result, Some(json!(pubkey)));
+    let fixtures: Value = serde_json::from_str(include_str!(
+        "../../core/tests/fixtures/challenges/v1/events.json"
+    ))
+    .unwrap();
+    let mut templates: Vec<_> = ["definition", "entry", "withdraw", "result"]
+        .iter()
+        .map(|name| {
+            fixtures["cases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == *name)
+                .unwrap()["event"]
+                .clone()
+        })
+        .collect();
+    for action in ["include", "exclude"] {
+        templates.push(json!({"pubkey":"11".repeat(32),"created_at":100,"kind":1985,"content":"","tags":[["L","video.divine.contest.Synthetic:é"],["l",action,"video.divine.contest.Synthetic:é"],["e","22".repeat(32),"wss://relay.example"]]}));
+    }
+    for mut template in templates {
+        template.as_object_mut().unwrap().remove("id");
+        template.as_object_mut().unwrap().remove("sig");
+        template["pubkey"] = json!("11".repeat(32));
+        let response = invoke_nostr_rpc(
+            create_test_tenant_extractor(tenant_id),
+            auth_state.clone(),
+            &authorization,
+            None,
+            NostrRpcRequest {
+                method: "sign_event".into(),
+                params: vec![template],
+            },
+        )
+        .await
+        .unwrap();
+        let value = response.result.expect("signed event result");
+        let signed: Event = if let Some(s) = value.as_str() {
+            serde_json::from_str(s).unwrap()
+        } else {
+            serde_json::from_value(value).unwrap()
+        };
+        signed.verify().unwrap();
+        assert_eq!(signed.pubkey, keys.public_key());
+    }
+    for kind in [0, 1, 21, 22, 22242, 27235] {
+        let event = EventBuilder::new(Kind::from(kind), "unrelated").build(keys.public_key());
+        let result = invoke_nostr_rpc(
+            create_test_tenant_extractor(tenant_id),
+            auth_state.clone(),
+            &authorization,
+            None,
+            NostrRpcRequest {
+                method: "sign_event".into(),
+                params: vec![serde_json::to_value(event).unwrap()],
+            },
+        )
+        .await;
+        assert!(result.is_err() || result.unwrap().error.is_some());
+    }
+    let result = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state.clone(),
+        &authorization,
+        None,
+        NostrRpcRequest {
+            method: "sign_canonical".into(),
+            params: vec![json!(STANDARD.encode(creator_binding_payload(&pubkey)))],
+        },
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(RpcError::Auth(AuthError::Forbidden(_)))
+    ));
+    for method in [
+        "nip04_encrypt",
+        "nip44_encrypt",
+        "nip04_decrypt",
+        "nip44_decrypt",
+    ] {
+        let result = invoke_nostr_rpc(
+            create_test_tenant_extractor(tenant_id),
+            auth_state.clone(),
+            &authorization,
+            None,
+            NostrRpcRequest {
+                method: method.into(),
+                params: vec![json!(pubkey), json!("plaintext")],
+            },
+        )
+        .await;
+        assert!(
+            result.is_err() || result.unwrap().error.is_some(),
+            "{method}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn permission_loading_hardening_preserves_deliberately_empty_policy() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (keys, pubkey) = create_test_user();
+    let manager = FileKeyManager::new().unwrap();
+    insert_user(&pool, tenant_id, &pubkey).await;
+    create_personal_key(&pool, tenant_id, &pubkey, &keys, &manager).await;
+    let pid:i32=sqlx::query_scalar("INSERT INTO policies(name) VALUES('Deliberately unrestricted synthetic policy') RETURNING id").fetch_one(&pool).await.unwrap();
+    let policy = keycast_core::repositories::PolicyRepository::new(pool.clone())
+        .find(pid)
+        .await
+        .unwrap();
+    assert!(policy.permission_displays(&pool).await.unwrap().is_empty());
+    let origin = format!("https://unrestricted-{}.example", Uuid::new_v4());
+    let (_, bunker) =
+        create_test_oauth_authorization(&pool, tenant_id, &pubkey, &origin, Some(pid), None, None)
+            .await;
+    let token = build_self_signed_ucan(&keys, tenant_id, &origin, Some(&bunker)).await;
+    let state = create_test_auth_state(
+        pool.clone(),
+        Arc::new(Box::new(manager) as Box<dyn KeyManager>),
+    );
+    let unsigned = EventBuilder::text_note("Deliberately unrestricted").build(keys.public_key());
+    let response = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        state,
+        &format!("Bearer {token}"),
+        None,
+        NostrRpcRequest {
+            method: "sign_event".into(),
+            params: vec![serde_json::to_value(unsigned).unwrap()],
+        },
+    )
+    .await
+    .unwrap();
+    assert!(response.result.is_some());
+    assert!(response.error.is_none());
+}

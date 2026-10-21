@@ -1,6 +1,7 @@
 use crate::custom_permissions::{
-    allowed_kinds::AllowedKinds, content_filter::ContentFilter, decrypt_only::DecryptOnly,
-    encrypt_to_self::EncryptToSelf, full_access::FullAccess,
+    allowed_kinds::AllowedKinds, challenge_actions::ChallengeActions,
+    content_filter::ContentFilter, decrypt_only::DecryptOnly, encrypt_to_self::EncryptToSelf,
+    full_access::FullAccess,
 };
 use crate::traits::CustomPermission;
 use chrono::DateTime;
@@ -55,6 +56,7 @@ impl Permission {
     pub fn to_custom_permission(&self) -> Result<Box<dyn CustomPermission>, PermissionError> {
         match self.identifier.as_str() {
             id if id.starts_with("allowed_kinds") => AllowedKinds::from_permission(self),
+            "challenge_actions" => ChallengeActions::from_permission(self),
             "content_filter" => ContentFilter::from_permission(self),
             "decrypt_only" => DecryptOnly::from_permission(self),
             "encrypt_to_self" => EncryptToSelf::from_permission(self),

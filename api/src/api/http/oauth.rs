@@ -965,7 +965,9 @@ pub async fn authorize_get(
         let policy_repo = PolicyRepository::new(pool.clone());
         match policy_repo.find_by_slug(&policy_slug).await {
             Ok(policy) => {
-                let permissions = policy.permission_displays(pool).await.unwrap_or_default();
+                let permissions = policy.permission_displays(pool).await.map_err(|_| {
+                    OAuthError::ServerError("Configured permission could not be loaded".into())
+                })?;
                 serde_json::json!({
                     "slug": policy.slug.clone().unwrap_or_else(|| policy.id.to_string()),
                     "display_name": policy.display_name.clone().unwrap_or_else(|| policy.name.clone()),
@@ -2599,6 +2601,7 @@ enum RefreshTokenRejectionReason {
     StoredPubkeyParseFailed,
     UcanGenerationFailed,
     RotatedTokenInsertFailed,
+    PermissionLoadFailed,
 }
 
 impl RefreshTokenRejectionReason {
@@ -2624,6 +2627,7 @@ impl RefreshTokenRejectionReason {
             Self::StoredPubkeyParseFailed => "stored_pubkey_parse_failed",
             Self::UcanGenerationFailed => "ucan_generation_failed",
             Self::RotatedTokenInsertFailed => "rotated_refresh_token_insert_failed",
+            Self::PermissionLoadFailed => "permission_load_failed",
         }
     }
 }
@@ -2830,6 +2834,34 @@ async fn handle_refresh_token_grant_inner(
         ));
     }
 
+    // Load policy info for response
+    let policy_info = if let Some(policy_id) = oauth_auth.policy_id {
+        let policy_repo = PolicyRepository::new(pool.clone());
+        match policy_repo.find(policy_id).await {
+            Ok(policy) => {
+                let permissions = policy.permission_displays(pool).await.map_err(|_| {
+                    refresh_grant_rejection(
+                        OAuthError::ServerError("Configured permission could not be loaded".into()),
+                        RefreshTokenRejectionReason::PermissionLoadFailed,
+                        stored_client_id.as_deref(),
+                    )
+                })?;
+                Some(TokenPolicyInfo {
+                    slug: policy.slug.clone().unwrap_or_else(|| policy.id.to_string()),
+                    display_name: policy
+                        .display_name
+                        .clone()
+                        .unwrap_or_else(|| policy.name.clone()),
+                    description: policy.description.clone().unwrap_or_default(),
+                    permissions,
+                })
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     // Get user email and account status for UCAN generation
     let user_repo = UserRepository::new(pool.clone());
     let email = user_repo
@@ -2950,28 +2982,6 @@ async fn handle_refresh_token_grant_inner(
     // Note: We can't recover the original secret, but client already has it
     // The bunker_url in refresh response uses the same bunker pubkey
     let bunker_url = format!("bunker://{}?{}", bunker_public_key.to_hex(), relay_params,);
-
-    // Load policy info for response
-    let policy_info = if let Some(policy_id) = oauth_auth.policy_id {
-        let policy_repo = PolicyRepository::new(pool.clone());
-        match policy_repo.find(policy_id).await {
-            Ok(policy) => {
-                let permissions = policy.permission_displays(pool).await.unwrap_or_default();
-                Some(TokenPolicyInfo {
-                    slug: policy.slug.clone().unwrap_or_else(|| policy.id.to_string()),
-                    display_name: policy
-                        .display_name
-                        .clone()
-                        .unwrap_or_else(|| policy.name.clone()),
-                    description: policy.description.clone().unwrap_or_default(),
-                    permissions,
-                })
-            }
-            _ => None,
-        }
-    } else {
-        None
-    };
 
     // Parse scope from policy for response
     let scope = if let Some(ref info) = policy_info {
@@ -3458,6 +3468,34 @@ async fn create_oauth_authorization_and_token(
     // Handle absolute expiration (30 days from creation - hard ceiling for silent re-auth)
     let handle_expires_at = Utc::now() + Duration::days(30);
 
+    // Load policy info from scope for response (policies are now global)
+    let policy_info = {
+        // Parse policy slug from scope (e.g., "policy:social" -> "social")
+        let policy_slug = parse_policy_scope(scope).unwrap_or_else(|_| "social".to_string());
+
+        let policy_repo = PolicyRepository::new(pool.clone());
+        match policy_repo.find_by_slug(&policy_slug).await {
+            Ok(policy) => {
+                let permissions = policy.permission_displays(pool).await.map_err(|_| {
+                    OAuthError::ServerError("Configured permission could not be loaded".into())
+                })?;
+                Some(TokenPolicyInfo {
+                    slug: policy.slug.clone().unwrap_or_else(|| policy.id.to_string()),
+                    display_name: policy
+                        .display_name
+                        .clone()
+                        .unwrap_or_else(|| policy.name.clone()),
+                    description: policy.description.clone().unwrap_or_default(),
+                    permissions,
+                })
+            }
+            Err(_) => {
+                tracing::warn!("Policy '{}' not found for token response", policy_slug);
+                None
+            }
+        }
+    };
+
     // Create new OAuth authorization - always INSERT (multi-device support)
     // Each authorization is a separate "ticket" for one client/device
     // Old authorizations remain valid until explicitly revoked
@@ -3566,32 +3604,6 @@ async fn create_oauth_authorization_and_token(
         relay_params,
         connection_secret.expose_secret()
     );
-
-    // Load policy info from scope for response (policies are now global)
-    let policy_info = {
-        // Parse policy slug from scope (e.g., "policy:social" -> "social")
-        let policy_slug = parse_policy_scope(scope).unwrap_or_else(|_| "social".to_string());
-
-        let policy_repo = PolicyRepository::new(pool.clone());
-        match policy_repo.find_by_slug(&policy_slug).await {
-            Ok(policy) => {
-                let permissions = policy.permission_displays(pool).await.unwrap_or_default();
-                Some(TokenPolicyInfo {
-                    slug: policy.slug.clone().unwrap_or_else(|| policy.id.to_string()),
-                    display_name: policy
-                        .display_name
-                        .clone()
-                        .unwrap_or_else(|| policy.name.clone()),
-                    description: policy.description.clone().unwrap_or_default(),
-                    permissions,
-                })
-            }
-            Err(_) => {
-                tracing::warn!("Policy '{}' not found for token response", policy_slug);
-                None
-            }
-        }
-    };
 
     // Return bunker URL with access_token for REST RPC API
     Ok(Json(TokenResponse {

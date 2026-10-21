@@ -1170,3 +1170,61 @@ async fn test_20_oauth_invalid_policy_id_allows_signing() {
         "OAuth authorization with invalid policy_id should follow current permissive behavior"
     );
 }
+
+#[tokio::test]
+async fn challenge_policy_nip46_enforces_signing_and_crypto_boundaries() {
+    let pool = setup_test_db().await;
+    let key_manager = FileKeyManager::new().unwrap();
+    let (pid, _) =
+        create_policy_with_permissions(&pool, 1, vec![("challenge_actions", json!({}))]).await;
+    let (auth, keys) = create_oauth_authorization(&pool, 1, Some(pid), &key_manager).await;
+    let handler = Nip46Handler::new_for_test(
+        keys.clone(),
+        keys.clone(),
+        auth.secret_hash.clone(),
+        auth.id,
+        1,
+        true,
+        pool.clone(),
+    );
+    let fixtures: serde_json::Value = serde_json::from_str(include_str!(
+        "../../core/tests/fixtures/challenges/v1/events.json"
+    ))
+    .unwrap();
+    let mut templates: Vec<_> = ["definition", "entry", "withdraw", "result"]
+        .iter()
+        .map(|name| {
+            fixtures["cases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == *name)
+                .unwrap()["event"]
+                .clone()
+        })
+        .collect();
+    for action in ["include", "exclude"] {
+        templates.push(json!({"pubkey":"11".repeat(32),"created_at":100,"kind":1985,"content":"","tags":[["L","video.divine.contest.Synthetic:é"],["l",action,"video.divine.contest.Synthetic:é"],["e","22".repeat(32),"wss://relay.example"]]}));
+    }
+    for mut template in templates {
+        template.as_object_mut().unwrap().remove("id");
+        template.as_object_mut().unwrap().remove("sig");
+        template["pubkey"] = json!("11".repeat(32));
+        let signed = handler
+            .sign_event_direct(serde_json::from_value(template).unwrap())
+            .await
+            .unwrap();
+        signed.verify().unwrap();
+        assert_eq!(signed.pubkey, keys.public_key());
+    }
+    let unrelated = EventBuilder::text_note("unrelated").build(keys.public_key());
+    assert!(handler.sign_event_direct(unrelated).await.is_err());
+    assert!(handler
+        .validate_permissions_for_encrypt("payload", &keys.public_key())
+        .await
+        .is_err());
+    assert!(handler
+        .validate_permissions_for_decrypt("payload", &keys.public_key())
+        .await
+        .is_err());
+}

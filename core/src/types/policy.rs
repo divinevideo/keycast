@@ -68,15 +68,16 @@ impl Policy {
         pool: &PgPool,
     ) -> Result<Vec<PermissionDisplay>, PolicyError> {
         let permissions = self.permissions(pool).await?;
-        let mut displays = Vec::new();
-
-        for perm in &permissions {
-            if let Ok(custom_perm) = perm.to_custom_permission() {
-                displays.push(custom_perm.display());
-            }
-        }
-
-        Ok(displays)
+        permissions
+            .iter()
+            .map(|perm| {
+                perm.to_custom_permission()
+                    .map(|p| p.display())
+                    .map_err(|_| {
+                        PolicyError::Permission("Configured permission could not be loaded".into())
+                    })
+            })
+            .collect()
     }
 
     /// Convert to PolicyInfo for API responses

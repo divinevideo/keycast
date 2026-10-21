@@ -83,6 +83,7 @@ export type PolicyWithPermissions = {
 
 export const AVAILABLE_PERMISSIONS = [
     "allowed_kinds",
+    "challenge_actions",
     "content_filter",
     "encrypt_to_self",
 ];
