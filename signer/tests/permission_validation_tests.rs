@@ -1217,14 +1217,21 @@ async fn challenge_policy_nip46_enforces_signing_and_crypto_boundaries() {
         signed.verify().unwrap();
         assert_eq!(signed.pubkey, keys.public_key());
     }
-    let unrelated = EventBuilder::text_note("unrelated").build(keys.public_key());
-    assert!(handler.sign_event_direct(unrelated).await.is_err());
-    assert!(handler
-        .validate_permissions_for_encrypt("payload", &keys.public_key())
-        .await
-        .is_err());
-    assert!(handler
-        .validate_permissions_for_decrypt("payload", &keys.public_key())
-        .await
-        .is_err());
+    for kind in [0, 1, 21, 22, 22242, 27235] {
+        let unrelated = EventBuilder::new(Kind::from(kind), "unrelated").build(keys.public_key());
+        let error = handler
+            .sign_event_direct(unrelated)
+            .await
+            .expect_err("unrelated kind must be denied");
+        assert!(
+            matches!(error.downcast_ref::<keycast_signer::SignerError>(),Some(keycast_signer::SignerError::PermissionDenied(message)) if message=="Blocked by 'challenge_actions' policy"),
+            "kind {kind} must fail at the permission gate"
+        );
+    }
+    assert!(
+        matches!(handler.validate_permissions_for_encrypt("payload",&keys.public_key()).await,Err(keycast_signer::SignerError::PermissionDenied(ref message)) if message=="Blocked by 'challenge_actions' policy")
+    );
+    assert!(
+        matches!(handler.validate_permissions_for_decrypt("payload",&keys.public_key()).await,Err(keycast_signer::SignerError::PermissionDenied(ref message)) if message=="Blocked by 'challenge_actions' policy")
+    );
 }

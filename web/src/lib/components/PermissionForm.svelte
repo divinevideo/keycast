@@ -1,6 +1,6 @@
 <script lang="ts">
 import {
-    AVAILABLE_PERMISSIONS,
+    TEAM_POLICY_PERMISSIONS,
     type AllowedKindsConfig,
     type ContentFilterConfig,
 } from "$lib/types";
@@ -64,7 +64,7 @@ let contentFilterConfig: ContentFilterConfig = $state({
         <label for="permission">Permission Type</label>
         <select bind:value={identifier} class="w-full">
             <option value={null}>Select a permission type...</option>
-            {#each AVAILABLE_PERMISSIONS as permission_identifier}
+            {#each TEAM_POLICY_PERMISSIONS as permission_identifier}
                 <option value={permission_identifier}>{toTitleCase(permission_identifier)}</option>
             {/each}
         </select>

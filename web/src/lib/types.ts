@@ -88,6 +88,11 @@ export const AVAILABLE_PERMISSIONS = [
     "encrypt_to_self",
 ];
 
+// Keep enforcement types registered while management creation is held for rollout.
+export const TEAM_POLICY_PERMISSIONS = AVAILABLE_PERMISSIONS.filter(
+    (identifier) => identifier !== "challenge_actions",
+);
+
 export type JsonValue =
     | string
     | number

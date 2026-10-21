@@ -489,6 +489,7 @@ fn curation(e: &Wire) -> Option<()> {
             && target.len() == 3
             && hex(&target[1]),
     )?;
+    valid(target[2].encode_utf16().count() <= 2048)?;
     check_relay(&target[2])?;
     if let Some(address) = optional(e, "a")? {
         valid(tags(e, "a").next()?.len() == 2)?;

@@ -474,3 +474,84 @@ fn signed_video_snapshot_preserves_canonical_empty_ordinary_tags() {
         );
     }
 }
+
+fn label_template(relay: &str) -> Value {
+    json!({"pubkey":"11".repeat(32),"kind":1985,"created_at":100,"content":"","tags":[["L","video.divine.contest.synthetic"],["l","include","video.divine.contest.synthetic"],["e","22".repeat(32),relay]]})
+}
+#[test]
+fn curation_relay_utf16_limit_matches_reader_without_restricting_definitions() {
+    let p = policy();
+    let prefix = "wss://relay.example/";
+    for (suffix, expected) in [
+        ("x".repeat(2048 - prefix.len()), true),
+        ("x".repeat(2049 - prefix.len()), false),
+        (format!("{}😀", "x".repeat(2046 - prefix.len())), true),
+        (format!("{}😀", "x".repeat(2047 - prefix.len())), false),
+    ] {
+        let relay = format!("{prefix}{suffix}");
+        assert_eq!(
+            p.can_sign(&unsigned(label_template(&relay))),
+            expected,
+            "{} UTF-16 units",
+            relay.encode_utf16().count()
+        );
+        let keys = nostr_sdk::Keys::generate();
+        let mut template = label_template(&relay);
+        template["pubkey"] = json!(keys.public_key().to_hex());
+        let signed = unsigned(template).sign_with_keys(&keys).unwrap();
+        assert_eq!(
+            p.can_sign(&unsigned(serde_json::to_value(signed).unwrap())),
+            expected,
+            "signed label template boundary"
+        );
+        let mut def = independent_definition();
+        for tag in def["tags"].as_array_mut().unwrap() {
+            if tag[0] == "challenge_relay" {
+                tag[1] = json!(relay);
+            }
+        }
+        assert!(
+            p.can_sign(&unsigned(def)),
+            "definition relays retain the signed-event budget"
+        );
+    }
+    assert!(!p.can_sign(&unsigned(label_template("https://relay.example/"))));
+}
+#[test]
+fn duplicate_winners_and_bare_event_id_curation_addresses_are_rejected() {
+    let p = policy();
+    let mut result = fixture("result");
+    let winner = result["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t[0] == "winner")
+        .unwrap()
+        .clone();
+    result["tags"].as_array_mut().unwrap().push(winner);
+    assert!(!p.can_sign(&unsigned(result)));
+    let mut label = label_template("wss://relay.example");
+    label["tags"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!(["a", "33".repeat(32)]));
+    assert!(!p.can_sign(&unsigned(label)));
+}
+
+#[test]
+fn unicode17_extend_data_preserves_title_grapheme_boundary() {
+    // unicode-segmentation 1.13.2 src/tables.rs (Unicode 17), grapheme_cat_table:
+    // U+1E6E3 has GC_Extend (line 1276). UAX #29 GB9 joins it to the preceding
+    // Tai Yo letter U+1E6E0; exercise the actual title limit, not scalar counts.
+    assert_eq!(unicode_segmentation::UNICODE_VERSION, (17, 0, 0));
+    let p = policy();
+    for (count, expected) in [(120, true), (121, false)] {
+        let mut def = independent_definition();
+        for tag in def["tags"].as_array_mut().unwrap() {
+            if tag[0] == "title" {
+                tag[1] = json!("\u{1e6e0}\u{1e6e3}".repeat(count));
+            }
+        }
+        assert_eq!(p.can_sign(&unsigned(def)), expected);
+    }
+}

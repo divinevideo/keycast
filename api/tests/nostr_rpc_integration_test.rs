@@ -3424,7 +3424,10 @@ async fn challenge_policy_http_signs_templates_and_denies_unrelated_operations()
             },
         )
         .await;
-        assert!(result.is_err() || result.unwrap().error.is_some());
+        assert!(
+            matches!(result, Err(RpcError::Auth(AuthError::Forbidden(ref message))) if message=="Operation denied by policy"),
+            "kind {kind} must fail at the permission gate"
+        );
     }
     let result = invoke_nostr_rpc(
         create_test_tenant_extractor(tenant_id),
@@ -3459,8 +3462,8 @@ async fn challenge_policy_http_signs_templates_and_denies_unrelated_operations()
         )
         .await;
         assert!(
-            result.is_err() || result.unwrap().error.is_some(),
-            "{method}"
+            matches!(result,Err(RpcError::Auth(AuthError::Forbidden(ref message))) if message=="Operation denied by policy"),
+            "{method} must fail at the permission gate before crypto parsing"
         );
     }
 }
