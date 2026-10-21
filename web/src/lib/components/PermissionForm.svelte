@@ -1,6 +1,6 @@
 <script lang="ts">
 import {
-    AVAILABLE_PERMISSIONS,
+    TEAM_POLICY_PERMISSIONS,
     type AllowedKindsConfig,
     type ContentFilterConfig,
 } from "$lib/types";
@@ -45,6 +45,9 @@ $effect(() => {
         case "allowed_kinds":
             config = allowedKindsConfig;
             break;
+        case "challenge_actions":
+            config = {};
+            break;
         case "content_filter":
             config = contentFilterConfig;
             break;
@@ -61,7 +64,7 @@ let contentFilterConfig: ContentFilterConfig = $state({
         <label for="permission">Permission Type</label>
         <select bind:value={identifier} class="w-full">
             <option value={null}>Select a permission type...</option>
-            {#each AVAILABLE_PERMISSIONS as permission_identifier}
+            {#each TEAM_POLICY_PERMISSIONS as permission_identifier}
                 <option value={permission_identifier}>{toTitleCase(permission_identifier)}</option>
             {/each}
         </select>
@@ -93,6 +96,8 @@ let contentFilterConfig: ContentFilterConfig = $state({
                 <input class="w-full" type="text" bind:value={contentFilterWords} />
             </div>
         </div>
+    {:else if identifier === "challenge_actions"}
+        <span class="mt-6">Create and manage challenges, enter and withdraw entries, announce results, and curate contests. No private-message access.</span>
     {:else if identifier === "encrypt_to_self"}
         <span class="mt-6">This permission allows for encryption/decryption but only when encrypting event to the same pubkey as the event pubkey field.</span>
     {/if}

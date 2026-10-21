@@ -1047,8 +1047,9 @@ async fn build_handler_for_owned_authorization(
         // Convert to CustomPermission trait objects
         db_permissions
             .iter()
-            .filter_map(|p| p.to_custom_permission().ok())
-            .collect()
+            .map(|p| p.to_custom_permission())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| RpcError::Internal("Configured permission could not be loaded".into()))?
     } else {
         // No policy = full access (empty permissions vec)
         vec![]
