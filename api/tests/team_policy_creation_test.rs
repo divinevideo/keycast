@@ -11,6 +11,7 @@ use keycast_api::api::{
 };
 use nostr_sdk::Keys;
 use serde_json::{json, Value};
+use serial_test::serial;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -35,6 +36,8 @@ async fn admin_team(pool: &PgPool) -> (i32, String) {
         .unwrap();
     (team, pubkey)
 }
+// Global counts include orphaned permissions; every test in this binary shares
+// the named serial guard so concurrent valid creation cannot change these totals.
 async fn row_counts(pool: &PgPool) -> (i64, i64, i64) {
     sqlx::query_as("SELECT (SELECT count(*) FROM policies),(SELECT count(*) FROM permissions),(SELECT count(*) FROM policy_permissions)").fetch_one(pool).await.unwrap()
 }
@@ -61,6 +64,7 @@ async fn create(
     .await
 }
 #[tokio::test]
+#[serial(team_policy_creation)]
 async fn stage_one_team_policy_creation_rejects_held_permissions_atomically() {
     let pool = common::setup_test_db().await;
     let (team, pubkey) = admin_team(&pool).await;
@@ -83,6 +87,7 @@ async fn stage_one_team_policy_creation_rejects_held_permissions_atomically() {
     }
 }
 #[tokio::test]
+#[serial(team_policy_creation)]
 async fn team_policy_creation_preserves_valid_existing_and_empty_policy_semantics() {
     let pool = common::setup_test_db().await;
     let (team, pubkey) = admin_team(&pool).await;
@@ -104,6 +109,7 @@ async fn team_policy_creation_preserves_valid_existing_and_empty_policy_semantic
 }
 
 #[tokio::test]
+#[serial(team_policy_creation)]
 async fn team_policy_creation_rejects_unknown_and_invalid_configuration_atomically() {
     let pool = common::setup_test_db().await;
     let (team, pubkey) = admin_team(&pool).await;
