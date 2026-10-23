@@ -569,6 +569,14 @@ impl UserRepository {
     /// whose disagreement is silent: it returns a wrong boolean rather than an
     /// error. If what "claimed" means ever changes, this predicate has
     /// to be revisited with the other three.
+    ///
+    /// A pubkey in `og_diviner_grants` also qualifies, whether or not it has a
+    /// users row. Those grants cover people who posted through a Divine app
+    /// before the cutoff with a key Keycast never saw (keycast#440), so most
+    /// have no account. The grant lookup therefore sits beside the users
+    /// lookup rather than inside it, where it could never match them. A grant
+    /// was already judged against the cutoff when its roster was built, so
+    /// `cutoff` does not apply to it.
     pub async fn is_og_diviner(
         &self,
         pubkey: &str,
@@ -577,6 +585,11 @@ impl UserRepository {
     ) -> Result<bool, RepositoryError> {
         sqlx::query_scalar(
             "SELECT EXISTS (
+                SELECT 1
+                FROM og_diviner_grants g
+                WHERE g.pubkey = $1
+                  AND g.tenant_id = $2
+            ) OR EXISTS (
                 SELECT 1
                 FROM users u
                 LEFT JOIN LATERAL (
