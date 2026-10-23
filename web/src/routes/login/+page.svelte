@@ -19,9 +19,25 @@
 	let currentSessionEmail = $state('');
 	let currentSessionPubkey = $state('');
 	let isSwitchingAccount = $state(false);
+	// Upstream OIDC login (api/src/api/http/oidc.rs), off unless the server has OIDC_ISSUER.
+	let oidc = $state<{ enabled: boolean; provider_name?: string; hide_password_login: boolean }>({
+		enabled: false,
+		hide_password_login: false
+	});
+
+	function oidcStartUrl() {
+		const back = `/login?oidc=1&redirect=${encodeURIComponent(resolveRedirectTarget())}`;
+		return `/api/auth/oidc/start?return_to=${encodeURIComponent(back)}`;
+	}
 
 	onMount(async () => {
 		hasExtension = typeof window !== 'undefined' && !!window.nostr;
+
+		try {
+			oidc = await api.get('/auth/oidc/config');
+		} catch {
+			// Older servers have no such endpoint: keep the password form.
+		}
 
 		try {
 			const status = await api.get<{
@@ -33,6 +49,12 @@
 			hasExistingSession = !!status.authenticated;
 			currentSessionEmail = status.email || status.pubkey || '';
 			currentSessionPubkey = status.pubkey || '';
+
+			// Coming back from the OIDC callback: the session cookie is fresh, so continue.
+			if (hasExistingSession && $page.url.searchParams.get('oidc') === '1') {
+				await handleContinueAsCurrentAccount();
+				return;
+			}
 		} catch (err) {
 			console.error('Session status check failed:', err);
 		} finally {
@@ -208,6 +230,18 @@
 				</button>
 			</div>
 		{:else}
+			{#if oidc.enabled}
+			<a class="btn-primary btn-oidc" href={oidcStartUrl()}>
+				Sign in with {oidc.provider_name}
+			</a>
+			{#if !oidc.hide_password_login}
+			<div class="auth-divider">
+				<span>or</span>
+			</div>
+			{/if}
+			{/if}
+
+			{#if !(oidc.enabled && oidc.hide_password_login)}
 			<form onsubmit={(e) => { e.preventDefault(); handleLogin(); }}>
 				<div class="form-group">
 					<label for="email">Email</label>
@@ -244,6 +278,7 @@
 			<p class="auth-link">
 				Don't have an account? <a href="/register">Create one</a>
 			</p>
+			{/if}
 
 			{#if hasExtension}
 			<div class="auth-divider">
@@ -457,6 +492,13 @@
 
 	.auth-link a:hover {
 		text-decoration: underline;
+	}
+
+	.btn-oidc {
+		display: block;
+		text-align: center;
+		text-decoration: none;
+		box-sizing: border-box;
 	}
 
 	.auth-divider {
