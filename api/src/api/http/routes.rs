@@ -12,7 +12,7 @@ use tower::{timeout::error::Elapsed, ServiceBuilder};
 
 use crate::api::http::{
     admin, ap, atproto, atproto_oauth, auth, claim, email_marketing, expensive_work, headless,
-    metrics, nostr_rpc, oauth, og_diviner, policies, retention, service_deletion,
+    metrics, nostr_rpc, oauth, og_diviner, oidc, policies, retention, service_deletion,
     service_provisioning, teams,
 };
 use crate::email_delivery::EmailDeliveryService;
@@ -97,6 +97,14 @@ pub fn api_routes(
         .route("/oauth/login", post(oauth::oauth_login))
         .route("/oauth/register", post(oauth::oauth_register))
         .layer(auth_cors.clone())
+        .with_state(auth_state.clone());
+
+    // Upstream OIDC login (browser navigations, no CORS needed). Answers 404 unless
+    // OIDC_ISSUER is configured; see oidc.rs.
+    let oidc_routes = Router::new()
+        .route("/auth/oidc/config", get(oidc::oidc_config))
+        .route("/auth/oidc/start", get(oidc::oidc_start))
+        .route("/auth/oidc/callback", get(oidc::oidc_callback))
         .with_state(auth_state.clone());
 
     // Logout route - public CORS so third-party OAuth apps can revoke sessions
@@ -455,6 +463,7 @@ pub fn api_routes(
         .merge(email_routes.layer(public_cors.clone()))
         .merge(password_reset_route.layer(public_cors.clone()))
         .merge(oauth_routes) // Has public_cors (third-party safe)
+        .merge(oidc_routes) // Top-level navigations only (start/callback), plus a public config read
         .merge(atproto_oauth_routes)
         .merge(connect_routes.layer(public_cors.clone()))
         .merge(signing_routes.layer(public_cors.clone()))

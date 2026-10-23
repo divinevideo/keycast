@@ -2088,7 +2088,7 @@ pub async fn authorize_get(
                 <p class="verification_subtext">Click the link in the email to verify your account and complete sign up. After verification, you'll be redirected back to the app.</p>
             </div>
 
-            <div id="login_view" class="form_view">
+            <div id="login_view" class="form_view">{oidc_login}
                 <form onsubmit="handleLogin(event)">
                     <div class="form_group">
                         <label for="login_email">Email</label>
@@ -2457,6 +2457,7 @@ pub async fn authorize_get(
             register_confirmation_toggle =
                 password_visibility_toggle_html("register_password-confirm"),
             register_nsec_toggle = password_visibility_toggle_html("register_nsec"),
+            oidc_login = super::oidc::popup_login_html(),
             brand = BRAND_NAME,
         )
     };

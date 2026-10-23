@@ -11,6 +11,7 @@ mod email_marketing;
 mod error;
 mod oauth_authorization;
 mod oauth_code;
+mod oidc_identity;
 mod personal_keys;
 mod policy;
 mod refresh_token;
@@ -42,6 +43,7 @@ pub use oauth_code::{
     StoreOAuthCodeParams, StoreOAuthCodeWithRegistrationParams, StoredExchangeCode,
     StoredPendingRegistration,
 };
+pub use oidc_identity::{OidcIdentityRepository, OidcLinkOutcome};
 pub use personal_keys::PersonalKeysRepository;
 pub use policy::PolicyRepository;
 pub use refresh_token::{RefreshTokenBinding, RefreshTokenRepository};

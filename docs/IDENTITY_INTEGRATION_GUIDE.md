@@ -716,6 +716,9 @@ FROM_NAME=Keycast
 BASE_URL=https://yourdomain.com
 ```
 
+Sign-in through an external OpenID Connect provider (optional, `OIDC_*`): see
+[OIDC_SIGN_IN.md](OIDC_SIGN_IN.md).
+
 ### Security Recommendations
 
 1. **Encryption Keys**:
