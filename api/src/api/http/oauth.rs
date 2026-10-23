@@ -3194,7 +3194,12 @@ async fn handle_authorization_code_grant(
         // Resolve the email before claiming the code so a lookup failure leaves it immediately
         // redeemable.
         let user_repo = UserRepository::new(pool.clone());
-        let email = user_repo.get_email(&user_pubkey, tenant_id).await?;
+        // Accounts preloaded by an admin have no e-mail until claimed; with the upstream OIDC
+        // login they can authorize apps before that, so a missing e-mail is not an error.
+        let email = user_repo
+            .get_optional_email(&user_pubkey, tenant_id)
+            .await?
+            .unwrap_or_default();
 
         // Claim, but do not delete, the exchange code. Downstream failures release this claim so
         // the same code can retry.

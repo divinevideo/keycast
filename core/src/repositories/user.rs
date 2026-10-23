@@ -1974,6 +1974,23 @@ impl UserRepository {
             .map_err(Into::into)
     }
 
+    /// Like [`Self::get_email`], but `None` for an account without an e-mail (a preloaded,
+    /// unclaimed account signed in through an upstream OIDC provider).
+    pub async fn get_optional_email(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<Option<String>, RepositoryError> {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT email FROM users WHERE pubkey = $1 AND tenant_id = $2",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     // =========================================================================
     // Key change methods
     // =========================================================================
