@@ -161,8 +161,8 @@ pub struct GrantLoadReport {
 
 /// Repository for the OG Diviner grant roster.
 ///
-/// Every method is a single statement on the pool, so none of them holds a
-/// connection while acquiring another.
+/// Each statement runs on the pool by itself, so no method holds a connection
+/// while acquiring another.
 #[derive(Debug)]
 pub struct OgDivinerGrantRepository {
     pool: PgPool,
@@ -312,6 +312,22 @@ mod tests {
         for line in &lines {
             assert!(!message.contains(line.trim()), "message echoed a line");
         }
+    }
+
+    #[test]
+    fn line_numbers_are_file_lines_counting_blank_ones() {
+        let input = format!("\n{}\n\nnot-a-key\n", key('a'));
+
+        let error = parse_grant_roster(&input).unwrap_err();
+
+        assert_eq!(
+            error,
+            GrantRosterError::InvalidLines {
+                count: 1,
+                first: vec![4],
+            },
+            "an operator finds the bad line by its number in the file"
+        );
     }
 
     #[test]
