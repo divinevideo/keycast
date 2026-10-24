@@ -3218,7 +3218,7 @@ impl UserRepository {
     ///
     /// This performs a complete account deletion:
     /// 0. Removes the pubkey's OG Diviner grant in this tenant
-    ///    (og_diviner_grants), even when no account row exists
+    ///    (og_diviner_grants)
     /// 1. Removes user from all teams (team_users)
     /// 2. Clears pending OAuth codes
     /// 3. Deletes AP RSA key material (ap_actor_keys)
@@ -3227,10 +3227,12 @@ impl UserRepository {
     ///
     /// Returns information about what was deleted for logging.
     ///
-    /// Returns [`RepositoryError::NotFound`] when no such account exists. A
-    /// caller that needs to treat an absent account as success should use
-    /// [`Self::delete_account_in_tx`], which reports it as
-    /// [`AccountDeletionOutcome::AlreadyAbsent`] rather than as an error.
+    /// Returns [`RepositoryError::NotFound`] when no such account exists, and
+    /// then commits nothing: the grant removal rolls back with the rest. A
+    /// caller that needs to treat an absent account as success, and still
+    /// remove the grant, should use [`Self::delete_account_in_tx`], which
+    /// reports it as [`AccountDeletionOutcome::AlreadyAbsent`] rather than as
+    /// an error.
     pub async fn delete_account(
         &self,
         pubkey: &str,
@@ -3258,7 +3260,9 @@ impl UserRepository {
     ///
     /// Reports an absent account as [`AccountDeletionOutcome::AlreadyAbsent`]
     /// instead of erroring, so the caller can still commit work in the same
-    /// transaction. An error here aborts the transaction and cannot be
+    /// transaction. The pubkey's OG Diviner grant in this tenant is removed
+    /// even then, and a caller that commits keeps that removal, as service
+    /// deletion does when it records `already_absent`. An error here aborts the transaction and cannot be
     /// distinguished from any other failure by the caller.
     pub async fn delete_account_in_tx(
         tx: &mut Transaction<'_, Postgres>,
