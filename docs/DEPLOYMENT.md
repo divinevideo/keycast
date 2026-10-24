@@ -409,38 +409,54 @@ Until the rows exist, support admins keep sessions they already hold, but a new 
 
 The OG Diviner chit (`GET /api/public/users/:pubkey/og-diviner`) also accepts pubkeys listed in the `og_diviner_grants` table. That covers people who posted through a Divine app before the cutoff with a key Keycast never saw (keycast#440). The `20261023120000_add_og_diviner_grants` migration creates the table empty, and an empty table changes no answer, so the code can ship before the data.
 
-The roster is built once, privately, from production relay data. It is never committed, attached to an issue, or pasted anywhere public. Load it with the loader, which prints counts, line numbers and the target tenant only:
+The roster is built privately from production relay data. It is never committed, attached to an issue, or pasted anywhere public.
+
+Build the roster immediately before loading it, and never load an old one: rebuild it instead. The loader skips, and revokes, any pubkey whose account deletion Keycast has recorded in the tenant (reported as `account deleted`), but Keycast's deletion records can be compacted 30 days after the deletion. An old roster can therefore re-grant someone who deleted their account long ago, and nothing would remove that grant.
+
+### Connecting
+
+The loader needs a direct connection that bypasses any transaction-mode pooler, because sqlx caches prepared statements per connection, and it needs an identity that can write `og_diviner_grants`.
+
+- **Production (Cloud Run):** there is no connection string to copy. The `keycast-migrate` job reaches Cloud SQL through the Cloud SQL Auth Proxy with IAM authentication (see `cloudbuild.yaml`), and the loader does the same. Run `cloud-sql-proxy --auto-iam-authn openvine-co:us-east1:keycast-db-east` under an identity with write access to the table, then point `DATABASE_URL` at the proxy on `127.0.0.1`.
+- **GKE:** use the `DATABASE_URL_DIRECT` value the `keycast-db-migrate` job reads, not the pooled `DATABASE_URL`.
+
+Export `DATABASE_URL` rather than putting it on the command line, so it stays out of shell history. Run the loader from a checkout of the commit that is deployed, so its queries match the schema it writes to and the lock it takes matches the one the running server's account deletion takes.
+
+### Loading
+
+The loader prints counts, line numbers and the target tenant only:
 
 ```bash
-# Dry run: validates the file and reports what would be granted. Writes nothing.
-DATABASE_URL=<the migration job's direct connection> \
-  cargo run -p keycast_core --example load-og-diviner-grants -- \
+export DATABASE_URL=...   # see "Connecting"
+
+# Dry run: validates the file and reports what a load would do. Writes nothing.
+cargo run -p keycast_core --example load-og-diviner-grants -- \
   --tenant-id 1 --evidence pre_cutoff_app_post <roster-file>
 
-# Same command with --apply to write. Re-running it grants nothing new.
+# The same command with --apply writes.
 ```
-
-`DATABASE_URL` must be the same direct connection, bypassing the transaction-mode pooler, that the migration job uses: `DATABASE_URL_DIRECT` for the GKE `keycast-db-migrate` job, or the connection the Cloud Run `keycast-migrate` job is configured with.
 
 Before applying:
 
 - Check that the tenant line names the deployment you mean.
 - Compare the dry run's `unique pubkeys` with the count the roster builder reported. If they differ, do not `--apply`; the file is not the roster that was reviewed.
 
-One malformed line (anything but a 64-character lowercase hex pubkey) rejects the whole file.
+One malformed line (anything but a 64-character lowercase hex pubkey) rejects the whole file. An applied load is one transaction: it lands whole or not at all. While it runs, account deletions in the tenant wait for it, and it waits for any already in progress.
 
-After applying, spot-check a known affected account. The endpoint answers with `Cache-Control: public, max-age=86400, stale-if-error=604800`, so a pubkey looked up before the load can keep showing `eligible: false` for up to a day, in shared caches and in clients. Bypass caches for the check: send `Cache-Control: no-cache` and add a query string no cache has seen. The route ignores the query string.
+Applying the same roster again straight away grants nothing new. To load again later, rebuild the roster first (see above) rather than re-running an old file.
+
+After applying, spot-check a known affected account. The endpoint answers with `Cache-Control: public, max-age=86400, stale-if-error=604800`, so a pubkey looked up before the load can keep showing `eligible: false` for up to a day, in shared caches and in clients. Bypass caches for the check: send `Cache-Control: no-cache` and add a query string no cache has seen. The route ignores the query string. `-i` prints the response headers, so you can tell from `Age` and `Cache-Control` whether a cache answered.
 
 ```bash
-curl -s -H 'Cache-Control: no-cache' \
+curl -si -H 'Cache-Control: no-cache' \
   "https://login.divine.video/api/public/users/<pubkey hex>/og-diviner?check=$(date +%s)"
 ```
 
 ### Removing grants
 
-Deleting an account in the Divine app removes its grant, whether or not the person had a Keycast account: the account-deletion coordinator calls Keycast's service deletion for every in-app deletion. Nothing here is a manual step for account holders.
+Deleting the account in the Divine app removes the grant, whether or not the person had a Keycast account. A deletion made only from another Nostr app reaches the relay but not Keycast, so that grant stays; this is a known, accepted limitation, and no manual step is expected.
 
-The SQL below is only for an operator backing out a bad load: one load is a single statement, so every row it wrote shares one `created_at`. Find it, then delete inside a transaction and check the row count before committing:
+The SQL below is only for an operator backing out a bad load. A load is one transaction, so every row it wrote shares one `created_at`. Find it, then delete inside a transaction and check the row count before committing:
 
 ```sql
 SELECT created_at, count(*) FROM og_diviner_grants
@@ -451,11 +467,12 @@ BEGIN;
 DELETE FROM og_diviner_grants
 WHERE tenant_id = 1
   AND evidence = 'pre_cutoff_app_post'
-  AND created_at >= '<window start, UTC>'
-  AND created_at <  '<window end, UTC>';
--- The DELETE count must equal the load's "newly granted" count. If not, ROLLBACK.
+  AND created_at = '<value exactly as the SELECT printed it>';
+-- The DELETE count must equal that row's count from the SELECT above. If not, ROLLBACK.
 COMMIT;
 ```
+
+Copy `created_at` exactly as printed, offset included: a hand-typed time without one is read in the session time zone. Compare against the SELECT, not the load's `newly granted`, which drifts legitimately as grantees delete their accounts.
 
 ---
 
