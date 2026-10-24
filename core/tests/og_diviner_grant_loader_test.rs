@@ -181,3 +181,43 @@ async fn the_table_rejects_malformed_pubkeys_and_unknown_evidence() {
         "evidence labels outside the vocabulary must not be stored"
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn a_dry_run_counts_only_grants_in_its_own_tenant() {
+    let pool = pool().await;
+    let repository = OgDivinerGrantRepository::new(pool.clone());
+    let other_tenant: i64 = sqlx::query_scalar(
+        "INSERT INTO tenants (domain, name) VALUES ('og-diviner-loader.example.invalid', 'OG loader test')
+         ON CONFLICT (domain) DO UPDATE SET name = EXCLUDED.name
+         RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let keys = vec![key('7'), key('8')];
+    purge(&pool, &keys).await;
+    let roster = parse_grant_roster(&keys.join("\n")).unwrap();
+    // The same pubkeys already granted elsewhere must not count as granted here.
+    repository
+        .load(other_tenant, EVIDENCE, &roster, true)
+        .await
+        .unwrap();
+
+    let dry_run = repository.load(TENANT_ID, EVIDENCE, &roster, false).await;
+    let applied = repository.load(TENANT_ID, EVIDENCE, &roster, true).await;
+    purge(&pool, &keys).await;
+    sqlx::query("DELETE FROM tenants WHERE id = $1")
+        .bind(other_tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (dry_run, applied) = (dry_run.unwrap(), applied.unwrap());
+    assert_eq!(applied.newly_granted, 2);
+    assert_eq!(
+        (dry_run.newly_granted, dry_run.already_granted),
+        (applied.newly_granted, applied.already_granted),
+        "a dry run predicts exactly what applying in the same tenant does"
+    );
+}
