@@ -175,11 +175,25 @@ async fn the_table_rejects_malformed_pubkeys_and_unknown_evidence() {
     .await;
     purge(&pool, &keys).await;
 
-    assert!(uppercase.is_err(), "uppercase hex must not be stored");
-    assert!(
-        unknown_evidence.is_err(),
+    // 23514 is check_violation: the rejection must come from the table's own
+    // constraints, not from some unrelated failure such as a missing tenant.
+    assert_eq!(
+        sqlstate(&uppercase).as_deref(),
+        Some("23514"),
+        "uppercase hex must not be stored"
+    );
+    assert_eq!(
+        sqlstate(&unknown_evidence).as_deref(),
+        Some("23514"),
         "evidence labels outside the vocabulary must not be stored"
     );
+}
+
+fn sqlstate<T>(result: &Result<T, sqlx::Error>) -> Option<String> {
+    match result {
+        Err(sqlx::Error::Database(error)) => error.code().map(|code| code.into_owned()),
+        _ => None,
+    }
 }
 
 #[tokio::test]
