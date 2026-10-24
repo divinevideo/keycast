@@ -249,8 +249,8 @@ async fn deleting_an_absent_account_removes_its_og_diviner_grant() {
     setup_env();
     let pool = common::setup_test_db().await;
     // Most OG Diviner grantees never had a Keycast account. The coordinator
-    // still calls this endpoint when one of them vanishes, and the grant must
-    // not outlive that request.
+    // still calls this endpoint when one of them deletes their account in the
+    // Divine app, and the grant must not outlive that request.
     let pubkey = Keys::generate().public_key().to_hex();
     sqlx::query(
         "INSERT INTO og_diviner_grants (tenant_id, pubkey, evidence)

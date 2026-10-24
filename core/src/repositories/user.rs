@@ -3273,12 +3273,13 @@ impl UserRepository {
         ).bind(tenant_id).bind(pubkey).fetch_all(&mut **tx).await?;
 
         // Remove any OG Diviner grant before the ownership check, not after it.
-        // Most grantees never had a Keycast account (keycast#440), so for them
-        // this path returns AlreadyAbsent -- and the service deletion path, run
-        // by the account-deletion coordinator on the person's own vanish
-        // request, still commits. Without this the grant would outlive the
-        // deletion. The delete is scoped to this tenant, so the cross-tenant
-        // risk the ownership check guards against does not apply to it.
+        // The account-deletion coordinator calls service deletion for every
+        // account deleted in the Divine app, including people who manage their
+        // own key and never had a Keycast account. Most grantees are those
+        // people (keycast#440), so for them this path returns AlreadyAbsent and
+        // the caller still commits; a delete placed after the check would never
+        // run for them. The delete is scoped to this tenant, so the
+        // cross-tenant risk the ownership check guards against does not apply.
         sqlx::query("DELETE FROM og_diviner_grants WHERE tenant_id = $1 AND pubkey = $2")
             .bind(tenant_id)
             .bind(pubkey)

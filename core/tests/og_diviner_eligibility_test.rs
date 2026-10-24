@@ -573,7 +573,7 @@ async fn account_deletion_removes_the_grant_in_its_tenant_only() {
 
     let with_account = granted_pubkey('5');
     // The common case: a grantee Keycast never held an account for, deleted on
-    // the coordinator's request after a vanish elsewhere.
+    // the coordinator's request after they deleted their account in the app.
     let without_account = granted_pubkey('6');
     let keys = [with_account.as_str(), without_account.as_str()];
 

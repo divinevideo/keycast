@@ -27,6 +27,7 @@
 - One bad line in the roster must abort the whole load with zero rows written.
 - Running the same roster twice must insert nothing the second time and report the rows as already granted.
 - Uppercase hex, npub, 63/65-char, and BOM-prefixed lines are rejected, not normalised.
+- Deleting an account must remove its grant, including for a grantee Keycast never held an account for. Excluding deleted accounts is one of #440's criteria, and before this change deleting the `users` row ended eligibility.
 
 ---
 
@@ -69,3 +70,15 @@
 - [ ] **Step 1:** CLI: `DATABASE_URL=... cargo run -p keycast_core --example load-og-diviner-grants -- --tenant-id <id> --evidence pre_cutoff_app_post [--apply] <roster-file>`. Dry run by default, matching the precedent. Prints counts only.
 - [ ] **Step 2:** Run it against the local test database with a synthetic roster: dry run, apply, apply again, a bad file. Confirm the output carries no pubkeys.
 - [ ] **Step 3:** Commit.
+
+### Task 4: Grants do not outlive account deletion (added after review)
+
+**Files:**
+- Modify: `core/src/repositories/user.rs` (`delete_account_in_tx`)
+- Test: `core/tests/og_diviner_eligibility_test.rs`, `api/tests/service_account_deletion_test.rs`
+
+The account-deletion coordinator calls service deletion for every account deleted in the Divine app, including people who manage their own key, and Keycast answers `already_absent` for anyone it never held an account for. The grant delete therefore runs before the ownership check, so it also covers grantees with no `users` row. It is tenant-scoped, so the cross-tenant risk the ownership check guards against does not apply.
+
+- [x] **Step 1:** Tests: a granted pubkey with an account is deleted and is no longer eligible; a granted pubkey with no account goes through service deletion, gets `already_absent`, and its grant is gone once the commit lands; a grant for the same pubkey in another tenant survives.
+- [x] **Step 2:** Delete the grant in `delete_account_in_tx`, ahead of the ownership check.
+- [x] **Step 3:** Commit.

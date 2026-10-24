@@ -438,9 +438,9 @@ curl -s -H 'Cache-Control: no-cache' \
 
 ### Removing grants
 
-Deleting an account through Keycast removes its grant, including the service deletion the account-deletion coordinator runs. A grantee who never had a Keycast account and deletes their account somewhere Keycast does not hear about keeps the row until it is removed by hand.
+Deleting an account in the Divine app removes its grant, whether or not the person had a Keycast account: the account-deletion coordinator calls Keycast's service deletion for every in-app deletion. Nothing here is a manual step for account holders.
 
-To back out a bad load: one load is a single statement, so every row it wrote shares one `created_at`. Find it, then delete inside a transaction and check the row count before committing:
+The SQL below is only for an operator backing out a bad load: one load is a single statement, so every row it wrote shares one `created_at`. Find it, then delete inside a transaction and check the row count before committing:
 
 ```sql
 SELECT created_at, count(*) FROM og_diviner_grants
