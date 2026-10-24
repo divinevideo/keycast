@@ -32,14 +32,24 @@ struct Args {
     roster_path: String,
 }
 
-fn parse_args() -> Result<Args, String> {
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut tenant_id = None;
     let mut evidence = None;
     let mut apply = false;
     let mut roster_path = None;
 
-    let mut args = env::args().skip(1);
+    let mut args = args.into_iter();
+    let mut seen_flags = Vec::new();
     while let Some(arg) = args.next() {
+        // A repeated flag is refused rather than letting the last one win: an
+        // operator who typed two tenant ids meant one of them, and this tool
+        // writes to whichever it keeps.
+        if arg.starts_with("--") {
+            if seen_flags.contains(&arg) {
+                return Err(format!("{arg} given more than once"));
+            }
+            seen_flags.push(arg.clone());
+        }
         match arg.as_str() {
             "--tenant-id" => {
                 let value = args.next().ok_or("--tenant-id needs a value")?;
@@ -70,7 +80,7 @@ fn parse_args() -> Result<Args, String> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    let args = match parse_args() {
+    let args = match parse_args(env::args().skip(1)) {
         Ok(args) => args,
         Err(message) => {
             eprintln!("{message}\n{USAGE}");
@@ -126,7 +136,10 @@ async fn main() -> ExitCode {
     if !report.applied {
         println!("DRY RUN: nothing written; pass --apply to load");
     }
-    println!("tenant:          {}", args.tenant_id);
+    println!(
+        "tenant:          {} ({}, {})",
+        args.tenant_id, report.tenant_domain, report.tenant_name
+    );
     println!("evidence:        {}", args.evidence.as_str());
     println!("lines read:      {}", roster.entries());
     println!("duplicate lines: {}", roster.duplicates());
@@ -142,4 +155,58 @@ async fn main() -> ExitCode {
     );
     println!("already granted: {}", report.already_granted);
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Result<Args, String> {
+        parse_args(list.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn accepts_each_flag_once() {
+        let parsed = args(&[
+            "--tenant-id",
+            "1",
+            "--evidence",
+            "pre_cutoff_app_post",
+            "--apply",
+            "roster.txt",
+        ])
+        .unwrap();
+
+        assert_eq!(parsed.tenant_id, 1);
+        assert!(parsed.apply);
+    }
+
+    #[test]
+    fn rejects_a_flag_given_twice() {
+        for list in [
+            &["--tenant-id", "2", "--tenant-id", "1"][..],
+            &[
+                "--evidence",
+                "pre_cutoff_app_post",
+                "--evidence",
+                "pre_cutoff_app_post",
+            ][..],
+            &["--apply", "--apply"][..],
+        ] {
+            let mut full = vec![
+                "--tenant-id",
+                "1",
+                "--evidence",
+                "pre_cutoff_app_post",
+                "roster.txt",
+            ];
+            // Each case repeats one flag; the base arguments complete the rest.
+            full.splice(0..0, list.iter().copied());
+            let error = args(&full).err().unwrap_or_default();
+            assert!(
+                error.contains("more than once"),
+                "{list:?} must be rejected, got {error:?}"
+            );
+        }
+    }
 }

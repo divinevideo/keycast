@@ -235,3 +235,30 @@ async fn a_dry_run_counts_only_grants_in_its_own_tenant() {
         "a dry run predicts exactly what applying in the same tenant does"
     );
 }
+
+#[tokio::test]
+#[serial]
+async fn the_report_names_the_tenant_it_loaded_into() {
+    let pool = pool().await;
+    let repository = OgDivinerGrantRepository::new(pool.clone());
+    let tenant: i64 = sqlx::query_scalar(
+        "INSERT INTO tenants (domain, name) VALUES ('og-diviner-report.example.invalid', 'OG report test')
+         ON CONFLICT (domain) DO UPDATE SET name = EXCLUDED.name
+         RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let roster = parse_grant_roster(&key('9')).unwrap();
+
+    let report = repository.load(tenant, EVIDENCE, &roster, false).await;
+    sqlx::query("DELETE FROM tenants WHERE id = $1")
+        .bind(tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let report = report.unwrap();
+    assert_eq!(report.tenant_domain, "og-diviner-report.example.invalid");
+    assert_eq!(report.tenant_name, "OG report test");
+}

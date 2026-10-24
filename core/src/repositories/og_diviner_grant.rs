@@ -151,9 +151,12 @@ pub fn parse_grant_roster(input: &str) -> Result<GrantRoster, GrantRosterError> 
     Ok(GrantRoster { entries, pubkeys })
 }
 
-/// What a load did, or would do on a dry run. Counts only.
+/// What a load did, or would do on a dry run. Counts and the target tenant
+/// only, so an operator can confirm the tenant before applying.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantLoadReport {
+    pub tenant_domain: String,
+    pub tenant_name: String,
     pub unique: usize,
     pub newly_granted: u64,
     pub already_granted: u64,
@@ -189,14 +192,14 @@ impl OgDivinerGrantRepository {
     ) -> Result<GrantLoadReport, RepositoryError> {
         // Checked explicitly so a dry run against the wrong tenant fails the
         // same way the real load would, instead of reporting a clean result.
-        let tenant_exists: bool =
-            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM tenants WHERE id = $1)")
+        let tenant: Option<(String, String)> =
+            sqlx::query_as("SELECT domain, name FROM tenants WHERE id = $1")
                 .bind(tenant_id)
-                .fetch_one(&self.pool)
+                .fetch_optional(&self.pool)
                 .await?;
-        if !tenant_exists {
+        let Some((tenant_domain, tenant_name)) = tenant else {
             return Err(RepositoryError::NotFound(format!("tenant {tenant_id}")));
-        }
+        };
 
         let unique = roster.pubkeys().len();
         let newly_granted = if apply {
@@ -225,6 +228,8 @@ impl OgDivinerGrantRepository {
         };
 
         Ok(GrantLoadReport {
+            tenant_domain,
+            tenant_name,
             unique,
             newly_granted,
             already_granted: unique as u64 - newly_granted,
