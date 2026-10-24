@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::str::FromStr;
 
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 
 use crate::repositories::RepositoryError;
 
@@ -153,6 +153,13 @@ pub fn parse_grant_roster(input: &str) -> Result<GrantRoster, GrantRosterError> 
 
 /// What a load did, or would do on a dry run. Counts and the target tenant
 /// only, so an operator can confirm the tenant before applying.
+///
+/// Every unique roster pubkey lands in exactly one of `newly_granted`,
+/// `already_granted` and `excluded_deleted`, so the three sum to `unique`. A
+/// pubkey with a recorded deletion in the tenant is `excluded_deleted` whether
+/// or not it already had a grant; if it did, the load removes that grant and
+/// also counts it in `revoked_deleted`. A dry run reports the same counts the
+/// load would.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantLoadReport {
     pub tenant_domain: String,
@@ -160,13 +167,44 @@ pub struct GrantLoadReport {
     pub unique: usize,
     pub newly_granted: u64,
     pub already_granted: u64,
+    /// Roster pubkeys with a `service_account_deletions` row in this tenant.
+    pub excluded_deleted: u64,
+    /// Of `excluded_deleted`, those whose existing grant the load removed.
+    pub revoked_deleted: u64,
     pub applied: bool,
+}
+
+/// Takes the tenant's grant lock for the rest of `conn`'s transaction.
+///
+/// Account deletion takes it shared, so deletions never wait on each other; a
+/// load takes it exclusive. A deletion deletes the grant and records itself in
+/// `service_account_deletions` in one transaction, and a load reads those
+/// records and inserts grants in another. Under READ COMMITTED neither sees the
+/// other's uncommitted rows, so without this lock a deletion running alongside
+/// a load could miss the grant while the load misses the deletion, leaving a
+/// grant nothing will ever remove: the coordinator does not call Keycast again
+/// for a completed deletion.
+pub(crate) async fn lock_tenant_grants(
+    conn: &mut PgConnection,
+    tenant_id: i64,
+    exclusive: bool,
+) -> Result<(), sqlx::Error> {
+    let statement = if exclusive {
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))"
+    } else {
+        "SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))"
+    };
+    sqlx::query(statement)
+        .bind(format!("og-diviner-grants:{tenant_id}"))
+        .execute(conn)
+        .await?;
+    Ok(())
 }
 
 /// Repository for the OG Diviner grant roster.
 ///
-/// Each statement runs on the pool by itself, so no method holds a connection
-/// while acquiring another.
+/// No method holds a connection while acquiring another, so it works on the
+/// loader's one-connection pool.
 #[derive(Debug)]
 pub struct OgDivinerGrantRepository {
     pool: PgPool,
@@ -180,9 +218,16 @@ impl OgDivinerGrantRepository {
     /// Grants every pubkey in `roster` in `tenant_id`, or with `apply` false,
     /// reports what that would do without writing.
     ///
-    /// Re-running a roster is a no-op: an existing grant keeps its original
-    /// evidence and timestamp and is counted as already granted. The insert is
-    /// one statement, so a load either lands whole or not at all.
+    /// A pubkey whose account deletion is recorded in the tenant is never
+    /// granted, and loses any grant it has: the coordinator will not call
+    /// Keycast for that deletion again, so nothing else would remove it. Those
+    /// records can be compacted 30 days after the deletion, which is why the
+    /// roster has to be built right before it is loaded (see docs/DEPLOYMENT.md).
+    ///
+    /// Re-running a roster grants nothing new: an existing grant keeps its
+    /// original evidence and timestamp and is counted as already granted. An
+    /// applied load is one transaction, so it lands whole or not at all, and
+    /// every row it writes shares one `created_at`.
     pub async fn load(
         &self,
         tenant_id: i64,
@@ -201,41 +246,129 @@ impl OgDivinerGrantRepository {
             return Err(RepositoryError::NotFound(format!("tenant {tenant_id}")));
         };
 
-        let unique = roster.pubkeys().len();
-        let newly_granted = if apply {
-            sqlx::query(
+        let unique = roster.pubkeys().len() as u64;
+        let (newly_granted, already_granted, excluded_deleted, revoked_deleted) = if apply {
+            let mut tx = self.pool.begin().await?;
+            // Held to commit. While it is held no deletion in this tenant can
+            // be in flight, so the three statements below see one fixed set of
+            // deletion records and the counts partition the roster exactly.
+            lock_tenant_grants(&mut tx, tenant_id, true).await?;
+
+            let newly_granted = sqlx::query(
                 "INSERT INTO og_diviner_grants (tenant_id, pubkey, evidence)
-                 SELECT $1, pubkey, $3
-                 FROM unnest($2::text[]) AS pubkey
+                 SELECT $1, roster.pubkey, $3
+                 FROM unnest($2::text[]) AS roster(pubkey)
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM service_account_deletions d
+                     WHERE d.tenant_id = $1 AND d.user_pubkey = roster.pubkey
+                 )
                  ON CONFLICT (tenant_id, pubkey) DO NOTHING",
             )
             .bind(tenant_id)
             .bind(roster.pubkeys())
             .bind(evidence.as_str())
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?
-            .rows_affected()
+            .rows_affected();
+
+            // The insert above never creates such a grant; this removes one
+            // that already existed, which only a load from before the deletion
+            // check could have written. Such a pubkey is reported as excluded,
+            // so it must also end up without a grant.
+            let revoked_deleted = sqlx::query(
+                "DELETE FROM og_diviner_grants g
+                 WHERE g.tenant_id = $1
+                   AND g.pubkey = ANY($2)
+                   AND EXISTS (
+                       SELECT 1 FROM service_account_deletions d
+                       WHERE d.tenant_id = $1 AND d.user_pubkey = g.pubkey
+                   )",
+            )
+            .bind(tenant_id)
+            .bind(roster.pubkeys())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+
+            let excluded_deleted = count_deleted(&mut tx, tenant_id, roster).await?;
+            // Under the lock this cannot fail. If it ever does, the report
+            // could not account for what was written, so roll back rather than
+            // commit a load nobody can describe.
+            let Some(already_granted) = unique.checked_sub(newly_granted + excluded_deleted) else {
+                return Err(RepositoryError::Integrity(
+                    "grant counts do not add up to the roster; nothing loaded".to_string(),
+                ));
+            };
+            tx.commit().await?;
+            (
+                newly_granted,
+                already_granted,
+                excluded_deleted,
+                revoked_deleted,
+            )
         } else {
-            let existing: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM og_diviner_grants
-                 WHERE tenant_id = $1 AND pubkey = ANY($2)",
+            let (already, excluded, revoked): (i64, i64, i64) = sqlx::query_as(
+                "SELECT
+                     count(*) FILTER (WHERE g.pubkey IS NOT NULL AND NOT deleted),
+                     count(*) FILTER (WHERE deleted),
+                     count(*) FILTER (WHERE g.pubkey IS NOT NULL AND deleted)
+                 FROM unnest($2::text[]) AS roster(pubkey)
+                 LEFT JOIN og_diviner_grants g
+                     ON g.tenant_id = $1 AND g.pubkey = roster.pubkey
+                 CROSS JOIN LATERAL (
+                     SELECT EXISTS (
+                         SELECT 1 FROM service_account_deletions d
+                         WHERE d.tenant_id = $1 AND d.user_pubkey = roster.pubkey
+                     ) AS deleted
+                 ) AS recorded",
             )
             .bind(tenant_id)
             .bind(roster.pubkeys())
             .fetch_one(&self.pool)
             .await?;
-            unique as u64 - existing as u64
+            // One statement over the roster with disjoint filters, so these
+            // never exceed `unique`.
+            let (already, excluded) = (already as u64, excluded as u64);
+            (
+                unique - already - excluded,
+                already,
+                excluded,
+                revoked as u64,
+            )
         };
 
         Ok(GrantLoadReport {
             tenant_domain,
             tenant_name,
-            unique,
+            unique: unique as usize,
             newly_granted,
-            already_granted: unique as u64 - newly_granted,
+            already_granted,
+            excluded_deleted,
+            revoked_deleted,
             applied: apply,
         })
     }
+}
+
+/// Roster pubkeys with a recorded deletion in the tenant, each counted once
+/// however many deletion requests name it.
+async fn count_deleted(
+    conn: &mut PgConnection,
+    tenant_id: i64,
+    roster: &GrantRoster,
+) -> Result<u64, sqlx::Error> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM unnest($2::text[]) AS roster(pubkey)
+         WHERE EXISTS (
+             SELECT 1 FROM service_account_deletions d
+             WHERE d.tenant_id = $1 AND d.user_pubkey = roster.pubkey
+         )",
+    )
+    .bind(tenant_id)
+    .bind(roster.pubkeys())
+    .fetch_one(conn)
+    .await?;
+    Ok(count as u64)
 }
 
 #[cfg(test)]

@@ -3280,6 +3280,11 @@ impl UserRepository {
         // the caller still commits; a delete placed after the check would never
         // run for them. The delete is scoped to this tenant, so the
         // cross-tenant risk the ownership check guards against does not apply.
+        // The shared grant lock orders this against a grant load in the
+        // tenant: a load already running commits before this delete looks, and
+        // a load that starts later waits for this commit and then sees the
+        // deletion record.
+        crate::repositories::og_diviner_grant::lock_tenant_grants(tx, tenant_id, false).await?;
         sqlx::query("DELETE FROM og_diviner_grants WHERE tenant_id = $1 AND pubkey = $2")
             .bind(tenant_id)
             .bind(pubkey)

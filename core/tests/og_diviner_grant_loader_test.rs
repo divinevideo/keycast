@@ -4,7 +4,9 @@
 // ABOUTME: Pins dry-run, re-run, unknown-tenant, and schema-guard behavior.
 
 use keycast_core::repositories::{
-    parse_grant_roster, OgDivinerGrantEvidence, OgDivinerGrantRepository, RepositoryError,
+    parse_grant_roster, AccountDeletionOutcome, OgDivinerGrantEvidence, OgDivinerGrantRepository,
+    RepositoryError, ServiceAccountDeletionOutcome, ServiceAccountDeletionRecord,
+    ServiceAccountDeletionRepository, UserRepository,
 };
 use serial_test::serial;
 use sqlx::PgPool;
@@ -300,5 +302,252 @@ async fn repository_errors_do_not_carry_the_failing_row() {
     assert!(
         !format!("{converted:?}").contains(&row_pubkey),
         "Debug must not carry the failing row"
+    );
+}
+
+/// Records a completed service deletion of `pubkey` in `tenant_id`, as the
+/// deletion coordinator's call would. The request id is derived from the
+/// pubkey so `forget_deletions` can find it again.
+async fn record_deletion(pool: &PgPool, tenant_id: i64, pubkey: &str) {
+    sqlx::query(
+        "INSERT INTO service_account_deletions
+             (deletion_request_id, tenant_id, user_pubkey, outcome)
+         VALUES ($1, $2, $3, 'already_absent')",
+    )
+    .bind(format!("og-loader-test-{tenant_id}-{pubkey}"))
+    .bind(tenant_id)
+    .bind(pubkey)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn forget_deletions(pool: &PgPool, keys: &[String]) {
+    sqlx::query("DELETE FROM service_account_deletions WHERE user_pubkey = ANY($1)")
+        .bind(keys)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn grant_directly(pool: &PgPool, pubkey: &str) {
+    sqlx::query(
+        "INSERT INTO og_diviner_grants (tenant_id, pubkey, evidence)
+         VALUES ($1, $2, 'pre_cutoff_app_post')",
+    )
+    .bind(TENANT_ID)
+    .bind(pubkey)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Someone who already deleted their account must not be granted: the
+/// coordinator will never call Keycast for them again, so nothing would ever
+/// remove the grant.
+#[tokio::test]
+#[serial]
+async fn a_recorded_deletion_excludes_the_pubkey_from_dry_run_and_apply() {
+    let pool = pool().await;
+    let repository = OgDivinerGrantRepository::new(pool.clone());
+    let keys = vec![key('1'), key('2')];
+    purge(&pool, &keys).await;
+    forget_deletions(&pool, &keys).await;
+    record_deletion(&pool, TENANT_ID, &keys[0]).await;
+    let roster = parse_grant_roster(&keys.join("\n")).unwrap();
+
+    let dry_run = repository.load(TENANT_ID, EVIDENCE, &roster, false).await;
+    let applied = repository.load(TENANT_ID, EVIDENCE, &roster, true).await;
+    let rows = granted(&pool, &keys).await;
+    purge(&pool, &keys).await;
+    forget_deletions(&pool, &keys).await;
+
+    let (dry_run, applied) = (dry_run.unwrap(), applied.unwrap());
+    assert_eq!(
+        (
+            applied.unique,
+            applied.newly_granted,
+            applied.already_granted,
+            applied.excluded_deleted,
+            applied.revoked_deleted,
+        ),
+        (2, 1, 0, 1, 0),
+        "the deleted pubkey is excluded, the other granted"
+    );
+    assert_eq!(
+        (
+            dry_run.newly_granted,
+            dry_run.already_granted,
+            dry_run.excluded_deleted,
+            dry_run.revoked_deleted,
+        ),
+        (
+            applied.newly_granted,
+            applied.already_granted,
+            applied.excluded_deleted,
+            applied.revoked_deleted,
+        ),
+        "a dry run predicts exactly what applying does"
+    );
+    assert_eq!(
+        rows,
+        vec![(keys[1].clone(), "pre_cutoff_app_post".to_string())],
+        "no grant was written for the deleted pubkey"
+    );
+}
+
+/// Positive control for the exclusion's tenant filter: a deletion recorded in
+/// another tenant says nothing about this one.
+#[tokio::test]
+#[serial]
+async fn a_deletion_in_another_tenant_does_not_exclude_the_pubkey() {
+    let pool = pool().await;
+    let repository = OgDivinerGrantRepository::new(pool.clone());
+    let other_tenant: i64 = sqlx::query_scalar(
+        "INSERT INTO tenants (domain, name) VALUES ('og-diviner-deleted.example.invalid', 'OG deleted test')
+         ON CONFLICT (domain) DO UPDATE SET name = EXCLUDED.name
+         RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let keys = vec![key('3')];
+    purge(&pool, &keys).await;
+    forget_deletions(&pool, &keys).await;
+    record_deletion(&pool, other_tenant, &keys[0]).await;
+    let roster = parse_grant_roster(&keys[0]).unwrap();
+
+    let dry_run = repository.load(TENANT_ID, EVIDENCE, &roster, false).await;
+    let applied = repository.load(TENANT_ID, EVIDENCE, &roster, true).await;
+    let rows = granted(&pool, &keys).await;
+    purge(&pool, &keys).await;
+    forget_deletions(&pool, &keys).await;
+    sqlx::query("DELETE FROM tenants WHERE id = $1")
+        .bind(other_tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (dry_run, applied) = (dry_run.unwrap(), applied.unwrap());
+    assert_eq!((dry_run.newly_granted, dry_run.excluded_deleted), (1, 0));
+    assert_eq!((applied.newly_granted, applied.excluded_deleted), (1, 0));
+    assert_eq!(rows.len(), 1, "the grant lands in this tenant");
+}
+
+/// A grant whose pubkey has a recorded deletion is revoked by the load and
+/// counted as excluded, not as already granted. The deletion path normally
+/// removes the grant itself, so this covers a grant the deletion could not
+/// see (see the sweep in `OgDivinerGrantRepository::load`).
+#[tokio::test]
+#[serial]
+async fn a_load_revokes_a_grant_whose_pubkey_has_a_recorded_deletion() {
+    let pool = pool().await;
+    let repository = OgDivinerGrantRepository::new(pool.clone());
+    let keys = vec![key('4'), key('5')];
+    purge(&pool, &keys).await;
+    forget_deletions(&pool, &keys).await;
+    grant_directly(&pool, &keys[0]).await;
+    grant_directly(&pool, &keys[1]).await;
+    record_deletion(&pool, TENANT_ID, &keys[0]).await;
+    let roster = parse_grant_roster(&keys.join("\n")).unwrap();
+
+    let dry_run = repository.load(TENANT_ID, EVIDENCE, &roster, false).await;
+    let after_dry_run = granted(&pool, &keys).await;
+    let applied = repository.load(TENANT_ID, EVIDENCE, &roster, true).await;
+    let rows = granted(&pool, &keys).await;
+    purge(&pool, &keys).await;
+    forget_deletions(&pool, &keys).await;
+
+    let (dry_run, applied) = (dry_run.unwrap(), applied.unwrap());
+    assert_eq!(
+        (
+            applied.newly_granted,
+            applied.already_granted,
+            applied.excluded_deleted,
+            applied.revoked_deleted,
+        ),
+        (0, 1, 1, 1)
+    );
+    assert_eq!(
+        (
+            dry_run.newly_granted,
+            dry_run.already_granted,
+            dry_run.excluded_deleted,
+            dry_run.revoked_deleted,
+        ),
+        (0, 1, 1, 1),
+        "a dry run predicts exactly what applying does"
+    );
+    assert_eq!(after_dry_run.len(), 2, "the dry run revoked nothing");
+    assert_eq!(
+        rows,
+        vec![(keys[1].clone(), "pre_cutoff_app_post".to_string())],
+        "only the deleted pubkey's grant was removed"
+    );
+}
+
+/// The race the load's lock closes. A service deletion running alongside a
+/// load can delete the (not yet visible) grant and record itself while the
+/// load inserts it; neither statement sees the other's uncommitted row, so
+/// without coordination the grant survives a deletion that will never be
+/// repeated. Here the real deletion path is held open, already past its grant
+/// delete and its record, when the load starts.
+#[tokio::test]
+#[serial]
+async fn a_deletion_in_flight_during_a_load_still_ends_without_a_grant() {
+    let pool = pool().await;
+    let repository = OgDivinerGrantRepository::new(pool.clone());
+    let keys = vec![key('6')];
+    purge(&pool, &keys).await;
+    forget_deletions(&pool, &keys).await;
+    let roster = parse_grant_roster(&keys[0]).unwrap();
+
+    let mut deletion = pool.begin().await.unwrap();
+    let outcome = UserRepository::delete_account_in_tx(&mut deletion, &keys[0], TENANT_ID)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, AccountDeletionOutcome::AlreadyAbsent));
+    ServiceAccountDeletionRepository::record_in_tx(
+        &mut deletion,
+        ServiceAccountDeletionRecord {
+            deletion_request_id: format!("og-loader-test-{TENANT_ID}-{}", keys[0]),
+            tenant_id: TENANT_ID,
+            user_pubkey: keys[0].clone(),
+            outcome: ServiceAccountDeletionOutcome::AlreadyAbsent,
+            teams_removed: 0,
+            oauth_authorizations_deleted: 0,
+            bunkers_notified: 0,
+        },
+    )
+    .await
+    .unwrap();
+
+    let load =
+        tokio::spawn(async move { repository.load(TENANT_ID, EVIDENCE, &roster, true).await });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let finished_while_deletion_open = load.is_finished();
+    deletion.commit().await.unwrap();
+    let report = load.await.unwrap();
+    let rows = granted(&pool, &keys).await;
+    purge(&pool, &keys).await;
+    forget_deletions(&pool, &keys).await;
+
+    assert!(
+        rows.is_empty(),
+        "the deletion committed, so no grant may survive it"
+    );
+    assert!(
+        !finished_while_deletion_open,
+        "the load must wait for a deletion in flight in its tenant"
+    );
+    let report = report.unwrap();
+    assert_eq!(
+        (
+            report.newly_granted,
+            report.already_granted,
+            report.excluded_deleted
+        ),
+        (0, 0, 1),
+        "the load saw the committed deletion and excluded the pubkey"
     );
 }

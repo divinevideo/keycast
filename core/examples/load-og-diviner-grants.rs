@@ -1,15 +1,21 @@
 // ABOUTME: Loads a private OG Diviner grant roster into og_diviner_grants
 // ABOUTME: Run with: cargo run -p keycast_core --example load-og-diviner-grants
 //
-// Usage:
-//   DATABASE_URL=... cargo run -p keycast_core --example load-og-diviner-grants -- \
+// Usage, with DATABASE_URL exported:
+//   cargo run -p keycast_core --example load-og-diviner-grants -- \
 //     --tenant-id <id> --evidence pre_cutoff_app_post [--apply] <roster-file>
 //
 // The roster is one 64-character lowercase hex pubkey per line, built privately
 // from relay data (keycast#440). It is never committed, and this loader never
 // prints a pubkey, a line of the file, or its path: output is counts and line
 // numbers only. Without --apply it is a dry run that reports what a load would
-// do. Re-running an applied roster is a no-op.
+// do. Re-running an applied roster grants nothing new.
+//
+// A pubkey whose account deletion Keycast has recorded in the tenant is counted
+// under "account deleted" and never granted; if it already had a grant, the
+// load revokes it. Build the roster right before loading it: deletion records
+// can be compacted 30 days after the deletion, so an old roster can re-grant
+// someone who deleted their account long ago.
 //
 // Point DATABASE_URL at a connection that bypasses the transaction-mode
 // pooler, as the migration job does: sqlx caches prepared statements per
@@ -154,6 +160,16 @@ async fn main() -> ExitCode {
         report.newly_granted
     );
     println!("already granted: {}", report.already_granted);
+    println!("account deleted: {}", report.excluded_deleted);
+    println!(
+        "{} {}",
+        if report.applied {
+            "grants revoked: "
+        } else {
+            "would revoke:   "
+        },
+        report.revoked_deleted
+    );
     ExitCode::SUCCESS
 }
 
