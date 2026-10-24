@@ -60,7 +60,8 @@ impl GrantRoster {
         self.entries
     }
 
-    pub fn pubkeys(&self) -> &[String] {
+    /// Crate-private so callers outside the loader cannot print the cohort.
+    pub(crate) fn pubkeys(&self) -> &[String] {
         &self.pubkeys
     }
 

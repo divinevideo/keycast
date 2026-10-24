@@ -1,7 +1,7 @@
 #![cfg(feature = "integration-tests")]
 
 // ABOUTME: Verifies OG Diviner eligibility uses the frozen signup policy.
-// ABOUTME: Guards the cutoff and excludes preloaded-but-unclaimed accounts.
+// ABOUTME: Guards the cutoff, preload exclusions, and tenant-scoped roster grants.
 
 use keycast_core::repositories::{og_diviner_cutoff, UserRepository};
 use serial_test::serial;
