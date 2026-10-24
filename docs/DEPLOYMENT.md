@@ -405,6 +405,25 @@ Until the rows exist, support admins keep sessions they already hold, but a new 
 
 ---
 
+## OG Diviner grants (one-time load)
+
+The OG Diviner chit (`GET /api/public/users/:pubkey/og-diviner`) also accepts pubkeys listed in the `og_diviner_grants` table. That covers people who posted through a Divine app before the cutoff with a key Keycast never saw (keycast#440). The `20261023120000_add_og_diviner_grants` migration creates the table empty, and an empty table changes no answer, so the code can ship before the data.
+
+The roster is built once, privately, from production relay data. It is never committed, attached to an issue, or pasted anywhere public. Load it with the loader, which prints counts and line numbers only:
+
+```bash
+# Dry run: validates the file and reports what would be granted. Writes nothing.
+DATABASE_URL=<direct connection, not the transaction-mode pooler> \
+  cargo run -p keycast_core --example load-og-diviner-grants -- \
+  --tenant-id 1 --evidence pre_cutoff_app_post <roster-file>
+
+# Same command with --apply to write. Re-running it grants nothing new.
+```
+
+One malformed line (anything but a 64-character lowercase hex pubkey) rejects the whole file. Afterwards, spot-check a known affected account against the endpoint.
+
+---
+
 ## Database backups
 
 Production Cloud SQL has automated backups and PITR configured outside this repo. Useful commands:

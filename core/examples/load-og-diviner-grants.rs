@@ -10,6 +10,10 @@
 // prints a pubkey, a line of the file, or its path: output is counts and line
 // numbers only. Without --apply it is a dry run that reports what a load would
 // do. Re-running an applied roster is a no-op.
+//
+// Point DATABASE_URL at a connection that bypasses the transaction-mode
+// pooler, as the migration job does: sqlx caches prepared statements per
+// connection. See "OG Diviner grants" in docs/DEPLOYMENT.md.
 
 use keycast_core::repositories::{
     parse_grant_roster, OgDivinerGrantEvidence, OgDivinerGrantRepository,
