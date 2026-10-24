@@ -3,7 +3,7 @@
 // ABOUTME: Verifies OG Diviner eligibility uses the frozen signup policy.
 // ABOUTME: Guards the cutoff, preload exclusions, and tenant-scoped roster grants.
 
-use keycast_core::repositories::{og_diviner_cutoff, UserRepository};
+use keycast_core::repositories::{og_diviner_cutoff, AccountDeletionOutcome, UserRepository};
 use serial_test::serial;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -549,5 +549,102 @@ async fn granted_app_posters_qualify_without_a_signup_record_and_only_in_their_t
     assert!(
         other_tenant_grant_seen_from_its_own_tenant,
         "positive control: the other tenant's grant does qualify in that tenant"
+    );
+}
+
+async fn grant_count(pool: &PgPool, tenant_id: i64, key: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM og_diviner_grants WHERE tenant_id = $1 AND pubkey = $2",
+    )
+    .bind(tenant_id)
+    .bind(key)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+#[serial]
+async fn account_deletion_removes_the_grant_in_its_tenant_only() {
+    let pool = pool().await;
+    let repository = UserRepository::new(pool.clone());
+    let cutoff = og_diviner_cutoff();
+    let other_tenant = second_tenant(&pool).await;
+
+    let with_account = granted_pubkey('5');
+    // The common case: a grantee Keycast never held an account for, deleted on
+    // the coordinator's request after a vanish elsewhere.
+    let without_account = granted_pubkey('6');
+    let keys = [with_account.as_str(), without_account.as_str()];
+
+    purge_grants(&pool, &[TENANT_ID, other_tenant], &keys).await;
+    purge(&pool, &keys).await;
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
+         VALUES ($1, 1, $2, $2)",
+    )
+    .bind(&with_account)
+    .bind(cutoff)
+    .execute(&pool)
+    .await
+    .unwrap();
+    for key in keys {
+        grant(&pool, TENANT_ID, key).await;
+        grant(&pool, other_tenant, key).await;
+    }
+
+    let deleted = repository.delete_account(&with_account, TENANT_ID).await;
+
+    let mut tx = pool.begin().await.unwrap();
+    let absent = UserRepository::delete_account_in_tx(&mut tx, &without_account, TENANT_ID).await;
+    tx.commit().await.unwrap();
+
+    let with_account_eligible = repository
+        .is_og_diviner(&with_account, TENANT_ID, cutoff)
+        .await
+        .unwrap();
+    let without_account_eligible = repository
+        .is_og_diviner(&without_account, TENANT_ID, cutoff)
+        .await
+        .unwrap();
+    let with_account_grants = grant_count(&pool, TENANT_ID, &with_account).await;
+    let without_account_grants = grant_count(&pool, TENANT_ID, &without_account).await;
+    let other_tenant_grants = [
+        grant_count(&pool, other_tenant, &with_account).await,
+        grant_count(&pool, other_tenant, &without_account).await,
+    ];
+
+    purge_grants(&pool, &[TENANT_ID, other_tenant], &keys).await;
+    purge(&pool, &keys).await;
+    sqlx::query("DELETE FROM tenants WHERE id = $1")
+        .bind(other_tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    deleted.expect("the account existed, so deletion succeeds");
+    assert!(
+        matches!(absent, Ok(AccountDeletionOutcome::AlreadyAbsent)),
+        "a grantee with no account is reported absent: {:?}",
+        absent.as_ref().err()
+    );
+    assert_eq!(
+        with_account_grants, 0,
+        "deleting the account removes its grant"
+    );
+    assert!(
+        !with_account_eligible,
+        "a deleted account is no longer eligible"
+    );
+    assert_eq!(
+        without_account_grants, 0,
+        "the grant goes even when there was no account to delete"
+    );
+    assert!(!without_account_eligible);
+    assert_eq!(
+        other_tenant_grants,
+        [1, 1],
+        "the same pubkey's grant in another tenant survives"
     );
 }
