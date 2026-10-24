@@ -31,6 +31,8 @@ pub enum RepositoryError {
     Unavailable(String),
 }
 
+// Keeps message() and never detail(): Postgres puts the failing row, pubkeys
+// included, in a constraint violation's detail, and these errors get printed.
 impl From<sqlx::Error> for RepositoryError {
     fn from(err: sqlx::Error) -> Self {
         match err {

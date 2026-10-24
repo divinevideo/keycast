@@ -262,3 +262,43 @@ async fn the_report_names_the_tenant_it_loaded_into() {
     assert_eq!(report.tenant_domain, "og-diviner-report.example.invalid");
     assert_eq!(report.tenant_name, "OG report test");
 }
+
+/// The loader prints load errors, and Postgres reports the failing row --
+/// pubkey included -- in a constraint violation's detail. The only thing
+/// keeping that row out of the output is RepositoryError's conversion keeping
+/// the message and dropping the detail. Pin it.
+#[tokio::test]
+#[serial]
+async fn repository_errors_do_not_carry_the_failing_row() {
+    let pool = pool().await;
+    let row_pubkey = key('b').to_uppercase();
+    purge(&pool, std::slice::from_ref(&row_pubkey)).await;
+
+    let raw = sqlx::query(
+        "INSERT INTO og_diviner_grants (tenant_id, pubkey, evidence)
+         VALUES (1, $1, 'pre_cutoff_app_post')",
+    )
+    .bind(&row_pubkey)
+    .execute(&pool)
+    .await
+    .expect_err("an uppercase pubkey violates the CHECK constraint");
+    purge(&pool, std::slice::from_ref(&row_pubkey)).await;
+
+    assert!(
+        format!("{raw:?}").contains(&row_pubkey),
+        "positive control: the raw sqlx error carries the failing row"
+    );
+    let converted = RepositoryError::from(raw);
+    assert!(
+        matches!(converted, RepositoryError::Integrity(_)),
+        "got {converted:?}"
+    );
+    assert!(
+        !converted.to_string().contains(&row_pubkey),
+        "Display must not carry the failing row"
+    );
+    assert!(
+        !format!("{converted:?}").contains(&row_pubkey),
+        "Debug must not carry the failing row"
+    );
+}
