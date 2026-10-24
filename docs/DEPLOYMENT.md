@@ -409,18 +409,53 @@ Until the rows exist, support admins keep sessions they already hold, but a new 
 
 The OG Diviner chit (`GET /api/public/users/:pubkey/og-diviner`) also accepts pubkeys listed in the `og_diviner_grants` table. That covers people who posted through a Divine app before the cutoff with a key Keycast never saw (keycast#440). The `20261023120000_add_og_diviner_grants` migration creates the table empty, and an empty table changes no answer, so the code can ship before the data.
 
-The roster is built once, privately, from production relay data. It is never committed, attached to an issue, or pasted anywhere public. Load it with the loader, which prints counts and line numbers only:
+The roster is built once, privately, from production relay data. It is never committed, attached to an issue, or pasted anywhere public. Load it with the loader, which prints counts, line numbers and the target tenant only:
 
 ```bash
 # Dry run: validates the file and reports what would be granted. Writes nothing.
-DATABASE_URL=<direct connection, not the transaction-mode pooler> \
+DATABASE_URL=<the migration job's direct connection> \
   cargo run -p keycast_core --example load-og-diviner-grants -- \
   --tenant-id 1 --evidence pre_cutoff_app_post <roster-file>
 
 # Same command with --apply to write. Re-running it grants nothing new.
 ```
 
-One malformed line (anything but a 64-character lowercase hex pubkey) rejects the whole file. Afterwards, spot-check a known affected account against the endpoint.
+`DATABASE_URL` must be the same direct connection, bypassing the transaction-mode pooler, that the migration job uses: `DATABASE_URL_DIRECT` for the GKE `keycast-db-migrate` job, or the connection the Cloud Run `keycast-migrate` job is configured with.
+
+Before applying:
+
+- Check that the tenant line names the deployment you mean.
+- Compare the dry run's `unique pubkeys` with the count the roster builder reported. If they differ, do not `--apply`; the file is not the roster that was reviewed.
+
+One malformed line (anything but a 64-character lowercase hex pubkey) rejects the whole file.
+
+After applying, spot-check a known affected account. The endpoint answers with `Cache-Control: public, max-age=86400, stale-if-error=604800`, so a pubkey looked up before the load can keep showing `eligible: false` for up to a day, in shared caches and in clients. Bypass caches for the check: send `Cache-Control: no-cache` and add a query string no cache has seen. The route ignores the query string.
+
+```bash
+curl -s -H 'Cache-Control: no-cache' \
+  "https://login.divine.video/api/public/users/<pubkey hex>/og-diviner?check=$(date +%s)"
+```
+
+### Removing grants
+
+Deleting an account through Keycast removes its grant, including the service deletion the account-deletion coordinator runs. A grantee who never had a Keycast account and deletes their account somewhere Keycast does not hear about keeps the row until it is removed by hand.
+
+To back out a bad load: one load is a single statement, so every row it wrote shares one `created_at`. Find it, then delete inside a transaction and check the row count before committing:
+
+```sql
+SELECT created_at, count(*) FROM og_diviner_grants
+WHERE tenant_id = 1 AND evidence = 'pre_cutoff_app_post'
+GROUP BY created_at ORDER BY created_at;
+
+BEGIN;
+DELETE FROM og_diviner_grants
+WHERE tenant_id = 1
+  AND evidence = 'pre_cutoff_app_post'
+  AND created_at >= '<window start, UTC>'
+  AND created_at <  '<window end, UTC>';
+-- The DELETE count must equal the load's "newly granted" count. If not, ROLLBACK.
+COMMIT;
+```
 
 ---
 
