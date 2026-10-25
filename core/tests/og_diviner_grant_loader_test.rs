@@ -487,3 +487,104 @@ async fn a_load_revokes_a_grant_whose_pubkey_has_a_recorded_deletion() {
         "only the deleted pubkey's grant was removed"
     );
 }
+
+/// The revoke is scoped to the load's tenant: a deletion recorded here must
+/// not remove the same pubkey's grant in another tenant.
+#[tokio::test]
+#[serial]
+async fn a_load_revokes_only_its_own_tenant_s_grant() {
+    let pool = pool().await;
+    let repository = OgDivinerGrantRepository::new(pool.clone());
+    let other_tenant: i64 = sqlx::query_scalar(
+        "INSERT INTO tenants (domain, name) VALUES ('og-diviner-revoke.example.invalid', 'OG revoke test')
+         ON CONFLICT (domain) DO UPDATE SET name = EXCLUDED.name
+         RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let keys = vec![key('6')];
+    purge(&pool, &keys).await;
+    forget_deletions(&pool, &keys).await;
+    grant_directly(&pool, &keys[0]).await;
+    sqlx::query(
+        "INSERT INTO og_diviner_grants (tenant_id, pubkey, evidence)
+         VALUES ($1, $2, 'pre_cutoff_app_post')",
+    )
+    .bind(other_tenant)
+    .bind(&keys[0])
+    .execute(&pool)
+    .await
+    .unwrap();
+    record_deletion(&pool, TENANT_ID, &keys[0]).await;
+    let roster = parse_grant_roster(&keys[0]).unwrap();
+
+    let applied = repository.load(TENANT_ID, EVIDENCE, &roster, true).await;
+    let other_grants: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM og_diviner_grants WHERE tenant_id = $1 AND pubkey = $2",
+    )
+    .bind(other_tenant)
+    .bind(&keys[0])
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let rows = granted(&pool, &keys).await;
+    purge(&pool, &keys).await;
+    forget_deletions(&pool, &keys).await;
+    sqlx::query("DELETE FROM tenants WHERE id = $1")
+        .bind(other_tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let applied = applied.unwrap();
+    assert_eq!((applied.excluded_deleted, applied.revoked_deleted), (1, 1));
+    assert!(rows.is_empty(), "this tenant's grant was revoked");
+    assert_eq!(other_grants, 1, "the other tenant's grant survives");
+}
+
+/// A pubkey can have more than one deletion record, one per request id. It is
+/// still one roster pubkey, so it must be counted once, or the counts stop
+/// adding up to the roster.
+#[tokio::test]
+#[serial]
+async fn two_deletion_records_for_one_pubkey_count_it_once() {
+    let pool = pool().await;
+    let repository = OgDivinerGrantRepository::new(pool.clone());
+    let keys = vec![key('6'), key('1')];
+    purge(&pool, &keys).await;
+    forget_deletions(&pool, &keys).await;
+    grant_directly(&pool, &keys[0]).await;
+    record_deletion(&pool, TENANT_ID, &keys[0]).await;
+    sqlx::query(
+        "INSERT INTO service_account_deletions
+             (deletion_request_id, tenant_id, user_pubkey, outcome)
+         VALUES ($1, $2, $3, 'already_absent')",
+    )
+    .bind(format!("og-loader-test-second-{}", keys[0]))
+    .bind(TENANT_ID)
+    .bind(&keys[0])
+    .execute(&pool)
+    .await
+    .unwrap();
+    let roster = parse_grant_roster(&keys.join("\n")).unwrap();
+
+    let dry_run = repository.load(TENANT_ID, EVIDENCE, &roster, false).await;
+    let applied = repository.load(TENANT_ID, EVIDENCE, &roster, true).await;
+    purge(&pool, &keys).await;
+    forget_deletions(&pool, &keys).await;
+
+    for (label, report) in [("dry run", dry_run.unwrap()), ("apply", applied.unwrap())] {
+        assert_eq!(
+            (
+                report.unique,
+                report.newly_granted,
+                report.already_granted,
+                report.excluded_deleted,
+                report.revoked_deleted,
+            ),
+            (2, 1, 0, 1, 1),
+            "{label}: the pubkey with two records is excluded and revoked once"
+        );
+    }
+}

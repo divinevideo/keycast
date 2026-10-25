@@ -41,7 +41,7 @@
 **Interfaces:**
 - Produces: table `og_diviner_grants (tenant_id BIGINT FK tenants ON DELETE CASCADE, pubkey TEXT CHECK ^[0-9a-f]{64}$, evidence TEXT CHECK IN ('pre_cutoff_app_post'), created_at TIMESTAMPTZ DEFAULT NOW(), PK (tenant_id, pubkey))`. `is_og_diviner` signature unchanged.
 
-- [x] **Step 1:** Add `granted_app_posters_qualify_per_tenant` asserting: granted pubkey with no users row → true; granted pubkey whose users row is post-cutoff (otherwise ineligible) → true; ungranted pubkey with no row → false; tenant-A grant queried in a second test tenant → false. Add route case `reports_true_for_a_granted_pubkey_without_an_account`.
+- [x] **Step 1:** Add `granted_app_posters_qualify_per_tenant` asserting: granted pubkey with no users row → true; granted pubkey whose users row is post-cutoff (otherwise ineligible) → true; ungranted pubkey with no row → false; tenant-A grant queried in a second test tenant → false. Add route case `reports_true_for_a_granted_pubkey_with_no_account`.
 - [x] **Step 2:** Run both; expect failure (relation `og_diviner_grants` does not exist).
 - [x] **Step 3:** Write the migration; wrap the query as `SELECT EXISTS (grant lookup) OR EXISTS (existing users lookup)`; document that grants are pre-adjudicated against the cutoff when the roster is built.
 - [x] **Step 4:** Run the eligibility and route tests, including the unchanged #416 test; expect pass.
@@ -129,4 +129,16 @@ Tasks 5 to 7 kept a one-time load and account deletion from missing each other w
 
 - [x] **Step 1:** Remove the lock, its callers, its tests and the stall runbook.
 - [x] **Step 2:** Rewrite the dry run as a join against the deleted set.
+- [x] **Step 3:** Commit.
+
+### Task 9: Pin the revoke's tenant scope and duplicate deletion records (added after review)
+
+**Files:**
+- Test: `core/tests/og_diviner_grant_loader_test.rs`
+- Modify: `docs/DEPLOYMENT.md`, `core/src/repositories/user.rs` (doc wrap)
+
+No test failed if the load's revoke lost its tenant filter, which would delete other tenants' grants. Nothing covered a pubkey with two deletion records, which a refactor of `deleted` into a join would double-count. The runbook's re-check now uses the same roster file, adds a next-day check, and says it cannot see a self-deletion that raced the load.
+
+- [x] **Step 1:** Tests: a load revokes only its own tenant's grant; two deletion records for one pubkey count it once in the dry run and the apply. Mutation-check the revoke's tenant filter.
+- [x] **Step 2:** Docs.
 - [x] **Step 3:** Commit.

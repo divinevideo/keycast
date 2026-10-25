@@ -3262,8 +3262,9 @@ impl UserRepository {
     /// instead of erroring, so the caller can still commit work in the same
     /// transaction. The pubkey's OG Diviner grant in this tenant is removed
     /// even then, and a caller that commits keeps that removal, as service
-    /// deletion does when it records `already_absent`. An error here aborts the transaction and cannot be
-    /// distinguished from any other failure by the caller.
+    /// deletion does when it records `already_absent`. An error here aborts
+    /// the transaction and cannot be distinguished from any other failure by
+    /// the caller.
     pub async fn delete_account_in_tx(
         tx: &mut Transaction<'_, Postgres>,
         pubkey: &str,

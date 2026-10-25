@@ -445,7 +445,7 @@ Before applying:
 
 One malformed line (anything but a 64-character lowercase hex pubkey) rejects the whole file. An applied load is one transaction: it lands whole or not at all.
 
-Straight after applying, run the dry run again. An account deleted in the Divine app while the load was writing can miss the grant the load inserted, and the dry run shows any such grant under `would revoke`. If that count is not 0, apply once more, which removes them. The load does not lock out account deletions instead because that would make every deletion in the tenant wait on it.
+Straight after applying, run the dry run again with the same roster file, and once more the next day. An account deleted in the Divine app while the load was writing can miss the grant the load inserted, and the dry run shows any such grant under `would revoke`. If that count is not 0, apply the same file once more, which removes them. Use the same file: a rebuilt roster has already dropped the deleted pubkey, so the dry run cannot see its leftover grant. The next-day check catches a deletion that was still finishing during the first one. The check only sees deletions Keycast recorded, so it misses a self-deletion through `DELETE /api/user/account` that raced the load. The load does not lock out account deletions instead because that would make every deletion in the tenant wait on it.
 
 Applying the same roster again straight away grants nothing new. To load again later, rebuild the roster first (see above) rather than re-running an old file.
 
