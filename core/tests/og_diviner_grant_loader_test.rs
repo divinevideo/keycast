@@ -4,13 +4,10 @@
 // ABOUTME: Pins dry-run, re-run, unknown-tenant, and schema-guard behavior.
 
 use keycast_core::repositories::{
-    parse_grant_roster, AccountDeletionOutcome, OgDivinerGrantEvidence, OgDivinerGrantRepository,
-    RepositoryError, ServiceAccountDeletionOutcome, ServiceAccountDeletionRecord,
-    ServiceAccountDeletionRepository, UserRepository,
+    parse_grant_roster, OgDivinerGrantEvidence, OgDivinerGrantRepository, RepositoryError,
 };
 use serial_test::serial;
-use sqlx::postgres::{PgConnectOptions, PgPool};
-use sqlx::{Postgres, Transaction};
+use sqlx::postgres::PgPool;
 
 const TENANT_ID: i64 = 1;
 const EVIDENCE: OgDivinerGrantEvidence = OgDivinerGrantEvidence::PreCutoffAppPost;
@@ -440,7 +437,9 @@ async fn a_deletion_in_another_tenant_does_not_exclude_the_pubkey() {
 /// A grant whose pubkey has a recorded deletion is revoked by the load and
 /// counted as excluded, not as already granted. The deletion path normally
 /// removes the grant itself, so this covers a grant the deletion could not
-/// see (see the sweep in `OgDivinerGrantRepository::load`).
+/// see: one a load inserted while that deletion ran. A dry run after the load
+/// reports it under "would revoke", and applying again removes it (see the
+/// `revoked` step in `OgDivinerGrantRepository::load`).
 #[tokio::test]
 #[serial]
 async fn a_load_revokes_a_grant_whose_pubkey_has_a_recorded_deletion() {
@@ -487,159 +486,4 @@ async fn a_load_revokes_a_grant_whose_pubkey_has_a_recorded_deletion() {
         vec![(keys[1].clone(), "pre_cutoff_app_post".to_string())],
         "only the deleted pubkey's grant was removed"
     );
-}
-
-/// Runs the real service deletion path for `pubkey` up to its commit and
-/// returns the open transaction, which holds the tenant's grant lock shared.
-async fn hold_deletion_open(pool: &PgPool, pubkey: &str) -> Transaction<'static, Postgres> {
-    let mut deletion = pool.begin().await.unwrap();
-    let outcome = UserRepository::delete_account_in_tx(&mut deletion, pubkey, TENANT_ID)
-        .await
-        .unwrap();
-    assert!(matches!(outcome, AccountDeletionOutcome::AlreadyAbsent));
-    ServiceAccountDeletionRepository::record_in_tx(
-        &mut deletion,
-        ServiceAccountDeletionRecord {
-            deletion_request_id: format!("og-loader-test-{TENANT_ID}-{pubkey}"),
-            tenant_id: TENANT_ID,
-            user_pubkey: pubkey.to_string(),
-            outcome: ServiceAccountDeletionOutcome::AlreadyAbsent,
-            teams_removed: 0,
-            oauth_authorizations_deleted: 0,
-            bunkers_notified: 0,
-        },
-    )
-    .await
-    .unwrap();
-    deletion
-}
-
-/// The race the load's lock closes. A service deletion running alongside a
-/// load can delete the (not yet visible) grant and record itself while the
-/// load inserts it; neither statement sees the other's uncommitted row, so
-/// without coordination the grant survives a deletion that will never be
-/// repeated. Here the real deletion path is held open, already past its grant
-/// delete and its record, when the load starts.
-#[tokio::test]
-#[serial]
-async fn a_deletion_in_flight_during_a_load_still_ends_without_a_grant() {
-    let pool = pool().await;
-    let repository = OgDivinerGrantRepository::new(pool.clone());
-    let keys = vec![key('6')];
-    purge(&pool, &keys).await;
-    forget_deletions(&pool, &keys).await;
-    let roster = parse_grant_roster(&keys[0]).unwrap();
-
-    let deletion = hold_deletion_open(&pool, &keys[0]).await;
-
-    let load =
-        tokio::spawn(async move { repository.load(TENANT_ID, EVIDENCE, &roster, true).await });
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let finished_while_deletion_open = load.is_finished();
-    deletion.commit().await.unwrap();
-    let report = load.await.unwrap();
-    let rows = granted(&pool, &keys).await;
-    purge(&pool, &keys).await;
-    forget_deletions(&pool, &keys).await;
-
-    assert!(
-        rows.is_empty(),
-        "the deletion committed, so no grant may survive it"
-    );
-    assert!(
-        !finished_while_deletion_open,
-        "the load must wait for a deletion in flight in its tenant"
-    );
-    let report = report.unwrap();
-    assert_eq!(
-        (
-            report.newly_granted,
-            report.already_granted,
-            report.excluded_deleted
-        ),
-        (0, 0, 1),
-        "the load saw the committed deletion and excluded the pubkey"
-    );
-}
-
-/// The load reads deletion records that commit while it waits for its lock.
-/// Under REPEATABLE READ its snapshot would date from before the wait and miss
-/// them, so the load must not inherit an isolation level from the server,
-/// database or role defaults.
-#[tokio::test]
-#[serial]
-async fn a_load_sees_a_deletion_that_commits_while_it_waits_whatever_the_default_isolation() {
-    let pool = pool().await;
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string());
-    let repeatable_read = PgPool::connect_with(
-        url.parse::<PgConnectOptions>()
-            .unwrap()
-            // The startup options string splits on unescaped spaces.
-            .options([("default_transaction_isolation", "repeatable\\ read")]),
-    )
-    .await
-    .unwrap();
-    let isolation: String = sqlx::query_scalar("SHOW transaction_isolation")
-        .fetch_one(&repeatable_read)
-        .await
-        .unwrap();
-    assert_eq!(isolation, "repeatable read", "positive control");
-    let repository = OgDivinerGrantRepository::new(repeatable_read);
-    let keys = vec![format!("06d3{}", "ab".repeat(30))];
-    purge(&pool, &keys).await;
-    forget_deletions(&pool, &keys).await;
-    let roster = parse_grant_roster(&keys[0]).unwrap();
-
-    let deletion = hold_deletion_open(&pool, &keys[0]).await;
-    let load =
-        tokio::spawn(async move { repository.load(TENANT_ID, EVIDENCE, &roster, true).await });
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    deletion.commit().await.unwrap();
-    let report = load.await.unwrap();
-    let rows = granted(&pool, &keys).await;
-    purge(&pool, &keys).await;
-    forget_deletions(&pool, &keys).await;
-
-    assert!(
-        rows.is_empty(),
-        "no grant may survive the committed deletion"
-    );
-    assert_eq!(report.unwrap().excluded_deleted, 1);
-}
-
-/// A load stuck behind a deletion that never finishes, or an operator's
-/// session that stalls holding the lock, must not block the tenant's account
-/// deletions indefinitely. The load gives up on the lock instead, writing
-/// nothing; re-running it is safe.
-#[tokio::test]
-#[serial]
-async fn a_load_gives_up_rather_than_wait_indefinitely_for_the_lock() {
-    let pool = pool().await;
-    let repository = OgDivinerGrantRepository::new(pool.clone());
-    let keys = vec![format!("06d3{}", "cd".repeat(30))];
-    purge(&pool, &keys).await;
-    forget_deletions(&pool, &keys).await;
-    let roster = parse_grant_roster(&keys[0]).unwrap();
-
-    let deletion = hold_deletion_open(&pool, &keys[0]).await;
-    let mut load =
-        tokio::spawn(async move { repository.load(TENANT_ID, EVIDENCE, &roster, true).await });
-    let gave_up = tokio::time::timeout(std::time::Duration::from_secs(12), &mut load).await;
-    deletion.rollback().await.unwrap();
-    let stopped_on_its_own = gave_up.is_ok();
-    let outcome = match gave_up {
-        Ok(joined) => joined.unwrap(),
-        Err(_) => load.await.unwrap(),
-    };
-    let rows = granted(&pool, &keys).await;
-    purge(&pool, &keys).await;
-    forget_deletions(&pool, &keys).await;
-
-    assert!(
-        stopped_on_its_own,
-        "the load must stop waiting for the lock on its own"
-    );
-    assert!(outcome.is_err(), "got {outcome:?}");
-    assert!(rows.is_empty(), "a load that gave up writes nothing");
 }

@@ -118,3 +118,15 @@ Nothing limited how long an applied load could hold, or wait for, the exclusive 
 - [x] **Step 1:** Tests: a load facing a deletion that never commits gives up on its own and writes nothing; a load on a connection whose default isolation is REPEATABLE READ still excludes a deletion that commits while it waits. Both seen red first. Mutation-check the isolation pin, the lock timeout, the exclusion, its tenant filter and the revoke.
 - [x] **Step 2:** Implement; check by hand that the idle timeout ends a stalled session and frees the lock.
 - [x] **Step 3:** Commit.
+
+### Task 8: Drop the grant lock (added after review)
+
+**Files:**
+- Modify: `core/src/repositories/og_diviner_grant.rs` (`load`), `core/src/groups/service.rs`, `core/src/repositories/service_account_deletion.rs` (`compact`), `core/src/repositories/user.rs` (`delete_account_in_tx`), `docs/DEPLOYMENT.md`, `docs/SERVICE_ACCOUNT_DELETION.md`
+- Test: `core/tests/og_diviner_grant_loader_test.rs`
+
+Tasks 5 to 7 kept a one-time load and account deletion from missing each other with a tenant lock, then bounded that lock with timeouts and an isolation pin. That put every account deletion behind a job that runs once, which is a worse failure than the one it prevented: a grant left on an account deleted during the few seconds a load writes. The lock, its timeouts, the isolation pin and the compaction lock are gone. The runbook instead has the operator run the dry run straight after the load and apply once more if it shows anything under `would revoke`; the existing revoke step removes those grants. Account deletion still removes the grant. The dry run now shares the load's definition of "deleted" as one set it joins against; a per-row EXISTS in each count scanned the deletion records once per roster row per count and took minutes on a full-size roster.
+
+- [x] **Step 1:** Remove the lock, its callers, its tests and the stall runbook.
+- [x] **Step 2:** Rewrite the dry run as a join against the deleted set.
+- [x] **Step 3:** Commit.

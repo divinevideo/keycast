@@ -422,7 +422,7 @@ The loader needs a direct connection that bypasses any transaction-mode pooler, 
 - **Production (Cloud Run):** there is no connection string to copy. The `keycast-migrate` job reaches Cloud SQL through the Cloud SQL Auth Proxy with IAM authentication (see `cloudbuild.yaml`), and the loader does the same. Run `cloud-sql-proxy --auto-iam-authn --port 5433 openvine-co:us-east1:keycast-db-east` under such an identity. The explicit port keeps it off 5432, where a local Postgres may already be listening. Then set `DATABASE_URL=postgres://<IAM database user>@127.0.0.1:5433/<database>`, with no password. The IAM database user is the account's email for a person, or the service account's email without `.gserviceaccount.com`.
 - **GKE:** use the `DATABASE_URL_DIRECT` value the `keycast-db-migrate` job reads, not the pooled `DATABASE_URL`.
 
-Export `DATABASE_URL` rather than putting it on the command line, so it stays out of shell history. Run from Cloud Shell or another machine that will stay awake and connected, not a laptop that may sleep mid-load (see "If a load stalls"). Run the loader from a checkout of the commit that is deployed, so its queries match the schema it writes to and the lock it takes matches the one the running server's account deletion takes.
+Export `DATABASE_URL` rather than putting it on the command line, so it stays out of shell history. Run from Cloud Shell or another machine that will stay awake and connected. Run the loader from a checkout of the commit that is deployed, so its queries match the schema it writes to.
 
 ### Loading
 
@@ -443,16 +443,9 @@ Before applying:
 - Check that the `database` line shows the production database and the IAM user you started the proxy as. The tenant line cannot tell environments apart: every database seeds tenant 1 as `login.divine.video`.
 - Compare the dry run's `unique pubkeys` with the count the roster builder reported. If they differ, do not `--apply`; the file is not the roster that was reviewed.
 
-One malformed line (anything but a 64-character lowercase hex pubkey) rejects the whole file. An applied load is one transaction: it lands whole or not at all. While it runs, account deletions in the tenant wait for it, and it waits for any already in progress.
+One malformed line (anything but a 64-character lowercase hex pubkey) rejects the whole file. An applied load is one transaction: it lands whole or not at all.
 
-#### If a load stalls
-
-A load gives up, writing nothing, if it cannot take its lock within 5 seconds or any statement runs past 60 seconds; re-run it. If its session goes quiet mid-load for 15 seconds, for example because the machine slept, Postgres ends the session, and the load rolls back and releases the lock. Do not suspend a running `--apply`. To end one by hand:
-
-```sql
-SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-WHERE application_name = 'og-diviner-grant-loader';
-```
+Straight after applying, run the dry run again. An account deleted in the Divine app while the load was writing can miss the grant the load inserted, and the dry run shows any such grant under `would revoke`. If that count is not 0, apply once more, which removes them. The load does not lock out account deletions instead because that would make every deletion in the tenant wait on it.
 
 Applying the same roster again straight away grants nothing new. To load again later, rebuild the roster first (see above) rather than re-running an old file.
 

@@ -3272,19 +3272,6 @@ impl UserRepository {
         // Keep group/account lock order consistent with group mutations. New
         // group creation and invitation acceptance share this principal lock.
         crate::groups::lock_group_account(tx, tenant_id, pubkey).await?;
-        // A one-time OG Diviner roster load must not interleave with a
-        // deletion, or each could miss the other's uncommitted rows and leave a
-        // grant behind for good. With this shared lock, a load already running
-        // commits before the grant delete below looks, and a load that starts
-        // later waits for this commit and then sees the deletion record that
-        // service deletion writes in this transaction. Self-deletion
-        // (DELETE /api/user/account) writes no record, so a later load can
-        // re-grant that pubkey; the roster builder's exclusion of vanished
-        // pubkeys covers it (see docs/DEPLOYMENT.md). Its
-        // cost is one shared lock per deletion, uncontended except while a load
-        // runs. Lock order: group-account first, then this; the load takes only
-        // this one, so there is no cycle.
-        crate::groups::lock_og_diviner_grants_shared(tx, tenant_id).await?;
         let _: Vec<i32> = sqlx::query_scalar(
             "SELECT g.id FROM identity_groups g JOIN group_memberships m ON m.group_id=g.id AND m.tenant_id=g.tenant_id WHERE m.tenant_id=$1 AND m.admin_pubkey=$2 ORDER BY g.id FOR UPDATE OF g",
         ).bind(tenant_id).bind(pubkey).fetch_all(&mut **tx).await?;
@@ -3297,6 +3284,9 @@ impl UserRepository {
         // the caller still commits; a delete placed after the check would never
         // run for them. The delete is scoped to this tenant, so the
         // cross-tenant risk the ownership check guards against does not apply.
+        // Self-deletion (DELETE /api/user/account) also lands here but writes
+        // no deletion record, so a later roster load can only skip that pubkey
+        // if the roster builder dropped it (see docs/DEPLOYMENT.md).
         sqlx::query("DELETE FROM og_diviner_grants WHERE tenant_id = $1 AND pubkey = $2")
             .bind(tenant_id)
             .bind(pubkey)

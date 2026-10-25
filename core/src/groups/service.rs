@@ -112,54 +112,6 @@ pub(crate) async fn lock_group_account(
     Ok(())
 }
 
-/// Serialize a tenant's OG Diviner grant loads with its account deletions and
-/// deletion-record compaction.
-///
-/// Account deletion deletes a pubkey's grant and records itself in
-/// `service_account_deletions` in one transaction; a grant load reads those
-/// records and inserts grants in another. Under READ COMMITTED neither sees the
-/// other's uncommitted rows, so interleaved they could each miss the other and
-/// leave a grant nothing will ever remove: the coordinator does not call
-/// Keycast again for a completed deletion. Retention compaction removes those
-/// records, so it would change what the load sees partway through. Deletions
-/// and compaction take this lock shared, so they never wait on each other; a
-/// load takes it exclusive.
-///
-/// This works only under READ COMMITTED, where each statement after the lock
-/// sees what committed while it waited. The load sets that level itself;
-/// deletion and compaction inherit the server default, which is READ
-/// COMMITTED unless someone changes it.
-///
-/// One key per tenant rather than one per pubkey: a load covers the whole
-/// roster in one transaction, and a lock per pubkey would hold thousands of
-/// entries in Postgres's server-wide lock table.
-pub(crate) async fn lock_og_diviner_grants_shared(
-    conn: &mut PgConnection,
-    tenant: i64,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtextextended($1,0))")
-        .bind(og_diviner_grants_lock_key(tenant))
-        .execute(conn)
-        .await?;
-    Ok(())
-}
-
-/// The exclusive side of [`lock_og_diviner_grants_shared`], for a grant load.
-pub(crate) async fn lock_og_diviner_grants_exclusive(
-    conn: &mut PgConnection,
-    tenant: i64,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
-        .bind(og_diviner_grants_lock_key(tenant))
-        .execute(conn)
-        .await?;
-    Ok(())
-}
-
-fn og_diviner_grants_lock_key(tenant: i64) -> String {
-    format!("og-diviner-grants:{tenant}")
-}
-
 async fn audit(
     conn: &mut PgConnection,
     tenant: i64,

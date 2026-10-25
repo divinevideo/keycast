@@ -116,8 +116,7 @@ async fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let options = match database_url.parse::<PgConnectOptions>() {
-        // Named so an operator can find a stuck load in pg_stat_activity and
-        // end it (see docs/DEPLOYMENT.md).
+        // Named so an operator can tell the load apart in pg_stat_activity.
         Ok(options) => options.application_name("og-diviner-grant-loader"),
         Err(error) => {
             eprintln!("DATABASE_URL is not a valid connection string: {error}");

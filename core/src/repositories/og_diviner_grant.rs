@@ -7,18 +7,11 @@ use std::str::FromStr;
 
 use sqlx::PgPool;
 
-use crate::groups::lock_og_diviner_grants_exclusive;
 use crate::repositories::RepositoryError;
 
 /// How many offending line numbers a roster error names. The count is always
 /// exact; the list is only a starting point for fixing the file.
 const REPORTED_LINE_LIMIT: usize = 10;
-
-/// Bounds on an applied load; see `load`. A deletion in flight finishes in
-/// well under the lock timeout, and a large roster loads in seconds.
-const LOAD_LOCK_TIMEOUT: &str = "5s";
-const LOAD_STATEMENT_TIMEOUT: &str = "60s";
-const LOAD_IDLE_TIMEOUT: &str = "15s";
 
 /// The rule that admitted a pubkey to the grant roster.
 ///
@@ -228,44 +221,21 @@ impl OgDivinerGrantRepository {
 
         let unique = roster.pubkeys().len() as u64;
         let (newly_granted, already_granted, excluded_deleted, revoked_deleted) = if apply {
-            let mut tx = self.pool.begin().await?;
-            // First, before anything takes a snapshot. The load must see
-            // deletion records that commit while it waits for the lock below,
-            // which REPEATABLE READ (if a server, database or role default
-            // ever set it) would hide behind a snapshot taken before the wait.
-            sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
-                .execute(&mut *tx)
-                .await?;
-            // While a load holds or waits for the lock, the tenant's account
-            // deletions wait for it, so nothing may let that wait run
-            // unbounded: not a deletion that never finishes, a slow statement,
-            // or an operator's stalled session (Postgres ends an idle
-            // transaction after the idle timeout, releasing the lock). A load
-            // that gives up writes nothing and can simply be re-run.
-            sqlx::query(
-                "SELECT set_config('lock_timeout', $1, true),
-                        set_config('statement_timeout', $2, true),
-                        set_config('idle_in_transaction_session_timeout', $3, true)",
-            )
-            .bind(LOAD_LOCK_TIMEOUT)
-            .bind(LOAD_STATEMENT_TIMEOUT)
-            .bind(LOAD_IDLE_TIMEOUT)
-            .execute(&mut *tx)
-            .await?;
-            // Held to commit. While it is held no deletion or retention
-            // compaction in this tenant can be in flight.
-            // Lock order: this is the only lock the load takes. Deletion takes
-            // its group-account lock first and this one second, so the two
-            // cannot wait on each other in a cycle.
-            lock_og_diviner_grants_exclusive(&mut tx, tenant_id).await?;
-
+            // No lock against account deletion, by choice: this runs once, and
+            // a lock would make every deletion in the tenant wait on it. The
+            // cost is a narrow race. A deletion that commits while this
+            // statement runs can miss the grant it inserts, leaving a grant on
+            // a deleted account. Re-running the dry run straight after the load
+            // shows any such grant under "would revoke", and applying again
+            // removes it (see docs/DEPLOYMENT.md).
+            //
             // One statement, so it sends the roster once and its parts share
             // one snapshot of the deletion records, which is what makes the
             // counts partition the roster. A pubkey with a recorded deletion
-            // is never inserted, and loses a grant it already had (which only
-            // a load from before the deletion check could have written): it
-            // is reported as excluded, so it must also end up without one.
-            // The insert and the delete touch disjoint pubkeys.
+            // is never inserted, and loses a grant it already had: it is
+            // reported as excluded, so it must also end up without one. The
+            // insert and the delete touch disjoint pubkeys.
+            let mut tx = self.pool.begin().await?;
             let (newly_granted, revoked_deleted, excluded_deleted): (i64, i64, i64) =
                 sqlx::query_as(
                     "WITH roster AS (
@@ -302,7 +272,7 @@ impl OgDivinerGrantRepository {
                 revoked_deleted as u64,
                 excluded_deleted as u64,
             );
-            // Under the lock this cannot fail. If it ever does, the report
+            // One snapshot means this cannot fail. If it ever does, the report
             // could not account for what was written, so roll back rather than
             // commit a load nobody can describe.
             let Some(already_granted) = unique.checked_sub(newly_granted + excluded_deleted) else {
@@ -318,22 +288,28 @@ impl OgDivinerGrantRepository {
                 revoked_deleted,
             )
         } else {
-            // No lock: a dry run is a prediction and must never hold up an
-            // account deletion.
+            // Defines "deleted" the same way the load does. Kept as a join
+            // against that one set rather than an EXISTS per count: Postgres
+            // inlines a per-row EXISTS into each FILTER and scans the deletion
+            // records once per roster row per count, which takes minutes on a
+            // full roster.
             let (already, excluded, revoked): (i64, i64, i64) = sqlx::query_as(
-                "SELECT
-                     count(*) FILTER (WHERE g.pubkey IS NOT NULL AND NOT deleted),
-                     count(*) FILTER (WHERE deleted),
-                     count(*) FILTER (WHERE g.pubkey IS NOT NULL AND deleted)
-                 FROM unnest($2::text[]) AS roster(pubkey)
-                 LEFT JOIN og_diviner_grants g
-                     ON g.tenant_id = $1 AND g.pubkey = roster.pubkey
-                 CROSS JOIN LATERAL (
-                     SELECT EXISTS (
+                "WITH roster AS (
+                     SELECT unnest($2::text[]) AS pubkey
+                 ), deleted AS (
+                     SELECT r.pubkey FROM roster r
+                     WHERE EXISTS (
                          SELECT 1 FROM service_account_deletions d
-                         WHERE d.tenant_id = $1 AND d.user_pubkey = roster.pubkey
-                     ) AS deleted
-                 ) AS recorded",
+                         WHERE d.tenant_id = $1 AND d.user_pubkey = r.pubkey
+                     )
+                 )
+                 SELECT
+                     count(*) FILTER (WHERE g.pubkey IS NOT NULL AND x.pubkey IS NULL),
+                     count(x.pubkey),
+                     count(*) FILTER (WHERE g.pubkey IS NOT NULL AND x.pubkey IS NOT NULL)
+                 FROM roster r
+                 LEFT JOIN og_diviner_grants g ON g.tenant_id = $1 AND g.pubkey = r.pubkey
+                 LEFT JOIN deleted x ON x.pubkey = r.pubkey",
             )
             .bind(tenant_id)
             .bind(roster.pubkeys())
@@ -489,183 +465,5 @@ mod tests {
 
         assert!(!debug.contains(&key('a')), "Debug echoed a pubkey: {debug}");
         assert!(debug.contains("entries: 1"), "got {debug}");
-    }
-}
-
-/// Lives in the crate rather than core/tests because it holds the load's lock
-/// directly through the crate-private helper, the way `load` does.
-#[cfg(all(test, feature = "integration-tests"))]
-mod lock_tests {
-    use super::*;
-    use crate::repositories::{
-        AccountDeletionOutcome, RetentionCompactionStatus, ServiceAccountDeletionOutcome,
-        ServiceAccountDeletionRecord, ServiceAccountDeletionRepository, UserRepository,
-    };
-
-    const TENANT_ID: i64 = 1;
-
-    async fn pool() -> PgPool {
-        let url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string());
-        assert!(url.contains("localhost") || url.contains("127.0.0.1"));
-        PgPool::connect(&url)
-            .await
-            .expect("connect to test database")
-    }
-
-    async fn cleanup(pool: &PgPool, pubkey: &str) {
-        sqlx::query("DELETE FROM og_diviner_grants WHERE pubkey = $1")
-            .bind(pubkey)
-            .execute(pool)
-            .await
-            .unwrap();
-        sqlx::query("DELETE FROM service_account_deletions WHERE user_pubkey = $1")
-            .bind(pubkey)
-            .execute(pool)
-            .await
-            .unwrap();
-    }
-
-    /// The other order of the race the grant lock closes; the loader
-    /// integration tests cover a deletion that starts first. A load holding
-    /// the exclusive lock has inserted a grant no one else can see yet. A
-    /// deletion arriving then must wait for the load to commit, so its delete
-    /// finds the grant and removes it.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn a_deletion_during_a_load_waits_for_it_and_removes_the_grant() {
-        let pool = pool().await;
-        let pubkey = format!("06d6{}", "a".repeat(60));
-        cleanup(&pool, &pubkey).await;
-
-        let mut load = pool.begin().await.unwrap();
-        lock_og_diviner_grants_exclusive(&mut load, TENANT_ID)
-            .await
-            .unwrap();
-        sqlx::query(
-            "INSERT INTO og_diviner_grants (tenant_id, pubkey, evidence)
-             VALUES ($1, $2, 'pre_cutoff_app_post')",
-        )
-        .bind(TENANT_ID)
-        .bind(&pubkey)
-        .execute(&mut *load)
-        .await
-        .unwrap();
-
-        let deletion = tokio::spawn({
-            let (pool, pubkey) = (pool.clone(), pubkey.clone());
-            async move {
-                let mut tx = pool.begin().await?;
-                let outcome =
-                    UserRepository::delete_account_in_tx(&mut tx, &pubkey, TENANT_ID).await?;
-                ServiceAccountDeletionRepository::record_in_tx(
-                    &mut tx,
-                    ServiceAccountDeletionRecord {
-                        deletion_request_id: format!("og-lock-test-{pubkey}"),
-                        tenant_id: TENANT_ID,
-                        user_pubkey: pubkey.clone(),
-                        outcome: ServiceAccountDeletionOutcome::AlreadyAbsent,
-                        teams_removed: 0,
-                        oauth_authorizations_deleted: 0,
-                        bunkers_notified: 0,
-                    },
-                )
-                .await?;
-                tx.commit().await?;
-                Ok::<_, RepositoryError>(outcome)
-            }
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let finished_while_load_open = deletion.is_finished();
-        load.commit().await.unwrap();
-        let outcome = deletion.await.unwrap();
-        let remaining: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM og_diviner_grants WHERE pubkey = $1")
-                .bind(&pubkey)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        cleanup(&pool, &pubkey).await;
-
-        assert_eq!(
-            remaining, 0,
-            "the deletion committed after the load, so it must have removed the grant"
-        );
-        assert!(
-            !finished_while_load_open,
-            "the deletion must wait for a load holding the grant lock"
-        );
-        assert!(matches!(outcome, Ok(AccountDeletionOutcome::AlreadyAbsent)));
-    }
-
-    /// Compaction removes a deletion record, which the load reads in three
-    /// statements. Unless it waits for the load, a record can vanish between
-    /// them: the load then misreports the pubkey as already granted and can
-    /// skip revoking a grant whose deletion it was meant to honour.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn compaction_during_a_load_waits_for_it() {
-        let pool = pool().await;
-        let pubkey = format!("06d6{}", "b".repeat(60));
-        let request_id = format!("og-lock-test-{pubkey}");
-        cleanup(&pool, &pubkey).await;
-        sqlx::query(
-            "DELETE FROM service_account_deletion_tombstones WHERE deletion_request_id = $1",
-        )
-        .bind(&request_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO service_account_deletions (
-                 deletion_request_id, tenant_id, user_pubkey, outcome,
-                 teams_removed, oauth_authorizations_deleted, bunkers_notified, completed_at
-             ) VALUES ($1, $2, $3, 'already_absent', 0, 0, 0, NOW() - INTERVAL '31 days')",
-        )
-        .bind(&request_id)
-        .bind(TENANT_ID)
-        .bind(&pubkey)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let mut load = pool.begin().await.unwrap();
-        lock_og_diviner_grants_exclusive(&mut load, TENANT_ID)
-            .await
-            .unwrap();
-        let compaction = tokio::spawn({
-            let (pool, pubkey, request_id) = (pool.clone(), pubkey.clone(), request_id.clone());
-            async move {
-                let keys = crate::retention::RetentionDigestKeyring::parse(&format!(
-                    "current=v1;v1={}",
-                    "1".repeat(64)
-                ))
-                .unwrap();
-                ServiceAccountDeletionRepository::new(pool)
-                    .compact(&request_id, TENANT_ID, &pubkey, &keys, chrono::Utc::now())
-                    .await
-            }
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let finished_while_load_open = compaction.is_finished();
-        load.commit().await.unwrap();
-        let status = compaction.await.unwrap();
-        cleanup(&pool, &pubkey).await;
-        sqlx::query(
-            "DELETE FROM service_account_deletion_tombstones WHERE deletion_request_id = $1",
-        )
-        .bind(&request_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        assert!(
-            matches!(status, Ok(RetentionCompactionStatus::Compacted)),
-            "got {status:?}"
-        );
-        assert!(
-            !finished_while_load_open,
-            "compaction must wait for a load holding the grant lock"
-        );
     }
 }
