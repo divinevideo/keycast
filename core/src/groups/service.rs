@@ -112,15 +112,18 @@ pub(crate) async fn lock_group_account(
     Ok(())
 }
 
-/// Serialize a tenant's OG Diviner grant loads with its account deletions.
+/// Serialize a tenant's OG Diviner grant loads with its account deletions and
+/// deletion-record compaction.
 ///
 /// Account deletion deletes a pubkey's grant and records itself in
 /// `service_account_deletions` in one transaction; a grant load reads those
 /// records and inserts grants in another. Under READ COMMITTED neither sees the
 /// other's uncommitted rows, so interleaved they could each miss the other and
 /// leave a grant nothing will ever remove: the coordinator does not call
-/// Keycast again for a completed deletion. Deletions take this lock shared, so
-/// they never wait on each other; a load takes it exclusive.
+/// Keycast again for a completed deletion. Retention compaction removes those
+/// records, so it would change what the load sees partway through. Deletions
+/// and compaction take this lock shared, so they never wait on each other; a
+/// load takes it exclusive.
 ///
 /// One key per tenant rather than one per pubkey: a load covers the whole
 /// roster in one transaction, and a lock per pubkey would hold thousands of

@@ -223,9 +223,10 @@ impl OgDivinerGrantRepository {
         let unique = roster.pubkeys().len() as u64;
         let (newly_granted, already_granted, excluded_deleted, revoked_deleted) = if apply {
             let mut tx = self.pool.begin().await?;
-            // Held to commit. While it is held no deletion in this tenant can
-            // be in flight, so the three statements below see one fixed set of
-            // deletion records and the counts partition the roster exactly.
+            // Held to commit. While it is held no deletion or retention
+            // compaction in this tenant can be in flight, so the three
+            // statements below see one fixed set of deletion records and the
+            // counts partition the roster exactly.
             // Lock order: this is the only lock the load takes. Deletion takes
             // its group-account lock first and this one second, so the two
             // cannot wait on each other in a cycle.
@@ -485,8 +486,8 @@ mod tests {
 mod lock_tests {
     use super::*;
     use crate::repositories::{
-        AccountDeletionOutcome, ServiceAccountDeletionOutcome, ServiceAccountDeletionRecord,
-        ServiceAccountDeletionRepository, UserRepository,
+        AccountDeletionOutcome, RetentionCompactionStatus, ServiceAccountDeletionOutcome,
+        ServiceAccountDeletionRecord, ServiceAccountDeletionRepository, UserRepository,
     };
 
     const TENANT_ID: i64 = 1;
@@ -583,5 +584,76 @@ mod lock_tests {
             "the deletion must wait for a load holding the grant lock"
         );
         assert!(matches!(outcome, Ok(AccountDeletionOutcome::AlreadyAbsent)));
+    }
+
+    /// Compaction removes a deletion record, which the load reads in three
+    /// statements. Unless it waits for the load, a record can vanish between
+    /// them: the load then misreports the pubkey as already granted and can
+    /// skip revoking a grant whose deletion it was meant to honour.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn compaction_during_a_load_waits_for_it() {
+        let pool = pool().await;
+        let pubkey = format!("06d6{}", "b".repeat(60));
+        let request_id = format!("og-lock-test-{pubkey}");
+        cleanup(&pool, &pubkey).await;
+        sqlx::query(
+            "DELETE FROM service_account_deletion_tombstones WHERE deletion_request_id = $1",
+        )
+        .bind(&request_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO service_account_deletions (
+                 deletion_request_id, tenant_id, user_pubkey, outcome,
+                 teams_removed, oauth_authorizations_deleted, bunkers_notified, completed_at
+             ) VALUES ($1, $2, $3, 'already_absent', 0, 0, 0, NOW() - INTERVAL '31 days')",
+        )
+        .bind(&request_id)
+        .bind(TENANT_ID)
+        .bind(&pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut load = pool.begin().await.unwrap();
+        lock_og_diviner_grants_exclusive(&mut load, TENANT_ID)
+            .await
+            .unwrap();
+        let compaction = tokio::spawn({
+            let (pool, pubkey, request_id) = (pool.clone(), pubkey.clone(), request_id.clone());
+            async move {
+                let keys = crate::retention::RetentionDigestKeyring::parse(&format!(
+                    "current=v1;v1={}",
+                    "1".repeat(64)
+                ))
+                .unwrap();
+                ServiceAccountDeletionRepository::new(pool)
+                    .compact(&request_id, TENANT_ID, &pubkey, &keys, chrono::Utc::now())
+                    .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let finished_while_load_open = compaction.is_finished();
+        load.commit().await.unwrap();
+        let status = compaction.await.unwrap();
+        cleanup(&pool, &pubkey).await;
+        sqlx::query(
+            "DELETE FROM service_account_deletion_tombstones WHERE deletion_request_id = $1",
+        )
+        .bind(&request_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(status, Ok(RetentionCompactionStatus::Compacted)),
+            "got {status:?}"
+        );
+        assert!(
+            !finished_while_load_open,
+            "compaction must wait for a load holding the grant lock"
+        );
     }
 }

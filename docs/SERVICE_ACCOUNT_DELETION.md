@@ -134,7 +134,9 @@ the only signal Keycast gets that one of them has deleted their account in the
 Divine app. A deletion made only from another Nostr app never reaches Keycast
 and leaves the grant in place. The removal takes the tenant's grant lock in
 shared mode and the grant loader takes it exclusively, so a deletion and a load
-running at the same time cannot miss each other.
+running at the same time cannot miss each other. Retention compaction of a
+deletion record takes the same lock in shared mode, so a record cannot
+disappear partway through a load.
 
 After the transaction commits, the signer daemon is told to drop the account's
 bunker connections. That notification is best-effort: it cannot fail a deletion

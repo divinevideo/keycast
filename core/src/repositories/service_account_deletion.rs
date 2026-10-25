@@ -212,6 +212,12 @@ impl ServiceAccountDeletionRepository {
             .bind(format!("deletion:{deletion_request_id}"))
             .execute(&mut *tx)
             .await?;
+        // An OG Diviner grant load reads this tenant's deletion records in
+        // several statements and must see one fixed set; removing one partway
+        // through would misreport the load and could leave a grant it was
+        // meant to revoke. Lock order: the deletion lock above, then this; the
+        // load takes only this one, so there is no cycle.
+        crate::groups::lock_og_diviner_grants_shared(&mut tx, tenant_id).await?;
 
         if let Some(tombstone) = sqlx::query_as::<_, ServiceAccountDeletionTombstone>(
             "SELECT deletion_request_id, tenant_id, outcome, completed_at,
