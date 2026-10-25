@@ -94,3 +94,15 @@ A load could grant someone who had already deleted their account, and nothing wo
 - [x] **Step 1:** Tests: a recorded deletion excludes the pubkey in the dry run and the apply with matching counts and no row written; a deletion in another tenant does not exclude it; a load revokes an existing grant whose pubkey has a recorded deletion; both race orders through the real deletion path: a deletion held open makes the load wait and the load then excludes the pubkey, and a load holding the lock makes the deletion wait and the deletion then removes the grant. Mutation-check the exclusion, its tenant filters, the sweep, and each side of the lock.
 - [x] **Step 2:** Exclude, sweep and count in one locked transaction; report `excluded_deleted` and `revoked_deleted`; take the shared lock in `delete_account_in_tx`. One tenant lock rather than one per pubkey, so a large roster cannot exhaust Postgres's server-wide lock table.
 - [x] **Step 3:** Commit.
+
+### Task 6: Compaction honours the grant lock (added after review)
+
+**Files:**
+- Modify: `core/src/repositories/service_account_deletion.rs` (`compact`), lock and load comments, `docs/DEPLOYMENT.md`, `docs/SERVICE_ACCOUNT_DELETION.md`
+- Test: `lock_tests` in `core/src/repositories/og_diviner_grant.rs`
+
+Retention compaction deleted a deletion record under only its per-request lock, so it could land between the load's statements. The load then counted that pubkey as already granted and could skip revoking its grant. Compaction now takes the grant lock shared, after its deletion lock. The runbook also says the roster builder must still drop NIP-62-vanished pubkeys, because Keycast's records miss compacted deletions and self-deletions through `DELETE /api/user/account`.
+
+- [x] **Step 1:** Test: a load holding the exclusive lock makes compaction wait, and compaction then completes. Seen red before the fix.
+- [x] **Step 2:** Take `lock_og_diviner_grants_shared` in `compact`.
+- [x] **Step 3:** Commit.
