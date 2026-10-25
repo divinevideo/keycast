@@ -26,6 +26,11 @@ fn key(seed: char) -> String {
     format!("06d3{}", std::iter::repeat_n(seed, 60).collect::<String>())
 }
 
+/// A second prefix, for tests added after `key`'s 16 seeds ran out.
+fn key2(seed: char) -> String {
+    format!("06d4{}", std::iter::repeat_n(seed, 60).collect::<String>())
+}
+
 async fn purge(pool: &PgPool, keys: &[String]) {
     sqlx::query("DELETE FROM og_diviner_grants WHERE pubkey = ANY($1)")
         .bind(keys)
@@ -437,8 +442,7 @@ async fn a_deletion_in_another_tenant_does_not_exclude_the_pubkey() {
 /// A grant whose pubkey has a recorded deletion is revoked by the load and
 /// counted as excluded, not as already granted. The deletion path normally
 /// removes the grant itself, so this covers a grant the deletion could not
-/// see: one a load inserted while that deletion ran. A dry run after the load
-/// reports it under "would revoke", and applying again removes it (see the
+/// see, such as one an earlier load inserted while that deletion ran (see the
 /// `revoked` step in `OgDivinerGrantRepository::load`).
 #[tokio::test]
 #[serial]
@@ -503,7 +507,7 @@ async fn a_load_revokes_only_its_own_tenant_s_grant() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    let keys = vec![key('6')];
+    let keys = vec![key2('a')];
     purge(&pool, &keys).await;
     forget_deletions(&pool, &keys).await;
     grant_directly(&pool, &keys[0]).await;
@@ -551,7 +555,7 @@ async fn a_load_revokes_only_its_own_tenant_s_grant() {
 async fn two_deletion_records_for_one_pubkey_count_it_once() {
     let pool = pool().await;
     let repository = OgDivinerGrantRepository::new(pool.clone());
-    let keys = vec![key('6'), key('1')];
+    let keys = vec![key2('b'), key2('c')];
     purge(&pool, &keys).await;
     forget_deletions(&pool, &keys).await;
     grant_directly(&pool, &keys[0]).await;

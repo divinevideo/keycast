@@ -137,7 +137,7 @@ Tasks 5 to 7 kept a one-time load and account deletion from missing each other w
 - Test: `core/tests/og_diviner_grant_loader_test.rs`
 - Modify: `docs/DEPLOYMENT.md`, `core/src/repositories/user.rs` (doc wrap)
 
-No test failed if the load's revoke lost its tenant filter, which would delete other tenants' grants. Nothing covered a pubkey with two deletion records, which a refactor of `deleted` into a join would double-count. The runbook's re-check now uses the same roster file, adds a next-day check, and says it cannot see a self-deletion that raced the load.
+No test failed if the load's revoke lost its tenant filter, which would delete other tenants' grants. Nothing covered a pubkey with two deletion records, which a refactor of `deleted` into a join would double-count. The runbook's post-load re-check, which re-applied the roster, is replaced by a cleanup that only revokes: re-applying could re-grant an account whose grant a self-deletion had removed without leaving a record. It runs straight after the load and again the next day, and the runbook says it cannot see a self-deletion that raced the load.
 
 - [x] **Step 1:** Tests: a load revokes only its own tenant's grant; two deletion records for one pubkey count it once in the dry run and the apply. Mutation-check the revoke's tenant filter.
 - [x] **Step 2:** Docs.

@@ -225,9 +225,10 @@ impl OgDivinerGrantRepository {
             // a lock would make every deletion in the tenant wait on it. The
             // cost is a narrow race. A deletion that commits while this
             // statement runs can miss the grant it inserts, leaving a grant on
-            // a deleted account. Re-running the dry run straight after the load
-            // shows any such grant under "would revoke", and applying again
-            // removes it (see docs/DEPLOYMENT.md).
+            // a deleted account. The runbook removes those afterwards with a
+            // cleanup that only revokes (see docs/DEPLOYMENT.md), rather than by
+            // re-applying, which would also re-grant anyone whose grant was
+            // removed since by a deletion that left no record.
             //
             // One statement, so it sends the roster once and its parts share
             // one snapshot of the deletion records, which is what makes the

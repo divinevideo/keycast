@@ -134,7 +134,7 @@ the only signal Keycast gets that one of them has deleted their account in the
 Divine app. A deletion made only from another Nostr app never reaches Keycast
 and leaves the grant in place. A deletion that runs while a grant load is
 writing can miss the grant that load inserts; the load runbook in
-docs/DEPLOYMENT.md checks for that straight after the load.
+docs/DEPLOYMENT.md removes those grants straight after the load.
 
 After the transaction commits, the signer daemon is told to drop the account's
 bunker connections. That notification is best-effort: it cannot fail a deletion

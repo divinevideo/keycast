@@ -445,7 +445,20 @@ Before applying:
 
 One malformed line (anything but a 64-character lowercase hex pubkey) rejects the whole file. An applied load is one transaction: it lands whole or not at all.
 
-Straight after applying, run the dry run again with the same roster file, and once more the next day. An account deleted in the Divine app while the load was writing can miss the grant the load inserted, and the dry run shows any such grant under `would revoke`. If that count is not 0, apply the same file once more, which removes them. Use the same file: a rebuilt roster has already dropped the deleted pubkey, so the dry run cannot see its leftover grant. The next-day check catches a deletion that was still finishing during the first one. The check only sees deletions Keycast recorded, so it misses a self-deletion through `DELETE /api/user/account` that raced the load. The load does not lock out account deletions instead because that would make every deletion in the tenant wait on it.
+An account deleted in the Divine app while the load was writing can miss the grant the load inserted. Straight after applying, and once more the next day, remove any grant whose account has a recorded deletion in the tenant. The next-day run catches a deletion that was still finishing during the first one. Use this cleanup, not a second `--apply`: it can only remove grants, while re-applying also re-grants anyone whose grant was removed since by a deletion that left no record. Run it in a transaction and check the `DELETE` count before committing; it is normally 0.
+
+```sql
+BEGIN;
+DELETE FROM og_diviner_grants g
+WHERE g.tenant_id = 1
+  AND EXISTS (
+      SELECT 1 FROM service_account_deletions d
+      WHERE d.tenant_id = g.tenant_id AND d.user_pubkey = g.pubkey
+  );
+COMMIT;
+```
+
+The cleanup only sees deletions Keycast recorded, so it misses a self-deletion through `DELETE /api/user/account` that raced the load. The load does not lock out account deletions instead because that would make every deletion in the tenant wait on it.
 
 Applying the same roster again straight away grants nothing new. To load again later, rebuild the roster first (see above) rather than re-running an old file.
 
