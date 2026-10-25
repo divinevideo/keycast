@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::str::FromStr;
 
-use sqlx::{PgConnection, PgPool};
+use sqlx::PgPool;
 
 use crate::groups::lock_og_diviner_grants_exclusive;
 use crate::repositories::RepositoryError;
@@ -13,6 +13,12 @@ use crate::repositories::RepositoryError;
 /// How many offending line numbers a roster error names. The count is always
 /// exact; the list is only a starting point for fixing the file.
 const REPORTED_LINE_LIMIT: usize = 10;
+
+/// Bounds on an applied load; see `load`. A deletion in flight finishes in
+/// well under the lock timeout, and a large roster loads in seconds.
+const LOAD_LOCK_TIMEOUT: &str = "5s";
+const LOAD_STATEMENT_TIMEOUT: &str = "60s";
+const LOAD_IDLE_TIMEOUT: &str = "15s";
 
 /// The rule that admitted a pubkey to the grant roster.
 ///
@@ -223,52 +229,79 @@ impl OgDivinerGrantRepository {
         let unique = roster.pubkeys().len() as u64;
         let (newly_granted, already_granted, excluded_deleted, revoked_deleted) = if apply {
             let mut tx = self.pool.begin().await?;
+            // First, before anything takes a snapshot. The load must see
+            // deletion records that commit while it waits for the lock below,
+            // which REPEATABLE READ (if a server, database or role default
+            // ever set it) would hide behind a snapshot taken before the wait.
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                .execute(&mut *tx)
+                .await?;
+            // While a load holds or waits for the lock, the tenant's account
+            // deletions wait for it, so nothing may let that wait run
+            // unbounded: not a deletion that never finishes, a slow statement,
+            // or an operator's stalled session (Postgres ends an idle
+            // transaction after the idle timeout, releasing the lock). A load
+            // that gives up writes nothing and can simply be re-run.
+            sqlx::query(
+                "SELECT set_config('lock_timeout', $1, true),
+                        set_config('statement_timeout', $2, true),
+                        set_config('idle_in_transaction_session_timeout', $3, true)",
+            )
+            .bind(LOAD_LOCK_TIMEOUT)
+            .bind(LOAD_STATEMENT_TIMEOUT)
+            .bind(LOAD_IDLE_TIMEOUT)
+            .execute(&mut *tx)
+            .await?;
             // Held to commit. While it is held no deletion or retention
-            // compaction in this tenant can be in flight, so the three
-            // statements below see one fixed set of deletion records and the
-            // counts partition the roster exactly.
+            // compaction in this tenant can be in flight.
             // Lock order: this is the only lock the load takes. Deletion takes
             // its group-account lock first and this one second, so the two
             // cannot wait on each other in a cycle.
             lock_og_diviner_grants_exclusive(&mut tx, tenant_id).await?;
 
-            let newly_granted = sqlx::query(
-                "INSERT INTO og_diviner_grants (tenant_id, pubkey, evidence)
-                 SELECT $1, roster.pubkey, $3
-                 FROM unnest($2::text[]) AS roster(pubkey)
-                 WHERE NOT EXISTS (
-                     SELECT 1 FROM service_account_deletions d
-                     WHERE d.tenant_id = $1 AND d.user_pubkey = roster.pubkey
-                 )
-                 ON CONFLICT (tenant_id, pubkey) DO NOTHING",
-            )
-            .bind(tenant_id)
-            .bind(roster.pubkeys())
-            .bind(evidence.as_str())
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-
-            // The insert above never creates such a grant; this removes one
-            // that already existed, which only a load from before the deletion
-            // check could have written. Such a pubkey is reported as excluded,
-            // so it must also end up without a grant.
-            let revoked_deleted = sqlx::query(
-                "DELETE FROM og_diviner_grants g
-                 WHERE g.tenant_id = $1
-                   AND g.pubkey = ANY($2)
-                   AND EXISTS (
-                       SELECT 1 FROM service_account_deletions d
-                       WHERE d.tenant_id = $1 AND d.user_pubkey = g.pubkey
-                   )",
-            )
-            .bind(tenant_id)
-            .bind(roster.pubkeys())
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-
-            let excluded_deleted = count_deleted(&mut tx, tenant_id, roster).await?;
+            // One statement, so it sends the roster once and its parts share
+            // one snapshot of the deletion records, which is what makes the
+            // counts partition the roster. A pubkey with a recorded deletion
+            // is never inserted, and loses a grant it already had (which only
+            // a load from before the deletion check could have written): it
+            // is reported as excluded, so it must also end up without one.
+            // The insert and the delete touch disjoint pubkeys.
+            let (newly_granted, revoked_deleted, excluded_deleted): (i64, i64, i64) =
+                sqlx::query_as(
+                    "WITH roster AS (
+                         SELECT unnest($2::text[]) AS pubkey
+                     ), deleted AS (
+                         SELECT r.pubkey FROM roster r
+                         WHERE EXISTS (
+                             SELECT 1 FROM service_account_deletions d
+                             WHERE d.tenant_id = $1 AND d.user_pubkey = r.pubkey
+                         )
+                     ), inserted AS (
+                         INSERT INTO og_diviner_grants (tenant_id, pubkey, evidence)
+                         SELECT $1, r.pubkey, $3 FROM roster r
+                         WHERE NOT EXISTS (SELECT 1 FROM deleted x WHERE x.pubkey = r.pubkey)
+                         ON CONFLICT (tenant_id, pubkey) DO NOTHING
+                         RETURNING 1
+                     ), revoked AS (
+                         DELETE FROM og_diviner_grants g
+                         WHERE g.tenant_id = $1
+                           AND g.pubkey IN (SELECT pubkey FROM deleted)
+                         RETURNING 1
+                     )
+                     SELECT (SELECT count(*) FROM inserted),
+                            (SELECT count(*) FROM revoked),
+                            (SELECT count(*) FROM deleted)",
+                )
+                .bind(tenant_id)
+                .bind(roster.pubkeys())
+                .bind(evidence.as_str())
+                .fetch_one(&mut *tx)
+                .await?;
+            let (newly_granted, revoked_deleted, excluded_deleted) = (
+                newly_granted as u64,
+                revoked_deleted as u64,
+                excluded_deleted as u64,
+            );
             // Under the lock this cannot fail. If it ever does, the report
             // could not account for what was written, so roll back rather than
             // commit a load nobody can describe.
@@ -328,27 +361,6 @@ impl OgDivinerGrantRepository {
             applied: apply,
         })
     }
-}
-
-/// Roster pubkeys with a recorded deletion in the tenant, each counted once
-/// however many deletion requests name it.
-async fn count_deleted(
-    conn: &mut PgConnection,
-    tenant_id: i64,
-    roster: &GrantRoster,
-) -> Result<u64, sqlx::Error> {
-    let count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM unnest($2::text[]) AS roster(pubkey)
-         WHERE EXISTS (
-             SELECT 1 FROM service_account_deletions d
-             WHERE d.tenant_id = $1 AND d.user_pubkey = roster.pubkey
-         )",
-    )
-    .bind(tenant_id)
-    .bind(roster.pubkeys())
-    .fetch_one(conn)
-    .await?;
-    Ok(count as u64)
 }
 
 #[cfg(test)]

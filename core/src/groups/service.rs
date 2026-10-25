@@ -125,6 +125,11 @@ pub(crate) async fn lock_group_account(
 /// and compaction take this lock shared, so they never wait on each other; a
 /// load takes it exclusive.
 ///
+/// This works only under READ COMMITTED, where each statement after the lock
+/// sees what committed while it waited. The load sets that level itself;
+/// deletion and compaction inherit the server default, which is READ
+/// COMMITTED unless someone changes it.
+///
 /// One key per tenant rather than one per pubkey: a load covers the whole
 /// roster in one transaction, and a lock per pubkey would hold thousands of
 /// entries in Postgres's server-wide lock table.
