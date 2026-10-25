@@ -3276,7 +3276,11 @@ impl UserRepository {
         // deletion, or each could miss the other's uncommitted rows and leave a
         // grant behind for good. With this shared lock, a load already running
         // commits before the grant delete below looks, and a load that starts
-        // later waits for this commit and then sees the deletion record. Its
+        // later waits for this commit and then sees the deletion record that
+        // service deletion writes in this transaction. Self-deletion
+        // (DELETE /api/user/account) writes no record, so a later load can
+        // re-grant that pubkey; the roster builder's exclusion of vanished
+        // pubkeys covers it (see docs/DEPLOYMENT.md). Its
         // cost is one shared lock per deletion, uncontended except while a load
         // runs. Lock order: group-account first, then this; the load takes only
         // this one, so there is no cycle.

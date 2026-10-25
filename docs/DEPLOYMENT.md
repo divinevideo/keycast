@@ -413,11 +413,13 @@ The roster is built privately from production relay data. It is never committed,
 
 Build the roster immediately before loading it, and never load an old one: rebuild it instead. The loader skips, and revokes, any pubkey whose account deletion Keycast has recorded in the tenant (reported as `account deleted`), but Keycast's deletion records can be compacted 30 days after the deletion. An old roster can therefore re-grant someone who deleted their account long ago, and nothing would remove that grant.
 
+Keycast's records do not cover every deletion, so the roster builder must still drop pubkeys that have vanished (NIP-62) on the relay. Records are compacted after 30 days, and an account deleted through Keycast's own `DELETE /api/user/account` route writes no record at all.
+
 ### Connecting
 
-The loader needs a direct connection that bypasses any transaction-mode pooler, because sqlx caches prepared statements per connection, and it needs an identity that can write `og_diviner_grants`.
+The loader needs a direct connection that bypasses any transaction-mode pooler, because sqlx caches prepared statements per connection, and it needs an identity that can read `tenants` and `service_account_deletions` and write `og_diviner_grants`.
 
-- **Production (Cloud Run):** there is no connection string to copy. The `keycast-migrate` job reaches Cloud SQL through the Cloud SQL Auth Proxy with IAM authentication (see `cloudbuild.yaml`), and the loader does the same. Run `cloud-sql-proxy --auto-iam-authn openvine-co:us-east1:keycast-db-east` under an identity with write access to the table, then point `DATABASE_URL` at the proxy on `127.0.0.1`.
+- **Production (Cloud Run):** there is no connection string to copy. The `keycast-migrate` job reaches Cloud SQL through the Cloud SQL Auth Proxy with IAM authentication (see `cloudbuild.yaml`), and the loader does the same. Run `cloud-sql-proxy --auto-iam-authn openvine-co:us-east1:keycast-db-east` under such an identity, then point `DATABASE_URL` at the proxy on `127.0.0.1`.
 - **GKE:** use the `DATABASE_URL_DIRECT` value the `keycast-db-migrate` job reads, not the pooled `DATABASE_URL`.
 
 Export `DATABASE_URL` rather than putting it on the command line, so it stays out of shell history. Run the loader from a checkout of the commit that is deployed, so its queries match the schema it writes to and the lock it takes matches the one the running server's account deletion takes.
