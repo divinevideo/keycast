@@ -158,7 +158,9 @@ async fn an_unknown_tenant_is_rejected_before_anything_is_written() {
 #[serial]
 async fn the_table_rejects_malformed_pubkeys_and_unknown_evidence() {
     let pool = pool().await;
-    let keys = vec![key('a'), key('a').to_uppercase()];
+    // Its own seed: purging another test's key would race it under a
+    // process-per-test runner, where #[serial] does not reach.
+    let keys = vec![key('0'), key('0').to_uppercase()];
     purge(&pool, &keys).await;
 
     let uppercase = sqlx::query(
