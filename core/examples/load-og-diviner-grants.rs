@@ -134,7 +134,9 @@ async fn main() -> ExitCode {
     let report = match report {
         Ok(report) => report,
         Err(error) => {
-            eprintln!("load failed, nothing loaded: {error}");
+            // Not "nothing loaded": a commit can land on the server and still
+            // report an error if the connection drops before the reply.
+            eprintln!("load failed: {error}\nre-run the dry run to see what, if anything, landed");
             return ExitCode::FAILURE;
         }
     };
