@@ -419,14 +419,14 @@ Keycast's records do not cover every deletion, so the roster builder must still 
 
 The loader needs a direct connection that bypasses any transaction-mode pooler, because sqlx caches prepared statements per connection, and it needs an identity that can read `tenants` and `service_account_deletions` and write `og_diviner_grants`.
 
-- **Production (Cloud Run):** there is no connection string to copy. The `keycast-migrate` job reaches Cloud SQL through the Cloud SQL Auth Proxy with IAM authentication (see `cloudbuild.yaml`), and the loader does the same. Run `cloud-sql-proxy --auto-iam-authn openvine-co:us-east1:keycast-db-east` under such an identity, then point `DATABASE_URL` at the proxy on `127.0.0.1`.
+- **Production (Cloud Run):** there is no connection string to copy. The `keycast-migrate` job reaches Cloud SQL through the Cloud SQL Auth Proxy with IAM authentication (see `cloudbuild.yaml`), and the loader does the same. Run `cloud-sql-proxy --auto-iam-authn --port 5433 openvine-co:us-east1:keycast-db-east` under such an identity. The explicit port keeps it off 5432, where a local Postgres may already be listening. Then set `DATABASE_URL=postgres://<IAM database user>@127.0.0.1:5433/<database>`, with no password. The IAM database user is the account's email for a person, or the service account's email without `.gserviceaccount.com`.
 - **GKE:** use the `DATABASE_URL_DIRECT` value the `keycast-db-migrate` job reads, not the pooled `DATABASE_URL`.
 
-Export `DATABASE_URL` rather than putting it on the command line, so it stays out of shell history. Run the loader from a checkout of the commit that is deployed, so its queries match the schema it writes to and the lock it takes matches the one the running server's account deletion takes.
+Export `DATABASE_URL` rather than putting it on the command line, so it stays out of shell history. Run from Cloud Shell or another machine that will stay awake and connected, not a laptop that may sleep mid-load (see "If a load stalls"). Run the loader from a checkout of the commit that is deployed, so its queries match the schema it writes to and the lock it takes matches the one the running server's account deletion takes.
 
 ### Loading
 
-The loader prints counts, line numbers and the target tenant only:
+The loader prints the database it connected to, the target tenant, counts and line numbers only:
 
 ```bash
 export DATABASE_URL=...   # see "Connecting"
@@ -440,10 +440,19 @@ cargo run -p keycast_core --example load-og-diviner-grants -- \
 
 Before applying:
 
-- Check that the tenant line names the deployment you mean.
+- Check that the `database` line shows the production database and the IAM user you started the proxy as. The tenant line cannot tell environments apart: every database seeds tenant 1 as `login.divine.video`.
 - Compare the dry run's `unique pubkeys` with the count the roster builder reported. If they differ, do not `--apply`; the file is not the roster that was reviewed.
 
 One malformed line (anything but a 64-character lowercase hex pubkey) rejects the whole file. An applied load is one transaction: it lands whole or not at all. While it runs, account deletions in the tenant wait for it, and it waits for any already in progress.
+
+#### If a load stalls
+
+A load gives up, writing nothing, if it cannot take its lock within 5 seconds or any statement runs past 60 seconds; re-run it. If its session goes quiet mid-load for 15 seconds, for example because the machine slept, Postgres ends the session, and the load rolls back and releases the lock. Do not suspend a running `--apply`. To end one by hand:
+
+```sql
+SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+WHERE application_name = 'og-diviner-grant-loader';
+```
 
 Applying the same roster again straight away grants nothing new. To load again later, rebuild the roster first (see above) rather than re-running an old file.
 

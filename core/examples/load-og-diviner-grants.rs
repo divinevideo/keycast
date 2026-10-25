@@ -24,7 +24,7 @@
 use keycast_core::repositories::{
     parse_grant_roster, OgDivinerGrantEvidence, OgDivinerGrantRepository,
 };
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use std::env;
 use std::process::ExitCode;
 
@@ -115,9 +115,18 @@ async fn main() -> ExitCode {
         eprintln!("DATABASE_URL must be set");
         return ExitCode::from(2);
     };
+    let options = match database_url.parse::<PgConnectOptions>() {
+        // Named so an operator can find a stuck load in pg_stat_activity and
+        // end it (see docs/DEPLOYMENT.md).
+        Ok(options) => options.application_name("og-diviner-grant-loader"),
+        Err(error) => {
+            eprintln!("DATABASE_URL is not a valid connection string: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let pool = match PgPoolOptions::new()
         .max_connections(1)
-        .connect(&database_url)
+        .connect_with(options)
         .await
     {
         Ok(pool) => pool,
@@ -126,6 +135,26 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // Printed before the load so a wrong DATABASE_URL shows up even when the
+    // load fails. The tenant line cannot do this: every database seeds tenant
+    // 1 as login.divine.video.
+    let server: Result<(String, String, String), sqlx::Error> = sqlx::query_as(
+        "SELECT current_database(), current_user::text,
+                coalesce(host(inet_server_addr()) || ':' || inet_server_port(), 'local socket')",
+    )
+    .fetch_one(&pool)
+    .await;
+    match server {
+        Ok((database, user, address)) => {
+            println!("database:        {database} as {user} at {address}")
+        }
+        Err(error) => {
+            eprintln!("could not identify the database server: {error}");
+            pool.close().await;
+            return ExitCode::FAILURE;
+        }
+    }
 
     let report = OgDivinerGrantRepository::new(pool.clone())
         .load(args.tenant_id, args.evidence, &roster, args.apply)

@@ -106,3 +106,15 @@ Retention compaction deleted a deletion record under only its per-request lock, 
 - [x] **Step 1:** Test: a load holding the exclusive lock makes compaction wait, and compaction then completes. Seen red before the fix.
 - [x] **Step 2:** Take `lock_og_diviner_grants_shared` in `compact`.
 - [x] **Step 3:** Commit.
+
+### Task 7: Bound the load's lock and name its database (added after review)
+
+**Files:**
+- Modify: `core/src/repositories/og_diviner_grant.rs` (`load`), `core/src/groups/service.rs` (lock doc), `core/examples/load-og-diviner-grants.rs`, `docs/DEPLOYMENT.md`
+- Test: `core/tests/og_diviner_grant_loader_test.rs`
+
+Nothing limited how long an applied load could hold, or wait for, the exclusive lock, and while it does every account deletion in the tenant waits; an operator's stalled session would block them indefinitely. The load now sets transaction-local lock, statement and idle-in-transaction timeouts, and sends the roster once, in a single statement whose parts share one snapshot. It pins READ COMMITTED, because a REPEATABLE READ default would take its snapshot before the lock wait and miss deletions committed during it. The loader names its session and prints the database, user and server address, since tenant 1 is `login.divine.video` in every database.
+
+- [x] **Step 1:** Tests: a load facing a deletion that never commits gives up on its own and writes nothing; a load on a connection whose default isolation is REPEATABLE READ still excludes a deletion that commits while it waits. Both seen red first. Mutation-check the isolation pin, the lock timeout, the exclusion, its tenant filter and the revoke.
+- [x] **Step 2:** Implement; check by hand that the idle timeout ends a stalled session and frees the lock.
+- [x] **Step 3:** Commit.
