@@ -37,7 +37,8 @@ SUITE_CASE_IDS = REQUIRED_CASE_IDS[4:]
 HOST_ENV = {'PATH': '/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin', 'LANG': 'C.UTF-8'}
 DATABASE_URL = 'postgres://postgres:acceptance@localhost:5432/keycast_image_acceptance'
 APP_ENV = {
-    'NODE_ENV': 'production', 'KMS_PROVIDER': 'file', 'USE_GCP_KMS': 'false',
+    'NODE_ENV': 'production', 'DISABLE_EMAILS': 'true',
+    'KMS_PROVIDER': 'file', 'USE_GCP_KMS': 'false',
     'MASTER_KEY_PATH': '/app/master.key', 'WEB_BUILD_DIR': '/app/web',
     'APP_URL': 'http://localhost:3000', 'ALLOWED_ORIGINS': 'http://localhost:3000',
     'ALLOWED_TENANT_DOMAINS': 'localhost', 'BUNKER_RELAYS': 'ws://localhost:8080',
@@ -122,6 +123,7 @@ class AcceptanceResult:
     expected_case_ids: tuple[str, ...]
     executed_case_ids: tuple[str, ...]
     counts: dict[str, int]
+    suite_exit_code: int | None
     cleanup: dict
     failure: str | None
 
@@ -183,6 +185,7 @@ class Runtime:
         self.images = {}
         self.network = ''
         self.owner = ''
+        self.suite_exit_code = None
 
     def save(self):
         write_json(self.journal_path, self.journal)
@@ -247,15 +250,22 @@ class Runtime:
         else:
             require(not attachments)
         require(not any(net.get('Ports', {}).values()))
-        expected_mounts = {'/var/lib/postgresql/data': 'tmpfs'} if role == 'postgres' else {}
-        if role == 'redis':
-            expected_mounts['/data'] = 'tmpfs'
-        if role == 'client':
-            expected_mounts['/tmp'] = 'tmpfs'
-        if role in ('migration', 'server'):
-            expected_mounts['/app/master.key'] = 'bind'
-        mounts = item.get('Mounts', [])
-        require(len(mounts) == len(expected_mounts))
+        # CLI --tmpfs is represented by HostConfig.Tmpfs, separately from
+        # .Mounts (bind/volume/explicit --mount entries). Validate both channels.
+        expected_tmpfs = {
+            'postgres': {'/var/lib/postgresql/data': 'rw,noexec,nosuid,size=1g'},
+            'redis': {'/data': 'rw,noexec,nosuid,size=64m'},
+            'client': {'/tmp': 'rw,nosuid,size=1g'},
+        }.get(role, {})
+        tmpfs = host.get('Tmpfs')
+        if tmpfs is None:
+            tmpfs = {}
+        require(isinstance(tmpfs, dict) and tmpfs == expected_tmpfs)
+        expected_mounts = {'/app/master.key': 'bind'} if role in ('migration', 'server') else {}
+        mounts = item.get('Mounts')
+        if mounts is None:
+            mounts = []
+        require(isinstance(mounts, list) and len(mounts) == len(expected_mounts))
         for mount in mounts:
             require(expected_mounts.get(mount['Destination']) == mount['Type'])
             if mount['Type'] == 'bind':
@@ -337,9 +347,13 @@ class Runtime:
             self.images[ident] = self.images.get(ident, set()) | defaults
 
     def execute_suite(self):
-        self.call(['exec', '-w', '/e2e', self.client, 'node',
+        # Playwright must retain its real nonzero failure exit. Independently
+        # read its sanitized summary even on failure; neither signal overrides
+        # the other. Future suites always attempt that fixed summary in teardown.
+        response = self.call(['exec', '-w', '/e2e', self.client, 'node',
                    'node_modules/@playwright/test/cli.js', 'test', '--config',
-                   'challenge-image.config.ts'], timeout=600)
+                   'challenge-image.config.ts'], timeout=600, check=False)
+        self.suite_exit_code = response.returncode
         # The suite writes ONLY this allowlisted aggregate in the client tmpfs.
         # No Playwright reports or child output are promotion evidence.
         summary = json.loads(self.call(['exec', '-w', '/e2e', self.client, 'node', '-e',
@@ -638,10 +652,14 @@ def run_acceptance(spec: RunSpec, execute: Executor | None = None) -> Acceptance
         finally:
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
+    suite_exit_code = runtime.suite_exit_code if runtime is not None else None
     complete = failure is None and set(cases) == set(REQUIRED_CASE_IDS)
-    passed = complete and all(cases.values()) and cleanup['complete']
-    if failure is None and not complete:
-        failure = 'incomplete_case_set'
+    passed = complete and suite_exit_code == 0 and all(cases.values()) and cleanup['complete']
+    if failure is None:
+        if suite_exit_code is not None and suite_exit_code != 0:
+            failure = 'suite_failed'
+        elif not complete:
+            failure = 'incomplete_case_set'
     identity = asdict(spec)
     del identity['evidence_dir']
     configuration = {'app_environment': APP_ENV, 'generated_server_key': True,
@@ -652,7 +670,7 @@ def run_acceptance(spec: RunSpec, execute: Executor | None = None) -> Acceptance
         tuple(case for case in REQUIRED_CASE_IDS if case in cases),
         {'expected': len(REQUIRED_CASE_IDS), 'executed': len(cases),
          'passed': sum(v is True for v in cases.values()), 'failed': sum(v is False for v in cases.values())},
-        cleanup, failure)
+        suite_exit_code, cleanup, failure)
     if runtime is not None:
         write_json(runtime.evidence / 'acceptance.json', asdict(result))
     return result

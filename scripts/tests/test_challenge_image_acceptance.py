@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -47,6 +48,8 @@ class DockerBoundary:
         self.sabotage = sabotage
         self.removed = []
         self.summary = {'schema_version': 1, 'cases': []}
+        self.server_environment = None
+        self.suite_exit_code = 0
 
     def __call__(self, argv, env, timeout):
         assert isinstance(argv, list) and all(isinstance(x, str) for x in argv)
@@ -90,26 +93,37 @@ class DockerBoundary:
             labels = dict([argv[argv.index('--label') + 1].split('=', 1)])
             ident = f'{len(self.containers) + 1:064x}'
             mounts = []
+            tmpfs = {}
+            mount_specs = []
             for i, value in enumerate(argv):
                 if value == '--mount':
                     fields = dict(x.split('=', 1) for x in argv[i + 1].split(',') if '=' in x)
-                    mounts.append({'Type': fields['type'], 'Source': fields['src'],
-                                   'Destination': fields['dst'], 'RW': False})
+                    readonly = 'readonly' in argv[i + 1].split(',')
+                    mounts.append({'Type': fields['type'], 'Source': fields.get('src', ''),
+                                   'Destination': fields['dst'], 'Mode': '', 'RW': not readonly,
+                                   'Propagation': ''})
+                    mount_specs.append({'Type': fields['type'], 'Source': fields.get('src', ''),
+                                        'Target': fields['dst'], 'ReadOnly': readonly})
                 if value == '--tmpfs':
-                    mounts.append({'Type': 'tmpfs', 'Destination': argv[i + 1].split(':')[0], 'RW': True})
+                    destination, _, options = argv[i + 1].partition(':')
+                    # --tmpfs is HostConfig.Tmpfs, not the .Mounts list.
+                    tmpfs[destination] = options
             effective_env = []
             for i, value in enumerate(argv):
                 if value == '--env':
                     effective_env.append(argv[i + 1])
                 if value == '--env-file':
                     effective_env.extend(Path(argv[i + 1]).read_text().splitlines())
+            if name.endswith('-server'):
+                self.server_environment = dict(entry.split('=', 1) for entry in effective_env)
             self.containers[ident] = {
                 'Id': ident, 'Name': '/' + name,
                 'Image': CLIENT_ID if ref == CLIENT_ID else DAEMON_ID if 'keycast@' in ref else DEP_ID,
                 'Config': {'Labels': labels, 'Env': effective_env}, 'Mounts': mounts,
                 'HostConfig': {'NetworkMode': network, 'PortBindings': {}, 'Privileged': False,
                                'PidMode': '', 'IpcMode': 'private', 'Binds': None,
-                               'VolumesFrom': None, 'Devices': [], 'CapAdd': None},
+                               'VolumesFrom': None, 'Devices': [], 'CapAdd': None,
+                               'Tmpfs': tmpfs or None, 'Mounts': mount_specs or None},
                 'State': {'Running': False},
                 'NetworkSettings': {'Networks': {} if network.startswith('container:') else {self.networks[network]['Name']: {'NetworkID': ''}}, 'Ports': {}},
             }
@@ -144,6 +158,8 @@ class DockerBoundary:
                 output = '1\n'
             elif 'redis-cli' in argv:
                 output = 'PONG\n'
+            elif 'node_modules/@playwright/test/cli.js' in argv:
+                code = self.suite_exit_code
             elif 'node' in argv:
                 script = argv[-1]
                 if 'generateSecretKey' in script and 'finalizeEvent' not in script:
@@ -179,6 +195,113 @@ class AcceptanceContracts(unittest.TestCase):
     def run_with(self, boundary=None):
         boundary = boundary or DockerBoundary()
         return module.run_acceptance(module.RunSpec.from_dict(self.data), boundary), boundary
+
+    def test_tmpfs_hostconfig_shape_and_nullable_mount_absence_reach_suite(self):
+        docker = DockerBoundary()
+        original = docker.__class__.__call__
+        def nullable(argv, env, timeout):
+            reply = original(docker, argv, env, timeout)
+            if argv[1] == 'inspect' and reply.returncode == 0:
+                data = json.loads(reply.stdout)
+                if not data[0]['Mounts']:
+                    data[0]['Mounts'] = None
+                reply.stdout = json.dumps(data)
+            return reply
+        result, _ = self.run_with(nullable)
+        self.assertEqual(result.failure, 'incomplete_case_set')
+        self.assertTrue(any('node_modules/@playwright/test/cli.js' in a for a, _, _ in docker.calls))
+        postgres = next(c for c in docker.calls if c[0][1] == 'create' and 'POSTGRES_DB=keycast_image_acceptance' in c[0])
+        self.assertIn('/var/lib/postgresql/data:rw,noexec,nosuid,size=1g', postgres[0])
+
+    def test_missing_changed_or_foreign_tmpfs_rejects_before_exec(self):
+        variants = (None, {}, {'/var/lib/postgresql/data': ''},
+                    {'/var/lib/postgresql/data': 'rw,noexec,nosuid,size=2g'},
+                    {'/var/lib/postgresql/data': 'rw,noexec,nosuid,size=1g', '/foreign': 'rw'},
+                    ['/var/lib/postgresql/data'])
+        for index, tmpfs in enumerate(variants):
+            with self.subTest(tmpfs=tmpfs):
+                self.data['evidence_dir'] = str(Path(self.temp.name) / str(index))
+                docker = DockerBoundary()
+                original = docker.__class__.__call__
+                def altered(argv, env, timeout):
+                    reply = original(docker, argv, env, timeout)
+                    if argv[1] == 'inspect' and reply.returncode == 0:
+                        data = json.loads(reply.stdout)
+                        data[0]['HostConfig']['Tmpfs'] = tmpfs
+                        reply.stdout = json.dumps(data)
+                    return reply
+                result, _ = self.run_with(altered)
+                self.assertFalse(result.passed)
+                self.assertFalse(any(a[1] == 'exec' for a, _, _ in docker.calls))
+
+    def test_stray_anonymous_volume_at_image_volume_path_is_rejected(self):
+        docker = DockerBoundary()
+        original = docker.__class__.__call__
+        def anonymous_volume(argv, env, timeout):
+            reply = original(docker, argv, env, timeout)
+            if argv[1] == 'inspect' and reply.returncode == 0:
+                data = json.loads(reply.stdout)
+                data[0]['Mounts'].append({
+                    'Type': 'volume', 'Name': '9' * 64,
+                    'Source': '/var/lib/docker/volumes/' + '9' * 64 + '/_data',
+                    'Destination': '/var/lib/postgresql/data', 'Driver': 'local',
+                    'Mode': '', 'RW': True, 'Propagation': ''})
+                reply.stdout = json.dumps(data)
+            return reply
+        result, _ = self.run_with(anonymous_volume)
+        self.assertFalse(result.passed)
+        self.assertFalse(any(a[1] == 'exec' for a, _, _ in docker.calls))
+
+    def test_emitted_server_environment_passes_actual_binary_startup_gates(self):
+        # Execute current Rust gates, rather than a Python copy of their logic.
+        root = RUNNER.parent.parent
+        main_source = (root / 'keycast/src/main.rs').read_text()
+        email_source = (root / 'api/src/email_service.rs').read_text()
+        def item(source, declaration):
+            begin = source.index(declaration)
+            return source[begin:source.index('\n}', begin) + 2]
+        harness = """
+use std::env;
+extern crate self as tracing;
+#[macro_export] macro_rules! warn { ($($argument:tt)*) => {{}}; }
+// These calls only emit warnings; none authorizes/rejects startup.
+fn warn_atproto_control_plane_config() {}
+"""
+        enum_start = main_source.index('enum KmsProvider {')
+        harness += main_source[main_source.rfind('#[derive(', 0, enum_start):enum_start]
+        harness += item(main_source, 'enum KmsProvider {') + '\n'
+        harness += item(main_source, 'fn resolve_kms_provider()') + '\n'
+        harness += item(main_source, 'fn validate_environment()') + '\n'
+        harness += 'mod keycast_api { pub mod email_service { use std::env;\n'
+        harness += item(email_source, 'pub fn validate_email_configuration()') + '\n}}\n'
+        harness += 'fn main() { std::process::exit(if validate_environment().is_ok() { 0 } else { 1 }); }\n'
+        source = Path(self.temp.name) / 'startup_gates.rs'
+        executable = Path(self.temp.name) / 'startup_gates'
+        source.write_text(harness)
+        compiler = shutil.which('rustc')
+        self.assertIsNotNone(compiler, 'actual startup-gate regression requires the Rust toolchain')
+        compiled = subprocess.run([compiler, '--edition=2021', '--crate-name', 'acceptance_startup_gates',
+                                   str(source), '-o', str(executable)],
+                                  env={'HOME': str(Path.home()), 'PATH': os.defpath},
+                                  capture_output=True, text=True, timeout=30)
+        self.assertEqual(compiled.returncode, 0, compiled.stderr)
+        _, docker = self.run_with()
+        self.assertIsNotNone(docker.server_environment)
+        environment = docker.server_environment
+        self.assertEqual(environment['NODE_ENV'], 'production')
+        self.assertNotIn('SENDGRID_API_KEY', environment)
+        checked = subprocess.run([str(executable)], env=environment,
+                                 capture_output=True, timeout=5)
+        self.assertEqual(checked.returncode, 0, 'actual binary startup gate rejects emitted server env')
+        for override in (None, 'false', 'TRUE'):
+            with self.subTest(override=override):
+                rejected = dict(environment)
+                rejected.pop('DISABLE_EMAILS', None)
+                if override is not None:
+                    rejected['DISABLE_EMAILS'] = override
+                checked = subprocess.run([str(executable)], env=rejected,
+                                         capture_output=True, timeout=5)
+                self.assertEqual(checked.returncode, 1)
 
     def test_tag_only_release_and_each_dependency_rejected_before_docker(self):
         for key in ('image_ref', 'postgres', 'redis', 'relay_builder'):
@@ -347,6 +470,7 @@ class AcceptanceContracts(unittest.TestCase):
         self.assertEqual(result.counts, {'expected': 9, 'executed': 9, 'passed': 9, 'failed': 0})
         self.data['evidence_dir'] = str(Path(self.temp.name) / 'failed-case')
         docker = DockerBoundary()
+        docker.suite_exit_code = 1
         docker.summary['cases'] = [
             {'id': 'signing.http', 'passed': False},
             {'id': 'signing.nip46', 'passed': True},
@@ -359,9 +483,45 @@ class AcceptanceContracts(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertEqual(result.counts['failed'], 1)
 
+    def test_nonzero_suite_exit_preserves_summary_and_independently_blocks_success(self):
+        for failed_case in (False, True):
+            with self.subTest(failed_case=failed_case):
+                self.data['evidence_dir'] = str(Path(self.temp.name) / str(failed_case))
+                docker = DockerBoundary()
+                docker.suite_exit_code = 1
+                docker.summary['cases'] = [
+                    {'id': 'signing.http', 'passed': not failed_case},
+                    {'id': 'signing.nip46', 'passed': True},
+                    {'id': 'consent.authorize', 'passed': True},
+                    {'id': 'consent.refresh', 'passed': True},
+                    {'id': 'management.creation-held', 'passed': True},
+                ]
+                result, _ = self.run_with(docker)
+                self.assertTrue(result.complete)
+                self.assertFalse(result.passed)
+                self.assertEqual(result.counts['executed'], 9)
+                self.assertEqual(result.counts['failed'], int(failed_case))
+                self.assertEqual(dataclasses.asdict(result).get('suite_exit_code'), 1)
+                self.assertEqual(result.failure, 'suite_failed')
+                self.assertTrue(result.cleanup['complete'])
+                self.assertNotIn('PRIVATE CHILD BODY', json.dumps(dataclasses.asdict(result)))
+
+    def test_nonzero_suite_exit_attempts_invalid_summary_and_fails_closed(self):
+        docker = DockerBoundary()
+        docker.suite_exit_code = 1
+        docker.summary['cases'] = [{'id': 'unknown', 'passed': True}]
+        result, _ = self.run_with(docker)
+        self.assertFalse(result.passed)
+        self.assertFalse(result.complete)
+        self.assertEqual(dataclasses.asdict(result).get('suite_exit_code'), 1)
+        self.assertTrue(any('readFileSync' in repr(a) for a, _, _ in docker.calls))
+        self.assertEqual(result.counts['executed'], 4)
+        self.assertTrue(result.cleanup['complete'])
+
     def test_incomplete_suite_does_not_discard_executed_case_evidence(self):
         docker = DockerBoundary()
         docker.summary['cases'] = [{'id': 'signing.http', 'passed': True}]
+        docker.suite_exit_code = 1
         result, _ = self.run_with(docker)
         self.assertFalse(result.complete)
         self.assertFalse(result.passed)
