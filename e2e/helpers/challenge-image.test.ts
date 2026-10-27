@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import defaultConfig from "../playwright.config";
 import dedicatedConfig from "../challenge-image.config";
-import { assertClientPackaging, assertDiscoverySeparation, configFromEnvironment, createFixtureHelpers, type FixtureConfig } from "./challenge-image-fixtures";
+import { assertEmptyConsentDisplay, CHALLENGE_TITLE, CHALLENGE_PHRASES, assertClientPackaging, assertDiscoverySeparation, configFromEnvironment, createFixtureHelpers, type FixtureConfig } from "./challenge-image-fixtures";
 
 const manifest = {
   schema_version: 1, nonce: "a".repeat(32), source_sha: "b".repeat(40),
@@ -627,4 +627,27 @@ test("summary completeness rejects missing, duplicate, skipped and failed requir
     const recorder = createSummaryRecorder(summaryIds, summaryBoundary(JSON.stringify({ schema_version: 1, cases })).io);
     await expect(recorder.assertComplete()).rejects.toThrow(/^challenge_image:summary_/);
   }
+});
+
+const genericConsentItem = { headings: ["App Access"], descriptions: ["Grant this application access to your account"] };
+const genericConsentDisplay = { items: [genericConsentItem], text: "App Access\nGrant this application access to your account" };
+test("empty-policy consent accepts the actual single generic fallback", () => {
+  expect(() => assertEmptyConsentDisplay(genericConsentDisplay)).not.toThrow();
+});
+for (const [name, display] of Object.entries({
+  zero: { items: [], text: "" },
+  multiple: { items: [genericConsentItem, genericConsentItem], text: genericConsentDisplay.text },
+  wrongTitle: { items: [{ ...genericConsentItem, headings: ["Other access"] }], text: genericConsentDisplay.text },
+  missingTitle: { items: [{ ...genericConsentItem, headings: [] }], text: genericConsentDisplay.text },
+  multipleTitles: { items: [{ ...genericConsentItem, headings: ["App Access", "Other access"] }], text: genericConsentDisplay.text },
+  wrongDescription: { items: [{ ...genericConsentItem, descriptions: ["Other access"] }], text: genericConsentDisplay.text },
+  missingDescription: { items: [{ ...genericConsentItem, descriptions: [] }], text: genericConsentDisplay.text },
+  multipleDescriptions: { items: [{ ...genericConsentItem, descriptions: [...genericConsentItem.descriptions, "Other access"] }], text: genericConsentDisplay.text },
+  challengeOnly: { items: [{ headings: [CHALLENGE_TITLE], descriptions: [CHALLENGE_PHRASES.join(", ")] }], text: CHALLENGE_TITLE },
+  extraChallengeTitle: { ...genericConsentDisplay, text: genericConsentDisplay.text + "\n" + CHALLENGE_TITLE },
+  invisibleGenericText: { ...genericConsentDisplay, text: "" },
+  changedCaseChallengeClaim: { ...genericConsentDisplay, text: genericConsentDisplay.text + "\nCREATE AND MANAGE CHALLENGES" },
+  ...Object.fromEntries(CHALLENGE_PHRASES.map((phrase, i) => [`challengeClaim${i}`, { ...genericConsentDisplay, text: genericConsentDisplay.text + "\n" + phrase }])),
+})) test(`empty-policy consent rejects ${name} display`, () => {
+  expect(() => assertEmptyConsentDisplay(display)).toThrow("challenge_image:empty_consent_display");
 });

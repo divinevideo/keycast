@@ -171,6 +171,18 @@ export const CONSENT_CASE_IDS = [
 ];
 export const CHALLENGE_TITLE = "Challenges and contest curation";
 export const CHALLENGE_PHRASES = ["Create and manage challenges", "enter and withdraw entries", "announce results", "curate contests", "No private-message access"];
+export interface RenderedConsentDisplay {
+  items: { headings: string[]; descriptions: string[] }[];
+  text: string;
+}
+export function assertEmptyConsentDisplay(display: RenderedConsentDisplay): void {
+  const title = "App Access", description = "Grant this application access to your account";
+  const item = display.items[0], text = display.text.replace(/\s+/g, " ").toLowerCase();
+  requireFixture(display.items.length === 1 && item.headings.length === 1 && item.headings[0] === title
+    && item.descriptions.length === 1 && item.descriptions[0] === description
+    && text.includes(title.toLowerCase()) && text.includes(description.toLowerCase())
+    && [CHALLENGE_TITLE, ...CHALLENGE_PHRASES].every(claim => !text.includes(claim.toLowerCase())), "empty_consent_display");
+}
 const permissionSpecs = {
   restricted: [["challenge_actions", "{}"]],
   empty: [],

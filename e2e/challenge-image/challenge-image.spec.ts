@@ -10,7 +10,7 @@ import {
   assertOwnedFixture, configFromEnvironment, preparePolicies, registerSyntheticUser, issueGrant,
   withPermissionMutation, assertPolicyUnchanged, assertNoGlobalChallenges, prepareAuthorization,
   issueAuthorizationCode, exchangeAuthorization, refreshGrant, codeState, assertRefreshState, teamPolicyCounts,
-  CONSENT_CASE_IDS, MALFORMED_PERMISSIONS, CONFIG_BOUNDARIES, CHALLENGE_TITLE, CHALLENGE_PHRASES,
+  assertEmptyConsentDisplay, CONSENT_CASE_IDS, MALFORMED_PERMISSIONS, CONFIG_BOUNDARIES, CHALLENGE_TITLE, CHALLENGE_PHRASES,
   type Grant, type FixtureConfig, type PolicyFixtures, type SessionFixture, type PolicyFixture,
 } from "../helpers/challenge-image-fixtures";
 import { httpRpc, openRelay, freezeTemplate, verifySignedResult, type SigningTemplate, type RpcOutcome } from "../helpers/challenge-image-rpc";
@@ -184,7 +184,17 @@ async function renderedGrant(page: Page, request: APIRequestContext, policy: Pol
   ensure(response?.status() === 200, "consent_page");
   const authorize = page.getByRole("button", { name: "Authorize", exact: true });
   await authorize.waitFor({ state: "visible" });
-  if (policy.kind === "empty") ensure(await page.locator(".permission_item").count() === 0, "empty_consent_display");
+  if (policy.kind === "empty") {
+    await page.getByRole("heading", { name: "App Access", exact: true }).waitFor({ state: "visible" });
+    await page.getByText("Grant this application access to your account", { exact: true }).waitFor({ state: "visible" });
+    assertEmptyConsentDisplay({
+      items: await page.locator(".permission_item").evaluateAll(nodes => nodes.map(node => ({
+        headings: Array.from(node.querySelectorAll("h3"), heading => heading.textContent?.trim() ?? ""),
+        descriptions: Array.from(node.querySelectorAll("p"), paragraph => paragraph.textContent?.trim() ?? ""),
+      }))),
+      text: await page.locator("body").innerText(),
+    });
+  }
   else {
     await page.getByRole("heading", { name: CHALLENGE_TITLE, exact: true }).waitFor({ state: "visible" });
     ensure(await page.locator(".permission_item").count() === 1, "consent_display_count");
