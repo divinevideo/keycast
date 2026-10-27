@@ -231,7 +231,11 @@ is lost, the candidate has no accepted replacement.
 
 After pulling the preserved index with explicit linux/amd64 selection, the workflow records
 the registry platform manifest digest and config digest separately from this daemon's
-`docker image inspect` `.Id`. The Task 1 runner compares migration/server container `.Image`
+`docker image inspect` `.Id`. Buildx `containerimage.digest` and
+`containerimage.descriptor.digest` must both match the registry index digest, and the
+descriptor media type must match the registry index. The config digest is read only from
+the registry platform manifest; provenance index metadata may omit the single-manifest
+`containerimage.config.digest` key. The Task 1 runner compares migration/server container `.Image`
 against that **same-daemon image ID** before and after testing. A config digest is not a
 substitute. Every migration/server container uses the preserved index reference with
 linux/amd64. All Postgres/Redis/relay discovery tags are resolved and pulled to digest

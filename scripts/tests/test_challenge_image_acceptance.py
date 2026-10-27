@@ -965,7 +965,7 @@ class WorkflowContracts(unittest.TestCase):
                 env={**os.environ, **baseline, 'RUNNER_TEMP': str(root)}, capture_output=True, timeout=10)
             self.assertNotEqual(result.returncode, 0)
 
-    def test_spec_adapter_preserves_index_platform_config_and_same_daemon_identity(self):
+    def test_spec_adapter_accepts_provenance_index_metadata_without_single_manifest_config_digest(self):
         code = self.inline_python('spec')
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -980,7 +980,9 @@ class WorkflowContracts(unittest.TestCase):
             index_digest, index_raw = raw({'mediaType': 'application/vnd.oci.image.index.v1+json', 'manifests': [
                 {'digest': platform_digest, 'platform': {'architecture': 'amd64', 'os': 'linux'}},
                 {'digest': attestation_digest, 'annotations': {'vnd.docker.reference.type': 'attestation-manifest', 'vnd.docker.reference.digest': platform_digest}}]})
-            metadata = {'containerimage.digest': index_digest, 'containerimage.config.digest': DIGEST, 'buildx.build.provenance': {'materials': [{'uri': 'pkg:docker/synthetic@1', 'digest': {'sha256': 'a' * 64}}]}}
+            metadata = {'containerimage.digest': index_digest,
+                'containerimage.descriptor': {'mediaType': 'application/vnd.oci.image.index.v1+json', 'digest': index_digest},
+                'buildx.build.provenance': {'materials': [{'uri': 'pkg:docker/synthetic@1', 'digest': {'sha256': 'a' * 64}}]}}
             calls = []
             def docker(args, **_kwargs):
                 calls.append(args)
@@ -1003,23 +1005,45 @@ class WorkflowContracts(unittest.TestCase):
                 raise AssertionError(args)
             environment = {'RUNNER_TEMP': directory, 'RELEASE_DIGEST': index_digest, 'CLIENT_ID': CLIENT_ID,
                 'RELEASE_METADATA': json.dumps(metadata), 'CLIENT_METADATA': json.dumps(metadata)}
-            for changed in (False, True):
-                (root / 'build-record.json').write_text(json.dumps(record))
-                with patch.dict(os.environ, {**environment, **({'RELEASE_DIGEST': 'latest'} if changed else {})}), \
-                    patch('subprocess.check_output', side_effect=docker), patch('subprocess.run'):
-                    if changed:
-                        with self.assertRaises(AssertionError):
-                            exec(compile(code, '<workflow-spec>', 'exec'), {})
-                    else:
-                        exec(compile(code, '<workflow-spec>', 'exec'), {})
-                        spec = json.loads((root / 'run-spec.json').read_text())
-                        self.assertEqual(spec['image_ref'], 'ghcr.io/divinevideo/keycast@' + index_digest)
-                        self.assertEqual(spec['platform_manifest_digest'], platform_digest)
-                        self.assertEqual(spec['registry_config_digest'], DIGEST)
-                        self.assertEqual(spec['daemon_image_id'], DAEMON_ID)
-                        self.assertNotEqual(spec['daemon_image_id'], spec['registry_config_digest'])
-                        self.assertTrue(all('@sha256:' in ref for ref in spec['dependencies'].values()))
-                        self.assertEqual(json.loads((root / 'build-record.json').read_text())['registry_index']['manifests'][1]['digest'], attestation_digest)
+            self.assertNotIn('containerimage.config.digest', metadata)
+            mutations = [
+                ('valid-provenance-index', lambda m: None),
+                ('missing-descriptor', lambda m: m.pop('containerimage.descriptor')),
+                ('missing-descriptor-digest', lambda m: m['containerimage.descriptor'].pop('digest')),
+                ('mismatched-descriptor-digest', lambda m: m['containerimage.descriptor'].update(digest=platform_digest)),
+                ('mismatched-descriptor-media-type', lambda m: m['containerimage.descriptor'].update(mediaType='application/vnd.oci.image.manifest.v1+json')),
+                ('missing-metadata-digest', lambda m: m.pop('containerimage.digest')),
+                ('mismatched-metadata-digest', lambda m: m.update({'containerimage.digest': platform_digest})),
+                ('tag-only-release', lambda m: None),
+            ]
+            for name, mutate in mutations:
+                with self.subTest(metadata=name):
+                    changed = copy.deepcopy(metadata); mutate(changed)
+                    (root / 'build-record.json').write_text(json.dumps(record))
+                    (root / 'run-spec.json').unlink(missing_ok=True)
+                    with patch.dict(os.environ, {**environment, 'RELEASE_METADATA': json.dumps(changed),
+                        **({'RELEASE_DIGEST': 'latest'} if name == 'tag-only-release' else {})}), \
+                        patch('subprocess.check_output', side_effect=docker), patch('subprocess.run'):
+                        if name != 'valid-provenance-index':
+                            with self.assertRaises((AssertionError, KeyError)):
+                                exec(compile(code, '<workflow-spec>', 'exec'), {})
+                            self.assertFalse((root / 'run-spec.json').exists())
+                        else:
+                            try:
+                                exec(compile(code, '<workflow-spec>', 'exec'), {})
+                            except (AssertionError, KeyError) as error:
+                                self.fail(f'valid provenance-index metadata without single-manifest config digest was rejected: {error!r}')
+                            spec = json.loads((root / 'run-spec.json').read_text())
+                            self.assertEqual(spec['image_ref'], 'ghcr.io/divinevideo/keycast@' + index_digest)
+                            self.assertEqual(spec['platform_manifest_digest'], platform_digest)
+                            self.assertEqual(spec['registry_config_digest'], DIGEST)
+                            self.assertEqual(spec['daemon_image_id'], DAEMON_ID)
+                            self.assertNotEqual(spec['daemon_image_id'], spec['registry_config_digest'])
+                            self.assertTrue(all('@sha256:' in ref for ref in spec['dependencies'].values()))
+                            saved = json.loads((root / 'build-record.json').read_text())
+                            self.assertEqual(saved['registry_index']['manifests'][1]['digest'], attestation_digest)
+                            self.assertEqual(saved['release_buildx_metadata']['containerimage.descriptor']['digest'], index_digest)
+                            self.assertNotIn('containerimage.config.digest', saved['release_buildx_metadata'])
             self.assertFalse(any(args[1:3] == ['network', 'create'] for args in calls))
 
     def test_sanitized_evidence_requires_exact_cases_exit_and_cleanup(self):

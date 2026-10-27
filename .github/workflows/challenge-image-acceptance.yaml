@@ -163,7 +163,11 @@ jobs:
           release_metadata = json.loads(os.environ['RELEASE_METADATA'])
           client_metadata = json.loads(os.environ['CLIENT_METADATA'])
           assert release_metadata['containerimage.digest'] == index_digest
-          assert release_metadata['containerimage.config.digest'] == config_digest
+          # With provenance the export root is an index; its metadata need not
+          # contain the single-manifest config key. Config comes from platform above.
+          descriptor = release_metadata['containerimage.descriptor']
+          assert descriptor['digest'] == index_digest
+          assert descriptor['mediaType'] == index['mediaType']
           def bases(value):
               found = []
               if isinstance(value, dict):
