@@ -1017,6 +1017,14 @@ class WorkflowContracts(unittest.TestCase):
         self.assertEqual(uploads[0]['with']['if-no-files-found'], 'error')
         self.assertEqual(uploads[0]['if'], 'always() && steps.evidence.outcome == \'success\'')
 
+    def test_checkout_auth_cleanup_accepts_tracked_submodule_metadata(self):
+        # checkout@v6 removes auth with recursive submodule foreach even when
+        # submodules are not requested. Exercise Git against the actual index:
+        # an unused gitlink without .gitmodules fails before any CI tests run.
+        result = subprocess.run(['git', 'submodule', 'foreach', '--recursive', 'true'],
+            cwd=ROOT, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_read_only_pr_workflow_semantics(self):
         self.check_workflow(workflow_file('challenge-image-contracts.yaml'), False)
 
