@@ -8,7 +8,8 @@ COPY e2e/package.json e2e/bun.lock ./
 RUN bun install --frozen-lockfile \
     && node node_modules/@playwright/test/cli.js install --with-deps chromium
 COPY e2e/challenge-image.config.ts ./
-# Only the standalone fixture and its side-effect-free PKCE dependency.
-COPY e2e/helpers/challenge-image-fixtures.ts e2e/helpers/oauth.ts ./helpers/
+# Only the dedicated suite's actual local dependency graph.
+COPY e2e/helpers/challenge-image-fixtures.ts e2e/helpers/oauth.ts e2e/helpers/challenge-image-rpc.ts ./helpers/
 COPY e2e/challenge-image/ ./challenge-image/
+COPY core/tests/fixtures/challenges/v1/events.json /core/tests/fixtures/challenges/v1/events.json
 CMD ["sleep", "infinity"]

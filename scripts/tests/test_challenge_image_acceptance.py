@@ -396,8 +396,8 @@ fn warn_atproto_control_plane_config() {}
 
     def test_incomplete_duplicate_unknown_and_failed_cases_fail_closed(self):
         for cases in ([], [{'id': 'unknown', 'passed': True}],
-                      [{'id': 'signing.http', 'passed': True}] * 2,
-                      [{'id': 'signing.http', 'passed': False}]):
+                      [{'id': 'signing.http.definition', 'passed': True}] * 2,
+                      [{'id': 'signing.http.definition', 'passed': False}]):
             with self.subTest(cases=cases):
                 docker = DockerBoundary()
                 docker.summary['cases'] = cases
@@ -455,29 +455,45 @@ fn warn_atproto_control_plane_config() {}
         self.assertFalse(result['complete'])
         self.assertEqual(docker.removed, [])
 
+    def test_all_transport_matrix_rows_are_mandatory_and_generic_slots_are_rejected(self):
+        names = (
+            'get_public_key', 'definition', 'entry', 'withdraw', 'result',
+            'contest_include', 'contest_exclude',
+            'denied_kind_0', 'denied_kind_1', 'denied_kind_4', 'denied_kind_21',
+            'denied_kind_22', 'denied_kind_44', 'denied_kind_1059',
+            'denied_kind_22242', 'denied_kind_27235', 'denied_kind_34235', 'denied_kind_34236',
+            'unmarked_31923', 'unmarked_1111', 'unmarked_1985',
+            'mismatched_contest_namespace', 'bad_embedded_snapshot',
+            'nip04_encrypt', 'nip04_decrypt', 'nip44_encrypt', 'nip44_decrypt',
+            'sign_canonical', 'nip17_wrap_batch', 'nip17_unwrap_batch',
+            'empty_policy_control', 'and_policy_control',
+        )
+        expected = {f'signing.{transport}.{name}' for transport in ('http', 'nip46') for name in names}
+        actual = [case for case in module.SUITE_CASE_IDS if case.startswith('signing.')]
+        self.assertEqual(set(actual), expected)
+        self.assertEqual(len(actual), 64)
+        self.assertEqual(len(module.REQUIRED_CASE_IDS), 71)
+        self.assertEqual(set(module.SUITE_CASE_IDS) - expected,
+                         {'consent.authorize', 'consent.refresh', 'management.creation-held'})
+        # An old aggregate cannot conceal a missing concrete transport row.
+        docker = DockerBoundary()
+        docker.summary['cases'] = [{'id': c, 'passed': True} for c in module.SUITE_CASE_IDS]
+        docker.summary['cases'][0]['id'] = 'signing.http'
+        result, _ = self.run_with(docker)
+        self.assertFalse(result.complete)
+        self.assertFalse(result.passed)
+
     def test_all_source_owned_cases_must_execute_and_cleanup_to_pass(self):
         docker = DockerBoundary()
-        docker.summary['cases'] = [
-            {'id': 'signing.http', 'passed': True},
-            {'id': 'signing.nip46', 'passed': True},
-            {'id': 'consent.authorize', 'passed': True},
-            {'id': 'consent.refresh', 'passed': True},
-            {'id': 'management.creation-held', 'passed': True},
-        ]
+        docker.summary['cases'] = [{'id': case, 'passed': True} for case in module.SUITE_CASE_IDS]
         result, _ = self.run_with(docker)
         self.assertTrue(result.complete)
         self.assertTrue(result.passed)
-        self.assertEqual(result.counts, {'expected': 9, 'executed': 9, 'passed': 9, 'failed': 0})
+        self.assertEqual(result.counts, {'expected': 71, 'executed': 71, 'passed': 71, 'failed': 0})
         self.data['evidence_dir'] = str(Path(self.temp.name) / 'failed-case')
         docker = DockerBoundary()
         docker.suite_exit_code = 1
-        docker.summary['cases'] = [
-            {'id': 'signing.http', 'passed': False},
-            {'id': 'signing.nip46', 'passed': True},
-            {'id': 'consent.authorize', 'passed': True},
-            {'id': 'consent.refresh', 'passed': True},
-            {'id': 'management.creation-held', 'passed': True},
-        ]
+        docker.summary['cases'] = [{'id': case, 'passed': case != 'signing.http.definition'} for case in module.SUITE_CASE_IDS]
         result, _ = self.run_with(docker)
         self.assertTrue(result.complete)
         self.assertFalse(result.passed)
@@ -489,17 +505,11 @@ fn warn_atproto_control_plane_config() {}
                 self.data['evidence_dir'] = str(Path(self.temp.name) / str(failed_case))
                 docker = DockerBoundary()
                 docker.suite_exit_code = 1
-                docker.summary['cases'] = [
-                    {'id': 'signing.http', 'passed': not failed_case},
-                    {'id': 'signing.nip46', 'passed': True},
-                    {'id': 'consent.authorize', 'passed': True},
-                    {'id': 'consent.refresh', 'passed': True},
-                    {'id': 'management.creation-held', 'passed': True},
-                ]
+                docker.summary['cases'] = [{'id': case, 'passed': case != 'signing.http.definition' or not failed_case} for case in module.SUITE_CASE_IDS]
                 result, _ = self.run_with(docker)
                 self.assertTrue(result.complete)
                 self.assertFalse(result.passed)
-                self.assertEqual(result.counts['executed'], 9)
+                self.assertEqual(result.counts['executed'], 71)
                 self.assertEqual(result.counts['failed'], int(failed_case))
                 self.assertEqual(dataclasses.asdict(result).get('suite_exit_code'), 1)
                 self.assertEqual(result.failure, 'suite_failed')
@@ -520,12 +530,12 @@ fn warn_atproto_control_plane_config() {}
 
     def test_incomplete_suite_does_not_discard_executed_case_evidence(self):
         docker = DockerBoundary()
-        docker.summary['cases'] = [{'id': 'signing.http', 'passed': True}]
+        docker.summary['cases'] = [{'id': 'signing.http.definition', 'passed': True}]
         docker.suite_exit_code = 1
         result, _ = self.run_with(docker)
         self.assertFalse(result.complete)
         self.assertFalse(result.passed)
-        self.assertIn('signing.http', result.executed_case_ids)
+        self.assertIn('signing.http.definition', result.executed_case_ids)
 
     def test_unexpected_image_environment_is_rejected_before_network(self):
         docker = DockerBoundary()
@@ -675,13 +685,7 @@ fn warn_atproto_control_plane_config() {}
 
     def test_cleanup_failed_full_suite_cannot_emit_passed_true(self):
         docker = DockerBoundary('cleanup')
-        docker.summary['cases'] = [
-            {'id': 'signing.http', 'passed': True},
-            {'id': 'signing.nip46', 'passed': True},
-            {'id': 'consent.authorize', 'passed': True},
-            {'id': 'consent.refresh', 'passed': True},
-            {'id': 'management.creation-held', 'passed': True},
-        ]
+        docker.summary['cases'] = [{'id': case, 'passed': True} for case in module.SUITE_CASE_IDS]
         result, _ = self.run_with(docker)
         self.assertTrue(result.complete)
         self.assertFalse(result.passed)

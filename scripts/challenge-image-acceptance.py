@@ -27,11 +27,24 @@ DIGEST = re.compile(r'sha256:[0-9a-f]{64}\Z')
 RESOURCE_ID = re.compile(r'[0-9a-f]{64}\Z')
 REFERENCE = re.compile(r'[a-z0-9][a-z0-9./:_-]*@sha256:[0-9a-f]{64}\Z')
 SHA = re.compile(r'[0-9a-f]{40}\Z')
-# Later acceptance slices extend this source contract, never a caller's RunSpec.
+# Source-owned matrix; callers cannot replace individual signing rows with an
+# aggregate. Consent/management IDs remain reserved for Task 4's real checks.
+SIGNING_CASE_NAMES = (
+    'get_public_key', 'definition', 'entry', 'withdraw', 'result',
+    'contest_include', 'contest_exclude',
+    'denied_kind_0', 'denied_kind_1', 'denied_kind_4', 'denied_kind_21',
+    'denied_kind_22', 'denied_kind_44', 'denied_kind_1059',
+    'denied_kind_22242', 'denied_kind_27235', 'denied_kind_34235', 'denied_kind_34236',
+    'unmarked_31923', 'unmarked_1111', 'unmarked_1985',
+    'mismatched_contest_namespace', 'bad_embedded_snapshot',
+    'nip04_encrypt', 'nip04_decrypt', 'nip44_encrypt', 'nip44_decrypt',
+    'sign_canonical', 'nip17_wrap_batch', 'nip17_unwrap_batch',
+    'empty_policy_control', 'and_policy_control',
+)
 REQUIRED_CASE_IDS = (
     'runtime.ownership', 'runtime.dependencies', 'runtime.migrations', 'runtime.health',
-    'signing.http', 'signing.nip46', 'consent.authorize', 'consent.refresh',
-    'management.creation-held',
+    *(f'signing.{transport}.{case}' for transport in ('http', 'nip46') for case in SIGNING_CASE_NAMES),
+    'consent.authorize', 'consent.refresh', 'management.creation-held',
 )
 SUITE_CASE_IDS = REQUIRED_CASE_IDS[4:]
 HOST_ENV = {'PATH': '/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin', 'LANG': 'C.UTF-8'}
