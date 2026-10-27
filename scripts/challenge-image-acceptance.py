@@ -692,7 +692,13 @@ def run_acceptance(spec: RunSpec, execute: Executor | None = None) -> Acceptance
             failure = 'incomplete_case_set'
     identity = asdict(spec)
     del identity['evidence_dir']
-    configuration = {'app_environment': APP_ENV, 'generated_server_key': True,
+    # Fingerprint only canonical nonsecret settings. DSNs, credentials and key
+    # material (including hashes of keys) are deliberately outside this input.
+    configuration = {'app_environment': {key: APP_ENV[key] for key in (
+                         'NODE_ENV', 'DISABLE_EMAILS', 'KMS_PROVIDER', 'USE_GCP_KMS',
+                         'MASTER_KEY_PATH', 'WEB_BUILD_DIR', 'APP_URL', 'ALLOWED_ORIGINS',
+                         'ALLOWED_TENANT_DOMAINS', 'BUNKER_RELAYS', 'SHOW_TEAMS_FUNCTIONALITY')},
+                     'generated_server_key': True,
                      'namespace': 'internal-postgres-owner', 'platform': 'linux/amd64',
                      'dependencies': spec.dependencies, 'required_cases': REQUIRED_CASE_IDS}
     fingerprint = hashlib.sha256(json.dumps(configuration, sort_keys=True, separators=(',', ':')).encode()).hexdigest()

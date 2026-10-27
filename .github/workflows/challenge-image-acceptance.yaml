@@ -1,0 +1,301 @@
+name: Challenge immutable image acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full current main commit SHA (40 lowercase hex characters)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  acceptance:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Require current main workflow and source identity before checkout or registry access
+        id: identity
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          e = os.environ
+          assert e['GITHUB_REPOSITORY'] == 'divinevideo/keycast'
+          assert e['GITHUB_EVENT_NAME'] == 'workflow_dispatch'
+          assert e['GITHUB_REF'] == 'refs/heads/main'
+          assert re.fullmatch('[0-9a-f]{40}', e['SOURCE_SHA'])
+          assert e['SOURCE_SHA'] == e['GITHUB_SHA'] == e['WORKFLOW_SHA']
+          assert e['GITHUB_WORKFLOW_REF'] == 'divinevideo/keycast/.github/workflows/challenge-image-acceptance.yaml@refs/heads/main'
+          PY
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.10
+      - name: Verify checkout, fetched main and clean tracked build inputs
+        id: source
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, subprocess
+          e = os.environ
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True, timeout=30).strip()
+          head = git('rev-parse', 'HEAD')
+          assert head == e['SOURCE_SHA'] == e['GITHUB_SHA'] == e['WORKFLOW_SHA']
+          assert not git('status', '--porcelain', '--untracked-files=no')
+          # checkout's authenticated full fetch has finished and removed credentials.
+          # A main advance between dispatch and fetch fails closed.
+          assert git('rev-parse', 'origin/main') == head
+          subprocess.run(['git', 'merge-base', '--is-ancestor', head, 'origin/main'], check=True, timeout=30)
+          root = pathlib.Path(e['RUNNER_TEMP'])
+          context = root / 'challenge-source'
+          context.mkdir(mode=0o700)
+          archive = subprocess.run(['git', 'archive', '--format=tar', head], check=True, capture_output=True, timeout=30).stdout
+          subprocess.run(['tar', '-xf', '-', '-C', str(context)], input=archive, check=True, timeout=30)
+          tracked = git('ls-files').splitlines()
+          hashes = {p: hashlib.sha256((context / p).read_bytes()).hexdigest() for p in tracked
+                    if p in ('Dockerfile', 'e2e/Dockerfile.acceptance', 'Cargo.lock', 'web/bun.lockb',
+                             'keycast-login/bun.lock', 'e2e/bun.lock', '.dockerignore',
+                             '.github/workflows/challenge-image-acceptance.yaml')}
+          fixture_policy = {p: hashlib.sha256((context / p).read_bytes()).hexdigest() for p in tracked
+              if p.startswith(('core/tests/fixtures/challenges/', 'core/src/custom_permissions/challenge'))
+                        or p in ('core/src/types/permission.rs', 'core/src/types/policy.rs')}
+          assert fixture_policy and len(hashes) == 8
+          record = dict(schema_version=1, source_sha=e['SOURCE_SHA'], github_sha=e['GITHUB_SHA'],
+              workflow_sha=e['WORKFLOW_SHA'], checkout_head=head, tooling_sha=head, tree=git('rev-parse', 'HEAD^{tree}'),
+              workflow_ref=e['GITHUB_WORKFLOW_REF'], event=e['GITHUB_EVENT_NAME'], ref=e['GITHUB_REF'],
+              workflow_run=int(e['GITHUB_RUN_ID']), workflow_attempt=int(e['GITHUB_RUN_ATTEMPT']),
+              input_hashes=hashes, fixture_policy_hashes=fixture_policy,
+              build_inputs=dict(platform='linux/amd64', context='git archive HEAD; tracked files only',
+                  release_dockerfile='Dockerfile', client_dockerfile='e2e/Dockerfile.acceptance', build_args={},
+                  cargo_locked=True, web_build='Normal Dockerfile Bun installs/build; not fully reproducible'))
+          (root / 'build-record.json').write_text(json.dumps(record, sort_keys=True))
+          PY
+      - uses: docker/setup-buildx-action@v3
+      - name: Authenticate only to existing candidate package
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # This is the only release build and the only pushed tag. Do not delete it
+      # or its referenced manifests/blobs until the release owner disposes of it.
+      - name: Build and preserve release index with provenance
+        id: release
+        uses: docker/build-push-action@v6
+        env:
+          BUILDX_METADATA_PROVENANCE: max
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+          DOCKER_BUILD_SUMMARY: "false"
+        with:
+          context: ${{ runner.temp }}/challenge-source
+          file: ${{ runner.temp }}/challenge-source/Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: mode=max
+          tags: ghcr.io/divinevideo/keycast:acceptance-${{ inputs.source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Build separate test tooling from identical clean source
+        id: client
+        uses: docker/build-push-action@v6
+        env:
+          BUILDX_METADATA_PROVENANCE: max
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+          DOCKER_BUILD_SUMMARY: "false"
+        with:
+          context: ${{ runner.temp }}/challenge-source
+          file: ${{ runner.temp }}/challenge-source/e2e/Dockerfile.acceptance
+          platforms: linux/amd64
+          load: true
+          push: false
+          labels: video.divine.keycast.role=test-tooling
+          provenance: false
+      - name: Resolve registry identities, pull dependencies and validate RunSpec before network creation
+        id: spec
+        env:
+          RELEASE_DIGEST: ${{ steps.release.outputs.digest }}
+          RELEASE_METADATA: ${{ steps.release.outputs.metadata }}
+          CLIENT_ID: ${{ steps.client.outputs.imageid }}
+          CLIENT_METADATA: ${{ steps.client.outputs.metadata }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, importlib.util, json, os, pathlib, re, subprocess, sys
+          root = pathlib.Path(os.environ['RUNNER_TEMP'])
+          def command(*args):
+              return subprocess.check_output(list(args), text=True, timeout=180)
+          def digest(value):
+              assert isinstance(value, str) and re.fullmatch('sha256:[0-9a-f]{64}', value)
+              return value
+          record = json.loads((root / 'build-record.json').read_text())
+          index_digest = digest(os.environ['RELEASE_DIGEST'])
+          image = 'ghcr.io/divinevideo/keycast@' + index_digest
+          def manifest(ref):
+              raw = command('docker', 'buildx', 'imagetools', 'inspect', ref, '--raw')
+              # Inspect emits a newline; the registry hashes the original JSON bytes.
+              expected = ref.rsplit('@', 1)[1]
+              assert any('sha256:' + hashlib.sha256(b).hexdigest() == expected
+                         for b in (raw.encode(), raw.rstrip('\n').encode()))
+              return json.loads(raw)
+          index = manifest(image)
+          assert index['mediaType'] == 'application/vnd.oci.image.index.v1+json'
+          platforms = [m for m in index['manifests'] if m.get('platform') == {'architecture': 'amd64', 'os': 'linux'}]
+          assert len(platforms) == 1
+          platform_digest = digest(platforms[0]['digest'])
+          attestations = [m for m in index['manifests'] if m.get('annotations', {}).get('vnd.docker.reference.type') == 'attestation-manifest'
+                          and m['annotations'].get('vnd.docker.reference.digest') == platform_digest]
+          assert attestations
+          platform = manifest('ghcr.io/divinevideo/keycast@' + platform_digest)
+          config_digest = digest(platform['config']['digest'])
+          attestation_manifests = {digest(m['digest']): manifest('ghcr.io/divinevideo/keycast@' + m['digest']) for m in attestations}
+          provenance = json.loads(command('docker', 'buildx', 'imagetools', 'inspect', image, '--format', '{{json .Provenance}}'))
+          release_metadata = json.loads(os.environ['RELEASE_METADATA'])
+          client_metadata = json.loads(os.environ['CLIENT_METADATA'])
+          assert release_metadata['containerimage.digest'] == index_digest
+          assert release_metadata['containerimage.config.digest'] == config_digest
+          def bases(value):
+              found = []
+              if isinstance(value, dict):
+                  for material in value.get('materials', []):
+                      if material.get('uri', '').startswith('pkg:docker/'):
+                          assert material.get('digest') and all(re.fullmatch('[0-9a-f]{64}', d) for d in material['digest'].values())
+                          found.append(material)
+                  for child in value.values():
+                      found.extend(bases(child))
+              elif isinstance(value, list):
+                  for child in value:
+                      found.extend(bases(child))
+              return found
+          release_bases, client_bases = bases([release_metadata, provenance]), bases(client_metadata)
+          assert release_bases and client_bases
+          command('docker', 'pull', '--platform', 'linux/amd64', image)
+          daemon_image_id = digest(json.loads(command('docker', 'image', 'inspect', image))[0]['Id'])
+          client_id = digest(os.environ['CLIENT_ID'])
+          client = json.loads(command('docker', 'image', 'inspect', client_id))[0]
+          assert client['Id'] == client_id and client['Architecture'] == 'amd64' and client['Os'] == 'linux'
+          assert client['Config']['Labels']['video.divine.keycast.role'] == 'test-tooling'
+          dependencies = {}
+          # Tags are discovery inputs only. RunSpec and every runtime invocation
+          # receive already-pulled digest references, never these tags.
+          for name, tag in {'postgres': 'postgres:16', 'redis': 'redis:7-alpine',
+                            'relay_builder': 'ghcr.io/verse-pbc/relay_builder:latest'}.items():
+              command('docker', 'pull', '--platform', 'linux/amd64', tag)
+              repo = tag.rsplit(':', 1)[0]
+              refs = json.loads(command('docker', 'image', 'inspect', tag))[0]['RepoDigests']
+              ref = next(r for r in refs if r.startswith(repo + '@'))
+              digest(ref.rsplit('@', 1)[1])
+              command('docker', 'pull', '--platform', 'linux/amd64', ref)
+              dependencies[name] = ref
+          loader = importlib.util.spec_from_file_location('acceptance', 'scripts/challenge-image-acceptance.py')
+          module = importlib.util.module_from_spec(loader); sys.modules[loader.name] = module; loader.loader.exec_module(module)
+          spec = dict(schema_version=1, source_sha=record['source_sha'], workflow_sha=record['workflow_sha'],
+              tooling_sha=record['tooling_sha'], workflow_run=record['workflow_run'], workflow_attempt=record['workflow_attempt'],
+              image_ref=image, platform_manifest_digest=platform_digest, registry_config_digest=config_digest,
+              daemon_image_id=daemon_image_id, test_client_image_id=client_id, dependencies=dependencies,
+              evidence_dir=str(root / 'challenge-runtime'))
+          module.RunSpec.from_dict(spec)
+          (root / 'run-spec.json').write_text(json.dumps(spec, sort_keys=True))
+          record.update(registry_index_digest=index_digest, candidate_tag='ghcr.io/divinevideo/keycast:acceptance-' + record['source_sha'] + '-' + str(record['workflow_run']) + '-' + str(record['workflow_attempt']),
+              registry_index=index, platform_manifest=platform, attestation_manifests=attestation_manifests,
+              provenance=provenance, release_buildx_metadata=release_metadata, client_buildx_metadata=client_metadata,
+              resolved_release_bases=release_bases, resolved_client_bases=client_bases,
+              preservation='Retain complete registry index and all platform/provenance manifests and blobs until explicit release-owner disposal')
+          assert hashlib.sha256((root / 'challenge-source/Cargo.lock').read_bytes()).hexdigest() == record['input_hashes']['Cargo.lock']
+          subprocess.run(['git', 'diff', '--exit-code', '--', 'Cargo.lock'], check=True, timeout=15)
+          (root / 'build-record.json').write_text(json.dumps(record, sort_keys=True))
+          PY
+      - name: Remove registry login before running test tooling
+        run: docker logout ghcr.io
+      - name: Execute exact preserved image acceptance
+        id: accept
+        run: python3 scripts/challenge-image-acceptance.py --spec "$RUNNER_TEMP/run-spec.json" > "$RUNNER_TEMP/acceptance-cli.json"
+      - name: Repeat bounded ownership cleanup, preserving the registry candidate
+        id: cleanup
+        if: always()
+        run: |
+          test -f "$RUNNER_TEMP/challenge-runtime/ownership.json"
+          python3 scripts/challenge-image-acceptance.py --cleanup "$RUNNER_TEMP/challenge-runtime/ownership.json" > "$RUNNER_TEMP/cleanup.json"
+      - name: Validate exact results and emit only allowlisted public evidence after cleanup
+        id: evidence
+        if: always()
+        env:
+          ACCEPT_OUTCOME: ${{ steps.accept.outcome }}
+          CLEANUP_OUTCOME: ${{ steps.cleanup.outcome }}
+        run: |
+          python3 - <<'PY'
+          import dataclasses, hashlib, importlib.util, json, os, pathlib, re, sys
+          root = pathlib.Path(os.environ['RUNNER_TEMP'])
+          loader = importlib.util.spec_from_file_location('acceptance', 'scripts/challenge-image-acceptance.py')
+          module = importlib.util.module_from_spec(loader); sys.modules[loader.name] = module; loader.loader.exec_module(module)
+          spec = json.loads((root / 'run-spec.json').read_text())
+          module.RunSpec.from_dict(spec)
+          result = json.loads((root / 'challenge-runtime/acceptance.json').read_text())
+          assert set(result) == {f.name for f in dataclasses.fields(module.AcceptanceResult)}
+          assert result['schema_version'] == 1
+          assert result['artifact_identity'] == {k: v for k, v in spec.items() if k != 'evidence_dir'}
+          expected = list(module.REQUIRED_CASE_IDS)
+          assert len(expected) == 106 and len(module.SUITE_CASE_IDS) == 102
+          assert result['expected_case_ids'] == expected
+          assert result['executed_case_ids'] == expected
+          assert result['counts'] == dict(expected=106, executed=106, passed=106, failed=0)
+          assert all(type(v) is int for v in result['counts'].values())
+          assert result['complete'] is True and result['passed'] is True
+          assert type(result['suite_exit_code']) is int and result['suite_exit_code'] == 0
+          assert result['failure'] is None
+          def clean(value):
+              assert set(value) == {'complete', 'removed', 'failed'}
+              assert value['complete'] is True and type(value['failed']) is int and value['failed'] == 0
+              assert type(value['removed']) is int and value['removed'] >= 0
+          clean(result['cleanup'])
+          final = json.loads((root / 'cleanup.json').read_text())
+          assert set(final) == {'schema_version', 'cleanup'} and final['schema_version'] == 1
+          clean(final['cleanup'])
+          assert os.environ['ACCEPT_OUTCOME'] == os.environ['CLEANUP_OUTCOME'] == 'success'
+          assert re.fullmatch('[0-9a-f]{64}', result['configuration_fingerprint'])
+          record = json.loads((root / 'build-record.json').read_text())
+          assert all(record[key] == spec['source_sha'] for key in (
+              'source_sha', 'github_sha', 'workflow_sha', 'checkout_head', 'tooling_sha'))
+          assert record['workflow_run'] == spec['workflow_run'] and record['workflow_attempt'] == spec['workflow_attempt']
+          assert record['ref'] == 'refs/heads/main' and record['event'] == 'workflow_dispatch'
+          assert record['workflow_ref'] == 'divinevideo/keycast/.github/workflows/challenge-image-acceptance.yaml@refs/heads/main'
+          settings = {key: module.APP_ENV[key] for key in (
+              'NODE_ENV', 'DISABLE_EMAILS', 'KMS_PROVIDER', 'USE_GCP_KMS', 'MASTER_KEY_PATH', 'WEB_BUILD_DIR',
+              'APP_URL', 'ALLOWED_ORIGINS', 'ALLOWED_TENANT_DOMAINS', 'BUNKER_RELAYS', 'SHOW_TEAMS_FUNCTIONALITY')}
+          configuration = dict(settings=settings, dependencies=spec['dependencies'],
+              fixture_policy_hashes=record['fixture_policy_hashes'], runner_fingerprint=result['configuration_fingerprint'],
+              substitutions=['owned ephemeral stores and relay', 'file KMS', 'generated synthetic identities', 'loopback origin', 'single instance'])
+          fingerprint = hashlib.sha256(json.dumps(configuration, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+          # Explicit mapping; never copy subprocess output, credentials, DSNs,
+          # ownership journals, browser reports or private-key hashes.
+          summary = {key: result[key] for key in ('schema_version', 'complete', 'passed', 'configuration_fingerprint',
+              'expected_case_ids', 'executed_case_ids', 'counts', 'suite_exit_code', 'cleanup', 'failure')}
+          summary['final_cleanup'] = final['cleanup']
+          artifact = dict(schema_version=1, run_spec=spec, build=record,
+              configuration=configuration, configuration_fingerprint=fingerprint,
+              evidence_scope='Isolated predeploy image acceptance; production enforcement remains unproven')
+          public = root / 'challenge-public'
+          public.mkdir(mode=0o700, exist_ok=True)
+          for name, data in (('summary.json', summary), ('artifact.json', artifact)):
+              module.write_json(public / name, data)
+          PY
+      - name: Retain only sanitized evidence
+        if: always() && steps.evidence.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: challenge-image-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/challenge-public/summary.json
+            ${{ runner.temp }}/challenge-public/artifact.json
+          retention-days: 90
+          if-no-files-found: error

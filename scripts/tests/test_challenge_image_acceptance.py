@@ -1,5 +1,8 @@
 """Pure Docker-boundary contracts: no daemon, credentials or services are used."""
+import copy
 import dataclasses
+import hashlib
+import re
 import importlib.util
 import json
 import os
@@ -196,6 +199,26 @@ class AcceptanceContracts(unittest.TestCase):
         boundary = boundary or DockerBoundary()
         return module.run_acceptance(module.RunSpec.from_dict(self.data), boundary), boundary
 
+    def test_fingerprint_allowlist_excludes_dsns_credentials_and_private_key_hashes(self):
+        baseline, _ = self.run_with()
+        self.data['evidence_dir'] = str(Path(self.temp.name) / 'changed')
+        altered = {**module.APP_ENV, 'DATABASE_URL': 'postgres://synthetic:secret@foreign/db',
+                   'REDIS_URL': 'redis://synthetic:secret@foreign',
+                   'SERVER_NSEC': 'private-key', 'PRIVATE_KEY_HASH': 'private-key-hash',
+                   'AWS_SECRET_ACCESS_KEY': 'credential'}
+        digest = hashlib.sha256
+        with patch.object(module, 'APP_ENV', altered), patch.object(module.hashlib, 'sha256', wraps=digest) as hashing:
+            changed, _ = self.run_with()
+        serialized = next(c.args[0] for c in hashing.call_args_list if b'app_environment' in c.args[0])
+        settings = json.loads(serialized)['app_environment']
+        self.assertEqual(set(settings), {'NODE_ENV', 'DISABLE_EMAILS', 'KMS_PROVIDER', 'USE_GCP_KMS',
+            'MASTER_KEY_PATH', 'WEB_BUILD_DIR', 'APP_URL', 'ALLOWED_ORIGINS', 'ALLOWED_TENANT_DOMAINS',
+            'BUNKER_RELAYS', 'SHOW_TEAMS_FUNCTIONALITY'})
+        self.assertEqual(changed.configuration_fingerprint, baseline.configuration_fingerprint)
+        self.assertNotIn(b'secret', serialized)
+        self.assertNotIn(b'private-key', serialized)
+        self.assertEqual(module.APP_ENV['DATABASE_URL'], module.DATABASE_URL)
+
     def test_tmpfs_hostconfig_shape_and_nullable_mount_absence_reach_suite(self):
         docker = DockerBoundary()
         original = docker.__class__.__call__
@@ -282,7 +305,8 @@ fn warn_atproto_control_plane_config() {}
         self.assertIsNotNone(compiler, 'actual startup-gate regression requires the Rust toolchain')
         compiled = subprocess.run([compiler, '--edition=2021', '--crate-name', 'acceptance_startup_gates',
                                    str(source), '-o', str(executable)],
-                                  env={'HOME': str(Path.home()), 'PATH': os.defpath},
+                                  env={**{k: os.environ[k] for k in ('RUSTUP_HOME', 'CARGO_HOME', 'RUSTUP_TOOLCHAIN') if k in os.environ},
+                                       'HOME': str(Path.home()), 'PATH': os.environ.get('PATH', os.defpath)},
                                   capture_output=True, text=True, timeout=30)
         self.assertEqual(compiled.returncode, 0, compiled.stderr)
         _, docker = self.run_with()
@@ -752,6 +776,305 @@ fn warn_atproto_control_plane_config() {}
         self.assertNotEqual(child.returncode, 0)
         self.assertNotIn('PRIVATE CHILD BODY', child.stdout + child.stderr)
         self.assertNotIn('"passed": true', child.stdout)
+
+
+ROOT = RUNNER.parent.parent
+PYTHON_CONTRACT = "python3 -m unittest discover -s scripts/tests -p 'test_challenge_image_acceptance.py' -v"
+
+
+def workflow_file(name):
+    path = ROOT / '.github/workflows' / name
+    if not path.exists():
+        raise AssertionError(f'missing workflow contract: {name}')
+    result = subprocess.run(['bun', '-e',
+        'process.stdout.write(JSON.stringify(Bun.YAML.parse(await Bun.stdin.text())))'],
+        input=path.read_text(), capture_output=True, text=True, timeout=15)
+    if result.returncode:
+        raise AssertionError(result.stderr)
+    return json.loads(result.stdout)
+
+
+class WorkflowContracts(unittest.TestCase):
+    def check_workflow(self, workflow, publishing):
+        self.assertEqual(set(workflow), {'name', 'on', 'permissions', 'jobs'})
+        self.assertEqual(workflow['permissions'], {'contents': 'read', **({'packages': 'write'} if publishing else {})})
+        self.assertEqual(set(workflow['on']), {'workflow_dispatch'} if publishing else {'pull_request'})
+        if not publishing:
+            self.assertEqual(workflow['on']['pull_request'], {'branches': ['main']})
+        else:
+            self.assertEqual(workflow['on']['workflow_dispatch']['inputs']['source_sha'],
+                {'description': 'Full current main commit SHA (40 lowercase hex characters)', 'required': True, 'type': 'string'})
+        self.assertEqual(set(workflow['jobs']), {'acceptance' if publishing else 'contracts'})
+        job = next(iter(workflow['jobs'].values()))
+        self.assertEqual(set(job), {'runs-on', 'timeout-minutes', 'steps'} | ({'if'} if publishing else set()))
+        self.assertEqual(job['runs-on'], 'ubuntu-24.04')
+        self.assertTrue(type(job['timeout-minutes']) is int and 0 < job['timeout-minutes'] <= 60)
+        for forbidden in ('services', 'environment', 'permissions', 'uses', 'continue-on-error'):
+            self.assertNotIn(forbidden, job)
+        steps = job['steps']
+        checkouts = [s for s in steps if s.get('uses', '').startswith('actions/checkout@')]
+        self.assertEqual(len(checkouts), 1)
+        self.assertEqual(checkouts[0]['with']['persist-credentials'], False)
+        uses = [s.get('uses') for s in steps if 'uses' in s]
+        allowed = {'actions/checkout@v6', 'oven-sh/setup-bun@v2', 'actions-rust-lang/setup-rust-toolchain@v1'}
+        if publishing:
+            allowed |= {'docker/setup-buildx-action@v3', 'docker/build-push-action@v6', 'docker/login-action@v3', 'actions/upload-artifact@v4'}
+        self.assertTrue(set(uses) <= allowed)
+        self.assertEqual(uses, ['actions/checkout@v6', 'oven-sh/setup-bun@v2',
+            *(['docker/setup-buildx-action@v3', 'docker/login-action@v3', 'docker/build-push-action@v6',
+               'docker/build-push-action@v6', 'actions/upload-artifact@v4'] if publishing else ['actions-rust-lang/setup-rust-toolchain@v1'])])
+        for step in steps:
+            self.assertNotIn('continue-on-error', step)
+            self.assertNotIn('services', step)
+            text = json.dumps(step)
+            self.assertIsNone(re.search(r'cloudbuild|build-test-push|bun run deploy|gcloud|id-token|repository_dispatch|gh workflow|IAM|secrets\.(?!GITHUB_TOKEN)', text, re.I))
+        bun = next(s for s in steps if s.get('uses') == 'oven-sh/setup-bun@v2')
+        self.assertEqual(bun['with'], {'bun-version': '1.3.10'})
+        if not publishing:
+            self.assertEqual(next(s['with'] for s in steps if s.get('uses') == 'actions-rust-lang/setup-rust-toolchain@v1'), {'toolchain': '1.93.0'})
+            self.assertEqual([s['run'] for s in steps if 'run' in s],
+                [PYTHON_CONTRACT, 'bun install --frozen-lockfile', 'bun test helpers/challenge-image.test.ts'])
+            self.assertEqual([s.get('working-directory') for s in steps if 'run' in s], [None, 'e2e', 'e2e'])
+            self.assertFalse(any('if' in s or 'env' in s for s in steps))
+            return
+        self.assertEqual(job['if'], "github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'")
+        by_id = {s['id']: s for s in steps if 'id' in s}
+        for ident in ('identity', 'source', 'release', 'client', 'spec', 'accept', 'cleanup', 'evidence'):
+            self.assertIn(ident, by_id)
+        order = [s.get('id', s.get('uses')) for s in steps]
+        self.assertLess(order.index('identity'), order.index('actions/checkout@v6'))
+        self.assertLess(order.index('source'), order.index('docker/login-action@v3'))
+        self.assertEqual(checkouts[0]['with']['ref'], '${{ inputs.source_sha }}')
+        self.assertEqual(checkouts[0]['with']['fetch-depth'], 0)
+        for ident in ('release', 'client'):
+            self.assertEqual(by_id[ident]['env'], {'BUILDX_METADATA_PROVENANCE': 'max',
+                'DOCKER_BUILD_RECORD_UPLOAD': 'false', 'DOCKER_BUILD_SUMMARY': 'false'})
+        release = by_id['release']['with']
+        self.assertEqual(release, {'context': '${{ runner.temp }}/challenge-source', 'file': '${{ runner.temp }}/challenge-source/Dockerfile',
+            'platforms': 'linux/amd64', 'push': True, 'provenance': 'mode=max',
+            'tags': 'ghcr.io/divinevideo/keycast:acceptance-${{ inputs.source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}'})
+        self.assertEqual(by_id['client']['with'], {'context': '${{ runner.temp }}/challenge-source',
+            'file': '${{ runner.temp }}/challenge-source/e2e/Dockerfile.acceptance', 'platforms': 'linux/amd64',
+            'load': True, 'push': False, 'labels': 'video.divine.keycast.role=test-tooling', 'provenance': False})
+        self.assertEqual([s.get('id') for s in steps if 'run' in s], ['identity', 'source', 'spec', None, 'accept', 'cleanup', 'evidence'])
+        self.assertEqual(next(s['run'] for s in steps if 'run' in s and 'id' not in s), 'docker logout ghcr.io')
+        self.assertFalse(any('if' in by_id[k] for k in ('identity', 'source', 'release', 'client', 'spec', 'accept')))
+        self.assertEqual(by_id['accept']['run'], 'python3 scripts/challenge-image-acceptance.py --spec "$RUNNER_TEMP/run-spec.json" > "$RUNNER_TEMP/acceptance-cli.json"')
+        self.assertEqual(by_id['cleanup']['if'], 'always()')
+        self.assertEqual(by_id['evidence']['if'], 'always()')
+        self.assertLess(order.index('cleanup'), order.index('evidence'))
+        uploads = [s for s in steps if s.get('uses') == 'actions/upload-artifact@v4']
+        self.assertEqual(len(uploads), 1)
+        self.assertEqual(uploads[0]['with']['path'].splitlines(),
+            ['${{ runner.temp }}/challenge-public/summary.json', '${{ runner.temp }}/challenge-public/artifact.json'])
+        self.assertEqual(uploads[0]['with']['retention-days'], 90)
+        self.assertEqual(uploads[0]['with']['if-no-files-found'], 'error')
+        self.assertEqual(uploads[0]['if'], 'always() && steps.evidence.outcome == \'success\'')
+
+    def test_read_only_pr_workflow_semantics(self):
+        self.check_workflow(workflow_file('challenge-image-contracts.yaml'), False)
+
+    def test_manual_candidate_workflow_semantics(self):
+        self.check_workflow(workflow_file('challenge-image-acceptance.yaml'), True)
+
+    def test_workflow_mutations_fail_closed(self):
+        original = workflow_file('challenge-image-acceptance.yaml')
+        mutations = [lambda w: w['on'].update(push={}), lambda w: w['permissions'].update({'id-token': 'write'}),
+            lambda w: w['jobs']['acceptance'].update(services={}), lambda w: w['jobs']['acceptance'].update({'if': 'true'}),
+            lambda w: w['jobs']['acceptance']['steps'].append({'run': 'gcloud builds submit --config cloudbuild.yaml'}),
+            lambda w: w['jobs']['acceptance']['steps'].append({'run': 'gh workflow run build-test-push.yaml'}),
+            lambda w: w['jobs']['acceptance']['steps'].append({'run': 'echo ${{ secrets.PRODUCTION_KEY }}'}),
+            lambda w: next(s for s in w['jobs']['acceptance']['steps'] if s.get('id') == 'accept').update({'continue-on-error': True}),
+            lambda w: next(s for s in w['jobs']['acceptance']['steps'] if s.get('uses') == 'actions/upload-artifact@v4')['with'].update(path='${{ runner.temp }}/**'),
+            lambda w: next(s for s in w['jobs']['acceptance']['steps'] if s.get('id') == 'release')['with'].update(tags='ghcr.io/divinevideo/keycast:latest')]
+        for i, mutate in enumerate(mutations):
+            with self.subTest(mutation=i):
+                changed = copy.deepcopy(original)
+                mutate(changed)
+                with self.assertRaises(AssertionError):
+                    self.check_workflow(changed, True)
+
+    def test_pr_mutations_cannot_add_credentials_or_skip_contracts(self):
+        original = workflow_file('challenge-image-contracts.yaml')
+        for mutate in (lambda w: w.update(env={'TOKEN': '${{ secrets.GITHUB_TOKEN }}'}),
+            lambda w: w['jobs']['contracts'].update(services={}),
+            lambda w: w['jobs']['contracts']['steps'][-1].update({'if': 'false'}),
+            lambda w: w['jobs']['contracts']['steps'].append({'uses': 'docker/login-action@v3'}),
+            lambda w: w['permissions'].update(packages='write')):
+            changed = copy.deepcopy(original); mutate(changed)
+            with self.assertRaises(AssertionError):
+                self.check_workflow(changed, False)
+
+    def inline_python(self, ident):
+        steps = workflow_file('challenge-image-acceptance.yaml')['jobs']['acceptance']['steps']
+        script = next(s['run'] for s in steps if s.get('id') == ident)
+        self.assertTrue(script.startswith("python3 - <<'PY'\n"))
+        return script.split('\n', 1)[1].rsplit('\nPY', 1)[0]
+
+    def test_identity_script_rejects_nonmain_mismatches_and_untrusted_workflow_path(self):
+        code = self.inline_python('identity')
+        baseline = {'SOURCE_SHA': '1' * 40, 'GITHUB_SHA': '1' * 40, 'WORKFLOW_SHA': '1' * 40,
+            'GITHUB_REF': 'refs/heads/main', 'GITHUB_EVENT_NAME': 'workflow_dispatch',
+            'GITHUB_WORKFLOW_REF': 'divinevideo/keycast/.github/workflows/challenge-image-acceptance.yaml@refs/heads/main',
+            'GITHUB_REPOSITORY': 'divinevideo/keycast'}
+        for override in ({}, {'GITHUB_REF': 'refs/heads/topic'}, {'GITHUB_SHA': '2' * 40}, {'WORKFLOW_SHA': '2' * 40},
+            {'SOURCE_SHA': 'main'}, {'GITHUB_EVENT_NAME': 'pull_request'}, {'GITHUB_WORKFLOW_REF': baseline['GITHUB_WORKFLOW_REF'].replace('@refs/heads/main', '@refs/heads/topic')}):
+            result = subprocess.run([sys.executable, '-c', code], env={**os.environ, **baseline, **override}, capture_output=True, timeout=5)
+            self.assertEqual(result.returncode == 0, not override, override)
+
+    def test_source_script_rejects_dirty_mismatched_or_advanced_main_and_excludes_ignored_files(self):
+        code = self.inline_python('source')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / 'repo'; repo.mkdir()
+            def git(*args):
+                return subprocess.check_output(['git', *args], cwd=repo, text=True,
+                    env={**os.environ, 'GIT_AUTHOR_NAME': 'Synthetic', 'GIT_AUTHOR_EMAIL': 'synthetic@example.test',
+                         'GIT_COMMITTER_NAME': 'Synthetic', 'GIT_COMMITTER_EMAIL': 'synthetic@example.test'}, timeout=10).strip()
+            git('init', '-q')
+            for name in ('Dockerfile', 'e2e/Dockerfile.acceptance', 'Cargo.lock', 'web/bun.lockb', 'keycast-login/bun.lock',
+                'e2e/bun.lock', '.dockerignore', '.github/workflows/challenge-image-acceptance.yaml',
+                'core/tests/fixtures/challenges/v1/events.json'):
+                file = repo / name; file.parent.mkdir(parents=True, exist_ok=True); file.write_text('synthetic')
+            (repo / '.gitignore').write_text('ignored-local-secret\n')
+            git('add', '.'); git('commit', '-qm', 'synthetic source')
+            head = git('rev-parse', 'HEAD'); git('update-ref', 'refs/remotes/origin/main', head)
+            (repo / 'ignored-local-secret').write_text('PRIVATE CHILD BODY')
+            baseline = {'SOURCE_SHA': head, 'GITHUB_SHA': head, 'WORKFLOW_SHA': head,
+                'GITHUB_WORKFLOW_REF': 'divinevideo/keycast/.github/workflows/challenge-image-acceptance.yaml@refs/heads/main',
+                'GITHUB_EVENT_NAME': 'workflow_dispatch', 'GITHUB_REF': 'refs/heads/main',
+                'GITHUB_RUN_ID': '123', 'GITHUB_RUN_ATTEMPT': '1'}
+            for i, overrides in enumerate(({}, {'SOURCE_SHA': '2' * 40}, {'WORKFLOW_SHA': '2' * 40})):
+                temp = root / str(i); temp.mkdir()
+                result = subprocess.run([sys.executable, '-c', code], cwd=repo,
+                    env={**os.environ, **baseline, **overrides, 'RUNNER_TEMP': str(temp)}, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode == 0, not overrides)
+                if not overrides:
+                    self.assertFalse((temp / 'challenge-source/ignored-local-secret').exists())
+                    self.assertEqual(json.loads((temp / 'build-record.json').read_text())['checkout_head'], head)
+            (repo / 'Cargo.lock').write_text('dirty')
+            result = subprocess.run([sys.executable, '-c', code], cwd=repo,
+                env={**os.environ, **baseline, 'RUNNER_TEMP': str(root)}, capture_output=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            git('checkout', '--', 'Cargo.lock')
+            (repo / 'Dockerfile').write_text('advanced')
+            git('add', 'Dockerfile'); git('commit', '-qm', 'synthetic advance')
+            git('update-ref', 'refs/remotes/origin/main', git('rev-parse', 'HEAD'))
+            git('checkout', '-q', head)
+            result = subprocess.run([sys.executable, '-c', code], cwd=repo,
+                env={**os.environ, **baseline, 'RUNNER_TEMP': str(root)}, capture_output=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_spec_adapter_preserves_index_platform_config_and_same_daemon_identity(self):
+        code = self.inline_python('spec')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'challenge-source').mkdir(); (root / 'challenge-source/Cargo.lock').write_text('synthetic lock')
+            record = dict(source_sha='1' * 40, workflow_sha='1' * 40, tooling_sha='1' * 40,
+                workflow_run=123, workflow_attempt=1, input_hashes={'Cargo.lock': hashlib.sha256(b'synthetic lock').hexdigest()})
+            def raw(data):
+                value = json.dumps(data)
+                return 'sha256:' + hashlib.sha256(value.encode()).hexdigest(), value + '\n'
+            platform_digest, platform_raw = raw({'config': {'digest': DIGEST}})
+            attestation_digest, attestation_raw = raw({'config': {'digest': DEP_ID}, 'layers': [{'digest': DIGEST}]})
+            index_digest, index_raw = raw({'mediaType': 'application/vnd.oci.image.index.v1+json', 'manifests': [
+                {'digest': platform_digest, 'platform': {'architecture': 'amd64', 'os': 'linux'}},
+                {'digest': attestation_digest, 'annotations': {'vnd.docker.reference.type': 'attestation-manifest', 'vnd.docker.reference.digest': platform_digest}}]})
+            metadata = {'containerimage.digest': index_digest, 'containerimage.config.digest': DIGEST, 'buildx.build.provenance': {'materials': [{'uri': 'pkg:docker/synthetic@1', 'digest': {'sha256': 'a' * 64}}]}}
+            calls = []
+            def docker(args, **_kwargs):
+                calls.append(args)
+                self.assertEqual(args[0], 'docker')
+                if args[1:4] == ['buildx', 'imagetools', 'inspect']:
+                    if '--format' in args:
+                        return json.dumps(metadata)
+                    return {index_digest: index_raw, platform_digest: platform_raw,
+                            attestation_digest: attestation_raw}[args[4].rsplit('@', 1)[1]]
+                if args[1] == 'pull':
+                    return ''
+                if args[1:3] == ['image', 'inspect']:
+                    ref = args[-1]
+                    if ref == CLIENT_ID:
+                        return json.dumps([{'Id': CLIENT_ID, 'Architecture': 'amd64', 'Os': 'linux',
+                                            'Config': {'Labels': {'video.divine.keycast.role': 'test-tooling'}}}])
+                    if ref.startswith('ghcr.io/divinevideo/keycast@'):
+                        return json.dumps([{'Id': DAEMON_ID}])
+                    return json.dumps([{'RepoDigests': [ref.rsplit(':', 1)[0] + '@' + DEP_ID]}])
+                raise AssertionError(args)
+            environment = {'RUNNER_TEMP': directory, 'RELEASE_DIGEST': index_digest, 'CLIENT_ID': CLIENT_ID,
+                'RELEASE_METADATA': json.dumps(metadata), 'CLIENT_METADATA': json.dumps(metadata)}
+            for changed in (False, True):
+                (root / 'build-record.json').write_text(json.dumps(record))
+                with patch.dict(os.environ, {**environment, **({'RELEASE_DIGEST': 'latest'} if changed else {})}), \
+                    patch('subprocess.check_output', side_effect=docker), patch('subprocess.run'):
+                    if changed:
+                        with self.assertRaises(AssertionError):
+                            exec(compile(code, '<workflow-spec>', 'exec'), {})
+                    else:
+                        exec(compile(code, '<workflow-spec>', 'exec'), {})
+                        spec = json.loads((root / 'run-spec.json').read_text())
+                        self.assertEqual(spec['image_ref'], 'ghcr.io/divinevideo/keycast@' + index_digest)
+                        self.assertEqual(spec['platform_manifest_digest'], platform_digest)
+                        self.assertEqual(spec['registry_config_digest'], DIGEST)
+                        self.assertEqual(spec['daemon_image_id'], DAEMON_ID)
+                        self.assertNotEqual(spec['daemon_image_id'], spec['registry_config_digest'])
+                        self.assertTrue(all('@sha256:' in ref for ref in spec['dependencies'].values()))
+                        self.assertEqual(json.loads((root / 'build-record.json').read_text())['registry_index']['manifests'][1]['digest'], attestation_digest)
+            self.assertFalse(any(args[1:3] == ['network', 'create'] for args in calls))
+
+    def test_sanitized_evidence_requires_exact_cases_exit_and_cleanup(self):
+        code = self.inline_python('evidence')
+        # Execute the actual publishing adapter with synthetic Task 1 outputs.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = spec_dict(root / 'challenge-runtime')
+            identity = {k: v for k, v in spec.items() if k != 'evidence_dir'}
+            result = dict(schema_version=1, complete=True, passed=True, artifact_identity=identity,
+                configuration_fingerprint='a' * 64, expected_case_ids=list(module.REQUIRED_CASE_IDS),
+                executed_case_ids=list(module.REQUIRED_CASE_IDS), counts={'expected': 106, 'executed': 106, 'passed': 106, 'failed': 0},
+                suite_exit_code=0, cleanup={'complete': True, 'removed': 6, 'failed': 0}, failure=None)
+            (root / 'challenge-runtime').mkdir()
+            (root / 'run-spec.json').write_text(json.dumps(spec))
+            (root / 'build-record.json').write_text(json.dumps({'schema_version': 1,
+                **{key: '1' * 40 for key in ('source_sha', 'github_sha', 'workflow_sha', 'checkout_head', 'tooling_sha')},
+                'workflow_run': 123, 'workflow_attempt': 1, 'ref': 'refs/heads/main', 'event': 'workflow_dispatch',
+                'workflow_ref': 'divinevideo/keycast/.github/workflows/challenge-image-acceptance.yaml@refs/heads/main',
+                'fixture_policy_hashes': {'synthetic': 'a' * 64}}))
+            (root / 'cleanup.json').write_text(json.dumps({'schema_version': 1, 'cleanup': result['cleanup']}))
+            for name, mutate in [('valid', lambda r: None), ('empty', lambda r: r.update(executed_case_ids=[])),
+                ('alias', lambda r: r['executed_case_ids'].__setitem__(4, 'signing.http')),
+                ('duplicate', lambda r: r['executed_case_ids'].append(r['executed_case_ids'][0])),
+                ('expected', lambda r: r.update(expected_case_ids=['signing.http'])),
+                ('skipped', lambda r: r.update(skipped=1)), ('failed', lambda r: r['counts'].update(failed=1)),
+                ('exit', lambda r: r.update(suite_exit_code=1)), ('cleanup', lambda r: r['cleanup'].update(complete=False)),
+                ('before-complete', lambda r: r.update(complete=False)), ('mismatch', lambda r: r['artifact_identity'].update(tooling_sha='2' * 40)),
+                ('secret', lambda r: r.update(raw_log='PRIVATE CHILD BODY'))]:
+                altered = copy.deepcopy(result)
+                mutate(altered)
+                (root / 'challenge-runtime/acceptance.json').write_text(json.dumps(altered))
+                process = subprocess.run([sys.executable, '-c', code], cwd=ROOT,
+                    env={**os.environ, 'RUNNER_TEMP': directory, 'ACCEPT_OUTCOME': 'success', 'CLEANUP_OUTCOME': 'success'},
+                    capture_output=True, timeout=5)
+                self.assertEqual(process.returncode == 0, name == 'valid', (name, process.stderr))
+                if name == 'valid':
+                    summary = json.loads((root / 'challenge-public/summary.json').read_text())
+                    artifact = json.loads((root / 'challenge-public/artifact.json').read_text())
+                    self.assertEqual(summary['executed_case_ids'], list(module.REQUIRED_CASE_IDS))
+                    self.assertEqual(summary['suite_exit_code'], 0)
+                    self.assertTrue(summary['cleanup']['complete'])
+                    self.assertEqual(artifact['run_spec'], spec)
+                    self.assertNotIn('PRIVATE CHILD BODY', json.dumps([summary, artifact]))
+            # A separate failed final cleanup must block even if the runner had succeeded.
+            (root / 'challenge-runtime/acceptance.json').write_text(json.dumps(result))
+            (root / 'cleanup.json').write_text(json.dumps({'schema_version': 1, 'cleanup': {'complete': False, 'removed': 0, 'failed': 1}}))
+            process = subprocess.run([sys.executable, '-c', code], cwd=ROOT,
+                env={**os.environ, 'RUNNER_TEMP': directory, 'ACCEPT_OUTCOME': 'success', 'CLEANUP_OUTCOME': 'success'}, capture_output=True, timeout=5)
+            self.assertNotEqual(process.returncode, 0)
+            (root / 'cleanup.json').write_text(json.dumps({'schema_version': 1, 'cleanup': result['cleanup']}))
+            for outcome in ('skipped', 'failure', ''):
+                process = subprocess.run([sys.executable, '-c', code], cwd=ROOT,
+                    env={**os.environ, 'RUNNER_TEMP': directory, 'ACCEPT_OUTCOME': outcome, 'CLEANUP_OUTCOME': 'success'}, capture_output=True, timeout=5)
+                self.assertNotEqual(process.returncode, 0)
 
 
 if __name__ == '__main__':

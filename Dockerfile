@@ -17,8 +17,8 @@ COPY ./database/migrations ./database/migrations
 COPY ./Cargo.toml ./Cargo.toml
 COPY ./Cargo.lock ./Cargo.lock
 
-RUN cargo build --release --bin keycast
-RUN cargo build --release --example migrate-vine-users
+RUN cargo build --locked --release --bin keycast
+RUN cargo build --locked --release --example migrate-vine-users
 
 # Build stage for Bun frontend
 FROM oven/bun:1 AS web-builder
