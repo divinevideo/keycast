@@ -74,6 +74,65 @@ nonempty exact permission link to `challenge_actions` with `{}` configuration. B
 consumers, verify that link and the exact `policy:challenges` scope; consumers must never widen
 it to `policy:full` as a fallback.
 
+## Read-only linked permission audit tool
+
+Build the standalone tool from the exact source revision being evaluated:
+
+```sh
+cargo build --locked -p keycast_core --example audit_policy_permissions
+```
+
+After separate authorization for the target database, supply its connection through
+`KEYCAST_PERMISSION_AUDIT_DATABASE_URL` using the approved connection workflow, then run:
+
+```sh
+./target/debug/examples/audit_policy_permissions --audit-linked-permissions-read-only
+```
+
+The flag and dedicated environment variable are required. The tool does not load `.env`,
+`DATABASE_URL`, the server, migrations, keys, authorizations, KMS or Redis. This invocation
+is tooling guidance, not authorization to access production. A local pass is not Stage 1
+release acceptance or production-data evidence.
+
+A dedicated SQLx pool has one connection and a five-second acquisition timeout. Before
+reading data, it begins an explicit repeatable-read, read-only transaction, sets local
+15-second statement, two-second lock and 30-second idle transaction timeouts, and checks
+server-reported `transaction_read_only` and isolation. The whole invocation has a 60-second
+async timeout. It rolls back after the audit. Only `public.policy_permissions` and
+`public.permissions` are queried; no policy names, account or key tables are read.
+
+One snapshot supplies linked-policy, link and distinct-permission counts and server-side
+encoded byte lengths. Before fetching any identifier/config text, it rejects more than 10,000
+links or distinct permissions, more than 8 MiB total identifier/config text, or more than
+256 KiB for any one identifier/config pair. These fixed conservative budgets have no CLI
+override. A budget/timeout/database error or incomplete link set exits nonzero without an
+audit report; it never reports success for a truncated set. Larger datasets need a separately
+reviewed bounded audit approach. The row query also has a limit of 10,001 and its returned
+count must match the snapshot's distinct-permission count.
+
+Each distinct linked permission is decoded through `JsonConfig::try_from`, converted by
+`Permission::to_custom_permission`, and passed through the same `.display()` conversion as
+consent. Shared permissions are counted once; malformed unlinked permissions are excluded.
+Policies without links retain their unrestricted semantics and contribute no linked rows.
+Null or missing permission references fail the audit. The tool does not validate policy
+behavior, repair data, or activate the challenge preset.
+
+Stdout contains one aggregate JSON object only after a complete scan: `complete`, `passed`,
+`totals`, and `conversions`. Conversions include successful/failed counts, successful display
+count, and fixed categories `malformed_json`, `unknown_permission`, `invalid_config`, and
+`conversion_database`. Invalid linked rows produce a complete aggregate report with
+`passed: false` and a nonzero exit. Stderr uses fixed messages only. Identifiers, configuration,
+IDs, policy names, display text, connection details and raw errors are never emitted.
+
+Pure tests run with `cargo test --locked -p keycast_core --example audit_policy_permissions`.
+The database test additionally requires `--features integration-tests` and
+`KEYCAST_PERMISSION_AUDIT_TEST_DATABASE_URL`; it accepts only an explicitly prepared, owned
+fixture at `127.0.0.1:55448`, database `keycast_permission_audit_test`. It creates/drops only
+synthetic `permissions` and `policy_permissions` fixture tables there. Never point it at an
+application database. It verifies shared links, malformed/unknown/invalid conversion,
+concurrent snapshot consistency, empty links, byte/row budgets, database failure and
+server rejection of writes. It never falls back to `DATABASE_URL` or shared services.
+
 ## Runtime versions and upgrade audit
 
 Fixture provenance is recorded in `core/tests/fixtures/challenges/SOURCE.md`. Timezone membership
