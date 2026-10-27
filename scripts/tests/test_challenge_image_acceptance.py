@@ -658,6 +658,21 @@ fn warn_atproto_control_plane_config() {}
         calls = [a for a, _, _ in docker.calls]
         self.assertLess(calls.index(handoff), next(i for i, a in enumerate(calls) if 'node_modules/@playwright/test/cli.js' in a))
 
+    def test_suite_receives_only_owned_fixture_bootstrap_identity(self):
+        _, docker = self.run_with()
+        handoff = next(a for a, _, _ in docker.calls if len(a) >= 2 and 'writeFileSync' in a[-2])
+        attestation = json.loads(handoff[-1])
+        suite = next(a for a, _, _ in docker.calls if 'node_modules/@playwright/test/cli.js' in a)
+        environment = dict(suite[i + 1].split('=', 1) for i, value in enumerate(suite) if value == '--env')
+        self.assertEqual(environment, {
+            'CHALLENGE_IMAGE_NONCE': attestation['nonce'],
+            'CHALLENGE_IMAGE_SOURCE_SHA': attestation['source_sha'],
+            'CHALLENGE_IMAGE_DAEMON_IMAGE_ID': attestation['daemon_image_id'],
+            'CHALLENGE_IMAGE_NAMESPACE_OWNER_ID': attestation['namespace_owner_id'],
+            'CHALLENGE_IMAGE_CLIENT_ID': attestation['client_id'],
+            'BUNKER_RELAYS': 'ws://localhost:8080',
+        })
+
     def test_cleanup_failed_full_suite_cannot_emit_passed_true(self):
         docker = DockerBoundary('cleanup')
         docker.summary['cases'] = [

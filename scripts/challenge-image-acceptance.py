@@ -350,7 +350,20 @@ class Runtime:
         # Playwright must retain its real nonzero failure exit. Independently
         # read its sanitized summary even on failure; neither signal overrides
         # the other. Future suites always attempt that fixed summary in teardown.
-        response = self.call(['exec', '-w', '/e2e', self.client, 'node',
+        # Agreement with the fixed ownership manifest is mandatory in the
+        # client before any SQL write or authentication request. No endpoints
+        # or credentials are inherited from the caller's environment.
+        fixture_environment = {
+            'CHALLENGE_IMAGE_NONCE': self.nonce,
+            'CHALLENGE_IMAGE_SOURCE_SHA': self.spec.source_sha,
+            'CHALLENGE_IMAGE_DAEMON_IMAGE_ID': self.spec.daemon_image_id,
+            'CHALLENGE_IMAGE_NAMESPACE_OWNER_ID': self.owner,
+            'CHALLENGE_IMAGE_CLIENT_ID': self.client,
+            'BUNKER_RELAYS': APP_ENV['BUNKER_RELAYS'],
+        }
+        bootstrap = [part for key, value in fixture_environment.items()
+                     for part in ('--env', key + '=' + value)]
+        response = self.call(['exec', *bootstrap, '-w', '/e2e', self.client, 'node',
                    'node_modules/@playwright/test/cli.js', 'test', '--config',
                    'challenge-image.config.ts'], timeout=600, check=False)
         self.suite_exit_code = response.returncode
