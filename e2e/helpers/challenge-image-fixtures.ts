@@ -85,6 +85,7 @@ export function configFromEnvironment(env: NodeJS.ProcessEnv = process.env): Fix
 // This helper itself performs collection validation only, with no setup or I/O.
 export function assertDiscoverySeparation(input: {
   defaultTestDir: string; dedicatedTestDir: string; defaultListing: string; dedicatedListing: string;
+  defaultExitCode: number | null; dedicatedExitCode: number | null;
 }): void {
   const normal = path.resolve(input.defaultTestDir), dedicated = path.resolve(input.dedicatedTestDir);
   const contains = (a: string, b: string) => {
@@ -92,8 +93,62 @@ export function assertDiscoverySeparation(input: {
     return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
   };
   requireFixture(!contains(normal, dedicated) && !contains(dedicated, normal), "discovery_roots");
-  requireFixture(!input.defaultListing.includes("challenge-image.spec.ts")
-    && input.dedicatedListing.includes("challenge-image.spec.ts"), "discovery_suite");
+  requireFixture(input.defaultExitCode === 0 && input.dedicatedExitCode === 0, "discovery_exit");
+  const listedFiles = (stdout: string): string[] => {
+    const lines = stdout.split(/\r?\n/);
+    const rows = lines.flatMap(line => {
+      // Actual Node Playwright list output, with or without a project prefix.
+      const row = line.match(/^\s+(?:\[[^\]\r\n]+\] › )?([^:\r\n]+\.spec\.ts):[1-9]\d*:[1-9]\d* › \S.*$/);
+      return row ? [row[1]] : [];
+    });
+    const totals = lines.flatMap(line => {
+      const total = line.match(/^Total: ([0-9]+) tests? in ([0-9]+) files?$/);
+      return total ? [[Number(total[1]), Number(total[2])]] : [];
+    });
+    requireFixture(lines.filter(line => line === "Listing tests:").length === 1 && totals.length === 1
+      && rows.length > 0 && totals[0][0] === rows.length && totals[0][1] === new Set(rows).size, "discovery_collection");
+    return rows;
+  };
+  const isSuite = (file: string) => path.posix.basename(file) === "challenge-image.spec.ts";
+  requireFixture(!listedFiles(input.defaultListing).some(isSuite)
+    && listedFiles(input.dedicatedListing).some(isSuite), "discovery_suite");
+}
+
+// Focused contract for this client's plain COPY instructions, not a Docker
+// builder. Callers supply Bun's actual local inputs plus runtime-read assets.
+// Repository-relative paths keep the same location beneath / in the client.
+export function assertClientPackaging(input: { dockerfile: string; requiredPaths: readonly string[] }): void {
+  let workdir = "/";
+  let copies: { source: string; destination: string; directory: boolean }[] = [];
+  for (const raw of input.dockerfile.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line.startsWith("FROM ")) { workdir = "/"; copies = []; }
+    if (line.startsWith("WORKDIR ")) workdir = path.posix.resolve(workdir, line.slice(8).trim());
+    if (!line.startsWith("COPY ") || line.startsWith("COPY --from=")) continue;
+    const parts = line.split(/\s+/).slice(1);
+    const destination = parts.pop()!;
+    requireFixture(parts.length > 0 && !/[\[\]"'\\*?]/.test(parts.join(" ") + destination)
+      && !parts.some(source => source.startsWith("--"))
+      && (parts.length === 1 || destination.endsWith("/")), "packaging_copy_format");
+    for (const source of parts) {
+      // Keep the narrow helper COPY boundary; never package the old auth/db
+      // fallbacks or broad trees as a way to satisfy an incomplete graph.
+      requireFixture(![".", "./", "e2e", "e2e/", "e2e/helpers", "e2e/helpers/", "e2e/helpers/auth.ts", "e2e/helpers/db.ts"].includes(source)
+        && (!source.endsWith("/") || source === "e2e/challenge-image/"), "packaging_copy_scope");
+      const directory = source.endsWith("/");
+      copies.push({ source, directory, destination: path.posix.resolve(workdir, destination,
+        !directory && destination.endsWith("/") ? path.posix.basename(source) : "") });
+    }
+  }
+  requireFixture(input.requiredPaths.length > 0, "packaging_graph");
+  for (const file of input.requiredPaths) {
+    requireFixture(path.posix.normalize(file) === file && !path.posix.isAbsolute(file) && !file.startsWith("../")
+      && !["e2e/helpers/auth.ts", "e2e/helpers/db.ts"].includes(file), "packaging_graph");
+    const expected = "/" + file;
+    requireFixture(copies.some(copy => copy.directory
+      ? file.startsWith(copy.source) && path.posix.join(copy.destination, file.slice(copy.source.length)) === expected
+      : copy.source === file && copy.destination === expected), "packaging_missing_file");
+  }
 }
 
 const permissionSpecs = {
@@ -166,7 +221,7 @@ export function createFixtureHelpers(io: FixtureIO) {
         const slug = `ci-${randomBytes(16).toString("hex")}-${kind}`;
         const displayName = `Synthetic acceptance ${kind}`;
         const inserted = await db.query(`INSERT INTO policies (slug, display_name, name, description, team_id)
-          VALUES ($1, $2, $2, $3, NULL) RETURNING id`, [slug, displayName, "Synthetic acceptance"]);
+          VALUES ($1, $2, $3, $4, NULL) RETURNING id`, [slug, displayName, displayName, "Synthetic acceptance"]);
         requireFixture(inserted.rows.length === 1 && Number.isSafeInteger(inserted.rows[0].id), "policy_insert");
         const p: PolicyFixture = Object.freeze({ id: inserted.rows[0].id, slug, scope: `policy:${slug}`, displayName, kind });
         const permissions: PermissionRow[] = [];

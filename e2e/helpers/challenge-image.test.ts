@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import defaultConfig from "../playwright.config";
 import dedicatedConfig from "../challenge-image.config";
-import { assertDiscoverySeparation, configFromEnvironment, createFixtureHelpers, type FixtureConfig } from "./challenge-image-fixtures";
+import { assertClientPackaging, assertDiscoverySeparation, configFromEnvironment, createFixtureHelpers, type FixtureConfig } from "./challenge-image-fixtures";
 
 const manifest = {
   schema_version: 1, nonce: "a".repeat(32), source_sha: "b".repeat(40),
@@ -82,15 +85,72 @@ function fixture(options: { ownership?: unknown; database?: string; token?: any;
 }
 const writes = (f: ReturnType<typeof fixture>) => f.queries.filter(q => /^\s*(INSERT|UPDATE|DELETE|TRUNCATE)/.test(q.sql));
 
-// Task 3 must run the real --list regression once its real spec exists.
-// Here the contract rejects overlapping roots, default inclusion or no suite.
+// Task 3 must supply real Node --list stdout and exit codes once its spec exists.
+const discoveryRoots = {
+  defaultTestDir: path.resolve(import.meta.dir, "../", defaultConfig.testDir!),
+  dedicatedTestDir: path.resolve(import.meta.dir, "../", dedicatedConfig.testDir!),
+};
+const discovery = {
+  ...discoveryRoots, defaultExitCode: 0, dedicatedExitCode: 0,
+  defaultListing: "Listing tests:\n  [chromium] › oauth.spec.ts:10:3 › OAuth\nTotal: 1 test in 1 file\n",
+  dedicatedListing: "Listing tests:\n  [chromium] › challenge-image.spec.ts:12:3 › image\nTotal: 1 test in 1 file\n",
+};
 test("default_discovery_excludes_challenge_image_suite", () => {
-  const root = path.resolve(import.meta.dir, "..");
-  const roots = { defaultTestDir: path.resolve(root, defaultConfig.testDir!), dedicatedTestDir: path.resolve(root, dedicatedConfig.testDir!) };
-  expect(() => assertDiscoverySeparation({ ...roots, defaultListing: "tests/oauth.spec.ts:1:1 › OAuth", dedicatedListing: "challenge-image/challenge-image.spec.ts:1:1 › image" })).not.toThrow();
-  expect(() => assertDiscoverySeparation({ ...roots, defaultListing: "challenge-image.spec.ts", dedicatedListing: "challenge-image.spec.ts" })).toThrow();
-  expect(() => assertDiscoverySeparation({ ...roots, dedicatedTestDir: roots.defaultTestDir, defaultListing: "", dedicatedListing: "challenge-image.spec.ts" })).toThrow();
-  expect(() => assertDiscoverySeparation({ ...roots, defaultListing: "", dedicatedListing: "Total: 0 tests" })).toThrow();
+  expect(() => assertDiscoverySeparation(discovery)).not.toThrow();
+  expect(() => assertDiscoverySeparation({ ...discovery, defaultListing: discovery.dedicatedListing })).toThrow();
+  expect(() => assertDiscoverySeparation({ ...discovery, dedicatedTestDir: discovery.defaultTestDir })).toThrow();
+  expect(() => assertDiscoverySeparation({ ...discovery, dedicatedListing: "Listing tests:\nTotal: 0 tests in 0 files\n" })).toThrow();
+});
+test("discovery accepts the observed project-free Node collection format", () => {
+  expect(() => assertDiscoverySeparation({ ...discovery,
+    dedicatedListing: "Listing tests:\n  challenge-image.spec.ts:1:83 › collection probe\nTotal: 1 test in 1 file\n",
+  })).not.toThrow();
+});
+for (const [name, change] of Object.entries({
+  failedDefault: { defaultExitCode: 1 }, failedDedicated: { dedicatedExitCode: 1 },
+  interruptedDedicated: { dedicatedExitCode: null },
+  throwingImport: { dedicatedExitCode: 1, dedicatedListing: "Listing tests:\nTotal: 0 tests in 0 files\nError: synthetic collection import failure\n  at challenge-image.spec.ts:1:7\n" },
+  filenameInDiagnostic: { dedicatedListing: "Listing tests:\nTotal: 0 tests in 0 files\nError: challenge-image.spec.ts:1:7\n" },
+  missingRow: { dedicatedListing: "Listing tests:\nTotal: 1 test in 1 file\nError: challenge-image.spec.ts:1:7\n" },
+  missingTotal: { dedicatedListing: "Listing tests:\n  [chromium] › challenge-image.spec.ts:12:3 › image\n" },
+  mismatchedCount: { dedicatedListing: "Listing tests:\n  [chromium] › challenge-image.spec.ts:12:3 › image\nTotal: 2 tests in 1 file\n" },
+})) test(`discovery rejects ${name} collection`, () => {
+  expect(() => assertDiscoverySeparation({ ...discovery, ...change })).toThrow();
+});
+
+// Bun resolves the real relative-import graph without executing module code.
+// Task 3 must replace/add entrypoints with its actual spec and include explicit
+// runtime-read fixture assets that a bundler cannot discover from readFile().
+function clientLocalGraph(entrypoints: string[]): string[] {
+  const scratch = mkdtempSync(path.join(tmpdir(), "keycast-image-packaging-"));
+  try {
+    const graph = path.join(scratch, "graph.json");
+    const built = spawnSync(process.execPath, ["build", ...entrypoints, "--target=node", "--packages=external",
+      `--outdir=${scratch}`, `--metafile=${graph}`], { cwd: path.resolve(import.meta.dir, ".."), timeout: 15000, encoding: "utf8" });
+    expect(built.status).toBe(0);
+    return Object.keys(JSON.parse(readFileSync(graph, "utf8")).inputs).map(file => path.posix.normalize(`e2e/${file}`));
+  } finally { rmSync(scratch, { recursive: true, force: true }); }
+}
+test("client packaging covers the actual current helper graph with precise copies", () => {
+  const dockerfile = readFileSync(path.resolve(import.meta.dir, "../Dockerfile.acceptance"), "utf8");
+  const requiredPaths = clientLocalGraph(["helpers/challenge-image-fixtures.ts"]);
+  expect(requiredPaths).toContain("e2e/helpers/challenge-image-fixtures.ts");
+  expect(requiredPaths).toContain("e2e/helpers/oauth.ts");
+  expect(() => assertClientPackaging({ dockerfile, requiredPaths })).not.toThrow();
+  // Removing a required transitive module's COPY must fail, even while its
+  // source exists in this checkout and the standalone bundle succeeds.
+  expect(() => assertClientPackaging({ dockerfile: dockerfile.replace(" e2e/helpers/oauth.ts", ""), requiredPaths })).toThrow();
+  expect(() => assertClientPackaging({ dockerfile: dockerfile.replace("./helpers/", "./misplaced/"), requiredPaths })).toThrow();
+});
+test("client packaging requires future local modules and exact runtime assets", () => {
+  const dockerfile = readFileSync(path.resolve(import.meta.dir, "../Dockerfile.acceptance"), "utf8");
+  const requiredPaths = ["e2e/helpers/challenge-image-rpc.ts", "core/tests/fixtures/challenges/v1/events.json"];
+  expect(() => assertClientPackaging({ dockerfile, requiredPaths })).toThrow();
+  const precise = dockerfile + "\nCOPY e2e/helpers/challenge-image-rpc.ts ./helpers/\nCOPY core/tests/fixtures/challenges/v1/events.json /core/tests/fixtures/challenges/v1/events.json\n";
+  expect(() => assertClientPackaging({ dockerfile: precise, requiredPaths })).not.toThrow();
+  expect(() => assertClientPackaging({ dockerfile: precise.replace("COPY core/tests/fixtures/challenges/v1/events.json /core/tests/fixtures/challenges/v1/events.json", ""), requiredPaths })).toThrow();
+  expect(() => assertClientPackaging({ dockerfile: precise + "COPY e2e/helpers/ ./helpers/\n", requiredPaths })).toThrow();
+  expect(() => assertClientPackaging({ dockerfile: precise + "COPY e2e/helpers/db.ts ./helpers/\n", requiredPaths })).toThrow();
 });
 
 describe("ownership guards", () => {
@@ -127,6 +187,18 @@ test("fresh restricted/empty/AND policies own exact TEXT permission links", asyn
   expect(p.restricted.scope).toBe(`policy:${p.restricted.slug}`); expect(p.restricted.slug).not.toBe(second.restricted.slug);
   for (const [policy, expected] of [[p.restricted, [["challenge_actions", "{}"]]], [p.empty, []], [p.intersection, [["challenge_actions", "{}"], ["allowed_kinds", '{"allowed_kinds":[31923]}']]]] as const) {
     expect(f.links.filter(l => l.policy_id === policy.id).map(l => { const r = f.permissions.find(r => r.id === l.permission_id); return [r.identifier, r.config]; })).toEqual(expected);
+  }
+});
+
+test("policy INSERT binds varchar display and text name to separate parameters", async () => {
+  const f = fixture(); await f.preparePolicies(config());
+  const inserts = f.queries.filter(q => q.sql.startsWith("INSERT INTO policies"));
+  expect(inserts).toHaveLength(3);
+  for (const [index, query] of inserts.entries()) {
+    // PostgreSQL infers VARCHAR(100) for display_name and TEXT for name.
+    // This focused assertion protects this one characterized statement.
+    expect(query.sql.replace(/\s+/g, " ")).toContain("VALUES ($1, $2, $3, $4, NULL)");
+    expect(query.values).toEqual([f.policies[index].slug, f.policies[index].display_name, f.policies[index].display_name, "Synthetic acceptance"]);
   }
 });
 
