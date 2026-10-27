@@ -212,8 +212,10 @@ uploaded assertions alone do not establish that identity.
 
 A `git archive HEAD` context excludes ignored and untracked local files. Both the normal
 release Dockerfile and the separate `e2e/Dockerfile.acceptance` client use this single clean
-tree. Both existing Rust Dockerfile builds now use `--locked`, and the workflow verifies
-`Cargo.lock` remains unchanged. **This also changes the normal production build recipe:
+tree. Both existing Rust Dockerfile builds use `--locked` to reject dependency resolution
+that would require changing `Cargo.lock`. The source lock hash is recorded; the later
+source-file comparison does not inspect the builder filesystem or prove full reproducibility.
+**This also changes the normal production build recipe:
 `cloudbuild.yaml` uses the same Dockerfile. Include this disclosure in the mechanism PR.**
 Normal web/keycast-login Bun installation and build behavior remains in the release recipe;
 it is recorded, including lock hashes, and is not claimed to be fully reproducible.
@@ -242,6 +244,9 @@ linux/amd64. All Postgres/Redis/relay discovery tags are resolved and pulled to 
 references before RunSpec construction or internal network creation. The independently
 built, loaded client is labelled test tooling; runtime receives no registry credentials,
 host credential mounts or production services. Registry login is removed before execution.
+The build record captures the actual daemon storage driver and reported driver-type
+(containerd snapshotter state, when reported); it neither changes daemon settings nor
+establishes hosted image-store compatibility.
 
 ### Sanitized evidence and configuration fingerprints
 
@@ -251,7 +256,11 @@ is no artifact glob or raw diagnostic upload. Both Docker build actions explicit
 their automatic build-record artifact upload and build summary; only the sanitized evidence
 paths are published. A failed/incomplete gate emits no accepted
 artifact. Private subprocess output, browser output, ownership journal and raw CLI capture
-remain outside the uploaded paths.
+remain outside the uploaded paths. Before acceptance assertions, the job log prints only
+a fixed known failure category, bounded counts, suite exit code, cleanup result, and
+failed/missing source-owned case IDs. Failed IDs come from the strict actual recorder
+summary retained locally; unknown/malformed diagnostics produce a fixed sanitized error.
+There is no failed-run artifact upload or acceptance bypass.
 
 RunSpec schema 1 is unchanged: source/workflow/tooling SHAs, run/attempt, preserved index
 reference, platform/config digests, same-daemon release/client IDs, exact digest-pinned

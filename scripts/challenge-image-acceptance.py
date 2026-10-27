@@ -145,6 +145,19 @@ class AcceptanceResult:
     failure: str | None
 
 
+def validate_suite_summary(summary: dict) -> dict[str, bool]:
+    exact_keys(summary, ('schema_version', 'cases'))
+    require(type(summary['schema_version']) is int and summary['schema_version'] == 1, 'suite_schema')
+    require(isinstance(summary['cases'], list), 'suite_schema')
+    cases = {}
+    for item in summary['cases']:
+        exact_keys(item, ('id', 'passed'))
+        require(isinstance(item['id'], str) and item['id'] in SUITE_CASE_IDS and
+                item['id'] not in cases and type(item['passed']) is bool, 'suite_cases')
+        cases[item['id']] = item['passed']
+    return cases
+
+
 def write_json(path: Path, value: dict) -> None:
     temporary = path.with_suffix('.tmp')
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
@@ -216,7 +229,7 @@ class Runtime:
         return response
 
     def inspect(self, kind: str, ident: str, optional: bool = False):
-        args = ['network', 'inspect', ident] if kind == 'network' else ['inspect', ident]
+        args = ['network', 'inspect', ident] if kind == 'network' else ['inspect', '--type', 'container', ident]
         response = self.call(args, check=not optional)
         if response.returncode:
             # Only explicit daemon not-found replies are absence. A Docker outage
@@ -239,18 +252,21 @@ class Runtime:
         self.journal['pending'] = [p for p in self.journal['pending'] if p['role'] != role]
         self.save()  # Exact IDs are durable before start, exec, mount or network use.
 
-    def check_network(self):
+    def check_network(self, active: bool = False):
         item = self.inspect('network', self.network)
         require(item['Id'] == self.network and item.get('Internal') is True)
-        require(item.get('Labels', {}).get(LABEL) == self.nonce)
+        require((item.get('Labels') or {}).get(LABEL) == self.nonce)
         allowed = {r['id'] for r in self.journal['resources'] if r['kind'] == 'container'}
-        require(set(item.get('Containers', {})) <= allowed)
+        members = set(item.get('Containers') or {})
+        require(members <= allowed)
+        if active:
+            require(members == {self.owner})
 
     def check_container(self, ident: str, image_id: str, role: str, active: bool = False):
-        self.check_network()
+        self.check_network(active=active)
         item = self.inspect('container', ident)
         require(item['Id'] == ident and item['Image'] == image_id)
-        require(item.get('Config', {}).get('Labels', {}).get(LABEL) == self.nonce)
+        require((item.get('Config', {}).get('Labels') or {}).get(LABEL) == self.nonce)
         host = item['HostConfig']
         mode = self.network if role == 'postgres' else 'container:' + self.owner
         require(host.get('NetworkMode') == mode)
@@ -266,7 +282,7 @@ class Runtime:
             require(network_id == self.network if active else network_id in ('', self.network))
         else:
             require(not attachments)
-        require(not any(net.get('Ports', {}).values()))
+        require(not any((net.get('Ports') or {}).values()))
         # CLI --tmpfs is represented by HostConfig.Tmpfs, separately from
         # .Mounts (bind/volume/explicit --mount entries). Validate both channels.
         expected_tmpfs = {
@@ -327,9 +343,15 @@ class Runtime:
             remaining = until - time.monotonic()
             if remaining <= 0:
                 break
-            response = self.call(args, timeout=min(5, remaining), check=False)
-            if response.returncode == 0 and (expected is None or response.stdout.strip() == expected):
-                return
+            try:
+                response = self.call(args, timeout=min(5, remaining), check=False)
+            except subprocess.TimeoutExpired:
+                # One slow exec consumes only this attempt, never the whole
+                # readiness budget. Ownership and other errors still propagate.
+                pass
+            else:
+                if response.returncode == 0 and (expected is None or response.stdout.strip() == expected):
+                    return
             time.sleep(min(0.5, max(0, until - time.monotonic())))
         raise AcceptanceError('readiness_timeout')
 
@@ -382,22 +404,33 @@ class Runtime:
                      for part in ('--env', key + '=' + value)]
         response = self.call(['exec', *bootstrap, '-w', '/e2e', self.client, 'node',
                    'node_modules/@playwright/test/cli.js', 'test', '--config',
-                   'challenge-image.config.ts'], timeout=600, check=False)
+                   'challenge-image.config.ts'], timeout=660, check=False)
         self.suite_exit_code = response.returncode
         # The suite writes ONLY this allowlisted aggregate in the client tmpfs.
         # No Playwright reports or child output are promotion evidence.
         summary = json.loads(self.call(['exec', '-w', '/e2e', self.client, 'node', '-e',
             "process.stdout.write(require('node:fs').readFileSync('/tmp/challenge-image-summary.json','utf8'))"]).stdout)
-        exact_keys(summary, ('schema_version', 'cases'))
-        require(type(summary['schema_version']) is int and summary['schema_version'] == 1, 'suite_schema')
-        require(isinstance(summary['cases'], list), 'suite_schema')
-        cases = {}
-        for item in summary['cases']:
-            exact_keys(item, ('id', 'passed'))
-            require(isinstance(item['id'], str) and item['id'] in SUITE_CASE_IDS and
-                    item['id'] not in cases and type(item['passed']) is bool, 'suite_cases')
-            cases[item['id']] = item['passed']
+        cases = validate_suite_summary(summary)
+        # Local-only strict recorder aggregate. It is never an upload path;
+        # failed IDs must come from these booleans, not the executed-ID list.
+        write_json(self.evidence / 'suite-summary.json', summary)
         return cases
+
+    def recheck_namespace(self):
+        self.check_network(active=True)
+        for resource in self.journal['resources']:
+            if resource['kind'] == 'container':
+                role = resource['role']
+                ident = self.spec.daemon_image_id if role in ('server', 'migration') else self.spec.test_client_image_id if role == 'client' else self.dependency_ids['relay_builder' if role == 'relay' else role]
+                self.check_container(resource['id'], ident, role, active=True)
+
+    def server_started_at(self, server):
+        item = self.inspect('container', server)
+        state = item.get('State') or {}
+        started = state.get('StartedAt')
+        require(state.get('Running') is True and type(item.get('RestartCount')) is int
+                and item['RestartCount'] == 0 and isinstance(started, str) and bool(started), 'server_state')
+        return started
 
     def run(self, cases: dict[str, bool]):
         self.prepare_images()  # All references already pulled; never resolve tags here.
@@ -449,11 +482,8 @@ class Runtime:
         self.probe(['exec', '-w', '/e2e', self.client, 'node', '-e', HEALTH_PROBE], 90)
         cases['runtime.health'] = True
         # Recheck the full namespace immediately before fixture/signing requests.
-        for resource in self.journal['resources']:
-            if resource['kind'] == 'container':
-                role = resource['role']
-                ident = self.spec.daemon_image_id if role in ('server', 'migration') else self.spec.test_client_image_id if role == 'client' else self.dependency_ids['relay_builder' if role == 'relay' else role]
-                self.check_container(resource['id'], ident, role, active=True)
+        self.recheck_namespace()
+        started_at = self.server_started_at(server)
         # Trusted runner handoff, not independent cryptographic ownership proof.
         # The client validates this strict schema/config and current_database()
         # before fixture writes. No caller-selected endpoints enter this file.
@@ -465,7 +495,16 @@ class Runtime:
         self.call(['exec', '-w', '/e2e', self.client, 'node', '-e',
             "require('node:fs').writeFileSync('/tmp/challenge-image-ownership.json',process.argv[1],{mode:0o600,flag:'wx'})",
             json.dumps(attestation, sort_keys=True)])
-        cases.update(self.execute_suite())
+        try:
+            cases.update(self.execute_suite())
+        finally:
+            # Revalidate the same daemon's image reference, all owned containers
+            # and membership after every completed suite, including failed suites.
+            rows = json.loads(self.call(['image', 'inspect', self.spec.image_ref]).stdout)
+            require(isinstance(rows, list) and len(rows) == 1
+                    and rows[0].get('Id') == self.spec.daemon_image_id, 'image_identity')
+            self.recheck_namespace()
+            require(self.server_started_at(server) == started_at, 'server_state')
 
 
 RELAY_PROBE = """
@@ -475,7 +514,7 @@ dns.setDefaultResultOrder('ipv4first');
 import {generateSecretKey, finalizeEvent} from 'nostr-tools/pure';
 const event = finalizeEvent({kind:1,created_at:Math.floor(Date.now()/1000),tags:[],content:'synthetic acceptance probe'},generateSecretKey());
 const ws = new WebSocket('ws://localhost:8080');
-const timer = setTimeout(()=>{ws.terminate();process.exit(1)},4500);
+const timer = setTimeout(()=>{ws.terminate();process.exit(1)},3000);
 ws.on('error',()=>{clearTimeout(timer);process.exit(1)});
 ws.on('open',()=>ws.send(JSON.stringify(['REQ','acceptance-probe',{ids:[event.id]}])));
 ws.on('message',(raw)=>{try{const message=JSON.parse(raw.toString());
@@ -486,7 +525,7 @@ if(message[0]==='EVENT' && message[1]==='acceptance-probe' && message[2]?.id===e
 HEALTH_PROBE = """
 require('node:dns').setDefaultResultOrder('ipv4first');
 (async()=>{for(const path of ['/healthz/startup','/healthz/ready']){
-const response=await fetch('http://localhost:3000'+path,{signal:AbortSignal.timeout(2000)});
+const response=await fetch('http://localhost:3000'+path,{signal:AbortSignal.timeout(1500)});
 if(!response.ok)process.exit(1);await response.arrayBuffer();}process.exit(0)})().catch(()=>process.exit(1));
 """
 
@@ -572,7 +611,7 @@ def _cleanup_owned(path: Path, execute: Executor | None = None) -> dict:
     # remove only by that journaled ID. Never enumerate by label or delete by name.
     for pending in list(journal['pending']):
         try:
-            args = ['network', 'inspect', pending['name']] if pending['kind'] == 'network' else ['inspect', pending['name']]
+            args = ['network', 'inspect', pending['name']] if pending['kind'] == 'network' else ['inspect', '--type', 'container', pending['name']]
             reply = call(args)
             if reply.returncode:
                 require(reply.stdout.strip() == '[]', 'cleanup_recovery_inspect')
@@ -587,7 +626,7 @@ def _cleanup_owned(path: Path, execute: Executor | None = None) -> dict:
                 ident = item.get('Id', '')
                 require(isinstance(ident, str) and RESOURCE_ID.fullmatch(ident) is not None)
                 labels = item.get('Labels', {}) if pending['kind'] == 'network' else item.get('Config', {}).get('Labels', {})
-                require(labels.get(LABEL) == journal['nonce'])
+                require((labels or {}).get(LABEL) == journal['nonce'])
                 expected_name = pending['name'] if pending['kind'] == 'network' else '/' + pending['name']
                 require(item.get('Name') == expected_name)
                 if pending['kind'] == 'network':
@@ -601,7 +640,9 @@ def _cleanup_owned(path: Path, execute: Executor | None = None) -> dict:
                 journal['resources'].append({'kind': pending['kind'], 'id': ident, 'role': pending['role'], 'removed': False})
             journal['pending'].remove(pending)
             write_json(path, journal)
-        except (AcceptanceError, OSError, ValueError, KeyError, subprocess.SubprocessError):
+        except Exception:
+            # Cleanup remains incomplete on any malformed inspect or boundary
+            # exception; never expose its text or broaden removal ownership.
             failed += 1
     resources = sorted(journal['resources'], key=lambda r: 2 if r['kind'] == 'network' else 1 if r['role'] == 'postgres' else 0)
     for resource in resources:
@@ -611,7 +652,7 @@ def _cleanup_owned(path: Path, execute: Executor | None = None) -> dict:
         if failed and (resource['role'] == 'postgres' or resource['kind'] == 'network'):
             continue
         try:
-            args = ['network', 'inspect', resource['id']] if resource['kind'] == 'network' else ['inspect', resource['id']]
+            args = ['network', 'inspect', resource['id']] if resource['kind'] == 'network' else ['inspect', '--type', 'container', resource['id']]
             reply = call(args)
             if reply.returncode:
                 require(reply.stdout.strip() == '[]', 'cleanup_inspect_failed')
@@ -620,13 +661,15 @@ def _cleanup_owned(path: Path, execute: Executor | None = None) -> dict:
                 require(isinstance(rows, list) and len(rows) == 1)
                 item = rows[0]
                 labels = item.get('Labels', {}) if resource['kind'] == 'network' else item.get('Config', {}).get('Labels', {})
-                require(item.get('Id') == resource['id'] and labels.get(LABEL) == journal['nonce'])
+                require(item.get('Id') == resource['id'] and (labels or {}).get(LABEL) == journal['nonce'])
                 args = ['network', 'rm', resource['id']] if resource['kind'] == 'network' else ['rm', '--force', '--volumes', resource['id']]
                 require(call(args).returncode == 0, 'cleanup_remove_failed')
             resource['removed'] = True
             removed += 1
             write_json(path, journal)
-        except (AcceptanceError, OSError, ValueError, KeyError, subprocess.SubprocessError):
+        except Exception:
+            # Cleanup remains incomplete on any malformed inspect or boundary
+            # exception; never expose its text or broaden removal ownership.
             failed += 1
     # No recursive deletion or caller-selected paths. Destroy only known ephemeral
     # files. A failed Docker cleanup still removes signing material and diagnostics.
@@ -671,6 +714,8 @@ def run_acceptance(spec: RunSpec, execute: Executor | None = None) -> Acceptance
         failure = str(error)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
         failure = 'invalid_runtime_or_child_result'
+    except Exception:
+        failure = 'unexpected_runtime_error'
     finally:
         # A second SIGTERM cannot interrupt the bounded cleanup phase. A hosted
         # workflow always-step repeats --cleanup if the process is forcibly killed.
@@ -690,6 +735,10 @@ def run_acceptance(spec: RunSpec, execute: Executor | None = None) -> Acceptance
             failure = 'suite_failed'
         elif not complete:
             failure = 'incomplete_case_set'
+        elif not all(cases.values()):
+            failure = 'case_failed'
+        elif not cleanup['complete']:
+            failure = 'cleanup_failed'
     identity = asdict(spec)
     del identity['evidence_dir']
     # Fingerprint only canonical nonsecret settings. DSNs, credentials and key
@@ -712,6 +761,74 @@ def run_acceptance(spec: RunSpec, execute: Executor | None = None) -> Acceptance
     return result
 
 
+# Only fixed runner categories may cross into hosted job logs. Exceptions,
+# Docker output, resource IDs and arbitrary strings never enter this mapping.
+FAILURE_CATEGORIES = frozenset({
+    'cancelled', 'child_timeout', 'child_failed', 'child_output_budget',
+    'invalid_runtime_or_child_result', 'unexpected_runtime_error',
+    'incomplete_case_set', 'suite_failed', 'case_failed', 'cleanup_failed',
+    'ownership_validation', 'acceptance_timeout', 'inspect_failed',
+    'resource_collision', 'invalid_resource_id', 'unexpected_container_environment',
+    'container_environment_mismatch', 'readiness_timeout', 'image_inspection',
+    'image_platform', 'image_identity', 'image_reference', 'unsafe_image_environment',
+    'suite_schema', 'suite_cases', 'key_generation', 'migration_failed', 'server_state',
+})
+
+
+def failure_diagnostics(evidence: Path) -> dict:
+    """Read only bounded, strictly validated aggregate fields for the job log.
+
+    The successful public artifact schemas/paths are unchanged. The local suite
+    summary is the recorder's actual boolean rows, never inferred from counts.
+    """
+    empty = dict(failure='missing_diagnostics', counts=None, suite_exit_code=None,
+                 cleanup=None, failed_case_ids=[], missing_case_ids=[])
+    def read(path):
+        with path.open('rb') as file:
+            body = file.read(131073)
+        require(len(body) <= 131072)
+        return json.loads(body)
+    try:
+        result = read(evidence / 'acceptance.json')
+    except FileNotFoundError:
+        return empty
+    except Exception:
+        return {**empty, 'failure': 'invalid_diagnostics'}
+    try:
+        exact_keys(result, (f.name for f in fields(AcceptanceResult)))
+        require(type(result['schema_version']) is int and result['schema_version'] == 1)
+        require(type(result['complete']) is bool and type(result['passed']) is bool)
+        failure = result['failure']
+        require(failure is None or isinstance(failure, str) and failure in FAILURE_CATEGORIES)
+        require(result['expected_case_ids'] == list(REQUIRED_CASE_IDS))
+        executed = result['executed_case_ids']
+        require(isinstance(executed, list) and all(isinstance(c, str) and c in REQUIRED_CASE_IDS for c in executed))
+        require(executed == [c for c in REQUIRED_CASE_IDS if c in executed])
+        counts = result['counts']
+        exact_keys(counts, ('expected', 'executed', 'passed', 'failed'))
+        require(all(type(v) is int and 0 <= v <= 106 for v in counts.values()))
+        require(counts['expected'] == 106 and counts['executed'] == len(executed)
+                and counts['passed'] + counts['failed'] == len(executed))
+        code = result['suite_exit_code']
+        require(code is None or type(code) is int and -128 <= code <= 255)
+        cleanup = result['cleanup']
+        exact_keys(cleanup, ('complete', 'removed', 'failed'))
+        require(type(cleanup['complete']) is bool and type(cleanup['removed']) is int
+                and 0 <= cleanup['removed'] <= 7 and type(cleanup['failed']) is int
+                and 0 <= cleanup['failed'] <= 64)
+        try:
+            suite = validate_suite_summary(read(evidence / 'suite-summary.json'))
+        except FileNotFoundError:
+            suite = {}
+        require(set(suite) == set(executed) & set(SUITE_CASE_IDS))
+        failed = [c for c in SUITE_CASE_IDS if suite.get(c) is False]
+        require(len(failed) == counts['failed'])
+        return dict(failure=failure, counts=counts, suite_exit_code=code, cleanup=cleanup,
+                    failed_case_ids=failed, missing_case_ids=[c for c in REQUIRED_CASE_IDS if c not in executed])
+    except Exception:
+        return {**empty, 'failure': 'invalid_diagnostics'}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     group = parser.add_mutually_exclusive_group(required=True)
@@ -727,7 +844,7 @@ def main() -> int:
         result = run_acceptance(spec)
         print(json.dumps(asdict(result), sort_keys=True))
         return 0 if result.passed else 1
-    except (OSError, ValueError, AcceptanceError, subprocess.SubprocessError):
+    except Exception:
         print('Acceptance input or cleanup failed.', file=__import__('sys').stderr)
         return 1
 

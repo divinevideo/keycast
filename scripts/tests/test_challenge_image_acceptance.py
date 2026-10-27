@@ -53,6 +53,7 @@ class DockerBoundary:
         self.summary = {'schema_version': 1, 'cases': []}
         self.server_environment = None
         self.suite_exit_code = 0
+        self.suite_finished = False
 
     def __call__(self, argv, env, timeout):
         assert isinstance(argv, list) and all(isinstance(x, str) for x in argv)
@@ -66,7 +67,7 @@ class DockerBoundary:
         if argv[1:3] == ['image', 'inspect']:
             ref = argv[-1]
             ident = CLIENT_ID if ref == CLIENT_ID else DAEMON_ID if 'keycast@' in ref else DEP_ID
-            if self.sabotage == 'wrong-image' and 'keycast@' in ref:
+            if (self.sabotage == 'wrong-image' or self.sabotage == 'post-image' and self.suite_finished) and 'keycast@' in ref:
                 ident = DEP_ID
             output = json.dumps([{'Id': ident, 'Os': 'linux', 'Architecture': 'amd64',
                                   'RepoDigests': [ref], 'Config': {'Env': []}}])
@@ -127,7 +128,8 @@ class DockerBoundary:
                                'PidMode': '', 'IpcMode': 'private', 'Binds': None,
                                'VolumesFrom': None, 'Devices': [], 'CapAdd': None,
                                'Tmpfs': tmpfs or None, 'Mounts': mount_specs or None},
-                'State': {'Running': False},
+                'State': {'Running': False, 'StartedAt': ''},
+                'RestartCount': 0,
                 'NetworkSettings': {'Networks': {} if network.startswith('container:') else {self.networks[network]['Name']: {'NetworkID': ''}}, 'Ports': {}},
             }
             if '--cidfile' in argv:
@@ -153,7 +155,10 @@ class DockerBoundary:
                 code, output = 1, '[]'
         elif argv[1] == 'start':
             assert argv[-1] in self.containers
-            self.containers[argv[-1]]['State']['Running'] = True
+            self.containers[argv[-1]]['State'].update(Running=True, StartedAt='2026-10-27T00:00:00.000000000Z')
+            mode = self.containers[argv[-1]]['HostConfig']['NetworkMode']
+            if mode in self.networks:
+                self.networks[mode]['Containers'][argv[-1]] = {'Name': self.containers[argv[-1]]['Name'][1:]}
             for attachment in self.containers[argv[-1]]['NetworkSettings']['Networks'].values():
                 attachment['NetworkID'] = self.containers[argv[-1]]['HostConfig']['NetworkMode']
         elif argv[1] == 'exec':
@@ -163,6 +168,23 @@ class DockerBoundary:
                 output = 'PONG\n'
             elif 'node_modules/@playwright/test/cli.js' in argv:
                 code = self.suite_exit_code
+                self.suite_finished = True
+                server = next(c for c in self.containers.values() if c['Name'].endswith('-server'))
+                if self.sabotage == 'post-container-image':
+                    server['Image'] = DEP_ID
+                if self.sabotage and self.sabotage.startswith('post-role:'):
+                    role = self.sabotage.split(':', 1)[1]
+                    next(c for c in self.containers.values() if c['Name'].endswith('-' + role))['Image'] = 'sha256:' + '0' * 64
+                if self.sabotage == 'post-missing-member':
+                    next(iter(self.networks.values()))['Containers'].clear()
+                if self.sabotage == 'post-member':
+                    next(iter(self.networks.values()))['Containers']['9' * 64] = {'Name': 'foreign'}
+                if self.sabotage == 'post-stop':
+                    server['State']['Running'] = False
+                if self.sabotage == 'post-started-at':
+                    server['State']['StartedAt'] = '2026-10-27T00:01:00.000000000Z'
+                if self.sabotage == 'post-restart':
+                    server['RestartCount'] = 1
             elif 'node' in argv:
                 script = argv[-1]
                 if 'generateSecretKey' in script and 'finalizeEvent' not in script:
@@ -179,7 +201,13 @@ class DockerBoundary:
                 return subprocess.CompletedProcess(argv, 1, '', 'PRIVATE CHILD BODY')
             self.removed.append(ident)
             self.containers.pop(ident, None)
+            for network in self.networks.values():
+                network['Containers'].pop(ident, None)
         elif argv[1:3] == ['network', 'rm']:
+            if self.networks[argv[-1]]['Containers']:
+                # Docker refuses removal with a foreign active endpoint; never
+                # silently disconnect or adopt that endpoint during cleanup.
+                return subprocess.CompletedProcess(argv, 1, '', 'PRIVATE CHILD BODY')
             self.removed.append(argv[-1])
             self.networks.pop(argv[-1], None)
         else:
@@ -198,6 +226,104 @@ class AcceptanceContracts(unittest.TestCase):
     def run_with(self, boundary=None):
         boundary = boundary or DockerBoundary()
         return module.run_acceptance(module.RunSpec.from_dict(self.data), boundary), boundary
+
+    def test_post_suite_revalidates_image_membership_and_server_process(self):
+        for sabotage in (None, 'post-image', 'post-container-image', 'post-member',
+                         'post-stop', 'post-started-at', 'post-restart', 'post-missing-member',
+                         *('post-role:' + role for role in ('postgres', 'redis', 'relay', 'client', 'migration'))):
+            with self.subTest(sabotage=sabotage):
+                self.data['evidence_dir'] = str(Path(self.temp.name) / str(sabotage))
+                docker = DockerBoundary(sabotage)
+                docker.summary['cases'] = [{'id': case, 'passed': True} for case in module.SUITE_CASE_IDS]
+                result, _ = self.run_with(docker)
+                self.assertEqual(result.passed, sabotage is None)
+                self.assertTrue(docker.suite_finished)
+                self.assertEqual(result.cleanup['complete'], sabotage != 'post-member')
+                self.assertNotIn('9' * 64, docker.removed)
+                self.assertEqual(result.failure is None, sabotage is None)
+                suite_index = next(i for i, (a, _, _) in enumerate(docker.calls) if 'node_modules/@playwright/test/cli.js' in a)
+                if sabotage is None:
+                    after = [a for a, _, _ in docker.calls[suite_index + 1:]]
+                    self.assertTrue(any(a[1:3] == ['image', 'inspect'] and a[-1] == self.data['image_ref'] for a in after))
+                    self.assertTrue(any(a[1:3] == ['network', 'inspect'] for a in after))
+
+    def test_post_suite_rechecks_even_when_summary_is_invalid_or_exec_times_out(self):
+        for sabotage in (None, 'timeout'):
+            self.data['evidence_dir'] = str(Path(self.temp.name) / str(sabotage))
+            docker = DockerBoundary(sabotage)
+            docker.summary = {'schema_version': 1, 'cases': [{'id': 'runtime.health', 'passed': True}]}
+            result, _ = self.run_with(docker)
+            self.assertFalse(result.passed)
+            suite_index = next(i for i, (a, _, _) in enumerate(docker.calls) if 'node_modules/@playwright/test/cli.js' in a)
+            self.assertTrue(any(a[1:3] == ['image', 'inspect'] for a, _, _ in docker.calls[suite_index + 1:]))
+            self.assertEqual(result.failure, 'child_timeout' if sabotage else 'suite_cases')
+            self.assertTrue(result.cleanup['complete'])
+
+    def test_probe_retries_attempt_timeouts_within_budget_and_propagates_unsafe_errors(self):
+        for behavior in ('recover', 'exhaust', 'unsafe', 'frozen-clock'):
+            with self.subTest(behavior=behavior):
+                self.data['evidence_dir'] = str(Path(self.temp.name) / behavior)
+                now, calls = [0.0], []
+                def execute(argv, env, timeout):
+                    calls.append(timeout)
+                    if behavior == 'unsafe':
+                        raise module.AcceptanceError('ownership_validation')
+                    if behavior == 'recover' and len(calls) == 2:
+                        return subprocess.CompletedProcess(argv, 0, 'ready', '')
+                    if behavior != 'frozen-clock':
+                        now[0] += timeout
+                    raise subprocess.TimeoutExpired(argv, timeout, output='PRIVATE CHILD BODY')
+                with patch.object(module.time, 'monotonic', side_effect=lambda: now[0]), patch.object(module.time, 'sleep', side_effect=lambda delay: now.__setitem__(0, now[0] + (0 if behavior == 'frozen-clock' else delay))):
+                    runtime = module.Runtime(module.RunSpec.from_dict(self.data), execute)
+                    runtime.deadline = 8
+                    if behavior == 'recover':
+                        runtime.probe(['exec', 'probe'], 20, 'ready')
+                        self.assertEqual(len(calls), 2)
+                    else:
+                        with self.assertRaisesRegex(module.AcceptanceError, '^' + ('ownership_validation' if behavior == 'unsafe' else 'readiness_timeout') + '$'):
+                            runtime.probe(['exec', 'probe'], 20)
+                        self.assertEqual(len(calls), 1 if behavior == 'unsafe' else 41 if behavior == 'frozen-clock' else 2)
+                    self.assertLessEqual(now[0], 8)
+                    self.assertTrue(all(0 < timeout <= 5 for timeout in calls))
+
+    def test_complete_false_case_with_zero_exit_has_fixed_failure_and_actual_case_diagnostics(self):
+        docker = DockerBoundary()
+        docker.summary['cases'] = [{'id': case, 'passed': case != 'signing.http.definition'} for case in module.SUITE_CASE_IDS]
+        result, _ = self.run_with(docker)
+        self.assertFalse(result.passed)
+        self.assertTrue(result.complete)
+        self.assertEqual(result.failure, 'case_failed')
+        summary = json.loads((self.directory / 'suite-summary.json').read_text())
+        self.assertEqual(summary, docker.summary)
+
+    def test_nullable_ports_reach_suite_but_nullable_labels_reject_without_exception(self):
+        for field in ('Ports', 'Labels'):
+            self.data['evidence_dir'] = str(Path(self.temp.name) / field)
+            docker = DockerBoundary()
+            original = docker.__class__.__call__
+            def nullable(argv, env, timeout):
+                reply = original(docker, argv, env, timeout)
+                if argv[1] == 'inspect' and reply.returncode == 0:
+                    data = json.loads(reply.stdout)
+                    data[0]['NetworkSettings' if field == 'Ports' else 'Config'][field] = None
+                    reply.stdout = json.dumps(data)
+                return reply
+            result, _ = self.run_with(nullable)
+            self.assertEqual(result.failure, 'incomplete_case_set' if field == 'Ports' else 'ownership_validation')
+            self.assertEqual(result.cleanup['complete'], field == 'Ports')
+
+    def test_unexpected_exception_writes_fixed_result_and_cleans(self):
+        docker = DockerBoundary()
+        original = docker.__class__.__call__
+        def broken(argv, env, timeout):
+            if argv[1:3] == ['image', 'inspect']:
+                raise AttributeError('PRIVATE CHILD BODY')
+            return original(docker, argv, env, timeout)
+        result, _ = self.run_with(broken)
+        self.assertEqual(result.failure, 'unexpected_runtime_error')
+        self.assertFalse(result.passed)
+        self.assertTrue(result.cleanup['complete'])
+        self.assertNotIn('PRIVATE CHILD BODY', (self.directory / 'acceptance.json').read_text())
 
     def test_fingerprint_allowlist_excludes_dsns_credentials_and_private_key_hashes(self):
         baseline, _ = self.run_with()
@@ -275,7 +401,7 @@ class AcceptanceContracts(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertFalse(any(a[1] == 'exec' for a, _, _ in docker.calls))
 
-    def test_emitted_server_environment_passes_actual_binary_startup_gates(self):
+    def test_emitted_server_environment_passes_extracted_rust_startup_gates(self):
         # Execute current Rust gates, rather than a Python copy of their logic.
         root = RUNNER.parent.parent
         main_source = (root / 'keycast/src/main.rs').read_text()
@@ -358,7 +484,7 @@ fn warn_atproto_control_plane_config() {}
     def test_legitimate_daemon_id_differs_from_config_digest(self):
         result, docker = self.run_with()
         self.assertTrue(any('--migrate' in call[0] for call in docker.calls))
-        self.assertFalse(result.passed)  # Future acceptance suite is absent.
+        self.assertFalse(result.passed)  # The boundary supplies an empty suite summary.
         self.assertFalse(result.complete)
         self.assertTrue(result.cleanup['complete'])
 
@@ -412,7 +538,10 @@ fn warn_atproto_control_plane_config() {}
         self.assertEqual(migrate[migrate.index('--entrypoint') + 1], '/app/keycast')
         serving = next(a for a in creates if any(v.startswith('ghcr.io/synthetic/keycast@') for v in a) and '--migrate' not in a)
         self.assertNotIn('--entrypoint', serving)
-        self.assertTrue(any('node_modules/@playwright/test/cli.js' in a and 'challenge-image.config.ts' in a for a, _, _ in docker.calls))
+        suite = next((a, timeout) for a, _, timeout in docker.calls if 'node_modules/@playwright/test/cli.js' in a)
+        self.assertIn('challenge-image.config.ts', suite[0])
+        self.assertEqual(suite[1], 660)
+        self.assertTrue(all('--type' in a and a[a.index('--type') + 1] == 'container' for a, _, _ in docker.calls if a[1] == 'inspect'))
         self.assertTrue(any('psql' in a and 'SELECT 1' in a and '--host=localhost' in a and '--port=5432' in a for a, _, _ in docker.calls))
         self.assertTrue(any('redis-cli' in a and 'PING' in a for a, _, _ in docker.calls))
         self.assertFalse(list(self.directory.glob('.private-*')))
@@ -421,7 +550,8 @@ fn warn_atproto_control_plane_config() {}
     def test_incomplete_duplicate_unknown_and_failed_cases_fail_closed(self):
         for cases in ([], [{'id': 'unknown', 'passed': True}],
                       [{'id': 'signing.http.definition', 'passed': True}] * 2,
-                      [{'id': 'signing.http.definition', 'passed': False}]):
+                      [{'id': 'signing.http.definition', 'passed': False}],
+                      [{'id': 'runtime.health', 'passed': True}]):
             with self.subTest(cases=cases):
                 docker = DockerBoundary()
                 docker.summary['cases'] = cases
@@ -528,6 +658,19 @@ fn warn_atproto_control_plane_config() {}
                         row['passed'] = False
                     result, _ = self.run_with(docker)
                     self.assertFalse(result.passed)
+                    if change == 'failed':
+                        self.assertTrue(result.complete)
+                        self.assertEqual(result.failure, 'case_failed')
+                        self.assertEqual(result.counts, {'expected': 106, 'executed': 106, 'passed': 105, 'failed': 1})
+                    elif change == 'missing':
+                        self.assertFalse(result.complete)
+                        self.assertEqual(result.failure, 'incomplete_case_set')
+                        self.assertNotIn(target, result.executed_case_ids)
+                        self.assertEqual(result.counts['executed'], 105)
+                    else:
+                        self.assertFalse(result.complete)
+                        self.assertEqual(result.failure, 'suite_cases' if change == 'duplicate' else 'invalid_runtime_or_child_result')
+                    self.assertTrue(result.cleanup['complete'])
 
     def test_all_source_owned_cases_must_execute_and_cleanup_to_pass(self):
         docker = DockerBoundary()
@@ -820,7 +963,7 @@ class WorkflowContracts(unittest.TestCase):
         if publishing:
             allowed |= {'docker/setup-buildx-action@v3', 'docker/build-push-action@v6', 'docker/login-action@v3', 'actions/upload-artifact@v4'}
         self.assertTrue(set(uses) <= allowed)
-        self.assertEqual(uses, ['actions/checkout@v6', 'oven-sh/setup-bun@v2',
+        self.assertEqual(uses, ['actions/checkout@v6', *([] if publishing else ['oven-sh/setup-bun@v2']),
             *(['docker/setup-buildx-action@v3', 'docker/login-action@v3', 'docker/build-push-action@v6',
                'docker/build-push-action@v6', 'actions/upload-artifact@v4'] if publishing else ['actions-rust-lang/setup-rust-toolchain@v1'])])
         for step in steps:
@@ -828,8 +971,11 @@ class WorkflowContracts(unittest.TestCase):
             self.assertNotIn('services', step)
             text = json.dumps(step)
             self.assertIsNone(re.search(r'cloudbuild|build-test-push|bun run deploy|gcloud|id-token|repository_dispatch|gh workflow|IAM|secrets\.(?!GITHUB_TOKEN)', text, re.I))
-        bun = next(s for s in steps if s.get('uses') == 'oven-sh/setup-bun@v2')
-        self.assertEqual(bun['with'], {'bun-version': '1.3.10'})
+        if publishing:
+            self.assertNotIn('oven-sh/setup-bun@v2', uses)
+        else:
+            bun = next(s for s in steps if s.get('uses') == 'oven-sh/setup-bun@v2')
+            self.assertEqual(bun['with'], {'bun-version': '1.3.10'})
         if not publishing:
             self.assertEqual(next(s['with'] for s in steps if s.get('uses') == 'actions-rust-lang/setup-rust-toolchain@v1'), {'toolchain': '1.93.0'})
             self.assertEqual([s['run'] for s in steps if 'run' in s],
@@ -992,6 +1138,8 @@ class WorkflowContracts(unittest.TestCase):
                         return json.dumps(metadata)
                     return {index_digest: index_raw, platform_digest: platform_raw,
                             attestation_digest: attestation_raw}[args[4].rsplit('@', 1)[1]]
+                if args[1] == 'info':
+                    return json.dumps('overlayfs' if '.Driver}}' in args[-1] else [['driver-type', 'io.containerd.snapshotter.v1']])
                 if args[1] == 'pull':
                     return ''
                 if args[1:3] == ['image', 'inspect']:
@@ -1044,7 +1192,59 @@ class WorkflowContracts(unittest.TestCase):
                             self.assertEqual(saved['registry_index']['manifests'][1]['digest'], attestation_digest)
                             self.assertEqual(saved['release_buildx_metadata']['containerimage.descriptor']['digest'], index_digest)
                             self.assertNotIn('containerimage.config.digest', saved['release_buildx_metadata'])
+                            self.assertEqual(saved['daemon_image_store'], {'storage_driver': 'overlayfs', 'driver_type': 'io.containerd.snapshotter.v1'})
             self.assertFalse(any(args[1:3] == ['network', 'create'] for args in calls))
+
+    def test_failed_evidence_logs_only_allowlisted_diagnostics_before_rejection(self):
+        code = self.inline_python('evidence')
+        for scenario in ('false', 'missing', 'early', 'injected', 'unknown-id', 'malformed-summary', 'no-result'):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                docker = DockerBoundary('wrong-image' if scenario == 'early' else None)
+                docker.summary['cases'] = [{'id': case, 'passed': case != 'signing.http.definition'} for case in module.SUITE_CASE_IDS]
+                if scenario == 'missing':
+                    docker.summary['cases'] = docker.summary['cases'][:-1]
+                result = module.run_acceptance(module.RunSpec.from_dict(spec_dict(root / 'challenge-runtime')), docker)
+                evidence = root / 'challenge-runtime'
+                (root / 'run-spec.json').write_text(json.dumps(spec_dict(evidence)))
+                (root / 'build-record.json').write_text(json.dumps({'schema_version': 1,
+                    **{key: '1' * 40 for key in ('source_sha', 'github_sha', 'workflow_sha', 'checkout_head', 'tooling_sha')},
+                    'workflow_run': 123, 'workflow_attempt': 1, 'ref': 'refs/heads/main', 'event': 'workflow_dispatch',
+                    'workflow_ref': 'divinevideo/keycast/.github/workflows/challenge-image-acceptance.yaml@refs/heads/main',
+                    'fixture_policy_hashes': {'synthetic': 'a' * 64}}))
+                (root / 'cleanup.json').write_text(json.dumps({'schema_version': 1, 'cleanup': result.cleanup}))
+                if scenario == 'injected':
+                    value = dataclasses.asdict(result); value['failure'] = 'PRIVATE token postgres://secret key nonce'
+                    (evidence / 'acceptance.json').write_text(json.dumps(value))
+                elif scenario in ('unknown-id', 'malformed-summary'):
+                    value = copy.deepcopy(docker.summary)
+                    if scenario == 'unknown-id':
+                        value['cases'][0]['id'] = 'PRIVATE token postgres://secret key nonce'
+                    else:
+                        value['cases'][0]['passed'] = 'PRIVATE token postgres://secret key nonce'
+                    (evidence / 'suite-summary.json').write_text(json.dumps(value))
+                elif scenario == 'no-result':
+                    (evidence / 'acceptance.json').unlink()
+                process = subprocess.run([sys.executable, '-c', code], cwd=ROOT,
+                    env={**os.environ, 'RUNNER_TEMP': directory, 'ACCEPT_OUTCOME': 'success', 'CLEANUP_OUTCOME': 'success'},
+                    capture_output=True, text=True, timeout=5)
+                self.assertNotEqual(process.returncode, 0)
+                self.assertTrue(process.stdout.strip(), 'failure diagnostics must precede missing spec/assertions')
+                diagnostic = json.loads(process.stdout)
+                self.assertEqual(set(diagnostic), {'failure', 'counts', 'suite_exit_code', 'cleanup', 'failed_case_ids', 'missing_case_ids'})
+                self.assertNotIn('PRIVATE', process.stdout + process.stderr)
+                self.assertFalse((root / 'challenge-public').exists())
+                if scenario in ('false', 'missing'):
+                    self.assertEqual(diagnostic['failed_case_ids'], ['signing.http.definition'])
+                    self.assertEqual(diagnostic['missing_case_ids'], ['management.picker'] if scenario == 'missing' else [])
+                    self.assertEqual(diagnostic['failure'], 'incomplete_case_set' if scenario == 'missing' else 'case_failed')
+                    self.assertEqual(diagnostic['suite_exit_code'], 0)
+                elif scenario == 'early':
+                    self.assertEqual(diagnostic['failure'], 'image_identity')
+                    self.assertEqual(diagnostic['failed_case_ids'], [])
+                    self.assertEqual(diagnostic['missing_case_ids'], list(module.REQUIRED_CASE_IDS))
+                else:
+                    self.assertEqual(diagnostic['failure'], 'missing_diagnostics' if scenario == 'no-result' else 'invalid_diagnostics')
 
     def test_sanitized_evidence_requires_exact_cases_exit_and_cleanup(self):
         code = self.inline_python('evidence')
@@ -1058,6 +1258,7 @@ class WorkflowContracts(unittest.TestCase):
                 executed_case_ids=list(module.REQUIRED_CASE_IDS), counts={'expected': 106, 'executed': 106, 'passed': 106, 'failed': 0},
                 suite_exit_code=0, cleanup={'complete': True, 'removed': 6, 'failed': 0}, failure=None)
             (root / 'challenge-runtime').mkdir()
+            (root / 'challenge-runtime/suite-summary.json').write_text(json.dumps({'schema_version': 1, 'cases': [{'id': c, 'passed': True} for c in module.SUITE_CASE_IDS]}))
             (root / 'run-spec.json').write_text(json.dumps(spec))
             (root / 'build-record.json').write_text(json.dumps({'schema_version': 1,
                 **{key: '1' * 40 for key in ('source_sha', 'github_sha', 'workflow_sha', 'checkout_head', 'tooling_sha')},
@@ -1070,6 +1271,7 @@ class WorkflowContracts(unittest.TestCase):
                 ('duplicate', lambda r: r['executed_case_ids'].append(r['executed_case_ids'][0])),
                 ('expected', lambda r: r.update(expected_case_ids=['signing.http'])),
                 ('skipped', lambda r: r.update(skipped=1)), ('failed', lambda r: r['counts'].update(failed=1)),
+                ('failure', lambda r: r.update(failure='case_failed')),
                 ('exit', lambda r: r.update(suite_exit_code=1)), ('cleanup', lambda r: r['cleanup'].update(complete=False)),
                 ('before-complete', lambda r: r.update(complete=False)), ('mismatch', lambda r: r['artifact_identity'].update(tooling_sha='2' * 40)),
                 ('secret', lambda r: r.update(raw_log='PRIVATE CHILD BODY'))]:

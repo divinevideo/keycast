@@ -22,7 +22,6 @@ export default defineConfig({
     trace: "off",
     video: "off",
     screenshot: "off",
-    extraHTTPHeaders: { Origin: "http://localhost:3000" },
     launchOptions: {
       args: ["--host-resolver-rules=MAP localhost 127.0.0.1"],
     },

@@ -3,6 +3,13 @@ import { readFile, writeFile } from "node:fs/promises";
 interface SummaryCase { id: string; passed: boolean }
 interface Summary { schema_version: 1; cases: SummaryCase[] }
 export interface CaseContext { canPass(): boolean }
+// Playwright status covers fixture/setup cancellation; the local deadline also
+// rejects a late body while an expired worker is stopping gracefully.
+export function createCaseContext(info: { readonly status?: string; readonly timeout: number },
+  now: () => number = () => performance.now()): CaseContext {
+  const deadline = now() + info.timeout;
+  return { canPass: () => info.status === "passed" && now() < deadline };
+}
 export interface SummaryIO { read(): Promise<string | undefined>; write(contents: string): Promise<void> }
 const SUMMARY_PATH = "/tmp/challenge-image-summary.json";
 const fileIO: SummaryIO = {

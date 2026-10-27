@@ -14,7 +14,7 @@ import {
   type Grant, type FixtureConfig, type PolicyFixtures, type SessionFixture, type PolicyFixture,
 } from "../helpers/challenge-image-fixtures";
 import { httpRpc, openRelay, freezeTemplate, verifySignedResult, type SigningTemplate, type RpcOutcome } from "../helpers/challenge-image-rpc";
-import { createSummaryRecorder } from "../helpers/challenge-image-summary";
+import { createSummaryRecorder, createCaseContext } from "../helpers/challenge-image-summary";
 
 // Deliberately no top-level I/O: --list must collect without any connection,
 // fixture read, environment requirement, global setup or browser launch.
@@ -32,12 +32,7 @@ const summary = createSummaryRecorder([
   ...CONSENT_CASE_IDS,
 ]);
 export function recordCase(id: string, operation: () => Promise<void>): Promise<void> {
-  // Status is the framework's authoritative cancellation guard (its budget
-  // also includes fixture setup). The local deadline additionally bounds this
-  // body even while Playwright is gracefully stopping an expired worker.
-  const info = test.info(), deadline = performance.now() + info.timeout;
-  return summary.recordCase(id, operation, { canPass: () =>
-    info.status === "passed" && performance.now() < deadline });
+  return summary.recordCase(id, operation, createCaseContext(test.info()));
 }
 let config: FixtureConfig, policies: PolicyFixtures, session: SessionFixture;
 let canonical: Record<string, SigningTemplate>;

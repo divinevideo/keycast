@@ -8,6 +8,8 @@ import defaultConfig from "../playwright.config";
 import dedicatedConfig from "../challenge-image.config";
 import { assertEmptyConsentDisplay, CHALLENGE_TITLE, CHALLENGE_PHRASES, assertClientPackaging, assertDiscoverySeparation, configFromEnvironment, createFixtureHelpers, type FixtureConfig } from "./challenge-image-fixtures";
 
+const requiredIdsLoader = "import importlib.util,json,sys; s=importlib.util.spec_from_file_location('acceptance', '../scripts/challenge-image-acceptance.py'); m=importlib.util.module_from_spec(s); sys.modules[s.name]=m; s.loader.exec_module(m); print(json.dumps(m.SUITE_CASE_IDS))";
+
 const manifest = {
   schema_version: 1, nonce: "a".repeat(32), source_sha: "b".repeat(40),
   daemon_image_id: `sha256:${"c".repeat(64)}`, namespace_owner_id: "d".repeat(64), client_id: "e".repeat(64),
@@ -24,7 +26,7 @@ const publicKey = "f".repeat(64); // Synthetic public identifier only.
 
 // Only external boundaries are replaced. Real helper control flow, SQL
 // parameters and request bodies remain under test; no services run.
-function fixture(options: { ownership?: unknown; database?: string; token?: any; user?: any; authorization?: any; missingToken?: boolean; processing?: boolean; httpError?: boolean; mutationFailure?: boolean; code?: any; refreshState?: any; globalPreset?: boolean; teamAbsent?: boolean } = {}) {
+function fixture(options: { ownership?: unknown; database?: string; token?: any; user?: any; authorization?: any; missingToken?: boolean; processing?: boolean; httpError?: boolean; httpStatus?: number; mutationFailure?: boolean; code?: any; refreshState?: any; globalPreset?: boolean; teamAbsent?: boolean } = {}) {
   const queries: { sql: string; values: any[] }[] = [];
   const calls: { method: string; url: string; options: any }[] = [];
   const policies: any[] = [], permissions: any[] = [], links: any[] = [];
@@ -73,7 +75,7 @@ function fixture(options: { ownership?: unknown; database?: string; token?: any;
   const request = Object.fromEntries(["get", "post"].map(method => [method, async (url: string, opts: any) => {
     calls.push({ method, url, options: opts });
     if (options.httpError) throw new Error("PRIVATE token and cookie diagnostics");
-    expect(url.startsWith("http://localhost:3000/api/")).toBe(true); expect(opts.timeout).toBe(15000); expect(opts.maxRedirects).toBe(0);
+    expect(url.startsWith("http://localhost:3000/api/")).toBe(true); expect(opts.headers.Origin).toBe("http://localhost:3000"); expect(opts.timeout).toBe(15000); expect(opts.maxRedirects).toBe(0);
     let body: any = {};
     if (url.endsWith("/register")) body = { success: true, pubkey: publicKey, verification_required: true };
     else if (url.endsWith("/verify-email")) body = options.processing && verifiedCalls++ === 0 ? { success: false, status: "processing", retry_after: 1 } : { success: true, authenticated: true };
@@ -84,7 +86,7 @@ function fixture(options: { ownership?: unknown; database?: string; token?: any;
       bunker_url: `bunker://${"1".repeat(64)}?relay=ws%3A%2F%2Flocalhost%3A8080&secret=synthetic-secret`,
       policy: { slug: grantPolicy.slug, display_name: grantPolicy.displayName, description: "Synthetic acceptance", permissions: grantPolicy.kind === "empty" ? [] : [...[{ icon: "🏆", title: "Challenges and contest curation", description: "Create and manage challenges, enter and withdraw entries, announce results, and curate contests. No private-message access." }], ...(grantPolicy.kind === "intersection" ? [{ icon: "🔒", title: "Other actions", description: "Synthetic restriction" }] : [])] }, ...options.token,
     }; else throw new Error("unexpected HTTP boundary");
-    return { ok: () => true, status: () => 200, json: async () => body, headers: () => ({ "set-cookie": "keycast_session=synthetic-session; Path=/; HttpOnly" }) };
+    return { ok: () => (options.httpStatus ?? 200) >= 200 && (options.httpStatus ?? 200) < 300, status: () => options.httpStatus ?? 200, json: async () => body, headers: () => ({ "set-cookie": "keycast_session=synthetic-session; Path=/; HttpOnly" }) };
   }]));
   return { ...helpers, queries, calls, policies, permissions, links, request: request as any,
     missingManifest() { readFails = true; }, bind(p: any) { grantPolicy = p; } };
@@ -166,6 +168,9 @@ test("client packaging requires exact runtime assets and every real helper", () 
   expect(() => assertClientPackaging({ dockerfile: dockerfile.replace("COPY core/tests/fixtures/challenges/v1/events.json /core/tests/fixtures/challenges/v1/events.json", ""), requiredPaths })).toThrow();
   expect(() => assertClientPackaging({ dockerfile: dockerfile.replace("/core/tests/fixtures/challenges/v1/events.json", "/wrong/events.json"), requiredPaths })).toThrow();
   expect(() => assertClientPackaging({ dockerfile: dockerfile + "\nCOPY e2e/helpers/ ./helpers/\n", requiredPaths })).toThrow();
+  expect(() => assertClientPackaging({ dockerfile: dockerfile + "\nCOPY e2e/helpers/. ./helpers/\n", requiredPaths })).toThrow();
+  expect(() => assertClientPackaging({ dockerfile: dockerfile + "\nfrom node:22-bookworm-slim\n", requiredPaths })).toThrow();
+  expect(() => assertClientPackaging({ dockerfile: dockerfile + "\nCOPY --from=bun / /\n", requiredPaths })).toThrow();
   expect(() => assertClientPackaging({ dockerfile: dockerfile + "\nCOPY e2e/helpers/db.ts ./helpers/\n", requiredPaths })).toThrow();
 });
 const signingCaseNames = [
@@ -189,7 +194,7 @@ test("real Node collection isolates and requires every transport matrix row exac
     return row ? [row[1]] : [];
   });
   expect(rows.sort()).toEqual([...expectedSigningIds].sort()); expect(new Set(rows).size).toBe(64);
-  const runner = spawnSync("python3", ["-B", "-c", "import importlib.util,json,sys; s=importlib.util.spec_from_file_location('acceptance', '../scripts/challenge-image-acceptance.py'); m=importlib.util.module_from_spec(s); sys.modules[s.name]=m; s.loader.exec_module(m); print(json.dumps(m.SUITE_CASE_IDS))"], { cwd, encoding: "utf8", timeout: 15000 });
+  const runner = spawnSync("python3", ["-B", "-c", requiredIdsLoader], { cwd, encoding: "utf8", timeout: 15000 });
   expect(runner.status).toBe(0);
   const required: string[] = JSON.parse(runner.stdout);
   expect(required.filter(id => id.startsWith("signing.")).sort()).toEqual([...expectedSigningIds].sort());
@@ -218,8 +223,8 @@ describe("ownership guards", () => {
   });
   test("missing manifest and wrong current database fail closed", async () => {
     const missing = fixture(); missing.missingManifest(); await expect(missing.preparePolicies(config())).rejects.toThrow("ownership"); expect(missing.queries).toHaveLength(0);
-    const foreign = fixture({ database: "keycast" }); await expect(foreign.preparePolicies(config())).rejects.toThrow("database");
-    await expect(foreign.registerSyntheticUser(foreign.request, config())).rejects.toThrow("database"); expect(writes(foreign)).toHaveLength(0); expect(foreign.calls).toHaveLength(0);
+    const foreign = fixture({ database: "keycast" }); await expect(foreign.preparePolicies(config())).rejects.toThrow(/^challenge_image:database_identity$/);
+    await expect(foreign.registerSyntheticUser(foreign.request, config())).rejects.toThrow(/^challenge_image:database_identity$/); expect(writes(foreign)).toHaveLength(0); expect(foreign.calls).toHaveLength(0);
   });
   test("non-loopback caller config fails before database or HTTP", async () => {
     for (const field of ["baseUrl", "relayUrl", "databaseUrl", "bunkerRelays"] as const) {
@@ -270,9 +275,9 @@ for (const [name, token] of Object.entries({ full: { scope: "policy:full" }, abs
 })) test(`rejects ${name} grant with sanitized diagnostics`, async () => {
   const f = fixture({ token }); const p = await f.preparePolicies(config()); const s = await f.registerSyntheticUser(f.request, config()); f.bind(p.restricted); await expect(f.issueGrant(f.request, s, p.restricted)).rejects.toThrow(/^challenge_image:/);
 });
-test("absent explicit scope, foreign policy and changed links fail before grant HTTP", async () => {
+test("unowned policy copies and changed owned links fail before grant HTTP", async () => {
   const f = fixture(); const p = await f.preparePolicies(config()); const s = await f.registerSyntheticUser(f.request, config()); f.calls.length = 0;
-  await expect(f.issueGrant(f.request, s, { ...p.restricted, scope: undefined })).rejects.toThrow(); await expect(f.issueGrant(f.request, s, { ...p.restricted })).rejects.toThrow();
+  await expect(f.issueGrant(f.request, s, { ...p.restricted, scope: undefined })).rejects.toThrow(/^challenge_image:grant_ownership$/); await expect(f.issueGrant(f.request, s, { ...p.restricted })).rejects.toThrow(/^challenge_image:grant_ownership$/);
   f.links.push({ policy_id: p.restricted.id, permission_id: f.permissions[1].id }); await expect(f.issueGrant(f.request, s, p.restricted)).rejects.toThrow(); expect(f.calls).toHaveLength(0);
 });
 test("failed mutation restores only its owned row in finally", async () => {
@@ -511,7 +516,7 @@ test("Task 4 requires actual consent, malformed boundaries and hold IDs in runne
   expect(recorder?.[1].replace(/\s+/g, "")).toBe('...["http","nip46"].flatMap(transport=>SIGNING_CASES.map(name=>`signing.${transport}.${name}`)),...CONSENT_CASE_IDS,');
   const names = spec.match(/export const SIGNING_CASES = \[([\s\S]*?)\] as const;/);
   expect(JSON.parse(`[${names![1].replace(/,\s*$/, "")}]`)).toEqual(signingCaseNames);
-  const runner = spawnSync("python3", ["-B", "-c", "import importlib.util,json,sys; s=importlib.util.spec_from_file_location('acceptance', '../scripts/challenge-image-acceptance.py'); m=importlib.util.module_from_spec(s); sys.modules[s.name]=m; s.loader.exec_module(m); print(json.dumps(m.SUITE_CASE_IDS))"], { cwd: path.resolve(import.meta.dir, ".."), encoding: "utf8", timeout: 15000 });
+  const runner = spawnSync("python3", ["-B", "-c", requiredIdsLoader], { cwd: path.resolve(import.meta.dir, ".."), encoding: "utf8", timeout: 15000 });
   expect(runner.status).toBe(0);
   expect(JSON.parse(runner.stdout).sort()).toEqual([...expectedSigningIds, ...expectedConsentIds].sort());
 });
@@ -650,4 +655,27 @@ for (const [name, display] of Object.entries({
   ...Object.fromEntries(CHALLENGE_PHRASES.map((phrase, i) => [`challengeClaim${i}`, { ...genericConsentDisplay, text: genericConsentDisplay.text + "\n" + phrase }])),
 })) test(`empty-policy consent rejects ${name} display`, () => {
   expect(() => assertEmptyConsentDisplay(display)).toThrow("challenge_image:empty_consent_display");
+});
+
+test("non-ok HTTP status rejects valid JSON with a fixed category before registration writes", async () => {
+  const f = fixture({ httpStatus: 503 });
+  await expect(f.registerSyntheticUser(f.request, config())).rejects.toThrow(/^challenge_image:http_status$/);
+  expect(f.calls).toHaveLength(1); expect(writes(f)).toHaveLength(0);
+});
+
+test("case pass context composes current framework status with its real local deadline", async () => {
+  const { createSummaryRecorder, createCaseContext } = await import("./challenge-image-summary");
+  for (const [status, finishedAt, pass] of [["passed", 109, true], ["timedOut", 101, false], ["passed", 110, false], ["passed", 111, false]] as const) {
+    let now = 100;
+    const info = { status: "passed", timeout: 10 }, file = summaryBoundary();
+    const recorder = createSummaryRecorder(summaryIds, file.io);
+    const context = createCaseContext(info, () => now);
+    const pending = recorder.recordCase(summaryIds[0], async () => { now = finishedAt; info.status = status; }, context);
+    if (pass) await pending; else await expect(pending).rejects.toThrow(/^challenge_image:case_failed$/);
+    expect(file.rows()).toEqual([{ id: summaryIds[0], passed: pass }]);
+  }
+});
+
+test("browser navigation config does not send the API Origin header", () => {
+  expect(dedicatedConfig.use?.extraHTTPHeaders).toBeUndefined();
 });

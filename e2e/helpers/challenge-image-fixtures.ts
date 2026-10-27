@@ -123,13 +123,18 @@ export function assertDiscoverySeparation(input: {
 // builder. Callers supply Bun's actual local inputs plus runtime-read assets.
 // Repository-relative paths keep the same location beneath / in the client.
 export function assertClientPackaging(input: { dockerfile: string; requiredPaths: readonly string[] }): void {
+  const allowedSources = new Set([...input.requiredPaths, "e2e/package.json", "e2e/bun.lock", "e2e/challenge-image/"]);
   let workdir = "/";
   let copies: { source: string; destination: string; directory: boolean }[] = [];
   for (const raw of input.dockerfile.split(/\r?\n/)) {
-    const line = raw.trim();
+    const line = raw.trim().replace(/^[a-z]+/i, instruction => instruction.toUpperCase());
     if (line.startsWith("FROM ")) { workdir = "/"; copies = []; }
     if (line.startsWith("WORKDIR ")) workdir = path.posix.resolve(workdir, line.slice(8).trim());
-    if (!line.startsWith("COPY ") || line.startsWith("COPY --from=")) continue;
+    if (!line.startsWith("COPY ")) continue;
+    if (line.startsWith("COPY --from=")) {
+      requireFixture(line === "COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun", "packaging_copy_scope");
+      continue;
+    }
     const parts = line.split(/\s+/).slice(1);
     const destination = parts.pop()!;
     requireFixture(parts.length > 0 && !/[\[\]"'\\*?]/.test(parts.join(" ") + destination)
@@ -138,7 +143,8 @@ export function assertClientPackaging(input: { dockerfile: string; requiredPaths
     for (const source of parts) {
       // Keep the narrow helper COPY boundary; never package the old auth/db
       // fallbacks or broad trees as a way to satisfy an incomplete graph.
-      requireFixture(![".", "./", "e2e", "e2e/", "e2e/helpers", "e2e/helpers/", "e2e/helpers/auth.ts", "e2e/helpers/db.ts"].includes(source)
+      requireFixture(allowedSources.has(source)
+        && (path.posix.normalize(source) === source)
         && (!source.endsWith("/") || source === "e2e/challenge-image/"), "packaging_copy_scope");
       const directory = source.endsWith("/");
       copies.push({ source, directory, destination: path.posix.resolve(workdir, destination,

@@ -39,9 +39,6 @@ jobs:
           ref: ${{ inputs.source_sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.3.10
       - name: Verify checkout, fetched main and clean tracked build inputs
         id: source
         env:
@@ -139,6 +136,16 @@ jobs:
               assert isinstance(value, str) and re.fullmatch('sha256:[0-9a-f]{64}', value)
               return value
           record = json.loads((root / 'build-record.json').read_text())
+          # Persist nonsecret actual daemon storage diagnostics before any image
+          # compatibility check can fail. Never infer or alter daemon settings.
+          driver = json.loads(command('docker', 'info', '--format', '{{json .Driver}}'))
+          status = json.loads(command('docker', 'info', '--format', '{{json .DriverStatus}}'))
+          assert isinstance(driver, str) and re.fullmatch('[a-zA-Z0-9_.-]{1,64}', driver)
+          assert isinstance(status, list) and all(isinstance(row, list) and len(row) == 2 for row in status)
+          types = [row[1] for row in status if row[0] == 'driver-type']
+          assert len(types) <= 1 and all(isinstance(value, str) and re.fullmatch('[a-zA-Z0-9_.-]{1,64}', value) for value in types)
+          record['daemon_image_store'] = dict(storage_driver=driver, driver_type=types[0] if types else None)
+          (root / 'build-record.json').write_text(json.dumps(record, sort_keys=True))
           index_digest = digest(os.environ['RELEASE_DIGEST'])
           image = 'ghcr.io/divinevideo/keycast@' + index_digest
           def manifest(ref):
@@ -242,56 +249,63 @@ jobs:
           root = pathlib.Path(os.environ['RUNNER_TEMP'])
           loader = importlib.util.spec_from_file_location('acceptance', 'scripts/challenge-image-acceptance.py')
           module = importlib.util.module_from_spec(loader); sys.modules[loader.name] = module; loader.loader.exec_module(module)
-          spec = json.loads((root / 'run-spec.json').read_text())
-          module.RunSpec.from_dict(spec)
-          result = json.loads((root / 'challenge-runtime/acceptance.json').read_text())
-          assert set(result) == {f.name for f in dataclasses.fields(module.AcceptanceResult)}
-          assert result['schema_version'] == 1
-          assert result['artifact_identity'] == {k: v for k, v in spec.items() if k != 'evidence_dir'}
-          expected = list(module.REQUIRED_CASE_IDS)
-          assert len(expected) == 106 and len(module.SUITE_CASE_IDS) == 102
-          assert result['expected_case_ids'] == expected
-          assert result['executed_case_ids'] == expected
-          assert result['counts'] == dict(expected=106, executed=106, passed=106, failed=0)
-          assert all(type(v) is int for v in result['counts'].values())
-          assert result['complete'] is True and result['passed'] is True
-          assert type(result['suite_exit_code']) is int and result['suite_exit_code'] == 0
-          assert result['failure'] is None
-          def clean(value):
-              assert set(value) == {'complete', 'removed', 'failed'}
-              assert value['complete'] is True and type(value['failed']) is int and value['failed'] == 0
-              assert type(value['removed']) is int and value['removed'] >= 0
-          clean(result['cleanup'])
-          final = json.loads((root / 'cleanup.json').read_text())
-          assert set(final) == {'schema_version', 'cleanup'} and final['schema_version'] == 1
-          clean(final['cleanup'])
-          assert os.environ['ACCEPT_OUTCOME'] == os.environ['CLEANUP_OUTCOME'] == 'success'
-          assert re.fullmatch('[0-9a-f]{64}', result['configuration_fingerprint'])
-          record = json.loads((root / 'build-record.json').read_text())
-          assert all(record[key] == spec['source_sha'] for key in (
-              'source_sha', 'github_sha', 'workflow_sha', 'checkout_head', 'tooling_sha'))
-          assert record['workflow_run'] == spec['workflow_run'] and record['workflow_attempt'] == spec['workflow_attempt']
-          assert record['ref'] == 'refs/heads/main' and record['event'] == 'workflow_dispatch'
-          assert record['workflow_ref'] == 'divinevideo/keycast/.github/workflows/challenge-image-acceptance.yaml@refs/heads/main'
-          settings = {key: module.APP_ENV[key] for key in (
-              'NODE_ENV', 'DISABLE_EMAILS', 'KMS_PROVIDER', 'USE_GCP_KMS', 'MASTER_KEY_PATH', 'WEB_BUILD_DIR',
-              'APP_URL', 'ALLOWED_ORIGINS', 'ALLOWED_TENANT_DOMAINS', 'BUNKER_RELAYS', 'SHOW_TEAMS_FUNCTIONALITY')}
-          configuration = dict(settings=settings, dependencies=spec['dependencies'],
-              fixture_policy_hashes=record['fixture_policy_hashes'], runner_fingerprint=result['configuration_fingerprint'],
-              substitutions=['owned ephemeral stores and relay', 'file KMS', 'generated synthetic identities', 'loopback origin', 'single instance'])
-          fingerprint = hashlib.sha256(json.dumps(configuration, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-          # Explicit mapping; never copy subprocess output, credentials, DSNs,
-          # ownership journals, browser reports or private-key hashes.
-          summary = {key: result[key] for key in ('schema_version', 'complete', 'passed', 'configuration_fingerprint',
-              'expected_case_ids', 'executed_case_ids', 'counts', 'suite_exit_code', 'cleanup', 'failure')}
-          summary['final_cleanup'] = final['cleanup']
-          artifact = dict(schema_version=1, run_spec=spec, build=record,
-              configuration=configuration, configuration_fingerprint=fingerprint,
-              evidence_scope='Isolated predeploy image acceptance; production enforcement remains unproven')
-          public = root / 'challenge-public'
-          public.mkdir(mode=0o700, exist_ok=True)
-          for name, data in (('summary.json', summary), ('artifact.json', artifact)):
-              module.write_json(public / name, data)
+          diagnostic = module.failure_diagnostics(root / 'challenge-runtime')
+          print(json.dumps(diagnostic, sort_keys=True), flush=True)
+          try:
+              assert diagnostic['failure'] not in ('missing_diagnostics', 'invalid_diagnostics')
+              spec = json.loads((root / 'run-spec.json').read_text())
+              module.RunSpec.from_dict(spec)
+              result = json.loads((root / 'challenge-runtime/acceptance.json').read_text())
+              assert set(result) == {f.name for f in dataclasses.fields(module.AcceptanceResult)}
+              assert result['schema_version'] == 1
+              assert result['artifact_identity'] == {k: v for k, v in spec.items() if k != 'evidence_dir'}
+              expected = list(module.REQUIRED_CASE_IDS)
+              assert len(expected) == 106 and len(module.SUITE_CASE_IDS) == 102
+              assert result['expected_case_ids'] == expected
+              assert result['executed_case_ids'] == expected
+              assert result['counts'] == dict(expected=106, executed=106, passed=106, failed=0)
+              assert all(type(v) is int for v in result['counts'].values())
+              assert result['complete'] is True and result['passed'] is True
+              assert type(result['suite_exit_code']) is int and result['suite_exit_code'] == 0
+              assert result['failure'] is None
+              def clean(value):
+                  assert set(value) == {'complete', 'removed', 'failed'}
+                  assert value['complete'] is True and type(value['failed']) is int and value['failed'] == 0
+                  assert type(value['removed']) is int and value['removed'] >= 0
+              clean(result['cleanup'])
+              final = json.loads((root / 'cleanup.json').read_text())
+              assert set(final) == {'schema_version', 'cleanup'} and final['schema_version'] == 1
+              clean(final['cleanup'])
+              assert os.environ['ACCEPT_OUTCOME'] == os.environ['CLEANUP_OUTCOME'] == 'success'
+              assert re.fullmatch('[0-9a-f]{64}', result['configuration_fingerprint'])
+              record = json.loads((root / 'build-record.json').read_text())
+              assert all(record[key] == spec['source_sha'] for key in (
+                  'source_sha', 'github_sha', 'workflow_sha', 'checkout_head', 'tooling_sha'))
+              assert record['workflow_run'] == spec['workflow_run'] and record['workflow_attempt'] == spec['workflow_attempt']
+              assert record['ref'] == 'refs/heads/main' and record['event'] == 'workflow_dispatch'
+              assert record['workflow_ref'] == 'divinevideo/keycast/.github/workflows/challenge-image-acceptance.yaml@refs/heads/main'
+              settings = {key: module.APP_ENV[key] for key in (
+                  'NODE_ENV', 'DISABLE_EMAILS', 'KMS_PROVIDER', 'USE_GCP_KMS', 'MASTER_KEY_PATH', 'WEB_BUILD_DIR',
+                  'APP_URL', 'ALLOWED_ORIGINS', 'ALLOWED_TENANT_DOMAINS', 'BUNKER_RELAYS', 'SHOW_TEAMS_FUNCTIONALITY')}
+              configuration = dict(settings=settings, dependencies=spec['dependencies'],
+                  fixture_policy_hashes=record['fixture_policy_hashes'], runner_fingerprint=result['configuration_fingerprint'],
+                  substitutions=['owned ephemeral stores and relay', 'file KMS', 'generated synthetic identities', 'loopback origin', 'single instance'])
+              fingerprint = hashlib.sha256(json.dumps(configuration, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+              # Explicit mapping; never copy subprocess output, credentials, DSNs,
+              # ownership journals, browser reports or private-key hashes.
+              summary = {key: result[key] for key in ('schema_version', 'complete', 'passed', 'configuration_fingerprint',
+                  'expected_case_ids', 'executed_case_ids', 'counts', 'suite_exit_code', 'cleanup', 'failure')}
+              summary['final_cleanup'] = final['cleanup']
+              artifact = dict(schema_version=1, run_spec=spec, build=record,
+                  configuration=configuration, configuration_fingerprint=fingerprint,
+                  evidence_scope='Isolated predeploy image acceptance; production enforcement remains unproven')
+              public = root / 'challenge-public'
+              public.mkdir(mode=0o700, exist_ok=True)
+              for name, data in (('summary.json', summary), ('artifact.json', artifact)):
+                  module.write_json(public / name, data)
+          except Exception:
+              print('Acceptance evidence rejected.', file=sys.stderr)
+              raise SystemExit(1)
           PY
       - name: Retain only sanitized evidence
         if: always() && steps.evidence.outcome == 'success'
