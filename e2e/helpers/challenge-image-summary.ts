@@ -2,6 +2,7 @@ import { readFile, writeFile } from "node:fs/promises";
 
 interface SummaryCase { id: string; passed: boolean }
 interface Summary { schema_version: 1; cases: SummaryCase[] }
+export interface CaseContext { canPass(): boolean }
 export interface SummaryIO { read(): Promise<string | undefined>; write(contents: string): Promise<void> }
 const SUMMARY_PATH = "/tmp/challenge-image-summary.json";
 const fileIO: SummaryIO = {
@@ -46,7 +47,7 @@ export function createSummaryRecorder(allowedIds: readonly string[], io: Summary
     const value = await load();
     if (value === undefined) await save({ schema_version: 1, cases: [] });
   }
-  async function recordCase(id: string, operation: () => Promise<void>): Promise<void> {
+  async function recordCase(id: string, operation: () => Promise<void>, context?: CaseContext): Promise<void> {
     check(allowed.has(id), "case");
     const value = await load() ?? { schema_version: 1 as const, cases: [] };
     check(!value.cases.some(row => row.id === id), "duplicate");
@@ -54,9 +55,17 @@ export function createSummaryRecorder(allowedIds: readonly string[], io: Summary
     // Persist an attempted failure before awaiting its body. Only this newly
     // appended row can become true; prior false entries cannot be upgraded.
     await save(value);
-    try { await operation(); row.passed = true; }
+    try {
+      await operation();
+      check(!context || context.canPass(), "deadline");
+      row.passed = true;
+    }
     catch { throw new Error("challenge_image:case_failed"); }
     finally { await save(value); }
   }
-  return { initialize, recordCase };
+  async function assertComplete(): Promise<void> {
+    const value = await load();
+    check(value && value.cases.length === allowed.size && value.cases.every(row => row.passed), "incomplete");
+  }
+  return { initialize, recordCase, assertComplete };
 }

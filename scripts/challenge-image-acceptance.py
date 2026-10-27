@@ -44,7 +44,11 @@ SIGNING_CASE_NAMES = (
 REQUIRED_CASE_IDS = (
     'runtime.ownership', 'runtime.dependencies', 'runtime.migrations', 'runtime.health',
     *(f'signing.{transport}.{case}' for transport in ('http', 'nip46') for case in SIGNING_CASE_NAMES),
-    'consent.authorize', 'consent.refresh', 'management.creation-held',
+    'consent.authorize', 'consent.refresh', 'consent.empty-authorize', 'consent.empty-refresh',
+    *(f'config.{case}.{boundary}'
+      for case in ('unknown_permission', 'allowed_kinds_string', 'challenge_null', 'challenge_unknown', 'challenge_json')
+      for boundary in ('http', 'detail', 'list', 'consent', 'exchange', 'refresh')),
+    'management.no-global-preset', 'management.creation-held', 'management.allowed-kinds-control', 'management.picker',
 )
 SUITE_CASE_IDS = REQUIRED_CASE_IDS[4:]
 HOST_ENV = {'PATH': '/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin', 'LANG': 'C.UTF-8'}

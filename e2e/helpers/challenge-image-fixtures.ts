@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import path from "node:path";
@@ -42,7 +42,12 @@ export interface SessionFixture {
   readonly tenantId: number;
   readonly teamId: number;
 }
+export interface AuthorizationRequest {
+  readonly clientId: string; readonly redirectUri: string; readonly scope: string;
+  readonly verifier: string; readonly challenge: string; readonly url: string;
+}
 export interface Grant {
+  clientId: string;
   accessToken: string;
   refreshToken: string;
   bunkerUrl: string;
@@ -151,6 +156,21 @@ export function assertClientPackaging(input: { dockerfile: string; requiredPaths
   }
 }
 
+export const MALFORMED_PERMISSIONS = [
+  ["unknown_permission", "unknown_permission", "{}"],
+  ["allowed_kinds_string", "allowed_kinds", '{"allowed_kinds":"x"}'],
+  ["challenge_null", "challenge_actions", "null"],
+  ["challenge_unknown", "challenge_actions", '{"unknown":true}'],
+  ["challenge_json", "challenge_actions", "{"],
+] as const;
+export const CONFIG_BOUNDARIES = ["http", "detail", "list", "consent", "exchange", "refresh"] as const;
+export const CONSENT_CASE_IDS = [
+  "consent.authorize", "consent.refresh", "consent.empty-authorize", "consent.empty-refresh",
+  ...MALFORMED_PERMISSIONS.flatMap(([name]) => CONFIG_BOUNDARIES.map(boundary => `config.${name}.${boundary}`)),
+  "management.no-global-preset", "management.creation-held", "management.allowed-kinds-control", "management.picker",
+];
+export const CHALLENGE_TITLE = "Challenges and contest curation";
+export const CHALLENGE_PHRASES = ["Create and manage challenges", "enter and withdraw entries", "announce results", "curate contests", "No private-message access"];
 const permissionSpecs = {
   restricted: [["challenge_actions", "{}"]],
   empty: [],
@@ -171,6 +191,8 @@ const userQuery = `SELECT u.pubkey, u.tenant_id, u.email_verification_token, u.e
 export function createFixtureHelpers(io: FixtureIO) {
   const policies = new WeakMap<PolicyFixture, { config: FixtureConfig; permissions: PermissionRow[]; mutating: boolean }>();
   const sessions = new WeakMap<SessionFixture, FixtureConfig>();
+  const authorizations = new WeakMap<AuthorizationRequest, { session: SessionFixture; policy: PolicyFixture; config: FixtureConfig }>();
+  const grants = new WeakMap<Grant, { session: SessionFixture; policy: PolicyFixture; config: FixtureConfig }>();
 
   async function checkManifest(c: FixtureConfig): Promise<void> {
     validConfig(c);
@@ -317,11 +339,19 @@ export function createFixtureHelpers(io: FixtureIO) {
       grant_type: "authorization_code", code: auth.code, client_id: clientId,
       redirect_uri: redirectUri, code_verifier: pkce.verifier,
     });
+    return bindToken(session, policy, clientId, token);
+  }
+  async function bindToken(session: SessionFixture, policy: PolicyFixture, clientId: string, token: any): Promise<Grant> {
+    const owner = policies.get(policy);
+    requireFixture(owner && sessions.has(session), "grant_ownership");
     requireFixture(token.scope === policy.scope && token.scope !== "policy:full", "grant_scope");
     requireFixture(token.policy?.slug === policy.slug && token.policy.display_name === policy.displayName
       && typeof token.policy.description === "string" && Array.isArray(token.policy.permissions)
       && token.policy.permissions.length === owner.permissions.length
       && token.policy.permissions.every((p: any) => typeof p.title === "string" && p.title.length > 0 && typeof p.description === "string" && p.description.length > 0), "grant_display");
+    const challengeDisplays = token.policy.permissions.filter((p: any) => p.title === CHALLENGE_TITLE);
+    requireFixture(challengeDisplays.length === owner.permissions.filter(p => p.identifier === "challenge_actions").length
+      && challengeDisplays.every((p: any) => CHALLENGE_PHRASES.every(phrase => p.description.includes(phrase))), "challenge_display");
     requireFixture(typeof token.access_token === "string" && token.access_token.length > 0
       && typeof token.refresh_token === "string" && token.refresh_token.length > 0 && token.token_type === "Bearer"
       && typeof token.authorization_handle === "string" && HEX64.test(token.authorization_handle), "grant_token");
@@ -343,8 +373,97 @@ export function createFixtureHelpers(io: FixtureIO) {
       // replace it or connect to it; response/signer use BUNKER_RELAYS.
       return rows[0].id as number;
     });
-    return { accessToken: token.access_token, refreshToken: token.refresh_token, bunkerUrl: token.bunker_url,
+    const grant: Grant = { clientId, accessToken: token.access_token, refreshToken: token.refresh_token, bunkerUrl: token.bunker_url,
       scope: token.scope, pubkey: session.pubkey, authorizationId };
+    grants.set(grant, { session, policy, config: owner.config });
+    return grant;
+  }
+  async function assertPolicyUnchanged(policy: PolicyFixture): Promise<void> {
+    const owner = policies.get(policy); requireFixture(owner, "policy_ownership");
+    await ownedDb(owner.config, db => assertPolicy(db, policy));
+  }
+  async function assertNoGlobalChallenges(c: FixtureConfig): Promise<void> {
+    await ownedDb(c, async db => {
+      const { rows } = await db.query("SELECT id FROM policies WHERE slug = $1 AND team_id IS NULL", ["challenges"]);
+      requireFixture(rows.length === 0, "global_challenges_preset");
+    });
+  }
+  async function prepareAuthorization(session: SessionFixture, policy: PolicyFixture): Promise<AuthorizationRequest> {
+    const owner = policies.get(policy), c = sessions.get(session);
+    requireFixture(owner && c && JSON.stringify(c) === JSON.stringify(owner.config), "grant_ownership");
+    await ownedDb(c, db => assertPolicy(db, policy));
+    const pkce = generatePKCE(), clientId = `image-${randomBytes(16).toString("hex")}`, redirectUri = BASE_URL + "/acceptance-callback";
+    const params = new URLSearchParams({ response_type: "code", client_id: clientId, redirect_uri: redirectUri,
+      scope: policy.scope, code_challenge: pkce.challenge, code_challenge_method: "S256", prompt: "consent", screen: "consent" });
+    const auth = Object.freeze({ clientId, redirectUri, scope: policy.scope, verifier: pkce.verifier, challenge: pkce.challenge, url: BASE_URL + "/api/oauth/authorize?" + params });
+    authorizations.set(auth, { session, policy, config: c }); return auth;
+  }
+  async function issueAuthorizationCode(request: APIRequestContext, session: SessionFixture, policy: PolicyFixture) {
+    const auth = await prepareAuthorization(session, policy);
+    const { body } = await jsonRequest(request, "post", "/api/oauth/authorize", {
+      client_id: auth.clientId, redirect_uri: auth.redirectUri, scope: auth.scope, approved: true,
+      code_challenge: auth.challenge, code_challenge_method: "S256",
+    }, session.cookie);
+    requireFixture(typeof body.code === "string" && body.code.length > 0, "authorization_code");
+    return { auth, code: body.code as string };
+  }
+  async function exchangeAuthorization(request: APIRequestContext, auth: AuthorizationRequest, code: string): Promise<Grant> {
+    const owner = authorizations.get(auth); requireFixture(owner && typeof code === "string" && code.length > 0, "code_ownership");
+    await ownedDb(owner.config, db => assertPolicy(db, owner.policy));
+    const { body } = await jsonRequest(request, "post", "/api/oauth/token", {
+      grant_type: "authorization_code", code, client_id: auth.clientId, redirect_uri: auth.redirectUri, code_verifier: auth.verifier,
+    });
+    return bindToken(owner.session, owner.policy, auth.clientId, body);
+  }
+  async function refreshGrant(request: APIRequestContext, grant: Grant): Promise<Grant> {
+    const owner = grants.get(grant); requireFixture(owner, "grant_ownership");
+    await ownedDb(owner.config, db => assertPolicy(db, owner.policy));
+    const { body } = await jsonRequest(request, "post", "/api/oauth/token", { grant_type: "refresh_token", refresh_token: grant.refreshToken, client_id: grant.clientId });
+    const rotated = await bindToken(owner.session, owner.policy, grant.clientId, body);
+    requireFixture(rotated.refreshToken !== grant.refreshToken && rotated.authorizationId === grant.authorizationId, "refresh_rotation");
+    return rotated;
+  }
+  async function codeState(auth: AuthorizationRequest, code: string): Promise<{ authorizations: number; refreshTokens: number }> {
+    const owner = authorizations.get(auth); requireFixture(owner && typeof code === "string" && code.length > 0, "code_ownership");
+    const { session, config: c } = owner;
+    return ownedDb(c, async db => {
+      const { rows } = await db.query(`SELECT code, pending_email, consumed_at, scope FROM oauth_codes
+        WHERE code = $1 AND user_pubkey = $2 AND tenant_id = $3 AND client_id = $4 AND redirect_uri = $5`,
+        [code, session.pubkey, session.tenantId, auth.clientId, auth.redirectUri]);
+      requireFixture(rows.length === 1 && rows[0].code === code && rows[0].pending_email === null
+        && rows[0].consumed_at === null && rows[0].scope === owner.policy.scope, "code_unconsumed");
+      const counts = await db.query(`SELECT COUNT(DISTINCT a.id)::int AS authorizations, COUNT(r.id)::int AS refresh_tokens
+        FROM oauth_authorizations a LEFT JOIN oauth_refresh_tokens r ON r.authorization_id = a.id
+        WHERE a.user_pubkey = $1 AND a.tenant_id = $2 AND a.client_id = $3`, [session.pubkey, session.tenantId, auth.clientId]);
+      requireFixture(counts.rows.length === 1, "code_state");
+      return { authorizations: counts.rows[0].authorizations, refreshTokens: counts.rows[0].refresh_tokens };
+    });
+  }
+  async function assertRefreshState(grant: Grant, consumed: boolean, expectedCount = 1): Promise<void> {
+    const owner = grants.get(grant); requireFixture(owner, "grant_ownership");
+    await ownedDb(owner.config, async db => {
+      const { rows } = await db.query(`SELECT a.id, a.policy_id, a.revoked_at, r.consumed_at,
+        (SELECT COUNT(*)::int FROM oauth_refresh_tokens rr WHERE rr.authorization_id = a.id) AS token_count
+        FROM oauth_authorizations a JOIN oauth_refresh_tokens r ON r.authorization_id = a.id
+        WHERE a.id = $1 AND a.user_pubkey = $2 AND a.tenant_id = $3 AND a.client_id = $4
+        AND r.token_hash = $5 AND r.tenant_id = $3`, [grant.authorizationId, owner.session.pubkey, owner.session.tenantId,
+        grant.clientId, createHash("sha256").update(grant.refreshToken).digest("hex")]);
+      requireFixture(rows.length === 1 && rows[0].policy_id === owner.policy.id && rows[0].revoked_at === null
+        && (rows[0].consumed_at !== null) === consumed && rows[0].token_count === expectedCount, "refresh_state");
+    });
+  }
+  async function teamPolicyCounts(session: SessionFixture): Promise<{ policies: number; permissions: number; links: number }> {
+    const c = sessions.get(session); requireFixture(c, "session_ownership");
+    return ownedDb(c, async db => {
+      const team = await db.query(`SELECT t.id FROM teams t JOIN team_users u ON u.team_id = t.id
+        WHERE t.id = $1 AND t.tenant_id = $2 AND u.user_pubkey = $3 AND u.role = 'admin'`, [session.teamId, session.tenantId, session.pubkey]);
+      requireFixture(team.rows.length === 1, "team_ownership");
+      // This database belongs exclusively to the nonce-bound acceptance runner.
+      // Whole-table counts also catch orphan permission/link writes on rejection.
+      const { rows } = await db.query(`SELECT (SELECT COUNT(*)::int FROM policies) AS policies,
+        (SELECT COUNT(*)::int FROM permissions) AS permissions, (SELECT COUNT(*)::int FROM policy_permissions) AS links`);
+      requireFixture(rows.length === 1, "team_counts"); return rows[0];
+    });
   }
   async function withPermissionMutation(policy: PolicyFixture, identifier: string, configText: string, operation: () => Promise<void>): Promise<void> {
     const owner = policies.get(policy);
@@ -366,7 +485,7 @@ export function createFixtureHelpers(io: FixtureIO) {
       finally { owner.mutating = false; }
     }
   }
-  return { assertOwnedFixture, preparePolicies, registerSyntheticUser, issueGrant, withPermissionMutation };
+  return { assertOwnedFixture, preparePolicies, registerSyntheticUser, issueGrant, withPermissionMutation, assertPolicyUnchanged, assertNoGlobalChallenges, prepareAuthorization, issueAuthorizationCode, exchangeAuthorization, refreshGrant, codeState, assertRefreshState, teamPolicyCounts };
 }
 
 const helpers = createFixtureHelpers({
@@ -385,4 +504,4 @@ const helpers = createFixtureHelpers({
   },
   pause: milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
 });
-export const { assertOwnedFixture, preparePolicies, registerSyntheticUser, issueGrant, withPermissionMutation } = helpers;
+export const { assertOwnedFixture, preparePolicies, registerSyntheticUser, issueGrant, withPermissionMutation, assertPolicyUnchanged, assertNoGlobalChallenges, prepareAuthorization, issueAuthorizationCode, exchangeAuthorization, refreshGrant, codeState, assertRefreshState, teamPolicyCounts } = helpers;

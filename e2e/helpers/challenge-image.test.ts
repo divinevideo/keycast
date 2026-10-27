@@ -24,7 +24,7 @@ const publicKey = "f".repeat(64); // Synthetic public identifier only.
 
 // Only external boundaries are replaced. Real helper control flow, SQL
 // parameters and request bodies remain under test; no services run.
-function fixture(options: { ownership?: unknown; database?: string; token?: any; user?: any; authorization?: any; missingToken?: boolean; processing?: boolean; httpError?: boolean; mutationFailure?: boolean } = {}) {
+function fixture(options: { ownership?: unknown; database?: string; token?: any; user?: any; authorization?: any; missingToken?: boolean; processing?: boolean; httpError?: boolean; mutationFailure?: boolean; code?: any; refreshState?: any; globalPreset?: boolean; teamAbsent?: boolean } = {}) {
   const queries: { sql: string; values: any[] }[] = [];
   const calls: { method: string; url: string; options: any }[] = [];
   const policies: any[] = [], permissions: any[] = [], links: any[] = [];
@@ -50,6 +50,12 @@ function fixture(options: { ownership?: unknown; database?: string; token?: any;
     } else if (q.includes("FROM users u JOIN tenants")) rows = [{ pubkey: publicKey, tenant_id: 7, email_verification_token: "synthetic-verification-token", email_verified: true, has_encrypted_key: true, ...options.user, ...(options.missingToken ? { email_verification_token: null } : {}) }];
     else if (q.startsWith("INSERT INTO teams")) rows = [{ id: 21 }];
     else if (q.startsWith("INSERT INTO team_users")) rows = [{ id: 31 }];
+    else if (q.startsWith("SELECT id FROM policies WHERE slug")) rows = options.globalPreset ? [{ id: 999 }] : [];
+    else if (q.startsWith("SELECT code, pending_email")) rows = [{ code: values[0], pending_email: null, consumed_at: null, scope: grantPolicy.scope, ...options.code }];
+    else if (q.startsWith("SELECT COUNT(DISTINCT a.id)")) rows = [{ authorizations: 0, refresh_tokens: 0 }];
+    else if (q.startsWith("SELECT a.id, a.policy_id")) rows = [{ id: 41, policy_id: grantPolicy.id, revoked_at: null, consumed_at: null, token_count: 1, ...options.refreshState }];
+    else if (q.startsWith("SELECT t.id FROM teams")) rows = options.teamAbsent ? [] : [{ id: 21 }];
+    else if (q.startsWith("SELECT (SELECT COUNT(*)::int FROM policies)")) rows = [{ policies: policies.length, permissions: permissions.length, links: links.length }];
     else if (q.includes("FROM oauth_authorizations")) rows = [{ id: 41, policy_id: grantPolicy.id, user_pubkey: publicKey, tenant_id: 7, bunker_public_key: "1".repeat(64), ...options.authorization }];
     else if (q.startsWith("UPDATE permissions")) {
       const row = permissions.find(p => p.id === values[2]);
@@ -73,10 +79,10 @@ function fixture(options: { ownership?: unknown; database?: string; token?: any;
     else if (url.endsWith("/verify-email")) body = options.processing && verifiedCalls++ === 0 ? { success: false, status: "processing", retry_after: 1 } : { success: true, authenticated: true };
     else if (url.endsWith("/authorize")) body = { code: "synthetic-code", redirect_uri: opts.data.redirect_uri };
     else if (url.endsWith("/token")) body = {
-      access_token: "synthetic-access", refresh_token: "synthetic-refresh", token_type: "Bearer", expires_in: 3600,
+      access_token: "synthetic-access", refresh_token: opts.data.grant_type === "refresh_token" ? "synthetic-rotated" : "synthetic-refresh", token_type: "Bearer", expires_in: 3600,
       authorization_handle: "2".repeat(64), scope: `policy:${grantPolicy.slug}`,
       bunker_url: `bunker://${"1".repeat(64)}?relay=ws%3A%2F%2Flocalhost%3A8080&secret=synthetic-secret`,
-      policy: { slug: grantPolicy.slug, display_name: grantPolicy.displayName, description: "Synthetic acceptance", permissions: grantPolicy.kind === "empty" ? [] : [...[{ icon: "🏆", title: "Challenges and contest curation", description: "Synthetic display" }], ...(grantPolicy.kind === "intersection" ? [{ icon: "🔒", title: "Other actions", description: "Synthetic restriction" }] : [])] }, ...options.token,
+      policy: { slug: grantPolicy.slug, display_name: grantPolicy.displayName, description: "Synthetic acceptance", permissions: grantPolicy.kind === "empty" ? [] : [...[{ icon: "🏆", title: "Challenges and contest curation", description: "Create and manage challenges, enter and withdraw entries, announce results, and curate contests. No private-message access." }], ...(grantPolicy.kind === "intersection" ? [{ icon: "🔒", title: "Other actions", description: "Synthetic restriction" }] : [])] }, ...options.token,
     }; else throw new Error("unexpected HTTP boundary");
     return { ok: () => true, status: () => 200, json: async () => body, headers: () => ({ "set-cookie": "keycast_session=synthetic-session; Path=/; HttpOnly" }) };
   }]));
@@ -142,6 +148,10 @@ test("client packaging covers the actual current helper graph with precise copie
   expect(requiredPaths).toContain("e2e/helpers/challenge-image-fixtures.ts");
   expect(requiredPaths).toContain("e2e/helpers/oauth.ts");
   expect(() => assertClientPackaging({ dockerfile, requiredPaths })).not.toThrow();
+  for (const file of requiredPaths) {
+    const source = file === "e2e/challenge-image/challenge-image.spec.ts" ? "e2e/challenge-image/" : file;
+    expect(() => assertClientPackaging({ dockerfile: dockerfile.replace(source, "missing-local-source"), requiredPaths })).toThrow();
+  }
   // Removing a required transitive module's COPY must fail, even while its
   // source exists in this checkout and the standalone bundle succeeds.
   expect(() => assertClientPackaging({ dockerfile: dockerfile.replace(" e2e/helpers/oauth.ts", ""), requiredPaths })).toThrow();
@@ -183,7 +193,12 @@ test("real Node collection isolates and requires every transport matrix row exac
   expect(runner.status).toBe(0);
   const required: string[] = JSON.parse(runner.stdout);
   expect(required.filter(id => id.startsWith("signing.")).sort()).toEqual([...expectedSigningIds].sort());
-  expect(required.filter(id => !id.startsWith("signing.")).sort()).toEqual(["consent.authorize", "consent.refresh", "management.creation-held"]);
+  expect(required.filter(id => !id.startsWith("signing.")).sort()).toEqual([...expectedConsentIds].sort());
+  const allRows = dedicated.stdout.split(/\r?\n/).flatMap(line => {
+    const row = line.match(/^\s+(?:\[[^\]\r\n]+\] › )?challenge-image\.spec\.ts:[1-9]\d*:[1-9]\d* › (\S+)$/);
+    return row ? [row[1]] : [];
+  });
+  expect(allRows.sort()).toEqual([...expectedSigningIds, ...expectedConsentIds].sort());
 }, 60000);
 
 describe("ownership guards", () => {
@@ -245,7 +260,7 @@ test("normal registration verifies generated image key and creates only team adm
 
 test("PKCE explicit policy and owned relay plus database binding yield memory-only grant", async () => {
   const f = fixture(); const p = await f.preparePolicies(config()); const s = await f.registerSyntheticUser(f.request, config()); f.bind(p.restricted); const g = await f.issueGrant(f.request, s, p.restricted);
-  expect(g).toEqual({ accessToken: "synthetic-access", refreshToken: "synthetic-refresh", bunkerUrl: `bunker://${"1".repeat(64)}?relay=ws%3A%2F%2Flocalhost%3A8080&secret=synthetic-secret`, scope: `policy:${p.restricted.slug}`, pubkey: publicKey, authorizationId: 41 });
+  expect(g).toEqual({ clientId: f.calls.find(c => c.url.endsWith("/authorize"))!.options.data.client_id, accessToken: "synthetic-access", refreshToken: "synthetic-refresh", bunkerUrl: `bunker://${"1".repeat(64)}?relay=ws%3A%2F%2Flocalhost%3A8080&secret=synthetic-secret`, scope: `policy:${p.restricted.slug}`, pubkey: publicKey, authorizationId: 41 });
   const auth = f.calls.find(c => c.url.endsWith("/authorize"))!.options, token = f.calls.find(c => c.url.endsWith("/token"))!.options;
   expect(auth.data.scope).toBe(p.restricted.scope); expect(auth.headers.Cookie).toBe(s.cookie); expect(auth.data.code_challenge_method).toBe("S256");
   expect(createHash("sha256").update(token.data.code_verifier).digest("base64url")).toBe(auth.data.code_challenge); expect(token.data.client_id).toBe(auth.data.client_id); expect(token.data.redirect_uri).toBe(auth.data.redirect_uri);
@@ -482,4 +497,134 @@ test("summary recorder sanitizes persistence errors without running case bodies"
     await expect(recorder.recordCase(summaryIds[0], async () => { ran = true; })).rejects.toThrow("challenge_image:summary_io");
   }
   expect(ran).toBe(false);
+});
+
+const malformedCaseNames = ["unknown_permission", "allowed_kinds_string", "challenge_null", "challenge_unknown", "challenge_json"];
+const expectedConsentIds = ["consent.authorize", "consent.refresh", "consent.empty-authorize", "consent.empty-refresh",
+  ...malformedCaseNames.flatMap(name => ["http", "detail", "list", "consent", "exchange", "refresh"].map(boundary => `config.${name}.${boundary}`)),
+  "management.no-global-preset", "management.creation-held", "management.allowed-kinds-control", "management.picker"];
+test("Task 4 requires actual consent, malformed boundaries and hold IDs in runner and recorder", async () => {
+  const module = await import("./challenge-image-fixtures") as any;
+  expect(module.CONSENT_CASE_IDS).toEqual(expectedConsentIds);
+  const spec = readFileSync(path.resolve(import.meta.dir, "../challenge-image/challenge-image.spec.ts"), "utf8");
+  const recorder = spec.match(/const summary = createSummaryRecorder\(\[([\s\S]*?)\]\);/);
+  expect(recorder?.[1].replace(/\s+/g, "")).toBe('...["http","nip46"].flatMap(transport=>SIGNING_CASES.map(name=>`signing.${transport}.${name}`)),...CONSENT_CASE_IDS,');
+  const names = spec.match(/export const SIGNING_CASES = \[([\s\S]*?)\] as const;/);
+  expect(JSON.parse(`[${names![1].replace(/,\s*$/, "")}]`)).toEqual(signingCaseNames);
+  const runner = spawnSync("python3", ["-B", "-c", "import importlib.util,json,sys; s=importlib.util.spec_from_file_location('acceptance', '../scripts/challenge-image-acceptance.py'); m=importlib.util.module_from_spec(s); sys.modules[s.name]=m; s.loader.exec_module(m); print(json.dumps(m.SUITE_CASE_IDS))"], { cwd: path.resolve(import.meta.dir, ".."), encoding: "utf8", timeout: 15000 });
+  expect(runner.status).toBe(0);
+  expect(JSON.parse(runner.stdout).sort()).toEqual([...expectedSigningIds, ...expectedConsentIds].sort());
+});
+for (const reason of ["deadline", "framework_timeout", "interrupted"]) test(`summary cannot record a late positive pass after ${reason}`, async () => {
+  const { createSummaryRecorder } = await import("./challenge-image-summary");
+  const file = summaryBoundary(), recorder = createSummaryRecorder(summaryIds, file.io);
+  let now = 100, status = "passed", finish!: () => void, entered!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const late = new Promise<void>(resolve => { finish = resolve; });
+  const pending = recorder.recordCase(summaryIds[0], async () => {
+    expect(file.rows()[0].passed).toBe(false); entered(); await late;
+  }, { canPass: () => now < 110 && status === "passed" });
+  await started;
+  if (reason === "deadline") now = 111;
+  else status = reason === "framework_timeout" ? "timedOut" : "interrupted";
+  finish();
+  await expect(pending).rejects.toThrow("challenge_image:case_failed");
+  expect(file.rows()).toEqual([{ id: summaryIds[0], passed: false }]);
+});
+test("request timeout remains failed even when caught by a late body", async () => {
+  const { createSummaryRecorder } = await import("./challenge-image-summary");
+  const file = summaryBoundary(), recorder = createSummaryRecorder(summaryIds, file.io);
+  let expired = false;
+  await expect(recorder.recordCase(summaryIds[0], async () => {
+    const { createRpcAdapters } = await rpcModule();
+    const adapter = createRpcAdapters({ requestTimeoutMs: 5, fetch: async () => new Promise(() => {}) });
+    try { await adapter.httpRpc(syntheticGrant("1".repeat(64)), "get_public_key", []); }
+    catch { expired = true; }
+  }, { canPass: () => !expired })).rejects.toThrow("challenge_image:case_failed");
+  expect(file.rows()[0].passed).toBe(false);
+});
+
+test("owned authorization request uses real PKCE, exact scope, explicit consent and registered-user code state", async () => {
+  const f = fixture(), c = config(); const p = await f.preparePolicies(c), s = await f.registerSyntheticUser(f.request, c); f.bind(p.restricted);
+  const pending = await f.issueAuthorizationCode(f.request, s, p.restricted);
+  const url = new URL(pending.auth.url);
+  expect(url.origin + url.pathname).toBe("http://localhost:3000/api/oauth/authorize");
+  expect(url.searchParams.get("scope")).toBe(p.restricted.scope);
+  expect(url.searchParams.get("prompt")).toBe("consent"); expect(url.searchParams.get("screen")).toBe("consent");
+  expect(url.searchParams.get("code_challenge_method")).toBe("S256");
+  expect(createHash("sha256").update(pending.auth.verifier).digest("base64url")).toBe(url.searchParams.get("code_challenge"));
+  expect(await f.codeState(pending.auth, pending.code)).toEqual({ authorizations: 0, refreshTokens: 0 });
+  const query = f.queries.find(q => q.sql.includes("SELECT code, pending_email"))!;
+  expect(query.values).toEqual([pending.code, s.pubkey, s.tenantId, pending.auth.clientId, pending.auth.redirectUri]);
+  expect(f.queries[f.queries.indexOf(query) - 1].sql).toBe("SELECT current_database() AS database");
+  const grant = await f.exchangeAuthorization(f.request, pending.auth, pending.code);
+  expect(grant.clientId).toBe(pending.auth.clientId);
+  expect(f.calls.at(-1)!.options.data).toEqual({ grant_type: "authorization_code", code: pending.code,
+    client_id: pending.auth.clientId, redirect_uri: pending.auth.redirectUri, code_verifier: pending.auth.verifier });
+  await expect(f.codeState({ ...pending.auth }, pending.code)).rejects.toThrow("code_ownership");
+});
+for (const code of [{ pending_email: "synthetic-pending@example.test" }, { consumed_at: "synthetic-time" }, { scope: "policy:full" }, { code: "foreign-code" }]) test("code introspection rejects a nonexact, pending or consumed row", async () => {
+  const f = fixture({ code }), p = await f.preparePolicies(config()), s = await f.registerSyntheticUser(f.request, config()); f.bind(p.restricted);
+  const pending = await f.issueAuthorizationCode(f.request, s, p.restricted);
+  await expect(f.codeState(pending.auth, pending.code)).rejects.toThrow("code_unconsumed");
+});
+test("refresh uses the actual OAuth client ID, rotates token, and owns exact hashed-token introspection", async () => {
+  const f = fixture(), p = await f.preparePolicies(config()), s = await f.registerSyntheticUser(f.request, config()); f.bind(p.restricted);
+  const grant = await f.issueGrant(f.request, s, p.restricted);
+  expect(grant.clientId).not.toBe(config().clientId);
+  await f.assertRefreshState(grant, false);
+  const q = f.queries.find(q => q.sql.startsWith("SELECT a.id, a.policy_id"))!;
+  expect(q.values).toEqual([grant.authorizationId, s.pubkey, s.tenantId, grant.clientId, createHash("sha256").update(grant.refreshToken).digest("hex")]);
+  expect(f.queries[f.queries.indexOf(q) - 1].sql).toBe("SELECT current_database() AS database");
+  const rotated = await f.refreshGrant(f.request, grant);
+  expect(rotated.refreshToken).not.toBe(grant.refreshToken); expect(rotated.clientId).toBe(grant.clientId);
+  expect(f.calls.at(-1)!.options.data).toEqual({ grant_type: "refresh_token", refresh_token: grant.refreshToken, client_id: grant.clientId });
+  await expect(f.assertRefreshState({ ...grant }, false)).rejects.toThrow("grant_ownership");
+});
+for (const refreshState of [{ policy_id: 999 }, { revoked_at: "synthetic-time" }, { consumed_at: "synthetic-time" }, { token_count: 2 }]) test("refresh state rejects wrong policy, revoked authorization, consumption or replacement rows", async () => {
+  const f = fixture({ refreshState }), p = await f.preparePolicies(config()), s = await f.registerSyntheticUser(f.request, config()); f.bind(p.restricted);
+  const grant = await f.issueGrant(f.request, s, p.restricted);
+  await expect(f.assertRefreshState(grant, false)).rejects.toThrow("refresh_state");
+});
+test("consumed refresh state proves no replacement and leaves authorization active", async () => {
+  const f = fixture({ refreshState: { consumed_at: "synthetic-time" } }), p = await f.preparePolicies(config()), s = await f.registerSyntheticUser(f.request, config()); f.bind(p.restricted);
+  const grant = await f.issueGrant(f.request, s, p.restricted); await f.assertRefreshState(grant, true);
+});
+test("global-preset guard and team counts require runner database and owned team-admin session", async () => {
+  const f = fixture(), c = config();
+  await f.assertNoGlobalChallenges(c);
+  expect(f.queries.at(-1)!.values).toEqual(["challenges"]);
+  const s = await f.registerSyntheticUser(f.request, c);
+  expect(await f.teamPolicyCounts(s)).toEqual({ policies: 0, permissions: 0, links: 0 });
+  const q = f.queries.find(q => q.sql.startsWith("SELECT t.id FROM teams"))!;
+  expect(q.values).toEqual([s.teamId, s.tenantId, s.pubkey]);
+  expect(f.queries[f.queries.indexOf(q) - 1].sql).toBe("SELECT current_database() AS database");
+  await expect(f.teamPolicyCounts({ ...s })).rejects.toThrow("session_ownership");
+  await expect(fixture({ globalPreset: true }).assertNoGlobalChallenges(c)).rejects.toThrow("global_challenges_preset");
+  const wrong = fixture({ database: "foreign" }); await expect(wrong.assertNoGlobalChallenges(c)).rejects.toThrow("database_identity");
+  expect(wrong.queries).toHaveLength(1);
+});
+test("new owned introspection fails if the handoff disappears, before any SQL", async () => {
+  const f = fixture(), p = await f.preparePolicies(config()), s = await f.registerSyntheticUser(f.request, config()); f.bind(p.restricted);
+  const pending = await f.issueAuthorizationCode(f.request, s, p.restricted), grant = await f.issueGrant(f.request, s, p.restricted);
+  f.queries.length = 0; f.missingManifest();
+  for (const operation of [() => f.codeState(pending.auth, pending.code), () => f.assertRefreshState(grant, false),
+    () => f.teamPolicyCounts(s), () => f.assertNoGlobalChallenges(config()), () => f.assertPolicyUnchanged(p.restricted)]) {
+    await expect(operation()).rejects.toThrow("ownership_manifest");
+  }
+  expect(f.queries).toHaveLength(0);
+});
+
+test("summary completeness rejects missing, duplicate, skipped and failed required cases", async () => {
+  const { createSummaryRecorder } = await import("./challenge-image-summary");
+  const complete = { schema_version: 1, cases: summaryIds.map(id => ({ id, passed: true })) };
+  const good = createSummaryRecorder(summaryIds, summaryBoundary(JSON.stringify(complete)).io);
+  expect(typeof good.assertComplete).toBe("function");
+  await good.assertComplete();
+  for (const cases of [complete.cases.slice(1), [...complete.cases, complete.cases[0]],
+    complete.cases.map((row, i) => i === 0 ? { ...row, skipped: true } : row),
+    complete.cases.map((row, i) => i === 0 ? { ...row, passed: false } : row)]) {
+    const recorder = createSummaryRecorder(summaryIds, summaryBoundary(JSON.stringify({ schema_version: 1, cases })).io);
+    await expect(recorder.assertComplete()).rejects.toThrow(/^challenge_image:summary_/);
+  }
 });

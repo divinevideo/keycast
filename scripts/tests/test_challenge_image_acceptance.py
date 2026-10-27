@@ -472,9 +472,12 @@ fn warn_atproto_control_plane_config() {}
         actual = [case for case in module.SUITE_CASE_IDS if case.startswith('signing.')]
         self.assertEqual(set(actual), expected)
         self.assertEqual(len(actual), 64)
-        self.assertEqual(len(module.REQUIRED_CASE_IDS), 71)
+        self.assertEqual(len(module.REQUIRED_CASE_IDS), 106)
         self.assertEqual(set(module.SUITE_CASE_IDS) - expected,
-                         {'consent.authorize', 'consent.refresh', 'management.creation-held'})
+                         {'consent.authorize', 'consent.refresh', 'consent.empty-authorize', 'consent.empty-refresh',
+                          'management.no-global-preset', 'management.creation-held', 'management.allowed-kinds-control', 'management.picker'}
+                         | {f'config.{name}.{boundary}' for name in ('unknown_permission', 'allowed_kinds_string', 'challenge_null', 'challenge_unknown', 'challenge_json')
+                            for boundary in ('http', 'detail', 'list', 'consent', 'exchange', 'refresh')})
         # An old aggregate cannot conceal a missing concrete transport row.
         docker = DockerBoundary()
         docker.summary['cases'] = [{'id': c, 'passed': True} for c in module.SUITE_CASE_IDS]
@@ -483,13 +486,32 @@ fn warn_atproto_control_plane_config() {}
         self.assertFalse(result.complete)
         self.assertFalse(result.passed)
 
+    def test_every_consent_boundary_is_mandatory_once_and_must_pass(self):
+        for target in (case for case in module.SUITE_CASE_IDS if not case.startswith('signing.')):
+            for change in ('missing', 'duplicate', 'skipped', 'failed'):
+                with self.subTest(target=target, change=change):
+                    self.data['evidence_dir'] = str(Path(self.temp.name) / target / change)
+                    docker = DockerBoundary()
+                    docker.summary['cases'] = [{'id': c, 'passed': True} for c in module.SUITE_CASE_IDS]
+                    row = next(row for row in docker.summary['cases'] if row['id'] == target)
+                    if change == 'missing':
+                        docker.summary['cases'].remove(row)
+                    elif change == 'duplicate':
+                        docker.summary['cases'].append(dict(row))
+                    elif change == 'skipped':
+                        row['skipped'] = True
+                    else:
+                        row['passed'] = False
+                    result, _ = self.run_with(docker)
+                    self.assertFalse(result.passed)
+
     def test_all_source_owned_cases_must_execute_and_cleanup_to_pass(self):
         docker = DockerBoundary()
         docker.summary['cases'] = [{'id': case, 'passed': True} for case in module.SUITE_CASE_IDS]
         result, _ = self.run_with(docker)
         self.assertTrue(result.complete)
         self.assertTrue(result.passed)
-        self.assertEqual(result.counts, {'expected': 71, 'executed': 71, 'passed': 71, 'failed': 0})
+        self.assertEqual(result.counts, {'expected': 106, 'executed': 106, 'passed': 106, 'failed': 0})
         self.data['evidence_dir'] = str(Path(self.temp.name) / 'failed-case')
         docker = DockerBoundary()
         docker.suite_exit_code = 1
@@ -509,7 +531,7 @@ fn warn_atproto_control_plane_config() {}
                 result, _ = self.run_with(docker)
                 self.assertTrue(result.complete)
                 self.assertFalse(result.passed)
-                self.assertEqual(result.counts['executed'], 71)
+                self.assertEqual(result.counts['executed'], 106)
                 self.assertEqual(result.counts['failed'], int(failed_case))
                 self.assertEqual(dataclasses.asdict(result).get('suite_exit_code'), 1)
                 self.assertEqual(result.failure, 'suite_failed')

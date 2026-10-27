@@ -1,4 +1,4 @@
-import { test } from "@playwright/test";
+import { test, type APIRequestContext, type Page } from "@playwright/test";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { generateSecretKey, getPublicKey, getEventHash } from "nostr-tools/pure";
@@ -6,7 +6,13 @@ import * as nip04 from "nostr-tools/nip04";
 import { v2 } from "nostr-tools/nip44";
 import { wrapEvent } from "nostr-tools/nip17";
 import { createRumor } from "nostr-tools/nip59";
-import { assertOwnedFixture, configFromEnvironment, preparePolicies, registerSyntheticUser, issueGrant, type Grant, type FixtureConfig, type PolicyFixtures, type SessionFixture } from "../helpers/challenge-image-fixtures";
+import {
+  assertOwnedFixture, configFromEnvironment, preparePolicies, registerSyntheticUser, issueGrant,
+  withPermissionMutation, assertPolicyUnchanged, assertNoGlobalChallenges, prepareAuthorization,
+  issueAuthorizationCode, exchangeAuthorization, refreshGrant, codeState, assertRefreshState, teamPolicyCounts,
+  CONSENT_CASE_IDS, MALFORMED_PERMISSIONS, CONFIG_BOUNDARIES, CHALLENGE_TITLE, CHALLENGE_PHRASES,
+  type Grant, type FixtureConfig, type PolicyFixtures, type SessionFixture, type PolicyFixture,
+} from "../helpers/challenge-image-fixtures";
 import { httpRpc, openRelay, freezeTemplate, verifySignedResult, type SigningTemplate, type RpcOutcome } from "../helpers/challenge-image-rpc";
 import { createSummaryRecorder } from "../helpers/challenge-image-summary";
 
@@ -23,10 +29,16 @@ type RequestRpc = (method: string, params: unknown[]) => Promise<RpcOutcome>;
 const ensure = (ok: unknown, category: string): void => { if (!ok) throw new Error(`challenge_image:${category}`); };
 const summary = createSummaryRecorder([
   ...["http", "nip46"].flatMap(transport => SIGNING_CASES.map(name => `signing.${transport}.${name}`)),
-  "consent.authorize", "consent.refresh", "management.creation-held",
+  ...CONSENT_CASE_IDS,
 ]);
-// Task 4 records only its real consent/hold operations through this same hook.
-export const recordCase = summary.recordCase;
+export function recordCase(id: string, operation: () => Promise<void>): Promise<void> {
+  // Status is the framework's authoritative cancellation guard (its budget
+  // also includes fixture setup). The local deadline additionally bounds this
+  // body even while Playwright is gracefully stopping an expired worker.
+  const info = test.info(), deadline = performance.now() + info.timeout;
+  return summary.recordCase(id, operation, { canPass: () =>
+    info.status === "passed" && performance.now() < deadline });
+}
 let config: FixtureConfig, policies: PolicyFixtures, session: SessionFixture;
 let canonical: Record<string, SigningTemplate>;
 test.beforeAll(async ({ playwright }) => {
@@ -35,6 +47,7 @@ test.beforeAll(async ({ playwright }) => {
   config = configFromEnvironment(); await assertOwnedFixture(config);
   const request = await playwright.request.newContext({ baseURL: config.baseUrl, timeout: 15000 });
   try {
+    await noGlobalChallenges(request); // Must run before the first synthetic seed.
     policies = await preparePolicies(config);
     session = await registerSyntheticUser(request, config);
     const fixture = JSON.parse(await readFile(path.resolve(__dirname, "../../core/tests/fixtures/challenges/v1/events.json"), "utf8"));
@@ -48,7 +61,7 @@ test.beforeAll(async ({ playwright }) => {
     }));
   } finally { await request.dispose(); }
 });
-test.afterAll(async () => { await summary.initialize(); });
+test.afterAll(async () => { await summary.initialize(); await summary.assertComplete(); });
 function ordinary(grant: Grant, kind = 1): SigningTemplate {
   return freezeTemplate({ pubkey: grant.pubkey, kind, created_at: Math.floor(Date.now() / 1000), content: kind === 0 ? "{}" : "Synthetic acceptance", tags: [] });
 }
@@ -149,3 +162,163 @@ for (const transport of ["http", "nip46"] as const) for (const name of SIGNING_C
     }
   }));
 }
+
+async function localJson(request: APIRequestContext, method: "get" | "post", route: string, data?: unknown, cookie?: string) {
+  const response = await request[method](config.baseUrl + route, { data, timeout: 15000, maxRedirects: 0,
+    headers: { Origin: config.baseUrl, ...(cookie ? { Cookie: cookie } : {}) } });
+  return { status: response.status(), body: await response.json() };
+}
+async function noGlobalChallenges(request: APIRequestContext): Promise<void> {
+  await assertNoGlobalChallenges(config);
+  const result = await localJson(request, "get", "/api/policies");
+  ensure(result.status === 200 && Array.isArray(result.body.policies)
+    && result.body.policies.every((p: any) => p.slug !== "challenges"), "global_preset_absent");
+}
+async function signedIn(page: Page): Promise<void> {
+  await page.context().addCookies([{ name: "keycast_session", value: session.cookie.slice("keycast_session=".length), url: config.baseUrl }]);
+}
+async function renderedGrant(page: Page, request: APIRequestContext, policy: PolicyFixture): Promise<Grant> {
+  const auth = await prepareAuthorization(session, policy);
+  await signedIn(page);
+  const response = await page.goto(auth.url);
+  ensure(response?.status() === 200, "consent_page");
+  const authorize = page.getByRole("button", { name: "Authorize", exact: true });
+  await authorize.waitFor({ state: "visible" });
+  if (policy.kind === "empty") ensure(await page.locator(".permission_item").count() === 0, "empty_consent_display");
+  else {
+    await page.getByRole("heading", { name: CHALLENGE_TITLE, exact: true }).waitFor({ state: "visible" });
+    ensure(await page.locator(".permission_item").count() === 1, "consent_display_count");
+    for (const phrase of CHALLENGE_PHRASES) await page.getByText(phrase, { exact: false }).waitFor({ state: "visible" });
+  }
+  let code = "";
+  await page.route(config.baseUrl + "/acceptance-callback?*", async route => {
+    const url = new URL(route.request().url());
+    code = url.searchParams.get("code") ?? "";
+    await route.fulfill({ status: 200, contentType: "text/plain", body: "Synthetic acceptance callback" });
+  });
+  try {
+    await Promise.all([page.waitForURL(url => url.origin === config.baseUrl && url.pathname === "/acceptance-callback"), authorize.click()]);
+    ensure(typeof code === "string" && code.length > 0, "consent_code");
+    return await exchangeAuthorization(request, auth, code!);
+  } finally { await page.unroute(config.baseUrl + "/acceptance-callback?*"); }
+}
+async function restrictedBoundary(grant: Grant): Promise<void> {
+  ensure(success(await httpRpc(grant, "get_public_key", []), "http") === session.pubkey, "consent_signer");
+  await sign((method, params) => httpRpc(grant, method, params), "http", grant, canonical.definition);
+  policyDenial(await httpRpc(grant, "sign_event", [ordinary(grant)]), "http");
+}
+for (const empty of [false, true]) for (const refresh of [false, true]) {
+  const id = `consent.${empty ? "empty-" : ""}${refresh ? "refresh" : "authorize"}`;
+  test(id, async ({ page, request }) => recordCase(id, async () => {
+    const policy = empty ? policies.empty : policies.restricted;
+    const original = await renderedGrant(page, request, policy);
+    const grant = refresh ? await refreshGrant(request, original) : original;
+    ensure(grant.scope === policy.scope, "consent_scope");
+    if (refresh) {
+      await assertRefreshState(original, true, 2);
+      await assertRefreshState(grant, false, 2);
+    }
+    await assertPolicyUnchanged(policy);
+    if (empty) {
+      await sign((method, params) => httpRpc(grant, method, params), "http", grant, ordinary(grant));
+    } else await restrictedBoundary(grant);
+  }));
+}
+function permissionLoadError(result: { status: number; body: any }, policyApi = false): void {
+  ensure(result.status === 500 && !Object.hasOwn(result.body, "result")
+    && (policyApi ? result.body.error === "permission_error" && result.body.message === "Configured permission could not be loaded"
+      : result.body.error === "Server error: Configured permission could not be loaded"), "permission_load_error");
+}
+async function healthyControl(request: APIRequestContext, grant: Grant): Promise<void> {
+  ensure(success(await httpRpc(grant, "get_public_key", []), "http") === session.pubkey, "healthy_rpc");
+  const result = await localJson(request, "get", "/api/policies");
+  ensure(result.status === 200 && Array.isArray(result.body.policies), "healthy_policies");
+}
+for (const [name, identifier, configText] of MALFORMED_PERMISSIONS) for (const boundary of CONFIG_BOUNDARIES) {
+  const id = `config.${name}.${boundary}`;
+  test(id, async ({ page, request }) => recordCase(id, async () => {
+    // Fresh owned policy and authorization: no HTTP signer has cached it before
+    // the mutation. Invalid global display configuration is always serial.
+    const policy = (await preparePolicies(config)).restricted;
+    const grant = await issueGrant(request, session, policy);
+    const control = await issueGrant(request, session, policies.restricted);
+    const pending = boundary === "exchange" ? await issueAuthorizationCode(request, session, policy) : undefined;
+    const beforeCode = pending ? await codeState(pending.auth, pending.code) : undefined;
+    if (pending) ensure(beforeCode?.authorizations === 0 && beforeCode.refreshTokens === 0, "code_initial_state");
+    if (boundary === "refresh") await assertRefreshState(grant, false);
+    const consent = boundary === "consent" ? await prepareAuthorization(session, policy) : undefined;
+    await healthyControl(request, control);
+    try {
+      await withPermissionMutation(policy, identifier, configText, async () => {
+        if (boundary === "http") {
+          const outcome = await httpRpc(grant, "get_public_key", []);
+          ensure(outcome.status === 500 && !Object.hasOwn(outcome, "result")
+            && outcome.error === "Configured permission could not be loaded", "cold_handler_failure");
+        } else if (boundary === "detail" || boundary === "list") {
+          permissionLoadError(await localJson(request, "get", boundary === "list" ? "/api/policies" : `/api/policies/${policy.slug}`), true);
+        } else if (boundary === "consent") {
+          await signedIn(page);
+          const response = await page.goto(consent!.url);
+          ensure(response?.status() === 500, "malformed_consent_status");
+          await page.getByText("Configured permission could not be loaded", { exact: false }).waitFor({ state: "visible" });
+          ensure(await page.getByRole("button", { name: "Authorize", exact: true }).count() === 0
+            && await page.locator(".btn_approve, form").count() === 0, "malformed_consent_approval");
+        } else {
+          const result = await localJson(request, "post", "/api/oauth/token", pending ? {
+            grant_type: "authorization_code", code: pending.code, client_id: pending.auth.clientId,
+            redirect_uri: pending.auth.redirectUri, code_verifier: pending.auth.verifier,
+          } : { grant_type: "refresh_token", refresh_token: grant.refreshToken, client_id: grant.clientId });
+          permissionLoadError(result);
+          ensure(["access_token", "refresh_token", "bunker_url"].every(key => !Object.hasOwn(result.body, key)), "rejected_credentials");
+          if (pending) {
+            // Code redemption is released on display failure. An in-memory
+            // UCAN may already have been generated; no credential row is added.
+            const after = await codeState(pending.auth, pending.code);
+            ensure(after.authorizations === beforeCode!.authorizations && after.refreshTokens === beforeCode!.refreshTokens, "code_rows_unchanged");
+          } else {
+            // Refresh consumption precedes display and is intentionally retained.
+            await assertRefreshState(grant, true);
+          }
+        }
+      });
+    } finally {
+      await healthyControl(request, control);
+      await assertPolicyUnchanged(policy);
+    }
+  }));
+}
+test("management.creation-held", async ({ request }) => recordCase("management.creation-held", async () => {
+  const before = await teamPolicyCounts(session);
+  const result = await localJson(request, "post", `/api/teams/${session.teamId}/policies`, {
+    name: "Synthetic challenge hold", permissions: [{ identifier: "challenge_actions", config: {} }],
+  }, session.cookie);
+  ensure(result.status === 400 && result.body.error === "This permission is not currently available for team policies", "creation_hold");
+  const after = await teamPolicyCounts(session);
+  ensure(after.policies === before.policies && after.permissions === before.permissions && after.links === before.links, "creation_hold_rows");
+}));
+test("management.allowed-kinds-control", async ({ request }) => recordCase("management.allowed-kinds-control", async () => {
+  const before = await teamPolicyCounts(session);
+  const result = await localJson(request, "post", `/api/teams/${session.teamId}/policies`, {
+    name: "Synthetic allowed kinds control", permissions: [{ identifier: "allowed_kinds", config: { allowed_kinds: [31923] } }],
+  }, session.cookie);
+  ensure(result.status === 200 && result.body.policy?.team_id === session.teamId
+    && result.body.permissions?.length === 1 && result.body.permissions[0].identifier === "allowed_kinds", "management_control");
+  const after = await teamPolicyCounts(session);
+  ensure(after.policies === before.policies + 1 && after.permissions === before.permissions + 1 && after.links === before.links + 1, "management_control_rows");
+}));
+test("management.picker", async ({ page }) => recordCase("management.picker", async () => {
+  await signedIn(page);
+  const response = await page.goto(`${config.baseUrl}/teams/${session.teamId}/policies/new`);
+  ensure(response?.status() === 200, "picker_page");
+  ensure(await page.evaluate(() => (window as any).__ENV__?.SHOW_TEAMS_FUNCTIONALITY === "true"), "picker_runtime_flag");
+  const select = page.locator("select");
+  await select.waitFor({ state: "visible" });
+  ensure(await select.isEnabled(), "picker_enabled");
+  ensure(await select.locator('option[value="challenge_actions"]').count() === 0, "picker_hold");
+  await select.selectOption("allowed_kinds");
+  ensure(await select.inputValue() === "allowed_kinds", "picker_selection");
+  await page.getByText("Which kinds are allowed for each permission type", { exact: false }).waitFor({ state: "visible" });
+}));
+test("management.no-global-preset", async ({ request }) => recordCase("management.no-global-preset", async () => {
+  await noGlobalChallenges(request);
+}));
