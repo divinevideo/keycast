@@ -137,6 +137,7 @@ test("client packaging covers the actual current helper graph with precise copie
   expect(requiredPaths).toContain("e2e/challenge-image/challenge-image.spec.ts");
   expect(requiredPaths).toContain("e2e/challenge-image.config.ts");
   expect(requiredPaths).toContain("e2e/helpers/challenge-image-rpc.ts");
+  expect(requiredPaths).toContain("e2e/helpers/challenge-image-summary.ts");
   expect(readFileSync(path.resolve(import.meta.dir, "../../core/tests/fixtures/challenges/v1/events.json"), "utf8").length).toBeGreaterThan(0);
   expect(requiredPaths).toContain("e2e/helpers/challenge-image-fixtures.ts");
   expect(requiredPaths).toContain("e2e/helpers/oauth.ts");
@@ -151,6 +152,7 @@ test("client packaging requires exact runtime assets and every real helper", () 
   const requiredPaths = [...clientLocalGraph(["challenge-image/challenge-image.spec.ts", "challenge-image.config.ts"]), "core/tests/fixtures/challenges/v1/events.json"];
   expect(() => assertClientPackaging({ dockerfile, requiredPaths })).not.toThrow();
   expect(() => assertClientPackaging({ dockerfile: dockerfile.replace(" e2e/helpers/challenge-image-rpc.ts", ""), requiredPaths })).toThrow();
+  expect(() => assertClientPackaging({ dockerfile: dockerfile.replace(" e2e/helpers/challenge-image-summary.ts", ""), requiredPaths })).toThrow();
   expect(() => assertClientPackaging({ dockerfile: dockerfile.replace("COPY core/tests/fixtures/challenges/v1/events.json /core/tests/fixtures/challenges/v1/events.json", ""), requiredPaths })).toThrow();
   expect(() => assertClientPackaging({ dockerfile: dockerfile.replace("/core/tests/fixtures/challenges/v1/events.json", "/wrong/events.json"), requiredPaths })).toThrow();
   expect(() => assertClientPackaging({ dockerfile: dockerfile + "\nCOPY e2e/helpers/ ./helpers/\n", requiredPaths })).toThrow();
@@ -414,4 +416,70 @@ for (const mode of ["connect_timeout", "connect_drop", "connect_denied"]) test(`
   const { createRpcAdapters } = await rpcModule(), boundary = await relayBoundary(mode);
   await expect(createRpcAdapters({ pool: () => boundary.pool as any, connectTimeoutMs: 10 }).openRelay(boundary.grant)).rejects.toThrow(/^challenge_image:/);
   expect(boundary.state.closed).toBe(1); expect(boundary.state.destroyed).toBe(1);
+});
+
+// Each factory models a fresh Playwright worker/module instance. Only the
+// persisted file boundary survives; actual recorder flow is exercised below.
+function summaryBoundary(initial?: string) {
+  let stored = initial;
+  const writes: string[] = [];
+  return { io: { async read() { return stored; }, async write(contents: string) { stored = contents; writes.push(contents); } },
+    read: () => stored, rows: () => JSON.parse(stored!).cases, writes };
+}
+const summaryIds = ["signing.http.get_public_key", "signing.http.definition", "signing.http.entry"];
+test("summary recorder preserves attempted pass and failure across fresh worker instances", async () => {
+  const { createSummaryRecorder } = await import("./challenge-image-summary");
+  const file = summaryBoundary(), first = createSummaryRecorder(summaryIds, file.io);
+  await first.initialize();
+  await first.recordCase("signing.http.get_public_key", async () => {});
+  await expect(first.recordCase("signing.http.definition", async () => { throw new Error("private original failure"); })).rejects.toThrow("challenge_image:case_failed");
+  const second = createSummaryRecorder(summaryIds, file.io);
+  await second.initialize(); // beforeAll in a replacement worker must not reset.
+  expect(file.rows()).toEqual([{ id: "signing.http.get_public_key", passed: true }, { id: "signing.http.definition", passed: false }]);
+  await second.recordCase("signing.http.entry", async () => {
+    expect(file.rows()).toEqual([{ id: "signing.http.get_public_key", passed: true }, { id: "signing.http.definition", passed: false }, { id: "signing.http.entry", passed: false }]);
+  });
+  expect(JSON.parse(file.read()!)).toEqual({ schema_version: 1, cases: [
+    { id: "signing.http.get_public_key", passed: true }, { id: "signing.http.definition", passed: false }, { id: "signing.http.entry", passed: true },
+  ] });
+});
+test("summary recorder never upgrades a previous failure or fabricates an unattempted case", async () => {
+  const { createSummaryRecorder } = await import("./challenge-image-summary");
+  const file = summaryBoundary(), first = createSummaryRecorder(summaryIds, file.io);
+  await first.initialize();
+  await expect(first.recordCase("signing.http.definition", async () => { throw new Error("private failure"); })).rejects.toThrow("challenge_image:case_failed");
+  const previous = file.read(), second = createSummaryRecorder(summaryIds, file.io); let ran = false;
+  await second.initialize();
+  await expect(second.recordCase("signing.http.definition", async () => { ran = true; })).rejects.toThrow("challenge_image:summary_duplicate");
+  expect(ran).toBe(false); expect(file.read()).toBe(previous);
+  await expect(second.recordCase("runtime.health", async () => { ran = true; })).rejects.toThrow("challenge_image:summary_case");
+  await expect(second.recordCase("unknown", async () => { ran = true; })).rejects.toThrow("challenge_image:summary_case");
+  expect(ran).toBe(false); expect(file.rows()).toEqual([{ id: "signing.http.definition", passed: false }]);
+});
+for (const [name, initial] of Object.entries({
+  parse: "{", schema: JSON.stringify({ schema_version: "1", cases: [] }), extra: JSON.stringify({ schema_version: 1, cases: [], nonce: "private" }),
+  notArray: JSON.stringify({ schema_version: 1, cases: {} }), missingField: JSON.stringify({ schema_version: 1, cases: [{ id: summaryIds[0] }] }),
+  wrongBoolean: JSON.stringify({ schema_version: 1, cases: [{ id: summaryIds[0], passed: "false" }] }),
+  rowExtra: JSON.stringify({ schema_version: 1, cases: [{ id: summaryIds[0], passed: true, error: "private" }] }),
+  duplicate: JSON.stringify({ schema_version: 1, cases: [{ id: summaryIds[0], passed: false }, { id: summaryIds[0], passed: true }] }),
+  unknown: JSON.stringify({ schema_version: 1, cases: [{ id: "unknown", passed: true }] }),
+  runtimeOwned: JSON.stringify({ schema_version: 1, cases: [{ id: "runtime.health", passed: true }] }),
+})) test(`summary recorder rejects ${name} persisted evidence without overwriting it`, async () => {
+  const { createSummaryRecorder } = await import("./challenge-image-summary");
+  const file = summaryBoundary(initial), recorder = createSummaryRecorder(summaryIds, file.io);
+  await expect(recorder.initialize()).rejects.toThrow(/^challenge_image:summary_/);
+  expect(file.read()).toBe(initial); expect(file.writes).toHaveLength(0);
+});
+test("summary recorder sanitizes persistence errors without running case bodies", async () => {
+  const { createSummaryRecorder } = await import("./challenge-image-summary");
+  let ran = false;
+  for (const io of [
+    { async read(): Promise<string | undefined> { throw new Error("private read details"); }, async write(_value: string) {} },
+    { async read() { return undefined; }, async write(_value: string) { throw new Error("private write details"); } },
+  ]) {
+    const recorder = createSummaryRecorder(summaryIds, io);
+    await expect(recorder.initialize()).rejects.toThrow("challenge_image:summary_io");
+    await expect(recorder.recordCase(summaryIds[0], async () => { ran = true; })).rejects.toThrow("challenge_image:summary_io");
+  }
+  expect(ran).toBe(false);
 });

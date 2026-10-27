@@ -1,5 +1,5 @@
 import { test } from "@playwright/test";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { generateSecretKey, getPublicKey, getEventHash } from "nostr-tools/pure";
 import * as nip04 from "nostr-tools/nip04";
@@ -8,6 +8,7 @@ import { wrapEvent } from "nostr-tools/nip17";
 import { createRumor } from "nostr-tools/nip59";
 import { assertOwnedFixture, configFromEnvironment, preparePolicies, registerSyntheticUser, issueGrant, type Grant, type FixtureConfig, type PolicyFixtures, type SessionFixture } from "../helpers/challenge-image-fixtures";
 import { httpRpc, openRelay, freezeTemplate, verifySignedResult, type SigningTemplate, type RpcOutcome } from "../helpers/challenge-image-rpc";
+import { createSummaryRecorder } from "../helpers/challenge-image-summary";
 
 // Deliberately no top-level I/O: --list must collect without any connection,
 // fixture read, environment requirement, global setup or browser launch.
@@ -19,25 +20,18 @@ export const SIGNING_CASES = [
 ] as const;
 type Transport = "http" | "nip46";
 type RequestRpc = (method: string, params: unknown[]) => Promise<RpcOutcome>;
-const cases: { id: string; passed: boolean }[] = [];
 const ensure = (ok: unknown, category: string): void => { if (!ok) throw new Error(`challenge_image:${category}`); };
-async function saveSummary() {
-  await writeFile("/tmp/challenge-image-summary.json", JSON.stringify({ schema_version: 1, cases }), { mode: 0o600 });
-}
+const summary = createSummaryRecorder([
+  ...["http", "nip46"].flatMap(transport => SIGNING_CASES.map(name => `signing.${transport}.${name}`)),
+  "consent.authorize", "consent.refresh", "management.creation-held",
+]);
 // Task 4 records only its real consent/hold operations through this same hook.
-// No runtime-owned IDs or stand-ins are ever written by the client suite.
-export async function recordCase(id: string, operation: () => Promise<void>): Promise<void> {
-  ensure(!cases.some(c => c.id === id), "case_duplicate");
-  const row = { id, passed: false }; cases.push(row);
-  try { await operation(); row.passed = true; }
-  catch { throw new Error("challenge_image:case_failed"); }
-  finally { await saveSummary(); }
-}
+export const recordCase = summary.recordCase;
 let config: FixtureConfig, policies: PolicyFixtures, session: SessionFixture;
 let canonical: Record<string, SigningTemplate>;
 test.beforeAll(async ({ playwright }) => {
   // Always attempt the strict summary, even if fixture initialization fails.
-  await saveSummary();
+  await summary.initialize();
   config = configFromEnvironment(); await assertOwnedFixture(config);
   const request = await playwright.request.newContext({ baseURL: config.baseUrl, timeout: 15000 });
   try {
@@ -54,7 +48,7 @@ test.beforeAll(async ({ playwright }) => {
     }));
   } finally { await request.dispose(); }
 });
-test.afterAll(async () => { await saveSummary(); });
+test.afterAll(async () => { await summary.initialize(); });
 function ordinary(grant: Grant, kind = 1): SigningTemplate {
   return freezeTemplate({ pubkey: grant.pubkey, kind, created_at: Math.floor(Date.now() / 1000), content: kind === 0 ? "{}" : "Synthetic acceptance", tags: [] });
 }
