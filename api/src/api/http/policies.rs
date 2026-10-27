@@ -50,13 +50,15 @@ pub async fn list_policies(
     // Build response with permission displays
     let mut policy_responses = Vec::new();
     for policy in policies {
-        let permissions = match policy.permission_displays(&pool).await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("Failed to load permissions for policy {}: {}", policy.id, e);
-                vec![]
-            }
-        };
+        let permissions = policy.permission_displays(&pool).await.map_err(|_| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "permission_error".into(),
+                    message: "Configured permission could not be loaded".into(),
+                }),
+            )
+        })?;
 
         policy_responses.push(PolicyResponse {
             slug: policy.slug.clone().unwrap_or_else(|| policy.id.to_string()),
@@ -103,13 +105,15 @@ pub async fn get_policy(
         ),
     })?;
 
-    let permissions = match policy.permission_displays(&pool).await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!("Failed to load permissions for policy {}: {}", policy.id, e);
-            vec![]
-        }
-    };
+    let permissions = policy.permission_displays(&pool).await.map_err(|_| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "permission_error".into(),
+                message: "Configured permission could not be loaded".into(),
+            }),
+        )
+    })?;
 
     Ok(Json(PolicyResponse {
         slug: policy.slug.clone().unwrap_or_else(|| policy.id.to_string()),

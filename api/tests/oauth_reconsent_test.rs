@@ -426,3 +426,98 @@ async fn another_persons_approval_does_not_skip_sign_in() {
     someone_else.handle = owner.handle.clone();
     no_longer_counts(&pool, &someone_else, "another person").await;
 }
+
+#[tokio::test]
+#[serial]
+async fn configured_permission_errors_prevent_consent_html() {
+    let (pool, keys) = setup().await;
+    let user = signed_in_user(&pool, &keys).await;
+    for (identifier, config) in [
+        ("unknown_permission", serde_json::json!({})),
+        (
+            "allowed_kinds",
+            serde_json::json!({"allowed_kinds": "invalid"}),
+        ),
+        ("challenge_actions", serde_json::json!({"unknown": true})),
+    ] {
+        let slug = format!("synthetic-{}", Uuid::new_v4());
+        let pid: i32 = sqlx::query_scalar("INSERT INTO policies(name, slug, team_id) VALUES ('Synthetic consent', $1, NULL) RETURNING id").bind(&slug).fetch_one(&pool).await.unwrap();
+        let permission: i32 = sqlx::query_scalar(
+            "INSERT INTO permissions(identifier, config) VALUES ($1, $2) RETURNING id",
+        )
+        .bind(identifier)
+        .bind(config.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO policy_permissions(policy_id,permission_id) VALUES($1,$2)")
+            .bind(pid)
+            .bind(permission)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (state, producer) = common::create_test_auth_state(pool.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, HeaderValue::from_str(&user.cookie).unwrap());
+        let request: AuthorizeRequest = serde_json::from_value(serde_json::json!({"client_id":"test-app","redirect_uri":format!("{APP}/callback"),"scope":format!("policy:{slug}"),"prompt":"consent","screen":"consent"})).unwrap();
+        assert!(
+            authorize_get(common::test_tenant(), State(state), headers, Query(request))
+                .await
+                .is_err(),
+            "invalid permission must prevent consent HTML"
+        );
+        producer.abort();
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn challenge_permission_is_disclosed_in_real_consent_html() {
+    let (pool, keys) = setup().await;
+    let user = signed_in_user(&pool, &keys).await;
+    let slug = format!("synthetic-{}", Uuid::new_v4());
+    let pid:i32=sqlx::query_scalar("INSERT INTO policies(name, slug, team_id) VALUES('Synthetic challenge consent',$1,NULL) RETURNING id").bind(&slug).fetch_one(&pool).await.unwrap();
+    let permission: i32 = sqlx::query_scalar(
+        "INSERT INTO permissions(identifier, config) VALUES('challenge_actions','{}') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO policy_permissions(policy_id,permission_id) VALUES($1,$2)")
+        .bind(pid)
+        .bind(permission)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (state, producer) = common::create_test_auth_state(pool.clone());
+    let mut headers = HeaderMap::new();
+    headers.insert(header::COOKIE, HeaderValue::from_str(&user.cookie).unwrap());
+    let request:AuthorizeRequest=serde_json::from_value(serde_json::json!({"client_id":"test-app","redirect_uri":format!("{APP}/callback"),"scope":format!("policy:{slug}"),"prompt":"consent","screen":"consent"})).unwrap();
+    let response = authorize_get(common::test_tenant(), State(state), headers, Query(request))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    for copy in [
+        "Create and manage challenges",
+        "enter and withdraw entries",
+        "announce results",
+        "curate contests",
+        "No private-message access",
+    ] {
+        assert!(html.contains(copy), "missing {copy}");
+    }
+    if let Ok(path) = std::env::var("CHALLENGE_CONSENT_HTML_PATH") {
+        std::fs::write(path, html).unwrap();
+    }
+    producer.abort();
+}

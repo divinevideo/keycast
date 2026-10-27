@@ -323,3 +323,128 @@ async fn refresh_grant_rejects_a_cross_tenant_request_without_consuming_the_toke
 
     cleanup(&pool, &user_pubkey).await;
 }
+
+#[tokio::test]
+async fn challenge_refresh_preserves_policy_scope_and_permission_display() {
+    let pool = setup_pool().await;
+    let (user_pubkey, refresh_token) = seed_authorization_with_refresh_token(&pool).await;
+    let slug = format!("synthetic-{}", Uuid::new_v4());
+    let pid: i32=sqlx::query_scalar("INSERT INTO policies(name,slug,team_id) VALUES('Synthetic challenge policy',$1,NULL) RETURNING id").bind(&slug).fetch_one(&pool).await.unwrap();
+    let permission: i32 = sqlx::query_scalar(
+        "INSERT INTO permissions(identifier,config) VALUES('challenge_actions','{}') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO policy_permissions(policy_id,permission_id) VALUES($1,$2)")
+        .bind(pid)
+        .bind(permission)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE oauth_authorizations SET policy_id=$1 WHERE user_pubkey=$2")
+        .bind(pid)
+        .bind(&user_pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let response = refresh(&pool, &refresh_token, BOUND_CLIENT_ID)
+        .await
+        .unwrap();
+    let body = response_json(response).await;
+    assert_eq!(body["scope"], format!("policy:{slug}"));
+    assert_eq!(body["policy"]["permissions"].as_array().unwrap().len(), 1);
+    assert!(body["policy"]["permissions"][0]["description"]
+        .as_str()
+        .unwrap()
+        .contains("curate contests"));
+    let rotated = body["refresh_token"].as_str().unwrap();
+    sqlx::query("UPDATE permissions SET identifier='unknown_permission' WHERE id=$1")
+        .bind(permission)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        refresh(&pool, rotated, BOUND_CLIENT_ID).await.is_err(),
+        "invalid configured permission cannot become an empty policy display"
+    );
+    cleanup(&pool, &user_pubkey).await;
+}
+
+#[tokio::test]
+async fn challenge_authorization_code_exchange_rejects_invalid_permission_display() {
+    use keycast_core::repositories::{OAuthCodeRepository, StoreOAuthCodeParams};
+    let pool = setup_pool().await;
+    let (user, _) = seed_authorization_with_refresh_token(&pool).await;
+    sqlx::query("UPDATE users SET email=$1 WHERE pubkey=$2")
+        .bind(format!("synthetic-{}@example.test", Uuid::new_v4()))
+        .bind(&user)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let slug = format!("synthetic-{}", Uuid::new_v4());
+    let pid:i32=sqlx::query_scalar("INSERT INTO policies(name,slug,team_id) VALUES('Synthetic challenge policy',$1,NULL) RETURNING id").bind(&slug).fetch_one(&pool).await.unwrap();
+    let permission: i32 = sqlx::query_scalar(
+        "INSERT INTO permissions(identifier,config) VALUES('challenge_actions','{}') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO policy_permissions(policy_id,permission_id) VALUES($1,$2)")
+        .bind(pid)
+        .bind(permission)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for invalid in [false, true] {
+        if invalid {
+            sqlx::query("UPDATE permissions SET config='{\"unknown\":true}' WHERE id=$1")
+                .bind(permission)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let code = format!("synthetic-code-{}", Uuid::new_v4());
+        OAuthCodeRepository::new(pool.clone())
+            .store(StoreOAuthCodeParams {
+                tenant_id: 1,
+                code: &code,
+                user_pubkey: &user,
+                client_id: BOUND_CLIENT_ID,
+                redirect_uri: "https://app.example/callback",
+                scope: &format!("policy:{slug}"),
+                code_challenge: None,
+                code_challenge_method: None,
+                expires_at: Utc::now() + Duration::minutes(10),
+                previous_auth_id: None,
+                state: None,
+                is_headless: false,
+            })
+            .await
+            .unwrap();
+        let (state, producer) = create_test_auth_state(pool.clone());
+        let result = oauth::token(
+            test_tenant_with_id(1),
+            State(state),
+            axum::Extension(common::test_email_sender()),
+            oauth::TokenRequestBody(oauth::TokenRequest {
+                grant_type: Some("authorization_code".into()),
+                code: Some(code),
+                client_id: BOUND_CLIENT_ID.into(),
+                redirect_uri: Some("https://app.example/callback".into()),
+                code_verifier: None,
+                refresh_token: None,
+            }),
+        )
+        .await;
+        producer.abort();
+        if invalid {
+            assert!(matches!(result, Err(oauth::OAuthError::ServerError(_))));
+        } else {
+            let body = response_json(result.unwrap()).await;
+            assert_eq!(body["scope"], format!("policy:{slug}"));
+            assert_eq!(body["policy"]["permissions"].as_array().unwrap().len(), 1);
+        }
+    }
+    cleanup(&pool, &user).await;
+}

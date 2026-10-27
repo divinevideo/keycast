@@ -19,6 +19,7 @@ use keycast_core::repositories::{
 };
 use keycast_core::secret_pool::SecretPoolError;
 use keycast_core::types::authorization::{Authorization, AuthorizationWithRelations};
+use keycast_core::types::permission::{JsonConfig, Permission};
 use keycast_core::types::policy::PolicyWithPermissions;
 use keycast_core::types::stored_key::PublicStoredKey;
 use keycast_core::types::team::{KeyWithRelations, Team, TeamWithRelations};
@@ -484,20 +485,35 @@ pub async fn add_policy(
     let tenant_id = tenant.0.id;
     verify_admin(&pool, &user_pubkey_hex, team_id, tenant_id).await?;
 
-    // Filter to valid permission identifiers
-    let permission_configs: Vec<(String, serde_json::Value)> = request
+    // Validate the complete request before the repository writes any rows.
+    let now = chrono::Utc::now();
+    let permission_configs = request
         .permissions
         .into_iter()
-        .filter(|p| {
-            if AVAILABLE_PERMISSIONS.contains(&p.identifier.as_str()) {
-                true
-            } else {
-                tracing::warn!("Skipping unknown permission identifier: {}", p.identifier);
-                false
+        .map(|p| {
+            // Stage 2 enables management creation after every serving revision has
+            // the Stage 1 enforcement code. Keep enforcement registration available.
+            if p.identifier == "challenge_actions" {
+                return Err(ApiError::bad_request(
+                    "This permission is not currently available for team policies",
+                ));
             }
+            if !AVAILABLE_PERMISSIONS.contains(&p.identifier.as_str()) {
+                return Err(ApiError::bad_request("Unknown permission type"));
+            }
+            let permission = Permission {
+                id: 0,
+                identifier: p.identifier.clone(),
+                config: JsonConfig(p.config.clone()),
+                created_at: now,
+                updated_at: now,
+            };
+            permission
+                .to_custom_permission()
+                .map_err(|_| ApiError::bad_request("Invalid permission configuration"))?;
+            Ok((p.identifier, p.config))
         })
-        .map(|p| (p.identifier, p.config))
-        .collect();
+        .collect::<ApiResult<Vec<_>>>()?;
 
     let policy_repo = PolicyRepository::new(pool.clone());
     let policy_with_permissions = policy_repo

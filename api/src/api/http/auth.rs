@@ -3804,7 +3804,9 @@ pub async fn list_permissions(
         // Load permission displays using the PolicyRepository (policies are now global)
         let permission_displays = if policy_id > 0 {
             match policy_repo.find(policy_id).await {
-                Ok(policy) => policy.permission_displays(&pool).await.unwrap_or_default(),
+                Ok(policy) => policy.permission_displays(&pool).await.map_err(|_| {
+                    AuthError::Internal("Configured permission could not be loaded".into())
+                })?,
                 Err(_) => Vec::new(),
             }
         } else {
