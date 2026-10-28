@@ -8,6 +8,11 @@ edition = "2021"
 integration-tests = []
 aws = ["dep:aws-sdk-kms", "dep:aws-config"]
 
+# Run this example's tests in `cargo test`, so CI guards the audit tool.
+[[example]]
+name = "audit_policy_permissions"
+test = true
+
 [dependencies]
 frost-secp256k1-tr = "=2.2.0"
 aes-gcm = "0.10"
