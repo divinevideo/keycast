@@ -123,10 +123,13 @@ jobs:
         id: spec
         env:
           RELEASE_DIGEST: ${{ steps.release.outputs.digest }}
-          RELEASE_METADATA: ${{ steps.release.outputs.metadata }}
           CLIENT_ID: ${{ steps.client.outputs.imageid }}
-          CLIENT_METADATA: ${{ steps.client.outputs.metadata }}
         run: |
+          # JSON data stays in the script/file, outside exec argv/environment.
+          umask 077
+          cat > "$RUNNER_TEMP/build-metadata-envelope.json" <<'KEYCAST_BUILD_METADATA_JSON'
+          {"release": ${{ toJSON(steps.release.outputs.metadata) }}, "client": ${{ toJSON(steps.client.outputs.metadata) }}}
+          KEYCAST_BUILD_METADATA_JSON
           python3 - <<'PY'
           import hashlib, importlib.util, json, os, pathlib, re, subprocess, sys
           root = pathlib.Path(os.environ['RUNNER_TEMP'])
@@ -167,8 +170,11 @@ jobs:
           config_digest = digest(platform['config']['digest'])
           attestation_manifests = {digest(m['digest']): manifest('ghcr.io/divinevideo/keycast@' + m['digest']) for m in attestations}
           provenance = json.loads(command('docker', 'buildx', 'imagetools', 'inspect', image, '--format', '{{json .Provenance}}'))
-          release_metadata = json.loads(os.environ['RELEASE_METADATA'])
-          client_metadata = json.loads(os.environ['CLIENT_METADATA'])
+          envelope = json.loads((root / 'build-metadata-envelope.json').read_text())
+          assert isinstance(envelope, dict) and set(envelope) == {'release', 'client'}
+          assert all(isinstance(value, str) for value in envelope.values())
+          release_metadata = json.loads(envelope['release'])
+          client_metadata = json.loads(envelope['client'])
           assert release_metadata['containerimage.digest'] == index_digest
           # With provenance the export root is an index; its metadata need not
           # contain the single-manifest config key. Config comes from platform above.

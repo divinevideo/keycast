@@ -995,6 +995,9 @@ class WorkflowContracts(unittest.TestCase):
         for ident in ('release', 'client'):
             self.assertEqual(by_id[ident]['env'], {'BUILDX_METADATA_PROVENANCE': 'max',
                 'DOCKER_BUILD_RECORD_UPLOAD': 'false', 'DOCKER_BUILD_SUMMARY': 'false'})
+        self.assertEqual(by_id['spec']['env'], {
+            'RELEASE_DIGEST': '${{ steps.release.outputs.digest }}',
+            'CLIENT_ID': '${{ steps.client.outputs.imageid }}'})
         release = by_id['release']['with']
         self.assertEqual(release, {'context': '${{ runner.temp }}/challenge-source', 'file': '${{ runner.temp }}/challenge-source/Dockerfile',
             'platforms': 'linux/amd64', 'push': True, 'provenance': 'mode=max',
@@ -1062,8 +1065,11 @@ class WorkflowContracts(unittest.TestCase):
     def inline_python(self, ident):
         steps = workflow_file('challenge-image-acceptance.yaml')['jobs']['acceptance']['steps']
         script = next(s['run'] for s in steps if s.get('id') == ident)
-        self.assertTrue(script.startswith("python3 - <<'PY'\n"))
-        return script.split('\n', 1)[1].rsplit('\nPY', 1)[0]
+        preamble, marker, code = script.partition("python3 - <<'PY'\n")
+        self.assertTrue(marker)
+        if ident != 'spec':
+            self.assertEqual(preamble, '')
+        return code.rsplit('\nPY', 1)[0]
 
     def test_identity_script_rejects_nonmain_mismatches_and_untrusted_workflow_path(self):
         code = self.inline_python('identity')
@@ -1119,6 +1125,110 @@ class WorkflowContracts(unittest.TestCase):
                 env={**os.environ, **baseline, 'RUNNER_TEMP': str(root)}, capture_output=True, timeout=10)
             self.assertNotEqual(result.returncode, 0)
 
+    def test_workflow_rejects_metadata_json_environment_transport(self):
+        original = workflow_file('challenge-image-acceptance.yaml')
+        self.check_workflow(original, True)
+        for role in ('release', 'client'):
+            changed = copy.deepcopy(original)
+            step = next(s for s in changed['jobs']['acceptance']['steps'] if s.get('id') == 'spec')
+            step['env'][role.upper() + '_METADATA'] = '${{ steps.' + role + '.outputs.metadata }}'
+            with self.subTest(role=role), self.assertRaises(AssertionError):
+                self.check_workflow(changed, True)
+
+    def test_actual_spec_step_preserves_oversized_hostile_metadata_as_file_data(self):
+        step = next(s for s in workflow_file('challenge-image-acceptance.yaml')['jobs']['acceptance']['steps'] if s.get('id') == 'spec')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'challenge-source'; source.mkdir()
+            (source / 'Cargo.lock').write_text('synthetic lock')
+            record = dict(source_sha='1' * 40, workflow_sha='1' * 40, tooling_sha='1' * 40,
+                workflow_run=123, workflow_attempt=1, input_hashes={'Cargo.lock': hashlib.sha256(b'synthetic lock').hexdigest()})
+            (root / 'build-record.json').write_text(json.dumps(record))
+            def raw(value):
+                body = json.dumps(value)
+                return 'sha256:' + hashlib.sha256(body.encode()).hexdigest(), body + '\n'
+            platform_digest, platform_raw = raw({'config': {'digest': DIGEST}})
+            attestation_digest, attestation_raw = raw({'config': {'digest': DEP_ID}, 'layers': [{'digest': DIGEST}]})
+            index_digest, index_raw = raw({'mediaType': 'application/vnd.oci.image.index.v1+json', 'manifests': [
+                {'digest': platform_digest, 'platform': {'architecture': 'amd64', 'os': 'linux'}},
+                {'digest': attestation_digest, 'annotations': {'vnd.docker.reference.type': 'attestation-manifest', 'vnd.docker.reference.digest': platform_digest}}]})
+            sentinel = root / 'must-not-exist'
+            hostile = '\nKEYCAST_BUILD_METADATA_JSON\n$(touch "' + str(sentinel) + '")\nquotes: \" \' \\; Unicode: é; $HOME'
+            metadata = {'containerimage.digest': index_digest,
+                'containerimage.descriptor': {'mediaType': 'application/vnd.oci.image.index.v1+json', 'digest': index_digest},
+                'buildx.build.provenance': {'materials': [{'uri': 'pkg:docker/synthetic@1', 'digest': {'sha256': 'a' * 64}}]}}
+            release = {**metadata, 'synthetic_data': 'r' * 330000 + hostile}
+            client = {**metadata, 'synthetic_data': 'c' * 150000 + hostile}
+            release_json, client_json = (json.dumps(value, ensure_ascii=False, indent=2) for value in (release, client))
+            self.assertGreater(len(release_json.encode()), 305316)
+            self.assertGreater(len(client_json.encode()), 113539)
+            values = {'toJSON(steps.release.outputs.metadata)': json.dumps(release_json, ensure_ascii=False),
+                      'toJSON(steps.client.outputs.metadata)': json.dumps(client_json, ensure_ascii=False)}
+            script = re.sub(r'\$\{\{\s*(.*?)\s*\}\}', lambda match: values[match[1]], step['run'])
+            script_path = root / 'spec-step.sh'; script_path.write_text(script)
+            binary = root / 'bin'; binary.mkdir()
+            fixture = dict(metadata=metadata, client_id=CLIENT_ID, daemon_id=DAEMON_ID, dependency_id=DEP_ID,
+                manifests={index_digest: index_raw, platform_digest: platform_raw, attestation_digest: attestation_raw})
+            (binary / 'responses.json').write_text(json.dumps(fixture))
+            docker = binary / 'docker'
+            docker.write_text('#!' + sys.executable + '\n' + """
+import json,sys
+from pathlib import Path
+fixture=json.loads(Path(__file__).with_name('responses.json').read_text())
+args=sys.argv[1:]
+with Path(__file__).with_name('calls.jsonl').open('a') as log:
+    log.write(json.dumps(args)+'\\n')
+if args[:3]==['buildx','imagetools','inspect']:
+    body=json.dumps(fixture['metadata']) if '--format' in args else fixture['manifests'][args[3].rsplit('@',1)[1]]
+elif args[0]=='info':
+    body=json.dumps('overlayfs' if args[-1]=='{{json .Driver}}' else [['driver-type','io.containerd.snapshotter.v1']])
+elif args[0]=='pull':
+    body=''
+elif args[:2]==['image','inspect']:
+    ref=args[-1]
+    if ref==fixture['client_id']:
+        body=json.dumps([{'Id':ref,'Architecture':'amd64','Os':'linux','Config':{'Labels':{'video.divine.keycast.role':'test-tooling'}}}])
+    elif ref.startswith('ghcr.io/divinevideo/keycast@'):
+        body=json.dumps([{'Id':fixture['daemon_id']}])
+    else:
+        body=json.dumps([{'RepoDigests':[ref.rsplit(':',1)[0]+'@'+fixture['dependency_id']]}])
+else:
+    raise SystemExit('Unexpected synthetic Docker boundary')
+sys.stdout.write(body)
+""")
+            docker.chmod(0o700)
+            # Launch the real rendered workflow script with only small inputs.
+            # No metadata value enters argv/env, even on native Darwin where
+            # its exec limit differs from the Linux hosted runner's limit.
+            environment = {'PATH': str(binary) + os.pathsep + os.environ['PATH'], 'LANG': 'C.UTF-8',
+                'RUNNER_TEMP': directory, 'RELEASE_DIGEST': index_digest, 'CLIENT_ID': CLIENT_ID,
+                'PYTHONDONTWRITEBYTECODE': '1'}
+            self.assertLess(max(len(k.encode()) + len(v.encode()) + 2 for k, v in environment.items()), 16384)
+            process = subprocess.run(['/bin/bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', str(script_path)],
+                cwd=ROOT, env=environment, capture_output=True, text=True, timeout=20)
+            self.assertEqual(process.returncode, 0, process.stderr)
+            self.assertEqual(process.stdout, '')
+            self.assertFalse(sentinel.exists())
+            envelope_path = root / 'build-metadata-envelope.json'
+            self.assertEqual(envelope_path.stat().st_mode & 0o777, 0o600)
+            envelope = json.loads(envelope_path.read_text())
+            self.assertEqual(envelope, {'release': release_json, 'client': client_json})
+            saved = json.loads((root / 'build-record.json').read_text())
+            self.assertEqual(saved['release_buildx_metadata'], release)
+            self.assertEqual(saved['client_buildx_metadata'], client)
+            self.assertEqual(saved['input_hashes'], record['input_hashes'])
+            self.assertEqual(saved['resolved_release_bases'][0], metadata['buildx.build.provenance']['materials'][0])
+            self.assertEqual(saved['resolved_client_bases'], metadata['buildx.build.provenance']['materials'])
+            spec = json.loads((root / 'run-spec.json').read_text())
+            self.assertEqual(spec['image_ref'], 'ghcr.io/divinevideo/keycast@' + index_digest)
+            self.assertEqual(spec['platform_manifest_digest'], platform_digest)
+            self.assertEqual(spec['registry_config_digest'], DIGEST)
+            self.assertEqual(spec['daemon_image_id'], DAEMON_ID)
+            calls = [json.loads(line) for line in (binary / 'calls.jsonl').read_text().splitlines()]
+            self.assertTrue(calls)
+            self.assertFalse(any(args[0] == 'create' or args[:2] == ['network', 'create'] for args in calls))
+            self.assertFalse((root / 'challenge-public').exists())
+
     def test_spec_adapter_accepts_provenance_index_metadata_without_single_manifest_config_digest(self):
         code = self.inline_python('spec')
         with tempfile.TemporaryDirectory() as directory:
@@ -1159,8 +1269,7 @@ class WorkflowContracts(unittest.TestCase):
                         return json.dumps([{'Id': DAEMON_ID}])
                     return json.dumps([{'RepoDigests': [ref.rsplit(':', 1)[0] + '@' + DEP_ID]}])
                 raise AssertionError(args)
-            environment = {'RUNNER_TEMP': directory, 'RELEASE_DIGEST': index_digest, 'CLIENT_ID': CLIENT_ID,
-                'RELEASE_METADATA': json.dumps(metadata), 'CLIENT_METADATA': json.dumps(metadata)}
+            environment = {'RUNNER_TEMP': directory, 'RELEASE_DIGEST': index_digest, 'CLIENT_ID': CLIENT_ID}
             self.assertNotIn('containerimage.config.digest', metadata)
             mutations = [
                 ('valid-provenance-index', lambda m: None),
@@ -1177,7 +1286,9 @@ class WorkflowContracts(unittest.TestCase):
                     changed = copy.deepcopy(metadata); mutate(changed)
                     (root / 'build-record.json').write_text(json.dumps(record))
                     (root / 'run-spec.json').unlink(missing_ok=True)
-                    with patch.dict(os.environ, {**environment, 'RELEASE_METADATA': json.dumps(changed),
+                    (root / 'build-metadata-envelope.json').write_text(json.dumps({
+                        'release': json.dumps(changed), 'client': json.dumps(metadata)}))
+                    with patch.dict(os.environ, {**environment,
                         **({'RELEASE_DIGEST': 'latest'} if name == 'tag-only-release' else {})}), \
                         patch('subprocess.check_output', side_effect=docker), patch('subprocess.run'):
                         if name != 'valid-provenance-index':
@@ -1201,6 +1312,25 @@ class WorkflowContracts(unittest.TestCase):
                             self.assertEqual(saved['release_buildx_metadata']['containerimage.descriptor']['digest'], index_digest)
                             self.assertNotIn('containerimage.config.digest', saved['release_buildx_metadata'])
                             self.assertEqual(saved['daemon_image_store'], {'storage_driver': 'overlayfs', 'driver_type': 'io.containerd.snapshotter.v1'})
+            for name, envelope in (
+                ('missing', None), ('malformed-envelope', '{'),
+                ('missing-role', json.dumps({'release': json.dumps(metadata)})),
+                ('unknown-field', json.dumps({'release': json.dumps(metadata), 'client': json.dumps(metadata), 'extra': True})),
+                ('non-string-role', json.dumps({'release': metadata, 'client': json.dumps(metadata)})),
+                ('malformed-release', json.dumps({'release': '{', 'client': json.dumps(metadata)})),
+                ('malformed-client', json.dumps({'release': json.dumps(metadata), 'client': '{'})),
+            ):
+                with self.subTest(envelope=name):
+                    path = root / 'build-metadata-envelope.json'
+                    if envelope is None:
+                        path.unlink(missing_ok=True)
+                    else:
+                        path.write_text(envelope)
+                    (root / 'run-spec.json').unlink(missing_ok=True)
+                    with patch.dict(os.environ, environment), patch('subprocess.check_output', side_effect=docker), patch('subprocess.run'):
+                        with self.assertRaises((AssertionError, ValueError, FileNotFoundError)):
+                            exec(compile(code, '<workflow-spec>', 'exec'), {})
+                    self.assertFalse((root / 'run-spec.json').exists())
             self.assertFalse(any(args[1:3] == ['network', 'create'] for args in calls))
 
     def test_failed_evidence_logs_only_allowlisted_diagnostics_before_rejection(self):
