@@ -49,8 +49,9 @@ database contents. No production data was queried or exported for this proposal.
 ## Ownership and cohort contract
 
 Funnelcake owns the private eligibility relation and its serving/deletion rules.
-Keycast remains the source of its historical account facts for a one-time
-snapshot, not an online dependency for new profile reads. Mobile consumes a
+Keycast remains the source of its historical account facts for an initial
+snapshot and any required late-completion deltas, not an online dependency for
+new profile reads. Mobile consumes a
 boolean, never signup, OAuth, claim or poster evidence.
 
 Define `eligible = (legacy OR early_poster OR approved_exception) AND NOT erased`.
@@ -75,6 +76,17 @@ although existing profile visibility filters still apply. A cleanup of old claim
 records can change today's answer: pin the predicate and snapshot instant, and
 compare with the existing endpoint before its source data is retired.
 
+The cutoff does not freeze every branch of today's predicate. A pre-cutoff
+web row can become eligible after the snapshot when email verification completes;
+a pre-cutoff pubkey-only row can also qualify after later materialization.
+Snapshot parity alone therefore cannot establish ongoing legacy parity.
+Before implementation, owners must choose explicitly between preserving those
+late completions through an idempotent durable delta feed, or changing policy to
+freeze legacy eligibility at the snapshot instant. The latter changes today's
+rule and requires explicit acceptance, including compatibility behavior.
+Until that decision, source retirement and activation are blocked; do not assume
+the remaining candidate count is zero or that one export preserves future answers.
+
 The early-poster cohort is original, nonarchive Divine app video received by the
 relay before cutoff. Signed `created_at` is not arrival evidence. Historical
 client tags are attribution evidence, not cryptographic proof of app use.
@@ -94,8 +106,9 @@ turn exceptions into an unauthenticated self-claim endpoint.
 
 ## Private data and storage proposal
 
-Workload: a frozen, relatively small eligibility dimension with high-frequency
-single/bounded-batch pubkey reads, rare corrections, and mandatory erasure. No
+Workload: a relatively small eligibility dimension with high-frequency
+single/bounded-batch pubkey reads, rare corrections, any legacy completion deltas
+required by the policy decision above, and mandatory erasure. No
 event-history scan belongs on the request path. No recurring recompute or
 refreshable MV is needed for this closed cohort.
 
@@ -178,10 +191,14 @@ does not return automatically if that same pubkey posts again. A new profile may
 be live while this historical badge remains false. Maintainers must accept that
 policy explicitly before implementation.
 
-Add the eligibility relation to the pubkey-only vanish sweep and its completion
-verifier, including provenance/audit subject references under their approved
+Add the eligibility relation to the pubkey-only vanish sweep and completion
+verification, including provenance/audit subject references under their approved
 retention rules. Do not compare operator import timestamps with signed vanish
-boundaries to decide whether the old badge survives. Purge affected user cache
+boundaries to decide whether the old badge survives. This requires new unbounded
+per-pubkey residue verification: the existing completion verifier accepts only
+event-boundary tables, not the pubkey-only sweep list. Gate completion on that
+new check so a late import cannot escape by carrying a newer operator timestamp.
+Purge affected user cache
 keys and every cached response embedding the value. Test compaction of request
 detail into tombstones, restart, stale imports and restoration from backups.
 Restored snapshots must replay subsequent erasures before serving; expire or
@@ -200,13 +217,31 @@ lookup to compensate. Implementers must confirm the existing service-auth and
 deletion paths before selecting transport. This bridge is new proposed work,
 not functionality supplied by #443.
 
+Funnelcake must persist direct-deletion suppression in a separate durable,
+cohort-scoped deletion ledger before acknowledging delivery, not only as a revoked
+eligibility row or an expiring deletion-attempt record. It is not a fabricated
+user-signed NIP-62 event and has no signed event-time boundary. Import, delta and
+serving checks consult this ledger as well as NIP-62 history. The eligibility
+relation remains derived state, not the deletion authority. Restore must replay
+ledger entries newer than the restored snapshot before serving, even after the
+sender prunes acknowledged outbox rows. Retain the minimal scoped suppression
+identity for as long as any retained export, backup or late delta could regrant
+it; owners must approve the precise retention and recovery policy before
+activation. Sweep eligibility/provenance residue and verify it without deleting
+the suppression record needed to prevent recreation.
+
 ## API and mobile contract
 
 Add top-level `is_og_diviner` to `UserData` in singleton and existing bounded bulk
 profile responses. It is independent of a Kind 0 profile and NIP-58 `badges`.
 Do not change hidden-user omissions to expose eligibility or moderation state.
 Successful authoritative reads return a boolean; omit the field on an
-eligibility/deletion dependency error and use `no-store` for that response.
+eligibility/deletion dependency error. Keep such unknown responses briefly
+cacheable to preserve profile edge shielding during dependency degradation:
+proposed browser and surrogate freshness is at most 5 seconds, with no stale
+reuse, subject to measured implementation review. Never reuse a cached true to
+fill the omitted field. Apply this error policy through middleware and edge
+layers rather than allowing the normal profile cache policy to override it.
 Missing means unknown/unsupported, **not false**. Do not publish provenance,
 counts, enrollment dates or a roster endpoint.
 
@@ -224,11 +259,17 @@ Keep the full existing response shape; this fragment shows only the additive
 field. Bulk uses that field on returned user objects, preserving its current
 `users`/`missing` envelope and visibility behavior.
 
+Other embeddings of `UserData`, including follower/following profile hydration,
+omit the field until their cache keys, purge scope and client semantics are
+explicitly covered. Search and GraphQL use explicit projections today; do not
+add the field there implicitly when extending the shared storage model.
+
 Mobile changes span the Funnelcake client, shared profile result models and the
 eligibility service/provider. Preserve true/false/unknown through parsing,
 including profiles not yet published and omitted/hidden bulk entries. Keep the
 existing badge rendering. Unknown hides the cosmetic badge temporarily and
-retries; it must not cache a permanent false or trigger Keycast fallback in
+retries with bounded exponential backoff and jitter, coalesced per subject;
+it must not cache a permanent false or trigger Keycast fallback in
 migrated clients. An authoritative false overrides a previous true.
 
 Proposed cache bound for new clients: no badge value beyond 60 seconds without
@@ -260,7 +301,9 @@ origin header. Browser/app TTLs and purge latency must be measured separately.
    compatibility is a bounded server-side adapter to Funnelcake's authoritative
    field that returns the existing `{ "eligible": true }` shape. It preserves
    Keycast input parsing and host-to-cohort mapping, returns a retryable error on
-   unknown/unavailable, and never falls back to the old account query. This is
+   unknown/unavailable, and never falls back to the old account query. Unmapped
+   hosts return an explicit unsupported-cohort response, not an endless retryable
+   dependency error; never redirect another tenant into the approved cohort. This is
    a new scoped compatibility PR, not permission to load #443's grant table.
    Test it before directing older clients to the new cohort. Requests still
    reaching Keycast remain an acknowledged transitional availability cost.
@@ -284,12 +327,12 @@ eligibility dependencies after that window and reconciliation are complete.
 
 | Scenario | Required evidence |
 | --- | --- |
-| Existing eligibility | Synthetic fixtures cover every predicate branch, nulls, late claims, token cleanup, tenant mismatch, revoked OAuth and suspended/banned accounts; private snapshot parity has zero unexplained losses |
+| Existing eligibility | Synthetic fixtures cover every predicate branch, nulls, late claims, token cleanup, tenant mismatch, revoked OAuth and suspended/banned accounts; private snapshot parity has zero unexplained losses; owner-approved late-completion policy and post-snapshot verification/materialization tests establish ongoing parity or explicitly accepted changes |
 | Poster evidence | Strict cutoff boundary, forged old event time received late, archive exclusion, legacy/canonical client tags, opted-out/missing tags and reinserted arrival evidence are tested |
 | API contract | Singleton and bulk agree for visible users; no Kind 0 required; missing/error stays unknown; hidden entries do not leak; no roster/provenance in JSON/OpenAPI |
 | Import durability | Partial write, process death, ambiguous acknowledgement, duplicate/altered manifest and wrong cohort cannot activate incomplete/conflicting state; retry preserves identity/count |
-| Erasure | Historical direct-deletion coverage established or its precise gap explicitly accepted before activation; delete before/during/after import, direct Keycast deletion, completed vanish, tombstone compaction, stale retry, exception and disaster restore cannot regrant; physical-erasure verifier includes new records |
-| Cache/client | False replaces true; failures do not stick; fresh/older client behavior and edge/browser/app expiration measured; new client works with Keycast unavailable |
+| Erasure | Historical direct-deletion coverage established or its precise gap explicitly accepted before activation; delete before/during/after import, direct Keycast deletion, completed vanish, tombstone compaction, stale retry, late-completion delta, exception and disaster restore cannot regrant; durable direct-deletion ledger survives outbox pruning and restore; new pubkey-only physical-erasure verification includes new records |
+| Cache/client | False replaces true; failures do not stick; unknown responses preserve bounded edge shielding without stale true; retry backoff is bounded under sustained failure; fresh/older client behavior and edge/browser/app expiration measured; new client works with Keycast unavailable |
 | Operations | No real roster in logs/git/artifacts; authenticated scoped loader/bridge; alert on failed deletion delivery, failed imports, unknown lookup rate and legacy endpoint traffic |
 
 No DDL, query benchmark or production-scale cost result is supplied here. Before
