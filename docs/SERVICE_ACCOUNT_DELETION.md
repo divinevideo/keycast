@@ -127,6 +127,15 @@ claim tokens, and the user row — which cascades to personal keys, OAuth
 authorizations and their refresh tokens, email-verification and password-reset
 tokens, and the user profile.
 
+It also removes the pubkey's OG Diviner grant in the calling tenant
+(`og_diviner_grants`, keycast#440), and does so even when the result is
+`already_absent`: most grantees never had a Keycast account, so this request is
+the only signal Keycast gets that one of them has deleted their account in the
+Divine app. A deletion made only from another Nostr app never reaches Keycast
+and leaves the grant in place. A deletion that runs while a grant load is
+writing can miss the grant that load inserts; the load runbook in
+docs/DEPLOYMENT.md removes those grants straight after the load.
+
 After the transaction commits, the signer daemon is told to drop the account's
 bunker connections. That notification is best-effort: it cannot fail a deletion
 that has already committed.
