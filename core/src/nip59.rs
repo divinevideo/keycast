@@ -82,7 +82,21 @@ pub fn unwrap_gift(keys: &Keys, gift_wrap: &Event) -> Result<UnwrappedGift, Gift
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr_sdk::EventBuilder;
+    use nostr_sdk::{EventBuilder, UnsignedEvent};
+
+    fn rumor_from(author: &Keys, receiver: &PublicKey, text: &str) -> UnsignedEvent {
+        let mut rumor = EventBuilder::private_msg_rumor(*receiver, text).build(author.public_key());
+        rumor.ensure_id();
+        rumor
+    }
+
+    /// A kind-13 seal signed by `signer` that carries `rumor` encrypted to `receiver`.
+    fn seal_signed_by(signer: &Keys, receiver: &PublicKey, rumor: &UnsignedEvent) -> Event {
+        let content = nip44::encrypt(signer.secret_key(), receiver, &rumor.as_json()).unwrap();
+        EventBuilder::new(Kind::Seal, content)
+            .sign_with_keys(signer)
+            .unwrap()
+    }
 
     /// A kind-13 seal whose content is a placeholder `len` bytes long.
     fn seal_of(len: usize) -> Event {
@@ -117,6 +131,76 @@ mod tests {
         wrap.verify().unwrap();
         let opened = nip44::decrypt(receiver.secret_key(), &wrap.pubkey, &wrap.content).unwrap();
         assert_eq!(Event::from_json(opened).unwrap(), seal);
+    }
+
+    #[test]
+    fn opens_a_wrap_for_a_message_that_needs_the_extended_length_prefix() {
+        let (sender, receiver) = (Keys::generate(), Keys::generate());
+        let text = "a".repeat(41_000);
+        let rumor = rumor_from(&sender, &receiver.public_key(), &text);
+        let seal = seal_signed_by(&sender, &receiver.public_key(), &rumor);
+
+        let wrap = gift_wrap_from_seal(&receiver.public_key(), &seal).unwrap();
+        let opened = unwrap_gift(&receiver, &wrap).unwrap();
+
+        assert_eq!(opened.sender, sender.public_key());
+        assert_eq!(opened.rumor.content, text);
+    }
+
+    #[test]
+    fn refuses_a_seal_whose_signature_is_not_valid() {
+        // The seal is the only anchor of the sender's identity, and anyone can
+        // build the wrap around it: a forged seal must not authenticate.
+        let (victim, attacker, receiver) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let rumor = rumor_from(&victim, &receiver.public_key(), "forged");
+        let seal = seal_signed_by(&victim, &receiver.public_key(), &rumor);
+        let other_signature = EventBuilder::text_note("unrelated")
+            .sign_with_keys(&attacker)
+            .unwrap()
+            .sig;
+        let mut forged = serde_json::to_value(&seal).unwrap();
+        forged["sig"] = serde_json::to_value(other_signature).unwrap();
+        let forged: Event = serde_json::from_value(forged).unwrap();
+        assert!(forged.verify().is_err(), "the test seal must be invalid");
+
+        let wrap = gift_wrap_from_seal(&receiver.public_key(), &forged).unwrap();
+
+        assert!(matches!(
+            unwrap_gift(&receiver, &wrap),
+            Err(GiftUnwrapError::InvalidEvent(_))
+        ));
+    }
+
+    #[test]
+    fn refuses_a_rumor_written_by_someone_other_than_the_seal_signer() {
+        let (signer, claimed, receiver) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let rumor = rumor_from(&claimed, &receiver.public_key(), "not mine");
+        let seal = seal_signed_by(&signer, &receiver.public_key(), &rumor);
+
+        let wrap = gift_wrap_from_seal(&receiver.public_key(), &seal).unwrap();
+
+        assert!(matches!(
+            unwrap_gift(&receiver, &wrap),
+            Err(GiftUnwrapError::SenderMismatch)
+        ));
+    }
+
+    #[test]
+    fn dates_a_wrap_at_random_instead_of_when_it_was_sent() {
+        // NIP-59 randomises the wrap's time, up to two days back, so it does not
+        // reveal when the message was sent. Eight wraps all landing within an
+        // hour of now by chance has odds of about 1 in 3 * 10^13.
+        let receiver = Keys::generate();
+        let seal = seal_of(10);
+        let now = Timestamp::now().as_u64();
+
+        let oldest_age = (0..8)
+            .map(|_| gift_wrap_from_seal(&receiver.public_key(), &seal).unwrap())
+            .map(|wrap| now.saturating_sub(wrap.created_at.as_u64()))
+            .max()
+            .unwrap();
+
+        assert!(oldest_age > 3_600, "oldest wrap was only {oldest_age}s old");
     }
 
     #[test]

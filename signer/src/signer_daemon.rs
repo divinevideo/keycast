@@ -247,7 +247,11 @@ impl Nip46Handler {
             let text = response_str;
             tokio::task::spawn_blocking(move || {
                 if use_nip44 {
-                    keycast_core::nip44::encrypt(&secret, &pubkey, &text).map_err(SignerError::from)
+                    // A response goes to a client whose NIP-44 support is unknown, and a u16-only
+                    // library cannot read the extended length prefix, so it would never answer.
+                    // Keep envelopes on the two-byte prefix: too large a response fails instead.
+                    nip44::encrypt(&secret, &pubkey, &text, nip44::Version::V2)
+                        .map_err(|e| SignerError::Nip44(e.into()))
                 } else {
                     nip04::encrypt(&secret, &pubkey, &text).map_err(SignerError::from)
                 }
@@ -2165,8 +2169,11 @@ impl UnifiedSigner {
                 let use_44 = use_nip44;
                 tokio::task::spawn_blocking(move || {
                     if use_44 {
-                        keycast_core::nip44::encrypt(&secret, &pubkey, &text)
-                            .map_err(SignerError::from)
+                        // A response goes to a client whose NIP-44 support is unknown, and a u16-only
+                        // library cannot read the extended length prefix, so it would never answer.
+                        // Keep envelopes on the two-byte prefix: too large a response fails instead.
+                        nip44::encrypt(&secret, &pubkey, &text, nip44::Version::V2)
+                            .map_err(|e| SignerError::Nip44(e.into()))
                     } else {
                         nip04::encrypt(&secret, &pubkey, &text).map_err(SignerError::from)
                     }

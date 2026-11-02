@@ -237,7 +237,7 @@ fn validate_p_tag_recipients(user_pubkey: &PublicKey, tags: &[Tag]) -> Result<()
 /// would become relay-routable metadata, so they must be approved too (a
 /// near-free defense-in-depth check; content stays bound by decryption). The
 /// crypto here (≤3 ECDH + HKDF + a bounded NIP-44 decrypt) runs inline: it is
-/// sub-millisecond and bounded, unlike the unwrap-batch path that fans out.
+/// bounded and cheap, unlike the unwrap-batch path that fans out.
 fn validate_seal(user_keys: &Keys, event: &UnsignedEvent) -> Result<(), MinorDmDenied> {
     let user_pubkey = user_keys.public_key();
     validate_p_tags_approved(&user_pubkey, event.tags.as_slice())?;

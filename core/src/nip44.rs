@@ -37,6 +37,18 @@ pub enum Nip44Error {
     Invalid(String),
 }
 
+/// For the callers that still use the 0.44 library on purpose.
+impl From<nostr_sdk::nips::nip44::Error> for Nip44Error {
+    fn from(error: nostr_sdk::nips::nip44::Error) -> Self {
+        use nostr_sdk::nips::nip44::{v2::ErrorV2, Error};
+        match error {
+            Error::MessageTooLong | Error::V2(ErrorV2::MessageTooLong) => Self::MessageTooLong,
+            Error::V2(ErrorV2::InvalidPadding) => Self::InvalidPadding,
+            other => Self::Invalid(other.to_string()),
+        }
+    }
+}
+
 fn invalid(error: impl std::fmt::Display) -> Nip44Error {
     Nip44Error::Invalid(error.to_string())
 }
@@ -111,30 +123,61 @@ mod tests {
         STANDARD.encode(bytes)
     }
 
+    /// The most the previous library will encrypt.
+    const PREVIOUS_LIBRARY_MAX: usize = 65_536 - 128;
+
     #[test]
     fn decrypts_payloads_the_previous_library_wrote() {
         let (sender, recipient) = (Keys::generate(), Keys::generate());
-        let payload = previous::encrypt(
-            sender.secret_key(),
-            &recipient.public_key(),
-            "hello",
-            previous::Version::V2,
-        )
-        .unwrap();
-        assert_eq!(
-            decrypt(recipient.secret_key(), &sender.public_key(), &payload).unwrap(),
-            "hello"
-        );
+        for len in [1, 5, PREVIOUS_LIBRARY_MAX] {
+            let plaintext = "a".repeat(len);
+            let payload = previous::encrypt(
+                sender.secret_key(),
+                &recipient.public_key(),
+                &plaintext,
+                previous::Version::V2,
+            )
+            .unwrap();
+            assert_eq!(
+                decrypt(recipient.secret_key(), &sender.public_key(), &payload).unwrap(),
+                plaintext,
+                "{len}-byte plaintext"
+            );
+        }
     }
 
     #[test]
-    fn writes_payloads_the_previous_library_can_read() {
+    fn writes_payloads_the_previous_library_can_read_below_the_extended_prefix() {
+        // 65,409 to 65,535 is where this code starts writing what the previous
+        // library never could, still with the two-byte prefix it can read.
         let (sender, recipient) = (Keys::generate(), Keys::generate());
-        let payload = encrypt(sender.secret_key(), &recipient.public_key(), "hello").unwrap();
-        assert_eq!(
-            previous::decrypt(recipient.secret_key(), &sender.public_key(), &payload).unwrap(),
-            "hello"
-        );
+        for len in [1, 5, PREVIOUS_LIBRARY_MAX, PREVIOUS_LIBRARY_MAX + 1, 65_535] {
+            let plaintext = "a".repeat(len);
+            let payload =
+                encrypt(sender.secret_key(), &recipient.public_key(), &plaintext).unwrap();
+            assert_eq!(
+                previous::decrypt(recipient.secret_key(), &sender.public_key(), &payload).unwrap(),
+                plaintext,
+                "{len}-byte plaintext"
+            );
+        }
+    }
+
+    #[test]
+    fn writes_the_extended_prefix_from_65536_bytes_which_the_previous_library_cannot_read() {
+        let (sender, recipient) = (Keys::generate(), Keys::generate());
+        for len in [65_536, 70_000] {
+            let payload = encrypt(
+                sender.secret_key(),
+                &recipient.public_key(),
+                &"a".repeat(len),
+            )
+            .unwrap();
+            assert!(
+                previous::decrypt(recipient.secret_key(), &sender.public_key(), &payload).is_err(),
+                "{len}-byte plaintext"
+            );
+        }
     }
 
     #[test]
@@ -241,6 +284,27 @@ mod tests {
                 &"a".repeat(CEILING + 1)
             ),
             Err(Nip44Error::MessageTooLong)
+        );
+    }
+
+    #[test]
+    fn converts_the_previous_librarys_bound_errors() {
+        use previous::{v2::ErrorV2, Error};
+        assert_eq!(
+            Nip44Error::from(Error::V2(ErrorV2::MessageTooLong)),
+            Nip44Error::MessageTooLong
+        );
+        assert_eq!(
+            Nip44Error::from(Error::MessageTooLong),
+            Nip44Error::MessageTooLong
+        );
+        assert_eq!(
+            Nip44Error::from(Error::V2(ErrorV2::InvalidPadding)),
+            Nip44Error::InvalidPadding
+        );
+        assert_eq!(
+            Nip44Error::from(Error::UnknownVersion(9)),
+            Nip44Error::Invalid(Error::UnknownVersion(9).to_string())
         );
     }
 

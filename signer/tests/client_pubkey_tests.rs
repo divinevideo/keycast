@@ -1357,6 +1357,40 @@ async fn decrypt_outcome(
         .await
 }
 
+/// A NIP-46 response is encrypted back to a client whose NIP-44 support is
+/// unknown, and a u16-only library cannot read the extended length prefix: it
+/// would never answer, instead of failing. So a response too large for the
+/// two-byte prefix must be refused rather than written with the six-byte one.
+#[tokio::test]
+async fn test_nip46_response_envelope_never_uses_the_extended_length_prefix() {
+    use keycast_core::nip44::Nip44Error;
+
+    let pool = setup_test_db().await;
+    let (handler, client, _user_keys) = handler_with_bound_client(&pool).await;
+    let peer = Keys::generate();
+
+    // 60,000 bytes encrypt to about 80,000 base64 characters, so the response
+    // carrying them is larger than the 65,408 bytes a two-byte prefix can hold.
+    let result = decrypt_outcome(
+        &handler,
+        &client,
+        "nip44_encrypt",
+        &peer.public_key(),
+        "a".repeat(60_000),
+    )
+    .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(keycast_signer::SignerError::Nip44(
+                Nip44Error::MessageTooLong
+            ))
+        ),
+        "got {result:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_nip04_decrypt_rejects_content_with_a_malformed_iv() {
     let pool = setup_test_db().await;

@@ -503,8 +503,9 @@ impl HttpRpcHandler {
     ///
     /// The rumor is encrypted through [`Self::nip44_encrypt`] and the kind-13
     /// seal is signed through [`Self::sign_event`]. Only the ephemeral outer
-    /// kind-1059 wrap is delegated directly to nostr-sdk, so the user's secret
-    /// key never bypasses the existing encrypt/sign policy surfaces.
+    /// kind-1059 wrap is built directly, by
+    /// [`keycast_core::nip59::gift_wrap_from_seal`], so the user's secret key
+    /// never bypasses the existing encrypt/sign policy surfaces.
     pub async fn nip17_wrap(
         &self,
         mut rumor: UnsignedEvent,
@@ -1333,6 +1334,42 @@ mod tests {
         );
         assert_eq!(sender, handler.public_key().to_hex());
         assert_eq!(content, text);
+    }
+
+    /// The seal's JSON is about a third larger than the rumor's padded size
+    /// (base64), and the wrap encrypts that JSON under the same 128 KiB bound,
+    /// so a direct message can be about 81,600 characters long, not 128 KiB.
+    #[tokio::test]
+    async fn nip17_wrap_holds_a_message_up_to_the_size_its_outer_layer_allows() {
+        let handler = create_test_handler(None, None);
+        let receiver = Keys::generate();
+        let rumor = build_rumor(
+            handler.public_key(),
+            receiver.public_key(),
+            &"a".repeat(80_000),
+        );
+
+        let gift_wrap = handler.nip17_wrap(rumor, &receiver.public_key()).await;
+
+        assert!(gift_wrap.is_ok(), "got {gift_wrap:?}");
+    }
+
+    #[tokio::test]
+    async fn nip17_wrap_reports_wrap_failed_when_the_outer_layer_cannot_hold_the_seal() {
+        let handler = create_test_handler(None, None);
+        let receiver = Keys::generate();
+        let rumor = build_rumor(
+            handler.public_key(),
+            receiver.public_key(),
+            &"a".repeat(90_000),
+        );
+
+        let gift_wrap = handler.nip17_wrap(rumor, &receiver.public_key()).await;
+
+        assert!(
+            matches!(gift_wrap, Err(WrapError::WrapFailed)),
+            "got {gift_wrap:?}"
+        );
     }
 
     #[tokio::test]
