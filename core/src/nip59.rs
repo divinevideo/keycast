@@ -192,11 +192,11 @@ mod tests {
         // hour of now by chance has odds of about 1 in 3 * 10^13.
         let receiver = Keys::generate();
         let seal = seal_of(10);
-        let now = Timestamp::now().as_u64();
+        let now = Timestamp::now().as_secs();
 
         let oldest_age = (0..8)
             .map(|_| gift_wrap_from_seal(&receiver.public_key(), &seal).unwrap())
-            .map(|wrap| now.saturating_sub(wrap.created_at.as_u64()))
+            .map(|wrap| now.saturating_sub(wrap.created_at.as_secs()))
             .max()
             .unwrap();
 
