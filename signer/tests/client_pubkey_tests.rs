@@ -1397,7 +1397,7 @@ async fn test_nip04_decrypt_rejects_content_with_a_malformed_iv() {
 #[tokio::test]
 async fn test_nip44_decrypt_rejects_a_payload_below_the_minimum_size() {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
-    use nostr_sdk::nips::nip44::v2::ErrorV2;
+    use keycast_core::nip44::Nip44Error;
 
     let pool = setup_test_db().await;
     let (handler, client, user_keys) = handler_with_bound_client(&pool).await;
@@ -1432,9 +1432,9 @@ async fn test_nip44_decrypt_rejects_a_payload_below_the_minimum_size() {
     assert!(
         matches!(
             result,
-            Err(keycast_signer::SignerError::Nip44(nip44::Error::V2(
-                ErrorV2::InvalidPadding
-            )))
+            Err(keycast_signer::SignerError::Nip44(
+                Nip44Error::InvalidPadding
+            ))
         ),
         "got {result:?}"
     );

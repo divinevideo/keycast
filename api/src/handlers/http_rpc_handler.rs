@@ -3,15 +3,14 @@
 
 use chrono::{DateTime, Utc};
 use keycast_core::creator_binding::validate_creator_binding_payload;
+use keycast_core::nip59::GiftUnwrapError;
 use keycast_core::secret_types::DecryptedPlaintext;
 use keycast_core::signing_session::{CacheKey, SessionError, SigningSession};
 use keycast_core::traits::CustomPermission;
 use moka::future::Cache;
 use nostr_sdk::nips::nip04;
 use nostr_sdk::nips::nip59::{self, UnwrappedGift};
-use nostr_sdk::{
-    Event, EventBuilder, JsonUtil, Keys, Kind, PublicKey, Tag, Timestamp, UnsignedEvent,
-};
+use nostr_sdk::{Event, EventBuilder, JsonUtil, Keys, Kind, PublicKey, Timestamp, UnsignedEvent};
 use once_cell::sync::Lazy;
 use secrecy::SecretString;
 use std::sync::{Arc, Mutex};
@@ -565,7 +564,7 @@ impl HttpRpcHandler {
 
         let recipient = *recipient;
         keycast_core::panic_scope::spawn_blocking(move || {
-            EventBuilder::gift_wrap_from_seal(&recipient, &signed_seal, Vec::<Tag>::new())
+            keycast_core::nip59::gift_wrap_from_seal(&recipient, &signed_seal)
         })
         .await
         .map_err(|_| WrapError::WrapFailed)?
@@ -576,19 +575,20 @@ impl HttpRpcHandler {
     ///
     /// This is the per-item primitive behind the `nip17_unwrap_batch` RPC. It
     /// reproduces the security guarantees the divine-mobile client enforces in
-    /// `GiftWrapUtil.getRumorEvent`, delegating the protocol unwrap to the
-    /// vetted `nostr_sdk` implementation rather than hand-rolling NIP-59:
+    /// `GiftWrapUtil.getRumorEvent`, delegating the protocol unwrap to
+    /// [`keycast_core::nip59::unwrap_gift`], which mirrors `nostr_sdk`'s NIP-59
+    /// unwrap but decrypts through the bounded NIP-44 entry point so a wrap whose
+    /// outer layer needs the extended length prefix opens:
     ///
     /// 1. validity (expiration/revocation) is checked first (cached, no DB hit);
     /// 2. the OUTER gift wrap's id+Schnorr signature is verified — defense in
-    ///    depth, since `UnwrappedGift::from_gift_wrap` verifies the *seal* but
-    ///    NOT the outer wrap;
-    /// 3. `UnwrappedGift::from_gift_wrap` decrypts the outer layer, **verifies
+    ///    depth, since `unwrap_gift` verifies the *seal* but NOT the outer wrap;
+    /// 3. `unwrap_gift` decrypts the outer layer, **verifies
     ///    the seal's signature** (the sole cryptographic anchor of the sender's
     ///    identity), decrypts the inner layer, and rejects a rumor whose
     ///    `pubkey` disagrees with the authenticated seal signer (`SenderMismatch`);
     /// 4. the cached decrypt policy is enforced against the **authenticated**
-    ///    inner sender — `from_gift_wrap` decrypts internally, so without this an
+    ///    inner sender — `unwrap_gift` decrypts internally, so without this an
     ///    `encrypt_to_self`-restricted authorization could read others' DMs.
     ///
     /// CPU-bound work (two Schnorr verifies + two NIP-44 decrypts) runs on
@@ -630,25 +630,24 @@ impl HttpRpcHandler {
                 let _permit = permit;
 
                 // Defense-in-depth: verify the outer wrap's own id+signature (parity
-                // with the client's getRumorEvent). from_gift_wrap does not do this.
+                // with the client's getRumorEvent). unwrap_gift does not do this.
                 gift_wrap
                     .verify()
                     .map_err(|_| UnwrapError::InvalidWrapSignature)?;
 
-                // from_gift_wrap is async but its crypto is synchronous; drive it to
-                // completion on this blocking thread (same pattern as sign_event).
-                tokio::runtime::Handle::current()
-                    .block_on(UnwrappedGift::from_gift_wrap(&keys, &gift_wrap))
-                    .map_err(|e| match e {
-                        // Defensive/unreachable: the kind gate above already rejects
-                        // non-gift-wraps before we get here, so from_gift_wrap's own
-                        // kind check never fires. Mapped anyway for exhaustiveness.
-                        nip59::Error::NotGiftWrap => UnwrapError::NotGiftWrap,
-                        nip59::Error::SenderMismatch => UnwrapError::SenderMismatch,
-                        // Signer (wrong recipient / decrypt failure) and Event (malformed
-                        // seal/rumor json) both surface as a decrypt failure to the client.
-                        _ => UnwrapError::DecryptFailed,
-                    })
+                keycast_core::nip59::unwrap_gift(&keys, &gift_wrap).map_err(|e| match e {
+                    // Defensive/unreachable: the kind gate above already rejects
+                    // non-gift-wraps before we get here, so unwrap_gift's own
+                    // kind check never fires. Mapped anyway for exhaustiveness.
+                    GiftUnwrapError::NotGiftWrap => UnwrapError::NotGiftWrap,
+                    GiftUnwrapError::SenderMismatch => UnwrapError::SenderMismatch,
+                    // Decrypt (wrong recipient, a payload over the NIP-44 bound) and
+                    // InvalidEvent (malformed seal/rumor json) both surface as a decrypt
+                    // failure to the client.
+                    GiftUnwrapError::Decrypt(_) | GiftUnwrapError::InvalidEvent(_) => {
+                        UnwrapError::DecryptFailed
+                    }
+                })
             },
         )
         .await
@@ -1248,6 +1247,92 @@ mod tests {
         );
         assert_eq!(unwrapped.rumor.content, "hello dm");
         assert_eq!(unwrapped.rumor.kind, Kind::PrivateDirectMessage);
+    }
+
+    /// Longer than the 40,682-character DM whose gift wrap still fits a
+    /// two-byte NIP-44 length prefix on its outer layer.
+    const DM_NEEDING_EXTENDED_PREFIX: usize = 41_000;
+
+    /// nostr 0.45 builds and opens gift wraps whose outer layer needs the NIP-44
+    /// extended length prefix. It is the oracle for these tests: an
+    /// implementation independent of the one under test.
+    mod next {
+        use nostr_next::event::FinalizeEvent;
+        use nostr_next::nips::nip59::GiftWrapBuilder;
+        use nostr_next::prelude::*;
+
+        fn keys(secret: &[u8]) -> Keys {
+            Keys::new(SecretKey::from_slice(secret).unwrap())
+        }
+
+        pub fn gift_wrap_json(sender_secret: &[u8], receiver_hex: &str, text: &str) -> String {
+            let sender = keys(sender_secret);
+            let receiver = PublicKey::from_hex(receiver_hex).unwrap();
+            let rumor = UnsignedEvent::from_json(
+                serde_json::json!({
+                    "pubkey": sender.public_key().to_hex(),
+                    "created_at": 1_700_000_000u64,
+                    "kind": 14,
+                    "tags": [["p", receiver_hex]],
+                    "content": text,
+                })
+                .to_string(),
+            )
+            .unwrap();
+            GiftWrapBuilder::new(receiver, rumor)
+                .finalize(&sender)
+                .unwrap()
+                .as_json()
+        }
+
+        /// The authenticated sender's hex key and the rumor's content.
+        pub fn open(receiver_secret: &[u8], gift_wrap_json: &str) -> (String, String) {
+            let wrap = Event::from_json(gift_wrap_json).unwrap();
+            let gift = UnwrappedGift::from_gift_wrap(&keys(receiver_secret), &wrap).unwrap();
+            (gift.sender.to_hex(), gift.rumor.content)
+        }
+    }
+
+    #[tokio::test]
+    async fn nip17_unwrap_opens_a_gift_wrap_that_needs_the_extended_prefix() {
+        let handler = create_test_handler(None, None);
+        let sender = Keys::generate();
+        let text = "a".repeat(DM_NEEDING_EXTENDED_PREFIX);
+        let json = next::gift_wrap_json(
+            &sender.secret_key().to_secret_bytes(),
+            &handler.public_key().to_hex(),
+            &text,
+        );
+        let gift_wrap: Event = serde_json::from_str(&json).expect("event parses");
+
+        let unwrapped = handler
+            .nip17_unwrap(gift_wrap)
+            .await
+            .expect("unwrap should succeed");
+
+        assert_eq!(unwrapped.sender, sender.public_key());
+        assert_eq!(unwrapped.rumor.content, text);
+    }
+
+    #[tokio::test]
+    async fn nip17_wrap_builds_a_gift_wrap_that_needs_the_extended_prefix() {
+        let handler = create_test_handler(None, None);
+        let receiver = Keys::generate();
+        let text = "a".repeat(DM_NEEDING_EXTENDED_PREFIX);
+        let rumor = build_rumor(handler.public_key(), receiver.public_key(), &text);
+
+        let gift_wrap = handler
+            .nip17_wrap(rumor, &receiver.public_key())
+            .await
+            .expect("wrap should succeed");
+
+        gift_wrap.verify().expect("outer wrap must verify");
+        let (sender, content) = next::open(
+            &receiver.secret_key().to_secret_bytes(),
+            &serde_json::to_string(&gift_wrap).unwrap(),
+        );
+        assert_eq!(sender, handler.public_key().to_hex());
+        assert_eq!(content, text);
     }
 
     #[tokio::test]

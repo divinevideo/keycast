@@ -247,8 +247,7 @@ impl Nip46Handler {
             let text = response_str;
             tokio::task::spawn_blocking(move || {
                 if use_nip44 {
-                    nip44::encrypt(&secret, &pubkey, &text, nip44::Version::V2)
-                        .map_err(SignerError::from)
+                    keycast_core::nip44::encrypt(&secret, &pubkey, &text).map_err(SignerError::from)
                 } else {
                     nip04::encrypt(&secret, &pubkey, &text).map_err(SignerError::from)
                 }
@@ -347,7 +346,7 @@ impl Nip46Handler {
                     let pubkey = third_party_pubkey;
                     let text = plaintext.to_string();
                     tokio::task::spawn_blocking(move || {
-                        nip44::encrypt(&secret, &pubkey, &text, nip44::Version::V2)
+                        keycast_core::nip44::encrypt(&secret, &pubkey, &text)
                     })
                     .await
                     .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
@@ -2166,7 +2165,7 @@ impl UnifiedSigner {
                 let use_44 = use_nip44;
                 tokio::task::spawn_blocking(move || {
                     if use_44 {
-                        nip44::encrypt(&secret, &pubkey, &text, nip44::Version::V2)
+                        keycast_core::nip44::encrypt(&secret, &pubkey, &text)
                             .map_err(SignerError::from)
                     } else {
                         nip04::encrypt(&secret, &pubkey, &text).map_err(SignerError::from)

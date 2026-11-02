@@ -2,7 +2,6 @@
 // ABOUTME: Provides sign/encrypt/decrypt operations for both HTTP and NIP-46 paths
 // ABOUTME: All CPU-bound crypto runs on spawn_blocking to avoid blocking async runtime
 
-use nostr_sdk::nips::nip44;
 use nostr_sdk::secp256k1::{Keypair, Message, SECP256K1};
 use nostr_sdk::{Event, Keys, PublicKey, UnsignedEvent};
 use secrecy::SecretString;
@@ -142,7 +141,7 @@ impl SigningSession {
         let plaintext = plaintext.to_string();
 
         crate::panic_scope::spawn_blocking(move || {
-            nip44::encrypt(&secret, &recipient, &plaintext, nip44::Version::V2)
+            crate::nip44::encrypt(&secret, &recipient, &plaintext)
         })
         .await?
         .map_err(|e| SessionError::Encryption(e.to_string()))
@@ -186,6 +185,26 @@ mod tests {
             matches!(&error, SessionError::Encryption(message) if message.contains("invalid padding")),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn nip44_round_trips_plaintext_that_needs_the_extended_length_prefix() {
+        let sender = SigningSession::new(Keys::generate());
+        let recipient = SigningSession::new(Keys::generate());
+        // A NIP-17 gift wrap encrypts the seal's JSON, which is larger than
+        // the 65,535 bytes a two-byte length prefix can describe.
+        let plaintext = "a".repeat(70_000);
+
+        let payload = sender
+            .nip44_encrypt(&recipient.keys().public_key(), &plaintext)
+            .await
+            .expect("encrypt");
+        let decrypted = recipient
+            .nip44_decrypt(&sender.keys().public_key(), &payload)
+            .await
+            .expect("decrypt");
+
+        assert_eq!(secrecy::ExposeSecret::expose_secret(&decrypted), plaintext);
     }
 
     #[test]
