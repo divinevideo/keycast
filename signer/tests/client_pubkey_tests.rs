@@ -1369,8 +1369,9 @@ async fn test_nip46_response_envelope_never_uses_the_extended_length_prefix() {
     let (handler, client, _user_keys) = handler_with_bound_client(&pool).await;
     let peer = Keys::generate();
 
-    // 60,000 bytes encrypt to about 80,000 base64 characters, so the response
-    // carrying them is larger than the 65,408 bytes a two-byte prefix can hold.
+    // 60,000 bytes pad to 65,536 and encrypt to 87,472 base64 characters, so the
+    // response carrying them is larger than the 65,408 bytes a two-byte prefix
+    // can hold.
     let result = decrypt_outcome(
         &handler,
         &client,

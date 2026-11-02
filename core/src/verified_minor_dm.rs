@@ -718,6 +718,38 @@ mod tests {
         );
     }
 
+    /// A rumor over 65,408 bytes, so its seal needs the extended NIP-44 length
+    /// prefix, addressed to `recipients` and encrypted to the approved key.
+    fn large_sealed_rumor(user: &Keys, recipients: &[PublicKey]) -> UnsignedEvent {
+        let mut rumor: serde_json::Value =
+            serde_json::from_str(&rumor_json(user, recipients)).unwrap();
+        rumor["content"] = json!("a".repeat(70_000));
+        let content =
+            crate::nip44::encrypt(user.secret_key(), &hq_pubkey(), &rumor.to_string()).unwrap();
+        EventBuilder::new(Kind::from(13u16), content).build(user.public_key())
+    }
+
+    #[test]
+    fn large_seal_to_an_approved_recipient_is_judged_by_its_recipients() {
+        // Before the extended prefix could be read, a seal this large could not be
+        // decrypted at all and was refused as `SealNotDecryptable`. It is now
+        // judged by who it is for, like any other seal.
+        let user = Keys::generate();
+        let event = large_sealed_rumor(&user, &[hq_pubkey()]);
+        assert_eq!(validate_minor_sign(&user, &event), Ok(()));
+    }
+
+    #[test]
+    fn large_seal_to_an_unapproved_recipient_is_still_refused() {
+        let user = Keys::generate();
+        let mallory = Keys::generate();
+        let event = large_sealed_rumor(&user, &[hq_pubkey(), mallory.public_key()]);
+        assert_eq!(
+            validate_minor_sign(&user, &event),
+            Err(MinorDmDenied::RecipientNotApproved)
+        );
+    }
+
     #[test]
     fn seal_with_approved_outer_p_tag_is_allowed() {
         // The benign case of the M1 check: an outer `p` tag naming the approved

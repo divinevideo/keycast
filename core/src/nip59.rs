@@ -186,6 +186,43 @@ mod tests {
     }
 
     #[test]
+    fn signs_each_wrap_with_a_fresh_key_that_belongs_to_neither_party() {
+        // A reused or fixed signing key would link every wrap Keycast builds
+        // to one public key. Ids alone differ anyway, so check the signer.
+        let (sender, receiver) = (Keys::generate(), Keys::generate());
+        let rumor = rumor_from(&sender, &receiver.public_key(), "hi");
+        let seal = seal_signed_by(&sender, &receiver.public_key(), &rumor);
+
+        let wraps: Vec<Event> = (0..3)
+            .map(|_| gift_wrap_from_seal(&receiver.public_key(), &seal).unwrap())
+            .collect();
+
+        let signers: std::collections::HashSet<PublicKey> =
+            wraps.iter().map(|wrap| wrap.pubkey).collect();
+        assert_eq!(signers.len(), wraps.len());
+        for wrap in &wraps {
+            assert_ne!(wrap.pubkey, sender.public_key());
+            assert_ne!(wrap.pubkey, receiver.public_key());
+            wrap.verify().unwrap();
+        }
+    }
+
+    #[test]
+    fn addresses_the_wrap_to_the_receiver_and_no_one_else() {
+        let (sender, receiver) = (Keys::generate(), Keys::generate());
+        let rumor = rumor_from(&sender, &receiver.public_key(), "hi");
+        let seal = seal_signed_by(&sender, &receiver.public_key(), &rumor);
+
+        let wrap = gift_wrap_from_seal(&receiver.public_key(), &seal).unwrap();
+
+        assert_eq!(wrap.tags.len(), 1);
+        assert_eq!(
+            wrap.tags.public_keys().collect::<Vec<_>>(),
+            vec![&receiver.public_key()]
+        );
+    }
+
+    #[test]
     fn dates_a_wrap_at_random_instead_of_when_it_was_sent() {
         // NIP-59 randomises the wrap's time, up to two days back, so it does not
         // reveal when the message was sent. Eight wraps all landing within an

@@ -2516,6 +2516,22 @@ mod request_decrypt_tests {
     }
 
     #[test]
+    fn decrypts_a_nip44_request_that_uses_the_extended_length_prefix() {
+        let (client, bunker) = (Keys::generate(), Keys::generate());
+        let padding = "a".repeat(70_000);
+        let plaintext = format!(r#"{{"id":"1","method":"ping","params":["{padding}"]}}"#);
+        let content =
+            keycast_core::nip44::encrypt(client.secret_key(), &bunker.public_key(), &plaintext)
+                .unwrap();
+
+        let (decrypted, used_nip44) =
+            decrypt_nip46_request(bunker.secret_key(), &client.public_key(), &content).unwrap();
+
+        assert_eq!(decrypted.expose_secret(), &plaintext);
+        assert!(used_nip44);
+    }
+
+    #[test]
     fn checks_the_nip44_payload_size_before_decrypting() {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         use std::sync::{Arc, Mutex};

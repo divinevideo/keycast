@@ -1373,6 +1373,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nip17_wrap_reports_encrypt_failed_when_the_message_alone_is_over_the_ceiling() {
+        let handler = create_test_handler(None, None);
+        let receiver = Keys::generate();
+        let rumor = build_rumor(
+            handler.public_key(),
+            receiver.public_key(),
+            &"a".repeat(131_000),
+        );
+
+        let gift_wrap = handler.nip17_wrap(rumor, &receiver.public_key()).await;
+
+        assert!(
+            matches!(gift_wrap, Err(WrapError::EncryptFailed)),
+            "got {gift_wrap:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn nip17_unwrap_rejects_non_gift_wrap() {
         let handler = create_test_handler(None, None);
         let sender = Keys::generate();
