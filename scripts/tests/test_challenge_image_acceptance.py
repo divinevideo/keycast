@@ -1,4 +1,5 @@
 """Pure Docker-boundary contracts: no daemon, credentials or services are used."""
+import ast
 import copy
 import dataclasses
 import hashlib
@@ -1228,6 +1229,26 @@ sys.stdout.write(body)
             self.assertTrue(calls)
             self.assertFalse(any(args[0] == 'create' or args[:2] == ['network', 'create'] for args in calls))
             self.assertFalse((root / 'challenge-public').exists())
+
+    def test_materials_completeness_flags_are_not_dependency_records(self):
+        tree = ast.parse(self.inline_python('spec'))
+        function = next(node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == 'bases')
+        namespace = {'re': re}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), '<workflow-bases>', 'exec'), namespace)
+        bases = namespace['bases']
+        material = {'uri': 'pkg:docker/synthetic@1', 'digest': {'sha256': 'a' * 64}}
+        for complete in (True, False):
+            with self.subTest(complete=complete):
+                provenance = {'materials': [material],
+                    'metadata': {'completeness': {'materials': complete}}}
+                self.assertEqual(bases([{'buildx.build.provenance': provenance}]), [material])
+                self.assertEqual(bases({'metadata': {'completeness': {'materials': complete}}}), [])
+        for invalid in ('not-an-array', {'uri': 'pkg:docker/synthetic@1'}, None, True, False):
+            with self.subTest(invalid=invalid), self.assertRaises(AssertionError):
+                bases({'materials': invalid})
+        with self.assertRaises(AssertionError):
+            bases({'materials': [{'uri': 'pkg:docker/synthetic@1', 'digest': {}}]})
 
     def test_spec_adapter_accepts_provenance_index_metadata_without_single_manifest_config_digest(self):
         code = self.inline_python('spec')

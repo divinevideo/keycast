@@ -181,18 +181,25 @@ jobs:
           descriptor = release_metadata['containerimage.descriptor']
           assert descriptor['digest'] == index_digest
           assert descriptor['mediaType'] == index['mediaType']
-          def bases(value):
+          def bases(value, path=()):
               found = []
               if isinstance(value, dict):
-                  for material in value.get('materials', []):
+                  materials = value.get('materials', [])
+                  # SLSA completeness.materials is a flag, not the dependency list.
+                  if path[-2:] == ('metadata', 'completeness') and 'materials' in value:
+                      assert isinstance(materials, bool)
+                      materials = []
+                  assert isinstance(materials, list)
+                  for material in materials:
+                      assert isinstance(material, dict)
                       if material.get('uri', '').startswith('pkg:docker/'):
                           assert material.get('digest') and all(re.fullmatch('[0-9a-f]{64}', d) for d in material['digest'].values())
                           found.append(material)
-                  for child in value.values():
-                      found.extend(bases(child))
+                  for key, child in value.items():
+                      found.extend(bases(child, (*path, key)))
               elif isinstance(value, list):
                   for child in value:
-                      found.extend(bases(child))
+                      found.extend(bases(child, path))
               return found
           release_bases, client_bases = bases([release_metadata, provenance]), bases(client_metadata)
           assert release_bases and client_bases
