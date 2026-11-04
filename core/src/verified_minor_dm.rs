@@ -237,7 +237,7 @@ fn validate_p_tag_recipients(user_pubkey: &PublicKey, tags: &[Tag]) -> Result<()
 /// would become relay-routable metadata, so they must be approved too (a
 /// near-free defense-in-depth check; content stays bound by decryption). The
 /// crypto here (≤3 ECDH + HKDF + a bounded NIP-44 decrypt) runs inline: it is
-/// sub-millisecond and bounded, unlike the unwrap-batch path that fans out.
+/// bounded and cheap, unlike the unwrap-batch path that fans out.
 fn validate_seal(user_keys: &Keys, event: &UnsignedEvent) -> Result<(), MinorDmDenied> {
     let user_pubkey = user_keys.public_key();
     validate_p_tags_approved(&user_pubkey, event.tags.as_slice())?;
@@ -712,6 +712,38 @@ mod tests {
         let event = EventBuilder::new(Kind::from(13u16), content)
             .tags([Tag::public_key(mallory.public_key())])
             .build(user.public_key());
+        assert_eq!(
+            validate_minor_sign(&user, &event),
+            Err(MinorDmDenied::RecipientNotApproved)
+        );
+    }
+
+    /// A rumor over 65,408 bytes, so its seal needs the extended NIP-44 length
+    /// prefix, addressed to `recipients` and encrypted to the approved key.
+    fn large_sealed_rumor(user: &Keys, recipients: &[PublicKey]) -> UnsignedEvent {
+        let mut rumor: serde_json::Value =
+            serde_json::from_str(&rumor_json(user, recipients)).unwrap();
+        rumor["content"] = json!("a".repeat(70_000));
+        let content =
+            crate::nip44::encrypt(user.secret_key(), &hq_pubkey(), &rumor.to_string()).unwrap();
+        EventBuilder::new(Kind::from(13u16), content).build(user.public_key())
+    }
+
+    #[test]
+    fn large_seal_to_an_approved_recipient_is_judged_by_its_recipients() {
+        // Before the extended prefix could be read, a seal this large could not be
+        // decrypted at all and was refused as `SealNotDecryptable`. It is now
+        // judged by who it is for, like any other seal.
+        let user = Keys::generate();
+        let event = large_sealed_rumor(&user, &[hq_pubkey()]);
+        assert_eq!(validate_minor_sign(&user, &event), Ok(()));
+    }
+
+    #[test]
+    fn large_seal_to_an_unapproved_recipient_is_still_refused() {
+        let user = Keys::generate();
+        let mallory = Keys::generate();
+        let event = large_sealed_rumor(&user, &[hq_pubkey(), mallory.public_key()]);
         assert_eq!(
             validate_minor_sign(&user, &event),
             Err(MinorDmDenied::RecipientNotApproved)

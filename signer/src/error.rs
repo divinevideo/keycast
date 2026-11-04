@@ -38,7 +38,7 @@ pub enum SignerError {
 
     /// NIP-44 encryption/decryption failed
     #[error("NIP-44 error: {0}")]
-    Nip44(#[from] nip44::Error),
+    Nip44(#[from] keycast_core::nip44::Nip44Error),
 
     /// Event signing failed
     #[error("Signing error: {0}")]

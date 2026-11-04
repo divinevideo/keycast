@@ -14,6 +14,7 @@ pub mod login_attempts;
 pub mod metrics;
 pub mod nip04;
 pub mod nip44;
+pub mod nip59;
 pub mod oauth_scopes;
 pub mod panic_scope;
 pub mod repositories;

@@ -247,8 +247,11 @@ impl Nip46Handler {
             let text = response_str;
             tokio::task::spawn_blocking(move || {
                 if use_nip44 {
+                    // A response goes to a client whose NIP-44 support is unknown, and a u16-only
+                    // library cannot read the extended length prefix, so it would never answer.
+                    // Keep envelopes on the two-byte prefix: too large a response fails instead.
                     nip44::encrypt(&secret, &pubkey, &text, nip44::Version::V2)
-                        .map_err(SignerError::from)
+                        .map_err(|e| SignerError::Nip44(e.into()))
                 } else {
                     nip04::encrypt(&secret, &pubkey, &text).map_err(SignerError::from)
                 }
@@ -347,7 +350,7 @@ impl Nip46Handler {
                     let pubkey = third_party_pubkey;
                     let text = plaintext.to_string();
                     tokio::task::spawn_blocking(move || {
-                        nip44::encrypt(&secret, &pubkey, &text, nip44::Version::V2)
+                        keycast_core::nip44::encrypt(&secret, &pubkey, &text)
                     })
                     .await
                     .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
@@ -2166,8 +2169,11 @@ impl UnifiedSigner {
                 let use_44 = use_nip44;
                 tokio::task::spawn_blocking(move || {
                     if use_44 {
+                        // A response goes to a client whose NIP-44 support is unknown, and a u16-only
+                        // library cannot read the extended length prefix, so it would never answer.
+                        // Keep envelopes on the two-byte prefix: too large a response fails instead.
                         nip44::encrypt(&secret, &pubkey, &text, nip44::Version::V2)
-                            .map_err(SignerError::from)
+                            .map_err(|e| SignerError::Nip44(e.into()))
                     } else {
                         nip04::encrypt(&secret, &pubkey, &text).map_err(SignerError::from)
                     }
@@ -2507,6 +2513,22 @@ mod request_decrypt_tests {
             assert!(plaintext.expose_secret().contains("ping"));
             assert_eq!(used_nip44, nip44);
         }
+    }
+
+    #[test]
+    fn decrypts_a_nip44_request_that_uses_the_extended_length_prefix() {
+        let (client, bunker) = (Keys::generate(), Keys::generate());
+        let padding = "a".repeat(70_000);
+        let plaintext = format!(r#"{{"id":"1","method":"ping","params":["{padding}"]}}"#);
+        let content =
+            keycast_core::nip44::encrypt(client.secret_key(), &bunker.public_key(), &plaintext)
+                .unwrap();
+
+        let (decrypted, used_nip44) =
+            decrypt_nip46_request(bunker.secret_key(), &client.public_key(), &content).unwrap();
+
+        assert_eq!(decrypted.expose_secret(), &plaintext);
+        assert!(used_nip44);
     }
 
     #[test]
