@@ -244,6 +244,55 @@ async fn absent_account_is_reported_as_success() {
 }
 
 #[tokio::test]
+async fn deleting_an_absent_account_removes_its_og_diviner_grant() {
+    common::assert_test_database_url();
+    setup_env();
+    let pool = common::setup_test_db().await;
+    // Most OG Diviner grantees never had a Keycast account. The coordinator
+    // still calls this endpoint when one of them deletes their account in the
+    // Divine app, and the grant must not outlive that request.
+    let pubkey = Keys::generate().public_key().to_hex();
+    sqlx::query(
+        "INSERT INTO og_diviner_grants (tenant_id, pubkey, evidence)
+         VALUES ($1, $2, 'pre_cutoff_app_post')",
+    )
+    .bind(TENANT_ID)
+    .bind(&pubkey)
+    .execute(&pool)
+    .await
+    .expect("insert grant");
+    let request_id = format!("req-og-grant-{pubkey}");
+
+    let resp = build_app(pool.clone())
+        .oneshot(deletion_request(
+            &pubkey,
+            &request_id,
+            Some(DELETION_SERVICE_TOKEN),
+        ))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = body_json(resp).await;
+    let grants: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM og_diviner_grants WHERE tenant_id = $1 AND pubkey = $2",
+    )
+    .bind(TENANT_ID)
+    .bind(&pubkey)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM og_diviner_grants WHERE pubkey = $1")
+        .bind(&pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["outcome"], "already_absent");
+    assert_eq!(grants, 0, "the committed deletion removed the grant");
+}
+
+#[tokio::test]
 async fn replaying_a_request_id_returns_the_first_outcome_without_deleting_again() {
     common::assert_test_database_url();
     setup_env();

@@ -1,9 +1,9 @@
 #![cfg(feature = "integration-tests")]
 
 // ABOUTME: Verifies OG Diviner eligibility uses the frozen signup policy.
-// ABOUTME: Guards the cutoff and excludes preloaded-but-unclaimed accounts.
+// ABOUTME: Guards the cutoff, preload exclusions, and tenant-scoped roster grants.
 
-use keycast_core::repositories::{og_diviner_cutoff, UserRepository};
+use keycast_core::repositories::{og_diviner_cutoff, AccountDeletionOutcome, UserRepository};
 use serial_test::serial;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -397,5 +397,254 @@ async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
     assert!(
         banned_claimed_early_eligible,
         "a ban does not rewrite historical cohort membership"
+    );
+}
+
+/// Grant fixtures use their own prefix so they never share a key with the
+/// signup fixtures above.
+fn granted_pubkey(seed: char) -> String {
+    format!("06d2{}", std::iter::repeat_n(seed, 60).collect::<String>())
+}
+
+/// A second tenant, so a grant can be shown not to cross tenants. Created on
+/// demand because the test database seeds only tenant 1.
+async fn second_tenant(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO tenants (domain, name) VALUES ('og-diviner-grants.example.invalid', 'OG grants test')
+         ON CONFLICT (domain) DO UPDATE SET name = EXCLUDED.name
+         RETURNING id",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn grant(pool: &PgPool, tenant_id: i64, key: &str) {
+    sqlx::query(
+        "INSERT INTO og_diviner_grants (tenant_id, pubkey, evidence)
+         VALUES ($1, $2, 'pre_cutoff_app_post')",
+    )
+    .bind(tenant_id)
+    .bind(key)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn purge_grants(pool: &PgPool, tenant_ids: &[i64], keys: &[&str]) {
+    for tenant_id in tenant_ids {
+        for key in keys {
+            sqlx::query("DELETE FROM og_diviner_grants WHERE pubkey = $1 AND tenant_id = $2")
+                .bind(key)
+                .bind(tenant_id)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn granted_app_posters_qualify_without_a_signup_record_and_only_in_their_tenant() {
+    let pool = pool().await;
+    let repository = UserRepository::new(pool.clone());
+    let cutoff = og_diviner_cutoff();
+    let other_tenant = second_tenant(&pool).await;
+
+    // Most of this cohort brought their own key and has no Keycast account.
+    let granted_no_account = granted_pubkey('1');
+    // Someone who posted before the cutoff and imported the key afterwards:
+    // their users row fails the signup rule, so only the grant qualifies them.
+    let granted_late_account = granted_pubkey('2');
+    let ungranted_no_account = granted_pubkey('3');
+    let granted_in_other_tenant_only = granted_pubkey('4');
+    let keys = [
+        granted_no_account.as_str(),
+        granted_late_account.as_str(),
+        ungranted_no_account.as_str(),
+        granted_in_other_tenant_only.as_str(),
+    ];
+
+    purge_grants(&pool, &[TENANT_ID, other_tenant], &keys).await;
+    purge(&pool, &keys).await;
+
+    sqlx::query(
+        "INSERT INTO users
+         (pubkey, tenant_id, email, email_verified, password_hash, created_at, updated_at)
+         VALUES ($1, 1, 'granted-late@example.invalid', TRUE, 'hash', $2, $2)",
+    )
+    .bind(&granted_late_account)
+    .bind(cutoff)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let late_account_before_grant = repository
+        .is_og_diviner(&granted_late_account, TENANT_ID, cutoff)
+        .await
+        .unwrap();
+
+    grant(&pool, TENANT_ID, &granted_no_account).await;
+    grant(&pool, TENANT_ID, &granted_late_account).await;
+    grant(&pool, other_tenant, &granted_in_other_tenant_only).await;
+
+    let mut observed = Vec::new();
+    for key in keys {
+        observed.push(
+            repository
+                .is_og_diviner(key, TENANT_ID, cutoff)
+                .await
+                .unwrap(),
+        );
+    }
+    let tenant_one_grant_seen_from_other_tenant = repository
+        .is_og_diviner(&granted_no_account, other_tenant, cutoff)
+        .await
+        .unwrap();
+    let other_tenant_grant_seen_from_its_own_tenant = repository
+        .is_og_diviner(&granted_in_other_tenant_only, other_tenant, cutoff)
+        .await
+        .unwrap();
+
+    // Teardown before the assertions, as above.
+    purge_grants(&pool, &[TENANT_ID, other_tenant], &keys).await;
+    purge(&pool, &keys).await;
+    sqlx::query("DELETE FROM tenants WHERE id = $1")
+        .bind(other_tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let [granted_no_account_eligible, granted_late_account_eligible, ungranted_no_account_eligible, granted_in_other_tenant_only_eligible] =
+        observed[..]
+    else {
+        panic!("expected one observation per fixture");
+    };
+
+    assert!(
+        !late_account_before_grant,
+        "precondition: a signup exactly at the cutoff does not qualify on its own"
+    );
+    assert!(
+        granted_no_account_eligible,
+        "a granted pubkey with no Keycast account qualifies"
+    );
+    assert!(
+        granted_late_account_eligible,
+        "a grant qualifies an account the signup rule rejects"
+    );
+    assert!(
+        !ungranted_no_account_eligible,
+        "a pubkey with neither a grant nor a signup record does not qualify"
+    );
+    assert!(
+        !granted_in_other_tenant_only_eligible,
+        "a grant in another tenant does not qualify the pubkey here"
+    );
+    assert!(
+        !tenant_one_grant_seen_from_other_tenant,
+        "a grant in tenant 1 does not qualify the pubkey in another tenant"
+    );
+    assert!(
+        other_tenant_grant_seen_from_its_own_tenant,
+        "positive control: the other tenant's grant does qualify in that tenant"
+    );
+}
+
+async fn grant_count(pool: &PgPool, tenant_id: i64, key: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM og_diviner_grants WHERE tenant_id = $1 AND pubkey = $2",
+    )
+    .bind(tenant_id)
+    .bind(key)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+#[serial]
+async fn account_deletion_removes_the_grant_in_its_tenant_only() {
+    let pool = pool().await;
+    let repository = UserRepository::new(pool.clone());
+    let cutoff = og_diviner_cutoff();
+    let other_tenant = second_tenant(&pool).await;
+
+    let with_account = granted_pubkey('5');
+    // The common case: a grantee Keycast never held an account for, deleted on
+    // the coordinator's request after they deleted their account in the app.
+    let without_account = granted_pubkey('6');
+    let keys = [with_account.as_str(), without_account.as_str()];
+
+    purge_grants(&pool, &[TENANT_ID, other_tenant], &keys).await;
+    purge(&pool, &keys).await;
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
+         VALUES ($1, 1, $2, $2)",
+    )
+    .bind(&with_account)
+    .bind(cutoff)
+    .execute(&pool)
+    .await
+    .unwrap();
+    for key in keys {
+        grant(&pool, TENANT_ID, key).await;
+        grant(&pool, other_tenant, key).await;
+    }
+
+    let deleted = repository.delete_account(&with_account, TENANT_ID).await;
+
+    let mut tx = pool.begin().await.unwrap();
+    let absent = UserRepository::delete_account_in_tx(&mut tx, &without_account, TENANT_ID).await;
+    tx.commit().await.unwrap();
+
+    let with_account_eligible = repository
+        .is_og_diviner(&with_account, TENANT_ID, cutoff)
+        .await
+        .unwrap();
+    let without_account_eligible = repository
+        .is_og_diviner(&without_account, TENANT_ID, cutoff)
+        .await
+        .unwrap();
+    let with_account_grants = grant_count(&pool, TENANT_ID, &with_account).await;
+    let without_account_grants = grant_count(&pool, TENANT_ID, &without_account).await;
+    let other_tenant_grants = [
+        grant_count(&pool, other_tenant, &with_account).await,
+        grant_count(&pool, other_tenant, &without_account).await,
+    ];
+
+    purge_grants(&pool, &[TENANT_ID, other_tenant], &keys).await;
+    purge(&pool, &keys).await;
+    sqlx::query("DELETE FROM tenants WHERE id = $1")
+        .bind(other_tenant)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    deleted.expect("the account existed, so deletion succeeds");
+    assert!(
+        matches!(absent, Ok(AccountDeletionOutcome::AlreadyAbsent)),
+        "a grantee with no account is reported absent: {:?}",
+        absent.as_ref().err()
+    );
+    assert_eq!(
+        with_account_grants, 0,
+        "deleting the account removes its grant"
+    );
+    assert!(
+        !with_account_eligible,
+        "a deleted account is no longer eligible"
+    );
+    assert_eq!(
+        without_account_grants, 0,
+        "the grant goes even when there was no account to delete"
+    );
+    assert!(!without_account_eligible);
+    assert_eq!(
+        other_tenant_grants,
+        [1, 1],
+        "the same pubkey's grant in another tenant survives"
     );
 }

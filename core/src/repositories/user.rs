@@ -569,6 +569,14 @@ impl UserRepository {
     /// whose disagreement is silent: it returns a wrong boolean rather than an
     /// error. If what "claimed" means ever changes, this predicate has
     /// to be revisited with the other three.
+    ///
+    /// A pubkey in `og_diviner_grants` also qualifies, whether or not it has a
+    /// users row. Those grants cover people who posted through a Divine app
+    /// before the cutoff with a key Keycast never saw (keycast#440), so most
+    /// have no account. The grant lookup therefore sits beside the users
+    /// lookup rather than inside it, where it could never match them. A grant
+    /// was already judged against the cutoff when its roster was built, so
+    /// `cutoff` does not apply to it.
     pub async fn is_og_diviner(
         &self,
         pubkey: &str,
@@ -577,6 +585,11 @@ impl UserRepository {
     ) -> Result<bool, RepositoryError> {
         sqlx::query_scalar(
             "SELECT EXISTS (
+                SELECT 1
+                FROM og_diviner_grants g
+                WHERE g.pubkey = $1
+                  AND g.tenant_id = $2
+            ) OR EXISTS (
                 SELECT 1
                 FROM users u
                 LEFT JOIN LATERAL (
@@ -3204,6 +3217,8 @@ impl UserRepository {
     /// Delete a user account and all associated data.
     ///
     /// This performs a complete account deletion:
+    /// 0. Removes the pubkey's OG Diviner grant in this tenant
+    ///    (og_diviner_grants)
     /// 1. Removes user from all teams (team_users)
     /// 2. Clears pending OAuth codes
     /// 3. Deletes AP RSA key material (ap_actor_keys)
@@ -3212,10 +3227,12 @@ impl UserRepository {
     ///
     /// Returns information about what was deleted for logging.
     ///
-    /// Returns [`RepositoryError::NotFound`] when no such account exists. A
-    /// caller that needs to treat an absent account as success should use
-    /// [`Self::delete_account_in_tx`], which reports it as
-    /// [`AccountDeletionOutcome::AlreadyAbsent`] rather than as an error.
+    /// Returns [`RepositoryError::NotFound`] when no such account exists, and
+    /// then commits nothing: the grant removal rolls back with the rest. A
+    /// caller that needs to treat an absent account as success, and still
+    /// remove the grant, should use [`Self::delete_account_in_tx`], which
+    /// reports it as [`AccountDeletionOutcome::AlreadyAbsent`] rather than as
+    /// an error.
     pub async fn delete_account(
         &self,
         pubkey: &str,
@@ -3243,8 +3260,11 @@ impl UserRepository {
     ///
     /// Reports an absent account as [`AccountDeletionOutcome::AlreadyAbsent`]
     /// instead of erroring, so the caller can still commit work in the same
-    /// transaction. An error here aborts the transaction and cannot be
-    /// distinguished from any other failure by the caller.
+    /// transaction. The pubkey's OG Diviner grant in this tenant is removed
+    /// even then, and a caller that commits keeps that removal, as service
+    /// deletion does when it records `already_absent`. An error here aborts
+    /// the transaction and cannot be distinguished from any other failure by
+    /// the caller.
     pub async fn delete_account_in_tx(
         tx: &mut Transaction<'_, Postgres>,
         pubkey: &str,
@@ -3256,6 +3276,23 @@ impl UserRepository {
         let _: Vec<i32> = sqlx::query_scalar(
             "SELECT g.id FROM identity_groups g JOIN group_memberships m ON m.group_id=g.id AND m.tenant_id=g.tenant_id WHERE m.tenant_id=$1 AND m.admin_pubkey=$2 ORDER BY g.id FOR UPDATE OF g",
         ).bind(tenant_id).bind(pubkey).fetch_all(&mut **tx).await?;
+
+        // Remove any OG Diviner grant before the ownership check, not after it.
+        // The account-deletion coordinator calls service deletion for every
+        // account deleted in the Divine app, including people who manage their
+        // own key and never had a Keycast account. Most grantees are those
+        // people (keycast#440), so for them this path returns AlreadyAbsent and
+        // the caller still commits; a delete placed after the check would never
+        // run for them. The delete is scoped to this tenant, so the
+        // cross-tenant risk the ownership check guards against does not apply.
+        // Self-deletion (DELETE /api/user/account) also lands here but writes
+        // no deletion record, so a later roster load can only skip that pubkey
+        // if the roster builder dropped it (see docs/DEPLOYMENT.md).
+        sqlx::query("DELETE FROM og_diviner_grants WHERE tenant_id = $1 AND pubkey = $2")
+            .bind(tenant_id)
+            .bind(pubkey)
+            .execute(&mut **tx)
+            .await?;
 
         // Confirm the account exists in this tenant before deleting anything.
         // Several of the deletes below are keyed on user_pubkey alone, so
@@ -3465,7 +3502,8 @@ pub struct DeleteAccountResult {
 pub enum AccountDeletionOutcome {
     /// The account existed in this tenant and every owned row was removed.
     Deleted(DeleteAccountResult),
-    /// No such account in this tenant. Nothing was changed.
+    /// No such account in this tenant. Nothing was changed except removing the
+    /// pubkey's OG Diviner grant in this tenant, if it had one.
     AlreadyAbsent,
 }
 

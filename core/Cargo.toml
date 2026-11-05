@@ -8,6 +8,12 @@ edition = "2021"
 integration-tests = []
 aws = ["dep:aws-sdk-kms", "dep:aws-config"]
 
+# Examples are not tested by default. This one is an operator tool that runs
+# against production data, so its argument parsing is tested like library code.
+[[example]]
+name = "load-og-diviner-grants"
+test = true
+
 [dependencies]
 frost-secp256k1-tr = "=2.2.0"
 aes-gcm = "0.10"

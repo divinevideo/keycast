@@ -155,3 +155,32 @@ async fn does_not_leak_one_tenant_s_answer_to_another() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn reports_true_for_a_granted_pubkey_with_no_account() {
+    let pool = common::setup_test_db().await;
+    let pubkey = Keys::generate().public_key().to_hex();
+    sqlx::query(
+        "INSERT INTO og_diviner_grants (tenant_id, pubkey, evidence)
+         VALUES (1, $1, 'pre_cutoff_app_post')",
+    )
+    .bind(&pubkey)
+    .execute(&pool)
+    .await
+    .expect("insert grant");
+
+    let response = call(1, pool.clone(), &pubkey).await;
+
+    sqlx::query("DELETE FROM og_diviner_grants WHERE pubkey = $1 AND tenant_id = 1")
+        .bind(&pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(response).await["eligible"],
+        true,
+        "a pubkey granted from the app-poster roster is eligible without signing up"
+    );
+}
