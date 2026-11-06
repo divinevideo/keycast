@@ -13,6 +13,7 @@ use base64::Engine;
 use chrono::{Duration, Utc};
 use keycast_core::bcrypt_admission::{BcryptAdmissionError, BcryptOperation, BcryptWorkload};
 use keycast_core::metrics::METRICS;
+use keycast_core::password_policy::{validate_new_password, PasswordPolicyError};
 use keycast_core::repositories::{
     CreateOAuthAuthorizationParams, OAuthAuthorizationRepository, OAuthCodeData,
     OAuthCodeRepository, PersonalKeysRepository, PolicyRepository, RefreshTokenRepository,
@@ -401,6 +402,7 @@ pub struct TokenResponse {
 
 #[derive(Debug)]
 pub enum OAuthError {
+    WeakPassword(PasswordPolicyError),
     Unauthorized,
     InvalidEmail,
     InvalidRequest(String),
@@ -421,9 +423,10 @@ impl OAuthError {
     fn status_code(&self) -> StatusCode {
         match self {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
-            Self::InvalidEmail | Self::InvalidRequest(_) | Self::InvalidGrant(_) => {
-                StatusCode::BAD_REQUEST
-            }
+            Self::WeakPassword(_)
+            | Self::InvalidEmail
+            | Self::InvalidRequest(_)
+            | Self::InvalidGrant(_) => StatusCode::BAD_REQUEST,
             Self::Database(_) | Self::Encryption(_) | Self::ServiceUnavailable => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
@@ -436,6 +439,13 @@ impl OAuthError {
 impl IntoResponse for OAuthError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
+            OAuthError::WeakPassword(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": error.message(), "code": error.code()})),
+                )
+                    .into_response();
+            }
             OAuthError::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 "Invalid email or password. Please check your credentials and try again."
@@ -3990,6 +4000,7 @@ pub async fn oauth_register(
     let tenant_id = tenant.0.id;
 
     req.email = normalize_registration_email(&req.email).map_err(|_| OAuthError::InvalidEmail)?;
+    validate_new_password(&req.password).map_err(OAuthError::WeakPassword)?;
 
     tracing::info!(
         "OAuth popup registration for email: {} in tenant: {}, nsec: {}, pubkey: {}, client_id: {}",

@@ -129,6 +129,8 @@ pub async fn headless_register(
 
     req.email =
         normalize_registration_email(&req.email).map_err(|_| HeadlessError::InvalidEmail)?;
+    keycast_core::password_policy::validate_new_password(&req.password)
+        .map_err(HeadlessError::WeakPassword)?;
 
     tracing::info!(
         event = "headless_registration_attempt",
@@ -1450,6 +1452,7 @@ pub async fn headless_resend_pin(
 
 #[derive(Debug)]
 pub enum HeadlessError {
+    WeakPassword(keycast_core::password_policy::PasswordPolicyError),
     Unauthorized,
     EmailNotVerified,
     InvalidEmail,
@@ -1484,6 +1487,11 @@ pub enum HeadlessError {
 impl IntoResponse for HeadlessError {
     fn into_response(self) -> Response {
         let (status, message, code) = match self {
+            HeadlessError::WeakPassword(error) => (
+                StatusCode::BAD_REQUEST,
+                error.message().to_string(),
+                error.code(),
+            ),
             HeadlessError::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 "Invalid email or password".to_string(),
