@@ -11,6 +11,12 @@ fn rejects_short_and_common_new_passwords() {
         " PASSWORD123 ",
         "12345678",
         "qwerty123",
+        "abcd1234",
+        "aaaaaaaa",
+        "12341234",
+        "passw0rd",
+        "qwerty12",
+        "password!",
         "        ",
         "  short  ",
     ] {

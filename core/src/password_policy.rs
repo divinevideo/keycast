@@ -43,6 +43,12 @@ const COMMON_PASSWORDS: &[&str] = &[
     "abc12345",
     "1q2w3e4r",
     "1qaz2wsx",
+    "abcd1234",
+    "aaaaaaaa",
+    "12341234",
+    "passw0rd",
+    "qwerty12",
+    "password!",
 ];
 
 /// Validate a new password without changing the value that will be hashed.
