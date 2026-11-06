@@ -30,6 +30,7 @@ use keycast_core::bcrypt_admission::{
     BcryptAdmission, BcryptAdmissionError, BcryptOperation, BcryptPermit, BcryptWorkload,
 };
 use keycast_core::metrics::METRICS;
+use keycast_core::password_policy::{validate_new_password, PasswordPolicyError};
 use keycast_core::repositories::{
     AccountStatusWithMinorRow, AuthEventRepository, CreateOAuthAuthorizationParams,
     MaterializePendingRegistrationOutcome, OAuthAuthorizationRepository, OAuthCodeData,
@@ -509,6 +510,7 @@ pub enum AuthError {
     Database(sqlx::Error),
     PasswordHash(bcrypt::BcryptError),
     InvalidCredentials,
+    WeakPassword(PasswordPolicyError),
     EmailAlreadyExists,
     EmailNotVerified,
     UserNotFound,
@@ -576,6 +578,9 @@ fn coded_error_response(status: StatusCode, message: &str, code: &str) -> Respon
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
+            AuthError::WeakPassword(error) => {
+                return coded_error_response(StatusCode::BAD_REQUEST, error.message(), error.code());
+            }
             AuthError::Database(e)
                 if has_database_constraint(&e, USERS_EMAIL_TENANT_CONSTRAINT) =>
             {
@@ -1139,6 +1144,7 @@ pub async fn register(
     let tenant_id = tenant.0.id;
 
     req.email = normalize_registration_email(&req.email).map_err(|_| AuthError::InvalidEmail)?;
+    validate_new_password(&req.password).map_err(AuthError::WeakPassword)?;
 
     let instance_id = keycast_core::instance::instance_id();
 
@@ -3165,6 +3171,7 @@ pub async fn reset_password(
     let pool = &auth_state.state.db;
     let bcrypt = &auth_state.state.bcrypt;
     let endpoint = "/api/auth/reset-password";
+    validate_new_password(&req.new_password).map_err(AuthError::WeakPassword)?;
     tracing::info!(tenant_id, "Password reset attempt received");
 
     // Find user with this reset token in this tenant
@@ -4470,12 +4477,7 @@ pub async fn change_password(
     let tenant_id = tenant.0.id;
     let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
 
-    // Validate new password length
-    if req.new_password.len() < 8 {
-        return Err(AuthError::BadRequest(
-            "New password must be at least 8 characters".to_string(),
-        ));
-    }
+    validate_new_password(&req.new_password).map_err(AuthError::WeakPassword)?;
 
     // Get user's current password hash
     let user_repo = UserRepository::new(pool.clone());

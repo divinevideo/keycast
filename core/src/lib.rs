@@ -17,6 +17,7 @@ pub mod nip44;
 pub mod nip59;
 pub mod oauth_scopes;
 pub mod panic_scope;
+pub mod password_policy;
 pub mod repositories;
 pub mod request_bounds;
 pub mod retention;
