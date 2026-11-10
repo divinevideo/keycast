@@ -414,9 +414,10 @@ rather than silently omitting the reader's privilege boundary. In GKE that
 failure stops the migration hook before the Deployment rolls; in Cloud Run it
 stops the migration job before the serving rollout.
 
-An existing `support_reader` must have no login, elevated role attributes, role
-memberships, ownership or table-level grants. The migration preserves an existing
-role; it does not repair broader privileges. It grants schema usage and explicit
+An existing `support_reader` must have no login, elevated role attributes,
+ownership or table-level grants, and must not itself be a member of any other
+role. A support login may be a member of `support_reader`. The migration preserves
+an existing role; it does not repair broader privileges. It grants schema usage and explicit
 column reads, excludes the classified secret columns, and revokes schema creation
 from `PUBLIC`. New columns remain unreadable until explicitly classified by a
 later migration; the integration test enforces that classification.
