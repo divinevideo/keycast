@@ -5,7 +5,6 @@ import path from "node:path";
 import { Client } from "pg";
 import type { APIRequestContext } from "@playwright/test";
 import { generatePKCE } from "./oauth";
-import { getDeliveredToken } from "./emails";
 
 const DATABASE_URL = "postgres://postgres:acceptance@localhost:5432/keycast_image_acceptance";
 const BASE_URL = "http://localhost:3000";
@@ -202,6 +201,7 @@ const policyQuery = `SELECT p.id AS policy_id, p.slug, p.team_id, p.display_name
   LEFT JOIN permissions pm ON pm.id = pp.permission_id
   WHERE p.id = $1 AND p.slug = $2 ORDER BY pp.id`;
 const userQuery = `SELECT u.pubkey, u.tenant_id, u.email_verified,
+  (u.password_hash IS NOT NULL AND length(u.password_hash) > 0) AS has_password_hash,
   EXISTS(SELECT 1 FROM personal_keys pk WHERE pk.user_pubkey = u.pubkey
     AND pk.tenant_id = u.tenant_id AND octet_length(pk.encrypted_secret_key) > 32) AS has_encrypted_key
   FROM users u JOIN tenants t ON t.id = u.tenant_id
@@ -299,48 +299,51 @@ export function createFixtureHelpers(io: FixtureIO) {
   async function registerSyntheticUser(request: APIRequestContext, c: FixtureConfig): Promise<SessionFixture> {
     await assertOwnedFixture(c);
     const email = `image-${c.nonce}${randomBytes(8).toString("hex")}@example.test`;
-    const { body: registered } = await jsonRequest(request, "post", "/api/auth/register", { email, password: randomBytes(32).toString("base64url") });
+    const password = randomBytes(32).toString("base64url");
+    const { body: registered } = await jsonRequest(request, "post", "/api/auth/register", { email, password });
     requireFixture(registered.success === true && registered.verification_required === true && HEX64.test(registered.pubkey), "registration");
-    let token: string | undefined;
     let tenantId: number | undefined;
     for (let attempt = 0; attempt < 10; attempt++) {
       const user = await ownedDb(c, async db => (await db.query(userQuery, [email, "localhost"])).rows);
       requireFixture(user.length <= 1, "registration_binding");
       if (user.length === 1) {
-        requireFixture(user[0].pubkey === registered.pubkey && Number.isSafeInteger(Number(user[0].tenant_id)) && user[0].has_encrypted_key === true, "registration_binding");
-        tenantId = Number(user[0].tenant_id);
-        break;
+        requireFixture(user[0].pubkey === registered.pubkey && Number.isSafeInteger(Number(user[0].tenant_id)) && Number(user[0].tenant_id) > 0, "registration_binding");
+        if (user[0].has_encrypted_key === true && user[0].has_password_hash === true) {
+          tenantId = Number(user[0].tenant_id);
+          break;
+        }
       }
       await io.pause(300);
     }
     requireFixture(tenantId, "registration_timeout");
-    try {
-      token = await getDeliveredToken(request, {
-        email, pathname: "/verify-email", baseUrl: BASE_URL, pause: io.pause,
-        beforeRead: () => assertOwnedFixture(c),
-      });
-    } catch (error) {
-      if (error instanceof Error && /^challenge_image:[a-z_]+$/.test(error.message)) throw error;
-      throw new Error(error instanceof Error && error.message === "email_delivery_token_timeout"
-        ? "challenge_image:verification_token_timeout" : "challenge_image:email_inbox");
-    }
-    let cookie: string | undefined;
-    for (let attempt = 0; attempt < 10; attempt++) {
-      await assertOwnedFixture(c);
-      const verified = await jsonRequest(request, "post", "/api/auth/verify-email", { token });
-      if (verified.body.status === "processing") { await io.pause(500); continue; }
-      requireFixture(verified.body.success === true && verified.body.authenticated === true, "verification");
-      cookie = verified.headers["set-cookie"]?.match(/(?:^|,\s*)keycast_session=([^;\s,]+)/)?.[1];
-      requireFixture(cookie, "session_cookie");
-      break;
-    }
-    requireFixture(cookie, "verification_timeout");
+    // Immutable-image acceptance does not test email delivery. Only this newly registered,
+    // nonce-bound synthetic row may be marked verified inside the owned acceptance database.
+    await ownedDb(c, db => transaction(db, async () => {
+      const user = (await db.query(userQuery + " FOR UPDATE OF u", [email, "localhost"])).rows;
+      requireFixture(user.length === 1 && user[0].pubkey === registered.pubkey && Number(user[0].tenant_id) === tenantId
+        && user[0].email_verified === false && user[0].has_encrypted_key === true && user[0].has_password_hash === true, "verification_fixture_binding");
+      const verified = await db.query(`UPDATE users u SET email_verified = true, updated_at = NOW()
+        WHERE u.pubkey = $1 AND u.email = $2 AND u.tenant_id = $3 AND NOT u.email_verified
+          AND u.password_hash IS NOT NULL AND length(u.password_hash) > 0
+          AND EXISTS(SELECT 1 FROM tenants t WHERE t.id = u.tenant_id AND t.domain = $4)
+          AND EXISTS(SELECT 1 FROM personal_keys pk WHERE pk.user_pubkey = u.pubkey
+            AND pk.tenant_id = u.tenant_id AND octet_length(pk.encrypted_secret_key) > 32)
+        RETURNING u.pubkey, u.tenant_id`, [registered.pubkey, email, tenantId, "localhost"]);
+      requireFixture(verified.rowCount === 1 && verified.rows.length === 1 && verified.rows[0].pubkey === registered.pubkey
+        && Number(verified.rows[0].tenant_id) === tenantId, "verification_fixture_update");
+    }));
+    await assertOwnedFixture(c);
+    const loggedIn = await jsonRequest(request, "post", "/api/auth/login", { email, password });
+    requireFixture(loggedIn.body.success === true && loggedIn.body.pubkey === registered.pubkey
+      && loggedIn.body.verification_required !== true, "login_binding");
+    const cookie = loggedIn.headers["set-cookie"]?.match(/(?:^|,\s*)keycast_session=([^;\s,]+)/)?.[1];
+    requireFixture(cookie, "session_cookie");
     // Minimal team fixture, following TeamRepository::create_with_admin. No
     // global admin, user/key insertion, default policy, or allowlist change.
     const teamId = await ownedDb(c, async db => transaction(db, async () => {
       const user = (await db.query(userQuery, [email, "localhost"])).rows;
       requireFixture(user.length === 1 && user[0].pubkey === registered.pubkey && Number(user[0].tenant_id) === tenantId
-        && user[0].email_verified === true && user[0].has_encrypted_key === true, "verified_user_binding");
+        && user[0].email_verified === true && user[0].has_encrypted_key === true && user[0].has_password_hash === true, "verified_user_binding");
       const team = await db.query("INSERT INTO teams (tenant_id, name) VALUES ($1, $2) RETURNING id", [tenantId, `Synthetic acceptance ${randomBytes(12).toString("hex")}`]);
       requireFixture(team.rows.length === 1 && Number.isSafeInteger(team.rows[0].id), "team_insert");
       await db.query("INSERT INTO team_users (team_id, user_pubkey, role) VALUES ($1, $2, 'admin') RETURNING id", [team.rows[0].id, registered.pubkey]);
