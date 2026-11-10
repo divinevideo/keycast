@@ -364,10 +364,8 @@ pub async fn claim_post(
         return Err(ClaimError::PasswordMismatch);
     }
 
-    // Validate password length
-    if form.password.len() < 8 {
-        return Err(ClaimError::WeakPassword);
-    }
+    keycast_core::password_policy::validate_new_password(&form.password)
+        .map_err(ClaimError::WeakPassword)?;
 
     // Validate email format (basic check)
     if !form.email.contains('@') || !form.email.contains('.') {
@@ -1203,7 +1201,7 @@ pub enum ClaimError {
     ConfirmationEmailTaken,
     UserNotFound,
     PasswordMismatch,
-    WeakPassword,
+    WeakPassword(keycast_core::password_policy::PasswordPolicyError),
     InvalidEmail,
     EmailExists,
     ServiceUnavailable,
@@ -1212,6 +1210,10 @@ pub enum ClaimError {
 
 impl IntoResponse for ClaimError {
     fn into_response(self) -> Response {
+        let password_error_code = match &self {
+            ClaimError::WeakPassword(error) => Some(error.code()),
+            _ => None,
+        };
         let (title, message) = match self {
             ClaimError::TokenUnrecognized => (
                 "Link not recognized",
@@ -1257,9 +1259,9 @@ impl IntoResponse for ClaimError {
                 "Passwords Don't Match",
                 "The passwords you entered don't match. Please go back and try again.",
             ),
-            ClaimError::WeakPassword => (
-                "Password Too Short",
-                "Your password must be at least 8 characters. Please go back and try again.",
+            ClaimError::WeakPassword(error) => (
+                "Choose a stronger password",
+                error.message(),
             ),
             ClaimError::InvalidEmail => (
                 "Invalid Email",
@@ -1358,7 +1360,13 @@ impl IntoResponse for ClaimError {
             message = escape_html(message),
         );
 
-        (axum::http::StatusCode::BAD_REQUEST, Html(html)).into_response()
+        let mut response = (StatusCode::BAD_REQUEST, Html(html)).into_response();
+        if let Some(code) = password_error_code {
+            response
+                .headers_mut()
+                .insert("x-error-code", axum::http::HeaderValue::from_static(code));
+        }
+        response
     }
 }
 
