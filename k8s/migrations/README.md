@@ -8,9 +8,10 @@ Each manifest is environment-specific and kept here as a historical record of wh
 
 Migrates all users from the original openvine-co Cloud SQL database to the target environment's CloudNativePG cluster. Decrypts private keys with the source KMS (openvine-co) and re-encrypts with the target environment's KMS.
 
-- `migrate-vine-users-poc.yaml` - POC environment
 - `migrate-vine-users-production.yaml` - Production environment
 
-Both manifests default to `DRY_RUN=true`. Set to `false` when ready to run for real.
+The production manifest is retained until production has moved to GKE. Production user migrations into POC are not supported; use synthetic test data there.
+
+The manifest defaults to `DRY_RUN=true`. Set to `false` when ready to run for real.
 
 The migration binary is idempotent: re-running skips users that already exist in the target database.
