@@ -82,6 +82,7 @@ function defaultEnv(port: number): Record<string, string> {
       process.env.ATPROTO_OAUTH_PDS_DID || "did:web:pds.divine.test",
     APP_URL: process.env.APP_URL || `http://localhost:${port}`,
     BASE_URL: process.env.BASE_URL || `http://localhost:${port}`,
+    ENABLE_DEV_EMAIL_INBOX: "true",
     PORT: String(port),
   };
 }

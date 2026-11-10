@@ -7,6 +7,10 @@ import path from "node:path";
 import defaultConfig from "../playwright.config";
 import dedicatedConfig from "../challenge-image.config";
 import { assertEmptyConsentDisplay, CHALLENGE_TITLE, CHALLENGE_PHRASES, assertClientPackaging, assertDiscoverySeparation, configFromEnvironment, createFixtureHelpers, type FixtureConfig } from "./challenge-image-fixtures";
+import { getDeliveredToken } from "./emails";
+import { findClaimDeliveryEmail } from "./db";
+import { registerAndVerify } from "./auth";
+import { registerAdmin } from "./admin";
 
 const requiredIdsLoader = "import importlib.util,json,sys; s=importlib.util.spec_from_file_location('acceptance', '../scripts/challenge-image-acceptance.py'); m=importlib.util.module_from_spec(s); sys.modules[s.name]=m; s.loader.exec_module(m); print(json.dumps(m.SUITE_CASE_IDS))";
 
@@ -23,6 +27,97 @@ const environment = {
 };
 const config = (): FixtureConfig => configFromEnvironment(environment);
 const publicKey = "f".repeat(64); // Synthetic public identifier only.
+
+test("delivered tokens match the recipient, purpose and latest captured email", async () => {
+  const calls: string[] = [];
+  const request = { get: async (route: string) => {
+    calls.push(route);
+    return { ok: () => true, json: async () => [
+      { to: "synthetic@example.test", verification_url: "http://localhost/verify-email?token=older" },
+      { to: "synthetic@example.test", verification_url: "http://localhost/verify-email?token=latest" },
+      { to: "synthetic@example.test", verification_url: "http://localhost/api/claim/confirm?token=claim-confirmation" },
+      { to: "other@example.test", verification_url: "http://localhost/verify-email?token=other" },
+    ] };
+  } } as any;
+  expect(await getDeliveredToken(request, { email: "synthetic@example.test", pathname: "/verify-email" })).toBe("latest");
+  expect(await getDeliveredToken(request, { email: "synthetic@example.test", pathname: "/api/claim/confirm" })).toBe("claim-confirmation");
+  expect(calls).toEqual(["/api/dev/emails", "/api/dev/emails"]);
+});
+
+test("inbox polling is bounded, checks ownership and never returns duplicate token parameters", async () => {
+  let reads = 0, guards = 0, pauses = 0;
+  const request = { get: async () => {
+    reads++;
+    return { ok: () => true, json: async () => [{ to: "synthetic@example.test", verification_url: "http://localhost/verify-email?token=one&token=two" }] };
+  } } as any;
+  await expect(getDeliveredToken(request, {
+    email: "synthetic@example.test", pathname: "/verify-email", attempts: 3,
+    beforeRead: async () => { guards++; }, pause: async () => { pauses++; },
+  })).rejects.toThrow("email_delivery_token_timeout");
+  expect([reads, guards, pauses]).toEqual([3, 3, 2]);
+});
+
+test("unavailable or malformed inboxes fail without exposing transport diagnostics", async () => {
+  for (const get of [
+    async () => { throw new Error("PRIVATE delivered credential"); },
+    async () => ({ ok: () => false, json: async () => { throw new Error("must not read body"); } }),
+    async () => ({ ok: () => true, json: async () => ({ credential: "PRIVATE" }) }),
+  ]) {
+    await expect(getDeliveredToken({ get } as any, { email: "synthetic@example.test", pathname: "/verify-email" }))
+      .rejects.toThrow(/^email_inbox_(unavailable|invalid_response)/);
+  }
+});
+
+test("ordinary registration verifies the delivered raw token instead of a database digest", async () => {
+  const posted: any[] = [];
+  const request = {
+    get: async () => ({ ok: () => true, json: async () => [{ to: "synthetic@example.test", verification_url: "http://localhost/verify-email?token=delivered-raw" }] }),
+    post: async (route: string, options: any) => {
+      posted.push({ route, ...options });
+      return { ok: () => true, json: async () => ({ success: true }), headers: () => ({ "set-cookie": "keycast_session=synthetic-session; HttpOnly" }) };
+    },
+  } as any;
+  await registerAndVerify(request, "synthetic@example.test", "synthetic-password");
+  expect(posted[1]).toEqual({ route: "/api/auth/verify-email", data: { token: "delivered-raw" } });
+});
+
+test("claim lookup hashes its raw input and reads only delivery metadata", async () => {
+  const query = async (sql: string, values: unknown[]) => {
+    expect(sql).toBe("SELECT pending_email FROM account_claim_tokens WHERE token = $1");
+    expect(values).toEqual([createHash("sha256").update("synthetic-raw-claim").digest("hex")]);
+    return { rows: [{ pending_email: "synthetic@example.test" }] };
+  };
+  expect(await findClaimDeliveryEmail({ query } as any, "synthetic-raw-claim")).toBe("synthetic@example.test");
+});
+
+test("an unverified admin retries a superseded delivery while its resend arrives", async () => {
+  let inboxReads = 0;
+  const verifiedTokens: string[] = [], routes: string[] = [];
+  const request = {
+    get: async () => ({ ok: () => true, json: async () => [{
+      to: "e2e-admin-fixed@test.local",
+      verification_url: `http://localhost/verify-email?token=${inboxReads++ === 0 ? "stale" : "current"}`,
+    }] }),
+    post: async (route: string, options: any) => {
+      routes.push(route);
+      let status = 200;
+      if (route.endsWith("/register")) status = 409;
+      if (route.endsWith("/login")) status = 403;
+      if (route.endsWith("/verify-email")) {
+        verifiedTokens.push(options.data.token);
+        if (options.data.token === "stale") status = 401;
+      }
+      return {
+        ok: () => status === 200, status: () => status,
+        json: async () => status === 401 ? { code: "VERIFICATION_LINK_SUPERSEDED" } : { success: true },
+        headers: () => ({ "set-cookie": "keycast_session=synthetic-session; HttpOnly" }),
+      };
+    },
+  } as any;
+  await registerAdmin(request);
+  expect(routes).toContain("/api/auth/resend-verification");
+  expect(verifiedTokens).toEqual(["stale", "current"]);
+});
 
 // Only external boundaries are replaced. Real helper control flow, SQL
 // parameters and request bodies remain under test; no services run.
@@ -49,7 +144,10 @@ function fixture(options: { ownership?: unknown; database?: string; token?: any;
       const p = policies.find(p => p.id === values[0] && p.slug === values[1]);
       rows = !p ? [] : links.filter(l => l.policy_id === p.id).map(l => ({ ...p, ...permissions.find(r => r.id === l.permission_id), policy_id: p.id, permission_id: l.permission_id }));
       if (p && !rows.length) rows = [{ ...p, policy_id: p.id, permission_id: null, identifier: null, config: null }];
-    } else if (q.includes("FROM users u JOIN tenants")) rows = [{ pubkey: publicKey, tenant_id: 7, email_verification_token: "synthetic-verification-token", email_verified: true, has_encrypted_key: true, ...options.user, ...(options.missingToken ? { email_verification_token: null } : {}) }];
+    } else if (q.includes("FROM users u JOIN tenants")) {
+      expect(q).not.toContain("email_verification_token");
+      rows = [{ pubkey: publicKey, tenant_id: 7, email_verified: true, has_encrypted_key: true, ...options.user }];
+    }
     else if (q.startsWith("INSERT INTO teams")) rows = [{ id: 21 }];
     else if (q.startsWith("INSERT INTO team_users")) rows = [{ id: 31 }];
     else if (q.startsWith("SELECT id FROM policies WHERE slug")) rows = options.globalPreset ? [{ id: 999 }] : [];
@@ -78,6 +176,10 @@ function fixture(options: { ownership?: unknown; database?: string; token?: any;
     expect(url.startsWith("http://localhost:3000/api/")).toBe(true); expect(opts.headers.Origin).toBe("http://localhost:3000"); expect(opts.timeout).toBe(15000); expect(opts.maxRedirects).toBe(0);
     let body: any = {};
     if (url.endsWith("/register")) body = { success: true, pubkey: publicKey, verification_required: true };
+    else if (url.endsWith("/dev/emails")) {
+      const registered = calls.find(call => call.url.endsWith("/register"))!;
+      body = options.missingToken ? [] : [{ to: registered.options.data.email, verification_url: "http://localhost:3000/verify-email?token=synthetic-verification-token" }];
+    }
     else if (url.endsWith("/verify-email")) body = options.processing && verifiedCalls++ === 0 ? { success: false, status: "processing", retry_after: 1 } : { success: true, authenticated: true };
     else if (url.endsWith("/authorize")) body = { code: "synthetic-code", redirect_uri: opts.data.redirect_uri };
     else if (url.endsWith("/token")) body = {
@@ -302,8 +404,9 @@ for (const [name, authorization] of Object.entries({ wrongPolicy: { policy_id: 9
 test("verification token lookup is bounded and never bypasses verification", async () => {
   const f = fixture({ missingToken: true });
   await expect(f.registerSyntheticUser(f.request, config())).rejects.toThrow("verification_token_timeout");
-  expect(f.queries.filter(q => q.sql.includes("FROM users u JOIN tenants"))).toHaveLength(10);
-  expect(f.calls).toHaveLength(1); expect(writes(f)).toHaveLength(0);
+  expect(f.calls.filter(call => call.url.endsWith("/dev/emails"))).toHaveLength(10);
+  expect(f.calls.some(call => call.url.endsWith("/verify-email"))).toBe(false);
+  expect(writes(f)).toHaveLength(0);
 });
 test("verification retries processing and refuses an unencrypted user", async () => {
   const retry = fixture({ processing: true }); await retry.registerSyntheticUser(retry.request, config());
@@ -560,7 +663,7 @@ test("owned authorization request uses real PKCE, exact scope, explicit consent 
   expect(createHash("sha256").update(pending.auth.verifier).digest("base64url")).toBe(url.searchParams.get("code_challenge"));
   expect(await f.codeState(pending.auth, pending.code)).toEqual({ authorizations: 0, refreshTokens: 0 });
   const query = f.queries.find(q => q.sql.includes("SELECT code, pending_email"))!;
-  expect(query.values).toEqual([pending.code, s.pubkey, s.tenantId, pending.auth.clientId, pending.auth.redirectUri]);
+  expect(query.values).toEqual([createHash("sha256").update(pending.code).digest("hex"), s.pubkey, s.tenantId, pending.auth.clientId, pending.auth.redirectUri]);
   expect(f.queries[f.queries.indexOf(query) - 1].sql).toBe("SELECT current_database() AS database");
   const grant = await f.exchangeAuthorization(f.request, pending.auth, pending.code);
   expect(grant.clientId).toBe(pending.auth.clientId);

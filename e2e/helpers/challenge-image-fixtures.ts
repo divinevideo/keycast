@@ -5,6 +5,7 @@ import path from "node:path";
 import { Client } from "pg";
 import type { APIRequestContext } from "@playwright/test";
 import { generatePKCE } from "./oauth";
+import { getDeliveredToken } from "./emails";
 
 const DATABASE_URL = "postgres://postgres:acceptance@localhost:5432/keycast_image_acceptance";
 const BASE_URL = "http://localhost:3000";
@@ -200,7 +201,7 @@ const policyQuery = `SELECT p.id AS policy_id, p.slug, p.team_id, p.display_name
   FROM policies p LEFT JOIN policy_permissions pp ON pp.policy_id = p.id
   LEFT JOIN permissions pm ON pm.id = pp.permission_id
   WHERE p.id = $1 AND p.slug = $2 ORDER BY pp.id`;
-const userQuery = `SELECT u.pubkey, u.tenant_id, u.email_verification_token, u.email_verified,
+const userQuery = `SELECT u.pubkey, u.tenant_id, u.email_verified,
   EXISTS(SELECT 1 FROM personal_keys pk WHERE pk.user_pubkey = u.pubkey
     AND pk.tenant_id = u.tenant_id AND octet_length(pk.encrypted_secret_key) > 32) AS has_encrypted_key
   FROM users u JOIN tenants t ON t.id = u.tenant_id
@@ -307,12 +308,22 @@ export function createFixtureHelpers(io: FixtureIO) {
       requireFixture(user.length <= 1, "registration_binding");
       if (user.length === 1) {
         requireFixture(user[0].pubkey === registered.pubkey && Number.isSafeInteger(Number(user[0].tenant_id)) && user[0].has_encrypted_key === true, "registration_binding");
-        token = user[0].email_verification_token; tenantId = Number(user[0].tenant_id);
-        if (typeof token === "string" && token.length > 0) break;
+        tenantId = Number(user[0].tenant_id);
+        break;
       }
       await io.pause(300);
     }
-    requireFixture(token && tenantId, "verification_token_timeout");
+    requireFixture(tenantId, "registration_timeout");
+    try {
+      token = await getDeliveredToken(request, {
+        email, pathname: "/verify-email", baseUrl: BASE_URL, pause: io.pause,
+        beforeRead: () => assertOwnedFixture(c),
+      });
+    } catch (error) {
+      if (error instanceof Error && /^challenge_image:[a-z_]+$/.test(error.message)) throw error;
+      throw new Error(error instanceof Error && error.message === "email_delivery_token_timeout"
+        ? "challenge_image:verification_token_timeout" : "challenge_image:email_inbox");
+    }
     let cookie: string | undefined;
     for (let attempt = 0; attempt < 10; attempt++) {
       await assertOwnedFixture(c);
@@ -445,10 +456,11 @@ export function createFixtureHelpers(io: FixtureIO) {
     const owner = authorizations.get(auth); requireFixture(owner && typeof code === "string" && code.length > 0, "code_ownership");
     const { session, config: c } = owner;
     return ownedDb(c, async db => {
+      const codeHash = createHash("sha256").update(code).digest("hex");
       const { rows } = await db.query(`SELECT code, pending_email, consumed_at, scope FROM oauth_codes
         WHERE code = $1 AND user_pubkey = $2 AND tenant_id = $3 AND client_id = $4 AND redirect_uri = $5`,
-        [code, session.pubkey, session.tenantId, auth.clientId, auth.redirectUri]);
-      requireFixture(rows.length === 1 && rows[0].code === code && rows[0].pending_email === null
+        [codeHash, session.pubkey, session.tenantId, auth.clientId, auth.redirectUri]);
+      requireFixture(rows.length === 1 && rows[0].code === codeHash && rows[0].pending_email === null
         && rows[0].consumed_at === null && rows[0].scope === owner.policy.scope, "code_unconsumed");
       const counts = await db.query(`SELECT COUNT(DISTINCT a.id)::int AS authorizations, COUNT(r.id)::int AS refresh_tokens
         FROM oauth_authorizations a LEFT JOIN oauth_refresh_tokens r ON r.authorization_id = a.id
