@@ -15,6 +15,16 @@ $$;
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 GRANT USAGE ON SCHEMA public TO support_reader;
 
+-- REVOKE can succeed with only a warning when the migrator cannot revoke the grant.
+DO $$
+BEGIN
+    IF has_schema_privilege('support_reader', 'public', 'CREATE') THEN
+        RAISE EXCEPTION 'support_reader must not create objects in schema public; revoke CREATE as its owner before migrating'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+END
+$$;
+
 -- Keep these lists explicit: new columns must be classified before becoming readable.
 GRANT SELECT (version, description, installed_on, success, checksum, execution_time)
     ON public._sqlx_migrations TO support_reader;

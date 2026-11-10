@@ -179,3 +179,40 @@ async fn support_reader_has_only_classified_column_reads(pool: PgPool) {
     );
     tx.rollback().await.expect("rollback future schema probe");
 }
+
+#[sqlx::test(migrations = "../database/migrations")]
+async fn migration_refuses_schema_create_it_cannot_revoke(pool: PgPool) {
+    let mut tx = pool.begin().await.expect("begin schema privilege probe");
+    let migrator = format!("support_migrator_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE ROLE {migrator} NOLOGIN"))
+        .execute(&mut *tx)
+        .await
+        .expect("create an unprivileged test migrator");
+    sqlx::query("GRANT CREATE ON SCHEMA public TO PUBLIC")
+        .execute(&mut *tx)
+        .await
+        .expect("restore legacy schema creation privilege for this probe");
+    sqlx::query(&format!("SET LOCAL ROLE {migrator}"))
+        .execute(&mut *tx)
+        .await
+        .expect("assume a non-owner migrator");
+
+    let error = sqlx::raw_sql(MIGRATION)
+        .execute(&mut *tx)
+        .await
+        .expect_err("migration must refuse an effective schema creation privilege");
+    let database_error = error
+        .as_database_error()
+        .expect("Postgres rejects migration");
+    assert_eq!(database_error.code().as_deref(), Some("42501"));
+    assert!(
+        database_error
+            .message()
+            .starts_with("support_reader must not create objects in schema public"),
+        "the explicit privilege assertion must reject the migration, not a later grant"
+    );
+    // Also removes the test-only cluster role and restores the schema ACL.
+    tx.rollback()
+        .await
+        .expect("rollback schema privilege probe");
+}

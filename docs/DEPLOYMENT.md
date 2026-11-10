@@ -419,7 +419,11 @@ ownership or table-level grants, and must not itself be a member of any other
 role. A support login may be a member of `support_reader`. The migration preserves
 an existing role; it does not repair broader privileges. It grants schema usage and explicit
 column reads, excludes the classified secret columns, and revokes schema creation
-from `PUBLIC`. New columns remain unreadable until explicitly classified by a
+from `PUBLIC`. It also checks the reader's effective schema creation privilege and
+stops if that privilege remains: a successful `REVOKE` statement alone does not
+prove the migration identity was able to remove it. In that case, a schema owner
+must remove the privilege under separate operational authorization before deployment.
+New columns remain unreadable until explicitly classified by a
 later migration; the integration test enforces that classification.
 
 This migration does not create a support login, grant membership to a login,
