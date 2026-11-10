@@ -104,7 +104,7 @@ async fn test_authorization_code_expiration() {
         "INSERT INTO oauth_codes (code, user_pubkey, client_id, redirect_uri, scope, expires_at, tenant_id, created_at)
          VALUES ($1, $2, 'Test App', $3, 'sign', $4, 1, NOW())"
     )
-    .bind(&code)
+    .bind(keycast_core::token_hash::hash_token(&code))
     .bind(&user_pubkey)
     .bind(format!("{}/callback", redirect_origin))
     .bind(expired_time)
@@ -115,7 +115,7 @@ async fn test_authorization_code_expiration() {
     // Try to fetch the code - should exist but be expired
     let result: Option<(chrono::DateTime<Utc>,)> =
         sqlx::query_as("SELECT expires_at FROM oauth_codes WHERE code = $1 AND expires_at > NOW()")
-            .bind(&code)
+            .bind(keycast_core::token_hash::hash_token(&code))
             .fetch_optional(&pool)
             .await
             .unwrap();
@@ -148,7 +148,7 @@ async fn test_authorization_code_one_time_use() {
         "INSERT INTO oauth_codes (code, user_pubkey, client_id, redirect_uri, scope, expires_at, tenant_id, created_at)
          VALUES ($1, $2, 'Test App', $3, 'sign', NOW() + INTERVAL '10 minutes', 1, NOW())"
     )
-    .bind(&code)
+    .bind(keycast_core::token_hash::hash_token(&code))
     .bind(&user_pubkey)
     .bind(format!("{}/callback", redirect_origin))
     .execute(&pool)
@@ -157,7 +157,7 @@ async fn test_authorization_code_one_time_use() {
 
     // First exchange - delete the code (simulating token exchange)
     let deleted = sqlx::query("DELETE FROM oauth_codes WHERE code = $1 RETURNING code")
-        .bind(&code)
+        .bind(keycast_core::token_hash::hash_token(&code))
         .fetch_optional(&pool)
         .await
         .unwrap();
@@ -168,7 +168,7 @@ async fn test_authorization_code_one_time_use() {
 
     // Second exchange - code should be gone
     let deleted_again = sqlx::query("DELETE FROM oauth_codes WHERE code = $1 RETURNING code")
-        .bind(&code)
+        .bind(keycast_core::token_hash::hash_token(&code))
         .fetch_optional(&pool)
         .await
         .unwrap();

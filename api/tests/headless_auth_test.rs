@@ -196,7 +196,7 @@ async fn test_headless_registration_creates_pending_record() {
             device_code
         ) VALUES ($1, $2, $3, $4, $5, $6, 1, NOW(), $7, $8, $9, $10)",
     )
-    .bind(&placeholder_code)
+    .bind(keycast_core::token_hash::hash_token(&placeholder_code))
     .bind(&pubkey)
     .bind(client_id)
     .bind(redirect_uri)
@@ -204,8 +204,8 @@ async fn test_headless_registration_creates_pending_record() {
     .bind(expires_at)
     .bind(&test_email)
     .bind(&password_hash)
-    .bind(&verification_token)
-    .bind(&device_code)
+    .bind(keycast_core::token_hash::hash_token(&verification_token))
+    .bind(keycast_core::token_hash::hash_token(&device_code))
     .execute(&pool)
     .await;
 
@@ -219,19 +219,22 @@ async fn test_headless_registration_creates_pending_record() {
         "SELECT user_pubkey, device_code, pending_email, pending_email_verification_token 
          FROM oauth_codes WHERE code = $1 AND tenant_id = 1",
     )
-    .bind(&placeholder_code)
+    .bind(keycast_core::token_hash::hash_token(&placeholder_code))
     .fetch_one(&pool)
     .await
     .expect("Record should exist");
 
     assert_eq!(record.0, pubkey);
-    assert_eq!(record.1, device_code);
+    assert_eq!(record.1, keycast_core::token_hash::hash_token(&device_code));
     assert_eq!(record.2, Some(test_email.clone()));
-    assert_eq!(record.3, Some(verification_token.clone()));
+    assert_eq!(
+        record.3,
+        Some(keycast_core::token_hash::hash_token(&verification_token))
+    );
 
     // Cleanup
     let _ = sqlx::query("DELETE FROM oauth_codes WHERE code = $1")
-        .bind(&placeholder_code)
+        .bind(keycast_core::token_hash::hash_token(&placeholder_code))
         .execute(&pool)
         .await;
 }
@@ -276,7 +279,7 @@ async fn test_headless_login_creates_code() {
         "INSERT INTO oauth_codes (code, user_pubkey, client_id, redirect_uri, scope, expires_at, tenant_id, created_at)
          VALUES ($1, $2, 'TestApp', 'https://test.example.com/callback', 'policy:social', $3, 1, NOW())"
     )
-    .bind(&code)
+    .bind(keycast_core::token_hash::hash_token(&code))
     .bind(&pubkey)
     .bind(expires_at)
     .execute(&pool)
@@ -288,7 +291,7 @@ async fn test_headless_login_creates_code() {
         "SELECT user_pubkey FROM oauth_codes 
          WHERE code = $1 AND tenant_id = 1 AND expires_at > NOW()",
     )
-    .bind(&code)
+    .bind(keycast_core::token_hash::hash_token(&code))
     .fetch_optional(&pool)
     .await
     .expect("Query should succeed");
@@ -466,7 +469,7 @@ async fn test_headless_authorize_creates_code() {
         "INSERT INTO oauth_codes (code, user_pubkey, client_id, redirect_uri, scope, expires_at, tenant_id, created_at)
          VALUES ($1, $2, 'SecondApp', 'https://second-app.example.com/callback', 'policy:readonly', $3, 1, NOW())"
     )
-    .bind(&code)
+    .bind(keycast_core::token_hash::hash_token(&code))
     .bind(&pubkey)
     .bind(expires_at)
     .execute(&pool)
@@ -477,7 +480,7 @@ async fn test_headless_authorize_creates_code() {
     let record = sqlx::query_as::<_, (String, String)>(
         "SELECT client_id, scope FROM oauth_codes WHERE code = $1 AND tenant_id = 1",
     )
-    .bind(&code)
+    .bind(keycast_core::token_hash::hash_token(&code))
     .fetch_one(&pool)
     .await
     .expect("Code should exist");
@@ -669,13 +672,13 @@ async fn test_device_code_polling_flow() {
             device_code
         ) VALUES ($1, $2, 'TestApp', 'https://test.example.com/callback', 'policy:social', $3, 1, NOW(), $4, $5, $6, $7)"
     )
-    .bind(&placeholder_code)
+    .bind(keycast_core::token_hash::hash_token(&placeholder_code))
     .bind(&pubkey)
     .bind(expires_at)
     .bind(&test_email)
     .bind(&password_hash)
-    .bind(&verification_token)
-    .bind(&device_code)
+    .bind(keycast_core::token_hash::hash_token(&verification_token))
+    .bind(keycast_core::token_hash::hash_token(&device_code))
     .execute(&pool)
     .await
     .expect("Should create pending registration");
@@ -708,7 +711,7 @@ async fn test_device_code_polling_flow() {
         "INSERT INTO oauth_codes (code, user_pubkey, client_id, redirect_uri, scope, expires_at, tenant_id, created_at)
          VALUES ($1, $2, 'TestApp', 'https://test.example.com/callback', 'policy:social', $3, 1, NOW())"
     )
-    .bind(&new_code)
+    .bind(keycast_core::token_hash::hash_token(&new_code))
     .bind(&pubkey)
     .bind(Utc::now() + Duration::minutes(10))
     .execute(&pool)
@@ -720,7 +723,7 @@ async fn test_device_code_polling_flow() {
         "SELECT user_pubkey FROM oauth_codes 
          WHERE code = $1 AND tenant_id = 1 AND expires_at > NOW() AND pending_email IS NULL",
     )
-    .bind(&new_code)
+    .bind(keycast_core::token_hash::hash_token(&new_code))
     .fetch_optional(&pool)
     .await
     .expect("Query should succeed");
@@ -774,7 +777,7 @@ async fn test_headless_stores_pkce_challenge() {
             code_challenge, code_challenge_method
         ) VALUES ($1, $2, 'PKCEApp', 'https://pkce.example.com/callback', 'policy:social', $3, 1, NOW(), $4, $5)"
     )
-    .bind(&code)
+    .bind(keycast_core::token_hash::hash_token(&code))
     .bind(&pubkey)
     .bind(Utc::now() + Duration::minutes(10))
     .bind(code_challenge)
@@ -787,7 +790,7 @@ async fn test_headless_stores_pkce_challenge() {
     let record = sqlx::query_as::<_, (Option<String>, Option<String>)>(
         "SELECT code_challenge, code_challenge_method FROM oauth_codes WHERE code = $1",
     )
-    .bind(&code)
+    .bind(keycast_core::token_hash::hash_token(&code))
     .fetch_one(&pool)
     .await
     .expect("Code should exist");
@@ -797,7 +800,7 @@ async fn test_headless_stores_pkce_challenge() {
 
     // Cleanup
     let _ = sqlx::query("DELETE FROM oauth_codes WHERE code = $1")
-        .bind(&code)
+        .bind(keycast_core::token_hash::hash_token(&code))
         .execute(&pool)
         .await;
     cleanup_test_user(&pool, &pubkey).await;

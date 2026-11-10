@@ -317,7 +317,7 @@ async fn test_claim_token_stats_counts_correctly() {
         "INSERT INTO account_claim_tokens (token, user_pubkey, expires_at, created_at, tenant_id)
          VALUES ($1, $2, $3, NOW(), $4)",
     )
-    .bind(&expired_token)
+    .bind(keycast_core::token_hash::hash_token(&expired_token))
     .bind(&pubkey_expired)
     .bind(past)
     .bind(tenant_id)

@@ -1,4 +1,5 @@
 use crate::repositories::RepositoryError;
+use crate::token_hash::hash_token;
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool};
 
@@ -28,7 +29,8 @@ pub struct AtprotoOAuthSession {
     pub user_pubkey: Option<String>,
     pub atproto_did: Option<String>,
     pub approved_at: Option<DateTime<Utc>>,
-    pub authorization_code: Option<String>,
+    #[sqlx(rename = "authorization_code")]
+    pub authorization_code_hash: Option<String>,
     pub authorization_code_expires_at: Option<DateTime<Utc>>,
     pub access_token_jti: Option<String>,
     pub access_token_expires_at: Option<DateTime<Utc>>,
@@ -67,8 +69,6 @@ pub struct CreateAtprotoOAuthSessionParams {
 
 #[derive(Debug, Clone)]
 pub struct IssueAtprotoTokensParams {
-    pub authorization_code: String,
-    pub authorization_code_expires_at: DateTime<Utc>,
     pub access_token_jti: String,
     pub access_token_expires_at: DateTime<Utc>,
     pub refresh_token_hash: String,
@@ -164,21 +164,19 @@ impl AtprotoOAuthSessionRepository {
     ) -> Result<Option<AtprotoOAuthSession>, RepositoryError> {
         sqlx::query_as::<_, AtprotoOAuthSession>(
             "UPDATE atproto_oauth_sessions
-             SET authorization_code = $2,
-                 authorization_code_expires_at = $3,
-                 access_token_jti = $4,
-                 access_token_expires_at = $5,
-                 refresh_token_hash = $6,
-                 refresh_token_expires_at = $7,
-                 dpop_jkt = $8,
-                 dpop_nonce = $9
+             SET authorization_code = NULL,
+                 authorization_code_expires_at = NULL,
+                 access_token_jti = $2,
+                 access_token_expires_at = $3,
+                 refresh_token_hash = $4,
+                 refresh_token_expires_at = $5,
+                 dpop_jkt = $6,
+                 dpop_nonce = $7
              WHERE request_uri = $1
                AND revoked_at IS NULL
              RETURNING *",
         )
         .bind(request_uri)
-        .bind(&params.authorization_code)
-        .bind(params.authorization_code_expires_at)
         .bind(&params.access_token_jti)
         .bind(params.access_token_expires_at)
         .bind(&params.refresh_token_hash)
@@ -202,7 +200,7 @@ impl AtprotoOAuthSessionRepository {
                AND revoked_at IS NULL
                AND authorization_code_expires_at > NOW()"
         ))
-        .bind(authorization_code)
+        .bind(hash_token(authorization_code))
         .fetch_optional(&self.pool)
         .await
         .map_err(Into::into)
@@ -223,7 +221,7 @@ impl AtprotoOAuthSessionRepository {
              RETURNING *",
         )
         .bind(request_uri)
-        .bind(authorization_code)
+        .bind(hash_token(authorization_code))
         .bind(authorization_code_expires_at)
         .fetch_optional(&self.pool)
         .await
@@ -243,7 +241,7 @@ impl AtprotoOAuthSessionRepository {
                AND authorization_code_expires_at > NOW()
              RETURNING *",
         )
-        .bind(authorization_code)
+        .bind(hash_token(authorization_code))
         .fetch_optional(&self.pool)
         .await
         .map_err(Into::into)

@@ -43,7 +43,7 @@
 	let copiedPubkey = $state(false);
 
 	// Claim link state
-	let claimToken = $state<{ claim_url: string; expires_at: string } | null>(null);
+	let claimToken = $state<{ claim_url?: string; created_at?: string; expires_at: string } | null>(null);
 	let isLoadingClaimToken = $state(false);
 	let isGeneratingClaimToken = $state(false);
 	let copiedClaimUrl = $state(false);
@@ -188,11 +188,11 @@
 		isLoadingClaimToken = true;
 		claimToken = null;
 		try {
-			const result = await api.get<{ has_token: boolean; claim_url?: string; expires_at?: string }>(
+			const result = await api.get<{ has_token: boolean; created_at?: string; expires_at?: string }>(
 				`/admin/claim-tokens?pubkey=${encodeURIComponent(pubkey)}`
 			);
-			if (result.has_token && result.claim_url && result.expires_at) {
-				claimToken = { claim_url: result.claim_url, expires_at: result.expires_at };
+			if (result.has_token && result.expires_at) {
+				claimToken = { created_at: result.created_at, expires_at: result.expires_at };
 			}
 		} catch (err) {
 			if (redirectToLoginOnAuthError(err)) return;
@@ -238,7 +238,7 @@
 	}
 
 	async function copyClaimUrl() {
-		if (!claimToken) return;
+		if (!claimToken?.claim_url) return;
 		try {
 			await navigator.clipboard.writeText(claimToken.claim_url);
 			copiedClaimUrl = true;
@@ -524,6 +524,7 @@
 													<p class="claim-loading">Checking for existing claim link...</p>
 												{:else if claimToken}
 													<div class="claim-url-display">
+														{#if claimToken.claim_url}
 														<div class="claim-url-row">
 															<input
 																type="text"
@@ -539,6 +540,10 @@
 																{/if}
 															</button>
 														</div>
+														{:else}
+															<p>A valid claim link exists. Links are only shown when created. Generate a new link to copy it; the earlier link will stop working.</p>
+															{#if claimToken.created_at}<p>Created {formatDate(claimToken.created_at)}</p>{/if}
+														{/if}
 														<span class="claim-expiry">
 															Expires {formatDate(claimToken.expires_at)}
 														</span>
@@ -548,7 +553,7 @@
 																onclick={() => regenerateClaimToken(u.vine_id!)}
 																disabled={isGeneratingClaimToken}
 															>
-																{isGeneratingClaimToken ? 'Regenerating...' : 'Regenerate'}
+																{isGeneratingClaimToken ? 'Generating...' : 'Generate new link'}
 															</button>
 															<button
 																class="btn-destructive-inline"

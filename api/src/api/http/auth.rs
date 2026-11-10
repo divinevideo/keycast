@@ -1952,8 +1952,8 @@ pub async fn finalize_pending_registration(
     if oauth_data.consumed_at.is_some() {
         return Err(AuthError::RegistrationAlreadyCompleted);
     }
-    let verification_token = oauth_data
-        .pending_email_verification_token
+    let generation_hash = oauth_data
+        .pending_email_verification_token_hash
         .as_deref()
         .ok_or_else(|| account_incomplete("Registration is incomplete. Please register again."))?;
     let oauth_code_repo = OAuthCodeRepository::new(pool.clone());
@@ -1966,7 +1966,7 @@ pub async fn finalize_pending_registration(
     // For the link path (RedisRequired), validate device_code + Redis BEFORE minting so we never
     // mint a code the polling app could never receive.
     let strict_delivery = if oauth_data.is_headless && delivery == HeadlessDelivery::RedisRequired {
-        let device_code = oauth_data.device_code.as_ref().ok_or_else(|| {
+        let device_code = oauth_data.device_code_hash.as_ref().ok_or_else(|| {
             tracing::error!(
                 event = "headless_poll_delivery_failed",
                 tenant_id = tenant_id,
@@ -1995,7 +1995,7 @@ pub async fn finalize_pending_registration(
         .map(char::from)
         .collect();
     let finalized = match oauth_code_repo
-        .materialize_pending_registration(tenant_id, verification_token, &candidate)
+        .materialize_pending_registration_by_hash(tenant_id, generation_hash, &candidate)
         .await?
     {
         MaterializePendingRegistrationOutcome::Ready(finalized) => *finalized,
@@ -2020,36 +2020,25 @@ pub async fn finalize_pending_registration(
 
     if let Some((device_code, redis)) = strict_delivery {
         let key = format!("oauth_poll:{}", device_code);
-        if let Err(e) = redis.setex(&key, redis_ttl_seconds, &new_code).await {
+        if let Err(e) = redis.setex(&key, redis_ttl_seconds, generation_hash).await {
             tracing::error!(
                 event = "headless_poll_delivery_failed",
                 tenant_id = tenant_id,
                 user_pubkey = %oauth_data.user_pubkey,
-                device_code = %device_code,
                 error = %e,
                 "Failed to store headless OAuth code in Redis for polling"
             );
-            // Keep the code for retry. Another concurrent finalizer may already have reused and
-            // delivered it, so even the call that minted it cannot safely delete it here.
+            // Keep the pending generation for retry; its next delivery mints a replacement code.
             return Err(headless_retry_error());
         }
-        tracing::debug!(
-            "Stored OAuth code in Redis for headless polling: device_code={}",
-            device_code
-        );
-    } else if let Some(ref device_code) = oauth_data.device_code {
+    } else if let Some(ref device_code) = oauth_data.device_code_hash {
         // Best-effort push: non-headless same-device verification, or the PIN path where the code
         // is also returned synchronously in the response body (so a Redis miss is not fatal).
         if let Some(redis) = redis {
             let key = format!("oauth_poll:{}", device_code);
-            if let Err(e) = redis.setex(&key, redis_ttl_seconds, &new_code).await {
+            if let Err(e) = redis.setex(&key, redis_ttl_seconds, generation_hash).await {
                 tracing::warn!("Failed to store OAuth code in Redis for polling: {}", e);
                 // Continue - redirect flow / synchronous return still works.
-            } else {
-                tracing::debug!(
-                    "Stored OAuth code in Redis for polling: device_code={}",
-                    device_code
-                );
             }
         }
     }
@@ -2214,17 +2203,15 @@ async fn perform_email_verification(
                 // Hash should complete in <1s normally. After 2min, assume instance died.
                 // User needs to re-register (cleanup job will delete this row)
                 tracing::warn!(
-                    "Password hash not completed after {}s for token {}..., likely instance died",
-                    age.num_seconds(),
-                    &token[..std::cmp::min(8, token.len())]
+                    "Password hash not completed after {}s, registration expired",
+                    age.num_seconds()
                 );
                 return Err(AuthError::RegistrationExpired);
             }
             // Still processing - tell caller to retry
             tracing::debug!(
-                "Password hash still processing (age: {}s) for token {}...",
-                age.num_seconds(),
-                &token[..std::cmp::min(8, token.len())]
+                "Password hash still processing (age: {}s)",
+                age.num_seconds()
             );
             return Ok(VerifyOutcome::Processing);
         }
@@ -5919,6 +5906,7 @@ mod tests {
     #[cfg(feature = "integration-tests")]
     use super::{VERIFICATION_LINK_SUPERSEDED_CODE, VERIFICATION_LINK_SUPERSEDED_HEADING};
     use axum::response::IntoResponse;
+    use keycast_core::token_hash::hash_token;
     use ucan::Ucan;
 
     #[test]
@@ -6444,7 +6432,7 @@ mod tests {
     async fn cleanup_verify_email_test_data(pool: &PgPool, pubkey: &str, token: &str) {
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE user_pubkey = $1 OR pending_email_verification_token = $2")
             .bind(pubkey)
-            .bind(token)
+            .bind(hash_token(token))
             .execute(pool)
             .await;
         let _ = sqlx::query("DELETE FROM personal_keys WHERE user_pubkey = $1")
@@ -6536,7 +6524,7 @@ mod tests {
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8, $9, $10, $11, $12)",
         )
         .bind(1_i64)
-        .bind(&placeholder_code)
+        .bind(keycast_core::token_hash::hash_token(&placeholder_code))
         .bind(&pubkey)
         .bind("TestMobileApp")
         .bind("https://test.example.com/callback")
@@ -6544,8 +6532,8 @@ mod tests {
         .bind(expires_at)
         .bind(&test_email)
         .bind(&password_hash)
-        .bind(&verification_token)
-        .bind(&device_code)
+        .bind(hash_token(&verification_token))
+        .bind(hash_token(&device_code))
         .bind(true)
         .execute(&pool)
         .await
@@ -6573,7 +6561,7 @@ mod tests {
             "SELECT COUNT(*) FROM oauth_codes
              WHERE tenant_id = 1 AND pending_email_verification_token = $1",
         )
-        .bind(&verification_token)
+        .bind(hash_token(&verification_token))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -6647,7 +6635,7 @@ mod tests {
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8, $9, $10, $11)",
         )
         .bind(1_i64)
-        .bind(&placeholder_code)
+        .bind(keycast_core::token_hash::hash_token(&placeholder_code))
         .bind(&pending_pubkey)
         .bind("TestApp")
         .bind("https://test.example.com/callback")
@@ -6655,7 +6643,7 @@ mod tests {
         .bind(expires_at)
         .bind(&duplicate_email)
         .bind(&password_hash)
-        .bind(&verification_token)
+        .bind(hash_token(&verification_token))
         .bind(&encrypted_secret)
         .execute(&pool)
         .await
@@ -6683,7 +6671,7 @@ mod tests {
             "SELECT COUNT(*) FROM oauth_codes
              WHERE tenant_id = 1 AND pending_email_verification_token = $1",
         )
-        .bind(&verification_token)
+        .bind(hash_token(&verification_token))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -6746,7 +6734,7 @@ mod tests {
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8, $9, $10, $11)",
         )
         .bind(1_i64)
-        .bind(&placeholder_code)
+        .bind(keycast_core::token_hash::hash_token(&placeholder_code))
         .bind(&pending_pubkey)
         .bind("TestApp")
         .bind("https://test.example.com/callback")
@@ -6754,7 +6742,7 @@ mod tests {
         .bind(expires_at)
         .bind(email)
         .bind(&password_hash)
-        .bind(&verification_token)
+        .bind(hash_token(&verification_token))
         .bind(&encrypted_secret)
         .execute(pool)
         .await
@@ -6817,17 +6805,19 @@ mod tests {
         let body2 = response_json(second).await;
         let code2 = extract_code_from_redirect(body2["redirect_to"].as_str().unwrap());
 
-        assert_eq!(
+        assert_ne!(
             code1, code2,
-            "idempotent re-arm reuses the same live exchange code"
+            "each re-arm discloses a new code and invalidates the earlier one"
         );
+        assert!(repo.find_valid(1, &code1).await.unwrap().is_none());
+        assert!(repo.find_valid(1, &code2).await.unwrap().is_some());
 
         cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
     }
 
     #[cfg(feature = "integration-tests")]
     #[tokio::test]
-    async fn test_concurrent_finalizers_return_the_same_exchange_code() {
+    async fn test_concurrent_finalizers_replace_unclaimed_exchange_code() {
         let pool = create_test_db().await;
         let email = format!("verify-concurrent-{}@example.com", Uuid::new_v4());
         let (pubkey, token) = insert_oauth_pending_registration(&pool, &email).await;
@@ -6856,14 +6846,14 @@ mod tests {
         );
         let first = first.unwrap();
         let second = second.unwrap();
-        assert_eq!(first.new_code, second.new_code);
+        assert_ne!(first.new_code, second.new_code);
 
         let exchange_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM oauth_codes
              WHERE tenant_id = 1 AND pending_email_verification_token = $1
                AND pending_email IS NULL",
         )
-        .bind(&token)
+        .bind(hash_token(&token))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -7066,7 +7056,7 @@ mod tests {
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8, $9, $10, $11, $12, true)",
         )
         .bind(1_i64)
-        .bind(&placeholder_code)
+        .bind(keycast_core::token_hash::hash_token(&placeholder_code))
         .bind(&pending_pubkey)
         .bind("TestApp")
         .bind("https://test.example.com/callback")
@@ -7074,9 +7064,9 @@ mod tests {
         .bind(expires_at)
         .bind(email)
         .bind(&password_hash)
-        .bind(&verification_token)
+        .bind(hash_token(&verification_token))
         .bind(&encrypted_secret)
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .execute(pool)
         .await
         .unwrap();
@@ -7183,7 +7173,7 @@ mod tests {
         .bind(&pubkey)
         .bind(email)
         .bind(&password_hash)
-        .bind(&token)
+        .bind(hash_token(&token))
         .execute(pool)
         .await
         .expect("first-party user row should insert");
@@ -7318,7 +7308,7 @@ mod tests {
             "UPDATE oauth_codes SET expires_at = NOW() - INTERVAL '1 second'
              WHERE pending_email_verification_token = $1 AND tenant_id = 1",
         )
-        .bind(&token)
+        .bind(hash_token(&token))
         .execute(&pool)
         .await
         .unwrap();
@@ -7650,7 +7640,7 @@ mod tests {
             "the user must remain materialized and verified"
         );
         assert!(
-            repo.find_live_exchange_code_with_expiry_for_pending(1, &pending)
+            repo.find_live_exchange_hash_with_expiry_for_pending(1, &pending)
                 .await
                 .unwrap()
                 .is_some(),
@@ -7702,16 +7692,104 @@ mod tests {
             Err(super::AuthError::ServiceUnavailable { .. })
         ));
         let live_code = repo
-            .find_live_exchange_code_with_expiry_for_pending(1, &pending)
+            .find_live_exchange_hash_with_expiry_for_pending(1, &pending)
             .await
             .unwrap()
             .map(|(code, _expires_at)| code);
-        assert_eq!(
-            live_code.as_deref(),
-            Some(first.new_code.as_str()),
-            "Redis redelivery failure must leave the reused code intact"
-        );
+        assert!(live_code.is_some());
+        assert!(repo.find_valid(1, &first.new_code).await.unwrap().is_none(), "replacement invalidates the previously disclosed code even when readiness delivery fails");
 
+        cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_poll_keeps_only_generation_digest_and_replaces_lost_codes() {
+        let pool = create_test_db().await;
+        let state = create_test_auth_state_with_redis(pool.clone()).await;
+        let redis = state.state.redis.as_ref().unwrap();
+        let email = format!("poll-digest-{}@example.com", Uuid::new_v4());
+        let (pubkey, token, device_code) =
+            insert_headless_pending_registration(&pool, &email).await;
+        let repo = keycast_core::repositories::OAuthCodeRepository::new(pool.clone());
+        let pending = repo
+            .find_by_verification_token(&token, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        let initial = super::finalize_pending_registration(
+            &pool,
+            Some(redis),
+            1,
+            &pending,
+            super::HeadlessDelivery::RedisRequired,
+        )
+        .await
+        .unwrap();
+        let key = format!("oauth_poll:{}", hash_token(&device_code));
+        assert_eq!(redis.get(&key).await.unwrap(), Some(hash_token(&token)));
+        assert!(redis
+            .get(&format!("oauth_poll:{device_code}"))
+            .await
+            .unwrap()
+            .is_none());
+
+        let poll_once = || async {
+            let response = super::super::oauth::poll(
+                State(state.clone()),
+                create_test_tenant(),
+                Query(super::super::oauth::PollRequest {
+                    device_code: device_code.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["code"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let first = poll_once().await;
+        let second = poll_once().await;
+        assert_ne!(first, second);
+        assert!(repo
+            .find_valid(1, &initial.new_code)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo.find_valid(1, &first).await.unwrap().is_none());
+        assert!(repo.find_valid(1, &second).await.unwrap().is_some());
+        assert!(repo
+            .find_valid(1, &hash_token(&second))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo
+            .find_by_device_code(&hash_token(&device_code), 1)
+            .await
+            .unwrap()
+            .is_none());
+
+        // A stale readiness record cannot authenticate a newer generation.
+        redis
+            .setex(&key, 60, &hash_token("stale-generation"))
+            .await
+            .unwrap();
+        let stale = super::super::oauth::poll(
+            State(state.clone()),
+            create_test_tenant(),
+            Query(super::super::oauth::PollRequest {
+                device_code: device_code.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stale.status(), StatusCode::ACCEPTED);
+        redis.del(&key).await.unwrap();
         cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
     }
 
@@ -7833,7 +7911,7 @@ mod tests {
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8, $9, $10, $11)",
         )
         .bind(1_i64)
-        .bind(&placeholder_code)
+        .bind(keycast_core::token_hash::hash_token(&placeholder_code))
         .bind(pubkey)
         .bind("TestApp")
         .bind("https://test.example.com/callback")
@@ -7841,7 +7919,7 @@ mod tests {
         .bind(Utc::now() + Duration::hours(24))
         .bind(email)
         .bind(password_hash)
-        .bind(verification_token)
+        .bind(hash_token(verification_token))
         .bind(encrypted_secret)
         .execute(pool)
         .await
@@ -8189,7 +8267,7 @@ mod tests {
             "SELECT COUNT(*) FROM oauth_codes
              WHERE tenant_id = 1 AND pending_email_verification_token = $1",
         )
-        .bind(&verification_token)
+        .bind(hash_token(&verification_token))
         .fetch_one(&pool)
         .await
         .unwrap();

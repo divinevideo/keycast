@@ -283,10 +283,7 @@ pub async fn headless_register(
             other => other.into(),
         })?;
 
-    // A duplicate register supersedes the earlier pending registration in place and keeps its
-    // device_code (keycast#268). Poll on the row's device_code, not the one we just generated, so
-    // the app polls the registration that actually exists.
-    let device_code = stored.device_code.unwrap_or(device_code);
+    // Each registration discloses its own new device credential once.
     if stored.superseded {
         tracing::info!(
             event = "headless_registration_superseded",
@@ -1063,7 +1060,8 @@ pub async fn headless_verify_pin(
         .await;
         return Err(HeadlessError::PinUnavailable);
     }
-    let Some(expected_generation_token) = pending.pending_email_verification_token.clone() else {
+    let Some(expected_generation_hash) = pending.pending_email_verification_token_hash.clone()
+    else {
         return Err(HeadlessError::PinUnavailable);
     };
 
@@ -1082,7 +1080,7 @@ pub async fn headless_verify_pin(
         .reserve_pin_attempt(
             &req.device_code,
             tenant_id,
-            &expected_generation_token,
+            &expected_generation_hash,
             MAX_PIN_ATTEMPTS,
             MAX_PIN_ATTEMPTS_LIFETIME,
         )
@@ -1150,7 +1148,12 @@ pub async fn headless_verify_pin(
             // The queue rejected or abandoned the job before bcrypt produced a comparison result,
             // so this request must not consume the attempt slot reserved above.
             oauth_code_repo
-                .refund_pin_attempt(&req.device_code, tenant_id, &expected_generation_token)
+                .refund_pin_attempt(
+                    &req.device_code,
+                    tenant_id,
+                    &expected_generation_hash,
+                    &pending,
+                )
                 .await?;
             return Err(bcrypt_headless_error(error));
         }
@@ -1209,7 +1212,12 @@ pub async fn headless_verify_pin(
     // burn a legitimate user's lifetime budget with the right code in their hand.
     //
     let released = oauth_code_repo
-        .reset_pin_attempts(&req.device_code, tenant_id, &expected_generation_token)
+        .reset_pin_attempts(
+            &req.device_code,
+            tenant_id,
+            &expected_generation_hash,
+            &pending,
+        )
         .await?;
     if released != PinAttemptRelease::CurrentGeneration {
         return Err(HeadlessError::PinInvalid);
@@ -1355,7 +1363,7 @@ pub async fn headless_resend_pin(
     let Some(email) = pending.pending_email.clone() else {
         return Ok(success());
     };
-    let Some(old_token) = pending.pending_email_verification_token.clone() else {
+    let Some(old_token_hash) = pending.pending_email_verification_token_hash.clone() else {
         return Ok(success());
     };
 
@@ -1387,7 +1395,7 @@ pub async fn headless_resend_pin(
         .reset_pin_for_resend(
             &req.device_code,
             tenant_id,
-            &old_token,
+            &old_token_hash,
             &new_token,
             &new_pin_hash,
             cooldown_cutoff,
@@ -1413,7 +1421,7 @@ pub async fn headless_resend_pin(
                 &req.device_code,
                 tenant_id,
                 keycast_core::repositories::PinResendSnapshot {
-                    verification_token: Some(&old_token),
+                    verification_token_hash: Some(&old_token_hash),
                     pin_hash: old_pin_hash.as_deref(),
                     pin_attempts: old_pin_attempts,
                     pin_sent_at: old_pin_sent_at,
@@ -1626,6 +1634,7 @@ impl From<keycast_core::repositories::RepositoryError> for HeadlessError {
 
 #[cfg(test)]
 mod tests {
+    use keycast_core::token_hash::hash_token;
 
     // Keep failure-path tests independent of the shared production sender.
     struct UnavailableSender;
@@ -1976,10 +1985,10 @@ mod tests {
             .expect("second response carries device_code")
             .to_string();
 
-        // The app keeps polling the registration it already knows about.
-        assert_eq!(
+        // Supersession discloses a new credential and invalidates the previous one.
+        assert_ne!(
             second_device_code, first_device_code,
-            "a duplicate register must return the existing registration's device_code"
+            "a duplicate register must rotate the device credential"
         );
 
         // Exactly one pending row, one live verification token: only one email is actionable.
@@ -1987,7 +1996,8 @@ mod tests {
         struct PendingRegistrationState {
             pending_password_hash: String,
             code_challenge: Option<String>,
-            pending_email_verification_token: Option<String>,
+            #[sqlx(rename = "pending_email_verification_token")]
+            pending_email_verification_token_hash: Option<String>,
             pin_attempts: i32,
             pin_failed_total: i32,
             pin_sent_at: Option<DateTime<Utc>>,
@@ -2056,7 +2066,7 @@ mod tests {
         // The first email's token is dead — that link now renders the terminal
         // superseded page rather than stranding the user on a 401.
         let current_token = row
-            .pending_email_verification_token
+            .pending_email_verification_token_hash
             .expect("pending row keeps a verification token");
         let stale_token_rows: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM oauth_codes
@@ -2185,7 +2195,7 @@ mod tests {
         let (pin_hash, pin_attempts): (Option<String>, i32) = sqlx::query_as(
             "SELECT pin_hash, pin_attempts FROM oauth_codes WHERE device_code = $1 AND tenant_id = 1",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .fetch_one(&pool)
         .await
         .expect("pending row should exist");
@@ -2198,7 +2208,7 @@ mod tests {
         assert_eq!(pin_attempts, 0, "attempt counter starts at zero");
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE email = $1")
@@ -2251,7 +2261,7 @@ mod tests {
         ) = sqlx::query_as(
             "SELECT pin_sent_at, pin_resend_at FROM oauth_codes WHERE device_code = $1 AND tenant_id = 1",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .fetch_one(&pool)
         .await
         .expect("pending row should exist");
@@ -2266,7 +2276,7 @@ mod tests {
         );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE email = $1")
@@ -2305,7 +2315,7 @@ mod tests {
                 device_code, is_headless, pin_hash, pin_attempts, pin_sent_at
             ) VALUES (1, $1, $2, $3, $4, $5, $6, NOW(), $7, $8, $9, $10, $11, true, $12, 0, NOW())",
         )
-        .bind(&placeholder)
+        .bind(hash_token(&placeholder))
         .bind(&pubkey)
         .bind("TestApp")
         .bind("https://test.example.com/callback")
@@ -2313,9 +2323,9 @@ mod tests {
         .bind(expires_at)
         .bind(email)
         .bind(&password_hash)
-        .bind(&token)
+        .bind(hash_token(&token))
         .bind(&encrypted_secret)
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .bind(&pin_hash)
         .execute(pool)
         .await
@@ -2375,7 +2385,7 @@ mod tests {
         assert!(verified.0);
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM personal_keys WHERE user_pubkey = $1")
@@ -2429,7 +2439,7 @@ mod tests {
         assert_eq!(response_json(locked).await["code"], "PIN_LOCKED");
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
@@ -2446,7 +2456,7 @@ mod tests {
         let email = format!("verify-pin-malformed-{}@example.com", uuid::Uuid::new_v4());
         let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
         sqlx::query("UPDATE oauth_codes SET pin_hash = 'not-a-bcrypt-hash' WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .expect("corrupt stored PIN hash");
@@ -2457,7 +2467,7 @@ mod tests {
 
         let (attempts,): (i32,) =
             sqlx::query_as("SELECT pin_attempts FROM oauth_codes WHERE device_code = $1")
-                .bind(&device_code)
+                .bind(hash_token(&device_code))
                 .fetch_one(&pool)
                 .await
                 .expect("read consumed PIN attempt");
@@ -2467,7 +2477,7 @@ mod tests {
         );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
@@ -2489,7 +2499,7 @@ mod tests {
         let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
 
         sqlx::query("UPDATE oauth_codes SET expires_at = $2 WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .bind(Utc::now() - Duration::minutes(1))
             .execute(&pool)
             .await
@@ -2504,7 +2514,7 @@ mod tests {
         let (attempts, failed_total): (i32, i32) = sqlx::query_as(
             "SELECT pin_attempts, pin_failed_total FROM oauth_codes WHERE device_code = $1",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -2512,7 +2522,7 @@ mod tests {
         assert_eq!(failed_total, 0);
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
@@ -2541,7 +2551,7 @@ mod tests {
             "UPDATE oauth_codes SET pin_attempts = $2, pin_failed_total = $3, \
              pin_resend_at = NOW() - INTERVAL '10 minutes' WHERE device_code = $1",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .bind(MAX_PIN_ATTEMPTS)
         .bind(MAX_PIN_ATTEMPTS_LIFETIME - 1)
         .execute(&pool)
@@ -2554,7 +2564,7 @@ mod tests {
         let (attempts, failed_total): (i32, i32) = sqlx::query_as(
             "SELECT pin_attempts, pin_failed_total FROM oauth_codes WHERE device_code = $1",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -2575,7 +2585,7 @@ mod tests {
         assert_eq!(response_json(exhausted).await["code"], "PIN_UNAVAILABLE");
 
         sqlx::query("UPDATE oauth_codes SET pin_resend_at = NOW() - INTERVAL '10 minutes' WHERE device_code = $1")
-            .bind(&device_code).execute(&pool).await.unwrap();
+            .bind(hash_token(&device_code)).execute(&pool).await.unwrap();
         let resend_again = call_resend_pin(auth_state.clone(), &device_code).await;
         assert_eq!(resend_again.status(), axum::http::StatusCode::OK);
         let still_closed = call_verify_pin(auth_state, &device_code, "000000").await;
@@ -2586,7 +2596,7 @@ mod tests {
         );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
@@ -2610,13 +2620,13 @@ mod tests {
 
         let (old_hash,): (Option<String>,) =
             sqlx::query_as("SELECT pin_hash FROM oauth_codes WHERE device_code = $1")
-                .bind(&device_code)
+                .bind(hash_token(&device_code))
                 .fetch_one(&pool)
                 .await
                 .unwrap();
 
         sqlx::query("UPDATE oauth_codes SET expires_at = $2 WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .bind(Utc::now() - Duration::minutes(1))
             .execute(&pool)
             .await
@@ -2636,7 +2646,7 @@ mod tests {
 
         let (new_hash,): (Option<String>,) =
             sqlx::query_as("SELECT pin_hash FROM oauth_codes WHERE device_code = $1")
-                .bind(&device_code)
+                .bind(hash_token(&device_code))
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -2646,7 +2656,7 @@ mod tests {
         );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
@@ -2669,7 +2679,7 @@ mod tests {
 
         // Within the 10-minute grace: past expires_at but not yet reaped.
         sqlx::query("UPDATE oauth_codes SET expires_at = $2 WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .bind(Utc::now() - Duration::minutes(1))
             .execute(&pool)
             .await
@@ -2683,7 +2693,7 @@ mod tests {
 
         let still_present: bool =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM oauth_codes WHERE device_code = $1)")
-                .bind(&device_code)
+                .bind(hash_token(&device_code))
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -2705,7 +2715,7 @@ mod tests {
         );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
@@ -2738,7 +2748,7 @@ mod tests {
              SET pin_attempts = 2, pin_failed_total = 2, pending_password_hash = NULL \
              WHERE device_code = $1",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .execute(&pool)
         .await
         .unwrap();
@@ -2755,7 +2765,7 @@ mod tests {
             "SELECT pin_attempts, pin_failed_total FROM oauth_codes \
              WHERE device_code = $1 AND pending_email IS NOT NULL",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .fetch_one(&pool)
         .await
         .expect("the pending row must survive an incomplete-registration failure");
@@ -2767,7 +2777,7 @@ mod tests {
         );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
@@ -2791,7 +2801,7 @@ mod tests {
         // runs a real comparison; the window then closes before the result is classified.
         let expire_at = Utc::now() + Duration::milliseconds(120);
         sqlx::query("UPDATE oauth_codes SET expires_at = $2 WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .bind(expire_at)
             .execute(&pool)
             .await
@@ -2815,7 +2825,7 @@ mod tests {
             "SELECT pin_attempts, pin_failed_total FROM oauth_codes \
              WHERE device_code = $1 AND pending_email IS NOT NULL",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -2826,7 +2836,7 @@ mod tests {
         );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
@@ -2848,7 +2858,7 @@ mod tests {
         let (no_pin_pubkey, no_pin_device) =
             insert_pending_with_pin(&pool, &no_pin_email, "123456").await;
         sqlx::query("UPDATE oauth_codes SET pin_hash = NULL WHERE device_code = $1")
-            .bind(&no_pin_device)
+            .bind(hash_token(&no_pin_device))
             .execute(&pool)
             .await
             .unwrap();
@@ -2862,7 +2872,7 @@ mod tests {
         let (undelivered_pubkey, undelivered_device) =
             insert_pending_with_pin(&pool, &undelivered_email, "123456").await;
         sqlx::query("UPDATE oauth_codes SET pin_sent_at = NULL WHERE device_code = $1")
-            .bind(&undelivered_device)
+            .bind(hash_token(&undelivered_device))
             .execute(&pool)
             .await
             .unwrap();
@@ -2872,7 +2882,10 @@ mod tests {
         assert_eq!(response_json(response).await["code"], "PIN_UNAVAILABLE");
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = ANY($1)")
-            .bind(vec![no_pin_device, undelivered_device])
+            .bind(vec![
+                hash_token(&no_pin_device),
+                hash_token(&undelivered_device),
+            ])
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE pubkey = ANY($1)")
@@ -2908,7 +2921,7 @@ mod tests {
         let (attempts, failed_total): (i32, i32) = sqlx::query_as(
             "SELECT pin_attempts, pin_failed_total FROM oauth_codes WHERE device_code = $1",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -2922,7 +2935,7 @@ mod tests {
         );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
@@ -2963,7 +2976,7 @@ mod tests {
         );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
@@ -3006,7 +3019,7 @@ mod tests {
         );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE pubkey = ANY($1)")
@@ -3028,7 +3041,7 @@ mod tests {
         let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
 
         sqlx::query("UPDATE oauth_codes SET consumed_at = NOW() WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -3047,7 +3060,7 @@ mod tests {
         );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
@@ -3109,7 +3122,7 @@ mod tests {
         assert!(has_key, "the pending personal key must be applied");
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM personal_keys WHERE user_pubkey = $1")
@@ -3158,7 +3171,7 @@ mod tests {
             "UPDATE oauth_codes SET pin_attempts = 5, pin_sent_at = NOW() - INTERVAL '10 minutes', \
              pin_resend_at = NOW() - INTERVAL '10 minutes' WHERE device_code = $1",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .execute(&pool)
         .await
         .unwrap();
@@ -3166,7 +3179,7 @@ mod tests {
         let (old_hash, old_token): (Option<String>, Option<String>) = sqlx::query_as(
             "SELECT pin_hash, pending_email_verification_token FROM oauth_codes WHERE device_code = $1",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -3177,7 +3190,7 @@ mod tests {
         let (attempts, new_hash, new_token): (i32, Option<String>, Option<String>) = sqlx::query_as(
             "SELECT pin_attempts, pin_hash, pending_email_verification_token FROM oauth_codes WHERE device_code = $1",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -3190,7 +3203,7 @@ mod tests {
         );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
@@ -3217,7 +3230,7 @@ mod tests {
         sqlx::query(
             "UPDATE oauth_codes SET pin_attempts = 5, pin_sent_at = NOW() WHERE device_code = $1",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .execute(&pool)
         .await
         .unwrap();
@@ -3226,7 +3239,7 @@ mod tests {
             sqlx::query_as(
                 "SELECT pin_hash, pin_resend_at FROM oauth_codes WHERE device_code = $1",
             )
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -3245,7 +3258,7 @@ mod tests {
         ) = sqlx::query_as(
             "SELECT pin_attempts, pin_hash, pin_resend_at FROM oauth_codes WHERE device_code = $1",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -3261,7 +3274,7 @@ mod tests {
         );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
@@ -3283,7 +3296,7 @@ mod tests {
         sqlx::query(
             "UPDATE oauth_codes SET pin_sent_at = NOW(), pin_resend_at = NOW() WHERE device_code = $1",
         )
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -3291,7 +3304,7 @@ mod tests {
         let (old_hash, old_token): (Option<String>, Option<String>) = sqlx::query_as(
             "SELECT pin_hash, pending_email_verification_token FROM oauth_codes WHERE device_code = $1",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -3303,7 +3316,7 @@ mod tests {
         let (new_hash, new_token): (Option<String>, Option<String>) = sqlx::query_as(
             "SELECT pin_hash, pending_email_verification_token FROM oauth_codes WHERE device_code = $1",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -3312,7 +3325,7 @@ mod tests {
         assert_eq!(new_token, old_token, "cooldown must not re-mint the token");
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
@@ -3337,7 +3350,7 @@ mod tests {
             "UPDATE oauth_codes SET pin_attempts = 5, pin_sent_at = $2, pin_resend_at = $2 \
              WHERE device_code = $1",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .bind(old_sent_at)
         .execute(&pool)
         .await
@@ -3356,7 +3369,7 @@ mod tests {
 
         let (old_hash, old_token, old_attempts, old_pin_sent_at, old_pin_resend_at): ResendFields =
             sqlx::query_as(RESEND_FIELDS_SQL)
-                .bind(&device_code)
+                .bind(hash_token(&device_code))
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -3366,7 +3379,7 @@ mod tests {
 
         let (new_hash, new_token, new_attempts, new_pin_sent_at, new_pin_resend_at): ResendFields =
             sqlx::query_as(RESEND_FIELDS_SQL)
-                .bind(&device_code)
+                .bind(hash_token(&device_code))
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -3390,7 +3403,7 @@ mod tests {
         );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
@@ -3413,7 +3426,7 @@ mod tests {
         let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
 
         sqlx::query("UPDATE oauth_codes SET pin_resend_at = NOW() - INTERVAL '10 minutes' WHERE device_code = $1")
-            .bind(&device_code).execute(&pool).await.unwrap();
+            .bind(hash_token(&device_code)).execute(&pool).await.unwrap();
 
         type Snap = (
             Option<String>,
@@ -3424,13 +3437,13 @@ mod tests {
         );
         let (b_hash, b_token, b_attempts, b_sent, b_resend): Snap =
             sqlx::query_as("SELECT pin_hash, pending_email_verification_token, pin_attempts, pin_sent_at, pin_resend_at FROM oauth_codes WHERE device_code = $1")
-                .bind(&device_code).fetch_one(&pool).await.unwrap();
+                .bind(hash_token(&device_code)).fetch_one(&pool).await.unwrap();
 
         let r = call_resend_pin(auth_state, &device_code).await;
         assert_eq!(r.status(), axum::http::StatusCode::OK);
         let (a_hash,): (Option<String>,) =
             sqlx::query_as("SELECT pin_hash FROM oauth_codes WHERE device_code = $1")
-                .bind(&device_code)
+                .bind(hash_token(&device_code))
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -3444,7 +3457,7 @@ mod tests {
                 &device_code,
                 1,
                 keycast_core::repositories::PinResendSnapshot {
-                    verification_token: b_token.as_deref(),
+                    verification_token_hash: b_token.as_deref(),
                     pin_hash: b_hash.as_deref(),
                     pin_attempts: b_attempts,
                     pin_sent_at: b_sent,
@@ -3458,7 +3471,7 @@ mod tests {
 
         let (final_hash,): (Option<String>,) =
             sqlx::query_as("SELECT pin_hash FROM oauth_codes WHERE device_code = $1")
-                .bind(&device_code)
+                .bind(hash_token(&device_code))
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -3469,7 +3482,7 @@ mod tests {
         );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
@@ -3492,7 +3505,7 @@ mod tests {
         sqlx::query(
             "UPDATE oauth_codes SET consumed_at = NOW(), pin_sent_at = NOW() - INTERVAL '10 minutes' WHERE device_code = $1",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .execute(&pool)
         .await
         .unwrap();
@@ -3501,7 +3514,7 @@ mod tests {
             sqlx::query_as(
                 "SELECT pin_hash, pending_email_verification_token, pin_attempts FROM oauth_codes WHERE device_code = $1",
             )
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -3513,7 +3526,7 @@ mod tests {
             sqlx::query_as(
                 "SELECT pin_hash, pending_email_verification_token, pin_attempts FROM oauth_codes WHERE device_code = $1",
             )
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -3529,7 +3542,7 @@ mod tests {
         );
 
         let _ = sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await;
         let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")

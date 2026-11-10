@@ -224,7 +224,7 @@ impl OAuthAuthorizationRepository {
              RETURNING id",
         )
         .bind(params.tenant_id)
-        .bind(code)
+        .bind(crate::token_hash::hash_token(code))
         .bind(&auth_code.user_pubkey)
         .bind(&auth_code.client_id)
         .bind(&auth_code.redirect_uri)
@@ -233,8 +233,8 @@ impl OAuthAuthorizationRepository {
         .bind(auth_code.code_challenge_method.as_deref())
         .bind(auth_code.state.as_deref())
         .bind(auth_code.is_headless)
-        .bind(auth_code.pending_email_verification_token.as_deref())
-        .bind(auth_code.device_code.as_deref())
+        .bind(auth_code.pending_email_verification_token_hash.as_deref())
+        .bind(auth_code.device_code_hash.as_deref())
         .bind(&params.user_pubkey)
         .bind(&params.redirect_origin)
         .bind(&params.client_id)
@@ -797,7 +797,7 @@ mod tests {
             .unwrap();
         let auth_code = code_repo.find_valid(1, &code).await.unwrap().unwrap();
         sqlx::query("UPDATE oauth_codes SET consumed_at = clock_timestamp() WHERE code = $1")
-            .bind(&code)
+            .bind(crate::token_hash::hash_token(&code))
             .execute(pool)
             .await
             .unwrap();
@@ -826,7 +826,7 @@ mod tests {
 
         let mut blocker = pool.begin().await.unwrap();
         sqlx::query("SELECT code FROM oauth_codes WHERE code = $1 FOR UPDATE")
-            .bind(&code)
+            .bind(crate::token_hash::hash_token(&code))
             .fetch_one(&mut *blocker)
             .await
             .unwrap();
@@ -873,7 +873,7 @@ mod tests {
 
         let mut blocker = pool.begin().await.unwrap();
         sqlx::query("SELECT code FROM oauth_codes WHERE code = $1 FOR UPDATE")
-            .bind(&code)
+            .bind(crate::token_hash::hash_token(&code))
             .fetch_one(&mut *blocker)
             .await
             .unwrap();
@@ -889,7 +889,7 @@ mod tests {
         // The waiter's statement began before this instant, so only a post-lock clock read sees
         // the claim as expired.
         sqlx::query("UPDATE oauth_codes SET expires_at = clock_timestamp() WHERE code = $1")
-            .bind(&code)
+            .bind(crate::token_hash::hash_token(&code))
             .execute(&mut *blocker)
             .await
             .unwrap();

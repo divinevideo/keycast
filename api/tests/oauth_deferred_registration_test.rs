@@ -52,13 +52,13 @@ async fn test_oauth_register_defers_user_creation() {
          pending_email, pending_password_hash, pending_email_verification_token)
          VALUES ($1, $2, 'Test App', $3, 'sign', $4, 1, NOW(), $5, $6, $7)"
     )
-    .bind(&code)
+    .bind(keycast_core::token_hash::hash_token(&code))
     .bind(&user_pubkey)
     .bind(format!("{}/callback", redirect_origin))
     .bind(Utc::now() + Duration::minutes(10))
     .bind(&email)
     .bind(password_hash)
-    .bind(&verification_token)
+    .bind(keycast_core::token_hash::hash_token(&verification_token))
     .execute(&pool)
     .await
     .expect("Should insert oauth_code with pending data");
@@ -68,7 +68,7 @@ async fn test_oauth_register_defers_user_creation() {
         "SELECT pending_email, pending_password_hash, pending_email_verification_token
          FROM oauth_codes WHERE code = $1",
     )
-    .bind(&code)
+    .bind(keycast_core::token_hash::hash_token(&code))
     .fetch_optional(&pool)
     .await
     .expect("Query should succeed");
@@ -80,7 +80,10 @@ async fn test_oauth_register_defers_user_creation() {
     let (stored_email, stored_hash, stored_token) = oauth_code.unwrap();
     assert_eq!(stored_email, email);
     assert_eq!(stored_hash, password_hash);
-    assert_eq!(stored_token, verification_token);
+    assert_eq!(
+        stored_token,
+        keycast_core::token_hash::hash_token(&verification_token)
+    );
 
     // Verify users table has NO row for this pubkey
     let user_exists: bool =
@@ -135,13 +138,13 @@ async fn test_token_exchange_creates_user_and_keys() {
          pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret)
          VALUES ($1, $2, 'Test App', $3, 'sign', $4, 1, NOW(), $5, $6, $7, $8)"
     )
-    .bind(&code)
+    .bind(keycast_core::token_hash::hash_token(&code))
     .bind(&user_pubkey)
     .bind(format!("{}/callback", redirect_origin))
     .bind(Utc::now() + Duration::minutes(10))
     .bind(&email)
     .bind(password_hash)
-    .bind(&verification_token)
+    .bind(keycast_core::token_hash::hash_token(&verification_token))
     .bind(mock_encrypted_secret)
     .execute(&pool)
     .await
@@ -153,7 +156,7 @@ async fn test_token_exchange_creates_user_and_keys() {
         "SELECT pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret
          FROM oauth_codes WHERE code = $1 AND expires_at > NOW()"
     )
-    .bind(&code)
+    .bind(keycast_core::token_hash::hash_token(&code))
     .fetch_one(&pool)
     .await
     .expect("Should find oauth_code");
@@ -193,7 +196,7 @@ async fn test_token_exchange_creates_user_and_keys() {
 
     // Delete oauth_code (consumed)
     sqlx::query("DELETE FROM oauth_codes WHERE code = $1")
-        .bind(&code)
+        .bind(keycast_core::token_hash::hash_token(&code))
         .execute(&pool)
         .await
         .expect("Should delete oauth_code");
@@ -249,9 +252,9 @@ async fn test_incomplete_oauth_allows_reregistration() {
     sqlx::query(
         "INSERT INTO oauth_codes (code, user_pubkey, client_id, redirect_uri, scope, expires_at, tenant_id, created_at,
          pending_email, pending_password_hash, pending_email_verification_token)
-         VALUES ($1, $2, 'Test App', $3, 'sign', $4, 1, NOW(), $5, 'hash1', 'token1')"
+         VALUES ($1, $2, 'Test App', $3, 'sign', $4, 1, NOW(), $5, 'hash1', encode(sha256(convert_to('token1', 'UTF8')), 'hex'))"
     )
-    .bind(&code_1)
+    .bind(keycast_core::token_hash::hash_token(&code_1))
     .bind(&user_pubkey_1)
     .bind(format!("{}/callback", redirect_origin))
     .bind(Utc::now() + Duration::minutes(10))
@@ -325,7 +328,7 @@ async fn test_incomplete_oauth_allows_reregistration() {
         (
             user_pubkey_2.clone(),
             "hash2".to_string(),
-            "token2".to_string()
+            keycast_core::token_hash::hash_token("token2")
         ),
         "the newest registration attempt must win every pending field"
     );
@@ -509,14 +512,15 @@ async fn test_autogenerate_creates_user_at_token_exchange() {
     sqlx::query(
         "INSERT INTO oauth_codes (code, user_pubkey, client_id, redirect_uri, scope, expires_at, tenant_id, created_at,
          pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret)
-         VALUES ($1, $2, 'Auto-Generate App', $3, 'sign', $4, 1, NOW(), $5, 'hash', 'token', $6)"
+         VALUES ($1, $2, 'Auto-Generate App', $3, 'sign', $4, 1, NOW(), $5, 'hash', $7, $6)"
     )
-    .bind(&code)
+    .bind(keycast_core::token_hash::hash_token(&code))
     .bind(&user_pubkey)
     .bind(format!("{}/callback", redirect_origin))
     .bind(Utc::now() + Duration::minutes(10))
     .bind(&email)
     .bind(mock_encrypted_secret)
+    .bind(keycast_core::token_hash::hash_token("token"))
     .execute(&pool)
     .await
     .expect("oauth_register should succeed");
@@ -525,7 +529,7 @@ async fn test_autogenerate_creates_user_at_token_exchange() {
     let has_pending: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM oauth_codes WHERE code = $1 AND pending_email = $2 AND pending_encrypted_secret IS NOT NULL)"
     )
-    .bind(&code)
+    .bind(keycast_core::token_hash::hash_token(&code))
     .bind(&email)
     .fetch_one(&pool)
     .await
@@ -551,7 +555,7 @@ async fn test_autogenerate_creates_user_at_token_exchange() {
         "SELECT pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret
          FROM oauth_codes WHERE code = $1"
     )
-    .bind(&code)
+    .bind(keycast_core::token_hash::hash_token(&code))
     .fetch_one(&pool)
     .await
     .expect("Should find oauth_code");
@@ -583,7 +587,7 @@ async fn test_autogenerate_creates_user_at_token_exchange() {
 
     // Delete oauth_code
     sqlx::query("DELETE FROM oauth_codes WHERE code = $1")
-        .bind(&code)
+        .bind(keycast_core::token_hash::hash_token(&code))
         .execute(&pool)
         .await
         .expect("Should delete oauth_code");

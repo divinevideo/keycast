@@ -2,6 +2,7 @@
 // ABOUTME: Provides methods for finding, creating, and querying user data
 
 use crate::repositories::RepositoryError;
+use crate::token_hash::hash_token;
 use crate::types::user::{User, UserAtprotoState, UserStatus};
 use chrono::{DateTime, TimeZone, Utc};
 use nostr_sdk::PublicKey;
@@ -810,7 +811,7 @@ impl UserRepository {
         .bind(email)
         .bind(password_hash)
         .bind(email_verified)
-        .bind(verification_token)
+        .bind(hash_token(verification_token))
         .bind(verification_expires_at)
         .bind(Utc::now())
         .bind(Utc::now())
@@ -845,7 +846,7 @@ impl UserRepository {
         .bind(email)
         .bind(password_hash)
         .bind(email_verified)
-        .bind(email_verification_token)
+        .bind(email_verification_token.map(hash_token))
         .bind(Utc::now())
         .bind(Utc::now())
         .execute(&self.pool)
@@ -898,7 +899,7 @@ impl UserRepository {
         .bind(email)
         .bind(password_hash)
         .bind(false)
-        .bind(verification_token)
+        .bind(hash_token(verification_token))
         .bind(verification_expires_at)
         .bind(now)
         .bind(now)
@@ -936,7 +937,7 @@ impl UserRepository {
             "SELECT pubkey, email_verification_expires_at, password_hash, created_at, email_verified FROM users
              WHERE email_verification_token = $1 AND tenant_id = $2",
         )
-        .bind(token)
+        .bind(hash_token(token))
         .bind(tenant_id)
         .fetch_optional(&self.pool)
         .await
@@ -987,7 +988,7 @@ impl UserRepository {
              SET email_verification_token = $1, email_verification_expires_at = $2, email_verification_sent_at = $3, updated_at = $4
              WHERE pubkey = $5 AND tenant_id = $6",
         )
-        .bind(token)
+        .bind(hash_token(token))
         .bind(expires_at)
         .bind(Utc::now())
         .bind(Utc::now())
@@ -1043,7 +1044,7 @@ impl UserRepository {
              SET email_verification_token = $1, email_verification_expires_at = $2, email_verification_sent_at = $3, updated_at = $4
              WHERE email = $5 AND tenant_id = $6",
         )
-        .bind(token)
+        .bind(hash_token(token))
         .bind(expires_at)
         .bind(Utc::now())
         .bind(Utc::now())
@@ -1071,7 +1072,7 @@ impl UserRepository {
              SET password_reset_token = $1, password_reset_expires_at = $2, updated_at = $3
              WHERE pubkey = $4 AND tenant_id = $5",
         )
-        .bind(token)
+        .bind(hash_token(token))
         .bind(expires_at)
         .bind(Utc::now())
         .bind(pubkey)
@@ -1091,7 +1092,7 @@ impl UserRepository {
             "SELECT pubkey, password_reset_expires_at FROM users
              WHERE password_reset_token = $1 AND tenant_id = $2",
         )
-        .bind(token)
+        .bind(hash_token(token))
         .bind(tenant_id)
         .fetch_optional(&self.pool)
         .await
@@ -1156,8 +1157,8 @@ impl UserRepository {
              WHERE pubkey = $6 AND tenant_id = $7",
         )
         .bind(new_email)
-        .bind(old_token)
-        .bind(new_token)
+        .bind(hash_token(old_token))
+        .bind(hash_token(new_token))
         .bind(expires_at)
         .bind(now)
         .bind(pubkey)
@@ -1203,6 +1204,7 @@ impl UserRepository {
             Option<String>,        // pending_email_old_token
             Option<String>,        // pending_email_new_token
         );
+        let token_hash = hash_token(token);
         let row: Option<Row> = sqlx::query_as(
             "SELECT pubkey, pending_email, pending_email_expires_at,
                     pending_email_old_confirmed_at, pending_email_new_confirmed_at,
@@ -1211,14 +1213,14 @@ impl UserRepository {
              WHERE (pending_email_old_token = $1 OR pending_email_new_token = $1)
                AND tenant_id = $2",
         )
-        .bind(token)
+        .bind(&token_hash)
         .bind(tenant_id)
         .fetch_optional(&self.pool)
         .await?;
 
         Ok(row.map(
             |(pubkey, email, expires, old_conf, new_conf, old_tok, _new_tok)| {
-                let side = if old_tok.as_deref() == Some(token) {
+                let side = if old_tok.as_deref() == Some(token_hash.as_str()) {
                     PendingEmailSide::Old
                 } else {
                     PendingEmailSide::New
@@ -1263,7 +1265,7 @@ impl UserRepository {
             .bind(Utc::now())
             .bind(pubkey)
             .bind(tenant_id)
-            .bind(token)
+            .bind(hash_token(token))
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() > 0)
@@ -1397,7 +1399,7 @@ impl UserRepository {
         .bind(Utc::now())
         .bind(pubkey)
         .bind(tenant_id)
-        .bind(token)
+        .bind(hash_token(token))
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
@@ -2011,7 +2013,7 @@ impl UserRepository {
         .bind(email)
         .bind(password_hash)
         .bind(false)
-        .bind(verification_token)
+        .bind(hash_token(verification_token))
         .bind(verification_expires_at)
         .bind(now)
         .bind(now)
@@ -2034,7 +2036,7 @@ impl UserRepository {
         // Delete the oauth code (one-time use)
         sqlx::query("DELETE FROM oauth_codes WHERE tenant_id = $1 AND code = $2")
             .bind(tenant_id)
-            .bind(oauth_code)
+            .bind(hash_token(oauth_code))
             .execute(&mut *tx)
             .await?;
 
@@ -2134,7 +2136,7 @@ impl UserRepository {
         )
         .bind(email)
         .bind(password_hash)
-        .bind(verification_token)
+        .bind(verification_token.map(hash_token))
         .bind(now)
         .bind(pubkey)
         .bind(tenant_id)
@@ -2822,7 +2824,7 @@ impl UserRepository {
              WHERE t.id = locked.id
              RETURNING locked.user_pubkey, locked.pending_email, locked.pending_password_hash",
         )
-        .bind(confirmation_token)
+        .bind(hash_token(confirmation_token))
         .bind(tenant_id)
         .fetch_optional(&mut *tx)
         .await?;
@@ -5425,7 +5427,7 @@ mod tests {
         assert_eq!(row.0.as_deref(), Some(email.as_str()));
         assert_eq!(row.1.as_deref(), Some("hash"));
         assert!(row.2, "email_verified should be set");
-        assert_eq!(row.3.as_deref(), Some(token.as_str()));
+        assert_eq!(row.3, Some(hash_token(&token)));
 
         let stored_secret: (Vec<u8>,) =
             sqlx::query_as("SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1")
@@ -5706,7 +5708,7 @@ mod tests {
         assert_eq!(row.0.as_deref(), Some(email.as_str()));
         assert_eq!(row.1.as_deref(), Some("pending-hash"));
         assert!(row.2, "same-email row must be marked verified");
-        assert_eq!(row.3.as_deref(), Some("token"));
+        assert_eq!(row.3, Some(hash_token("token")));
 
         let keys: Vec<(Vec<u8>,)> =
             sqlx::query_as("SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1")

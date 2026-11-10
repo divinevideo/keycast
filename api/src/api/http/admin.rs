@@ -469,7 +469,7 @@ pub struct GetClaimTokenQuery {
 pub struct GetClaimTokenResponse {
     pub has_token: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub claim_url: Option<String>,
+    pub created_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
 }
@@ -493,20 +493,14 @@ pub async fn get_claim_token(
         .await?;
 
     match token {
-        Some(ct) => {
-            let app_url =
-                std::env::var("APP_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
-            let claim_url = format!("{}/api/claim?token={}", app_url, ct.token);
-
-            Ok(Json(GetClaimTokenResponse {
-                has_token: true,
-                claim_url: Some(claim_url),
-                expires_at: Some(ct.expires_at.to_rfc3339()),
-            }))
-        }
+        Some(ct) => Ok(Json(GetClaimTokenResponse {
+            has_token: true,
+            created_at: Some(ct.created_at.to_rfc3339()),
+            expires_at: Some(ct.expires_at.to_rfc3339()),
+        })),
         None => Ok(Json(GetClaimTokenResponse {
             has_token: false,
-            claim_url: None,
+            created_at: None,
             expires_at: None,
         })),
     }
@@ -3017,23 +3011,15 @@ pub async fn create_minor_account(
             )));
         }
 
-        // Existing unclaimed minor — return existing valid token or create a new one
-        let claim_token = if let Some(existing_token) = claim_token_repo
-            .find_valid_by_user_pubkey(&existing_pubkey, tenant_id)
-            .await?
-        {
-            existing_token
-        } else {
-            let token = generate_claim_token();
-            let (new_token, _invalidated) = claim_token_repo
-                .create_with_prior_invalidation(&token, &existing_pubkey, None, tenant_id)
-                .await?;
-            new_token
-        };
+        // Raw links cannot be recovered. A retry replaces the previous link.
+        let token = generate_claim_token();
+        let (claim_token, _) = claim_token_repo
+            .create_with_prior_invalidation(&token, &existing_pubkey, None, tenant_id)
+            .await?;
 
         let app_url =
             std::env::var("APP_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
-        let claim_url = format!("{}/api/claim?token={}", app_url, claim_token.token);
+        let claim_url = format!("{}/api/claim?token={}", app_url, token);
 
         tracing::info!(
             event = "minor_account_retry",
@@ -3079,22 +3065,14 @@ pub async fn create_minor_account(
                 .find_user_minor_status_by_username(&username, tenant_id)
                 .await?
             {
-                let claim_token = if let Some(existing_token) = claim_token_repo
-                    .find_valid_by_user_pubkey(&dup_pubkey, tenant_id)
-                    .await?
-                {
-                    existing_token
-                } else {
-                    let token = generate_claim_token();
-                    let (new_token, _) = claim_token_repo
-                        .create_with_prior_invalidation(&token, &dup_pubkey, None, tenant_id)
-                        .await?;
-                    new_token
-                };
+                let token = generate_claim_token();
+                let (claim_token, _) = claim_token_repo
+                    .create_with_prior_invalidation(&token, &dup_pubkey, None, tenant_id)
+                    .await?;
 
                 let app_url = std::env::var("APP_URL")
                     .unwrap_or_else(|_| "http://localhost:3000".to_string());
-                let claim_url = format!("{}/api/claim?token={}", app_url, claim_token.token);
+                let claim_url = format!("{}/api/claim?token={}", app_url, token);
 
                 return Ok((
                     StatusCode::OK,
@@ -3138,7 +3116,7 @@ pub async fn create_minor_account(
         .await?;
 
     let app_url = std::env::var("APP_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
-    let claim_url = format!("{}/api/claim?token={}", app_url, claim_token.token);
+    let claim_url = format!("{}/api/claim?token={}", app_url, token);
 
     tracing::info!(
         event = "minor_account_created",

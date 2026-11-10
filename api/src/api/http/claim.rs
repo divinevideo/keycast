@@ -705,23 +705,17 @@ pub async fn claim_resend_post(
         .await
         .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?
     {
-        // Rotate the confirmation token only if the previous one expired;
-        // otherwise resend the same one so an already-delivered, unclicked
-        // link keeps working. Mint the candidate before the guarded write so
+        // Raw confirmation tokens are not recoverable. Mint a new one before the guarded write so
         // the rotation lands in that same statement; if the write loses (still
         // in cooldown, out of budget, token died) the freshly minted value is
         // simply discarded unused.
-        let rotated = if state.confirmation_expired {
-            Some((
-                super::auth::generate_secure_token(),
-                Utc::now()
-                    + Duration::hours(
-                        keycast_core::types::claim_token::CLAIM_CONFIRMATION_EXPIRY_HOURS,
-                    ),
-            ))
-        } else {
-            None
-        };
+        let rotated = (
+            super::auth::generate_secure_token(),
+            Utc::now()
+                + Duration::hours(
+                    keycast_core::types::claim_token::CLAIM_CONFIRMATION_EXPIRY_HOURS,
+                ),
+        );
 
         let source = email_delivery.coarse_source(&headers);
         let reservation = match email_delivery
@@ -749,7 +743,8 @@ pub async fn claim_resend_post(
             .touch_claim_confirmation(
                 &form.token,
                 tenant_id,
-                rotated.as_ref().map(|(t, e)| (t.as_str(), *e)),
+                (&rotated.0, rotated.1),
+                &state.confirmation_token_hash,
                 super::auth::CLAIM_RESEND_COOLDOWN_MINUTES,
             )
             .await
@@ -763,18 +758,13 @@ pub async fn claim_resend_post(
         };
 
         if claimed_slot {
-            let confirmation_token = match &rotated {
-                Some((fresh, _)) => fresh.clone(),
-                None => state.confirmation_token,
-            };
-
             // Best-effort send: log and continue rather than fail the
             // response. Failing here would leak, via a 500 vs 200, whether a
             // pending claim exists for this token -- and a claimer who
             // retries a failed send has nothing better to do than resend
             // again anyway.
             if let Err(e) = email_delivery
-                .send_claim_confirmation(&state.to_email, &confirmation_token)
+                .send_claim_confirmation(&state.to_email, &rotated.0)
                 .await
             {
                 tracing::error!("Failed to resend claim confirmation: {}", e);
@@ -801,7 +791,7 @@ async fn confirmation_error(
         .await
         .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?;
 
-    let Some((claim_token, confirmation_expires_at)) = row else {
+    let Some((claim_state, confirmation_expires_at)) = row else {
         // No row: unrecognized token, already consumed (idempotent re-click
         // behavior, intentional), or superseded by a resend that rotated an
         // expired confirmation token to a fresh value.
@@ -821,20 +811,14 @@ async fn confirmation_error(
     }
 
     use keycast_core::types::claim_token::ClaimTokenState;
-    Ok(
-        match claim_token_repo
-            .classify(&claim_token, tenant_id)
-            .await
-            .map_err(|e| ClaimError::Internal(format!("Database error: {}", e)))?
-        {
-            ClaimTokenState::Valid(_) => None,
-            ClaimTokenState::AlreadyClaimed(_) => Some(ClaimError::TokenAlreadyClaimed),
-            ClaimTokenState::AdminInvalidated(_) => Some(ClaimError::TokenAdminInvalidated),
-            ClaimTokenState::Replaced { .. } => Some(ClaimError::TokenReplaced),
-            ClaimTokenState::Expired(_) => Some(ClaimError::TokenExpired),
-            ClaimTokenState::Unrecognized => Some(ClaimError::TokenUnrecognized),
-        },
-    )
+    Ok(match claim_state {
+        ClaimTokenState::Valid(_) => None,
+        ClaimTokenState::AlreadyClaimed(_) => Some(ClaimError::TokenAlreadyClaimed),
+        ClaimTokenState::AdminInvalidated(_) => Some(ClaimError::TokenAdminInvalidated),
+        ClaimTokenState::Replaced { .. } => Some(ClaimError::TokenReplaced),
+        ClaimTokenState::Expired(_) => Some(ClaimError::TokenExpired),
+        ClaimTokenState::Unrecognized => Some(ClaimError::TokenUnrecognized),
+    })
 }
 
 /// Success page shown after `claim_confirm_post` completes a claim. Moved here

@@ -19,6 +19,42 @@ Keycast is a hosted NIP-46 (Nostr remote signer) bunker service. We take securit
 - ✅ **NIP-44 encryption** for bunker communication over Nostr relays
 - ✅ **gRPC with mTLS** for KMS API calls
 
+### Recovery and claim links
+
+Password-reset, email-verification, email-change and account-claim token values
+are stored as lowercase SHA-256 digests. Repository methods hash the presented
+raw token before matching; the stored digest is not a working link. These tokens
+are generated with cryptographic randomness. Passwords and short PINs retain
+their password-hashing algorithms, not this fast token hash.
+
+OAuth authorization codes, device credentials, pending-registration email tokens
+and ATProto authorization codes use the same digest storage. Repeated registration
+rotates its device credential; repeated finalization replaces an unclaimed
+exchange code instead of recovering it. A code already being redeemed remains
+protected from replacement. Polling uses a hashed device-keyed readiness marker
+containing only the verified generation digest, then creates a fresh code for
+the response. Raw exchange codes are not cached in Redis.
+
+Claim links are shown only when generated. Support lookup returns existence,
+creation time and expiry, never a recoverable URL. Generating another link or
+retrying unclaimed account provisioning replaces the previous claim link.
+Resending a claim confirmation creates a new confirmation link and invalidates
+the earlier one; existing cooldowns and lifetime send limits still apply.
+
+Support lookup and newly generated links (synthetic account):
+
+![Existing claim-link metadata without a recoverable URL](images/claim-link-metadata.png)
+
+![A newly generated claim link shown for copying](images/claim-link-new.png)
+
+The token-hashing migration backfills existing values without changing their
+expiry, so outstanding links continue to work. Digest-format constraints reject
+legacy token formats: token issuance requires the matching application version
+after migration. Do not roll back only the application binary across this schema
+change. Migration execution and rollout remain operator-controlled actions.
+Older plaintext polling-cache entries are not read by the new polling path;
+an in-flight app may need to verify again to establish the new readiness marker.
+
 ### Password Login Protection
 
 Password login uses a tenant-scoped attempt budget shared by the web, OAuth popup, and
