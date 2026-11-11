@@ -1921,6 +1921,8 @@ pub struct FinalizedRegistration {
 /// How a freshly minted headless exchange code reaches the waiting app.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum HeadlessDelivery {
+    /// A browser delivery choice publishes readiness without disclosing a code yet.
+    PollingRequired,
     /// Email-link path: publish only readiness; the authenticated poll creates the code.
     RedisRequired,
     /// Direct response path: return a newly minted code without publishing polling readiness.
@@ -1960,7 +1962,9 @@ pub async fn finalize_pending_registration(
     };
 
     // Validate device binding and delivery availability before preparing a headless handoff.
-    let strict_delivery = if oauth_data.is_headless && delivery == HeadlessDelivery::RedisRequired {
+    let strict_delivery = if delivery == HeadlessDelivery::PollingRequired
+        || (oauth_data.is_headless && delivery == HeadlessDelivery::RedisRequired)
+    {
         let device_code = oauth_data.device_code_hash.as_ref().ok_or_else(|| {
             tracing::error!(
                 event = "headless_poll_delivery_failed",
@@ -2049,6 +2053,8 @@ pub async fn finalize_pending_registration(
 
 /// Result of running the interactive POST email-verification logic.
 enum VerifyOutcome {
+    /// Both browser delivery paths remain available; no code has been disclosed here.
+    BrowserChoice,
     /// Non-headless OAuth: send the browser to the client callback carrying a fresh code.
     OAuthRedirect { redirect_url: String },
     /// Headless (mobile app): the app polls for the code; the page just shows success.
@@ -2066,6 +2072,7 @@ enum VerifyOutcome {
 /// Outcomes that a server-side GET may produce. This deliberately excludes first-party user
 /// verification and session issuance, which require the interactive POST flow.
 enum PendingVerifyOutcome {
+    BrowserChoice,
     OAuthRedirect { redirect_url: String },
     Headless,
     AlreadyVerified,
@@ -2077,6 +2084,7 @@ async fn perform_pending_email_verification(
     auth_state: &super::routes::AuthState,
     tenant_id: i64,
     token: &str,
+    continue_here: bool,
 ) -> Result<Option<PendingVerifyOutcome>, AuthError> {
     let pool = &auth_state.state.db;
     let oauth_code_repo = OAuthCodeRepository::new(pool.clone());
@@ -2099,12 +2107,22 @@ async fn perform_pending_email_verification(
     // Complete via the shared finalize path. This intentionally does NOT delete the pending row:
     // re-verifying within the 24h window re-arms a fresh 10-minute code, which makes link
     // prefetch/preview harmless. Once token issuance completes, finalize refuses to re-mint.
+    let browser_choice = !oauth_data.is_headless
+        && oauth_data.device_code_hash.is_some()
+        && auth_state.state.redis.is_some()
+        && !continue_here;
     let finalized = match finalize_pending_registration(
         pool,
         auth_state.state.redis.as_ref(),
         tenant_id,
         &oauth_data,
-        HeadlessDelivery::RedisRequired,
+        if browser_choice {
+            HeadlessDelivery::PollingRequired
+        } else if continue_here && !oauth_data.is_headless {
+            HeadlessDelivery::RedisBestEffort
+        } else {
+            HeadlessDelivery::RedisRequired
+        },
     )
     .await
     {
@@ -2114,6 +2132,10 @@ async fn perform_pending_email_verification(
         }
         Err(e) => return Err(e),
     };
+
+    if browser_choice {
+        return Ok(Some(PendingVerifyOutcome::BrowserChoice));
+    }
 
     if finalized.new_code.is_none() {
         tracing::info!(
@@ -2145,14 +2167,30 @@ async fn perform_pending_email_verification(
 
 /// Core POST email-verification logic. OAuth/headless pending rows finalize server-side; normal
 /// first-party registrations are verified and receive a session only through this interactive POST.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VerificationDelivery {
+    Automatic,
+    Direct,
+    OAuthDirect,
+}
+
 async fn perform_email_verification(
     auth_state: &super::routes::AuthState,
     headers: &HeaderMap,
     tenant_id: i64,
     token: &str,
+    delivery: VerificationDelivery,
 ) -> Result<VerifyOutcome, AuthError> {
-    if let Some(outcome) = perform_pending_email_verification(auth_state, tenant_id, token).await? {
+    if let Some(outcome) = perform_pending_email_verification(
+        auth_state,
+        tenant_id,
+        token,
+        delivery != VerificationDelivery::Automatic,
+    )
+    .await?
+    {
         return Ok(match outcome {
+            PendingVerifyOutcome::BrowserChoice => VerifyOutcome::BrowserChoice,
             PendingVerifyOutcome::OAuthRedirect { redirect_url } => {
                 VerifyOutcome::OAuthRedirect { redirect_url }
             }
@@ -2160,6 +2198,10 @@ async fn perform_email_verification(
             PendingVerifyOutcome::AlreadyVerified => VerifyOutcome::AlreadyVerified,
             PendingVerifyOutcome::Expired => VerifyOutcome::Expired,
         });
+    }
+
+    if delivery == VerificationDelivery::OAuthDirect {
+        return Err(AuthError::VerificationLinkSuperseded);
     }
 
     let pool = &auth_state.state.db;
@@ -2286,11 +2328,64 @@ pub async fn verify_email(
     headers: HeaderMap,
     Json(req): Json<VerifyEmailRequest>,
 ) -> Result<impl IntoResponse, AuthError> {
+    verify_email_with_delivery(
+        tenant,
+        State(auth_state),
+        headers,
+        Json(req),
+        VerificationDelivery::Direct,
+    )
+    .await
+}
+
+/// Prepare browser polling/window selection while retaining first-party verification behavior.
+pub async fn verify_email_prepare(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<super::routes::AuthState>,
+    headers: HeaderMap,
+    Json(req): Json<VerifyEmailRequest>,
+) -> Result<impl IntoResponse, AuthError> {
+    verify_email_with_delivery(
+        tenant,
+        State(auth_state),
+        headers,
+        Json(req),
+        VerificationDelivery::Automatic,
+    )
+    .await
+}
+
+/// Explicit browser delivery, authenticated by the same emailed verification token.
+pub async fn verify_email_here(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<super::routes::AuthState>,
+    headers: HeaderMap,
+    Json(req): Json<VerifyEmailRequest>,
+) -> Result<impl IntoResponse, AuthError> {
+    verify_email_with_delivery(
+        tenant,
+        State(auth_state),
+        headers,
+        Json(req),
+        VerificationDelivery::OAuthDirect,
+    )
+    .await
+}
+
+async fn verify_email_with_delivery(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<super::routes::AuthState>,
+    headers: HeaderMap,
+    Json(req): Json<VerifyEmailRequest>,
+    delivery: VerificationDelivery,
+) -> Result<impl IntoResponse, AuthError> {
     let tenant_id = tenant.0.id;
     // Emitted with the same event_type as the GET path so both transports are comparable in the
     // auth-event feed (keycast#262 made the GET primary).
     let outcome =
-        match perform_email_verification(&auth_state, &headers, tenant_id, &req.token).await {
+        match perform_email_verification(&auth_state, &headers, tenant_id, &req.token, delivery)
+            .await
+        {
             Ok(outcome) => outcome,
             Err(err) => {
                 record_verify_email_event(
@@ -2308,6 +2403,7 @@ pub async fn verify_email(
         };
 
     let outcome_reason = match &outcome {
+        VerifyOutcome::BrowserChoice => "browser_delivery_choice",
         VerifyOutcome::Headless => "headless",
         VerifyOutcome::OAuthRedirect { .. } => "oauth_redirect",
         VerifyOutcome::AlreadyVerified => "already_verified",
@@ -2332,6 +2428,11 @@ pub async fn verify_email(
     .await;
 
     let response = match outcome {
+        VerifyOutcome::BrowserChoice => (StatusCode::OK, Json(VerifyEmailResponse {
+            success: true,
+            message: "Email verified. Return to the window where you started signing in, or continue here.".to_string(),
+            redirect_to: None, authenticated: None, status: Some("choose_window".to_string()), retry_after: None,
+        })).into_response(),
         VerifyOutcome::Headless => (
             StatusCode::OK,
             Json(VerifyEmailResponse {
@@ -2447,7 +2548,15 @@ pub async fn verify_email_get(
         );
     };
 
-    match perform_pending_email_verification(&auth_state, tenant_id, &token).await {
+    match perform_pending_email_verification(&auth_state, tenant_id, &token, false).await {
+        Ok(Some(PendingVerifyOutcome::BrowserChoice)) => {
+            emit("accepted", Some("browser_delivery_choice"), 303).await;
+            Redirect::to(&format!(
+                "/email-verification/continue?token={}",
+                urlencoding::encode(&token)
+            ))
+            .into_response()
+        }
         Ok(Some(PendingVerifyOutcome::OAuthRedirect { redirect_url })) => {
             emit("success", Some("oauth_redirect"), 303).await;
             Redirect::to(&redirect_url).into_response()
@@ -7890,44 +7999,126 @@ mod tests {
 
     #[cfg(feature = "integration-tests")]
     #[tokio::test]
-    async fn browser_email_link_redirects_even_with_a_device_code_and_redis() {
+    async fn browser_verification_allows_either_window_without_invalidating_the_winner() {
         let pool = create_test_db().await;
         let state = create_test_auth_state_with_redis(pool.clone()).await;
-        let email = format!("browser-link-{}@example.com", Uuid::new_v4());
-        let (pubkey, token, device_code) =
-            insert_headless_pending_registration(&pool, &email).await;
-        sqlx::query("UPDATE oauth_codes SET is_headless = false WHERE pending_email_verification_token = $1")
+        for continue_here in [true, false] {
+            let email = format!("browser-link-{}@example.com", Uuid::new_v4());
+            let (pubkey, token, device_code) =
+                insert_headless_pending_registration(&pool, &email).await;
+            sqlx::query("UPDATE oauth_codes SET is_headless = false WHERE pending_email_verification_token = $1")
             .bind(hash_token(&token)).execute(&pool).await.unwrap();
-        let response = verify_email(
+            let response = super::verify_email_prepare(
+                create_test_tenant(),
+                State(state.clone()),
+                HeaderMap::new(),
+                Json(VerifyEmailRequest {
+                    token: token.clone(),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response_json(response).await;
+            assert_eq!(body["status"], "choose_window");
+            assert!(body["redirect_to"].is_null());
+            let code = if continue_here {
+                let response = super::verify_email_here(
+                    create_test_tenant(),
+                    State(state.clone()),
+                    HeaderMap::new(),
+                    Json(VerifyEmailRequest {
+                        token: token.clone(),
+                    }),
+                )
+                .await
+                .unwrap()
+                .into_response();
+                let body = response_json(response).await;
+                extract_code_from_redirect(
+                    body["redirect_to"]
+                        .as_str()
+                        .expect("explicit continuation must redirect"),
+                )
+            } else {
+                let response = super::super::oauth::poll(
+                    State(state.clone()),
+                    create_test_tenant(),
+                    Query(super::super::oauth::PollRequest {
+                        device_code: device_code.clone(),
+                    }),
+                )
+                .await
+                .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = response_json(response).await;
+                let code = body["code"].as_str().unwrap().to_string();
+                let response = super::verify_email_here(
+                    create_test_tenant(),
+                    State(state.clone()),
+                    HeaderMap::new(),
+                    Json(VerifyEmailRequest {
+                        token: token.clone(),
+                    }),
+                )
+                .await
+                .map(IntoResponse::into_response)
+                .unwrap_or_else(IntoResponse::into_response);
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                code
+            };
+            let repo = keycast_core::repositories::OAuthCodeRepository::new(pool.clone());
+            assert!(repo.find_valid(1, &code).await.unwrap().is_some());
+            let poll = super::super::oauth::poll(
+                State(state.clone()),
+                create_test_tenant(),
+                Query(super::super::oauth::PollRequest { device_code }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(poll.status(), StatusCode::ACCEPTED);
+            assert!(
+                repo.find_valid(1, &code).await.unwrap().is_some(),
+                "waiting original-tab polls must not replace a browser redirect code"
+            );
+            cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
+        }
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn explicit_oauth_delivery_does_not_issue_a_first_party_session() {
+        let pool = create_test_db().await;
+        let pubkey = Keys::generate().public_key().to_hex();
+        let email = format!("not-oauth-{}@example.com", Uuid::new_v4());
+        let token = format!("verify-{}", Uuid::new_v4());
+        let users = keycast_core::repositories::UserRepository::new(pool.clone());
+        users
+            .create_with_credentials(
+                &pubkey,
+                1,
+                &email,
+                "hash",
+                false,
+                &token,
+                Utc::now() + Duration::hours(1),
+            )
+            .await
+            .unwrap();
+        let response = super::verify_email_here(
             create_test_tenant(),
-            State(state.clone()),
+            State(create_test_auth_state(pool.clone())),
             HeaderMap::new(),
             Json(VerifyEmailRequest {
                 token: token.clone(),
             }),
         )
-        .await
-        .unwrap()
-        .into_response();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_json(response).await;
-        let redirect = body["redirect_to"]
-            .as_str()
-            .expect("browser link must still complete through its client redirect");
-        let code = extract_code_from_redirect(redirect);
-        let repo = keycast_core::repositories::OAuthCodeRepository::new(pool.clone());
-        assert!(repo.find_valid(1, &code).await.unwrap().is_some());
-        let poll = super::super::oauth::poll(
-            State(state.clone()),
-            create_test_tenant(),
-            Query(super::super::oauth::PollRequest { device_code }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(poll.status(), StatusCode::ACCEPTED);
-        assert!(
-            repo.find_valid(1, &code).await.unwrap().is_some(),
-            "waiting original-tab polls must not replace a browser redirect code"
+        .await;
+        assert!(response.is_err());
+        assert_eq!(
+            users.get_email_verified(&pubkey, 1).await.unwrap(),
+            Some(false)
         );
         cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
     }

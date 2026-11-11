@@ -37,6 +37,13 @@ the response. Raw exchange codes are not cached in Redis.
 Overlapping verification attempts wait while a disclosed exchange code is still
 valid. A lost response cannot recover that raw code; a new verified generation
 or expiry permits a fresh handoff without invalidating an in-flight valid code.
+For browser OAuth registration with device polling, email verification prepares
+readiness and offers a window choice. The original window can obtain its code
+through polling, or the user can choose **Continue here** for the client redirect.
+The first handoff wins; the other path waits without replacing its code. Native
+headless verification still hands off to the originating app.
+
+![Browser verification lets the user choose a window without redisclosing a code](images/browser-delivery-choice.png)
 
 Claim links are shown only when generated. Support lookup returns existence,
 creation time and expiry, never a recoverable URL. Generating another link or
