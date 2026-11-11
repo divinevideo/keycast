@@ -7933,8 +7933,10 @@ mod tests {
     }
 
     #[cfg(feature = "integration-tests")]
-    async fn assert_poll_recovers_after_pre_disclosure_database_failure(fail_lookup: bool) {
-        let pool = create_test_db().await;
+    async fn assert_poll_recovers_after_pre_disclosure_database_failure(
+        pool: PgPool,
+        fail_lookup: bool,
+    ) {
         let state = create_test_auth_state_with_redis(pool.clone()).await;
         let email = format!("poll-db-retry-{}@example.com", Uuid::new_v4());
         let (pubkey, token, device_code) =
@@ -8071,15 +8073,15 @@ mod tests {
     }
 
     #[cfg(feature = "integration-tests")]
-    #[tokio::test]
-    async fn poll_recovers_after_pending_lookup_failure_without_reverification() {
-        assert_poll_recovers_after_pre_disclosure_database_failure(true).await;
+    #[sqlx::test(migrations = "../database/migrations")]
+    async fn poll_recovers_after_pending_lookup_failure_without_reverification(pool: PgPool) {
+        assert_poll_recovers_after_pre_disclosure_database_failure(pool, true).await;
     }
 
     #[cfg(feature = "integration-tests")]
-    #[tokio::test]
-    async fn poll_recovers_after_materialization_failure_without_reverification() {
-        assert_poll_recovers_after_pre_disclosure_database_failure(false).await;
+    #[sqlx::test(migrations = "../database/migrations")]
+    async fn poll_recovers_after_materialization_failure_without_reverification(pool: PgPool) {
+        assert_poll_recovers_after_pre_disclosure_database_failure(pool, false).await;
     }
 
     #[cfg(feature = "integration-tests")]
