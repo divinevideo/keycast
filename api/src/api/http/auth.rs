@@ -6014,6 +6014,7 @@ mod tests {
     #[cfg(feature = "integration-tests")]
     use super::{VERIFICATION_LINK_SUPERSEDED_CODE, VERIFICATION_LINK_SUPERSEDED_HEADING};
     use axum::response::IntoResponse;
+    #[cfg(feature = "integration-tests")]
     use keycast_core::token_hash::hash_token;
     use ucan::Ucan;
 

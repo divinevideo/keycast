@@ -1634,6 +1634,7 @@ impl From<keycast_core::repositories::RepositoryError> for HeadlessError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "integration-tests")]
     use keycast_core::token_hash::hash_token;
 
     // Keep failure-path tests independent of the shared production sender.
