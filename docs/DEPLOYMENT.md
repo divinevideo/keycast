@@ -388,6 +388,52 @@ kubectl rollout restart deployment/keycast -n identity
 
 ---
 
+## Support database reader (deployment prerequisite)
+
+Before deploying an image containing the `20261110180000_support_reader_column_grants`
+migration, check the role setup on **each target database cluster**, including
+staging, POC and any future GKE production cutover. A role on one cluster does
+not provision it on another. Connect through the migration job's direct database
+path, using its database identity, and inspect:
+
+```sql
+SELECT current_user, rolcreaterole, rolsuper
+FROM pg_roles WHERE rolname = current_user;
+
+SELECT rolname, rolcanlogin, rolsuper, rolcreaterole, rolcreatedb,
+       rolreplication, rolbypassrls
+FROM pg_roles WHERE rolname = 'support_reader';
+```
+
+If `support_reader` is absent, the migration identity must be able to create
+roles. Otherwise a database administrator must provision the `NOLOGIN` role
+before deployment, under separate operational authorization. Database ownership
+and schema/table grants alone do not confer `CREATEROLE`. Do not deploy until
+one of those prerequisites is satisfied: the migration deliberately fails
+rather than silently omitting the reader's privilege boundary. In GKE that
+failure stops the migration hook before the Deployment rolls; in Cloud Run it
+stops the migration job before the serving rollout.
+
+An existing `support_reader` must have no login, elevated role attributes,
+ownership or table-level grants, and must not itself be a member of any other
+role. A support login may be a member of `support_reader`. The migration preserves
+an existing role; it does not repair broader privileges. It grants schema usage and explicit
+column reads, excludes the classified secret columns, and revokes schema creation
+from `PUBLIC`. It also checks the reader's effective schema creation privilege and
+stops if that privilege remains: a successful `REVOKE` statement alone does not
+prove the migration identity was able to remove it. In that case, a schema owner
+must remove the privilege under separate operational authorization before deployment.
+New columns remain unreadable until explicitly classified by a
+later migration; the integration test enforces that classification.
+
+This migration does not create a support login, grant membership to a login,
+configure IAM or enable a support SQL tool. Those are separate operational steps.
+Provisioning and verifying this role is required again on a new cluster during
+cutover; successful validation on a local database is not proof of deployment
+readiness elsewhere.
+
+---
+
 ## Support admin grants (one-time seed)
 
 Support admin grants live in the Postgres `support_admins` table. Before that table existed they lived only in a per-deployment Redis set, which the server no longer reads. The `20261009120000_add_support_admins` migration creates the table empty, so each deployment's existing support admins have to be copied across once:

@@ -975,9 +975,21 @@ async fn burn_dummy_bcrypt(
 /// [`OAuthCodeRepository::reserve_pin_attempt`], not the opacity of the reply.
 pub async fn headless_verify_pin(
     tenant: crate::api::tenant::TenantExtractor,
+    state: State<super::routes::AuthState>,
+    headers: HeaderMap,
+    req: Json<HeadlessVerifyPinRequest>,
+) -> Result<impl IntoResponse, HeadlessError> {
+    headless_verify_pin_with_clock(tenant, state, headers, req, Utc::now).await
+}
+
+// Keep the two expiry checks on one clock, which tests can advance across real bcrypt work
+// without requiring a database round trip and CPU admission to fit a wall-clock interval.
+async fn headless_verify_pin_with_clock(
+    tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
     headers: HeaderMap,
     Json(req): Json<HeadlessVerifyPinRequest>,
+    now: impl Fn() -> chrono::DateTime<Utc>,
 ) -> Result<impl IntoResponse, HeadlessError> {
     let pool = &auth_state.state.db;
     let tenant_id = tenant.0.id;
@@ -1017,7 +1029,7 @@ pub async fn headless_verify_pin(
     // device_code: telling the user their code did not match would be false and would invite them
     // to retype it forever. The PIN carries no window of its own — it is one of two presentations
     // of the same confirmation code as the emailed link, so it expires exactly when the link does.
-    if pending.expires_at <= Utc::now() {
+    if pending.expires_at <= now() {
         record_pin_verify_failure(
             pool,
             &headers,
@@ -1160,7 +1172,7 @@ pub async fn headless_verify_pin(
     // that as expiry rather than letting a wrong PIN read as "did not match" or a correct one fall
     // through to a finalize that cannot succeed. Uses the window already loaded above, so this
     // costs no query.
-    if pending.expires_at <= Utc::now() {
+    if pending.expires_at <= now() {
         record_pin_verify_failure(
             pool,
             &headers,
@@ -2776,9 +2788,7 @@ mod tests {
             .await;
     }
 
-    /// bcrypt is deliberately slow, so the registration's window can close while a comparison is
-    /// running. That must still read as expiry rather than as a wrong PIN. Simulated by expiring
-    /// the row mid-flight, which is what the elapsed bcrypt time would otherwise do.
+    /// Expiry after a real PIN comparison must take precedence over a wrong-PIN response.
     #[cfg(feature = "integration-tests")]
     #[tokio::test]
     async fn test_verify_pin_expiring_during_the_comparison_reports_expired() {
@@ -2787,9 +2797,10 @@ mod tests {
         let email = format!("verify-pin-race-{}@example.com", uuid::Uuid::new_v4());
         let (pubkey, device_code) = insert_pending_with_pin(&pool, &email, "123456").await;
 
-        // Alive at the snapshot check and at the reservation, so the request gets past both and
-        // runs a real comparison; the window then closes before the result is classified.
-        let expire_at = Utc::now() + Duration::milliseconds(120);
+        // The database reservation has a generous live window. Advance only the handler's clock
+        // across the real comparison, so scheduling and database latency cannot expire it early.
+        let before_comparison = Utc::now();
+        let expire_at = before_comparison + Duration::hours(24);
         sqlx::query("UPDATE oauth_codes SET expires_at = $2 WHERE device_code = $1")
             .bind(&device_code)
             .bind(expire_at)
@@ -2797,20 +2808,38 @@ mod tests {
             .await
             .unwrap();
 
-        // A wrong PIN would otherwise be reported as simply not matching.
-        let response = call_verify_pin(auth_state, &device_code, "000000").await;
-        assert!(
-            Utc::now() > expire_at,
-            "the comparison must actually outlast the window for this test to mean anything"
-        );
+        let clock_reads = std::cell::Cell::new(0);
+        let result = super::headless_verify_pin_with_clock(
+            create_unit_test_tenant(),
+            axum::extract::State(auth_state),
+            axum::http::HeaderMap::new(),
+            axum::Json(super::HeadlessVerifyPinRequest {
+                device_code: device_code.clone(),
+                pin: "000000".to_string(),
+            }),
+            || {
+                let reads = clock_reads.get();
+                clock_reads.set(reads + 1);
+                if reads == 0 {
+                    before_comparison
+                } else {
+                    expire_at + Duration::seconds(1)
+                }
+            },
+        )
+        .await;
+        let response = match result {
+            Ok(response) => axum::response::IntoResponse::into_response(response),
+            Err(error) => axum::response::IntoResponse::into_response(error),
+        };
+        assert_eq!(clock_reads.get(), 2, "both expiry checks must run");
         assert_eq!(response.status(), axum::http::StatusCode::GONE);
         assert_eq!(response_json(response).await["code"], "PIN_EXPIRED");
 
         // Prove the 410 came from the post-comparison check rather than from the reservation
         // refusing an already-expired row. Reaching bcrypt requires the reservation to have
         // succeeded while the window was still open, and a reservation charges both counters
-        // exactly once. Without this the test would pass vacuously whenever scheduling ate the
-        // window before the reservation ran.
+        // exactly once. Keep this assertion so an early return cannot pass the test vacuously.
         let (attempts, failed_total): (i32, i32) = sqlx::query_as(
             "SELECT pin_attempts, pin_failed_total FROM oauth_codes \
              WHERE device_code = $1 AND pending_email IS NOT NULL",
