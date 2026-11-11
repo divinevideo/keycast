@@ -373,6 +373,20 @@ impl PrefixedRedis {
         .await
     }
 
+    /// Atomically consume a key's value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Redis or connection refresh fails.
+    pub async fn getdel(&self, key: &str) -> RedisResult<Option<String>> {
+        let prefixed = self.prefixed_key(key).into_owned();
+        self.with_refresh(|mut conn| {
+            let key = prefixed.clone();
+            async move { redis::cmd("GETDEL").arg(key).query_async(&mut conn).await }
+        })
+        .await
+    }
+
     /// Delete a key.
     ///
     /// # Errors

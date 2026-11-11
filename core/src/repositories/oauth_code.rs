@@ -148,6 +148,8 @@ pub struct FinalizedPendingRegistration {
 pub enum MaterializePendingRegistrationOutcome {
     /// User/key materialization and exchange-code selection committed together.
     Ready(Box<FinalizedPendingRegistration>),
+    /// Verified registration prepared for a one-time polling handoff, without minting a code.
+    ReadyForPolling(Box<OAuthCodeData>),
     /// A live exchange code is currently claimed by token issuance.
     Processing,
     /// The generation was superseded, consumed, expired, or removed before it could be locked.
@@ -166,6 +168,7 @@ enum UserMaterializationOutcome {
 
 enum ExchangeSelection {
     Ready(StoredExchangeCode),
+    Polling,
     Processing,
 }
 
@@ -428,6 +431,26 @@ impl OAuthCodeRepository {
         tenant_id: i64,
         verification_token_hash: &str,
         candidate_code: &str,
+    ) -> Result<MaterializePendingRegistrationOutcome, RepositoryError> {
+        self.materialize_for_delivery(tenant_id, verification_token_hash, Some(candidate_code))
+            .await
+    }
+
+    /// Verify and materialize without creating an exchange code that must be recovered later.
+    pub async fn prepare_pending_registration_for_poll(
+        &self,
+        tenant_id: i64,
+        verification_token_hash: &str,
+    ) -> Result<MaterializePendingRegistrationOutcome, RepositoryError> {
+        self.materialize_for_delivery(tenant_id, verification_token_hash, None)
+            .await
+    }
+
+    async fn materialize_for_delivery(
+        &self,
+        tenant_id: i64,
+        verification_token_hash: &str,
+        candidate_code: Option<&str>,
     ) -> Result<MaterializePendingRegistrationOutcome, RepositoryError> {
         let mut tx = self.pool.begin().await?;
         let query = format!(
@@ -722,17 +745,13 @@ impl OAuthCodeRepository {
         .fetch_optional(&mut *tx)
         .await?;
 
-        let selection = if matches!(existing, Some((_, _, Some(_)))) {
-            ExchangeSelection::Processing
-        } else {
-            // Finalizers hold the pending-row lock, as does redemption. Replace any
-            // unclaimed predecessor; only the newly generated bearer can be disclosed.
-            sqlx::query("DELETE FROM oauth_codes WHERE tenant_id = $1 AND pending_email IS NULL AND pending_email_verification_token = $2 AND consumed_at IS NULL")
-                    .bind(tenant_id)
-                    .bind(verification_token_hash)
-                    .execute(&mut *tx)
-                    .await?;
-            let expires_at: DateTime<Utc> = sqlx::query_scalar(
+        let selection = match (candidate_code, existing) {
+            (None, _) => ExchangeSelection::Polling,
+            (Some(_), Some(_)) => ExchangeSelection::Processing,
+            (Some(candidate_code), None) => {
+                // The first handoff owns the code through expiry/redemption. A concurrent
+                // PIN, poll, or email re-click must not invalidate a code already in flight.
+                let expires_at: DateTime<Utc> = sqlx::query_scalar(
                     "INSERT INTO oauth_codes
                          (tenant_id, code, user_pubkey, client_id, redirect_uri, scope,
                           code_challenge, code_challenge_method, expires_at, previous_auth_id, state,
@@ -757,11 +776,12 @@ impl OAuthCodeRepository {
                 .bind(pending.device_code_hash.as_deref())
                 .fetch_one(&mut *tx)
                 .await?;
-            ExchangeSelection::Ready(StoredExchangeCode {
-                code: candidate_code.to_string(),
-                expires_at,
-                freshly_minted: true,
-            })
+                ExchangeSelection::Ready(StoredExchangeCode {
+                    code: candidate_code.to_string(),
+                    expires_at,
+                    freshly_minted: true,
+                })
+            }
         };
 
         let still_live: bool = sqlx::query_scalar(
@@ -782,6 +802,9 @@ impl OAuthCodeRepository {
         }
 
         let result = match selection {
+            ExchangeSelection::Polling => {
+                MaterializePendingRegistrationOutcome::ReadyForPolling(pending)
+            }
             ExchangeSelection::Ready(exchange_code) => {
                 MaterializePendingRegistrationOutcome::Ready(Box::new(
                     FinalizedPendingRegistration {
@@ -2514,7 +2537,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_concurrent_exact_generation_materializers_replace_unclaimed_codes() {
+    async fn test_concurrent_exact_generation_materializers_preserve_the_first_handoff() {
         let pool = setup_pool().await;
         let repo = OAuthCodeRepository::new(pool.clone());
         let device_code = format!("dc_{}", uuid::Uuid::new_v4());
@@ -2537,27 +2560,22 @@ mod tests {
             repo.materialize_pending_registration(1, &token, &candidate_a),
             repo.materialize_pending_registration(1, &token, &candidate_b),
         );
-        let MaterializePendingRegistrationOutcome::Ready(first) = first.unwrap() else {
-            panic!("first finalizer must be ready");
+        let winner = match (first.unwrap(), second.unwrap()) {
+            (
+                MaterializePendingRegistrationOutcome::Ready(winner),
+                MaterializePendingRegistrationOutcome::Processing,
+            )
+            | (
+                MaterializePendingRegistrationOutcome::Processing,
+                MaterializePendingRegistrationOutcome::Ready(winner),
+            ) => winner,
+            _ => panic!("exactly one finalizer may disclose a code"),
         };
-        let MaterializePendingRegistrationOutcome::Ready(second) = second.unwrap() else {
-            panic!("second finalizer must be ready");
-        };
-        assert_ne!(first.exchange_code.code, second.exchange_code.code);
-        assert_eq!(
-            usize::from(
-                repo.find_valid(1, &first.exchange_code.code)
-                    .await
-                    .unwrap()
-                    .is_some()
-            ) + usize::from(
-                repo.find_valid(1, &second.exchange_code.code)
-                    .await
-                    .unwrap()
-                    .is_some()
-            ),
-            1
-        );
+        assert!(repo
+            .find_valid(1, &winner.exchange_code.code)
+            .await
+            .unwrap()
+            .is_some());
 
         let user_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE pubkey = $1 AND tenant_id = 1")
@@ -3400,30 +3418,26 @@ mod tests {
         }
         blocker.commit().await.unwrap();
 
-        let MaterializePendingRegistrationOutcome::Ready(first) = first.await.unwrap().unwrap()
-        else {
-            panic!("first finalizer must be ready");
+        let winner = match (
+            first.await.unwrap().unwrap(),
+            second.await.unwrap().unwrap(),
+        ) {
+            (
+                MaterializePendingRegistrationOutcome::Ready(winner),
+                MaterializePendingRegistrationOutcome::Processing,
+            )
+            | (
+                MaterializePendingRegistrationOutcome::Processing,
+                MaterializePendingRegistrationOutcome::Ready(winner),
+            ) => winner,
+            _ => panic!("exactly one finalizer may disclose a code"),
         };
-        let MaterializePendingRegistrationOutcome::Ready(second) = second.await.unwrap().unwrap()
-        else {
-            panic!("second finalizer must be ready");
-        };
-        assert_ne!(first.exchange_code.code, second.exchange_code.code);
-        assert_eq!(
-            usize::from(
-                repo.find_valid(1, &first.exchange_code.code)
-                    .await
-                    .unwrap()
-                    .is_some()
-            ) + usize::from(
-                repo.find_valid(1, &second.exchange_code.code)
-                    .await
-                    .unwrap()
-                    .is_some()
-            ),
-            1
-        );
-        assert!(first.exchange_code.freshly_minted && second.exchange_code.freshly_minted);
+        assert!(repo
+            .find_valid(1, &winner.exchange_code.code)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(winner.exchange_code.freshly_minted);
         let code_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM oauth_codes
              WHERE device_code = $1 AND pending_email IS NULL",

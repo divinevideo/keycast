@@ -4917,7 +4917,7 @@ pub async fn poll(
         keycast_core::token_hash::hash_token(&req.device_code)
     );
 
-    match redis.get(&key).await {
+    match redis.getdel(&key).await {
         Ok(Some(generation_hash)) => {
             let pool = &auth_state.state.db;
             let repo = OAuthCodeRepository::new(pool.clone());
@@ -4937,7 +4937,7 @@ pub async fn poll(
                 )
                     .into_response());
             };
-            let finalized = super::auth::finalize_pending_registration(
+            let finalized = match super::auth::finalize_pending_registration(
                 pool,
                 None,
                 tenant.0.id,
@@ -4945,14 +4945,37 @@ pub async fn poll(
                 super::auth::HeadlessDelivery::RedisBestEffort,
             )
             .await
-            .map_err(|_| {
-                OAuthError::ServerError("Sign-in is still finishing. Please retry.".into())
-            })?;
-            // Keep readiness so a lost response can be replaced, never recovered.
+            {
+                Ok(finalized) => finalized,
+                Err(super::auth::AuthError::ServiceUnavailable { .. }) => {
+                    // A live handoff may already be on its way via PIN or an earlier poll.
+                    // Keep that code valid. Readiness may retry only after it expires.
+                    let ttl = (pending.expires_at - Utc::now())
+                        .num_seconds()
+                        .clamp(1, 600) as u64;
+                    if let Err(error) = redis.setex(&key, ttl, &generation_hash).await {
+                        tracing::warn!(%error, "Unable to restore OAuth polling readiness");
+                    }
+                    return Ok((
+                        StatusCode::ACCEPTED,
+                        Json(serde_json::json!({"status": "pending"})),
+                    )
+                        .into_response());
+                }
+                Err(_) => {
+                    return Err(OAuthError::ServerError(
+                        "Sign-in is still finishing. Please retry.".into(),
+                    ))
+                }
+            };
+            // Readiness is consumed atomically. A concurrent poll cannot replace
+            // the code this response has just disclosed.
             Ok((
                 StatusCode::OK,
                 Json(PollResponse {
-                    code: finalized.new_code,
+                    code: finalized.new_code.ok_or_else(|| {
+                        OAuthError::ServerError("No authorization code was issued".into())
+                    })?,
                 }),
             )
                 .into_response())

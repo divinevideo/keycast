@@ -29,11 +29,14 @@ their password-hashing algorithms, not this fast token hash.
 
 OAuth authorization codes, device credentials, pending-registration email tokens
 and ATProto authorization codes use the same digest storage. Repeated registration
-rotates its device credential; repeated finalization replaces an unclaimed
-exchange code instead of recovering it. A code already being redeemed remains
-protected from replacement. Polling uses a hashed device-keyed readiness marker
+rotates its device credential. A disclosed exchange code remains valid until
+redemption or expiry; overlapping finalizers do not recover or replace it.
+Polling uses a one-time hashed device-keyed readiness marker
 containing only the verified generation digest, then creates a fresh code for
 the response. Raw exchange codes are not cached in Redis.
+Overlapping verification attempts wait while a disclosed exchange code is still
+valid. A lost response cannot recover that raw code; a new verified generation
+or expiry permits a fresh handoff without invalidating an in-flight valid code.
 
 Claim links are shown only when generated. Support lookup returns existence,
 creation time and expiry, never a recoverable URL. Generating another link or
@@ -48,10 +51,13 @@ Support lookup and newly generated links (synthetic account):
 ![A newly generated claim link shown for copying](images/claim-link-new.png)
 
 The token-hashing migration backfills existing values without changing their
-expiry, so outstanding links continue to work. Digest-format constraints reject
-legacy token formats: token issuance requires the matching application version
-after migration. Do not roll back only the application binary across this schema
-change. Migration execution and rollout remain operator-controlled actions.
+expiry, so those links work with the new binary. It does not add constraints that
+would reject writes from a still-serving old revision or require manual schema
+changes to roll back. Links issued by an old revision during the rollout, or by
+the new revision before an application rollback, can require replacement.
+Hash-only storage and lookup apply once the new revision serves requests;
+rolling back also restores the previous revision's token-storage behavior.
+Migration execution and rollout remain operator-controlled actions.
 Older plaintext polling-cache entries are not read by the new polling path;
 an in-flight app may need to verify again to establish the new readiness marker.
 

@@ -1252,7 +1252,7 @@ pub async fn headless_verify_pin(
 
     Ok(Json(HeadlessVerifyPinResponse {
         success: true,
-        code: finalized.new_code,
+        code: finalized.new_code.ok_or(HeadlessError::PinUnavailable)?,
         pubkey: pending.user_pubkey,
         state: finalized.state,
     }))

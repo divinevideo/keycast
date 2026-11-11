@@ -281,11 +281,4 @@ async fn migration_preserves_links_nulls_and_expiry(pool: PgPool) {
         .await
         .unwrap()
         .is_some());
-    assert!(sqlx::query(
-        "UPDATE account_claim_tokens SET token = 'legacy-raw-format' WHERE user_pubkey = $1"
-    )
-    .bind(PUBKEY)
-    .execute(&pool)
-    .await
-    .is_err());
 }
