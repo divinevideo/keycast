@@ -1960,9 +1960,7 @@ pub async fn finalize_pending_registration(
     };
 
     // Validate device binding and delivery availability before preparing a headless handoff.
-    let strict_delivery = if delivery == HeadlessDelivery::RedisRequired
-        && (oauth_data.is_headless || (oauth_data.device_code_hash.is_some() && redis.is_some()))
-    {
+    let strict_delivery = if oauth_data.is_headless && delivery == HeadlessDelivery::RedisRequired {
         let device_code = oauth_data.device_code_hash.as_ref().ok_or_else(|| {
             tracing::error!(
                 event = "headless_poll_delivery_failed",
@@ -7729,15 +7727,13 @@ mod tests {
 
     #[cfg(feature = "integration-tests")]
     #[tokio::test]
-    async fn test_browser_poll_keeps_only_generation_digest_and_preserves_disclosed_codes() {
+    async fn test_poll_keeps_only_generation_digest_and_preserves_disclosed_codes() {
         let pool = create_test_db().await;
         let state = create_test_auth_state_with_redis(pool.clone()).await;
         let redis = state.state.redis.as_ref().unwrap();
         let email = format!("poll-digest-{}@example.com", Uuid::new_v4());
         let (pubkey, token, device_code) =
             insert_headless_pending_registration(&pool, &email).await;
-        sqlx::query("UPDATE oauth_codes SET is_headless = false WHERE pending_email_verification_token = $1")
-            .bind(hash_token(&token)).execute(&pool).await.unwrap();
         let repo = keycast_core::repositories::OAuthCodeRepository::new(pool.clone());
         let pending = repo
             .find_by_verification_token(&token, 1)
@@ -7888,6 +7884,50 @@ mod tests {
         assert!(
             repo.redeem_code(1, &code, &auth_code).await.unwrap(),
             "PIN response code must remain redeemable throughout the overlap"
+        );
+        cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn browser_email_link_redirects_even_with_a_device_code_and_redis() {
+        let pool = create_test_db().await;
+        let state = create_test_auth_state_with_redis(pool.clone()).await;
+        let email = format!("browser-link-{}@example.com", Uuid::new_v4());
+        let (pubkey, token, device_code) =
+            insert_headless_pending_registration(&pool, &email).await;
+        sqlx::query("UPDATE oauth_codes SET is_headless = false WHERE pending_email_verification_token = $1")
+            .bind(hash_token(&token)).execute(&pool).await.unwrap();
+        let response = verify_email(
+            create_test_tenant(),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(VerifyEmailRequest {
+                token: token.clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let redirect = body["redirect_to"]
+            .as_str()
+            .expect("browser link must still complete through its client redirect");
+        let code = extract_code_from_redirect(redirect);
+        let repo = keycast_core::repositories::OAuthCodeRepository::new(pool.clone());
+        assert!(repo.find_valid(1, &code).await.unwrap().is_some());
+        let poll = super::super::oauth::poll(
+            State(state.clone()),
+            create_test_tenant(),
+            Query(super::super::oauth::PollRequest { device_code }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(poll.status(), StatusCode::ACCEPTED);
+        assert!(
+            repo.find_valid(1, &code).await.unwrap().is_some(),
+            "waiting original-tab polls must not replace a browser redirect code"
         );
         cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
     }
