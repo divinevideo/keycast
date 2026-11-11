@@ -4917,7 +4917,9 @@ pub async fn poll(
         keycast_core::token_hash::hash_token(&req.device_code)
     );
 
-    match redis.getdel(&key).await {
+    // Readiness is verified-generation state, not a bearer code. Leave it intact
+    // across database errors; the pending-row lock owns the single code handoff.
+    match redis.get(&key).await {
         Ok(Some(generation_hash)) => {
             let pool = &auth_state.state.db;
             let repo = OAuthCodeRepository::new(pool.clone());
@@ -4949,13 +4951,7 @@ pub async fn poll(
                 Ok(finalized) => finalized,
                 Err(super::auth::AuthError::ServiceUnavailable { .. }) => {
                     // A live handoff may already be on its way via PIN or an earlier poll.
-                    // Keep that code valid. Readiness may retry only after it expires.
-                    let ttl = (pending.expires_at - Utc::now())
-                        .num_seconds()
-                        .clamp(1, 600) as u64;
-                    if let Err(error) = redis.setex(&key, ttl, &generation_hash).await {
-                        tracing::warn!(%error, "Unable to restore OAuth polling readiness");
-                    }
+                    // Neither replace that code nor overwrite a newer readiness generation.
                     return Ok((
                         StatusCode::ACCEPTED,
                         Json(serde_json::json!({"status": "pending"})),
@@ -4968,8 +4964,8 @@ pub async fn poll(
                     ))
                 }
             };
-            // Readiness is consumed atomically. A concurrent poll cannot replace
-            // the code this response has just disclosed.
+            // Concurrent polls cannot replace a disclosed code: materialization
+            // checks live handoffs under the pending-generation row lock.
             Ok((
                 StatusCode::OK,
                 Json(PollResponse {

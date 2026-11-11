@@ -7933,6 +7933,213 @@ mod tests {
     }
 
     #[cfg(feature = "integration-tests")]
+    async fn assert_poll_recovers_after_pre_disclosure_database_failure(fail_lookup: bool) {
+        let pool = create_test_db().await;
+        let state = create_test_auth_state_with_redis(pool.clone()).await;
+        let email = format!("poll-db-retry-{}@example.com", Uuid::new_v4());
+        let (pubkey, token, device_code) =
+            insert_headless_pending_registration(&pool, &email).await;
+        let repo = keycast_core::repositories::OAuthCodeRepository::new(pool.clone());
+        let pending = repo
+            .find_by_verification_token(&token, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        let prepared = super::finalize_pending_registration(
+            &pool,
+            state.state.redis.as_ref(),
+            1,
+            &pending,
+            super::HeadlessDelivery::RedisRequired,
+        )
+        .await
+        .unwrap();
+        assert!(prepared.new_code.is_none());
+        let key = format!("oauth_poll:{}", hash_token(&device_code));
+        let redis = state.state.redis.as_ref().unwrap();
+        assert_eq!(redis.get(&key).await.unwrap(), Some(hash_token(&token)));
+
+        let fault = format!("poll_fault_{}", Uuid::new_v4().simple());
+        let failed_state = if fail_lookup {
+            // A distinct closed pool fails the pending-row lookup without closing the
+            // healthy pool used by the subsequent request.
+            let closed = sqlx::postgres::PgPoolOptions::new()
+                .connect_with((*pool.connect_options()).clone())
+                .await
+                .unwrap();
+            closed.close().await;
+            let mut failed = create_test_auth_state(closed);
+            Arc::get_mut(&mut failed.state).unwrap().redis = state.state.redis.clone();
+            failed
+        } else {
+            // Sequence advancement survives transaction rollback. Fail exactly the
+            // first exchange INSERT for this synthetic user, never another test's row.
+            let sql = format!(
+                "CREATE SEQUENCE {fault}_seq;
+                 CREATE FUNCTION {fault}_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF NEW.user_pubkey = '{pubkey}' AND NEW.pending_email IS NULL THEN
+                     IF nextval('{fault}_seq') = 1 THEN
+                       RAISE EXCEPTION 'injected first exchange insert failure';
+                     END IF;
+                   END IF;
+                   RETURN NEW;
+                 END; $$;
+                 CREATE TRIGGER {fault}_trigger BEFORE INSERT ON oauth_codes
+                 FOR EACH ROW EXECUTE FUNCTION {fault}_fn();"
+            );
+            sqlx::raw_sql(&sql).execute(&pool).await.unwrap();
+            state.clone()
+        };
+        let poll_request = || {
+            Query(super::super::oauth::PollRequest {
+                device_code: device_code.clone(),
+            })
+        };
+        let failed =
+            super::super::oauth::poll(State(failed_state), create_test_tenant(), poll_request())
+                .await;
+        assert!(
+            failed.is_err(),
+            "the injected failure must reach the poll error path"
+        );
+        if fail_lookup {
+            assert!(matches!(
+                failed,
+                Err(super::super::oauth::OAuthError::Database(_))
+            ));
+        }
+        if !fail_lookup {
+            let attempts: (i64, bool) =
+                sqlx::query_as(&format!("SELECT last_value, is_called FROM {fault}_seq"))
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                attempts,
+                (1, true),
+                "the failed request must reach exchange materialization"
+            );
+        }
+        assert_eq!(
+            redis.get(&key).await.unwrap(),
+            Some(hash_token(&token)),
+            "pre-disclosure failure must not consume or rewrite readiness"
+        );
+        assert!(
+            repo.find_live_exchange_hash_with_expiry_for_pending(1, &pending)
+                .await
+                .unwrap()
+                .is_none(),
+            "no code may have been minted by the failed request"
+        );
+
+        // No new email verification/PIN action occurs between failure and retry.
+        let retry =
+            super::super::oauth::poll(State(state.clone()), create_test_tenant(), poll_request())
+                .await
+                .unwrap();
+        assert_eq!(retry.status(), StatusCode::OK);
+        let body = response_json(retry).await;
+        let code = body["code"].as_str().unwrap();
+        assert!(repo.find_valid(1, code).await.unwrap().is_some());
+        let overlapping =
+            super::super::oauth::poll(State(state.clone()), create_test_tenant(), poll_request())
+                .await
+                .unwrap();
+        assert_eq!(overlapping.status(), StatusCode::ACCEPTED);
+        assert!(
+            repo.find_valid(1, code).await.unwrap().is_some(),
+            "retry must retain first-code-wins"
+        );
+        assert_eq!(redis.get(&key).await.unwrap(), Some(hash_token(&token)));
+        if !fail_lookup {
+            let attempts: (i64, bool) =
+                sqlx::query_as(&format!("SELECT last_value, is_called FROM {fault}_seq"))
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                attempts,
+                (2, true),
+                "only the healthy retry should insert an exchange code"
+            );
+            sqlx::raw_sql(&format!("DROP TRIGGER {fault}_trigger ON oauth_codes; DROP FUNCTION {fault}_fn(); DROP SEQUENCE {fault}_seq;")).execute(&pool).await.unwrap();
+        }
+        redis.del(&key).await.unwrap();
+        cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn poll_recovers_after_pending_lookup_failure_without_reverification() {
+        assert_poll_recovers_after_pre_disclosure_database_failure(true).await;
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn poll_recovers_after_materialization_failure_without_reverification() {
+        assert_poll_recovers_after_pre_disclosure_database_failure(false).await;
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn concurrent_polls_keep_readiness_but_disclose_only_one_code() {
+        let pool = create_test_db().await;
+        let state = create_test_auth_state_with_redis(pool.clone()).await;
+        let email = format!("poll-readiness-race-{}@example.com", Uuid::new_v4());
+        let (pubkey, token, device_code) =
+            insert_headless_pending_registration(&pool, &email).await;
+        let repo = keycast_core::repositories::OAuthCodeRepository::new(pool.clone());
+        let pending = repo
+            .find_by_verification_token(&token, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        super::finalize_pending_registration(
+            &pool,
+            state.state.redis.as_ref(),
+            1,
+            &pending,
+            super::HeadlessDelivery::RedisRequired,
+        )
+        .await
+        .unwrap();
+        let request = || {
+            Query(super::super::oauth::PollRequest {
+                device_code: device_code.clone(),
+            })
+        };
+        let (first, second) = tokio::join!(
+            super::super::oauth::poll(State(state.clone()), create_test_tenant(), request()),
+            super::super::oauth::poll(State(state.clone()), create_test_tenant(), request()),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        let winner = match (first.status(), second.status()) {
+            (StatusCode::OK, StatusCode::ACCEPTED) => first,
+            (StatusCode::ACCEPTED, StatusCode::OK) => second,
+            statuses => panic!("exactly one poll must disclose a code: {statuses:?}"),
+        };
+        let body = response_json(winner).await;
+        let code = body["code"].as_str().unwrap();
+        assert!(repo.find_valid(1, code).await.unwrap().is_some());
+        let redis = state.state.redis.as_ref().unwrap();
+        let key = format!("oauth_poll:{}", hash_token(&device_code));
+        assert_eq!(redis.get(&key).await.unwrap(), Some(hash_token(&token)));
+        assert_eq!(
+            repo.find_live_exchange_hash_with_expiry_for_pending(1, &pending)
+                .await
+                .unwrap()
+                .unwrap()
+                .0,
+            hash_token(code)
+        );
+        redis.del(&key).await.unwrap();
+        cleanup_verify_email_test_data(&pool, &pubkey, &token).await;
+    }
+
+    #[cfg(feature = "integration-tests")]
     #[tokio::test]
     async fn pin_handoff_survives_a_concurrent_poll_and_email_reclick() {
         let pool = create_test_db().await;

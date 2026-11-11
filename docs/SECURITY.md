@@ -31,9 +31,12 @@ OAuth authorization codes, device credentials, pending-registration email tokens
 and ATProto authorization codes use the same digest storage. Repeated registration
 rotates its device credential. A disclosed exchange code remains valid until
 redemption or expiry; overlapping finalizers do not recover or replace it.
-Polling uses a one-time hashed device-keyed readiness marker
+Polling uses a hashed device-keyed readiness marker
 containing only the verified generation digest, then creates a fresh code for
 the response. Raw exchange codes are not cached in Redis.
+The marker survives retryable database failures before disclosure. Polls do not
+consume or rewrite readiness; the database generation lock admits only one live
+code, and expired or superseded generations cannot authorize another handoff.
 Overlapping verification attempts wait while a disclosed exchange code is still
 valid. A lost response cannot recover that raw code; a new verified generation
 or expiry permits a fresh handoff without invalidating an in-flight valid code.
