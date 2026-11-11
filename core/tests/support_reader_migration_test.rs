@@ -6,7 +6,7 @@ use sqlx::PgPool;
 const MIGRATION: &str =
     include_str!("../../database/migrations/20261110180000_support_reader_column_grants.sql");
 
-const HIDDEN_COLUMNS: [(&str, &str); 25] = [
+const HIDDEN_COLUMNS: [(&str, &str); 26] = [
     ("users", "password_reset_token"),
     ("users", "email_verification_token"),
     ("users", "pending_email_old_token"),
@@ -17,6 +17,7 @@ const HIDDEN_COLUMNS: [(&str, &str); 25] = [
     ("oauth_codes", "device_code"),
     ("oauth_codes", "pending_email_verification_token"),
     ("atproto_oauth_sessions", "authorization_code"),
+    ("oauth_authorizations", "authorization_handle"),
     ("users", "password_hash"),
     ("oauth_codes", "pin_hash"),
     ("oauth_codes", "pending_password_hash"),

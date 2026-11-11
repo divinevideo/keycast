@@ -79,7 +79,7 @@ GRANT SELECT (id, tenant_id, name, pubkey, signing_key_id, policy_id, mode, key_
 GRANT SELECT (id, user_pubkey, redirect_origin, client_id, bunker_public_key, relays,
     created_at, updated_at, policy_id, expires_at, tenant_id, client_pubkey,
     connected_client_pubkey, connected_at, last_activity, activity_count, revoked_at,
-    authorization_handle, handle_expires_at, is_first_party, verified_client_pubkey)
+    handle_expires_at, is_first_party, verified_client_pubkey)
     ON public.oauth_authorizations TO support_reader;
 GRANT SELECT (user_pubkey, client_id, redirect_uri, scope, expires_at, created_at,
     tenant_id, code_challenge, code_challenge_method, pending_email, previous_auth_id,
