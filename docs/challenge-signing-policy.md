@@ -94,6 +94,11 @@ The flag and dedicated environment variable are required. The tool does not load
 is tooling guidance, not authorization to access production. A local pass is not Stage 1
 release acceptance or production-data evidence.
 
+The URL is parsed by SQLx, which fills any host, port, user, password, database or TLS mode
+the URL omits from libpq-style `PG*` environment variables and `~/.pgpass`. Put every
+connection part in the URL, or clear those variables, so the target cannot come from
+ambient shell state.
+
 A dedicated SQLx pool has one connection and a five-second acquisition timeout. Before
 reading data, it begins an explicit repeatable-read, read-only transaction, sets local
 15-second statement, two-second lock and 30-second idle transaction timeouts, and checks
@@ -124,9 +129,11 @@ count, and fixed categories `malformed_json`, `unknown_permission`, `invalid_con
 `passed: false` and a nonzero exit. Stderr uses fixed messages only. Identifiers, configuration,
 IDs, policy names, display text, connection details and raw errors are never emitted.
 
-Pure tests run with `cargo test --locked -p keycast_core --example audit_policy_permissions`.
-The database test additionally requires `--features integration-tests` and
-`KEYCAST_PERMISSION_AUDIT_TEST_DATABASE_URL`; it accepts only an explicitly prepared, owned
+Pure tests (invocation gating, factory/display conversion, budgets) run in the normal
+`cargo test --workspace` CI pass, or alone with
+`cargo test --locked -p keycast_core --example audit_policy_permissions`. The database test
+is ignored by default and additionally requires `--features integration-tests`, `-- --ignored`
+and `KEYCAST_PERMISSION_AUDIT_TEST_DATABASE_URL`; it accepts only an explicitly prepared, owned
 fixture at `127.0.0.1:55448`, database `keycast_permission_audit_test`. It creates/drops only
 synthetic `permissions` and `policy_permissions` fixture tables there. Never point it at an
 application database. It verifies shared links, malformed/unknown/invalid conversion,
