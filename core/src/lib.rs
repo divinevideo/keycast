@@ -26,6 +26,7 @@ pub mod secret_types;
 pub mod signing_handler;
 pub mod signing_session;
 pub mod tenant_query;
+pub mod token_hash;
 pub mod traits;
 pub mod types;
 pub mod verified_minor_dm;

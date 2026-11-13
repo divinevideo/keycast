@@ -143,7 +143,7 @@ async fn confirm_refuses_after_admin_invalidation(pool: PgPool) {
 
     // Admin invalidates between staging and confirm.
     sqlx::query("UPDATE account_claim_tokens SET invalidated_at = NOW() WHERE token = $1")
-        .bind(&token)
+        .bind(keycast_core::token_hash::hash_token(&token))
         .execute(&pool)
         .await
         .unwrap();
@@ -192,7 +192,7 @@ async fn confirm_refuses_after_confirmation_window_expires(pool: PgPool) {
     sqlx::query(
         "UPDATE account_claim_tokens SET confirmation_expires_at = NOW() - INTERVAL '1 minute' WHERE token = $1",
     )
-    .bind(&token)
+    .bind(keycast_core::token_hash::hash_token(&token))
     .execute(&pool)
     .await
     .unwrap();

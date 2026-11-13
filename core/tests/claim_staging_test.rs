@@ -37,7 +37,7 @@ async fn stage_pending_claim_writes_pending_state_on_valid_token(pool: PgPool) {
         "SELECT pending_email, pending_password_hash, confirmation_token \
          FROM account_claim_tokens WHERE token = $1 AND tenant_id = $2",
     )
-    .bind(&token)
+    .bind(keycast_core::token_hash::hash_token(&token))
     .bind(TENANT_ID)
     .fetch_one(&pool)
     .await
@@ -47,14 +47,14 @@ async fn stage_pending_claim_writes_pending_state_on_valid_token(pool: PgPool) {
         (
             Some("new@example.com".into()),
             Some("hash".into()),
-            Some("conf-tok-1".into())
+            Some(keycast_core::token_hash::hash_token("conf-tok-1"))
         )
     );
 
     // used_at is NOT set by staging -- the token is not yet consumed.
     let used: (Option<DateTime<Utc>>,) =
         sqlx::query_as("SELECT used_at FROM account_claim_tokens WHERE token = $1")
-            .bind(&token)
+            .bind(keycast_core::token_hash::hash_token(&token))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -110,14 +110,17 @@ async fn stage_pending_claim_stops_at_the_lifetime_send_limit(pool: PgPool) {
         "SELECT confirmation_token, confirmation_send_count \
          FROM account_claim_tokens WHERE token = $1 AND tenant_id = $2",
     )
-    .bind(&token)
+    .bind(keycast_core::token_hash::hash_token(&token))
     .bind(TENANT_ID)
     .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(
         staged.0,
-        Some(format!("conf-tok-{}", CLAIM_CONFIRMATION_SEND_LIMIT - 1)),
+        Some(keycast_core::token_hash::hash_token(&format!(
+            "conf-tok-{}",
+            CLAIM_CONFIRMATION_SEND_LIMIT - 1
+        ))),
         "the over-budget attempt must not overwrite the confirmation token"
     );
     assert_eq!(

@@ -80,6 +80,21 @@ async fn single_and_batch_issuance_audit_only_created_links(pool: PgPool) {
     .await
     .unwrap();
     assert!(issued.claim_url.contains("/api/claim?token="));
+    let lookup = admin::get_claim_token(
+        tenant(),
+        State(state.clone()),
+        auth(&actor),
+        axum::extract::Query(admin::GetClaimTokenQuery {
+            pubkey: pubkey.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+    let metadata = serde_json::to_value(lookup.0).unwrap();
+    assert_eq!(metadata["has_token"], true);
+    assert!(metadata["created_at"].is_string());
+    assert!(metadata["expires_at"].is_string());
+    assert!(metadata.get("claim_url").is_none());
     let sender: Arc<dyn EmailSender> = Arc::new(DevEmailSender::new());
     let batch = admin::batch_create_claim_tokens(
         tenant(),

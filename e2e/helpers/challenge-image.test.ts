@@ -7,6 +7,10 @@ import path from "node:path";
 import defaultConfig from "../playwright.config";
 import dedicatedConfig from "../challenge-image.config";
 import { assertEmptyConsentDisplay, CHALLENGE_TITLE, CHALLENGE_PHRASES, assertClientPackaging, assertDiscoverySeparation, configFromEnvironment, createFixtureHelpers, type FixtureConfig } from "./challenge-image-fixtures";
+import { getDeliveredToken } from "./emails";
+import { findClaimDeliveryEmail } from "./db";
+import { registerAndVerify } from "./auth";
+import { registerAdmin } from "./admin";
 
 const requiredIdsLoader = "import importlib.util,json,sys; s=importlib.util.spec_from_file_location('acceptance', '../scripts/challenge-image-acceptance.py'); m=importlib.util.module_from_spec(s); sys.modules[s.name]=m; s.loader.exec_module(m); print(json.dumps(m.SUITE_CASE_IDS))";
 
@@ -24,13 +28,104 @@ const environment = {
 const config = (): FixtureConfig => configFromEnvironment(environment);
 const publicKey = "f".repeat(64); // Synthetic public identifier only.
 
+test("delivered tokens match the recipient, purpose and latest captured email", async () => {
+  const calls: string[] = [];
+  const request = { get: async (route: string) => {
+    calls.push(route);
+    return { ok: () => true, json: async () => [
+      { to: "synthetic@example.test", verification_url: "http://localhost/verify-email?token=older" },
+      { to: "synthetic@example.test", verification_url: "http://localhost/verify-email?token=latest" },
+      { to: "synthetic@example.test", verification_url: "http://localhost/api/claim/confirm?token=claim-confirmation" },
+      { to: "other@example.test", verification_url: "http://localhost/verify-email?token=other" },
+    ] };
+  } } as any;
+  expect(await getDeliveredToken(request, { email: "synthetic@example.test", pathname: "/verify-email" })).toBe("latest");
+  expect(await getDeliveredToken(request, { email: "synthetic@example.test", pathname: "/api/claim/confirm" })).toBe("claim-confirmation");
+  expect(calls).toEqual(["/api/dev/emails", "/api/dev/emails"]);
+});
+
+test("inbox polling is bounded, checks ownership and never returns duplicate token parameters", async () => {
+  let reads = 0, guards = 0, pauses = 0;
+  const request = { get: async () => {
+    reads++;
+    return { ok: () => true, json: async () => [{ to: "synthetic@example.test", verification_url: "http://localhost/verify-email?token=one&token=two" }] };
+  } } as any;
+  await expect(getDeliveredToken(request, {
+    email: "synthetic@example.test", pathname: "/verify-email", attempts: 3,
+    beforeRead: async () => { guards++; }, pause: async () => { pauses++; },
+  })).rejects.toThrow("email_delivery_token_timeout");
+  expect([reads, guards, pauses]).toEqual([3, 3, 2]);
+});
+
+test("unavailable or malformed inboxes fail without exposing transport diagnostics", async () => {
+  for (const get of [
+    async () => { throw new Error("PRIVATE delivered credential"); },
+    async () => ({ ok: () => false, json: async () => { throw new Error("must not read body"); } }),
+    async () => ({ ok: () => true, json: async () => ({ credential: "PRIVATE" }) }),
+  ]) {
+    await expect(getDeliveredToken({ get } as any, { email: "synthetic@example.test", pathname: "/verify-email" }))
+      .rejects.toThrow(/^email_inbox_(unavailable|invalid_response)/);
+  }
+});
+
+test("ordinary registration verifies the delivered raw token instead of a database digest", async () => {
+  const posted: any[] = [];
+  const request = {
+    get: async () => ({ ok: () => true, json: async () => [{ to: "synthetic@example.test", verification_url: "http://localhost/verify-email?token=delivered-raw" }] }),
+    post: async (route: string, options: any) => {
+      posted.push({ route, ...options });
+      return { ok: () => true, json: async () => ({ success: true }), headers: () => ({ "set-cookie": "keycast_session=synthetic-session; HttpOnly" }) };
+    },
+  } as any;
+  await registerAndVerify(request, "synthetic@example.test", "synthetic-password");
+  expect(posted[1]).toEqual({ route: "/api/auth/verify-email", data: { token: "delivered-raw" } });
+});
+
+test("claim lookup hashes its raw input and reads only delivery metadata", async () => {
+  const query = async (sql: string, values: unknown[]) => {
+    expect(sql).toBe("SELECT pending_email FROM account_claim_tokens WHERE token = $1");
+    expect(values).toEqual([createHash("sha256").update("synthetic-raw-claim").digest("hex")]);
+    return { rows: [{ pending_email: "synthetic@example.test" }] };
+  };
+  expect(await findClaimDeliveryEmail({ query } as any, "synthetic-raw-claim")).toBe("synthetic@example.test");
+});
+
+test("an unverified admin retries a superseded delivery while its resend arrives", async () => {
+  let inboxReads = 0;
+  const verifiedTokens: string[] = [], routes: string[] = [];
+  const request = {
+    get: async () => ({ ok: () => true, json: async () => [{
+      to: "e2e-admin-fixed@test.local",
+      verification_url: `http://localhost/verify-email?token=${inboxReads++ === 0 ? "stale" : "current"}`,
+    }] }),
+    post: async (route: string, options: any) => {
+      routes.push(route);
+      let status = 200;
+      if (route.endsWith("/register")) status = 409;
+      if (route.endsWith("/login")) status = 403;
+      if (route.endsWith("/verify-email")) {
+        verifiedTokens.push(options.data.token);
+        if (options.data.token === "stale") status = 401;
+      }
+      return {
+        ok: () => status === 200, status: () => status,
+        json: async () => status === 401 ? { code: "VERIFICATION_LINK_SUPERSEDED" } : { success: true },
+        headers: () => ({ "set-cookie": "keycast_session=synthetic-session; HttpOnly" }),
+      };
+    },
+  } as any;
+  await registerAdmin(request);
+  expect(routes).toContain("/api/auth/resend-verification");
+  expect(verifiedTokens).toEqual(["stale", "current"]);
+});
+
 // Only external boundaries are replaced. Real helper control flow, SQL
 // parameters and request bodies remain under test; no services run.
-function fixture(options: { ownership?: unknown; database?: string; token?: any; user?: any; authorization?: any; missingToken?: boolean; processing?: boolean; httpError?: boolean; httpStatus?: number; mutationFailure?: boolean; code?: any; refreshState?: any; globalPreset?: boolean; teamAbsent?: boolean } = {}) {
+function fixture(options: { ownership?: unknown; database?: string; token?: any; user?: any; lockedUser?: any; readinessDelay?: number; verificationUpdateRows?: number; login?: any; loginError?: boolean; loginCookie?: string; loseOwnershipAfterReady?: boolean; authorization?: any; httpError?: boolean; httpStatus?: number; mutationFailure?: boolean; code?: any; refreshState?: any; globalPreset?: boolean; teamAbsent?: boolean } = {}) {
   const queries: { sql: string; values: any[] }[] = [];
   const calls: { method: string; url: string; options: any }[] = [];
   const policies: any[] = [], permissions: any[] = [], links: any[] = [];
-  let grantPolicy: any, readFails = false, failedMutation = false, verifiedCalls = 0;
+  let grantPolicy: any, readFails = false, failedMutation = false, userReads = 0, fixtureVerified = false;
   const db = { async query(sql: string, values: any[] = []) {
     queries.push({ sql, values });
     const q = sql.replace(/\s+/g, " ").trim();
@@ -49,7 +144,20 @@ function fixture(options: { ownership?: unknown; database?: string; token?: any;
       const p = policies.find(p => p.id === values[0] && p.slug === values[1]);
       rows = !p ? [] : links.filter(l => l.policy_id === p.id).map(l => ({ ...p, ...permissions.find(r => r.id === l.permission_id), policy_id: p.id, permission_id: l.permission_id }));
       if (p && !rows.length) rows = [{ ...p, policy_id: p.id, permission_id: null, identifier: null, config: null }];
-    } else if (q.includes("FROM users u JOIN tenants")) rows = [{ pubkey: publicKey, tenant_id: 7, email_verification_token: "synthetic-verification-token", email_verified: true, has_encrypted_key: true, ...options.user, ...(options.missingToken ? { email_verification_token: null } : {}) }];
+    } else if (q.includes("FROM users u JOIN tenants")) {
+      expect(q).not.toContain("email_verification_token");
+      expect(q).toContain("AS has_password_hash");
+      const ready = userReads++ >= (options.readinessDelay ?? 0);
+      rows = [{ pubkey: publicKey, tenant_id: 7, email_verified: fixtureVerified, has_encrypted_key: ready, has_password_hash: ready,
+        ...options.user, ...(q.includes("FOR UPDATE OF u") ? options.lockedUser : {}) }];
+      if (options.loseOwnershipAfterReady && ready) readFails = true;
+    }
+    else if (q.startsWith("UPDATE users u SET email_verified")) {
+      const registered = calls.find(call => call.url.endsWith("/register"))!.options.data;
+      expect(values).toEqual([publicKey, registered.email, 7, "localhost"]);
+      rows = Array.from({ length: options.verificationUpdateRows ?? 1 }, () => ({ pubkey: publicKey, tenant_id: 7 }));
+      fixtureVerified = rows.length === 1;
+    }
     else if (q.startsWith("INSERT INTO teams")) rows = [{ id: 21 }];
     else if (q.startsWith("INSERT INTO team_users")) rows = [{ id: 31 }];
     else if (q.startsWith("SELECT id FROM policies WHERE slug")) rows = options.globalPreset ? [{ id: 999 }] : [];
@@ -78,7 +186,10 @@ function fixture(options: { ownership?: unknown; database?: string; token?: any;
     expect(url.startsWith("http://localhost:3000/api/")).toBe(true); expect(opts.headers.Origin).toBe("http://localhost:3000"); expect(opts.timeout).toBe(15000); expect(opts.maxRedirects).toBe(0);
     let body: any = {};
     if (url.endsWith("/register")) body = { success: true, pubkey: publicKey, verification_required: true };
-    else if (url.endsWith("/verify-email")) body = options.processing && verifiedCalls++ === 0 ? { success: false, status: "processing", retry_after: 1 } : { success: true, authenticated: true };
+    else if (url.endsWith("/login")) {
+      if (options.loginError) throw new Error("PRIVATE password and session diagnostics");
+      body = { success: true, pubkey: publicKey, ...options.login };
+    }
     else if (url.endsWith("/authorize")) body = { code: "synthetic-code", redirect_uri: opts.data.redirect_uri };
     else if (url.endsWith("/token")) body = {
       access_token: "synthetic-access", refresh_token: opts.data.grant_type === "refresh_token" ? "synthetic-rotated" : "synthetic-refresh", token_type: "Bearer", expires_in: 3600,
@@ -86,7 +197,8 @@ function fixture(options: { ownership?: unknown; database?: string; token?: any;
       bunker_url: `bunker://${"1".repeat(64)}?relay=ws%3A%2F%2Flocalhost%3A8080&secret=synthetic-secret`,
       policy: { slug: grantPolicy.slug, display_name: grantPolicy.displayName, description: "Synthetic acceptance", permissions: grantPolicy.kind === "empty" ? [] : [...[{ icon: "🏆", title: "Challenges and contest curation", description: "Create and manage challenges, enter and withdraw entries, announce results, and curate contests. No private-message access." }], ...(grantPolicy.kind === "intersection" ? [{ icon: "🔒", title: "Other actions", description: "Synthetic restriction" }] : [])] }, ...options.token,
     }; else throw new Error("unexpected HTTP boundary");
-    return { ok: () => (options.httpStatus ?? 200) >= 200 && (options.httpStatus ?? 200) < 300, status: () => options.httpStatus ?? 200, json: async () => body, headers: () => ({ "set-cookie": "keycast_session=synthetic-session; Path=/; HttpOnly" }) };
+    return { ok: () => (options.httpStatus ?? 200) >= 200 && (options.httpStatus ?? 200) < 300, status: () => options.httpStatus ?? 200, json: async () => body,
+      headers: () => ({ "set-cookie": url.endsWith("/login") ? (options.loginCookie ?? "keycast_session=synthetic-session; Path=/; HttpOnly") : "keycast_session=synthetic-session; Path=/; HttpOnly" }) };
   }]));
   return { ...helpers, queries, calls, policies, permissions, links, request: request as any,
     missingManifest() { readFails = true; }, bind(p: any) { grantPolicy = p; } };
@@ -255,12 +367,34 @@ test("policy INSERT binds varchar display and text name to separate parameters",
   }
 });
 
-test("normal registration verifies generated image key and creates only team admin", async () => {
+test("image setup verifies only its registered synthetic row then uses real password login", async () => {
   const f = fixture(); const s = await f.registerSyntheticUser(f.request, config()); expect(s.pubkey).toBe(publicKey); expect(s.cookie).toBe("keycast_session=synthetic-session"); expect(s.teamId).toBe(21);
   const data = f.calls.find(c => c.url.endsWith("/register"))!.options.data; expect(data.email).toMatch(/^image-[a-f0-9]+@example\.test$/); expect(data.password.length).toBeGreaterThanOrEqual(32); expect(Object.keys(data).sort()).toEqual(["email", "password"]);
   expect(f.queries.filter(q => q.sql.includes("FROM users u JOIN tenants")).every(q => q.values[0] === data.email && q.values[1] === "localhost")).toBe(true);
-  expect(f.calls.find(c => c.url.endsWith("/verify-email"))!.options.data).toEqual({ token: "synthetic-verification-token" });
-  expect(writes(f).map(q => q.sql.match(/INSERT INTO (\w+)/)![1])).toEqual(["teams", "team_users"]); expect(writes(f)[1].values).toEqual([21, publicKey]);
+  const login = f.calls.find(c => c.url.endsWith("/login"))!;
+  expect(login.options.data.email === data.email && login.options.data.password === data.password).toBe(true);
+  expect(Object.keys(login.options.data).sort()).toEqual(["email", "password"]);
+  expect(f.calls.map(call => call.url)).toEqual(["http://localhost:3000/api/auth/register", "http://localhost:3000/api/auth/login"]);
+  const verification = writes(f)[0];
+  expect(verification.sql.replace(/\s+/g, " ")).toContain("WHERE u.pubkey = $1 AND u.email = $2 AND u.tenant_id = $3 AND NOT u.email_verified");
+  expect(verification.sql).toContain("t.domain = $4");
+  expect(verification.sql).toContain("u.password_hash IS NOT NULL");
+  expect(verification.sql).toContain("pk.tenant_id = u.tenant_id");
+  expect(verification.values).toEqual([publicKey, data.email, s.tenantId, "localhost"]);
+  const updateIndex = f.queries.indexOf(verification);
+  expect(f.queries[updateIndex - 1].sql).toContain("FOR UPDATE OF u");
+  expect(f.queries[updateIndex - 2].sql).toBe("BEGIN");
+  expect(f.queries[updateIndex - 3].sql).toBe("SELECT current_database() AS database");
+  expect(f.queries[updateIndex + 1].sql).toBe("COMMIT");
+  expect(writes(f).filter(query => query.sql.startsWith("INSERT")).map(q => q.sql.match(/INSERT INTO (\w+)/)![1])).toEqual(["teams", "team_users"]);
+  expect(writes(f)[2].values).toEqual([21, publicKey]);
+  expect(Object.keys(s).sort()).toEqual(["cookie", "pubkey", "teamId", "tenantId"]);
+});
+
+test("production-mode image helper never reads bearer columns, calls the dev inbox or logs credentials", () => {
+  const source = readFileSync(path.resolve(import.meta.dir, "challenge-image-fixtures.ts"), "utf8");
+  expect(source).not.toMatch(/email_verification_token|confirmation_token|getDeliveredToken|\/api\/dev\/emails|\/api\/auth\/verify-email/);
+  expect(source).not.toMatch(/\bconsole\s*\.|\bprocess\.(stdout|stderr)|JSON\.stringify\((password|cookie|session)\)/);
 });
 
 test("PKCE explicit policy and owned relay plus database binding yield memory-only grant", async () => {
@@ -299,18 +433,46 @@ for (const [name, authorization] of Object.entries({ wrongPolicy: { policy_id: 9
   const f = fixture({ authorization }); const policies = await f.preparePolicies(config()); const session = await f.registerSyntheticUser(f.request, config()); f.bind(policies.restricted);
   await expect(f.issueGrant(f.request, session, policies.restricted)).rejects.toThrow("grant_database_binding");
 });
-test("verification token lookup is bounded and never bypasses verification", async () => {
-  const f = fixture({ missingToken: true });
-  await expect(f.registerSyntheticUser(f.request, config())).rejects.toThrow("verification_token_timeout");
-  expect(f.queries.filter(q => q.sql.includes("FROM users u JOIN tenants"))).toHaveLength(10);
+for (const user of [{ has_encrypted_key: false }, { has_password_hash: false }]) test("registration readiness is bounded before verification setup or login", async () => {
+  const f = fixture({ user });
+  await expect(f.registerSyntheticUser(f.request, config())).rejects.toThrow("registration_timeout");
+  expect(f.queries.filter(query => query.sql.includes("FROM users u JOIN tenants"))).toHaveLength(10);
   expect(f.calls).toHaveLength(1); expect(writes(f)).toHaveLength(0);
 });
-test("verification retries processing and refuses an unencrypted user", async () => {
-  const retry = fixture({ processing: true }); await retry.registerSyntheticUser(retry.request, config());
-  expect(retry.calls.filter(c => c.url.endsWith("/verify-email"))).toHaveLength(2);
-  const invalid = fixture({ user: { has_encrypted_key: false } });
-  await expect(invalid.registerSyntheticUser(invalid.request, config())).rejects.toThrow("registration_binding");
-  expect(invalid.calls).toHaveLength(1); expect(writes(invalid)).toHaveLength(0);
+test("registration waits for asynchronous encrypted-key and password-hash readiness", async () => {
+  const f = fixture({ readinessDelay: 2 });
+  await f.registerSyntheticUser(f.request, config());
+  expect(f.queries.filter(query => query.sql.includes("FROM users u JOIN tenants"))).toHaveLength(5);
+  expect(f.calls.filter(call => call.url.endsWith("/login"))).toHaveLength(1);
+});
+for (const lockedUser of [{ pubkey: "0".repeat(64) }, { tenant_id: 8 }, { email_verified: true }, { has_encrypted_key: false }, { has_password_hash: false }]) test("verification setup rechecks exact registration binding under lock", async () => {
+  const f = fixture({ lockedUser });
+  await expect(f.registerSyntheticUser(f.request, config())).rejects.toThrow("verification_fixture_binding");
+  expect(writes(f)).toHaveLength(0); expect(f.calls).toHaveLength(1);
+  expect(f.queries.at(-1)!.sql).toBe("ROLLBACK");
+});
+for (const verificationUpdateRows of [0, 2]) test("verification setup requires exactly one affected owned row", async () => {
+  const f = fixture({ verificationUpdateRows });
+  await expect(f.registerSyntheticUser(f.request, config())).rejects.toThrow("verification_fixture_update");
+  expect(writes(f)).toHaveLength(1); expect(f.calls).toHaveLength(1);
+  expect(f.queries.at(-1)!.sql).toBe("ROLLBACK");
+});
+test("lost ownership prevents synthetic verification setup", async () => {
+  const f = fixture({ loseOwnershipAfterReady: true });
+  await expect(f.registerSyntheticUser(f.request, config())).rejects.toThrow("ownership_manifest");
+  expect(writes(f)).toHaveLength(0); expect(f.calls).toHaveLength(1);
+});
+for (const login of [{ success: false }, { pubkey: "0".repeat(64) }, { verification_required: true }]) test("login must return successful authentication for the registered public key", async () => {
+  const f = fixture({ login });
+  await expect(f.registerSyntheticUser(f.request, config())).rejects.toThrow("login_binding");
+  expect(writes(f)).toHaveLength(1);
+});
+test("login must return a session cookie and must not leak transport diagnostics", async () => {
+  const absent = fixture({ loginCookie: "" });
+  await expect(absent.registerSyntheticUser(absent.request, config())).rejects.toThrow("session_cookie");
+  const failed = fixture({ loginError: true });
+  await expect(failed.registerSyntheticUser(failed.request, config())).rejects.toThrow(/^challenge_image:http_request$/);
+  expect(writes(absent)).toHaveLength(1); expect(writes(failed)).toHaveLength(1);
 });
 test("HTTP exceptions never reveal request token or cookie diagnostics", async () => {
   const f = fixture({ httpError: true });
@@ -560,7 +722,7 @@ test("owned authorization request uses real PKCE, exact scope, explicit consent 
   expect(createHash("sha256").update(pending.auth.verifier).digest("base64url")).toBe(url.searchParams.get("code_challenge"));
   expect(await f.codeState(pending.auth, pending.code)).toEqual({ authorizations: 0, refreshTokens: 0 });
   const query = f.queries.find(q => q.sql.includes("SELECT code, pending_email"))!;
-  expect(query.values).toEqual([pending.code, s.pubkey, s.tenantId, pending.auth.clientId, pending.auth.redirectUri]);
+  expect(query.values).toEqual([createHash("sha256").update(pending.code).digest("hex"), s.pubkey, s.tenantId, pending.auth.clientId, pending.auth.redirectUri]);
   expect(f.queries[f.queries.indexOf(query) - 1].sql).toBe("SELECT current_database() AS database");
   const grant = await f.exchangeAuthorization(f.request, pending.auth, pending.code);
   expect(grant.clientId).toBe(pending.auth.clientId);

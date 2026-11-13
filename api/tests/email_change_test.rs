@@ -28,10 +28,11 @@ use keycast_api::{
     email_service::{DevEmailSender, EmailSender},
     PrefixedRedis,
 };
+use keycast_core::token_hash::hash_token;
 use nostr_sdk::Keys;
 use redis::aio::ConnectionManager;
 use sqlx::PgPool;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -125,7 +126,7 @@ async fn create_user(pool: &PgPool, pubkey: &str, email: &str, password: &str) {
 fn build_app(pool: PgPool) -> Router {
     build_app_with_delivery(
         pool,
-        EmailDeliveryService::unrestricted_for_tests(Arc::new(DevEmailSender::new())),
+        EmailDeliveryService::unrestricted_for_tests(captured_sender()),
     )
 }
 
@@ -242,6 +243,26 @@ async fn pending_state(
     .expect("read pending state")
 }
 
+fn captured_sender() -> Arc<DevEmailSender> {
+    static SENDER: OnceLock<Arc<DevEmailSender>> = OnceLock::new();
+    SENDER
+        .get_or_init(|| Arc::new(DevEmailSender::new()))
+        .clone()
+}
+
+fn emailed_token(digest: &str) -> String {
+    captured_sender()
+        .get_captured_emails()
+        .iter()
+        .rev()
+        .flat_map(|email| [email.verification_url.as_ref(), email.reset_url.as_ref()])
+        .flatten()
+        .filter_map(|url| url.split("?token=").nth(1))
+        .find(|raw| hash_token(raw) == digest)
+        .expect("raw token must come from the delivered email")
+        .to_string()
+}
+
 async fn current_email(pool: &PgPool, pubkey: &str) -> String {
     sqlx::query_scalar("SELECT email FROM users WHERE pubkey = $1")
         .bind(pubkey)
@@ -265,8 +286,8 @@ async fn suppressed_email_change_preserves_pending_state_and_skips_provider() {
          pending_email_sent_at = $5 WHERE pubkey = $6 AND tenant_id = $7",
     )
     .bind(&prior_target)
-    .bind("prior-old-token")
-    .bind("prior-new-token")
+    .bind(hash_token("prior-old-token"))
+    .bind(hash_token("prior-new-token"))
     .bind(Utc::now() + Duration::hours(1))
     .bind(Utc::now() - Duration::hours(1))
     .bind(&pubkey)
@@ -336,8 +357,8 @@ async fn same_target_cooldown_returns_before_shared_admission() {
          pending_email_sent_at = NOW() WHERE pubkey = $5 AND tenant_id = $6",
     )
     .bind(&new_email)
-    .bind("prior-old-token")
-    .bind("prior-new-token")
+    .bind(hash_token("prior-old-token"))
+    .bind(hash_token("prior-new-token"))
     .bind(Utc::now() + Duration::hours(1))
     .bind(&pubkey)
     .bind(TENANT_ID)
@@ -405,8 +426,8 @@ async fn test_happy_path_dual_confirm_finalizes() {
 
     let (pending, old_tok, new_tok, _, _) = pending_state(&pool, &pubkey).await;
     assert_eq!(pending.as_deref(), Some(new_email.as_str()));
-    let old_tok = old_tok.expect("old token");
-    let new_tok = new_tok.expect("new token");
+    let old_tok = emailed_token(&old_tok.expect("old token"));
+    let new_tok = emailed_token(&new_tok.expect("new token"));
     assert_eq!(current_email(&pool, &pubkey).await, old_email);
 
     // Confirm new address only — must not finalize.
@@ -467,7 +488,7 @@ async fn test_finalizes_regardless_of_confirmation_order() {
         &app,
         "/auth/confirm-email-change",
         None,
-        serde_json::json!({ "token": old_tok.unwrap() }),
+        serde_json::json!({ "token": emailed_token(&old_tok.unwrap()) }),
     )
     .await;
     assert_eq!(current_email(&pool, &pubkey).await, old_email);
@@ -477,7 +498,7 @@ async fn test_finalizes_regardless_of_confirmation_order() {
         &app,
         "/auth/confirm-email-change",
         None,
-        serde_json::json!({ "token": new_tok.unwrap() }),
+        serde_json::json!({ "token": emailed_token(&new_tok.unwrap()) }),
     )
     .await;
     assert_eq!(current_email(&pool, &pubkey).await, new_email);
@@ -510,7 +531,7 @@ async fn test_partial_confirmation_does_not_finalize() {
         &app,
         "/auth/confirm-email-change",
         None,
-        serde_json::json!({ "token": old_tok.unwrap() }),
+        serde_json::json!({ "token": emailed_token(&old_tok.unwrap()) }),
     )
     .await;
 
@@ -630,7 +651,7 @@ async fn test_expired_token_rejected() {
         &app,
         "/auth/confirm-email-change",
         None,
-        serde_json::json!({ "token": old_tok.unwrap() }),
+        serde_json::json!({ "token": emailed_token(&old_tok.unwrap()) }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -664,7 +685,7 @@ async fn test_cancel_clears_pending() {
         &app,
         "/auth/cancel-email-change",
         None,
-        serde_json::json!({ "token": old_tok.unwrap() }),
+        serde_json::json!({ "token": emailed_token(&old_tok.unwrap()) }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);

@@ -31,12 +31,14 @@ async fn insert_pending_registration(
             $3, 1, NOW(), $4, 'plain', $5, 'test-password-hash', $6, $7, $8
          )",
     )
-    .bind(code)
+    .bind(keycast_core::token_hash::hash_token(code))
     .bind(user_pubkey)
     .bind(Utc::now() + Duration::minutes(10))
     .bind(verifier)
     .bind(email)
-    .bind(format!("verify-{code}"))
+    .bind(keycast_core::token_hash::hash_token(&format!(
+        "verify-{code}"
+    )))
     .bind(pending_encrypted_secret)
     .bind(is_headless)
     .execute(pool)

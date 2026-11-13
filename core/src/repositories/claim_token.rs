@@ -1,3 +1,4 @@
+use crate::token_hash::hash_token;
 use chrono::{DateTime, Duration, Utc};
 use sqlx::{PgPool, Postgres, Transaction};
 
@@ -30,20 +31,13 @@ pub enum StagePendingOutcome {
 }
 
 /// Send-related state for a staged pending claim, read by the resend endpoint
-/// to decide whether a resend is due and which confirmation token to (re)send.
-/// `confirmation_token` and `confirmation_expired` are non-optional because
-/// `stage_pending_claim` always writes `pending_email`, `confirmation_token`,
-/// and `confirmation_expires_at` together, and `confirm_claim_consuming_token`
-/// always clears them together — so a row with `pending_email IS NOT NULL`
-/// (this query's guard) is guaranteed to also carry a confirmation token and
-/// expiry.
+/// to decide whether a resend is due. Each resend creates a new token.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct PendingClaimSendState {
     pub user_pubkey: String,
     pub to_email: String,
     pub confirmation_sent_at: Option<DateTime<Utc>>,
-    pub confirmation_token: String,
-    pub confirmation_expired: bool,
+    pub confirmation_token_hash: String,
 }
 
 /// Repository for account claim token operations.
@@ -93,7 +87,7 @@ impl ClaimTokenRepository {
                AND used_at IS NULL
                AND invalidated_at IS NULL"
         ))
-        .bind(token)
+        .bind(hash_token(token))
         .fetch_optional(&self.pool)
         .await
         .map_err(Into::into)
@@ -116,7 +110,7 @@ impl ClaimTokenRepository {
              RETURNING ",
             claim_token_columns!()
         ))
-        .bind(token)
+        .bind(hash_token(token))
         .fetch_optional(&self.pool)
         .await
         .map_err(Into::into)
@@ -181,6 +175,7 @@ impl ClaimTokenRepository {
         user_pubkey: &str,
         tenant_id: i64,
     ) -> Result<(), RepositoryError> {
+        Self::lock_issuance_in_tx(tx, user_pubkey, tenant_id).await?;
         sqlx::query(
             "SELECT id FROM account_claim_tokens
              WHERE user_pubkey = $1 AND tenant_id = $2
@@ -193,6 +188,19 @@ impl ClaimTokenRepository {
         Ok(())
     }
 
+    async fn lock_issuance_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        user_pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<(), RepositoryError> {
+        // Also serializes issuance when the account has no claim rows yet.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("claim-issuance:{tenant_id}:{user_pubkey}"))
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
     pub async fn create_in_tx(
         tx: &mut Transaction<'_, Postgres>,
         token: &str,
@@ -200,6 +208,20 @@ impl ClaimTokenRepository {
         created_by_pubkey: Option<&str>,
         tenant_id: i64,
     ) -> Result<ClaimToken, RepositoryError> {
+        Self::lock_issuance_in_tx(tx, user_pubkey, tenant_id).await?;
+        let invalidated = sqlx::query(
+            "UPDATE account_claim_tokens
+             SET expires_at = NOW(), invalidated_at = NOW(), invalidated_by = $3,
+                 invalidation_reason = 'replaced_by_new_link'
+             WHERE user_pubkey = $1 AND tenant_id = $2
+               AND used_at IS NULL AND invalidated_at IS NULL AND expires_at > NOW()",
+        )
+        .bind(user_pubkey)
+        .bind(tenant_id)
+        .bind(created_by_pubkey)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
         let now = Utc::now();
         let expires_at = now + Duration::days(CLAIM_TOKEN_EXPIRY_DAYS);
         let claim_token = sqlx::query_as::<_, ClaimToken>(concat!(
@@ -209,7 +231,7 @@ impl ClaimTokenRepository {
              RETURNING ",
             claim_token_columns!()
         ))
-        .bind(token)
+        .bind(hash_token(token))
         .bind(user_pubkey)
         .bind(expires_at)
         .bind(now)
@@ -217,7 +239,7 @@ impl ClaimTokenRepository {
         .bind(tenant_id)
         .fetch_one(&mut **tx)
         .await?;
-        Self::audit_creation_in_tx(tx, &claim_token, 0).await?;
+        Self::audit_creation_in_tx(tx, &claim_token, invalidated).await?;
         Ok(claim_token)
     }
 
@@ -247,20 +269,14 @@ impl ClaimTokenRepository {
         Ok(())
     }
 
-    /// Return the current token or mint one replacement while the caller holds
-    /// the provisioning operation lock in this same transaction.
-    pub async fn find_or_replace_for_provisioning_in_tx(
+    /// Replace the claim link under the caller's provisioning-operation lock.
+    pub async fn replace_for_provisioning_in_tx(
         tx: &mut Transaction<'_, Postgres>,
         user_pubkey: &str,
         tenant_id: i64,
         replacement_token: &str,
     ) -> Result<ClaimToken, RepositoryError> {
-        if let Some(existing) =
-            Self::find_valid_by_user_pubkey_in_tx(tx, user_pubkey, tenant_id).await?
-        {
-            return Ok(existing);
-        }
-
+        Self::lock_issuance_in_tx(tx, user_pubkey, tenant_id).await?;
         let now = Utc::now();
         sqlx::query(
             "UPDATE account_claim_tokens
@@ -282,7 +298,7 @@ impl ClaimTokenRepository {
              RETURNING ",
             claim_token_columns!()
         ))
-        .bind(replacement_token)
+        .bind(hash_token(replacement_token))
         .bind(user_pubkey)
         .bind(expires_at)
         .bind(now)
@@ -373,6 +389,8 @@ impl ClaimTokenRepository {
 
         let mut tx = self.pool.begin().await?;
 
+        Self::lock_issuance_in_tx(&mut tx, user_pubkey, tenant_id).await?;
+
         let invalidated_count = sqlx::query(
             "UPDATE account_claim_tokens
              SET expires_at = NOW(),
@@ -399,7 +417,7 @@ impl ClaimTokenRepository {
              RETURNING ",
             claim_token_columns!()
         ))
-        .bind(token)
+        .bind(hash_token(token))
         .bind(user_pubkey)
         .bind(expires_at)
         .bind(now)
@@ -494,9 +512,9 @@ impl ClaimTokenRepository {
         )
         .bind(pending_email)
         .bind(pending_password_hash)
-        .bind(confirmation_token)
+        .bind(hash_token(confirmation_token))
         .bind(confirmation_expires_at)
-        .bind(token)
+        .bind(hash_token(token))
         .bind(tenant_id)
         .bind(CLAIM_CONFIRMATION_SEND_LIMIT)
         .execute(&self.pool)
@@ -519,7 +537,7 @@ impl ClaimTokenRepository {
                AND invalidated_at IS NULL
                AND expires_at > NOW()",
         )
-        .bind(token)
+        .bind(hash_token(token))
         .bind(tenant_id)
         .fetch_optional(&self.pool)
         .await?;
@@ -535,7 +553,7 @@ impl ClaimTokenRepository {
         }
     }
 
-    /// Look up the claim token string and confirmation expiry for a given
+    /// Look up the claim state and confirmation expiry for a given
     /// confirmation token, with no validity guard at all.
     ///
     /// Used to validate the read-only preview and classify a failed confirm.
@@ -548,23 +566,28 @@ impl ClaimTokenRepository {
         &self,
         confirmation_token: &str,
         tenant_id: i64,
-    ) -> Result<Option<(String, Option<DateTime<Utc>>)>, RepositoryError> {
-        sqlx::query_as(
+    ) -> Result<Option<(ClaimTokenState, Option<DateTime<Utc>>)>, RepositoryError> {
+        let row: Option<(String, Option<DateTime<Utc>>)> = sqlx::query_as(
             "SELECT token, confirmation_expires_at
              FROM account_claim_tokens
              WHERE confirmation_token = $1
                AND tenant_id = $2",
         )
-        .bind(confirmation_token)
+        .bind(hash_token(confirmation_token))
         .bind(tenant_id)
         .fetch_optional(&self.pool)
-        .await
-        .map_err(Into::into)
+        .await?;
+        match row {
+            Some((token_hash, expires_at)) => Ok(Some((
+                self.classify_hash(&token_hash, tenant_id).await?,
+                expires_at,
+            ))),
+            None => Ok(None),
+        }
     }
 
     /// Read the send-related state of a staged pending claim, for the resend
-    /// endpoint to decide whether a resend is due (cooldown) and whether the
-    /// existing confirmation token is still usable or needs rotating.
+    /// endpoint to identify the recipient and current confirmation generation.
     /// Explicit columns (no `SELECT *`), guarded by the same still-valid
     /// predicate as `stage_pending_claim`. Returns `None` when no staged,
     /// still-valid pending claim exists for this token (unknown token, no
@@ -581,8 +604,7 @@ impl ClaimTokenRepository {
             "SELECT user_pubkey,
                     pending_email AS to_email,
                     confirmation_sent_at,
-                    confirmation_token,
-                    (confirmation_expires_at <= NOW()) AS confirmation_expired
+                    confirmation_token AS confirmation_token_hash
              FROM account_claim_tokens
              WHERE token = $1
                AND tenant_id = $2
@@ -591,7 +613,7 @@ impl ClaimTokenRepository {
                AND invalidated_at IS NULL
                AND expires_at > NOW()",
         )
-        .bind(token)
+        .bind(hash_token(token))
         .bind(tenant_id)
         .fetch_optional(&self.pool)
         .await
@@ -609,9 +631,7 @@ impl ClaimTokenRepository {
     /// how many arrived at once. Doing it in one statement means exactly one
     /// concurrent request can win a given slot.
     ///
-    /// When `rotated` is `Some` (because the prior confirmation token had
-    /// already expired) the freshly minted token/expiry pair replaces the old
-    /// one in the same write.
+    /// The freshly minted token/expiry pair always replaces the old one in the same write.
     ///
     /// Guarded by the same still-valid predicate as
     /// `pending_claim_send_state`/`stage_pending_claim`, so a claim token that
@@ -624,13 +644,13 @@ impl ClaimTokenRepository {
         &self,
         token: &str,
         tenant_id: i64,
-        rotated: Option<(&str, DateTime<Utc>)>,
+        rotated: (&str, DateTime<Utc>),
+        expected_confirmation_hash: &str,
         cooldown_minutes: i32,
     ) -> Result<bool, RepositoryError> {
-        let updated = match rotated {
-            Some((new_confirmation_token, new_confirmation_expires_at)) => {
-                sqlx::query(
-                    "UPDATE account_claim_tokens
+        let (new_confirmation_token, new_confirmation_expires_at) = rotated;
+        let updated = sqlx::query(
+            "UPDATE account_claim_tokens
                      SET confirmation_sent_at = NOW(),
                          confirmation_send_count = confirmation_send_count + 1,
                          confirmation_token = $1,
@@ -644,41 +664,18 @@ impl ClaimTokenRepository {
                        AND confirmation_send_count < $5
                        AND (confirmation_sent_at IS NULL
                             OR confirmation_sent_at
-                               < NOW() - make_interval(mins => $6))",
-                )
-                .bind(new_confirmation_token)
-                .bind(new_confirmation_expires_at)
-                .bind(token)
-                .bind(tenant_id)
-                .bind(CLAIM_CONFIRMATION_SEND_LIMIT)
-                .bind(cooldown_minutes)
-                .execute(&self.pool)
-                .await?
-            }
-            None => {
-                sqlx::query(
-                    "UPDATE account_claim_tokens
-                     SET confirmation_sent_at = NOW(),
-                         confirmation_send_count = confirmation_send_count + 1
-                     WHERE token = $1
-                       AND tenant_id = $2
-                       AND pending_email IS NOT NULL
-                       AND used_at IS NULL
-                       AND invalidated_at IS NULL
-                       AND expires_at > NOW()
-                       AND confirmation_send_count < $3
-                       AND (confirmation_sent_at IS NULL
-                            OR confirmation_sent_at
-                               < NOW() - make_interval(mins => $4))",
-                )
-                .bind(token)
-                .bind(tenant_id)
-                .bind(CLAIM_CONFIRMATION_SEND_LIMIT)
-                .bind(cooldown_minutes)
-                .execute(&self.pool)
-                .await?
-            }
-        };
+                               < NOW() - make_interval(mins => $6))
+                       AND confirmation_token = $7",
+        )
+        .bind(hash_token(new_confirmation_token))
+        .bind(new_confirmation_expires_at)
+        .bind(hash_token(token))
+        .bind(tenant_id)
+        .bind(CLAIM_CONFIRMATION_SEND_LIMIT)
+        .bind(cooldown_minutes)
+        .bind(expected_confirmation_hash)
+        .execute(&self.pool)
+        .await?;
 
         Ok(updated.rows_affected() > 0)
     }
@@ -692,13 +689,21 @@ impl ClaimTokenRepository {
         token: &str,
         tenant_id: i64,
     ) -> Result<ClaimTokenState, RepositoryError> {
+        self.classify_hash(&hash_token(token), tenant_id).await
+    }
+
+    async fn classify_hash(
+        &self,
+        token_hash: &str,
+        tenant_id: i64,
+    ) -> Result<ClaimTokenState, RepositoryError> {
         let ct = sqlx::query_as::<_, ClaimToken>(concat!(
             "SELECT ",
             claim_token_columns!(),
             " FROM account_claim_tokens
                  WHERE token = $1 AND tenant_id = $2"
         ))
-        .bind(token)
+        .bind(token_hash)
         .bind(tenant_id)
         .fetch_optional(&self.pool)
         .await?;

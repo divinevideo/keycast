@@ -562,7 +562,7 @@ async fn test_clear_invalidates_outstanding_claim_token() {
         "INSERT INTO account_claim_tokens (token, user_pubkey, expires_at, created_at, tenant_id) \
          VALUES ($1, $2, NOW() + INTERVAL '7 days', NOW(), $3)",
     )
-    .bind(&token)
+    .bind(keycast_core::token_hash::hash_token(&token))
     .bind(&pubkey)
     .bind(TENANT_ID)
     .execute(&pool)
@@ -604,7 +604,7 @@ async fn test_clear_invalidates_outstanding_claim_token() {
     // Invalidation is attributed to the moderator that drove the revoke.
     let invalidated_by: (Option<String>,) =
         sqlx::query_as("SELECT invalidated_by FROM account_claim_tokens WHERE token = $1")
-            .bind(&token)
+            .bind(keycast_core::token_hash::hash_token(&token))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -630,7 +630,7 @@ async fn test_clear_without_actor_still_invalidates_claim_token() {
         "INSERT INTO account_claim_tokens (token, user_pubkey, expires_at, created_at, tenant_id) \
          VALUES ($1, $2, NOW() + INTERVAL '7 days', NOW(), $3)",
     )
-    .bind(&token)
+    .bind(keycast_core::token_hash::hash_token(&token))
     .bind(&pubkey)
     .bind(TENANT_ID)
     .execute(&pool)
@@ -655,7 +655,7 @@ async fn test_clear_without_actor_still_invalidates_claim_token() {
         sqlx::query_as(
             "SELECT invalidated_at, invalidated_by FROM account_claim_tokens WHERE token = $1",
         )
-        .bind(&token)
+        .bind(keycast_core::token_hash::hash_token(&token))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -690,7 +690,7 @@ async fn test_clear_does_not_invalidate_other_tenant_claim_token() {
         "INSERT INTO account_claim_tokens (token, user_pubkey, expires_at, created_at, tenant_id) \
          VALUES ($1, $2, NOW() + INTERVAL '7 days', NOW(), $3)",
     )
-    .bind(&foreign_token)
+    .bind(keycast_core::token_hash::hash_token(&foreign_token))
     .bind(&pubkey)
     .bind(OTHER_TENANT_ID)
     .execute(&pool)
@@ -714,7 +714,7 @@ async fn test_clear_does_not_invalidate_other_tenant_claim_token() {
     // The tenant-2 token must be untouched: still valid, never invalidated.
     let (invalidated_at,): (Option<chrono::DateTime<Utc>>,) =
         sqlx::query_as("SELECT invalidated_at FROM account_claim_tokens WHERE token = $1")
-            .bind(&foreign_token)
+            .bind(keycast_core::token_hash::hash_token(&foreign_token))
             .fetch_one(&pool)
             .await
             .unwrap();

@@ -3,13 +3,13 @@
 
 use crate::repositories::EmailMarketingConsent;
 use crate::repositories::RepositoryError;
+use crate::token_hash::hash_token;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 /// Data returned when finding an OAuth code
 ///
-/// Field names match `oauth_codes` columns so `sqlx::FromRow` maps by name; queries may
-/// list the columns in any order as long as every field has a matching selected column.
+/// Bearer columns decode into explicitly named digest fields, never recoverable credentials.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct OAuthCodeData {
     pub user_pubkey: String,
@@ -20,7 +20,8 @@ pub struct OAuthCodeData {
     pub code_challenge_method: Option<String>,
     pub pending_email: Option<String>,
     pub pending_password_hash: Option<String>,
-    pub pending_email_verification_token: Option<String>,
+    #[sqlx(rename = "pending_email_verification_token")]
+    pub pending_email_verification_token_hash: Option<String>,
     pub pending_encrypted_secret: Option<Vec<u8>>,
     /// The consent answer carried on the pending row and written onto the materialized user.
     /// Stored as text; parse with EmailMarketingConsent::from_db at the point of use.
@@ -29,8 +30,11 @@ pub struct OAuthCodeData {
     pub pending_email_marketing_app_version: Option<String>,
     pub previous_auth_id: Option<i32>,
     pub state: Option<String>,
-    /// RFC 8628 device_code for secure polling (returned in response body, never in URLs)
-    pub device_code: Option<String>,
+    /// Digest of the RFC 8628 device credential disclosed only at registration.
+    #[sqlx(rename = "device_code")]
+    pub device_code_hash: Option<String>,
+    /// Immutable pending-row creation time, retained across same-email supersession.
+    pub created_at: DateTime<Utc>,
     /// Whether this code was issued via headless flow (for first_party UCAN fact)
     pub is_headless: bool,
     /// bcrypt hash of the 6-digit in-app PIN fallback (keycast#262), if one was issued
@@ -120,9 +124,6 @@ pub struct StoreOAuthCodeWithRegistrationParams<'a> {
 /// Outcome of storing a pending registration.
 #[derive(Debug, Clone)]
 pub struct StoredPendingRegistration {
-    /// The `device_code` now on the row — the caller's own on a fresh registration, or the
-    /// superseded row's existing one. This is what the client must poll.
-    pub device_code: Option<String>,
     /// Whether this call re-armed an existing live pending registration instead of creating one.
     pub superseded: bool,
 }
@@ -147,6 +148,8 @@ pub struct FinalizedPendingRegistration {
 pub enum MaterializePendingRegistrationOutcome {
     /// User/key materialization and exchange-code selection committed together.
     Ready(Box<FinalizedPendingRegistration>),
+    /// Verified registration prepared for a one-time polling handoff, without minting a code.
+    ReadyForPolling(Box<OAuthCodeData>),
     /// A live exchange code is currently claimed by token issuance.
     Processing,
     /// The generation was superseded, consumed, expired, or removed before it could be locked.
@@ -165,6 +168,7 @@ enum UserMaterializationOutcome {
 
 enum ExchangeSelection {
     Ready(StoredExchangeCode),
+    Polling,
     Processing,
 }
 
@@ -187,7 +191,7 @@ pub enum PinAttemptRelease {
 /// reached the user.
 #[derive(Debug, Clone, Copy)]
 pub struct PinResendSnapshot<'a> {
-    pub verification_token: Option<&'a str>,
+    pub verification_token_hash: Option<&'a str>,
     pub pin_hash: Option<&'a str>,
     pub pin_attempts: i32,
     pub pin_sent_at: Option<DateTime<Utc>>,
@@ -211,7 +215,7 @@ impl OAuthCodeRepository {
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(params.tenant_id)
-        .bind(params.code)
+        .bind(hash_token(params.code))
         .bind(params.user_pubkey)
         .bind(params.client_id)
         .bind(params.redirect_uri)
@@ -256,7 +260,7 @@ impl OAuthCodeRepository {
              )",
         )
         .bind(params.tenant_id)
-        .bind(params.code)
+        .bind(hash_token(params.code))
         .bind(params.user_pubkey)
         .bind(params.client_id)
         .bind(params.redirect_uri)
@@ -268,8 +272,8 @@ impl OAuthCodeRepository {
         .bind(params.state)
         .bind(params.is_headless)
         .bind(Utc::now())
-        .bind(pending.pending_email_verification_token.as_deref())
-        .bind(pending.device_code.as_deref())
+        .bind(pending.pending_email_verification_token_hash.as_deref())
+        .bind(pending.device_code_hash.as_deref())
         .execute(&self.pool)
         .await?;
 
@@ -292,10 +296,8 @@ impl OAuthCodeRepository {
     /// a fresh PKCE verifier per register call, so the stored challenge has to be the one matching
     /// the verifier the app is now holding or token exchange would fail PKCE.
     ///
-    /// **`device_code` is deliberately preserved**, and the effective one is returned. It is the
-    /// only field where the *first* attempt wins: keeping it makes the outcome independent of the
-    /// order the two responses arrive in, so an app that stored the first response's device_code
-    /// is still polling the right registration.
+    /// Device credentials rotate with each generation. Only their digests are retained; callers
+    /// disclose their newly generated credential once and older responses no longer authorize polling.
     ///
     /// `expires_at` is refreshed, unlike [`Self::reset_pin_for_resend`], which deliberately never
     /// extends the window. A resend is free; a re-register is a whole new registration (new
@@ -315,13 +317,15 @@ impl OAuthCodeRepository {
         params: StoreOAuthCodeWithRegistrationParams<'_>,
     ) -> Result<StoredPendingRegistration, RepositoryError> {
         let mut tx = self.pool.begin().await?;
-        let row: Option<(Option<String>,)> = sqlx::query_as(
+        let row: Option<(bool,)> = sqlx::query_as(
             "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at,
              pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret, state, device_code, is_headless, pin_hash, pin_sent_at, pending_email_marketing_consent, pending_email_marketing_app_version)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
              ON CONFLICT (tenant_id, lower(pending_email))
                  WHERE pending_email IS NOT NULL AND consumed_at IS NULL
-             DO UPDATE SET
+              DO UPDATE SET
+                  code = EXCLUDED.code,
+                  device_code = EXCLUDED.device_code,
                  user_pubkey = EXCLUDED.user_pubkey,
                  client_id = EXCLUDED.client_id,
                  redirect_uri = EXCLUDED.redirect_uri,
@@ -346,10 +350,10 @@ impl OAuthCodeRepository {
                      WHERE users.tenant_id = EXCLUDED.tenant_id
                        AND lower(users.email) = lower(EXCLUDED.pending_email)
                 )
-              RETURNING device_code",
+               RETURNING (xmax <> 0)",
         )
         .bind(params.tenant_id)
-        .bind(params.code)
+        .bind(hash_token(params.code))
         .bind(params.user_pubkey)
         .bind(params.client_id)
         .bind(params.redirect_uri)
@@ -360,10 +364,10 @@ impl OAuthCodeRepository {
         .bind(Utc::now())
         .bind(params.pending_email)
         .bind(params.pending_password_hash)
-        .bind(params.pending_email_verification_token)
+        .bind(hash_token(params.pending_email_verification_token))
         .bind(params.pending_encrypted_secret)
         .bind(params.state)
-        .bind(params.device_code)
+        .bind(params.device_code.map(hash_token))
         .bind(params.is_headless)
         .bind(params.pin_hash)
         // pin_sent_at tracks confirmed delivery; callers set it after the email send succeeds.
@@ -391,21 +395,15 @@ impl OAuthCodeRepository {
             return Err(RepositoryError::Duplicate);
         }
 
-        let Some((device_code,)) = row else {
+        let Some((superseded,)) = row else {
             tx.rollback().await?;
             return Err(RepositoryError::Unavailable(
                 "pending registration could not be superseded".to_string(),
             ));
         };
-        // The UPDATE branch leaves device_code untouched, so a returned value different from the
-        // one we offered means we superseded an existing pending registration.
-        let superseded = device_code.as_deref() != params.device_code;
         tx.commit().await?;
 
-        Ok(StoredPendingRegistration {
-            device_code,
-            superseded,
-        })
+        Ok(StoredPendingRegistration { superseded })
     }
 
     /// Lock and materialize one exact pending registration generation atomically.
@@ -419,6 +417,41 @@ impl OAuthCodeRepository {
         verification_token: &str,
         candidate_code: &str,
     ) -> Result<MaterializePendingRegistrationOutcome, RepositoryError> {
+        self.materialize_pending_registration_by_hash(
+            tenant_id,
+            &hash_token(verification_token),
+            candidate_code,
+        )
+        .await
+    }
+
+    /// Finalize a generation already authenticated by a link, PIN, or polling readiness.
+    pub async fn materialize_pending_registration_by_hash(
+        &self,
+        tenant_id: i64,
+        verification_token_hash: &str,
+        candidate_code: &str,
+    ) -> Result<MaterializePendingRegistrationOutcome, RepositoryError> {
+        self.materialize_for_delivery(tenant_id, verification_token_hash, Some(candidate_code))
+            .await
+    }
+
+    /// Verify and materialize without creating an exchange code that must be recovered later.
+    pub async fn prepare_pending_registration_for_poll(
+        &self,
+        tenant_id: i64,
+        verification_token_hash: &str,
+    ) -> Result<MaterializePendingRegistrationOutcome, RepositoryError> {
+        self.materialize_for_delivery(tenant_id, verification_token_hash, None)
+            .await
+    }
+
+    async fn materialize_for_delivery(
+        &self,
+        tenant_id: i64,
+        verification_token_hash: &str,
+        candidate_code: Option<&str>,
+    ) -> Result<MaterializePendingRegistrationOutcome, RepositoryError> {
         let mut tx = self.pool.begin().await?;
         let query = format!(
             "SELECT {} FROM oauth_codes
@@ -429,7 +462,7 @@ impl OAuthCodeRepository {
         );
         let Some(pending) = sqlx::query_as::<_, OAuthCodeData>(&query)
             .bind(tenant_id)
-            .bind(verification_token)
+            .bind(verification_token_hash)
             .bind(Utc::now())
             .fetch_optional(&mut *tx)
             .await?
@@ -478,7 +511,8 @@ impl OAuthCodeRepository {
         let outcome = if let Some((existing_email, email_verified, has_password_hash)) = existing {
             match existing_email.as_deref() {
                 Some(bound_email) if bound_email != email => {
-                    Self::delete_pending_generation(&mut tx, tenant_id, verification_token).await?;
+                    Self::delete_pending_generation(&mut tx, tenant_id, verification_token_hash)
+                        .await?;
                     UserMaterializationOutcome::DuplicateKey
                 }
                 _ => {
@@ -493,8 +527,12 @@ impl OAuthCodeRepository {
                     .fetch_optional(&mut *tx)
                     .await?;
                     if email_owner.is_some() {
-                        Self::delete_pending_generation(&mut tx, tenant_id, verification_token)
-                            .await?;
+                        Self::delete_pending_generation(
+                            &mut tx,
+                            tenant_id,
+                            verification_token_hash,
+                        )
+                        .await?;
                         UserMaterializationOutcome::EmailAlreadyExists
                     } else {
                         if existing_email.is_none() || !email_verified || !has_password_hash {
@@ -523,7 +561,7 @@ impl OAuthCodeRepository {
                             )
                             .bind(email)
                             .bind(password_hash)
-                            .bind(verification_token)
+                            .bind(verification_token_hash)
                             .bind(now)
                             .bind(&pending.user_pubkey)
                             .bind(tenant_id)
@@ -555,7 +593,7 @@ impl OAuthCodeRepository {
             .bind(tenant_id)
             .bind(email)
             .bind(password_hash)
-            .bind(verification_token)
+            .bind(verification_token_hash)
             .bind(now)
             .bind(consent_state)
             .bind(consent_at)
@@ -579,8 +617,12 @@ impl OAuthCodeRepository {
                 .await?;
                 match pubkey_state {
                     Some((Some(bound_email), _, _)) if bound_email != email => {
-                        Self::delete_pending_generation(&mut tx, tenant_id, verification_token)
-                            .await?;
+                        Self::delete_pending_generation(
+                            &mut tx,
+                            tenant_id,
+                            verification_token_hash,
+                        )
+                        .await?;
                         UserMaterializationOutcome::DuplicateKey
                     }
                     Some((existing_email, email_verified, has_password_hash)) => {
@@ -595,8 +637,12 @@ impl OAuthCodeRepository {
                         .fetch_optional(&mut *tx)
                         .await?;
                         if email_owner.is_some() {
-                            Self::delete_pending_generation(&mut tx, tenant_id, verification_token)
-                                .await?;
+                            Self::delete_pending_generation(
+                                &mut tx,
+                                tenant_id,
+                                verification_token_hash,
+                            )
+                            .await?;
                             UserMaterializationOutcome::EmailAlreadyExists
                         } else {
                             if existing_email.is_none() || !email_verified || !has_password_hash {
@@ -625,7 +671,7 @@ impl OAuthCodeRepository {
                                 )
                                 .bind(email)
                                 .bind(password_hash)
-                                .bind(verification_token)
+                                .bind(verification_token_hash)
                                 .bind(now)
                                 .bind(&pending.user_pubkey)
                                 .bind(tenant_id)
@@ -642,8 +688,12 @@ impl OAuthCodeRepository {
                         }
                     }
                     None => {
-                        Self::delete_pending_generation(&mut tx, tenant_id, verification_token)
-                            .await?;
+                        Self::delete_pending_generation(
+                            &mut tx,
+                            tenant_id,
+                            verification_token_hash,
+                        )
+                        .await?;
                         UserMaterializationOutcome::EmailAlreadyExists
                     }
                 }
@@ -690,19 +740,17 @@ impl OAuthCodeRepository {
         .bind(pending.code_challenge_method.as_deref())
         .bind(pending.state.as_deref())
         .bind(pending.is_headless)
-        .bind(pending.pending_email_verification_token.as_deref())
-        .bind(pending.device_code.as_deref())
+        .bind(pending.pending_email_verification_token_hash.as_deref())
+        .bind(pending.device_code_hash.as_deref())
         .fetch_optional(&mut *tx)
         .await?;
 
-        let selection = match existing {
-            Some((_, _, Some(_))) => ExchangeSelection::Processing,
-            Some((code, expires_at, None)) => ExchangeSelection::Ready(StoredExchangeCode {
-                code,
-                expires_at,
-                freshly_minted: false,
-            }),
-            None => {
+        let selection = match (candidate_code, existing) {
+            (None, _) => ExchangeSelection::Polling,
+            (Some(_), Some(_)) => ExchangeSelection::Processing,
+            (Some(candidate_code), None) => {
+                // The first handoff owns the code through expiry/redemption. A concurrent
+                // PIN, poll, or email re-click must not invalidate a code already in flight.
                 let expires_at: DateTime<Utc> = sqlx::query_scalar(
                     "INSERT INTO oauth_codes
                          (tenant_id, code, user_pubkey, client_id, redirect_uri, scope,
@@ -714,7 +762,7 @@ impl OAuthCodeRepository {
                      RETURNING expires_at",
                 )
                 .bind(tenant_id)
-                .bind(candidate_code)
+                .bind(hash_token(candidate_code))
                 .bind(&pending.user_pubkey)
                 .bind(&pending.client_id)
                 .bind(&pending.redirect_uri)
@@ -724,8 +772,8 @@ impl OAuthCodeRepository {
                 .bind(pending.previous_auth_id)
                 .bind(pending.state.as_deref())
                 .bind(pending.is_headless)
-                .bind(pending.pending_email_verification_token.as_deref())
-                .bind(pending.device_code.as_deref())
+                .bind(pending.pending_email_verification_token_hash.as_deref())
+                .bind(pending.device_code_hash.as_deref())
                 .fetch_one(&mut *tx)
                 .await?;
                 ExchangeSelection::Ready(StoredExchangeCode {
@@ -745,7 +793,7 @@ impl OAuthCodeRepository {
             )",
         )
         .bind(tenant_id)
-        .bind(verification_token)
+        .bind(verification_token_hash)
         .fetch_one(&mut *tx)
         .await?;
         if !still_live {
@@ -754,6 +802,9 @@ impl OAuthCodeRepository {
         }
 
         let result = match selection {
+            ExchangeSelection::Polling => {
+                MaterializePendingRegistrationOutcome::ReadyForPolling(pending)
+            }
             ExchangeSelection::Ready(exchange_code) => {
                 MaterializePendingRegistrationOutcome::Ready(Box::new(
                     FinalizedPendingRegistration {
@@ -813,7 +864,7 @@ impl OAuthCodeRepository {
          pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret, \
          pending_email_marketing_consent, \
          pending_email_marketing_app_version, \
-         previous_auth_id, state, device_code, is_headless, pin_hash, pin_attempts, \
+         previous_auth_id, state, device_code, created_at, is_headless, pin_hash, pin_attempts, \
          pin_failed_total, pin_sent_at, pin_resend_at, consumed_at, expires_at";
 
     /// Find a valid (non-expired) OAuth code.
@@ -828,7 +879,7 @@ impl OAuthCodeRepository {
         );
         let result = sqlx::query_as::<_, OAuthCodeData>(&query)
             .bind(tenant_id)
-            .bind(code)
+            .bind(hash_token(code))
             .bind(Utc::now())
             .fetch_optional(&self.pool)
             .await?;
@@ -848,7 +899,7 @@ impl OAuthCodeRepository {
             Self::SELECT_COLUMNS
         );
         let result = sqlx::query_as::<_, OAuthCodeData>(&query)
-            .bind(token)
+            .bind(hash_token(token))
             .bind(tenant_id)
             .bind(Utc::now())
             .fetch_optional(&self.pool)
@@ -870,7 +921,7 @@ impl OAuthCodeRepository {
             Self::SELECT_COLUMNS
         );
         let result = sqlx::query_as::<_, OAuthCodeData>(&query)
-            .bind(token)
+            .bind(hash_token(token))
             .bind(tenant_id)
             .fetch_optional(&self.pool)
             .await?;
@@ -899,7 +950,7 @@ impl OAuthCodeRepository {
             Self::SELECT_COLUMNS
         );
         let result = sqlx::query_as::<_, OAuthCodeData>(&query)
-            .bind(device_code)
+            .bind(hash_token(device_code))
             .bind(tenant_id)
             .fetch_optional(&self.pool)
             .await?;
@@ -948,7 +999,7 @@ impl OAuthCodeRepository {
         &self,
         device_code: &str,
         tenant_id: i64,
-        expected_generation_token: &str,
+        expected_generation_hash: &str,
         max_attempts: i32,
         max_lifetime_attempts: i32,
     ) -> Result<PinAttemptReservation, RepositoryError> {
@@ -962,9 +1013,9 @@ impl OAuthCodeRepository {
                 AND pending_email IS NOT NULL AND consumed_at IS NULL AND expires_at > $6 \
               RETURNING pin_attempts",
         )
-        .bind(device_code)
+        .bind(hash_token(device_code))
         .bind(tenant_id)
-        .bind(expected_generation_token)
+        .bind(expected_generation_hash)
         .bind(max_attempts)
         .bind(max_lifetime_attempts)
         .bind(now)
@@ -983,9 +1034,9 @@ impl OAuthCodeRepository {
                 AND pending_email_verification_token = $3 \
                 AND pending_email IS NOT NULL AND consumed_at IS NULL",
         )
-        .bind(device_code)
+        .bind(hash_token(device_code))
         .bind(tenant_id)
-        .bind(expected_generation_token)
+        .bind(expected_generation_hash)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -1014,7 +1065,8 @@ impl OAuthCodeRepository {
         &self,
         device_code: &str,
         tenant_id: i64,
-        expected_generation_token: &str,
+        expected_generation_hash: &str,
+        lineage: &OAuthCodeData,
     ) -> Result<PinAttemptRelease, RepositoryError> {
         let mut tx = self.pool.begin().await?;
         let current = sqlx::query(
@@ -1025,9 +1077,9 @@ impl OAuthCodeRepository {
                 AND pending_email_verification_token = $3 \
                 AND pending_email IS NOT NULL AND consumed_at IS NULL",
         )
-        .bind(device_code)
+        .bind(hash_token(device_code))
         .bind(tenant_id)
-        .bind(expected_generation_token)
+        .bind(expected_generation_hash)
         .execute(&mut *tx)
         .await?
         .rows_affected()
@@ -1039,9 +1091,9 @@ impl OAuthCodeRepository {
 
         let changed = Self::compensate_changed_pin_generation(
             &mut tx,
-            device_code,
+            lineage,
             tenant_id,
-            expected_generation_token,
+            expected_generation_hash,
         )
         .await?;
         tx.commit().await?;
@@ -1065,14 +1117,8 @@ impl OAuthCodeRepository {
     /// window. Otherwise repeated resends could extend a pending row indefinitely, defeating the
     /// row's finite lifecycle (keycast#262).
     ///
-    /// The rewrite is applied to the pending row and to every sibling row sharing the
-    /// `device_code` (unlike [`Self::reserve_pin_attempt`] / [`Self::reset_pin_attempts`], which
-    /// are scoped to the pending row). That is deliberate: this rewrites
-    /// `pending_email_verification_token`, which minted sibling exchange-code rows copy and which
-    /// redemption correlates on (see [`Self::mark_pending_consumed`]). Restricting the rewrite to
-    /// the pending row would desynchronize the token between a pre-resend minted code and the
-    /// pending row, so redeeming that code would no longer mark the registration consumed. If you
-    /// need to narrow this, change the redemption correlation key first.
+    /// The expected generation is a decoded digest; the replacement token is raw and hashed here.
+    /// Resend invalidates unclaimed sibling exchange codes. A claimed exchange prevents rotation.
     ///
     /// # Cooldown claim
     ///
@@ -1088,7 +1134,7 @@ impl OAuthCodeRepository {
         &self,
         device_code: &str,
         tenant_id: i64,
-        expected_generation_token: &str,
+        expected_generation_hash: &str,
         new_verification_token: &str,
         new_pin_hash: &str,
         cooldown_cutoff: DateTime<Utc>,
@@ -1106,9 +1152,9 @@ impl OAuthCodeRepository {
                AND (pin_resend_at IS NULL OR pin_resend_at <= $4) \
              FOR UPDATE",
         )
-        .bind(device_code)
+        .bind(hash_token(device_code))
         .bind(tenant_id)
-        .bind(expected_generation_token)
+        .bind(expected_generation_hash)
         .bind(cooldown_cutoff)
         .fetch_optional(&mut *tx)
         .await?;
@@ -1129,8 +1175,8 @@ impl OAuthCodeRepository {
              )",
         )
         .bind(tenant_id)
-        .bind(device_code)
-        .bind(expected_generation_token)
+        .bind(hash_token(device_code))
+        .bind(expected_generation_hash)
         .fetch_one(&mut *tx)
         .await?;
         if consumed_claim {
@@ -1148,11 +1194,11 @@ impl OAuthCodeRepository {
                AND expires_at > clock_timestamp() \
                AND (pin_resend_at IS NULL OR pin_resend_at <= $6)",
         )
-        .bind(new_verification_token)
+        .bind(hash_token(new_verification_token))
         .bind(new_pin_hash)
-        .bind(device_code)
+        .bind(hash_token(device_code))
         .bind(tenant_id)
-        .bind(expected_generation_token)
+        .bind(expected_generation_hash)
         .bind(cooldown_cutoff)
         .execute(&mut *tx)
         .await?
@@ -1163,17 +1209,17 @@ impl OAuthCodeRepository {
             return Ok(false);
         }
 
-        // Keep sibling exchange-code rows correlated with the pending row's new token.
+        // A new generation invalidates every unclaimed predecessor exchange code.
         sqlx::query(
-            "UPDATE oauth_codes SET pending_email_verification_token = $1 \
-              WHERE device_code = $2 AND tenant_id = $3 \
+            "DELETE FROM oauth_codes WHERE pending_email_verification_token <> $1 \
+              AND device_code = $2 AND tenant_id = $3 \
                 AND pending_email_verification_token = $4 \
                 AND pending_email IS NULL AND consumed_at IS NULL",
         )
-        .bind(new_verification_token)
-        .bind(device_code)
+        .bind(hash_token(new_verification_token))
+        .bind(hash_token(device_code))
         .bind(tenant_id)
-        .bind(expected_generation_token)
+        .bind(expected_generation_hash)
         .execute(&mut *tx)
         .await?;
 
@@ -1183,9 +1229,8 @@ impl OAuthCodeRepository {
 
     /// Restore PIN resend fields after replacement email delivery fails.
     ///
-    /// Like [`Self::reset_pin_for_resend`], the restore covers the pending row and its sibling
-    /// exchange-code rows, so it undoes that call's token rewrite everywhere (see the coupling note
-    /// there).
+    /// The previous generation is a digest snapshot; the expected replacement token is raw.
+    /// No invalidated exchange code is recovered when restoring the previous PIN after delivery failure.
     ///
     /// `expected_verification_token` and `expected_pin_hash` identify the generation the failing
     /// call itself wrote. The restore applies only while both values are still current, so a resend
@@ -1208,10 +1253,10 @@ impl OAuthCodeRepository {
                AND pin_hash = $3 AND pending_email_verification_token = $4 \
              FOR UPDATE",
         )
-        .bind(device_code)
+        .bind(hash_token(device_code))
         .bind(tenant_id)
         .bind(expected_pin_hash)
-        .bind(expected_verification_token)
+        .bind(hash_token(expected_verification_token))
         .fetch_optional(&mut *tx)
         .await?;
         if locked.is_none() {
@@ -1230,8 +1275,8 @@ impl OAuthCodeRepository {
              )",
         )
         .bind(tenant_id)
-        .bind(device_code)
-        .bind(expected_verification_token)
+        .bind(hash_token(device_code))
+        .bind(hash_token(expected_verification_token))
         .fetch_one(&mut *tx)
         .await?;
         if consumed_claim {
@@ -1247,15 +1292,15 @@ impl OAuthCodeRepository {
                 AND pending_email IS NOT NULL AND consumed_at IS NULL \
                 AND pin_hash = $8 AND pending_email_verification_token = $9",
         )
-        .bind(previous.verification_token)
+        .bind(previous.verification_token_hash)
         .bind(previous.pin_hash)
         .bind(previous.pin_attempts)
         .bind(previous.pin_sent_at)
         .bind(previous.pin_resend_at)
-        .bind(device_code)
+        .bind(hash_token(device_code))
         .bind(tenant_id)
         .bind(expected_pin_hash)
-        .bind(expected_verification_token)
+        .bind(hash_token(expected_verification_token))
         .execute(&mut *tx)
         .await?
         .rows_affected()
@@ -1272,10 +1317,10 @@ impl OAuthCodeRepository {
                AND pending_email_verification_token = $4 \
                AND pending_email IS NULL AND consumed_at IS NULL",
         )
-        .bind(previous.verification_token)
-        .bind(device_code)
+        .bind(previous.verification_token_hash)
+        .bind(hash_token(device_code))
         .bind(tenant_id)
-        .bind(expected_verification_token)
+        .bind(hash_token(expected_verification_token))
         .execute(&mut *tx)
         .await?;
 
@@ -1297,9 +1342,9 @@ impl OAuthCodeRepository {
                AND pending_email IS NOT NULL AND consumed_at IS NULL",
         )
         .bind(Utc::now())
-        .bind(device_code)
+        .bind(hash_token(device_code))
         .bind(tenant_id)
-        .bind(expected_verification_token)
+        .bind(hash_token(expected_verification_token))
         .execute(&self.pool)
         .await?
         .rows_affected()
@@ -1325,7 +1370,8 @@ impl OAuthCodeRepository {
         &self,
         device_code: &str,
         tenant_id: i64,
-        expected_generation_token: &str,
+        expected_generation_hash: &str,
+        lineage: &OAuthCodeData,
     ) -> Result<PinAttemptRelease, RepositoryError> {
         let mut tx = self.pool.begin().await?;
         let current = sqlx::query(
@@ -1335,9 +1381,9 @@ impl OAuthCodeRepository {
                 AND pending_email_verification_token = $3 \
                 AND pending_email IS NOT NULL AND consumed_at IS NULL",
         )
-        .bind(device_code)
+        .bind(hash_token(device_code))
         .bind(tenant_id)
-        .bind(expected_generation_token)
+        .bind(expected_generation_hash)
         .execute(&mut *tx)
         .await?
         .rows_affected()
@@ -1349,9 +1395,9 @@ impl OAuthCodeRepository {
 
         let changed = Self::compensate_changed_pin_generation(
             &mut tx,
-            device_code,
+            lineage,
             tenant_id,
-            expected_generation_token,
+            expected_generation_hash,
         )
         .await?;
         tx.commit().await?;
@@ -1364,20 +1410,21 @@ impl OAuthCodeRepository {
 
     async fn compensate_changed_pin_generation(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        device_code: &str,
+        lineage: &OAuthCodeData,
         tenant_id: i64,
-        expected_generation_token: &str,
+        expected_generation_hash: &str,
     ) -> Result<bool, RepositoryError> {
         let compensated = sqlx::query(
             "UPDATE oauth_codes
              SET pin_failed_total = GREATEST(pin_failed_total - 1, 0)
-             WHERE device_code = $1 AND tenant_id = $2
+              WHERE lower(pending_email) = lower($1) AND tenant_id = $2 AND created_at = $4
                AND pending_email_verification_token IS DISTINCT FROM $3
                AND pending_email IS NOT NULL AND consumed_at IS NULL",
         )
-        .bind(device_code)
+        .bind(lineage.pending_email.as_deref())
         .bind(tenant_id)
-        .bind(expected_generation_token)
+        .bind(expected_generation_hash)
+        .bind(lineage.created_at)
         .execute(&mut **tx)
         .await?
         .rows_affected()
@@ -1385,8 +1432,8 @@ impl OAuthCodeRepository {
         Ok(compensated)
     }
 
-    /// Find a still-live exchange code matching the same pending registration semantics.
-    pub async fn find_live_exchange_code_with_expiry_for_pending(
+    /// Find a live exchange digest and expiry for diagnostics, never bearer-code recovery.
+    pub async fn find_live_exchange_hash_with_expiry_for_pending(
         &self,
         tenant_id: i64,
         pending: &OAuthCodeData,
@@ -1438,8 +1485,8 @@ impl OAuthCodeRepository {
         .bind(pending.state.as_deref())
         .bind(pending.is_headless)
         .bind(now)
-        .bind(pending.pending_email_verification_token.as_deref())
-        .bind(pending.device_code.as_deref())
+        .bind(pending.pending_email_verification_token_hash.as_deref())
+        .bind(pending.device_code_hash.as_deref())
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
@@ -1454,7 +1501,7 @@ impl OAuthCodeRepository {
     ) -> Result<bool, RepositoryError> {
         let mut tx = self.pool.begin().await?;
 
-        if auth_code.pending_email_verification_token.is_some() {
+        if auth_code.pending_email_verification_token_hash.is_some() {
             let pending_exists: Option<(i32,)> = sqlx::query_as(
                 "SELECT 1 FROM oauth_codes
                  WHERE tenant_id = $1
@@ -1482,8 +1529,8 @@ impl OAuthCodeRepository {
             .bind(auth_code.code_challenge_method.as_deref())
             .bind(auth_code.state.as_deref())
             .bind(auth_code.is_headless)
-            .bind(auth_code.pending_email_verification_token.as_deref())
-            .bind(auth_code.device_code.as_deref())
+            .bind(auth_code.pending_email_verification_token_hash.as_deref())
+            .bind(auth_code.device_code_hash.as_deref())
             .fetch_optional(&mut *tx)
             .await?;
 
@@ -1507,7 +1554,7 @@ impl OAuthCodeRepository {
                AND expires_at > clock_timestamp()",
         )
         .bind(tenant_id)
-        .bind(code)
+        .bind(hash_token(code))
         .bind(&auth_code.user_pubkey)
         .bind(&auth_code.client_id)
         .bind(&auth_code.redirect_uri)
@@ -1516,8 +1563,8 @@ impl OAuthCodeRepository {
         .bind(auth_code.code_challenge_method.as_deref())
         .bind(auth_code.state.as_deref())
         .bind(auth_code.is_headless)
-        .bind(auth_code.pending_email_verification_token.as_deref())
-        .bind(auth_code.device_code.as_deref())
+        .bind(auth_code.pending_email_verification_token_hash.as_deref())
+        .bind(auth_code.device_code_hash.as_deref())
         .execute(&mut *tx)
         .await?
         .rows_affected()
@@ -1540,7 +1587,7 @@ impl OAuthCodeRepository {
         auth_code: &OAuthCodeData,
     ) -> Result<bool, RepositoryError> {
         let mut tx = self.pool.begin().await?;
-        if auth_code.pending_email_verification_token.is_some() {
+        if auth_code.pending_email_verification_token_hash.is_some() {
             let locked: Option<(i32,)> = sqlx::query_as(
                 "SELECT 1 FROM oauth_codes
                  WHERE tenant_id = $1 AND user_pubkey = $2 AND client_id = $3
@@ -1563,8 +1610,8 @@ impl OAuthCodeRepository {
             .bind(auth_code.code_challenge_method.as_deref())
             .bind(auth_code.state.as_deref())
             .bind(auth_code.is_headless)
-            .bind(auth_code.pending_email_verification_token.as_deref())
-            .bind(auth_code.device_code.as_deref())
+            .bind(auth_code.pending_email_verification_token_hash.as_deref())
+            .bind(auth_code.device_code_hash.as_deref())
             .fetch_optional(&mut *tx)
             .await?;
             if locked.is_none() {
@@ -1583,13 +1630,13 @@ impl OAuthCodeRepository {
                AND expires_at > clock_timestamp()",
         )
         .bind(tenant_id)
-        .bind(code)
+        .bind(hash_token(code))
         .bind(&auth_code.user_pubkey)
         .bind(&auth_code.client_id)
         .bind(&auth_code.redirect_uri)
         .bind(&auth_code.scope)
-        .bind(auth_code.pending_email_verification_token.as_deref())
-        .bind(auth_code.device_code.as_deref())
+        .bind(auth_code.pending_email_verification_token_hash.as_deref())
+        .bind(auth_code.device_code_hash.as_deref())
         .execute(&mut *tx)
         .await?
         .rows_affected()
@@ -1606,7 +1653,7 @@ impl OAuthCodeRepository {
         code: &str,
         auth_code: &OAuthCodeData,
     ) -> Result<bool, RepositoryError> {
-        if auth_code.pending_email_verification_token.is_none() {
+        if auth_code.pending_email_verification_token_hash.is_none() {
             return Ok(true);
         }
 
@@ -1645,9 +1692,9 @@ impl OAuthCodeRepository {
         .bind(auth_code.code_challenge_method.as_deref())
         .bind(auth_code.state.as_deref())
         .bind(auth_code.is_headless)
-        .bind(auth_code.pending_email_verification_token.as_deref())
-        .bind(auth_code.device_code.as_deref())
-        .bind(code)
+        .bind(auth_code.pending_email_verification_token_hash.as_deref())
+        .bind(auth_code.device_code_hash.as_deref())
+        .bind(hash_token(code))
         .execute(&self.pool)
         .await?;
 
@@ -1684,7 +1731,7 @@ impl OAuthCodeRepository {
         sqlx::query(
             "DELETE FROM oauth_codes WHERE pending_email_verification_token = $1 AND tenant_id = $2",
         )
-        .bind(token)
+        .bind(hash_token(token))
         .bind(tenant_id)
         .execute(&self.pool)
         .await?;
@@ -1695,7 +1742,7 @@ impl OAuthCodeRepository {
     pub async fn delete(&self, tenant_id: i64, code: &str) -> Result<(), RepositoryError> {
         sqlx::query("DELETE FROM oauth_codes WHERE tenant_id = $1 AND code = $2")
             .bind(tenant_id)
-            .bind(code)
+            .bind(hash_token(code))
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -1771,6 +1818,10 @@ mod tests {
         assert_eq!(data.code_challenge, Some("challenge123".to_string()));
 
         // Delete code
+        let digest = hash_token(&code);
+        assert!(repo.find_valid(1, &digest).await.unwrap().is_none());
+        repo.delete(1, &digest).await.unwrap();
+        assert!(repo.find_valid(1, &code).await.unwrap().is_some());
         repo.delete(1, &code).await.unwrap();
 
         // Should no longer be found
@@ -2148,7 +2199,7 @@ mod tests {
         assert!(data.is_headless);
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -2177,7 +2228,7 @@ mod tests {
         );
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -2238,7 +2289,7 @@ mod tests {
                  FOR UPDATE NOWAIT",
             )
             .bind(1_i64)
-            .bind(&token)
+            .bind(hash_token(&token))
             .fetch_optional(&pool)
             .await;
             if matches!(
@@ -2263,7 +2314,7 @@ mod tests {
             supersede_repo
                 .store_with_pending_registration(StoreOAuthCodeWithRegistrationParams {
                     tenant_id: 1,
-                    code: "replacement-code",
+                    code: &format!("replacement-code-{}", uuid::Uuid::new_v4()),
                     user_pubkey: &replacement_pubkey,
                     client_id: "replacement-client",
                     redirect_uri: "http://localhost:3000/replacement",
@@ -2310,12 +2361,12 @@ mod tests {
             .unwrap();
         assert_eq!(surviving.user_pubkey, pending.user_pubkey);
         assert_eq!(
-            surviving.pending_email_verification_token.as_deref(),
-            Some(token.as_str())
+            surviving.pending_email_verification_token_hash.as_deref(),
+            Some(hash_token(&token).as_str())
         );
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -2417,7 +2468,7 @@ mod tests {
             "SELECT COUNT(*) FROM oauth_codes
              WHERE device_code = $1 AND pending_email IS NULL",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -2426,7 +2477,7 @@ mod tests {
         assert_eq!(exchange_count, 0);
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -2474,7 +2525,7 @@ mod tests {
         ));
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -2486,7 +2537,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_concurrent_exact_generation_materializers_are_idempotent() {
+    async fn test_concurrent_exact_generation_materializers_preserve_the_first_handoff() {
         let pool = setup_pool().await;
         let repo = OAuthCodeRepository::new(pool.clone());
         let device_code = format!("dc_{}", uuid::Uuid::new_v4());
@@ -2509,13 +2560,22 @@ mod tests {
             repo.materialize_pending_registration(1, &token, &candidate_a),
             repo.materialize_pending_registration(1, &token, &candidate_b),
         );
-        let MaterializePendingRegistrationOutcome::Ready(first) = first.unwrap() else {
-            panic!("first finalizer must be ready");
+        let winner = match (first.unwrap(), second.unwrap()) {
+            (
+                MaterializePendingRegistrationOutcome::Ready(winner),
+                MaterializePendingRegistrationOutcome::Processing,
+            )
+            | (
+                MaterializePendingRegistrationOutcome::Processing,
+                MaterializePendingRegistrationOutcome::Ready(winner),
+            ) => winner,
+            _ => panic!("exactly one finalizer may disclose a code"),
         };
-        let MaterializePendingRegistrationOutcome::Ready(second) = second.unwrap() else {
-            panic!("second finalizer must be ready");
-        };
-        assert_eq!(first.exchange_code.code, second.exchange_code.code);
+        assert!(repo
+            .find_valid(1, &winner.exchange_code.code)
+            .await
+            .unwrap()
+            .is_some());
 
         let user_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE pubkey = $1 AND tenant_id = 1")
@@ -2534,7 +2594,7 @@ mod tests {
         assert_eq!(key_count, 1);
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -2560,24 +2620,24 @@ mod tests {
         let max = 3;
         const LIFETIME: i32 = 1000;
         let first = repo
-            .reserve_pin_attempt(&device_code, 1, &token, max, LIFETIME)
+            .reserve_pin_attempt(&device_code, 1, &hash_token(&token), max, LIFETIME)
             .await
             .unwrap();
         assert_eq!(first, PinAttemptReservation::Reserved { attempt: 1 });
         let second = repo
-            .reserve_pin_attempt(&device_code, 1, &token, max, LIFETIME)
+            .reserve_pin_attempt(&device_code, 1, &hash_token(&token), max, LIFETIME)
             .await
             .unwrap();
         assert_eq!(second, PinAttemptReservation::Reserved { attempt: 2 });
         let third = repo
-            .reserve_pin_attempt(&device_code, 1, &token, max, LIFETIME)
+            .reserve_pin_attempt(&device_code, 1, &hash_token(&token), max, LIFETIME)
             .await
             .unwrap();
         assert_eq!(third, PinAttemptReservation::Reserved { attempt: 3 });
 
         // At the cap: no slot can be reserved (atomic lockout), and the counter does not grow.
         let locked = repo
-            .reserve_pin_attempt(&device_code, 1, &token, max, LIFETIME)
+            .reserve_pin_attempt(&device_code, 1, &hash_token(&token), max, LIFETIME)
             .await
             .unwrap();
         assert_eq!(
@@ -2594,13 +2654,19 @@ mod tests {
 
         // Unknown device_code reserves nothing.
         let none = repo
-            .reserve_pin_attempt("nonexistent", 1, "missing-token", max, LIFETIME)
+            .reserve_pin_attempt(
+                "nonexistent",
+                1,
+                &hash_token("missing-token"),
+                max,
+                LIFETIME,
+            )
             .await
             .unwrap();
         assert_eq!(none, PinAttemptReservation::CurrentPinLocked);
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -2617,10 +2683,10 @@ mod tests {
             insert_pending_registration(&repo, &device_code, Some("pinhash123"), expires_at).await;
 
         // Burn a couple of attempt slots (as a near-success run would), then reset on success.
-        repo.reserve_pin_attempt(&device_code, 1, &token, 5, 1000)
+        repo.reserve_pin_attempt(&device_code, 1, &hash_token(&token), 5, 1000)
             .await
             .unwrap();
-        repo.reserve_pin_attempt(&device_code, 1, &token, 5, 1000)
+        repo.reserve_pin_attempt(&device_code, 1, &hash_token(&token), 5, 1000)
             .await
             .unwrap();
         let before = repo
@@ -2634,7 +2700,7 @@ mod tests {
             "lifetime counter tracked them too"
         );
 
-        repo.reset_pin_attempts(&device_code, 1, &token)
+        repo.reset_pin_attempts(&device_code, 1, &hash_token(&token), &before)
             .await
             .unwrap();
 
@@ -2656,7 +2722,7 @@ mod tests {
         );
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -2677,18 +2743,23 @@ mod tests {
         )
         .await;
         assert_eq!(
-            repo.reserve_pin_attempt(&device_code, 1, &stale_token, 5, 50)
+            repo.reserve_pin_attempt(&device_code, 1, &hash_token(&stale_token), 5, 50)
                 .await
                 .unwrap(),
             PinAttemptReservation::Reserved { attempt: 1 }
         );
 
+        let lineage = repo
+            .find_by_device_code(&device_code, 1)
+            .await
+            .unwrap()
+            .unwrap();
         let replacement_pubkey = Keys::generate().public_key().to_hex();
         let replacement_device = format!("replacement_{}", uuid::Uuid::new_v4());
         let replacement_token = format!("replacement_{}", uuid::Uuid::new_v4());
         repo.store_with_pending_registration(StoreOAuthCodeWithRegistrationParams {
             tenant_id: 1,
-            code: "replacement-code",
+            code: &format!("replacement-code-{}", uuid::Uuid::new_v4()),
             user_pubkey: &replacement_pubkey,
             client_id: "replacement-client",
             redirect_uri: "http://localhost:3000/replacement",
@@ -2711,25 +2782,25 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            repo.refund_pin_attempt(&device_code, 1, &stale_token)
+            repo.refund_pin_attempt(&device_code, 1, &hash_token(&stale_token), &lineage)
                 .await
                 .unwrap(),
             PinAttemptRelease::GenerationChanged
         );
 
         let current = repo
-            .find_by_device_code(&device_code, 1)
+            .find_by_device_code(&replacement_device, 1)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(
-            current.pending_email_verification_token.as_deref(),
-            Some(replacement_token.as_str())
+            current.pending_email_verification_token_hash.as_deref(),
+            Some(hash_token(&replacement_token).as_str())
         );
         assert_eq!((current.pin_attempts, current.pin_failed_total), (0, 0));
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&replacement_device))
             .execute(&pool)
             .await
             .unwrap();
@@ -2750,18 +2821,23 @@ mod tests {
         )
         .await;
         assert_eq!(
-            repo.reserve_pin_attempt(&device_code, 1, &stale_token, 5, 50)
+            repo.reserve_pin_attempt(&device_code, 1, &hash_token(&stale_token), 5, 50)
                 .await
                 .unwrap(),
             PinAttemptReservation::Reserved { attempt: 1 }
         );
 
+        let lineage = repo
+            .find_by_device_code(&device_code, 1)
+            .await
+            .unwrap()
+            .unwrap();
         let replacement_pubkey = Keys::generate().public_key().to_hex();
         let replacement_device = format!("replacement_{}", uuid::Uuid::new_v4());
         let replacement_token = format!("replacement_{}", uuid::Uuid::new_v4());
         repo.store_with_pending_registration(StoreOAuthCodeWithRegistrationParams {
             tenant_id: 1,
-            code: "replacement-code-correct-pin",
+            code: &format!("replacement-code-correct-pin-{}", uuid::Uuid::new_v4()),
             user_pubkey: &replacement_pubkey,
             client_id: "replacement-client",
             redirect_uri: "http://localhost:3000/replacement",
@@ -2784,13 +2860,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            repo.reset_pin_attempts(&device_code, 1, &stale_token)
+            repo.reset_pin_attempts(&device_code, 1, &hash_token(&stale_token), &lineage)
                 .await
                 .unwrap(),
             PinAttemptRelease::GenerationChanged
         );
         let current = repo
-            .find_by_device_code(&device_code, 1)
+            .find_by_device_code(&replacement_device, 1)
             .await
             .unwrap()
             .unwrap();
@@ -2798,7 +2874,7 @@ mod tests {
         assert_eq!((current.pin_attempts, current.pin_failed_total), (0, 0));
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&replacement_device))
             .execute(&pool)
             .await
             .unwrap();
@@ -2846,7 +2922,7 @@ mod tests {
         let sibling_attempts = |pool: PgPool, code: String| async move {
             let row: (i32,) =
                 sqlx::query_as("SELECT pin_attempts FROM oauth_codes WHERE code = $1")
-                    .bind(&code)
+                    .bind(hash_token(&code))
                     .fetch_one(&pool)
                     .await
                     .unwrap();
@@ -2858,7 +2934,10 @@ mod tests {
             .reserve_pin_attempt(
                 &device_code,
                 1,
-                pending.pending_email_verification_token.as_deref().unwrap(),
+                pending
+                    .pending_email_verification_token_hash
+                    .as_deref()
+                    .unwrap(),
                 5,
                 1000,
             )
@@ -2873,14 +2952,18 @@ mod tests {
 
         // Resetting on success must also leave the sibling row alone.
         sqlx::query("UPDATE oauth_codes SET pin_attempts = 2 WHERE code = $1")
-            .bind(&minted_code)
+            .bind(hash_token(&minted_code))
             .execute(&pool)
             .await
             .unwrap();
         repo.reset_pin_attempts(
             &device_code,
             1,
-            pending.pending_email_verification_token.as_deref().unwrap(),
+            pending
+                .pending_email_verification_token_hash
+                .as_deref()
+                .unwrap(),
+            &pending,
         )
         .await
         .unwrap();
@@ -2899,7 +2982,7 @@ mod tests {
         // Once the registration is consumed (token issuance succeeded), no attempt slot may be
         // reserved: the terminal marker must end the PIN lifecycle too.
         sqlx::query("UPDATE oauth_codes SET consumed_at = NOW() WHERE device_code = $1 AND pending_email IS NOT NULL")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -2907,7 +2990,10 @@ mod tests {
             .reserve_pin_attempt(
                 &device_code,
                 1,
-                pending.pending_email_verification_token.as_deref().unwrap(),
+                pending
+                    .pending_email_verification_token_hash
+                    .as_deref()
+                    .unwrap(),
                 5,
                 1000,
             )
@@ -2920,7 +3006,7 @@ mod tests {
         );
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -2945,7 +3031,7 @@ mod tests {
         .await;
 
         let outcome = repo
-            .reserve_pin_attempt(&device_code, 1, &token, 5, 50)
+            .reserve_pin_attempt(&device_code, 1, &hash_token(&token), 5, 50)
             .await
             .unwrap();
         assert_eq!(
@@ -2966,7 +3052,7 @@ mod tests {
         );
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -2994,6 +3080,7 @@ mod tests {
         let cutoff = Utc::now();
         let token_a = format!("verif_a_{}", uuid::Uuid::new_v4());
         let token_b = format!("verif_b_{}", uuid::Uuid::new_v4());
+        let expected_generation = hash_token(&expected_generation);
 
         let (a, b) = tokio::join!(
             repo.reset_pin_for_resend(
@@ -3034,12 +3121,12 @@ mod tests {
             "the stored PIN must be the one the winning caller was told it installed"
         );
         assert_eq!(
-            data.pending_email_verification_token.as_deref(),
-            Some(winner_token.as_str())
+            data.pending_email_verification_token_hash.as_deref(),
+            Some(hash_token(winner_token).as_str())
         );
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -3057,16 +3144,16 @@ mod tests {
             insert_pending_registration(&repo, &device_code, Some("oldpin"), expires_at).await;
         let original_expiry: DateTime<Utc> =
             sqlx::query_scalar("SELECT expires_at FROM oauth_codes WHERE device_code = $1")
-                .bind(&device_code)
+                .bind(hash_token(&device_code))
                 .fetch_one(&pool)
                 .await
                 .unwrap();
 
         // Burn two attempts.
-        repo.reserve_pin_attempt(&device_code, 1, &old_token, 5, 1000)
+        repo.reserve_pin_attempt(&device_code, 1, &hash_token(&old_token), 5, 1000)
             .await
             .unwrap();
-        repo.reserve_pin_attempt(&device_code, 1, &old_token, 5, 1000)
+        repo.reserve_pin_attempt(&device_code, 1, &hash_token(&old_token), 5, 1000)
             .await
             .unwrap();
 
@@ -3075,7 +3162,7 @@ mod tests {
             .reset_pin_for_resend(
                 &device_code,
                 1,
-                &old_token,
+                &hash_token(&old_token),
                 &new_token,
                 "newpin",
                 Utc::now(),
@@ -3094,7 +3181,7 @@ mod tests {
         // Resend must NOT extend the original 24h window (keycast#262 bounded lifecycle).
         let after_expiry: DateTime<Utc> =
             sqlx::query_scalar("SELECT expires_at FROM oauth_codes WHERE device_code = $1")
-                .bind(&device_code)
+                .bind(hash_token(&device_code))
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -3111,7 +3198,7 @@ mod tests {
         assert!(by_token.is_some(), "new token should resolve to the row");
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -3138,7 +3225,7 @@ mod tests {
         let replacement_token = format!("replacement_{}", uuid::Uuid::new_v4());
         repo.store_with_pending_registration(StoreOAuthCodeWithRegistrationParams {
             tenant_id: 1,
-            code: "replacement-code",
+            code: &format!("replacement-code-{}", uuid::Uuid::new_v4()),
             user_pubkey: &replacement_pubkey,
             client_id: "replacement-client",
             redirect_uri: "http://localhost:3000/replacement",
@@ -3164,7 +3251,7 @@ mod tests {
             .reset_pin_for_resend(
                 &device_code,
                 1,
-                &stale_token,
+                &hash_token(&stale_token),
                 "stale-resend-token",
                 "stale-resend-pin",
                 Utc::now(),
@@ -3173,18 +3260,18 @@ mod tests {
             .unwrap());
 
         let current = repo
-            .find_by_device_code(&device_code, 1)
+            .find_by_device_code(&replacement_device, 1)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(
-            current.pending_email_verification_token.as_deref(),
-            Some(replacement_token.as_str())
+            current.pending_email_verification_token_hash.as_deref(),
+            Some(hash_token(&replacement_token).as_str())
         );
         assert_eq!(current.pin_hash.as_deref(), Some("replacement-pin"));
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&replacement_device))
             .execute(&pool)
             .await
             .unwrap();
@@ -3200,7 +3287,7 @@ mod tests {
             insert_pending_registration(&repo, &device_code, Some("oldpin"), expires_at).await;
 
         sqlx::query("UPDATE oauth_codes SET expires_at = NOW() - INTERVAL '1 second' WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -3209,7 +3296,7 @@ mod tests {
             .reset_pin_for_resend(
                 &device_code,
                 1,
-                &old_token,
+                &hash_token(&old_token),
                 "new-token",
                 "new-pin",
                 Utc::now() - chrono::Duration::minutes(5),
@@ -3222,14 +3309,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            pending.pending_email_verification_token.as_deref(),
-            Some(old_token.as_str()),
+            pending.pending_email_verification_token_hash.as_deref(),
+            Some(hash_token(&old_token).as_str()),
             "an expired registration must keep its last usable generation"
         );
         assert_eq!(pending.pin_hash.as_deref(), Some("oldpin"));
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -3257,7 +3344,7 @@ mod tests {
         assert!(pending.pin_sent_at.is_some());
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -3290,7 +3377,7 @@ mod tests {
             "SELECT 1 FROM oauth_codes
              WHERE device_code = $1 AND pending_email IS NOT NULL FOR UPDATE",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .fetch_one(&mut *blocker)
         .await
         .unwrap();
@@ -3331,28 +3418,38 @@ mod tests {
         }
         blocker.commit().await.unwrap();
 
-        let MaterializePendingRegistrationOutcome::Ready(first) = first.await.unwrap().unwrap()
-        else {
-            panic!("first finalizer must be ready");
+        let winner = match (
+            first.await.unwrap().unwrap(),
+            second.await.unwrap().unwrap(),
+        ) {
+            (
+                MaterializePendingRegistrationOutcome::Ready(winner),
+                MaterializePendingRegistrationOutcome::Processing,
+            )
+            | (
+                MaterializePendingRegistrationOutcome::Processing,
+                MaterializePendingRegistrationOutcome::Ready(winner),
+            ) => winner,
+            _ => panic!("exactly one finalizer may disclose a code"),
         };
-        let MaterializePendingRegistrationOutcome::Ready(second) = second.await.unwrap().unwrap()
-        else {
-            panic!("second finalizer must be ready");
-        };
-        assert_eq!(first.exchange_code.code, second.exchange_code.code);
-        assert!(first.exchange_code.freshly_minted ^ second.exchange_code.freshly_minted);
+        assert!(repo
+            .find_valid(1, &winner.exchange_code.code)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(winner.exchange_code.freshly_minted);
         let code_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM oauth_codes
              WHERE device_code = $1 AND pending_email IS NULL",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(code_count, 1);
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -3401,7 +3498,7 @@ mod tests {
         assert!(finalized.exchange_code.freshly_minted);
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -3431,7 +3528,7 @@ mod tests {
 
         // No exchange code minted yet: the pending row must not be mistaken for one.
         assert!(
-            repo.find_live_exchange_code_with_expiry_for_pending(1, &pending)
+            repo.find_live_exchange_hash_with_expiry_for_pending(1, &pending)
                 .await
                 .unwrap()
                 .is_none(),
@@ -3463,13 +3560,13 @@ mod tests {
 
         // The live exchange code is now found and reused; the pending row is still untouched.
         assert_eq!(
-            repo.find_live_exchange_code_with_expiry_for_pending(1, &pending)
+            repo.find_live_exchange_hash_with_expiry_for_pending(1, &pending)
                 .await
                 .unwrap()
                 .as_ref()
                 .map(|row| row.0.as_str()),
-            Some(exchange_code.as_str()),
-            "live exchange code must be returned for reuse"
+            Some(hash_token(&exchange_code).as_str()),
+            "only the exchange digest may be read back"
         );
         assert!(
             repo.find_by_device_code(&device_code, 1)
@@ -3520,7 +3617,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            repo.find_live_exchange_code_with_expiry_for_pending(1, &pending)
+            repo.find_live_exchange_hash_with_expiry_for_pending(1, &pending)
                 .await
                 .unwrap()
                 .is_none(),
@@ -3572,12 +3669,12 @@ mod tests {
             .unwrap());
 
         let found = repo
-            .find_live_exchange_code_with_expiry_for_pending(1, &pending)
+            .find_live_exchange_hash_with_expiry_for_pending(1, &pending)
             .await
             .unwrap()
             .expect("live exchange code should be returned with expiry");
 
-        assert_eq!(found.0, exchange_code);
+        assert_eq!(found.0, hash_token(&exchange_code));
         assert!(
             found.1 <= expires_at && found.1 > Utc::now(),
             "expiry must come from the DB row so Redis TTL can be bounded"
@@ -3687,7 +3784,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let found = repo
-            .find_live_exchange_code_with_expiry_for_pending(1, &pending_b)
+            .find_live_exchange_hash_with_expiry_for_pending(1, &pending_b)
             .await
             .unwrap();
         assert!(
@@ -3718,7 +3815,7 @@ mod tests {
             "SELECT 1 FROM oauth_codes
              WHERE device_code = $1 AND pending_email IS NOT NULL FOR UPDATE",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .fetch_one(&mut *blocker)
         .await
         .unwrap();
@@ -3759,7 +3856,7 @@ mod tests {
         assert!(first ^ second);
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -3787,7 +3884,7 @@ mod tests {
         assert!(repo.redeem_code(1, &code, &auth_code).await.unwrap());
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -3808,7 +3905,7 @@ mod tests {
         let auth_code = repo.find_valid(1, &code).await.unwrap().unwrap();
         let token = finalized
             .pending
-            .pending_email_verification_token
+            .pending_email_verification_token_hash
             .as_deref()
             .unwrap();
 
@@ -3831,20 +3928,20 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            pending.pending_email_verification_token.as_deref(),
+            pending.pending_email_verification_token_hash.as_deref(),
             Some(token)
         );
         let exchange_token: Option<String> = sqlx::query_scalar(
             "SELECT pending_email_verification_token FROM oauth_codes WHERE code = $1",
         )
-        .bind(&code)
+        .bind(hash_token(&code))
         .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(exchange_token.as_deref(), Some(token));
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -3866,7 +3963,7 @@ mod tests {
         let code = finalized.exchange_code.code.clone();
         let token = finalized
             .pending
-            .pending_email_verification_token
+            .pending_email_verification_token_hash
             .clone()
             .unwrap();
         let auth_code = repo.find_valid(1, &code).await.unwrap().unwrap();
@@ -3879,8 +3976,8 @@ mod tests {
                AND pending_email IS NOT NULL
              FOR UPDATE",
         )
-        .bind(&device_code)
-        .bind(&token)
+        .bind(hash_token(&device_code))
+        .bind(token.clone())
         .fetch_one(&mut *redemption)
         .await
         .unwrap();
@@ -3893,7 +3990,7 @@ mod tests {
                 .reset_pin_for_resend(
                     &resend_device,
                     1,
-                    &resend_token,
+                    &resend_token.clone(),
                     "replacement-token",
                     "replacement-pin",
                     Utc::now() - chrono::Duration::minutes(5),
@@ -3930,8 +4027,8 @@ mod tests {
                    AND pending_email_verification_token = $2
                    AND pending_email IS NULL AND consumed_at IS NULL",
             )
-            .bind(&code)
-            .bind(&token)
+            .bind(hash_token(&code))
+            .bind(token.clone())
             .execute(&mut *redemption)
             .await
             .unwrap()
@@ -3945,7 +4042,7 @@ mod tests {
             "SELECT pending_email_verification_token FROM oauth_codes
              WHERE tenant_id = 1 AND device_code = $1 AND pending_email IS NOT NULL",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -3953,11 +4050,11 @@ mod tests {
             "SELECT pending_email_verification_token, consumed_at IS NOT NULL
              FROM oauth_codes WHERE tenant_id = 1 AND code = $1",
         )
-        .bind(&code)
+        .bind(hash_token(&code))
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(pending_token.as_deref(), Some(token.as_str()));
+        assert_eq!(pending_token.as_deref(), Some(token.clone().as_str()));
         assert_eq!(exchange_token, pending_token);
         assert!(exchange_consumed);
         assert!(repo
@@ -3966,7 +4063,7 @@ mod tests {
             .unwrap());
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -3988,7 +4085,7 @@ mod tests {
         let code = finalized.exchange_code.code.clone();
         let old_token = finalized
             .pending
-            .pending_email_verification_token
+            .pending_email_verification_token_hash
             .clone()
             .unwrap();
         let old_pin_hash = finalized.pending.pin_hash.clone().unwrap();
@@ -3999,13 +4096,22 @@ mod tests {
             .reset_pin_for_resend(
                 &device_code,
                 1,
-                &old_token,
+                &old_token.clone(),
                 &replacement_token,
                 &replacement_pin_hash,
                 Utc::now() - chrono::Duration::minutes(5),
             )
             .await
             .unwrap());
+        assert!(repo.find_valid(1, &code).await.unwrap().is_none());
+        let MaterializePendingRegistrationOutcome::Ready(replacement) = repo
+            .materialize_pending_registration(1, &replacement_token, "replacement-restore-exchange")
+            .await
+            .unwrap()
+        else {
+            panic!("replacement ready");
+        };
+        let code = replacement.exchange_code.code;
         let auth_code = repo.find_valid(1, &code).await.unwrap().unwrap();
 
         let mut redemption = pool.begin().await.unwrap();
@@ -4016,8 +4122,8 @@ mod tests {
                AND pending_email IS NOT NULL
              FOR UPDATE",
         )
-        .bind(&device_code)
-        .bind(&replacement_token)
+        .bind(hash_token(&device_code))
+        .bind(hash_token(&replacement_token))
         .fetch_one(&mut *redemption)
         .await
         .unwrap();
@@ -4034,7 +4140,7 @@ mod tests {
                     &restore_device,
                     1,
                     PinResendSnapshot {
-                        verification_token: Some(&restore_old_token),
+                        verification_token_hash: Some(&restore_old_token.clone()),
                         pin_hash: Some(&restore_old_pin_hash),
                         pin_attempts: finalized.pending.pin_attempts,
                         pin_sent_at: finalized.pending.pin_sent_at,
@@ -4075,8 +4181,8 @@ mod tests {
                    AND pending_email_verification_token = $2
                    AND pending_email IS NULL AND consumed_at IS NULL",
             )
-            .bind(&code)
-            .bind(&replacement_token)
+            .bind(hash_token(&code))
+            .bind(hash_token(&replacement_token))
             .execute(&mut *redemption)
             .await
             .unwrap()
@@ -4090,7 +4196,7 @@ mod tests {
             "SELECT pending_email_verification_token, pin_hash FROM oauth_codes
              WHERE tenant_id = 1 AND device_code = $1 AND pending_email IS NOT NULL",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -4098,11 +4204,14 @@ mod tests {
             "SELECT pending_email_verification_token, consumed_at IS NOT NULL
              FROM oauth_codes WHERE tenant_id = 1 AND code = $1",
         )
-        .bind(&code)
+        .bind(hash_token(&code))
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(pending_token.as_deref(), Some(replacement_token.as_str()));
+        assert_eq!(
+            pending_token.as_deref(),
+            Some(hash_token(&replacement_token).as_str())
+        );
         assert_eq!(pending_pin.as_deref(), Some(replacement_pin_hash.as_str()));
         assert_eq!(exchange_token, pending_token);
         assert!(exchange_consumed);
@@ -4112,7 +4221,7 @@ mod tests {
             .unwrap());
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -4135,7 +4244,7 @@ mod tests {
         let auth_code = repo.find_valid(1, &code).await.unwrap().unwrap();
         let token = finalized
             .pending
-            .pending_email_verification_token
+            .pending_email_verification_token_hash
             .clone()
             .unwrap();
 
@@ -4144,7 +4253,7 @@ mod tests {
             "SELECT 1 FROM oauth_codes
              WHERE device_code = $1 AND pending_email IS NOT NULL FOR UPDATE",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .fetch_one(&mut *blocker)
         .await
         .unwrap();
@@ -4159,7 +4268,7 @@ mod tests {
         let replacement = format!("replacement_{}", uuid::Uuid::new_v4());
         let finalizer = tokio::spawn(async move {
             finalize_repo
-                .materialize_pending_registration(1, &token, &replacement)
+                .materialize_pending_registration_by_hash(1, &token, &replacement)
                 .await
         });
 
@@ -4180,12 +4289,21 @@ mod tests {
         }
         blocker.commit().await.unwrap();
 
-        assert!(redemption.await.unwrap().unwrap());
+        let redeemed = redemption.await.unwrap().unwrap();
         match finalizer.await.unwrap().unwrap() {
             MaterializePendingRegistrationOutcome::Ready(result) => {
-                assert_eq!(result.exchange_code.code, code)
+                assert!(!redeemed, "replacement wins before the old code is claimed");
+                assert_ne!(result.exchange_code.code, code);
+                assert!(repo.find_valid(1, &code).await.unwrap().is_none());
+                assert!(repo
+                    .find_valid(1, &result.exchange_code.code)
+                    .await
+                    .unwrap()
+                    .is_some());
             }
-            MaterializePendingRegistrationOutcome::Processing => {}
+            MaterializePendingRegistrationOutcome::Processing => {
+                assert!(redeemed, "a claimed code prevents replacement");
+            }
             other => panic!("unexpected finalizer outcome: {other:?}"),
         }
         let live_codes: i64 = sqlx::query_scalar(
@@ -4193,14 +4311,14 @@ mod tests {
              WHERE device_code = $1 AND pending_email IS NULL
                AND expires_at > clock_timestamp()",
         )
-        .bind(&device_code)
+        .bind(hash_token(&device_code))
         .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(live_codes, 1);
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -4220,25 +4338,25 @@ mod tests {
         let code = finalized.exchange_code.code.clone();
         let token = finalized
             .pending
-            .pending_email_verification_token
+            .pending_email_verification_token_hash
             .clone()
             .unwrap();
         let auth_code = repo.find_valid(1, &code).await.unwrap().unwrap();
         assert!(repo.redeem_code(1, &code, &auth_code).await.unwrap());
 
         assert!(matches!(
-            repo.materialize_pending_registration(1, &token, "must-not-mint")
+            repo.materialize_pending_registration_by_hash(1, &token, "must-not-mint")
                 .await
                 .unwrap(),
             MaterializePendingRegistrationOutcome::Processing
         ));
         sqlx::query("UPDATE oauth_codes SET expires_at = clock_timestamp() - INTERVAL '1 second' WHERE code = $1")
-            .bind(&code)
+            .bind(hash_token(&code))
             .execute(&pool)
             .await
             .unwrap();
         let recovered = repo
-            .materialize_pending_registration(1, &token, "recovered-code")
+            .materialize_pending_registration_by_hash(1, &token, "recovered-code")
             .await
             .unwrap();
         let MaterializePendingRegistrationOutcome::Ready(recovered) = recovered else {
@@ -4247,7 +4365,7 @@ mod tests {
         assert_eq!(recovered.exchange_code.code, "recovered-code");
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -4325,7 +4443,7 @@ mod tests {
         );
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1")
-            .bind(&device_code)
+            .bind(hash_token(&device_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -4406,9 +4524,9 @@ mod tests {
         );
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1 OR code IN ($2, $3)")
-            .bind(&device_code)
-            .bind(&exchange_a)
-            .bind(&exchange_b)
+            .bind(hash_token(&device_code))
+            .bind(hash_token(&exchange_a))
+            .bind(hash_token(&exchange_b))
             .execute(&pool)
             .await
             .unwrap();
@@ -4591,7 +4709,7 @@ mod tests {
             .unwrap();
         sqlx::query("UPDATE oauth_codes SET consumed_at = $1 WHERE device_code = $2")
             .bind(Utc::now())
-            .bind(&consumed_dc)
+            .bind(hash_token(&consumed_dc))
             .execute(&pool)
             .await
             .unwrap();
@@ -4616,7 +4734,7 @@ mod tests {
         .await
         .unwrap();
         sqlx::query("UPDATE oauth_codes SET consumed_at = NOW() WHERE code = $1")
-            .bind(&exchange_code)
+            .bind(hash_token(&exchange_code))
             .execute(&pool)
             .await
             .unwrap();
@@ -4630,7 +4748,7 @@ mod tests {
         // find_by_device_code filters expired, so query the raw row for the expired case.
         let expired_still_present: Option<(String,)> =
             sqlx::query_as("SELECT device_code FROM oauth_codes WHERE device_code = $1")
-                .bind(&expired_dc)
+                .bind(hash_token(&expired_dc))
                 .fetch_optional(&pool)
                 .await
                 .unwrap();
@@ -4640,7 +4758,7 @@ mod tests {
         );
         let grace_still_present: Option<(String,)> =
             sqlx::query_as("SELECT device_code FROM oauth_codes WHERE device_code = $1")
-                .bind(&grace_dc)
+                .bind(hash_token(&grace_dc))
                 .fetch_optional(&pool)
                 .await
                 .unwrap();
@@ -4650,14 +4768,14 @@ mod tests {
         );
         let consumed_still_present: Option<(String,)> =
             sqlx::query_as("SELECT device_code FROM oauth_codes WHERE device_code = $1")
-                .bind(&consumed_dc)
+                .bind(hash_token(&consumed_dc))
                 .fetch_optional(&pool)
                 .await
                 .unwrap();
         assert!(consumed_still_present.is_none(), "consumed row removed");
         let exchange_claim_present: bool =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM oauth_codes WHERE code = $1)")
-                .bind(&exchange_code)
+                .bind(hash_token(&exchange_code))
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -4674,13 +4792,13 @@ mod tests {
         );
 
         sqlx::query("DELETE FROM oauth_codes WHERE device_code = $1 OR device_code = $2")
-            .bind(&live_dc)
-            .bind(&grace_dc)
+            .bind(hash_token(&live_dc))
+            .bind(hash_token(&grace_dc))
             .execute(&pool)
             .await
             .unwrap();
         sqlx::query("DELETE FROM oauth_codes WHERE code = $1")
-            .bind(&exchange_code)
+            .bind(hash_token(&exchange_code))
             .execute(&pool)
             .await
             .unwrap();

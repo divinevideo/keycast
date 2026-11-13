@@ -19,6 +19,58 @@ Keycast is a hosted NIP-46 (Nostr remote signer) bunker service. We take securit
 - ✅ **NIP-44 encryption** for bunker communication over Nostr relays
 - ✅ **gRPC with mTLS** for KMS API calls
 
+### Recovery and claim links
+
+Password-reset, email-verification, email-change and account-claim token values
+are stored as lowercase SHA-256 digests. Repository methods hash the presented
+raw token before matching; the stored digest is not a working link. These tokens
+are generated with cryptographic randomness. Passwords and short PINs retain
+their password-hashing algorithms, not this fast token hash.
+
+OAuth authorization codes, device credentials, pending-registration email tokens
+and ATProto authorization codes use the same digest storage. Repeated registration
+rotates its device credential. A disclosed exchange code remains valid until
+redemption or expiry; overlapping finalizers do not recover or replace it.
+Polling uses a hashed device-keyed readiness marker
+containing only the verified generation digest, then creates a fresh code for
+the response. Raw exchange codes are not cached in Redis.
+The marker survives retryable database failures before disclosure. Polls do not
+consume or rewrite readiness; the database generation lock admits only one live
+code, and expired or superseded generations cannot authorize another handoff.
+Overlapping verification attempts wait while a disclosed exchange code is still
+valid. A lost response cannot recover that raw code; a new verified generation
+or expiry permits a fresh handoff without invalidating an in-flight valid code.
+For browser OAuth registration with device polling, email verification prepares
+readiness and offers a window choice. The original window can obtain its code
+through polling, or the user can choose **Continue here** for the client redirect.
+The first handoff wins; the other path waits without replacing its code. Native
+headless verification still hands off to the originating app.
+
+![Browser verification lets the user choose a window without redisclosing a code](images/browser-delivery-choice.png)
+
+Claim links are shown only when generated. Support lookup returns existence,
+creation time and expiry, never a recoverable URL. Generating another link or
+retrying unclaimed account provisioning replaces the previous claim link.
+Resending a claim confirmation creates a new confirmation link and invalidates
+the earlier one; existing cooldowns and lifetime send limits still apply.
+
+Support lookup and newly generated links (synthetic account):
+
+![Existing claim-link metadata without a recoverable URL](images/claim-link-metadata.png)
+
+![A newly generated claim link shown for copying](images/claim-link-new.png)
+
+The token-hashing migration backfills existing values without changing their
+expiry, so those links work with the new binary. It does not add constraints that
+would reject writes from a still-serving old revision or require manual schema
+changes to roll back. Links issued by an old revision during the rollout, or by
+the new revision before an application rollback, can require replacement.
+Hash-only storage and lookup apply once the new revision serves requests;
+rolling back also restores the previous revision's token-storage behavior.
+Migration execution and rollout remain operator-controlled actions.
+Older plaintext polling-cache entries are not read by the new polling path;
+an in-flight app may need to verify again to establish the new readiness marker.
+
 ### Password Login Protection
 
 Password login uses a tenant-scoped attempt budget shared by the web, OAuth popup, and

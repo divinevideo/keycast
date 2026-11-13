@@ -3053,7 +3053,6 @@ async fn handle_authorization_code_grant(
     let code_challenge_method = auth_code.code_challenge_method;
     let pending_email = auth_code.pending_email;
     let pending_password_hash = auth_code.pending_password_hash;
-    let pending_email_verification_token = auth_code.pending_email_verification_token;
     let pending_encrypted_secret = auth_code.pending_encrypted_secret;
     let previous_auth_id = auth_code.previous_auth_id;
     let is_headless = auth_code.is_headless;
@@ -3093,7 +3092,7 @@ async fn handle_authorization_code_grant(
         })?;
 
         validate_pkce(verifier, &challenge, method)?;
-        tracing::debug!("PKCE validation successful for code: {}", &code[..8]);
+        tracing::debug!("PKCE validation successful");
     }
 
     // Extract optional nsec from code_verifier (for BYOK flow)
@@ -3165,11 +3164,7 @@ async fn handle_authorization_code_grant(
         let pending_password_hash_val = pending_password_hash.ok_or_else(|| {
             OAuthError::InvalidRequest("Missing password hash in pending registration".to_string())
         })?;
-        let verification_token = pending_email_verification_token.ok_or_else(|| {
-            OAuthError::InvalidRequest(
-                "Missing verification token in pending registration".to_string(),
-            )
-        })?;
+        let verification_token = generate_secure_token();
 
         // Finalize pending registration atomically (user + personal_keys + delete code)
         let verification_expires = Utc::now() + Duration::hours(EMAIL_VERIFICATION_EXPIRY_HOURS);
@@ -4137,7 +4132,7 @@ pub async fn oauth_register(
     // Store authorization code with pending registration data (including state for redirect after verification)
     // User + personal_keys will be created atomically when email is verified
     let scope = req.scope.as_deref().unwrap_or("sign_event");
-    let stored = store_oauth_code_with_pending_registration(
+    let _stored = store_oauth_code_with_pending_registration(
         pool,
         tenant_id,
         &code,
@@ -4156,7 +4151,6 @@ pub async fn oauth_register(
         Some(&device_code),
     )
     .await?;
-    let device_code = stored.device_code.unwrap_or(device_code);
 
     tracing::info!(
         "OAuth registration pending email verification: user {}, email {}",
@@ -4896,6 +4890,7 @@ pub struct PollResponse {
 /// See: https://datatracker.ietf.org/doc/html/rfc8628
 pub async fn poll(
     State(auth_state): State<super::routes::AuthState>,
+    tenant: crate::api::tenant::TenantExtractor,
     Query(req): Query<PollRequest>,
 ) -> Result<Response, OAuthError> {
     // Validate device_code parameter (basic sanity check - alphanumeric, reasonable length)
@@ -4917,14 +4912,69 @@ pub async fn poll(
         ));
     };
 
-    let key = format!("oauth_poll:{}", req.device_code);
+    let key = format!(
+        "oauth_poll:{}",
+        keycast_core::token_hash::hash_token(&req.device_code)
+    );
 
+    // Readiness is verified-generation state, not a bearer code. Leave it intact
+    // across database errors; the pending-row lock owns the single code handoff.
     match redis.get(&key).await {
-        Ok(Some(code)) => {
-            // Delete key (one-time use)
-            let _ = redis.del(&key).await;
-
-            Ok((StatusCode::OK, Json(PollResponse { code })).into_response())
+        Ok(Some(generation_hash)) => {
+            let pool = &auth_state.state.db;
+            let repo = OAuthCodeRepository::new(pool.clone());
+            let pending = repo
+                .find_by_device_code(&req.device_code, tenant.0.id)
+                .await
+                .map_err(|e| OAuthError::Database(e.to_string()))?;
+            let Some(pending) = pending.filter(|pending| {
+                pending.pending_email_verification_token_hash.as_deref()
+                    == Some(generation_hash.as_str())
+                    && pending.consumed_at.is_none()
+                    && pending.expires_at > Utc::now()
+            }) else {
+                return Ok((
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({ "status": "pending" })),
+                )
+                    .into_response());
+            };
+            let finalized = match super::auth::finalize_pending_registration(
+                pool,
+                None,
+                tenant.0.id,
+                &pending,
+                super::auth::HeadlessDelivery::RedisBestEffort,
+            )
+            .await
+            {
+                Ok(finalized) => finalized,
+                Err(super::auth::AuthError::ServiceUnavailable { .. }) => {
+                    // A live handoff may already be on its way via PIN or an earlier poll.
+                    // Neither replace that code nor overwrite a newer readiness generation.
+                    return Ok((
+                        StatusCode::ACCEPTED,
+                        Json(serde_json::json!({"status": "pending"})),
+                    )
+                        .into_response());
+                }
+                Err(_) => {
+                    return Err(OAuthError::ServerError(
+                        "Sign-in is still finishing. Please retry.".into(),
+                    ))
+                }
+            };
+            // Concurrent polls cannot replace a disclosed code: materialization
+            // checks live handoffs under the pending-generation row lock.
+            Ok((
+                StatusCode::OK,
+                Json(PollResponse {
+                    code: finalized.new_code.ok_or_else(|| {
+                        OAuthError::ServerError("No authorization code was issued".into())
+                    })?,
+                }),
+            )
+                .into_response())
         }
         Ok(None) => {
             // Not ready yet

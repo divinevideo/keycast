@@ -8,7 +8,7 @@
 
 	const api = new KeycastApi();
 
-	let status = $state<'loading' | 'processing' | 'success' | 'oauth_redirect' | 'headless_verified' | 'error' | 'superseded' | 'no-token'>('loading');
+	let status = $state<'loading' | 'processing' | 'success' | 'oauth_redirect' | 'headless_verified' | 'choose_window' | 'error' | 'superseded' | 'no-token'>('loading');
 	let message = $state('');
 	let redirectUrl = $state('');
 
@@ -27,12 +27,14 @@
 		retry_after?: number;
 	}
 
-	async function verifyEmail(token: string): Promise<void> {
+	async function verifyEmail(token: string, continueHere = false): Promise<void> {
+		status = 'loading';
 		const maxAttempts = 30; // Max 30 seconds of polling
 
 		for (let attempt = 0; attempt < maxAttempts; attempt++) {
 			try {
-				const response = await api.post<VerifyEmailResponse>('/auth/verify-email', { token });
+				const endpoint = continueHere ? '/auth/verify-email/continue-here' : '/auth/verify-email/prepare';
+				const response = await api.post<VerifyEmailResponse>(endpoint, { token });
 
 				// Handle "processing" status - bcrypt still hashing
 				if (response.status === 'processing') {
@@ -44,6 +46,16 @@
 				}
 
 				if (response.success) {
+					if (continueHere && response.status === 'already_verified') {
+						status = 'headless_verified';
+						message = 'This sign-in has already finished. Return to your application.';
+						return;
+					}
+					if (response.status === 'choose_window') {
+						status = 'choose_window';
+						message = 'Return to the window where you started signing in. If it is closed, you can continue here.';
+						return;
+					}
 					// Headless flow (mobile app) — app is polling, just show success
 					if (response.status === 'headless') {
 						status = 'headless_verified';
@@ -119,6 +131,11 @@
 				}
 				// Check for 503 Service Unavailable (server busy)
 				if (err.status === 503) {
+					if (continueHere) {
+						status = 'choose_window';
+						message = 'Sign-in is still finishing. If your original window is open, return there. Otherwise, try again shortly.';
+						return;
+					}
 					status = 'processing';
 					message = 'Server is busy, please wait...';
 					await sleep(5000);
@@ -191,6 +208,14 @@
 			<h1>Email Verified!</h1>
 			<p class="subtitle">{message}</p>
 			<p class="redirect-notice">Redirecting to application...</p>
+
+		{:else if status === 'choose_window'}
+			<h1>Email Verified!</h1>
+			<p class="subtitle">{message}</p>
+			<button class="btn-primary" onclick={() => {
+				const token = $page.url.searchParams.get('token');
+				if (token) void verifyEmail(token, true);
+			}}>Continue here</button>
 
 		{:else if status === 'headless_verified'}
 			<div class="status-icon success">

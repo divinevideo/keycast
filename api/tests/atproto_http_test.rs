@@ -1156,8 +1156,6 @@ async fn disable_escape_hatch_revokes_atproto_oauth_refresh_sessions() {
         .store_token_artifacts(
             &request_uri,
             IssueAtprotoTokensParams {
-                authorization_code: format!("auth-code-{}", Uuid::new_v4()),
-                authorization_code_expires_at: Utc::now() + Duration::minutes(5),
                 access_token_jti: format!("access-jti-{}", Uuid::new_v4()),
                 access_token_expires_at: Utc::now() + Duration::minutes(15),
                 refresh_token_hash: refresh_token_hash.clone(),
@@ -1260,8 +1258,6 @@ async fn enable_rollback_revokes_atproto_oauth_refresh_sessions() {
         .store_token_artifacts(
             &request_uri,
             IssueAtprotoTokensParams {
-                authorization_code: format!("auth-code-{}", Uuid::new_v4()),
-                authorization_code_expires_at: Utc::now() + Duration::minutes(5),
                 access_token_jti: format!("access-jti-{}", Uuid::new_v4()),
                 access_token_expires_at: Utc::now() + Duration::minutes(15),
                 refresh_token_hash: refresh_token_hash.clone(),
@@ -1548,8 +1544,6 @@ async fn disable_path_revokes_atproto_oauth_refresh_sessions() {
         .store_token_artifacts(
             &request_uri,
             IssueAtprotoTokensParams {
-                authorization_code: format!("auth-code-{}", Uuid::new_v4()),
-                authorization_code_expires_at: Utc::now() + Duration::minutes(5),
                 access_token_jti: format!("access-jti-{}", Uuid::new_v4()),
                 access_token_expires_at: Utc::now() + Duration::minutes(15),
                 refresh_token_hash: refresh_token_hash.clone(),

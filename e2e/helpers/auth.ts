@@ -1,5 +1,5 @@
 import { APIRequestContext } from "@playwright/test";
-import { getVerificationToken } from "./db";
+import { getVerificationToken } from "./emails";
 
 interface VerifyResult {
   cookie: string;
@@ -19,8 +19,7 @@ export async function registerAndVerify(
     throw new Error(`Registration failed (${registerRes.status()}): ${body}`);
   }
 
-  // Extract verification token from DB (polls until ready)
-  const token = await getVerificationToken(email);
+  const token = await getVerificationToken(request, email);
 
   // Verify email - retry until bcrypt finishes hashing the password
   for (let attempt = 0; attempt < 10; attempt++) {
