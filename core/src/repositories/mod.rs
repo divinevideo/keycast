@@ -11,6 +11,7 @@ mod email_marketing;
 mod error;
 mod oauth_authorization;
 mod oauth_code;
+mod og_diviner_grant;
 mod personal_keys;
 mod policy;
 mod refresh_token;
@@ -41,6 +42,10 @@ pub use oauth_code::{
     OAuthCodeRepository, PinAttemptRelease, PinAttemptReservation, PinResendSnapshot,
     StoreOAuthCodeParams, StoreOAuthCodeWithRegistrationParams, StoredExchangeCode,
     StoredPendingRegistration,
+};
+pub use og_diviner_grant::{
+    parse_grant_roster, GrantLoadReport, GrantRoster, GrantRosterError, OgDivinerGrantEvidence,
+    OgDivinerGrantRepository,
 };
 pub use personal_keys::PersonalKeysRepository;
 pub use policy::PolicyRepository;
