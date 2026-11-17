@@ -326,7 +326,7 @@ async fn test_set_does_not_invalidate_claim_token() {
         "INSERT INTO account_claim_tokens (token, user_pubkey, expires_at, created_at, tenant_id) \
          VALUES ($1, $2, NOW() + INTERVAL '7 days', NOW(), $3)",
     )
-    .bind(&token)
+    .bind(keycast_core::token_hash::hash_token(&token))
     .bind(&pubkey)
     .bind(TENANT_ID)
     .execute(&pool)
@@ -346,7 +346,7 @@ async fn test_set_does_not_invalidate_claim_token() {
         "SELECT COUNT(*) FROM account_claim_tokens \
          WHERE token = $1 AND used_at IS NULL AND invalidated_at IS NULL AND expires_at > NOW()",
     )
-    .bind(&token)
+    .bind(keycast_core::token_hash::hash_token(&token))
     .fetch_one(&pool)
     .await
     .unwrap();

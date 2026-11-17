@@ -1256,8 +1256,6 @@ pub async fn token(
             repo.store_token_artifacts(
                 &session.request_uri,
                 IssueAtprotoTokensParams {
-                    authorization_code: code.to_string(),
-                    authorization_code_expires_at: Utc::now(),
                     access_token_jti: access_token_jti.clone(),
                     access_token_expires_at: Utc::now()
                         + Duration::minutes(ACCESS_TOKEN_EXPIRY_MINUTES),
@@ -1353,10 +1351,6 @@ pub async fn token(
                     &session.request_uri,
                     &refresh_token_hash,
                     IssueAtprotoTokensParams {
-                        authorization_code: session.authorization_code.unwrap_or_default(),
-                        authorization_code_expires_at: session
-                            .authorization_code_expires_at
-                            .unwrap_or_else(Utc::now),
                         access_token_jti: access_token_jti.clone(),
                         access_token_expires_at: Utc::now()
                             + Duration::minutes(ACCESS_TOKEN_EXPIRY_MINUTES),

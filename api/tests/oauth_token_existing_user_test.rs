@@ -135,7 +135,7 @@ async fn cleanup_user(pool: &PgPool, user_pubkey: &str, code: &str) {
         .execute(pool)
         .await;
     let _ = sqlx::query("DELETE FROM oauth_codes WHERE code = $1 OR user_pubkey = $2")
-        .bind(code)
+        .bind(keycast_core::token_hash::hash_token(code))
         .bind(user_pubkey)
         .execute(pool)
         .await;
@@ -274,15 +274,15 @@ async fn oauth_token_issuance_failure_leaves_pending_registration_rearmable() {
          VALUES (1, $1, $2, $3, $4, 'policy:social', $5, NOW(), $6,
                  'already-finalized', $7, $8, $9, true, 'pin-hash', NOW())",
     )
-    .bind(&pending_code)
+    .bind(keycast_core::token_hash::hash_token(&pending_code))
     .bind(&user_pubkey)
     .bind(&client_id)
     .bind(redirect_uri)
     .bind(Utc::now() + Duration::hours(24))
     .bind(&email)
-    .bind(&verification_token)
+    .bind(keycast_core::token_hash::hash_token(&verification_token))
     .bind(keys.secret_key().to_secret_bytes())
-    .bind(&device_code)
+    .bind(keycast_core::token_hash::hash_token(&device_code))
     .execute(&pool)
     .await
     .unwrap();

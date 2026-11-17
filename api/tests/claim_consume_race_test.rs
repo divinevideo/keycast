@@ -98,7 +98,7 @@ async fn token_flags(pool: &PgPool, token: &str) -> (bool, bool) {
         Option<chrono::DateTime<chrono::Utc>>,
         Option<chrono::DateTime<chrono::Utc>>,
     ) = sqlx::query_as("SELECT used_at, invalidated_at FROM account_claim_tokens WHERE token = $1")
-        .bind(token)
+        .bind(keycast_core::token_hash::hash_token(token))
         .fetch_one(pool)
         .await
         .expect("read token flags");
@@ -208,7 +208,7 @@ async fn test_expired_token_not_consumed() {
     sqlx::query(
         "UPDATE account_claim_tokens SET expires_at = NOW() - INTERVAL '1 hour' WHERE token = $1",
     )
-    .bind(&token)
+    .bind(keycast_core::token_hash::hash_token(&token))
     .execute(&pool)
     .await
     .expect("expire token");

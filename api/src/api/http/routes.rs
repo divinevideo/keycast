@@ -107,6 +107,14 @@ pub fn api_routes(
 
     // verify_email needs auth_state for key_manager (to decrypt keys and issue UCAN)
     let verify_email_route = Router::new()
+        .route(
+            "/auth/verify-email/prepare",
+            post(auth::verify_email_prepare),
+        )
+        .route(
+            "/auth/verify-email/continue-here",
+            post(auth::verify_email_here),
+        )
         // Keep GET for links sent before keycast#360. New emails use the public /verify-email route,
         // while POST stays for the SPA page and native clients.
         .route(

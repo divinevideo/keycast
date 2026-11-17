@@ -49,7 +49,7 @@ async fn insert_raw_token(
          (token, user_pubkey, expires_at, created_at, tenant_id, used_at, invalidated_at)
          VALUES ($1, $2, $3, NOW(), $4, $5, $6)",
     )
-    .bind(token)
+    .bind(keycast_core::token_hash::hash_token(token))
     .bind(user_pubkey)
     .bind(expires_at)
     .bind(tenant_id)

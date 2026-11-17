@@ -77,7 +77,7 @@ test.describe("Account claim flow", () => {
     if (!claimToken) {
       throw new Error("claim URL missing token");
     }
-    const confirmationToken = await getClaimConfirmationToken(claimToken);
+    const confirmationToken = await getClaimConfirmationToken(request, claimToken);
     const confirmUrl = new URL("/api/claim/confirm", apiUrl);
     confirmUrl.searchParams.set("token", confirmationToken);
     await page.goto(confirmUrl.toString());

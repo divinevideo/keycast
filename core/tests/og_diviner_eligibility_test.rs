@@ -208,7 +208,9 @@ async fn eligibility_uses_signup_claim_and_mobile_authorization_timestamps() {
              (token, user_pubkey, tenant_id, expires_at, used_at, created_at)
              VALUES ($1, $2, 1, $3, $4, $5)",
         )
-        .bind(Uuid::new_v4().to_string())
+        .bind(keycast_core::token_hash::hash_token(
+            &Uuid::new_v4().to_string(),
+        ))
         .bind(key)
         .bind(cutoff + chrono::Duration::days(1))
         .bind(used_at)

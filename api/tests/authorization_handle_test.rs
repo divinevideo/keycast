@@ -240,7 +240,7 @@ async fn test_previous_auth_id_can_be_stored_in_oauth_codes() {
         "INSERT INTO oauth_codes (code, user_pubkey, client_id, redirect_uri, scope, expires_at, tenant_id, previous_auth_id, created_at)
          VALUES ($1, $2, 'Test App', $3, 'sign', $4, 1, $5, NOW())",
     )
-    .bind(&code)
+    .bind(keycast_core::token_hash::hash_token(&code))
     .bind(&user_pubkey)
     .bind(&redirect_uri)
     .bind(expires_at)
@@ -252,7 +252,7 @@ async fn test_previous_auth_id_can_be_stored_in_oauth_codes() {
     // Retrieve and verify
     let stored_previous_auth_id: Option<i32> =
         sqlx::query_scalar("SELECT previous_auth_id FROM oauth_codes WHERE code = $1")
-            .bind(&code)
+            .bind(keycast_core::token_hash::hash_token(&code))
             .fetch_one(&pool)
             .await
             .expect("Failed to fetch oauth_code");
@@ -265,7 +265,7 @@ async fn test_previous_auth_id_can_be_stored_in_oauth_codes() {
 
     // Cleanup
     sqlx::query("DELETE FROM oauth_codes WHERE code = $1")
-        .bind(&code)
+        .bind(keycast_core::token_hash::hash_token(&code))
         .execute(&pool)
         .await
         .expect("Failed to cleanup");
@@ -522,7 +522,7 @@ async fn test_previous_auth_id_passed_through_oauth_code() {
         "INSERT INTO oauth_codes (code, user_pubkey, client_id, redirect_uri, scope, expires_at, tenant_id, previous_auth_id, created_at)
          VALUES ($1, $2, 'Test App', $3, 'sign', $4, 1, $5, NOW())",
     )
-    .bind(&code)
+    .bind(keycast_core::token_hash::hash_token(&code))
     .bind(&user_pubkey)
     .bind(&redirect_uri)
     .bind(expires_at)
@@ -534,7 +534,7 @@ async fn test_previous_auth_id_passed_through_oauth_code() {
     // Fetch and verify previous_auth_id
     let fetched_previous_auth_id: Option<i32> =
         sqlx::query_scalar("SELECT previous_auth_id FROM oauth_codes WHERE code = $1")
-            .bind(&code)
+            .bind(keycast_core::token_hash::hash_token(&code))
             .fetch_one(&pool)
             .await
             .expect("Failed to fetch oauth_code");
@@ -547,7 +547,7 @@ async fn test_previous_auth_id_passed_through_oauth_code() {
 
     // Cleanup
     sqlx::query("DELETE FROM oauth_codes WHERE code = $1")
-        .bind(&code)
+        .bind(keycast_core::token_hash::hash_token(&code))
         .execute(&pool)
         .await
         .expect("Failed to cleanup");

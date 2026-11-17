@@ -64,14 +64,17 @@ async fn create_with_prior_invalidation_invalidates_existing_and_inserts_new() {
         .expect("create_with_prior_invalidation");
 
     assert_eq!(invalidated_count, 1);
-    assert_eq!(new_tok.token, "tok_v2_regen");
+    assert_eq!(
+        new_tok.token_hash,
+        keycast_core::token_hash::hash_token("tok_v2_regen")
+    );
     assert!(new_tok.expires_at > Utc::now() + Duration::days(6));
     assert_eq!(new_tok.invalidated_at, None);
 
     let v1 = sqlx::query_as::<_, keycast_core::types::claim_token::ClaimToken>(
         "SELECT * FROM account_claim_tokens WHERE token = $1",
     )
-    .bind("tok_v1_regen")
+    .bind(keycast_core::token_hash::hash_token("tok_v1_regen"))
     .fetch_one(&pool)
     .await
     .expect("fetch v1");
@@ -100,7 +103,10 @@ async fn create_with_prior_invalidation_noops_when_no_priors() {
         .expect("create_with_prior_invalidation");
 
     assert_eq!(invalidated_count, 0);
-    assert_eq!(new_tok.token, "tok_fresh_regen");
+    assert_eq!(
+        new_tok.token_hash,
+        keycast_core::token_hash::hash_token("tok_fresh_regen")
+    );
 
     cleanup(&pool, pk).await;
 }

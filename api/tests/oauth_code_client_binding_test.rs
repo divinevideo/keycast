@@ -25,13 +25,13 @@ async fn insert_authorization_code(pool: &PgPool, code: &str, user_pubkey: &str,
             pending_encrypted_secret
          ) VALUES ($1, $2, $3, $4, 'policy:social', $5, 1, NOW(), $6, 'test-password-hash', $7, $8)",
     )
-    .bind(code)
+    .bind(keycast_core::token_hash::hash_token(code))
     .bind(user_pubkey)
     .bind(ISSUED_CLIENT_ID)
     .bind(REDIRECT_URI)
     .bind(Utc::now() + Duration::minutes(10))
     .bind(email)
-    .bind(format!("verify-{code}"))
+    .bind(keycast_core::token_hash::hash_token(&format!("verify-{code}")))
     .bind(Keys::generate().secret_key().to_secret_bytes().to_vec())
     .execute(pool)
     .await
@@ -93,7 +93,7 @@ async fn redemption_by_a_different_client_is_rejected_and_leaves_the_code_unspen
     let code_still_present: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM oauth_codes WHERE tenant_id = 1 AND code = $1)",
     )
-    .bind(&code)
+    .bind(keycast_core::token_hash::hash_token(&code))
     .fetch_one(&pool)
     .await
     .expect("Query should succeed");
@@ -114,7 +114,7 @@ async fn redemption_by_a_different_client_is_rejected_and_leaves_the_code_unspen
     );
 
     let _ = sqlx::query("DELETE FROM oauth_codes WHERE code = $1")
-        .bind(&code)
+        .bind(keycast_core::token_hash::hash_token(&code))
         .execute(&pool)
         .await;
 }

@@ -15,15 +15,17 @@ use axum::{
 use chrono::{Duration, Utc};
 use http_body_util::BodyExt;
 use keycast_api::api::http::{claim, routes::AuthState};
+use keycast_api::email_service::EmailSender;
 use keycast_api::ucan_auth::did_to_nostr_pubkey;
 use keycast_api::{
     email_delivery::{EmailAdmissionRefusal, EmailDeliveryService},
     email_service::DevEmailSender,
 };
+use keycast_core::token_hash::hash_token;
 use keycast_core::types::claim_token::CLAIM_CONFIRMATION_SEND_LIMIT;
 use nostr_sdk::{Keys, ToBech32};
 use sqlx::PgPool;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tower::ServiceExt;
 use ucan::Ucan;
 
@@ -48,8 +50,15 @@ fn test_tenant() -> keycast_api::api::tenant::TenantExtractor {
 fn build_app(auth_state: AuthState) -> Router {
     build_app_with_delivery(
         auth_state,
-        EmailDeliveryService::unrestricted_for_tests(Arc::new(DevEmailSender::new())),
+        EmailDeliveryService::unrestricted_for_tests(captured_sender()),
     )
+}
+
+fn captured_sender() -> Arc<DevEmailSender> {
+    static SENDER: OnceLock<Arc<DevEmailSender>> = OnceLock::new();
+    SENDER
+        .get_or_init(|| Arc::new(DevEmailSender::new()))
+        .clone()
 }
 
 fn build_app_with_delivery(auth_state: AuthState, email_delivery: EmailDeliveryService) -> Router {
@@ -189,7 +198,7 @@ async fn seed_valid_claim_token(pool: &PgPool) -> (String, String) {
         "INSERT INTO account_claim_tokens (token, user_pubkey, expires_at, created_at, tenant_id) \
          VALUES ($1, $2, NOW() + INTERVAL '7 days', NOW(), $3)",
     )
-    .bind(&token)
+    .bind(hash_token(&token))
     .bind(&pubkey)
     .bind(TENANT_ID)
     .execute(pool)
@@ -210,7 +219,7 @@ async fn read_claim_token_row(pool: &PgPool, token: &str) -> ClaimTokenRow {
     sqlx::query_as::<_, ClaimTokenRow>(
         "SELECT used_at, pending_email, confirmation_token FROM account_claim_tokens WHERE token = $1",
     )
-    .bind(token)
+    .bind(hash_token(token))
     .fetch_one(pool)
     .await
     .expect("read claim token row")
@@ -235,14 +244,23 @@ async fn read_user_email_verified(pool: &PgPool, pubkey: &str) -> bool {
 }
 
 async fn read_confirmation_token(pool: &PgPool, claim_token: &str) -> String {
-    sqlx::query_scalar::<_, Option<String>>(
+    let digest = sqlx::query_scalar::<_, Option<String>>(
         "SELECT confirmation_token FROM account_claim_tokens WHERE token = $1",
     )
-    .bind(claim_token)
+    .bind(hash_token(claim_token))
     .fetch_one(pool)
     .await
     .expect("read confirmation token")
-    .expect("confirmation_token must be staged after POST /api/claim")
+    .expect("confirmation_token must be staged after POST /api/claim");
+    captured_sender()
+        .get_captured_emails()
+        .iter()
+        .rev()
+        .filter_map(|email| email.verification_url.as_ref())
+        .filter_map(|url| url.split("?token=").nth(1))
+        .find(|raw| hash_token(raw) == digest)
+        .expect("raw token must come from the delivered email, not the database")
+        .to_string()
 }
 
 async fn read_confirmation_sent_at(
@@ -252,7 +270,7 @@ async fn read_confirmation_sent_at(
     sqlx::query_scalar::<_, Option<chrono::DateTime<Utc>>>(
         "SELECT confirmation_sent_at FROM account_claim_tokens WHERE token = $1",
     )
-    .bind(claim_token)
+    .bind(hash_token(claim_token))
     .fetch_one(pool)
     .await
     .expect("read confirmation_sent_at")
@@ -265,7 +283,7 @@ async fn read_confirmation_expires_at(
     sqlx::query_scalar::<_, Option<chrono::DateTime<Utc>>>(
         "SELECT confirmation_expires_at FROM account_claim_tokens WHERE token = $1",
     )
-    .bind(claim_token)
+    .bind(hash_token(claim_token))
     .fetch_one(pool)
     .await
     .expect("read confirmation_expires_at")
@@ -278,7 +296,7 @@ async fn read_claim_token_used_at(
     sqlx::query_scalar::<_, Option<chrono::DateTime<Utc>>>(
         "SELECT used_at FROM account_claim_tokens WHERE token = $1",
     )
-    .bind(claim_token)
+    .bind(hash_token(claim_token))
     .fetch_one(pool)
     .await
     .expect("read used_at")
@@ -436,7 +454,7 @@ async fn assert_confirmation_preview_is_read_only(method: &str) {
     );
     assert_eq!(
         row.confirmation_token.as_deref(),
-        Some(confirmation_token.as_str())
+        Some(hash_token(&confirmation_token).as_str())
     );
     assert_eq!(row.pending_email.as_deref(), Some(claim_email.as_str()));
     assert_eq!(response.status(), StatusCode::OK);
@@ -690,21 +708,21 @@ async fn confirmation_submission_rechecks_changes_after_preview() {
                 sqlx::query(
                     "UPDATE account_claim_tokens SET invalidated_at = NOW() WHERE token = $1",
                 )
-                .bind(&token)
+                .bind(hash_token(&token))
                 .execute(&pool)
                 .await
                 .unwrap();
             }
             "expired" => {
                 sqlx::query("UPDATE account_claim_tokens SET confirmation_expires_at = NOW() - INTERVAL '1 minute' WHERE token = $1")
-                    .bind(&token).execute(&pool).await.unwrap();
+                    .bind(hash_token(&token)).execute(&pool).await.unwrap();
             }
             "superseded" => {
                 sqlx::query(
                     "UPDATE account_claim_tokens SET confirmation_token = $1 WHERE token = $2",
                 )
-                .bind(format!("replacement-{pubkey}"))
-                .bind(&token)
+                .bind(hash_token(&format!("replacement-{pubkey}")))
+                .bind(hash_token(&token))
                 .execute(&pool)
                 .await
                 .unwrap();
@@ -877,7 +895,7 @@ async fn resend_stops_sending_once_the_lifetime_budget_is_spent() {
          WHERE token = $2",
     )
     .bind(CLAIM_CONFIRMATION_SEND_LIMIT)
-    .bind(&token)
+    .bind(hash_token(&token))
     .execute(&pool)
     .await
     .unwrap();
@@ -906,7 +924,7 @@ async fn resend_stops_sending_once_the_lifetime_budget_is_spent() {
 
     let count: (i32,) =
         sqlx::query_as("SELECT confirmation_send_count FROM account_claim_tokens WHERE token = $1")
-            .bind(&token)
+            .bind(hash_token(&token))
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -986,7 +1004,7 @@ async fn denied_resend_delivery_leaves_confirmation_state_unchanged() {
     sqlx::query(
         "UPDATE account_claim_tokens SET confirmation_sent_at = NOW() - INTERVAL '6 minutes' WHERE token = $1",
     )
-    .bind(&token)
+    .bind(hash_token(&token))
     .execute(&pool)
     .await
     .unwrap();
@@ -1039,7 +1057,7 @@ async fn resend_after_cooldown_bumps() {
     sqlx::query(
         "UPDATE account_claim_tokens SET confirmation_sent_at = NOW() - INTERVAL '6 minutes' WHERE token = $1",
     )
-    .bind(&token)
+    .bind(hash_token(&token))
     .execute(&pool)
     .await
     .expect("backdate confirmation_sent_at");
@@ -1066,9 +1084,9 @@ async fn resend_after_cooldown_bumps() {
         sent_at_before,
         sent_at_after
     );
-    assert_eq!(
+    assert_ne!(
         confirmation_token_before, confirmation_token_after,
-        "a resend of a still-valid (non-expired) confirmation token must not rotate it"
+        "every delivered resend replaces the earlier confirmation link"
     );
 }
 
@@ -1104,7 +1122,7 @@ async fn resend_rotates_expired_confirmation_token() {
              confirmation_expires_at = NOW() - INTERVAL '1 minute' \
          WHERE token = $1",
     )
-    .bind(&token)
+    .bind(hash_token(&token))
     .execute(&pool)
     .await
     .expect("backdate confirmation_sent_at and expire the confirmation window");
@@ -1184,7 +1202,7 @@ async fn confirm_with_expired_confirmation_window_shows_expired_page() {
     sqlx::query(
         "UPDATE account_claim_tokens SET confirmation_expires_at = NOW() - INTERVAL '1 minute' WHERE token = $1",
     )
-    .bind(&token)
+    .bind(hash_token(&token))
     .execute(&pool)
     .await
     .expect("backdate confirmation_expires_at");

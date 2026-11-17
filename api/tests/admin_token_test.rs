@@ -540,7 +540,10 @@ async fn test_claim_token_create_and_find() {
         .await
         .expect("find claim token");
     assert!(found.is_some(), "should find valid claim token");
-    assert_eq!(found.unwrap().token, token);
+    assert_eq!(
+        found.unwrap().token_hash,
+        keycast_core::token_hash::hash_token(&token)
+    );
 
     // Also find by token directly
     let found_direct = claim_repo.find_valid(&token).await.expect("find by token");
@@ -581,7 +584,7 @@ async fn test_claim_token_expired_not_returned() {
         "INSERT INTO account_claim_tokens (token, user_pubkey, expires_at, created_at, tenant_id)
          VALUES ($1, $2, $3, NOW(), $4)",
     )
-    .bind(&token)
+    .bind(keycast_core::token_hash::hash_token(&token))
     .bind(&pubkey)
     .bind(past)
     .bind(tenant_id)

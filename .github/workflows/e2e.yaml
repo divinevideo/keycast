@@ -71,6 +71,8 @@ jobs:
       ATPROTO_OAUTH_JWT_PRIVATE_KEY_HEX: "8f2a55949068468ad5d670dfd0c0a33d5b9e7e1a2c0d2059f0f8f8779d4d078d"
       ATPROTO_OAUTH_PDS_DID: "did:web:pds.divine.test"
       ENABLE_EXAMPLES: "true"
+      NODE_ENV: "test"
+      ENABLE_DEV_EMAIL_INBOX: "true"
       ENABLE_TENANT_AUTO_PROVISIONING: "true"
       API_URL: http://localhost:3000
       KEYCAST_BINARY: ${{ github.workspace }}/target/debug/keycast

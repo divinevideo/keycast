@@ -42,7 +42,9 @@ pub const CLAIM_CONFIRMATION_SEND_LIMIT: i32 = 10;
 #[derive(Debug, FromRow)]
 pub struct ClaimToken {
     pub id: i32,
-    pub token: String,
+    /// Stored digest, never a credential that can be put in a claim link.
+    #[sqlx(rename = "token")]
+    pub token_hash: String,
     pub user_pubkey: String,
     pub expires_at: DateTime<Utc>,
     pub used_at: Option<DateTime<Utc>>,

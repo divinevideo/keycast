@@ -1,5 +1,6 @@
 import { APIRequestContext } from "@playwright/test";
-import { getVerificationToken, withDb } from "./db";
+import { withDb } from "./db";
+import { getVerificationToken } from "./emails";
 
 export const ADMIN_SECRET_KEY =
   "6d84196f84e681d76f75c149c79e0375ecefae480a355130d0642a1e7c7bab44";
@@ -12,13 +13,20 @@ const ADMIN_PASSWORD = "AdminPass123!";
 async function verifyAdminEmail(
   request: APIRequestContext,
 ): Promise<{ cookie: string }> {
-  const token = await getVerificationToken(ADMIN_EMAIL);
-
   for (let attempt = 0; attempt < 10; attempt++) {
+    const token = await getVerificationToken(request, ADMIN_EMAIL);
     const verifyRes = await request.post("/api/auth/verify-email", {
       data: { token },
     });
     if (!verifyRes.ok()) {
+      if (verifyRes.status() === 401) {
+        const error = await verifyRes.json();
+        if (error.code === "VERIFICATION_LINK_SUPERSEDED") {
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          continue;
+        }
+        throw new Error("Admin email verification rejected the delivered token");
+      }
       const body = await verifyRes.text();
       throw new Error(
         `Admin email verification failed (${verifyRes.status()}): ${body}`,
@@ -55,6 +63,8 @@ export async function registerAdmin(
       data: { email: ADMIN_EMAIL, password: ADMIN_PASSWORD },
     });
     if (loginRes.status() === 403) {
+      const resend = await request.post("/api/auth/resend-verification", { data: { email: ADMIN_EMAIL } });
+      if (!resend.ok()) throw new Error("Admin verification email resend failed");
       return verifyAdminEmail(request);
     }
     if (!loginRes.ok()) {

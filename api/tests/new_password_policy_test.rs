@@ -101,13 +101,13 @@ async fn all_new_password_paths_share_policy_without_changing_legacy_login() {
     let claim_token = Uuid::new_v4().to_string();
     let original_hash = bcrypt::hash("1234", 4).unwrap();
     sqlx::query("INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, password_reset_token, password_reset_expires_at) VALUES ($1, 1, $2, $3, true, $4, NOW() + INTERVAL '1 hour')")
-        .bind(&pubkey).bind(&email).bind(&original_hash).bind(&reset_token)
+        .bind(&pubkey).bind(&email).bind(&original_hash).bind(keycast_core::token_hash::hash_token(&reset_token))
         .execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO personal_keys (user_pubkey, tenant_id, encrypted_secret_key) VALUES ($1, 1, $2)")
         .bind(&pubkey).bind(keys.secret_key().to_secret_bytes().to_vec())
         .execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO account_claim_tokens (token, user_pubkey, tenant_id, expires_at) VALUES ($1, $2, 1, NOW() + INTERVAL '1 day')")
-        .bind(&claim_token).bind(&pubkey).execute(&pool).await.unwrap();
+        .bind(keycast_core::token_hash::hash_token(&claim_token)).bind(&pubkey).execute(&pool).await.unwrap();
     let headers = session(&keys).await;
 
     // Exercise actual login handlers, not just bcrypt: old weak credentials remain usable.
@@ -219,7 +219,7 @@ async fn all_new_password_paths_share_policy_without_changing_legacy_login() {
             "SELECT password_reset_token = $2 FROM users WHERE pubkey = $1 AND tenant_id = 1",
         )
         .bind(&pubkey)
-        .bind(&reset_token)
+        .bind(keycast_core::token_hash::hash_token(&reset_token))
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -241,7 +241,7 @@ async fn all_new_password_paths_share_policy_without_changing_legacy_login() {
         .unwrap();
         assert!(!pending_exists);
         let unstaged: bool = sqlx::query_scalar("SELECT pending_password_hash IS NULL AND confirmation_token IS NULL FROM account_claim_tokens WHERE token = $1")
-            .bind(&claim_token).fetch_one(&pool).await.unwrap();
+            .bind(keycast_core::token_hash::hash_token(&claim_token)).fetch_one(&pool).await.unwrap();
         assert!(unstaged);
     }
 
@@ -321,7 +321,7 @@ async fn all_new_password_paths_share_policy_without_changing_legacy_login() {
     let pending_hash: String = sqlx::query_scalar(
         "SELECT pending_password_hash FROM account_claim_tokens WHERE token = $1",
     )
-    .bind(&claim_token)
+    .bind(keycast_core::token_hash::hash_token(&claim_token))
     .fetch_one(&pool)
     .await
     .unwrap();

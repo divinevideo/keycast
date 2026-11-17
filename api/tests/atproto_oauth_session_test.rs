@@ -65,6 +65,50 @@ async fn stores_and_revokes_atproto_oauth_sessions() {
     assert_eq!(approved.atproto_did.as_deref(), Some(did));
 
     let authorization_code = format!("auth-code-{}", Uuid::new_v4());
+    let first_code = format!("first-code-{}", Uuid::new_v4());
+    repo.store_authorization_code(&request_uri, &first_code, Utc::now() + Duration::minutes(5))
+        .await
+        .unwrap()
+        .unwrap();
+    let stored = repo
+        .store_authorization_code(
+            &request_uri,
+            &authorization_code,
+            Utc::now() + Duration::minutes(5),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let code_hash = keycast_core::token_hash::hash_token(&authorization_code);
+    assert_eq!(
+        stored.authorization_code_hash.as_deref(),
+        Some(code_hash.as_str())
+    );
+    assert!(repo
+        .find_by_authorization_code(&first_code)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(repo
+        .find_by_authorization_code(&code_hash)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(repo
+        .consume_authorization_code(&code_hash)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(repo
+        .consume_authorization_code(&authorization_code)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(repo
+        .consume_authorization_code(&authorization_code)
+        .await
+        .unwrap()
+        .is_none());
     let access_token_jti = format!("access-jti-{}", Uuid::new_v4());
     let refresh_token = format!("refresh-token-{}", Uuid::new_v4());
     let refresh_token_hash = hash_refresh_token(&refresh_token);
@@ -73,8 +117,6 @@ async fn stores_and_revokes_atproto_oauth_sessions() {
         .store_token_artifacts(
             &request_uri,
             IssueAtprotoTokensParams {
-                authorization_code,
-                authorization_code_expires_at: Utc::now() + Duration::minutes(5),
                 access_token_jti,
                 access_token_expires_at: Utc::now() + Duration::minutes(15),
                 refresh_token_hash: refresh_token_hash.clone(),
@@ -86,6 +128,11 @@ async fn stores_and_revokes_atproto_oauth_sessions() {
         .await
         .unwrap()
         .unwrap();
+
+    assert!(
+        issued.authorization_code_hash.is_none(),
+        "token artifacts must not restore a consumed code"
+    );
 
     assert_eq!(
         issued.refresh_token_hash.as_deref(),
@@ -155,8 +202,6 @@ async fn consumes_and_rotates_refresh_token_artifacts() {
         .store_token_artifacts(
             &request_uri,
             IssueAtprotoTokensParams {
-                authorization_code: format!("auth-code-{}", Uuid::new_v4()),
-                authorization_code_expires_at: Utc::now() + Duration::minutes(5),
                 access_token_jti: format!("access-jti-{}", Uuid::new_v4()),
                 access_token_expires_at: Utc::now() + Duration::minutes(15),
                 refresh_token_hash: refresh_token_hash.clone(),
@@ -182,8 +227,6 @@ async fn consumes_and_rotates_refresh_token_artifacts() {
             &request_uri,
             &refresh_token_hash,
             IssueAtprotoTokensParams {
-                authorization_code: format!("auth-code-{}", Uuid::new_v4()),
-                authorization_code_expires_at: Utc::now(),
                 access_token_jti: format!("access-jti-{}", Uuid::new_v4()),
                 access_token_expires_at: Utc::now() + Duration::minutes(15),
                 refresh_token_hash: next_refresh_hash.clone(),

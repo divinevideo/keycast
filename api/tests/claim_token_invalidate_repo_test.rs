@@ -67,7 +67,7 @@ async fn invalidate_valid_for_user_marks_single_valid_token() {
     let after = sqlx::query_as::<_, keycast_core::types::claim_token::ClaimToken>(
         "SELECT * FROM account_claim_tokens WHERE token = $1",
     )
-    .bind("tok_live_inv")
+    .bind(keycast_core::token_hash::hash_token("tok_live_inv"))
     .fetch_one(&pool)
     .await
     .expect("fetch");
@@ -112,7 +112,7 @@ async fn invalidate_valid_for_user_skips_used_and_already_invalidated() {
          (token, user_pubkey, expires_at, created_at, tenant_id, used_at)
          VALUES ($1, $2, $3, NOW(), 1, NOW())",
     )
-    .bind("tok_used_skip")
+    .bind(keycast_core::token_hash::hash_token("tok_used_skip"))
     .bind(pk)
     .bind(Utc::now() + Duration::days(7))
     .execute(&pool)
@@ -125,7 +125,7 @@ async fn invalidate_valid_for_user_skips_used_and_already_invalidated() {
          (token, user_pubkey, expires_at, created_at, tenant_id, invalidated_at, invalidated_by)
          VALUES ($1, $2, $3, NOW(), 1, NOW(), $4)",
     )
-    .bind("tok_already_inv_skip")
+    .bind(keycast_core::token_hash::hash_token("tok_already_inv_skip"))
     .bind(pk)
     .bind(Utc::now() + Duration::days(7))
     .bind("prior_admin")

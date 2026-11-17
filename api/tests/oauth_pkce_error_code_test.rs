@@ -126,7 +126,7 @@ async fn insert_code(pool: &PgPool, code: &str, challenge: &str, method: &str) -
             $9, $10, false
          )",
     )
-    .bind(code)
+    .bind(keycast_core::token_hash::hash_token(code))
     .bind(keys.public_key().to_hex())
     .bind(CLIENT_ID)
     .bind(REDIRECT_URI)
@@ -134,7 +134,9 @@ async fn insert_code(pool: &PgPool, code: &str, challenge: &str, method: &str) -
     .bind(challenge)
     .bind(method)
     .bind(format!("pkce-error-{}@example.com", Uuid::new_v4()))
-    .bind(format!("verify-{code}"))
+    .bind(keycast_core::token_hash::hash_token(&format!(
+        "verify-{code}"
+    )))
     .bind(&secret)
     .execute(pool)
     .await

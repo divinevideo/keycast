@@ -132,7 +132,26 @@ async fn replays_before_claim_after_claim_and_after_deletion() {
     assert_eq!(replay.status(), StatusCode::OK);
     let replay = response_typed(replay).await;
     assert_eq!(replay.pubkey, first.pubkey);
-    assert_eq!(replay.claim_url, first.claim_url);
+    assert_ne!(replay.claim_url, first.claim_url);
+    let claims = keycast_core::repositories::ClaimTokenRepository::new(pool.clone());
+    let raw = |link: &Option<String>| {
+        link.as_ref()
+            .unwrap()
+            .split("?token=")
+            .nth(1)
+            .unwrap()
+            .to_string()
+    };
+    assert!(claims
+        .find_valid(&raw(&first.claim_url))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(claims
+        .find_valid(&raw(&replay.claim_url))
+        .await
+        .unwrap()
+        .is_some());
     assert!(replay.replayed);
 
     sqlx::query("UPDATE users SET email = $1, password_hash = 'claimed' WHERE pubkey = $2")
@@ -260,7 +279,8 @@ async fn concurrent_expired_token_replay_returns_one_replacement() {
     while let Some(link) = calls.join_next().await {
         links.push(link.unwrap());
     }
-    assert!(links.iter().all(|link| link == &links[0]));
+    let unique: std::collections::HashSet<_> = links.iter().collect();
+    assert_eq!(unique.len(), links.len());
     assert_ne!(Some(links[0].clone()), created.claim_url);
 
     let valid: i64 = sqlx::query_scalar(

@@ -205,10 +205,11 @@ fn request_fingerprint(tenant_id: i64, username: &str, display_name: Option<&str
 fn claim_response(
     pubkey: String,
     token: keycast_core::types::claim_token::ClaimToken,
+    raw_token: &str,
     replayed: bool,
 ) -> Response {
     let app_url = std::env::var("APP_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
-    let claim_url = format!("{app_url}/api/claim?token={}", token.token);
+    let claim_url = format!("{app_url}/api/claim?token={raw_token}");
     let status = if replayed {
         StatusCode::OK
     } else {
@@ -328,7 +329,7 @@ async fn replay_in_tx(
         return Ok(claimed_response(row.user_pubkey.trim().to_string()));
     }
     let replacement = generate_claim_token();
-    let token = ClaimTokenRepository::find_or_replace_for_provisioning_in_tx(
+    let token = ClaimTokenRepository::replace_for_provisioning_in_tx(
         tx,
         row.user_pubkey.trim(),
         tenant_id,
@@ -339,6 +340,7 @@ async fn replay_in_tx(
     Ok(claim_response(
         row.user_pubkey.trim().to_string(),
         token,
+        &replacement,
         true,
     ))
 }
@@ -438,7 +440,7 @@ async fn provision_with_operation(
                 format!("User with username {username} already exists"),
             ));
         }
-        let token = ClaimTokenRepository::find_or_replace_for_provisioning_in_tx(
+        let token = ClaimTokenRepository::replace_for_provisioning_in_tx(
             &mut tx,
             &existing_pubkey,
             tenant_id,
@@ -458,7 +460,12 @@ async fn provision_with_operation(
         .await
         .map_err(map_repo_error)?;
         tx.commit().await.map_err(|e| map_repo_error(e.into()))?;
-        return Ok(claim_response(existing_pubkey, token, true));
+        return Ok(claim_response(
+            existing_pubkey,
+            token,
+            &replacement_token,
+            true,
+        ));
     }
 
     UserRepository::create_minor_account_in_tx(
@@ -505,7 +512,7 @@ async fn provision_with_operation(
             ),
         }
     }
-    Ok(claim_response(pubkey, token, false))
+    Ok(claim_response(pubkey, token, &replacement_token, false))
 }
 
 pub async fn create_minor_account(

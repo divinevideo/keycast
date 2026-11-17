@@ -64,7 +64,7 @@ pub async fn seed_valid_claim_token(pool: &PgPool) -> (String, String) {
         "INSERT INTO account_claim_tokens (token, user_pubkey, expires_at, created_at, tenant_id)
          VALUES ($1, $2, $3, NOW(), $4)",
     )
-    .bind(&token)
+    .bind(keycast_core::token_hash::hash_token(&token))
     .bind(&pubkey)
     .bind(Utc::now() + Duration::days(1))
     .bind(TENANT_ID)
@@ -87,7 +87,7 @@ pub async fn seed_used_claim_token(pool: &PgPool) -> (String, String) {
              (token, user_pubkey, expires_at, used_at, created_at, tenant_id)
          VALUES ($1, $2, $3, NOW(), NOW(), $4)",
     )
-    .bind(&token)
+    .bind(keycast_core::token_hash::hash_token(&token))
     .bind(&pubkey)
     .bind(Utc::now() + Duration::days(1))
     .bind(TENANT_ID)

@@ -292,7 +292,7 @@ async fn suppressed_forgot_password_preserves_token_and_skips_provider() {
     .bind(&pubkey)
     .bind(&email)
     .bind(hash("old-password", 4).unwrap())
-    .bind(&prior_token)
+    .bind(keycast_core::token_hash::hash_token(&prior_token))
     .bind(Utc::now() + Duration::hours(1))
     .execute(&pool)
     .await
@@ -351,7 +351,10 @@ async fn suppressed_forgot_password_preserves_token_and_skips_provider() {
     .fetch_one(&pool)
     .await
     .expect("read preserved token");
-    assert_eq!(stored_token.as_deref(), Some(prior_token.as_str()));
+    assert_eq!(
+        stored_token,
+        Some(keycast_core::token_hash::hash_token(&prior_token))
+    );
     assert!(sender.get_captured_emails().is_empty());
 
     let delivery_event: (String, Option<String>) = sqlx::query_as(
@@ -396,7 +399,7 @@ async fn suppressed_verification_resend_preserves_token_and_skips_provider() {
     .bind(&pubkey)
     .bind(&email)
     .bind(hash("old-password", 4).unwrap())
-    .bind(&prior_token)
+    .bind(keycast_core::token_hash::hash_token(&prior_token))
     .bind(Utc::now() + Duration::hours(1))
     .bind(Utc::now() - Duration::hours(1))
     .execute(&pool)
@@ -456,7 +459,10 @@ async fn suppressed_verification_resend_preserves_token_and_skips_provider() {
     .fetch_one(&pool)
     .await
     .expect("read preserved verification token");
-    assert_eq!(stored_token.as_deref(), Some(prior_token.as_str()));
+    assert_eq!(
+        stored_token,
+        Some(keycast_core::token_hash::hash_token(&prior_token))
+    );
     assert!(sender.get_captured_emails().is_empty());
 
     let delivery_event: (String, Option<String>) = sqlx::query_as(
@@ -504,7 +510,7 @@ async fn test_reset_password_records_success_event_and_updates_hash() {
     .bind(&pubkey)
     .bind(&email)
     .bind(&old_password_hash)
-    .bind(&reset_token)
+    .bind(keycast_core::token_hash::hash_token(&reset_token))
     .bind(Utc::now() + Duration::hours(1))
     .execute(&pool)
     .await

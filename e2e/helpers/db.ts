@@ -1,5 +1,7 @@
-import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import type { APIRequestContext } from "@playwright/test";
 import { Client } from "pg";
+import { getDeliveredToken } from "./emails";
 
 const CONNECTION_STRING =
   process.env.DATABASE_URL || "postgres://postgres:password@localhost/keycast";
@@ -14,87 +16,13 @@ export async function withDb<T>(fn: (client: Client) => Promise<T>): Promise<T> 
   }
 }
 
-export async function getVerificationToken(email: string): Promise<string> {
+export async function getClaimConfirmationToken(request: APIRequestContext, claimToken: string): Promise<string> {
   for (let i = 0; i < 10; i++) {
     try {
-      const token = await withDb(async (db) => {
-        const result = await db.query(
-          "SELECT email_verification_token FROM users WHERE email = $1",
-          [email],
-        );
-        if (result.rows.length > 0 && result.rows[0].email_verification_token) {
-          return result.rows[0].email_verification_token as string;
-        }
-        return null;
-      });
+      const email = await withDb((db) => findClaimDeliveryEmail(db, claimToken));
 
-      if (token) {
-        return token;
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (!message.includes("ECONNRESET")) {
-        throw error;
-      }
-    }
-
-    await new Promise((r) => setTimeout(r, 300));
-  }
-
-  const fallbackToken = execFileSync(
-    process.execPath,
-    [
-      "-e",
-      `
-        const { Client } = require("pg");
-        (async () => {
-          const client = new Client({ connectionString: process.env.DATABASE_URL });
-          await client.connect();
-          const result = await client.query(
-            "SELECT email_verification_token FROM users WHERE email = $1",
-            [process.env.TOKEN_LOOKUP_EMAIL],
-          );
-          process.stdout.write(result.rows[0]?.email_verification_token || "");
-          await client.end();
-        })().catch((error) => {
-          console.error(error);
-          process.exit(1);
-        });
-      `,
-    ],
-    {
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        DATABASE_URL: CONNECTION_STRING,
-        TOKEN_LOOKUP_EMAIL: email,
-      },
-    },
-  ).trim();
-
-  if (fallbackToken) {
-    return fallbackToken;
-  }
-
-  throw new Error(`Could not find verification token for ${email}`);
-}
-
-export async function getClaimConfirmationToken(claimToken: string): Promise<string> {
-  for (let i = 0; i < 10; i++) {
-    try {
-      const token = await withDb(async (db) => {
-        const result = await db.query(
-          "SELECT confirmation_token FROM account_claim_tokens WHERE token = $1",
-          [claimToken],
-        );
-        if (result.rows.length > 0 && result.rows[0].confirmation_token) {
-          return result.rows[0].confirmation_token as string;
-        }
-        return null;
-      });
-
-      if (token) {
-        return token;
+      if (email) {
+        return await getDeliveredToken(request, { email, pathname: "/api/claim/confirm" });
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -107,6 +35,15 @@ export async function getClaimConfirmationToken(claimToken: string): Promise<str
   }
 
   throw new Error("Could not find claim confirmation token");
+}
+
+export async function findClaimDeliveryEmail(db: Pick<Client, "query">, claimToken: string): Promise<string | undefined> {
+  const claimHash = createHash("sha256").update(claimToken).digest("hex");
+  const result = await db.query(
+    "SELECT pending_email FROM account_claim_tokens WHERE token = $1",
+    [claimHash],
+  );
+  return result.rows[0]?.pending_email;
 }
 
 export async function markUserAtprotoReady(
