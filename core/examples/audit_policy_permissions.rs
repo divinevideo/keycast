@@ -211,26 +211,34 @@ async fn audit_snapshot(
         conversions,
     })
 }
-async fn run() -> Result<Report, AuditError> {
-    use sqlx::{
-        postgres::{PgConnectOptions, PgPoolOptions},
-        ConnectOptions,
-    };
-    use std::time::Duration;
-    let mut args = std::env::args_os().skip(1);
+/// Requires the exact opt-in flag before reading only the dedicated connection
+/// variable. Deliberately no DATABASE_URL, dotenv, app configuration, logging,
+/// migrations or key manager.
+fn connect_options(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+    dedicated_url: impl FnOnce() -> Option<String>,
+) -> Result<sqlx::postgres::PgConnectOptions, AuditError> {
+    use sqlx::ConnectOptions;
+    let mut args = args.into_iter();
     if args.next().as_deref() != Some(std::ffi::OsStr::new("--audit-linked-permissions-read-only"))
         || args.next().is_some()
     {
         return Err(AuditError::Usage);
     }
-    // Deliberately no dotenv, app configuration, logging, migrations or key manager.
-    let url = std::env::var("KEYCAST_PERMISSION_AUDIT_DATABASE_URL")
-        .map_err(|_| AuditError::ConnectionRequired)?;
-    let options = url
-        .parse::<PgConnectOptions>()
+    let url = dedicated_url().ok_or(AuditError::ConnectionRequired)?;
+    Ok(url
+        .parse::<sqlx::postgres::PgConnectOptions>()
         .map_err(|_| AuditError::Database)?
         .application_name("keycast_permission_audit")
-        .disable_statement_logging();
+        .disable_statement_logging())
+}
+
+async fn run() -> Result<Report, AuditError> {
+    use sqlx::postgres::PgPoolOptions;
+    use std::time::Duration;
+    let options = connect_options(std::env::args_os().skip(1), || {
+        std::env::var("KEYCAST_PERMISSION_AUDIT_DATABASE_URL").ok()
+    })?;
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(Duration::from_secs(5))
@@ -388,8 +396,41 @@ mod tests {
         );
     }
 
-    // Explicit feature and dedicated fixture URL: never use DATABASE_URL or shared services.
+    #[test]
+    fn invocation_requires_exact_flag_then_dedicated_connection() {
+        let flag = || "--audit-linked-permissions-read-only".into();
+        let url = || Some("postgres://synthetic@127.0.0.1:1/synthetic".to_string());
+        let unread = || -> Option<String> { panic!("connection read before flag check") };
+        for args in [
+            vec![],
+            vec!["--audit".into()],
+            vec![flag(), "--extra".into()],
+        ] {
+            assert_eq!(
+                connect_options(args, unread).unwrap_err(),
+                AuditError::Usage
+            );
+        }
+        assert_eq!(
+            connect_options([flag()], || None).unwrap_err(),
+            AuditError::ConnectionRequired
+        );
+        assert_eq!(
+            connect_options([flag()], || Some("synthetic-invalid-dsn".into())).unwrap_err(),
+            AuditError::Database
+        );
+        let options = connect_options([flag()], url).unwrap();
+        assert_eq!(options.get_host(), "127.0.0.1");
+        assert_eq!(
+            options.get_application_name(),
+            Some("keycast_permission_audit")
+        );
+    }
+
+    // Double opt-in: explicit feature, `--ignored`, and a dedicated fixture URL. Never
+    // DATABASE_URL or shared services; CI runs this target's pure tests only.
     #[cfg(feature = "integration-tests")]
+    #[ignore = "requires the owned fixture in docs/challenge-signing-policy.md"]
     #[tokio::test]
     async fn owned_database_snapshot_budgets_and_readonly() {
         use sqlx::{postgres::PgConnectOptions, ConnectOptions};
