@@ -124,4 +124,10 @@ export type BunkerSession = {
 
 export type BunkerSessionsResponse = {
     sessions: BunkerSession[];
+    device_sessions?: DeviceSession[];
+};
+
+export type DeviceSession = {
+    id: string;
+    expires_at: string;
 };

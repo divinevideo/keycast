@@ -197,6 +197,7 @@ async fn oauth_token_exchanges_plain_existing_user_code() {
             redirect_uri: Some(redirect_uri.to_string()),
             code_verifier: Some(format!("verifier.{}", nsec)),
             refresh_token: None,
+            device_code: None,
         }),
     )
     .await
@@ -218,6 +219,7 @@ async fn oauth_token_exchanges_plain_existing_user_code() {
             redirect_uri: Some(redirect_uri.to_string()),
             code_verifier: Some(format!("verifier.{}", nsec)),
             refresh_token: None,
+            device_code: None,
         }),
     )
     .await
@@ -323,6 +325,7 @@ async fn oauth_token_issuance_failure_leaves_pending_registration_rearmable() {
             redirect_uri: Some(redirect_uri.to_string()),
             code_verifier: None,
             refresh_token: None,
+            device_code: None,
         }),
     )
     .await

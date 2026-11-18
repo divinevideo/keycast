@@ -159,6 +159,7 @@ async fn exchange(pool: &PgPool, code: &str, verifier: &str) -> Response {
             redirect_uri: Some(REDIRECT_URI.to_string()),
             code_verifier: Some(verifier.to_string()),
             refresh_token: None,
+            device_code: None,
         }),
     )
     .await;

@@ -11,6 +11,7 @@ mod email_marketing;
 mod error;
 mod oauth_authorization;
 mod oauth_code;
+pub mod oauth_device;
 mod personal_keys;
 mod policy;
 mod refresh_token;

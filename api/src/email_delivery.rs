@@ -468,9 +468,15 @@ impl EmailDeliveryService {
     /// Derive a coarse source from the trusted suffix of `X-Forwarded-For`.
     #[must_use]
     pub fn coarse_source(&self, headers: &HeaderMap) -> Option<String> {
-        let source = coarse_source(headers, self.config.source_trusted_proxy_hops);
+        let source = self.source_subnet(headers);
         METRICS.observe_email_delivery_source_subject(source.is_some());
         source
+    }
+
+    /// Derive the configured ingress source without recording email-delivery traffic.
+    #[must_use]
+    pub fn source_subnet(&self, headers: &HeaderMap) -> Option<String> {
+        coarse_source(headers, self.config.source_trusted_proxy_hops)
     }
 
     /// Atomically reserve all rolling budgets and provider slots for one flow.

@@ -95,6 +95,12 @@ pub fn spawn_cleanup_task(pool: PgPool) -> tokio::task::JoinHandle<()> {
                 }
             }
 
+            let device_repo =
+                keycast_core::repositories::oauth_device::DeviceAuthorizationRepository::new(&pool);
+            if let Err(error) = device_repo.cleanup().await {
+                tracing::error!(error = %error, "Cleanup task: failed to delete expired device state");
+            }
+
             // Warn before the window closes, so a stuck drain is visible while it can still be
             // fixed rather than only after the rows are gone.
             match count_email_marketing_queue_near_expiry(

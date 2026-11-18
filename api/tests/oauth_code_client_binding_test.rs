@@ -53,6 +53,7 @@ async fn redeem_code(pool: &PgPool, code: &str, presented_client_id: &str) -> Re
             redirect_uri: Some(REDIRECT_URI.to_string()),
             code_verifier: None,
             refresh_token: None,
+            device_code: None,
         }),
     )
     .await;

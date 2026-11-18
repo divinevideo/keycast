@@ -1012,6 +1012,7 @@ async fn cache_control_middleware(request: Request<Body>, next: Next) -> Respons
         || path.starts_with("/health")
         || path == "/livez"
         || path == "/verify-email"
+        || path == "/device"
         || path == "/email-verification/continue"
     {
         // Dynamic content - no caching
@@ -1207,11 +1208,19 @@ fn request_span(request: &Request<Body>) -> tracing::Span {
         })
         .unwrap_or_else(|| "missing-request-id".to_string());
 
+    // Device codes can appear in the verification and phone login URLs.
+    let request_uri = request.uri();
+    let uri = match request_uri.path() {
+        "/device" | "/login" => request_uri.path(),
+        _ => request_uri
+            .path_and_query()
+            .map_or(request_uri.path(), |value| value.as_str()),
+    };
     tracing::span!(
         Level::INFO,
         "request",
         method = %request.method(),
-        uri = %request.uri(),
+        uri = %uri,
         trace_id = %trace_id,
     )
 }
@@ -1659,6 +1668,9 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         .with_state(database.pool.clone())
         // Canonical public verification path used by iOS Universal Links and Android App Links.
         .merge(public_verify_email_route)
+        .merge(keycast_api::api::http::routes::device_verification_route(
+            api_state.clone(),
+        ))
         // Apple/Android app association files
         .nest("/.well-known", well_known_routes)
         // All API endpoints under /api prefix

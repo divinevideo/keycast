@@ -58,6 +58,7 @@ async fn exchange_code(pool: &PgPool, code: &str, verifier: &str) -> StatusCode 
             redirect_uri: Some("https://test.example.com/callback".to_string()),
             code_verifier: Some(verifier.to_string()),
             refresh_token: None,
+            device_code: None,
         }),
     )
     .await;

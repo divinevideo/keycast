@@ -2,6 +2,7 @@
 
 use anyhow::{anyhow, Result};
 use axum::http::HeaderMap;
+use keycast_core::repositories::oauth_device::DEVICE_TOKEN_ORIGIN;
 use std::env;
 use ucan::crypto::did::{DidParser, SECP256K1_MAGIC_BYTES};
 use ucan::crypto::KeyMaterial;
@@ -41,6 +42,30 @@ pub async fn validate_ucan_token(
     auth_header: &str,
     expected_tenant_id: i64,
 ) -> Result<(String, String, Option<String>, Ucan)> {
+    validate_ucan_token_for_purpose(auth_header, expected_tenant_id, false).await
+}
+
+/// A TV credential can authenticate only a TV session operation.
+pub(crate) async fn validate_device_ucan(
+    auth_header: &str,
+    expected_tenant_id: i64,
+) -> Result<(String, String)> {
+    let (pubkey, _, _, ucan) =
+        validate_ucan_token_for_purpose(auth_header, expected_tenant_id, true).await?;
+    let session = ucan
+        .facts()
+        .iter()
+        .find_map(|fact| fact.get("device_session").and_then(|value| value.as_str()))
+        .ok_or_else(|| anyhow!("Missing device session"))?;
+
+    Ok((pubkey, uuid::Uuid::parse_str(session)?.to_string()))
+}
+
+async fn validate_ucan_token_for_purpose(
+    auth_header: &str,
+    expected_tenant_id: i64,
+    device_only: bool,
+) -> Result<(String, String, Option<String>, Ucan)> {
     // Extract token from "Bearer <token>"
     let token = auth_header
         .strip_prefix("Bearer ")
@@ -76,6 +101,10 @@ pub async fn validate_ucan_token(
         .find_map(|fact| fact.get("redirect_origin").and_then(|v| v.as_str()))
         .map(String::from)
         .ok_or_else(|| anyhow!("UCAN missing required redirect_origin fact"))?;
+
+    if (redirect_origin == DEVICE_TOKEN_ORIGIN) != device_only {
+        return Err(anyhow!("UCAN is not valid for this purpose"));
+    }
 
     // Extract bunker_pubkey from facts (optional - for direct cache lookup)
     let bunker_pubkey = facts
@@ -117,7 +146,7 @@ pub async fn validate_ucan_token(
     // Verify issuer is either the user (self-issued) or server (delegated)
     let issuer_pubkey_hex = issuer_pubkey.to_hex();
     let user_pubkey_hex = user_pubkey.to_hex();
-    if issuer_pubkey_hex != user_pubkey_hex {
+    if device_only || issuer_pubkey_hex != user_pubkey_hex {
         let server_pubkey = server_pubkey()?;
         if issuer_pubkey_hex != server_pubkey {
             return Err(anyhow!(

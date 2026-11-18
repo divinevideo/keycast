@@ -315,12 +315,7 @@ pub async fn generate_server_signed_ucan(
     admin_role: Option<&str>,
     status: Option<&keycast_core::types::user::UserStatus>,
 ) -> Result<String, AuthError> {
-    use crate::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
     use serde_json::json;
-    use ucan::builder::UcanBuilder;
-
-    let server_key_material = NostrKeyMaterial::from_keys(server_keys.clone());
-    let user_did = nostr_pubkey_to_did(user_pubkey);
 
     let mut facts = json!({
         "tenant_id": tenant_id,
@@ -342,10 +337,30 @@ pub async fn generate_server_signed_ucan(
         }
     }
 
+    sign_server_ucan(
+        user_pubkey,
+        server_keys,
+        facts,
+        token_expiry_seconds() as u64,
+    )
+    .await
+}
+
+pub(crate) async fn sign_server_ucan(
+    user_pubkey: &PublicKey,
+    server_keys: &Keys,
+    facts: serde_json::Value,
+    lifetime_seconds: u64,
+) -> Result<String, AuthError> {
+    use crate::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
+    use ucan::builder::UcanBuilder;
+
+    let server_key_material = NostrKeyMaterial::from_keys(server_keys.clone());
+    let user_did = nostr_pubkey_to_did(user_pubkey);
     let ucan = UcanBuilder::default()
-        .issued_by(&server_key_material) // Server issues
-        .for_audience(&user_did) // For this user
-        .with_lifetime(token_expiry_seconds() as u64)
+        .issued_by(&server_key_material)
+        .for_audience(&user_did)
+        .with_lifetime(lifetime_seconds)
         .with_fact(facts)
         .build()
         .map_err(|e| AuthError::Internal(format!("Failed to build UCAN: {}", e)))?
@@ -3572,9 +3587,10 @@ pub struct BunkerSession {
 #[derive(Debug, Serialize)]
 pub struct BunkerSessionsResponse {
     pub sessions: Vec<BunkerSession>,
+    pub device_sessions: Vec<keycast_core::repositories::oauth_device::DeviceSessionInfo>,
 }
 
-/// List all active bunker sessions for the authenticated user
+/// List active app and TV sessions for the authenticated user.
 pub async fn list_sessions(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
@@ -3620,7 +3636,53 @@ pub async fn list_sessions(
         )
         .collect();
 
-    Ok(Json(BunkerSessionsResponse { sessions }))
+    let device_sessions =
+        keycast_core::repositories::oauth_device::DeviceAuthorizationRepository::new(&pool)
+            .list_active_sessions(tenant_id, &user_pubkey)
+            .await?;
+    Ok(Json(BunkerSessionsResponse {
+        sessions,
+        device_sessions,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RevokeDeviceSessionRequest {
+    pub id: String,
+}
+
+/// End one TV connection using the account owner's management session.
+pub async fn revoke_device_session(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<super::routes::AuthState>,
+    headers: HeaderMap,
+    Json(req): Json<RevokeDeviceSessionRequest>,
+) -> Result<Response, AuthError> {
+    let tenant_id = tenant.0.id;
+    let user_pubkey = extract_user_for_authorization_management(&headers, tenant_id).await?;
+    let id = uuid::Uuid::parse_str(&req.id)
+        .map_err(|_| AuthError::BadRequest("Invalid TV session ID".to_string()))?
+        .to_string();
+    let revoked = keycast_core::repositories::oauth_device::DeviceAuthorizationRepository::new(
+        &auth_state.state.db,
+    )
+    .revoke(tenant_id, &id, &user_pubkey)
+    .await?;
+    if !revoked {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "TV session not found",
+                "code": "TV_SESSION_NOT_FOUND",
+            })),
+        )
+            .into_response());
+    }
+    Ok(Json(RevokeSessionResponse {
+        success: true,
+        message: "TV session signed out".to_string(),
+    })
+    .into_response())
 }
 
 #[derive(Debug, Deserialize)]
