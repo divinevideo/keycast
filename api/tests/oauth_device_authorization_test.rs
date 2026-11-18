@@ -504,4 +504,59 @@ async fn phone_approval_yields_a_single_read_only_session_that_can_rotate_and_re
         .status(),
         StatusCode::OK,
     );
+    for _ in 0..30 {
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                START,
+                "client_id=divine-tv",
+                &[(
+                    header::HeaderName::from_static("x-forwarded-for"),
+                    "2001:db8:1234:100::1"
+                )],
+            )
+            .await
+            .status(),
+            StatusCode::OK,
+        );
+    }
+    let tenant_after_ipv6 = redis.get("oauth_device:create:1").await.unwrap();
+    for forwarded in ["2001:db8:1234:ab00::1", "2001:db8:1234:ffff::1"] {
+        json_error(
+            request(
+                &app,
+                Method::POST,
+                START,
+                "client_id=divine-tv",
+                &[(
+                    header::HeaderName::from_static("x-forwarded-for"),
+                    forwarded,
+                )],
+            )
+            .await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "temporarily_unavailable",
+        )
+        .await;
+    }
+    assert_eq!(
+        redis.get("oauth_device:create:1").await.unwrap(),
+        tenant_after_ipv6
+    );
+    assert_eq!(
+        request(
+            &app,
+            Method::POST,
+            START,
+            "client_id=divine-tv",
+            &[(
+                header::HeaderName::from_static("x-forwarded-for"),
+                "2001:db8:5678::1"
+            )],
+        )
+        .await
+        .status(),
+        StatusCode::OK,
+    );
 }

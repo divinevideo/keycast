@@ -21,6 +21,7 @@ use keycast_core::{
 use nostr_sdk::PublicKey;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::net::{IpAddr, Ipv6Addr};
 use uuid::Uuid;
 
 use crate::{
@@ -140,6 +141,20 @@ fn format_user_code(code: &str) -> String {
     format!("{}-{}", &code[..4], &code[4..])
 }
 
+fn creation_source_hash(source: Option<&str>) -> String {
+    let source = source.and_then(|value| value.parse::<IpAddr>().ok());
+    let source = source.map(|address| match address {
+        // A /48 allocation shares one TV creation budget, including all its /56s.
+        IpAddr::V6(address) => {
+            let mut octets = address.octets();
+            octets[6..].fill(0);
+            IpAddr::V6(Ipv6Addr::from(octets)).to_string()
+        }
+        IpAddr::V4(address) => address.to_string(),
+    });
+    hash_refresh_token(source.as_deref().unwrap_or("unknown"))
+}
+
 #[derive(Deserialize)]
 pub struct DeviceAuthorizationRequest {
     client_id: String,
@@ -180,7 +195,7 @@ pub async fn authorize(
     // Use the ingress trust configuration already shared by browser admission.
     // Requests without a usable source share a bounded fallback bucket.
     let source = email_delivery.coarse_source(&headers);
-    let source_hash = hash_refresh_token(source.as_deref().unwrap_or("unknown"));
+    let source_hash = creation_source_hash(source.as_deref());
     admission(
         &auth.state,
         format!("oauth_device:create_source:{}:{source_hash}", tenant.id),
