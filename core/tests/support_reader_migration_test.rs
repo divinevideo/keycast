@@ -6,7 +6,7 @@ use sqlx::PgPool;
 const MIGRATION: &str =
     include_str!("../../database/migrations/20261110180000_support_reader_column_grants.sql");
 
-const HIDDEN_COLUMNS: [(&str, &str); 26] = [
+const HIDDEN_COLUMNS: [(&str, &str); 40] = [
     ("users", "password_reset_token"),
     ("users", "email_verification_token"),
     ("users", "pending_email_old_token"),
@@ -33,6 +33,21 @@ const HIDDEN_COLUMNS: [(&str, &str); 26] = [
     ("ap_actor_keys", "encrypted_private_key"),
     ("oauth_codes", "pending_encrypted_secret"),
     ("group_backups", "ciphertext"),
+    // TV pairing and session state is visible only to the application.
+    ("oauth_device_grants", "tenant_id"),
+    ("oauth_device_grants", "device_code_hash"),
+    ("oauth_device_grants", "user_code_hash"),
+    ("oauth_device_grants", "user_pubkey"),
+    ("oauth_device_grants", "expires_at"),
+    ("oauth_device_grants", "next_poll_at"),
+    ("oauth_device_grants", "poll_interval_seconds"),
+    ("oauth_device_grants", "status"),
+    ("oauth_device_sessions", "id"),
+    ("oauth_device_sessions", "tenant_id"),
+    ("oauth_device_sessions", "user_pubkey"),
+    ("oauth_device_sessions", "refresh_token_hash"),
+    ("oauth_device_sessions", "expires_at"),
+    ("oauth_device_sessions", "revoked_at"),
 ];
 
 #[sqlx::test(migrations = "../database/migrations")]
