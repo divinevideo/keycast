@@ -368,7 +368,8 @@ fn verification_html(status: StatusCode, content: &str) -> Response {
     no_store((
         status,
         [
-            (header::REFERRER_POLICY, "no-referrer"),
+            // Form POSTs need a same-origin Origin header. Limit the Referer to its origin.
+            (header::REFERRER_POLICY, "strict-origin"),
             (header::CONTENT_SECURITY_POLICY, "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"),
         ],
         Html(include_str!("oauth_device_page.html").replace("<!-- content -->", content)),

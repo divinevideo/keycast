@@ -131,7 +131,7 @@ async fn phone_approval_yields_a_single_read_only_session_that_can_rotate_and_re
     std::env::set_var("APP_URL", ORIGIN);
     let bootstrap_pool = common::setup_test_db().await;
     let pool = PgPoolOptions::new()
-        .max_connections(1)
+        .max_connections(2)
         .connect_with(bootstrap_pool.connect_options().as_ref().clone())
         .await
         .unwrap();
@@ -260,12 +260,15 @@ async fn phone_approval_yields_a_single_read_only_session_that_can_rotate_and_re
     .unwrap();
     assert_eq!(interval, 10);
     advance_poll(&pool, device_code).await;
+    // Exercise the polling transaction with one available connection.
+    let reserved_connection = pool.acquire().await.unwrap();
     json_error(
         poll(&app, device_code, "divine-tv").await,
         StatusCode::BAD_REQUEST,
         "authorization_pending",
     )
     .await;
+    drop(reserved_connection);
 
     let page = request(
         &app,
@@ -276,7 +279,8 @@ async fn phone_approval_yields_a_single_read_only_session_that_can_rotate_and_re
     )
     .await;
     assert_eq!(page.status(), StatusCode::OK);
-    assert_eq!(page.headers()[header::REFERRER_POLICY], "no-referrer");
+    // A no-referrer form document sends Origin: null even on same-origin POST.
+    assert_eq!(page.headers()[header::REFERRER_POLICY], "strict-origin");
     assert!(!page
         .headers()
         .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
@@ -285,6 +289,12 @@ async fn phone_approval_yields_a_single_read_only_session_that_can_rotate_and_re
     assert!(page.contains(user_code));
     assert!(page.contains(&email));
     assert!(!page.contains(device_code));
+    assert_eq!(
+        decision(&app, user_code, "approve", &pubkey, "null", &cookie)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN,
+    );
     assert_eq!(
         decision(&app, user_code, "approve", &pubkey, TV_ORIGIN, &cookie)
             .await
