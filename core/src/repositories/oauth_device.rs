@@ -307,8 +307,8 @@ impl<'a> DeviceAuthorizationRepository<'a> {
         user_pubkey: &str,
     ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
-            "UPDATE oauth_device_sessions SET revoked_at = clock_timestamp()
-             WHERE tenant_id = $1 AND id = $2 AND user_pubkey = $3 AND revoked_at IS NULL",
+            "UPDATE oauth_device_sessions SET revoked_at = COALESCE(revoked_at, clock_timestamp())
+             WHERE tenant_id = $1 AND id = $2 AND user_pubkey = $3",
         )
         .bind(tenant_id)
         .bind(session_id)

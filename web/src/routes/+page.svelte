@@ -211,8 +211,13 @@ async function revokeDeviceSession(session: DeviceSession) {
 		await api.post('/user/device-sessions/revoke', { id: session.id });
 		deviceSessions = deviceSessions.filter((deviceSession) => deviceSession.id !== session.id);
 		toast.success('Signed out of Divine TV');
-	} catch {
-		toast.error('Failed to sign out of Divine TV. Please try again.');
+	} catch (err: any) {
+		if (err?.status === 404) {
+			deviceSessions = deviceSessions.filter((item) => item.id !== session.id);
+			toast.success('TV session is already signed out.');
+		} else {
+			toast.error('Failed to sign out of Divine TV. Please try again.');
+		}
 	} finally {
 		revokingDeviceSessions = new Set([...revokingDeviceSessions].filter((id) => id !== session.id));
 	}

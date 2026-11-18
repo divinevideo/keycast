@@ -3657,11 +3657,11 @@ pub async fn revoke_device_session(
     State(auth_state): State<super::routes::AuthState>,
     headers: HeaderMap,
     Json(req): Json<RevokeDeviceSessionRequest>,
-) -> Result<Json<RevokeSessionResponse>, AuthError> {
+) -> Result<Response, AuthError> {
     let tenant_id = tenant.0.id;
     let user_pubkey = extract_user_for_authorization_management(&headers, tenant_id).await?;
     let id = uuid::Uuid::parse_str(&req.id)
-        .map_err(|_| AuthError::InvalidToken)?
+        .map_err(|_| AuthError::BadRequest("Invalid TV session ID".to_string()))?
         .to_string();
     let revoked = keycast_core::repositories::oauth_device::DeviceAuthorizationRepository::new(
         &auth_state.state.db,
@@ -3669,12 +3669,19 @@ pub async fn revoke_device_session(
     .revoke(tenant_id, &id, &user_pubkey)
     .await?;
     if !revoked {
-        return Err(AuthError::InvalidToken);
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "TV session not found",
+            })),
+        )
+            .into_response());
     }
     Ok(Json(RevokeSessionResponse {
         success: true,
         message: "TV session signed out".to_string(),
-    }))
+    })
+    .into_response())
 }
 
 #[derive(Debug, Deserialize)]

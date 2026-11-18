@@ -1049,10 +1049,10 @@ async fn account_manages_only_its_own_tv_sessions(
 
     let unknown_id = Uuid::new_v4().to_string();
     for forbidden_id in [&foreign_id, &foreign_tenant_id, &unknown_id] {
-        assert!(browser_revoke(app, cookie, forbidden_id)
-            .await
-            .status()
-            .is_client_error());
+        assert_eq!(
+            browser_revoke(app, cookie, forbidden_id).await.status(),
+            StatusCode::NOT_FOUND
+        );
     }
     assert!(browser_revoke(app, cookie, &id).await.status().is_success());
     let revoked: bool = sqlx::query_scalar(
@@ -1063,6 +1063,20 @@ async fn account_manages_only_its_own_tv_sessions(
     .await
     .unwrap();
     assert!(revoked);
+    let first_revoked_at: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT revoked_at FROM oauth_device_sessions WHERE id = $1")
+            .bind(&id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(browser_revoke(app, cookie, &id).await.status().is_success());
+    let repeated_revoked_at: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT revoked_at FROM oauth_device_sessions WHERE id = $1")
+            .bind(&id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(first_revoked_at, repeated_revoked_at);
     for untouched_id in [&other_live_id, &foreign_id, &foreign_tenant_id, &expired_id] {
         let untouched: bool = sqlx::query_scalar(
             "SELECT revoked_at IS NULL FROM oauth_device_sessions WHERE id = $1",
