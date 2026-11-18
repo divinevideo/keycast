@@ -3673,6 +3673,7 @@ pub async fn revoke_device_session(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "error": "TV session not found",
+                "code": "TV_SESSION_NOT_FOUND",
             })),
         )
             .into_response());

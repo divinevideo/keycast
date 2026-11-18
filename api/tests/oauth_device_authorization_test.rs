@@ -1049,10 +1049,9 @@ async fn account_manages_only_its_own_tv_sessions(
 
     let unknown_id = Uuid::new_v4().to_string();
     for forbidden_id in [&foreign_id, &foreign_tenant_id, &unknown_id] {
-        assert_eq!(
-            browser_revoke(app, cookie, forbidden_id).await.status(),
-            StatusCode::NOT_FOUND
-        );
+        let response = browser_revoke(app, cookie, forbidden_id).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(payload(response).await["code"], "TV_SESSION_NOT_FOUND");
     }
     assert!(browser_revoke(app, cookie, &id).await.status().is_success());
     let revoked: bool = sqlx::query_scalar(

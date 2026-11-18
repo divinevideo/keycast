@@ -212,7 +212,7 @@ async function revokeDeviceSession(session: DeviceSession) {
 		deviceSessions = deviceSessions.filter((deviceSession) => deviceSession.id !== session.id);
 		toast.success('Signed out of Divine TV');
 	} catch (err: any) {
-		if (err?.status === 404) {
+		if (err?.status === 404 && err?.code === 'TV_SESSION_NOT_FOUND') {
 			deviceSessions = deviceSessions.filter((item) => item.id !== session.id);
 			toast.success('TV session is already signed out.');
 		} else {
