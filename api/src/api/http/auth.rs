@@ -315,12 +315,7 @@ pub async fn generate_server_signed_ucan(
     admin_role: Option<&str>,
     status: Option<&keycast_core::types::user::UserStatus>,
 ) -> Result<String, AuthError> {
-    use crate::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
     use serde_json::json;
-    use ucan::builder::UcanBuilder;
-
-    let server_key_material = NostrKeyMaterial::from_keys(server_keys.clone());
-    let user_did = nostr_pubkey_to_did(user_pubkey);
 
     let mut facts = json!({
         "tenant_id": tenant_id,
@@ -342,10 +337,30 @@ pub async fn generate_server_signed_ucan(
         }
     }
 
+    sign_server_ucan(
+        user_pubkey,
+        server_keys,
+        facts,
+        token_expiry_seconds() as u64,
+    )
+    .await
+}
+
+pub(crate) async fn sign_server_ucan(
+    user_pubkey: &PublicKey,
+    server_keys: &Keys,
+    facts: serde_json::Value,
+    lifetime_seconds: u64,
+) -> Result<String, AuthError> {
+    use crate::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
+    use ucan::builder::UcanBuilder;
+
+    let server_key_material = NostrKeyMaterial::from_keys(server_keys.clone());
+    let user_did = nostr_pubkey_to_did(user_pubkey);
     let ucan = UcanBuilder::default()
-        .issued_by(&server_key_material) // Server issues
-        .for_audience(&user_did) // For this user
-        .with_lifetime(token_expiry_seconds() as u64)
+        .issued_by(&server_key_material)
+        .for_audience(&user_did)
+        .with_lifetime(lifetime_seconds)
         .with_fact(facts)
         .build()
         .map_err(|e| AuthError::Internal(format!("Failed to build UCAN: {}", e)))?

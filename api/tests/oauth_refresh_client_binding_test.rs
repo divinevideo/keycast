@@ -191,6 +191,7 @@ async fn refresh_for_tenant(
             redirect_uri: None,
             code_verifier: None,
             refresh_token: Some(refresh_token.to_string()),
+            device_code: None,
         }),
     )
     .await;
@@ -434,6 +435,7 @@ async fn challenge_authorization_code_exchange_rejects_invalid_permission_displa
                 redirect_uri: Some("https://app.example/callback".into()),
                 code_verifier: None,
                 refresh_token: None,
+                device_code: None,
             }),
         )
         .await;

@@ -10,6 +10,7 @@
 // index HTML, while avoiding unsupported `openid`/`id_token` claims.
 
 use axum::Json;
+use keycast_core::repositories::oauth_device::DEVICE_GRANT_TYPE;
 use serde::Serialize;
 
 use super::atproto_oauth_metadata::{app_origin, endpoint};
@@ -19,6 +20,7 @@ pub struct OpenIdConfiguration {
     issuer: String,
     authorization_endpoint: String,
     token_endpoint: String,
+    device_authorization_endpoint: String,
     response_types_supported: Vec<String>,
     grant_types_supported: Vec<String>,
     token_endpoint_auth_methods_supported: Vec<String>,
@@ -32,10 +34,12 @@ pub async fn openid_configuration_metadata() -> Json<OpenIdConfiguration> {
         issuer: origin.clone(),
         authorization_endpoint: endpoint(&origin, "/api/oauth/authorize"),
         token_endpoint: endpoint(&origin, "/api/oauth/token"),
+        device_authorization_endpoint: endpoint(&origin, "/api/oauth/device_authorization"),
         response_types_supported: vec!["code".to_string()],
         grant_types_supported: vec![
             "authorization_code".to_string(),
             "refresh_token".to_string(),
+            DEVICE_GRANT_TYPE.to_string(),
         ],
         token_endpoint_auth_methods_supported: vec!["none".to_string()],
         code_challenge_methods_supported: vec!["S256".to_string()],

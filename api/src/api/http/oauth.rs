@@ -275,12 +275,13 @@ pub struct ApproveRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct TokenRequest {
-    pub grant_type: Option<String>, // "authorization_code" or "refresh_token"
-    pub code: Option<String>,       // For authorization_code grant
+    pub grant_type: Option<String>,
+    pub code: Option<String>, // For authorization_code grant
     pub client_id: String,
     pub redirect_uri: Option<String>, // For authorization_code grant
     pub code_verifier: Option<String>, // For PKCE (authorization_code grant)
     pub refresh_token: Option<String>, // For refresh_token grant
+    pub device_code: Option<String>,  // For the RFC 8628 device grant
 }
 
 pub struct TokenRequestBody(pub TokenRequest);
@@ -2557,7 +2558,7 @@ pub async fn authorize_post(
 /// POST /oauth/token
 /// Exchange authorization code or refresh token for access tokens
 /// This is the standard OAuth 2.0 token endpoint for third-party apps
-/// Supports: authorization_code (default), refresh_token
+/// Supports authorization_code (default), refresh_token, and the RFC 8628 device grant.
 pub async fn token(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
@@ -2571,9 +2572,35 @@ pub async fn token(
         "authorization_code" => {
             handle_authorization_code_grant(tenant_id, auth_state, email_sender, req).await
         }
-        "refresh_token" => handle_refresh_token_grant(tenant_id, auth_state, req).await,
+        "refresh_token" => {
+            if let Some(refresh) = req
+                .refresh_token
+                .as_deref()
+                .filter(|refresh| refresh.starts_with(super::oauth_device::REFRESH_PREFIX))
+            {
+                return Ok(super::oauth_device::refresh(
+                    tenant_id,
+                    auth_state,
+                    &req.client_id,
+                    refresh,
+                )
+                .await
+                .into_response());
+            }
+            handle_refresh_token_grant(tenant_id, auth_state, req).await
+        }
+        keycast_core::repositories::oauth_device::DEVICE_GRANT_TYPE => {
+            Ok(super::oauth_device::exchange(
+                tenant_id,
+                auth_state,
+                &req.client_id,
+                req.device_code.as_deref(),
+            )
+            .await
+            .into_response())
+        }
         _ => Err(OAuthError::InvalidRequest(format!(
-            "Invalid grant_type '{}'. Supported: authorization_code, refresh_token.",
+            "Invalid grant_type '{}'. Supported: authorization_code, refresh_token, device_code.",
             grant_type
         ))),
     }
@@ -5157,6 +5184,7 @@ mod tests {
                 redirect_uri: None,
                 code_verifier: None,
                 refresh_token: None,
+                device_code: None,
             },
         )
         .await;
@@ -5222,6 +5250,7 @@ mod tests {
                 redirect_uri: None,
                 code_verifier: None,
                 refresh_token: Some("raw-refresh-token-sentinel".to_string()),
+                device_code: None,
             },
         )
         .await;

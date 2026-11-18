@@ -92,6 +92,16 @@ async fn openid_configuration_returns_json_with_issuer() {
         "https://login.divine.video/api/oauth/token"
     );
 
+    assert_eq!(
+        payload["device_authorization_endpoint"],
+        "https://login.divine.video/api/oauth/device_authorization"
+    );
+    assert!(payload["grant_types_supported"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value == "urn:ietf:params:oauth:grant-type:device_code"));
+
     // Keycast is not an OpenID Provider yet, so this compatibility document
     // must stay honest about the OAuth capabilities it actually has.
     assert!(payload["response_types_supported"]

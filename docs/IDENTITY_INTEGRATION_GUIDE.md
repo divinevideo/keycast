@@ -54,6 +54,20 @@ Both flows provide **NIP-46 bunker URLs** for remote signing, keeping private ke
 
 ---
 
+## Divine TV sign-in
+
+The public OAuth client `divine-tv` uses the [OAuth device authorization grant](https://www.rfc-editor.org/rfc/rfc8628.html) to link a viewer’s public profile and follows. The TV session has scope `tv:read`. It can verify or revoke its own session.
+
+1. Send `client_id=divine-tv` as form data to `POST /api/oauth/device_authorization`. The response includes `device_code`, `user_code`, `verification_uri`, `verification_uri_complete`, `expires_in`, and `interval`.
+2. Display the user code and verification URL. Encode the complete URL in the QR code. The viewer signs in to Keycast on their phone, checks that the code matches their TV, and approves or denies the request.
+3. Poll `POST /api/oauth/token` at the returned interval. Send form fields `grant_type=urn:ietf:params:oauth:grant-type:device_code`, `client_id=divine-tv`, and `device_code`. Keep polling on `authorization_pending` and add five seconds to the interval on each `slow_down`. Stop on `access_denied`, `expired_token`, or `invalid_grant`.
+4. The token response contains `access_token`, `refresh_token`, `token_type`, `expires_in`, `scope`, and the verified Nostr `pubkey` in lowercase hex. Verify a saved session with `GET /api/oauth/device_session` and the bearer access token. Its response contains `pubkey`.
+5. To renew, send `grant_type=refresh_token`, `client_id=divine-tv`, and `refresh_token` to `POST /api/oauth/token`. Replace the stored credentials with the rotated response. To sign out, send the bearer access token to `POST /api/oauth/device_revoke` and clear the local session. An expired access token can be renewed before revocation.
+
+Browser-based TV clients send these requests without cookies. The phone approval page uses the Keycast browser session at the configured app origin.
+
+---
+
 ## Personal Authentication (First-Party Apps)
 
 ### Flow Overview

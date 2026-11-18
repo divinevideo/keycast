@@ -12,7 +12,7 @@ use tower::{timeout::error::Elapsed, ServiceBuilder};
 
 use crate::api::http::{
     admin, ap, atproto, atproto_oauth, auth, claim, email_marketing, expensive_work, headless,
-    metrics, nostr_rpc, oauth, og_diviner, policies, retention, service_deletion,
+    metrics, nostr_rpc, oauth, oauth_device, og_diviner, policies, retention, service_deletion,
     service_provisioning, teams,
 };
 use crate::email_delivery::EmailDeliveryService;
@@ -60,6 +60,20 @@ pub fn public_verify_email_route(
             expensive_work::HTTP_BODY_LIMIT,
         ))
         .with_state(AuthState { state, auth_tx })
+}
+
+/// This browser flow uses the first-party session cookie and same-origin forms.
+pub fn device_verification_route(state: Arc<KeycastState>) -> Router {
+    Router::new()
+        .route(
+            oauth_device::VERIFICATION_PATH,
+            get(oauth_device::verify_page).post(oauth_device::verify_decision),
+        )
+        .layer(axum::extract::DefaultBodyLimit::max(1024))
+        .with_state(AuthState {
+            state,
+            auth_tx: None,
+        })
 }
 
 /// Build API routes - pure JSON endpoints, no HTML
@@ -138,6 +152,12 @@ pub fn api_routes(
         .route("/oauth/authorize", get(oauth::authorize_get))
         .route("/oauth/authorize", post(oauth::authorize_post))
         .route("/oauth/token", post(oauth::token))
+        .route(
+            oauth_device::AUTHORIZATION_PATH,
+            post(oauth_device::authorize),
+        )
+        .route(oauth_device::SESSION_PATH, get(oauth_device::session))
+        .route(oauth_device::REVOCATION_PATH, post(oauth_device::revoke))
         .route("/oauth/poll", get(oauth::poll)) // iOS PWA polling endpoint
         .route("/oauth/connect", post(oauth::connect_post))
         .layer(public_cors.clone())

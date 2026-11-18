@@ -12,4 +12,5 @@ pub use dpop::{
     jkt_log_prefix, verify_dpop_proof,
 };
 pub use key_material::{NostrKeyMaterial, NostrVerifyKeyMaterial};
+pub(crate) use validation::validate_device_ucan;
 pub use validation::{extract_user_from_ucan, is_server_signed, validate_ucan_token};

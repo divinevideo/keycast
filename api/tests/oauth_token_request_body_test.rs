@@ -22,7 +22,35 @@ async fn echo_token_request(TokenRequestBody(req): TokenRequestBody) -> impl Int
         "redirect_uri": req.redirect_uri,
         "code_verifier": req.code_verifier,
         "refresh_token": req.refresh_token,
+        "device_code": req.device_code,
     }))
+}
+
+#[tokio::test]
+async fn token_request_accepts_device_code_form_without_authorization_code() {
+    let response = test_app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/oauth/token")
+                .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(concat!(
+                    "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code",
+                    "&client_id=divine-tv&device_code=tv-device-code"
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(
+        body["grant_type"],
+        "urn:ietf:params:oauth:grant-type:device_code"
+    );
+    assert_eq!(body["device_code"], "tv-device-code");
+    assert!(body["code"].is_null());
 }
 
 fn test_app() -> Router {
