@@ -64,7 +64,7 @@ The public OAuth client `divine-tv` uses the [OAuth device authorization grant](
 4. The token response contains `access_token`, `refresh_token`, `token_type`, `expires_in`, `scope`, and the verified Nostr `pubkey` in lowercase hex. Verify a saved session with `GET /api/oauth/device_session` and the bearer access token. Its response contains `pubkey`.
 5. To renew, send `grant_type=refresh_token`, `client_id=divine-tv`, and `refresh_token` to `POST /api/oauth/token`. Replace the stored credentials with the rotated response. To sign out, send the bearer access token to `POST /api/oauth/device_revoke` and clear the local session. An expired access token can be renewed before revocation.
 
-Browser-based TV clients send these requests without cookies. The phone approval page uses the Keycast browser session at the configured app origin.
+Browser-based TV clients send these requests without cookies. The phone approval page uses the Keycast browser session at the configured app origin. A TV session expires 30 days after pairing, even when its credentials are refreshed; start a new pairing when renewal returns `invalid_grant`.
 
 ---
 
