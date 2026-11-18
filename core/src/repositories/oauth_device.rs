@@ -41,6 +41,13 @@ pub struct DeviceSession {
     pub expires_at: DateTime<Utc>,
 }
 
+/// An active TV connection that its owner can end from their account.
+#[derive(Debug, serde::Serialize, sqlx::FromRow)]
+pub struct DeviceSessionInfo {
+    pub id: String,
+    pub expires_at: DateTime<Utc>,
+}
+
 #[derive(Debug)]
 pub enum DevicePoll {
     Pending,
@@ -252,24 +259,44 @@ impl<'a> DeviceAuthorizationRepository<'a> {
         .await
     }
 
-    pub async fn active(
+    pub async fn active_session_protected_minor(
         &self,
         tenant_id: i64,
         session_id: &str,
         user_pubkey: &str,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<Option<bool>, sqlx::Error> {
         sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM oauth_device_sessions AS session
+            "SELECT account.verified_minor FROM oauth_device_sessions AS session
              JOIN users AS account ON account.pubkey = session.user_pubkey
                                    AND account.tenant_id = session.tenant_id
              WHERE session.tenant_id = $1 AND session.id = $2 AND session.user_pubkey = $3
                AND session.revoked_at IS NULL AND session.expires_at > clock_timestamp()
-               AND account.status = 'active' AND account.email IS NOT NULL AND account.email_verified)",
+               AND account.status = 'active' AND account.email IS NOT NULL AND account.email_verified",
         )
         .bind(tenant_id)
         .bind(session_id)
         .bind(user_pubkey)
-        .fetch_one(self.pool)
+        .fetch_optional(self.pool)
+        .await
+    }
+
+    pub async fn list_active_sessions(
+        &self,
+        tenant_id: i64,
+        user_pubkey: &str,
+    ) -> Result<Vec<DeviceSessionInfo>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT session.id, session.expires_at FROM oauth_device_sessions AS session
+             JOIN users AS account ON account.pubkey = session.user_pubkey
+                                   AND account.tenant_id = session.tenant_id
+             WHERE session.tenant_id = $1 AND session.user_pubkey = $2
+               AND session.revoked_at IS NULL AND session.expires_at > clock_timestamp()
+               AND account.status = 'active' AND account.email IS NOT NULL AND account.email_verified
+             ORDER BY session.expires_at DESC, session.id",
+        )
+        .bind(tenant_id)
+        .bind(user_pubkey)
+        .fetch_all(self.pool)
         .await
     }
 
@@ -278,8 +305,8 @@ impl<'a> DeviceAuthorizationRepository<'a> {
         tenant_id: i64,
         session_id: &str,
         user_pubkey: &str,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
             "UPDATE oauth_device_sessions SET revoked_at = clock_timestamp()
              WHERE tenant_id = $1 AND id = $2 AND user_pubkey = $3 AND revoked_at IS NULL",
         )
@@ -288,7 +315,7 @@ impl<'a> DeviceAuthorizationRepository<'a> {
         .bind(user_pubkey)
         .execute(self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() == 1)
     }
 
     pub async fn cleanup(&self) -> Result<(), sqlx::Error> {

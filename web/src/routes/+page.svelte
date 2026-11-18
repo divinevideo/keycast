@@ -2,7 +2,7 @@
 import { getCurrentUser, setCurrentUser } from "$lib/current_user.svelte";
 import { KeycastApi } from "$lib/keycast_api.svelte";
 import { BRAND } from "$lib/brand";
-import type { TeamWithRelations, BunkerSession } from "$lib/types";
+import type { TeamWithRelations, BunkerSession, BunkerSessionsResponse, DeviceSession } from "$lib/types";
 import { Key, ArrowRight, PlusCircle, Gear, Copy, Check, EnvelopeSimple, CaretDown, CaretUp, Question, ArrowSquareOut, ShieldCheck, Export, PlugsConnected } from "phosphor-svelte";
 import Loader from "$lib/components/Loader.svelte";
 import CreateBunkerModal from "$lib/components/CreateBunkerModal.svelte";
@@ -30,6 +30,8 @@ const authMethod = $derived(currentUser?.authMethod);
 
 let teams = $state<TeamWithRelations[]>([]);
 let sessions = $state<BunkerSession[]>([]);
+let deviceSessions = $state<DeviceSession[]>([]);
+let revokingDeviceSessions = $state<Set<string>>(new Set());
 let isLoadingDashboard = $state(true);
 let isCheckingAuth = $state(true);
 let error = $state('');
@@ -156,14 +158,16 @@ async function loadSessions() {
 	if (!currentUser?.pubkey) return;
 
 	try {
-		const response = await api.get<{ sessions: BunkerSession[] }>('/user/sessions');
+		const response = await api.get<BunkerSessionsResponse>('/user/sessions');
 		sessions = response.sessions || [];
+		deviceSessions = response.device_sessions ?? [];
 	} catch (err: any) {
 		// 404 is expected for NIP-07 admins without user records
 		if (err?.status !== 404) {
 			console.error('Failed to load sessions:', err);
 		}
 		sessions = [];
+		deviceSessions = [];
 	}
 }
 
@@ -198,6 +202,20 @@ function formatDate(dateStr: string): string {
 function confirmRevoke(group: GroupedSession) {
 	sessionToRevoke = group;
 	showRevokeModal = true;
+}
+
+async function revokeDeviceSession(session: DeviceSession) {
+	if (revokingDeviceSessions.has(session.id)) return;
+	revokingDeviceSessions = new Set([...revokingDeviceSessions, session.id]);
+	try {
+		await api.post('/user/device-sessions/revoke', { id: session.id });
+		deviceSessions = deviceSessions.filter((deviceSession) => deviceSession.id !== session.id);
+		toast.success('Signed out of Divine TV');
+	} catch {
+		toast.error('Failed to sign out of Divine TV. Please try again.');
+	} finally {
+		revokingDeviceSessions = new Set([...revokingDeviceSessions].filter((id) => id !== session.id));
+	}
 }
 
 async function revokeGroupedSession(group: GroupedSession) {
@@ -640,6 +658,38 @@ $effect(() => {
 							</div>
 						{/each}
 					</div>
+				{/if}
+			</section>
+			{/if}
+
+			{#if authMethod !== 'nip07' || deviceSessions.length > 0}
+			<section class="apps-section" aria-labelledby="tv-sessions-title">
+				<h2 class="section-title" id="tv-sessions-title">TV Sessions</h2>
+				{#if deviceSessions.length === 0}
+					<div class="empty-state">
+						<p>No TV sessions.</p>
+					</div>
+				{:else}
+					<div class="apps-list">
+						{#each deviceSessions as session (session.id)}
+							<div class="app-card">
+								<div class="tv-session-header">
+									<div class="app-info">
+										<p class="app-name">Divine TV session</p>
+										<p class="app-meta">Expires {formatDate(session.expires_at)}</p>
+									</div>
+									<button
+										class="btn-revoke"
+										onclick={() => revokeDeviceSession(session)}
+										disabled={revokingDeviceSessions.has(session.id)}
+									>
+										{revokingDeviceSessions.has(session.id) ? 'Signing out…' : 'Sign out'}
+									</button>
+								</div>
+							</div>
+						{/each}
+					</div>
+					<p class="app-meta">Signing out disconnects that TV. You can pair it again to sign back in.</p>
 				{/if}
 			</section>
 			{/if}
@@ -1211,6 +1261,19 @@ $effect(() => {
 	.app-info {
 		min-width: 0;
 		flex: 1;
+	}
+
+	.tv-session-header {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 1rem;
+		padding: 1rem 1.25rem;
+	}
+
+	.tv-session-header .btn-revoke:disabled {
+		opacity: 0.6;
+		cursor: wait;
 	}
 
 	.app-name {

@@ -3587,9 +3587,10 @@ pub struct BunkerSession {
 #[derive(Debug, Serialize)]
 pub struct BunkerSessionsResponse {
     pub sessions: Vec<BunkerSession>,
+    pub device_sessions: Vec<keycast_core::repositories::oauth_device::DeviceSessionInfo>,
 }
 
-/// List all active bunker sessions for the authenticated user
+/// List active app and TV sessions for the authenticated user.
 pub async fn list_sessions(
     tenant: crate::api::tenant::TenantExtractor,
     State(pool): State<PgPool>,
@@ -3635,7 +3636,45 @@ pub async fn list_sessions(
         )
         .collect();
 
-    Ok(Json(BunkerSessionsResponse { sessions }))
+    let device_sessions =
+        keycast_core::repositories::oauth_device::DeviceAuthorizationRepository::new(&pool)
+            .list_active_sessions(tenant_id, &user_pubkey)
+            .await?;
+    Ok(Json(BunkerSessionsResponse {
+        sessions,
+        device_sessions,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RevokeDeviceSessionRequest {
+    pub id: String,
+}
+
+/// End one TV connection using the account owner's management session.
+pub async fn revoke_device_session(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<super::routes::AuthState>,
+    headers: HeaderMap,
+    Json(req): Json<RevokeDeviceSessionRequest>,
+) -> Result<Json<RevokeSessionResponse>, AuthError> {
+    let tenant_id = tenant.0.id;
+    let user_pubkey = extract_user_for_authorization_management(&headers, tenant_id).await?;
+    let id = uuid::Uuid::parse_str(&req.id)
+        .map_err(|_| AuthError::InvalidToken)?
+        .to_string();
+    let revoked = keycast_core::repositories::oauth_device::DeviceAuthorizationRepository::new(
+        &auth_state.state.db,
+    )
+    .revoke(tenant_id, &id, &user_pubkey)
+    .await?;
+    if !revoked {
+        return Err(AuthError::InvalidToken);
+    }
+    Ok(Json(RevokeSessionResponse {
+        success: true,
+        message: "TV session signed out".to_string(),
+    }))
 }
 
 #[derive(Debug, Deserialize)]

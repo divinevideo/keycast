@@ -247,6 +247,10 @@ pub fn api_routes(
     let bunker_routes = Router::new()
         .route("/user/bunker/create", post(auth::create_bunker))
         .route("/user/sessions/revoke", post(auth::revoke_session))
+        .route(
+            "/user/device-sessions/revoke",
+            post(auth::revoke_device_session),
+        )
         .layer(auth_cors.clone())
         .with_state(auth_state.clone());
 

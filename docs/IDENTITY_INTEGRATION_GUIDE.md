@@ -61,10 +61,12 @@ The public OAuth client `divine-tv` uses the [OAuth device authorization grant](
 1. Send `client_id=divine-tv` as form data to `POST /api/oauth/device_authorization`. The response includes `device_code`, `user_code`, `verification_uri`, `verification_uri_complete`, `expires_in`, and `interval`.
 2. Display the user code and verification URL. Encode the complete URL in the QR code. The viewer signs in to Keycast on their phone, checks that the code matches their TV, and approves or denies the request.
 3. Poll `POST /api/oauth/token` at the returned interval. Send form fields `grant_type=urn:ietf:params:oauth:grant-type:device_code`, `client_id=divine-tv`, and `device_code`. Keep polling on `authorization_pending` and add five seconds to the interval on each `slow_down`. Stop on `access_denied`, `expired_token`, or `invalid_grant`.
-4. The token response contains `access_token`, `refresh_token`, `token_type`, `expires_in`, `scope`, and the verified Nostr `pubkey` in lowercase hex. Verify a saved session with `GET /api/oauth/device_session` and the bearer access token. Its response contains `pubkey`.
+4. The token response contains `access_token`, `refresh_token`, `token_type`, `expires_in`, `scope`, and the verified Nostr `pubkey` in lowercase hex. Verify a saved session with `GET /api/oauth/device_session` and the bearer access token. Its response contains `pubkey` and the current `protected_minor` boolean. TV clients must apply protected-minor viewing restrictions when it is true and must not treat an unavailable session check as an unrestricted account.
 5. To renew, send `grant_type=refresh_token`, `client_id=divine-tv`, and `refresh_token` to `POST /api/oauth/token`. Replace the stored credentials with the rotated response. To sign out, send the bearer access token to `POST /api/oauth/device_revoke` and clear the local session. An expired access token can be renewed before revocation.
 
 Browser-based TV clients send these requests without cookies. The phone approval page uses the Keycast browser session at the configured app origin. A TV session expires 30 days after pairing, even when its credentials are refreshed; start a new pairing when renewal returns `invalid_grant`.
+
+The account dashboard lists active TV sessions and lets the account owner sign out each TV without access to that TV. First-party account sessions can also read the additive `device_sessions` list from `GET /api/user/sessions` and revoke one with `POST /api/user/device-sessions/revoke` and JSON `{ "id": "<session UUID>" }`. TV bearer tokens cannot use these account-management endpoints. Signing out immediately prevents session verification and renewal; other TV sessions stay connected.
 
 ---
 

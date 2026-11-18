@@ -6,7 +6,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     Extension, Form, Json,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use keycast_core::{
     repositories::{
         oauth_device::{
@@ -194,7 +194,7 @@ pub async fn authorize(
     }
     // Use the ingress trust configuration already shared by browser admission.
     // Requests without a usable source share a bounded fallback bucket.
-    let source = email_delivery.coarse_source(&headers);
+    let source = email_delivery.source_subnet(&headers);
     let source_hash = creation_source_hash(source.as_deref());
     admission(
         &auth.state,
@@ -253,6 +253,16 @@ struct DeviceTokenResponse {
     refresh_token: String,
 }
 
+fn access_lifetime(expires_at: DateTime<Utc>, now: DateTime<Utc>) -> Result<u64, DeviceError> {
+    let seconds = (expires_at - now)
+        .num_seconds()
+        .min(ACCESS_LIFETIME_SECONDS);
+    if seconds <= 0 {
+        return Err(DeviceError::InvalidGrant);
+    }
+    Ok(seconds as u64)
+}
+
 async fn issue_access_token(
     tenant_id: i64,
     auth: &AuthState,
@@ -260,12 +270,7 @@ async fn issue_access_token(
     refresh_token: String,
 ) -> Result<Response, DeviceError> {
     let pubkey = PublicKey::from_hex(&session.user_pubkey).map_err(|_| DeviceError::Unavailable)?;
-    let expires_in = (session.expires_at - Utc::now())
-        .num_seconds()
-        .min(ACCESS_LIFETIME_SECONDS);
-    if expires_in <= 0 {
-        return Err(DeviceError::InvalidGrant);
-    }
+    let expires_in = access_lifetime(session.expires_at, Utc::now())?;
     let access_token = sign_server_ucan(
         &pubkey,
         &auth.state.server_keys,
@@ -274,7 +279,7 @@ async fn issue_access_token(
             "redirect_origin": DEVICE_TOKEN_ORIGIN,
             "device_session": session.id,
         }),
-        expires_in as u64,
+        expires_in,
     )
     .await
     .map_err(|_| DeviceError::Unavailable)?;
@@ -283,7 +288,7 @@ async fn issue_access_token(
         Json(DeviceTokenResponse {
             access_token,
             token_type: "Bearer",
-            expires_in,
+            expires_in: expires_in as i64,
             scope: DEVICE_SCOPE,
             pubkey: pubkey.to_hex(),
             refresh_token,
@@ -374,13 +379,17 @@ pub async fn session(
     headers: HeaderMap,
 ) -> Result<Response, DeviceError> {
     let (pubkey, session_id) = authenticate(&headers, tenant.id).await?;
-    if !DeviceAuthorizationRepository::new(&auth.state.db)
-        .active(tenant.id, &session_id, &pubkey)
+    let protected_minor = DeviceAuthorizationRepository::new(&auth.state.db)
+        .active_session_protected_minor(tenant.id, &session_id, &pubkey)
         .await?
-    {
-        return Err(DeviceError::InvalidToken);
-    }
-    Ok(no_store(Json(json!({"pubkey": pubkey})).into_response()))
+        .ok_or(DeviceError::InvalidToken)?;
+    Ok(no_store(
+        Json(json!({
+            "pubkey": pubkey,
+            "protected_minor": protected_minor,
+        }))
+        .into_response(),
+    ))
 }
 
 pub async fn revoke(
@@ -528,7 +537,7 @@ pub async fn verify_page(
         StatusCode::OK,
         &format!(
             r#"<h1>Sign in to Divine TV</h1>
-        <p>Make sure this code matches the one shown on your own TV.</p>
+        <p>Make sure this code matches the one shown on your own TV. If someone sent you this link or code, choose Deny.</p>
         <p class="code">{formatted_code}</p>
         <p>Continue as <strong>{}</strong>. Divine TV can read public account information, including your follows.</p>
         <p><a href="{}">Use a different account</a></p>
@@ -633,5 +642,35 @@ pub async fn verify_decision(
         ),
         Ok(false) => code_prompt(true),
         Err(error) => browser_error(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, TimeZone};
+
+    #[test]
+    fn access_lifetime_requires_a_full_remaining_second() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        for expires_at in [
+            now - Duration::seconds(1),
+            now,
+            now + Duration::milliseconds(900),
+        ] {
+            assert!(matches!(
+                access_lifetime(expires_at, now),
+                Err(DeviceError::InvalidGrant)
+            ));
+        }
+        assert_eq!(access_lifetime(now + Duration::seconds(1), now).unwrap(), 1);
+        assert_eq!(
+            access_lifetime(now + Duration::seconds(300), now).unwrap(),
+            300
+        );
+        assert_eq!(
+            access_lifetime(now + Duration::seconds(3600), now).unwrap(),
+            900
+        );
     }
 }
