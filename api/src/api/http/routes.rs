@@ -154,7 +154,7 @@ pub fn api_routes(
         .route("/oauth/token", post(oauth::token))
         .route(
             oauth_device::AUTHORIZATION_PATH,
-            post(oauth_device::authorize),
+            post(oauth_device::authorize).layer(axum::Extension(email_delivery.clone())),
         )
         .route(oauth_device::SESSION_PATH, get(oauth_device::session))
         .route(oauth_device::REVOCATION_PATH, post(oauth_device::revoke))

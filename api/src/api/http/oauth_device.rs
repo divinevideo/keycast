@@ -4,7 +4,7 @@ use axum::{
     extract::{rejection::FormRejection, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
-    Form, Json,
+    Extension, Form, Json,
 };
 use chrono::Utc;
 use keycast_core::{
@@ -23,7 +23,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::{api::tenant::TenantExtractor, state::KeycastState, ucan_auth::validate_device_ucan};
+use crate::{
+    api::tenant::TenantExtractor, email_delivery::EmailDeliveryService, state::KeycastState,
+    ucan_auth::validate_device_ucan,
+};
 
 use super::{
     atproto_oauth_metadata::{app_origin, endpoint},
@@ -156,6 +159,8 @@ struct DeviceAuthorizationResponse {
 pub async fn authorize(
     TenantExtractor(tenant): TenantExtractor,
     State(auth): State<AuthState>,
+    Extension(email_delivery): Extension<EmailDeliveryService>,
+    headers: HeaderMap,
     form: Result<Form<DeviceAuthorizationRequest>, FormRejection>,
 ) -> Result<Response, DeviceError> {
     let Form(request) = form.map_err(|_| DeviceError::InvalidRequest)?;
@@ -172,6 +177,17 @@ pub async fn authorize(
     {
         return Err(DeviceError::InvalidScope);
     }
+    // Use the ingress trust configuration already shared by browser admission.
+    // Requests without a usable source share a bounded fallback bucket.
+    let source = email_delivery.coarse_source(&headers);
+    let source_hash = hash_refresh_token(source.as_deref().unwrap_or("unknown"));
+    admission(
+        &auth.state,
+        format!("oauth_device:create_source:{}:{source_hash}", tenant.id),
+        30,
+        60,
+    )
+    .await?;
     admission(
         &auth.state,
         format!("oauth_device:create:{}", tenant.id),

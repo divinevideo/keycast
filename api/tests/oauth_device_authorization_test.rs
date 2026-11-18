@@ -436,4 +436,72 @@ async fn phone_approval_yields_a_single_read_only_session_that_can_rotate_and_re
         "expired_token",
     )
     .await;
+
+    let redis = state.redis.as_ref().unwrap();
+    let tenant_before = redis.get("oauth_device:create:1").await.unwrap();
+    for _ in 0..30 {
+        assert_eq!(
+            request(
+                &app,
+                Method::POST,
+                START,
+                "client_id=divine-tv",
+                &[(
+                    header::HeaderName::from_static("x-forwarded-for"),
+                    "192.0.2.91"
+                )],
+            )
+            .await
+            .status(),
+            StatusCode::OK,
+        );
+    }
+    let tenant_after = redis.get("oauth_device:create:1").await.unwrap();
+    assert_eq!(
+        tenant_after.as_deref().unwrap().parse::<u64>().unwrap(),
+        tenant_before.as_deref().unwrap().parse::<u64>().unwrap() + 30,
+    );
+    for forwarded in [
+        "192.0.2.92",
+        "198.51.100.1, 192.0.2.91",
+        "203.0.113.1, 192.0.2.91",
+    ] {
+        let limited = request(
+            &app,
+            Method::POST,
+            START,
+            "client_id=divine-tv",
+            &[(
+                header::HeaderName::from_static("x-forwarded-for"),
+                forwarded,
+            )],
+        )
+        .await;
+        assert_eq!(limited.headers()[header::RETRY_AFTER], "60");
+        json_error(
+            limited,
+            StatusCode::TOO_MANY_REQUESTS,
+            "temporarily_unavailable",
+        )
+        .await;
+    }
+    assert_eq!(
+        redis.get("oauth_device:create:1").await.unwrap(),
+        tenant_after
+    );
+    assert_eq!(
+        request(
+            &app,
+            Method::POST,
+            START,
+            "client_id=divine-tv",
+            &[(
+                header::HeaderName::from_static("x-forwarded-for"),
+                "198.51.100.1"
+            )],
+        )
+        .await
+        .status(),
+        StatusCode::OK,
+    );
 }
