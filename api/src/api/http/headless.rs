@@ -28,6 +28,11 @@ use super::auth::{
 };
 use super::oauth::{extract_origin, parse_policy_scope};
 use crate::login_attempt_limiter::{LoginAttemptAdmission, LoginAttemptLimiter};
+use crate::signup_limiter::{SignupAdmission, SignupLimiter};
+
+/// Body of a 429 from the sign-up admission limits.
+const SIGNUP_RATE_LIMIT_MESSAGE: &str =
+    "Too many accounts have been created from this network recently. Please try again later.";
 
 // ============================================================================
 // Headless Registration
@@ -141,6 +146,7 @@ pub async fn headless_register(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
     axum::Extension(email_sender): axum::Extension<Arc<dyn EmailSender>>,
+    headers: HeaderMap,
     Json(mut req): Json<HeadlessRegisterRequest>,
 ) -> Result<impl IntoResponse, HeadlessError> {
     let pool = &auth_state.state.db;
@@ -151,6 +157,23 @@ pub async fn headless_register(
         normalize_registration_email(&req.email).map_err(|_| HeadlessError::InvalidEmail)?;
     keycast_core::password_policy::validate_new_password(&req.password)
         .map_err(HeadlessError::WeakPassword)?;
+
+    // Admitted before any database, password-hashing or key work: an instant
+    // sign-up is a permanent account, and nothing reaps one nobody confirms.
+    let limiter = SignupLimiter::new(
+        auth_state.state.redis.clone(),
+        crate::signup_limiter::configured(),
+    );
+    if let SignupAdmission::Limited { retry_after } = limiter.admit(tenant_id, &headers).await {
+        tracing::warn!(
+            event = "headless_registration_rate_limited",
+            tenant_id = tenant_id,
+            client_id = %req.client_id,
+            retry_after = retry_after,
+            "Headless registration refused by sign-up limits"
+        );
+        return Err(HeadlessError::SignupRateLimited { retry_after });
+    }
 
     tracing::info!(
         event = "headless_registration_attempt",
@@ -1606,6 +1629,10 @@ pub enum HeadlessError {
     TooManyRequests {
         retry_after: u32,
     },
+    /// Registration refused by the sign-up admission limits.
+    SignupRateLimited {
+        retry_after: u32,
+    },
 }
 
 impl IntoResponse for HeadlessError {
@@ -1699,6 +1726,17 @@ impl IntoResponse for HeadlessError {
                     [("Retry-After", retry_after.to_string())],
                     Json(serde_json::json!({
                         "error": LOGIN_RATE_LIMIT_MESSAGE,
+                        "code": TOO_MANY_ATTEMPTS_CODE,
+                    })),
+                )
+                    .into_response();
+            }
+            HeadlessError::SignupRateLimited { retry_after } => {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("Retry-After", retry_after.to_string())],
+                    Json(serde_json::json!({
+                        "error": SIGNUP_RATE_LIMIT_MESSAGE,
                         "code": TOO_MANY_ATTEMPTS_CODE,
                     })),
                 )
@@ -1951,6 +1989,7 @@ mod tests {
             create_unit_test_tenant(),
             axum::extract::State(create_lazy_auth_state()),
             axum::Extension(test_email_sender()),
+            axum::http::HeaderMap::new(),
             axum::Json(super::HeadlessRegisterRequest {
                 email: "person@gmail..com".to_string(),
                 password: "testpassword123".to_string(),
@@ -2041,6 +2080,7 @@ mod tests {
                     create_unit_test_tenant(),
                     axum::extract::State(auth_state),
                     axum::Extension(test_email_sender()),
+                    axum::http::HeaderMap::new(),
                     axum::Json(super::HeadlessRegisterRequest {
                         email,
                         password: password.to_string(),
@@ -2238,6 +2278,7 @@ mod tests {
             create_unit_test_tenant(),
             axum::extract::State(auth_state),
             axum::Extension(test_email_sender()),
+            axum::http::HeaderMap::new(),
             axum::Json(super::HeadlessRegisterRequest {
                 email: email.clone(),
                 password: "testpassword123".to_string(),
@@ -2285,6 +2326,7 @@ mod tests {
             create_unit_test_tenant(),
             axum::extract::State(auth_state),
             axum::Extension(test_email_sender()),
+            axum::http::HeaderMap::new(),
             axum::Json(super::HeadlessRegisterRequest {
                 email: email.clone(),
                 password: "testpassword123".to_string(),
@@ -2349,6 +2391,7 @@ mod tests {
             create_unit_test_tenant(),
             axum::extract::State(auth_state),
             axum::Extension(test_email_sender()),
+            axum::http::HeaderMap::new(),
             axum::Json(super::HeadlessRegisterRequest {
                 email: email.clone(),
                 password: "testpassword123".to_string(),

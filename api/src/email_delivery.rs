@@ -877,7 +877,7 @@ fn subject_hash(tenant_id: i64, subject: &str) -> String {
 
 /// Return a coarse source subnet without retaining the request address.
 #[must_use]
-fn coarse_source(headers: &HeaderMap, trusted_proxy_hops: usize) -> Option<String> {
+pub(crate) fn coarse_source(headers: &HeaderMap, trusted_proxy_hops: usize) -> Option<String> {
     let forwarded = headers.get("x-forwarded-for")?.to_str().ok()?;
     // Trusted ingress addresses form a suffix. Values before the selected hop may have been
     // supplied by the caller, so selection must never depend on caller-controlled chain length.

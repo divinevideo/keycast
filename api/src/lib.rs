@@ -12,6 +12,7 @@ pub mod login_attempt_limiter;
 pub mod nip98;
 pub mod redis;
 mod replay_reservation;
+pub mod signup_limiter;
 pub mod state;
 pub mod ucan_auth;
 

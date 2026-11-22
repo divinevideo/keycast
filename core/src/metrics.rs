@@ -110,6 +110,14 @@ struct HttpRpcAcquireKey {
 
 type HttpRpcAcquireMetric = Histogram<{ HTTP_RPC_ACQUIRE_BUCKETS.len() }>;
 
+/// Outcomes recorded by [`Metrics::observe_signup_admission`].
+pub const SIGNUP_ADMISSION_OUTCOMES: [&str; 4] = [
+    "admitted",
+    "source_limited",
+    "global_limited",
+    "unavailable",
+];
+
 /// Global metrics counters accessible from any crate
 pub struct Metrics {
     // === NIP-46 Signer Daemon Metrics ===
@@ -253,6 +261,7 @@ pub struct Metrics {
     auth_email_send_failures_total: Mutex<BTreeMap<String, u64>>,
     email_delivery_admissions_total: Mutex<BTreeMap<EmailDeliveryKey, u64>>,
     email_delivery_source_subjects: [AtomicU64; 2],
+    signup_admissions_total: [AtomicU64; SIGNUP_ADMISSION_OUTCOMES.len()],
     email_provider_outcomes_total: Mutex<BTreeMap<EmailProviderKey, u64>>,
     email_provider_durations: Mutex<BTreeMap<EmailProviderKey, EmailProviderDurationMetric>>,
     email_provider_in_flight: AtomicU64,
@@ -344,6 +353,7 @@ impl Metrics {
             auth_email_send_failures_total: Mutex::new(BTreeMap::new()),
             email_delivery_admissions_total: Mutex::new(BTreeMap::new()),
             email_delivery_source_subjects: std::array::from_fn(|_| AtomicU64::new(0)),
+            signup_admissions_total: std::array::from_fn(|_| AtomicU64::new(0)),
             email_provider_outcomes_total: Mutex::new(BTreeMap::new()),
             email_provider_durations: Mutex::new(BTreeMap::new()),
             email_provider_in_flight: AtomicU64::new(0),
@@ -754,6 +764,17 @@ impl Metrics {
             .lock()
             .expect("email delivery admission metrics lock poisoned");
         *totals.entry(key).or_insert(0) += 1;
+    }
+
+    /// Count one registration admission decision. `outcome` is one of
+    /// [`SIGNUP_ADMISSION_OUTCOMES`]; anything else is ignored.
+    pub fn observe_signup_admission(&self, outcome: &str) {
+        if let Some(index) = SIGNUP_ADMISSION_OUTCOMES
+            .iter()
+            .position(|known| *known == outcome)
+        {
+            self.signup_admissions_total[index].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn observe_email_delivery_source_subject(&self, derived: bool) {
@@ -1340,6 +1361,18 @@ impl Metrics {
             output.push_str(&format!(
                 "keycast_auth_requests_total{{endpoint=\"{}\",outcome=\"{}\",reason_code=\"{}\"}} {}\n",
                 key.endpoint, key.outcome, key.reason_code, count
+            ));
+        }
+
+        output.push_str(
+            "\n# HELP keycast_signup_admissions_total Registration admission decisions by outcome\n",
+        );
+        output.push_str("# TYPE keycast_signup_admissions_total counter\n");
+        for (index, outcome) in SIGNUP_ADMISSION_OUTCOMES.iter().enumerate() {
+            output.push_str(&format!(
+                "keycast_signup_admissions_total{{outcome=\"{}\"}} {}\n",
+                outcome,
+                self.signup_admissions_total[index].load(Ordering::Relaxed)
             ));
         }
 

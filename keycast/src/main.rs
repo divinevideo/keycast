@@ -1386,6 +1386,14 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         keycast_api::email_delivery::EmailDeliveryService::from_env(prefixed_redis.clone())
             .map_err(|error| format!("Invalid email delivery configuration: {error}"))?;
     tracing::info!("✔︎ Shared email delivery admission initialized");
+    let signup_limits = keycast_api::signup_limiter::init_from_env()
+        .map_err(|error| format!("Invalid sign-up limit configuration: {error}"))?;
+    tracing::info!(
+        source_limit = signup_limits.source_limit,
+        global_limit = signup_limits.global_limit,
+        window_seconds = signup_limits.window.as_secs(),
+        "✔︎ Sign-up admission limits initialized"
+    );
 
     // Setup key managers (one for signer, one for API - they're cheap to create)
     let kms_provider =

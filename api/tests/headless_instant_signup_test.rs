@@ -16,6 +16,7 @@ use keycast_api::{
     api::http::{auth, headless, oauth, routes::AuthState},
     email_delivery::EmailDeliveryService,
     email_service::{DevEmailSender, EmailSender},
+    signup_limiter::{SignupAdmission, SignupLimitConfig, SignupLimiter},
 };
 use nostr_sdk::Keys;
 use serde_json::{json, Value};
@@ -64,6 +65,15 @@ async fn auth_state_with_redis(pool: PgPool) -> AuthState {
 }
 
 async fn register(state: &AuthState, email: &str, instant_access: Option<bool>) -> Response {
+    register_from(state, email, instant_access, HeaderMap::new()).await
+}
+
+async fn register_from(
+    state: &AuthState,
+    email: &str,
+    instant_access: Option<bool>,
+    headers: HeaderMap,
+) -> Response {
     let mut request = json!({
         "email": email,
         "password": PASSWORD,
@@ -80,6 +90,7 @@ async fn register(state: &AuthState, email: &str, instant_access: Option<bool>) 
         common::test_tenant(),
         State(state.clone()),
         Extension(email_sender()),
+        headers,
         Json(serde_json::from_value(request).unwrap()),
     )
     .await
@@ -124,6 +135,16 @@ async fn verify_link(state: &AuthState, token: &str) -> Response {
         Ok(response) => response.into_response(),
         Err(error) => error.into_response(),
     }
+}
+
+fn from_network(address: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-forwarded-for", address.parse().expect("valid header"));
+    headers
+}
+
+fn test_limiter(state: &AuthState, config: SignupLimitConfig) -> SignupLimiter {
+    SignupLimiter::new(state.state.redis.clone(), config)
 }
 
 fn bearer(token: &str) -> HeaderMap {
@@ -472,4 +493,98 @@ async fn instant_register_and_handover_do_not_nest_pool_acquisition() {
         second["pubkey"].as_str().unwrap().to_string(),
     ];
     cleanup(&pool, &pubkeys, &email).await;
+}
+
+#[tokio::test]
+async fn signup_limits_count_each_network_separately() {
+    let pool = common::setup_oauth_test_db().await;
+    let state = auth_state_with_redis(pool).await;
+    let limiter = test_limiter(
+        &state,
+        SignupLimitConfig {
+            source_limit: 2,
+            global_limit: 100,
+            ..SignupLimitConfig::default()
+        },
+    );
+    let tenant = 1;
+
+    for _ in 0..2 {
+        assert_eq!(
+            limiter.admit(tenant, &from_network("203.0.113.5")).await,
+            SignupAdmission::Admitted
+        );
+    }
+    // Same /24: the window is full.
+    match limiter.admit(tenant, &from_network("203.0.113.77")).await {
+        SignupAdmission::Limited { retry_after } => {
+            assert!(retry_after > 0 && retry_after <= 3600, "{retry_after}");
+        }
+        SignupAdmission::Admitted => panic!("a third sign-up from one network was admitted"),
+    }
+    // Another network still gets in.
+    assert_eq!(
+        limiter.admit(tenant, &from_network("198.51.100.4")).await,
+        SignupAdmission::Admitted
+    );
+}
+
+#[tokio::test]
+async fn signup_limits_cap_the_total_even_without_a_source() {
+    let pool = common::setup_oauth_test_db().await;
+    let state = auth_state_with_redis(pool).await;
+    let limiter = test_limiter(
+        &state,
+        SignupLimitConfig {
+            source_limit: 100,
+            global_limit: 3,
+            ..SignupLimitConfig::default()
+        },
+    );
+
+    for _ in 0..3 {
+        assert_eq!(
+            limiter.admit(1, &HeaderMap::new()).await,
+            SignupAdmission::Admitted
+        );
+    }
+    assert!(matches!(
+        limiter.admit(1, &from_network("192.0.2.9")).await,
+        SignupAdmission::Limited { .. }
+    ));
+}
+
+#[tokio::test]
+async fn registration_from_a_full_network_is_refused_before_any_account_work() {
+    let pool = common::setup_oauth_test_db().await;
+    let state = auth_state_with_redis(pool.clone()).await;
+    let network = from_network("203.0.113.40");
+    let defaults = SignupLimitConfig::default();
+    let limiter = test_limiter(&state, defaults);
+    for _ in 0..defaults.source_limit {
+        assert_eq!(
+            limiter.admit(common::test_tenant().0.id, &network).await,
+            SignupAdmission::Admitted
+        );
+    }
+    let email = format!("limited-{}@example.com", Uuid::new_v4());
+
+    let response = register_from(&state, &email, Some(true), network).await;
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u32>().ok())
+        .expect("a limited sign-up says when to retry");
+    assert!(retry_after > 0);
+    let body = body_json(response).await;
+    assert_eq!(body["code"], "TOO_MANY_ATTEMPTS");
+    let created: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE email = $1")
+        .bind(&email)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(created, 0, "a refused sign-up must not create an account");
 }
