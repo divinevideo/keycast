@@ -26,6 +26,8 @@ pub enum AccountGateState {
     Present {
         status: String,
         verified_minor: bool,
+        /// Has an email that is not confirmed yet ([`keycast_core::unconfirmed_email`]).
+        email_unconfirmed: bool,
     },
     Missing,
 }

@@ -532,7 +532,9 @@ pub enum AuthError {
         description: String,
     },
     BadRequest(String),
-    Forbidden(String),   // User has no authorization for this origin
+    Forbidden(String), // User has no authorization for this origin
+    /// An account with an unconfirmed email asked to sign a DM-shaped event.
+    EmailNotConfirmed,
     KeyEgressDenied,     // Policy refuses raw-key egress for this account
     RegistrationExpired, // Async bcrypt timed out (instance died)
     /// The pending registration already completed token issuance; re-mint is refused
@@ -719,6 +721,13 @@ impl IntoResponse for AuthError {
                     StatusCode::FORBIDDEN,
                     KEY_EGRESS_DENIED_MESSAGE,
                     KEY_EGRESS_DENIED_CODE,
+                );
+            }
+            AuthError::EmailNotConfirmed => {
+                return coded_error_response(
+                    StatusCode::FORBIDDEN,
+                    keycast_core::unconfirmed_email::EMAIL_NOT_CONFIRMED_MESSAGE,
+                    keycast_core::unconfirmed_email::EMAIL_NOT_CONFIRMED_CODE,
                 );
             }
             AuthError::RegistrationExpired => (
@@ -4205,15 +4214,18 @@ pub struct PubkeyResponse {
     pub npub: String,   // bech32 format
 }
 
-/// Apply the verified_minor DM containment gate (support-trust-safety#183) to a
-/// `/user/sign` request, on either the fast or slow path. Refusals surface the
-/// uniform policy-denial message (no account-state leak); the specific reason is
-/// logged server-side only. `keys` is the user's signing keypair (needed to
-/// recover a kind-13 seal's recipient by trial decryption).
+/// Apply the DM containment gate to a `/user/sign` request, on either the fast
+/// or slow path. Protected minors (support-trust-safety#183) and accounts with
+/// an unconfirmed email share its rules. A minor gets the uniform policy-denial
+/// message (no account-state leak); an unconfirmed account gets a coded refusal
+/// its client can explain. The specific reason is logged server-side only.
+/// `keys` is the user's signing keypair (needed to recover a kind-13 seal's
+/// recipient by trial decryption).
 fn enforce_minor_dm_sign(
     keys: &Keys,
     unsigned_event: &UnsignedEvent,
     user_pubkey: &str,
+    gates: keycast_core::unconfirmed_email::DmGates,
 ) -> Result<(), AuthError> {
     keycast_core::verified_minor_dm::validate_minor_sign(keys, unsigned_event).map_err(|denied| {
         tracing::warn!(
@@ -4221,9 +4233,15 @@ fn enforce_minor_dm_sign(
             user_pubkey = %user_pubkey,
             kind = unsigned_event.kind.as_u16(),
             reason = %denied,
-            "verified_minor DM sign refused (/user/sign)"
+            verified_minor = gates.verified_minor,
+            email_unconfirmed = gates.email_unconfirmed,
+            "DM containment sign refused (/user/sign)"
         );
-        AuthError::Forbidden("Operation denied by policy".to_string())
+        if gates.verified_minor {
+            AuthError::Forbidden("Operation denied by policy".to_string())
+        } else {
+            AuthError::EmailNotConfirmed
+        }
     })
 }
 
@@ -4269,16 +4287,14 @@ pub async fn sign_event(
     // the fast and slow paths. Fetch the flag once here (only for DM-shaped
     // kinds) so the hot fast path returns a clean 403 too, rather than the
     // signer handler's error mapping to a 503. A missing user row fails closed.
-    let verified_minor =
-        if keycast_core::verified_minor_dm::is_minor_gated_kind(unsigned_event.kind) {
-            user_repo
-                .get_verified_minor(&user_pubkey, tenant_id)
-                .await?
-                .ok_or_else(|| AuthError::Forbidden("Operation denied by policy".to_string()))?
-                .verified_minor
-        } else {
-            false
-        };
+    let dm_gates = if keycast_core::verified_minor_dm::is_minor_gated_kind(unsigned_event.kind) {
+        user_repo
+            .get_dm_gates(&user_pubkey, tenant_id)
+            .await?
+            .ok_or_else(|| AuthError::Forbidden("Operation denied by policy".to_string()))?
+    } else {
+        keycast_core::unconfirmed_email::DmGates::default()
+    };
 
     // FAST PATH: sign through the cached handler for the token's own
     // authorization (checked above). Tokens without one take the slow path.
@@ -4297,8 +4313,13 @@ pub async fn sign_event(
             // DM containment on the fast path returns a clean 403 here; the
             // signer handler also gates as a backstop, but its error would
             // map to a 503 through the Internal wrapper below.
-            if verified_minor {
-                enforce_minor_dm_sign(&handler.get_keys(), &unsigned_event, &user_pubkey)?;
+            if dm_gates.contained() {
+                enforce_minor_dm_sign(
+                    &handler.get_keys(),
+                    &unsigned_event,
+                    &user_pubkey,
+                    dm_gates,
+                )?;
             }
 
             let signed_event = handler
@@ -4345,9 +4366,9 @@ pub async fn sign_event(
     let keys = Keys::new(secret_key.into());
 
     // verified_minor DM containment on the slow path (support-trust-safety#183);
-    // `verified_minor` was resolved once above and shared with the fast path.
-    if verified_minor {
-        enforce_minor_dm_sign(&keys, &unsigned_event, &user_pubkey)?;
+    // `dm_gates` was resolved once above and shared with the fast path.
+    if dm_gates.contained() {
+        enforce_minor_dm_sign(&keys, &unsigned_event, &user_pubkey, dm_gates)?;
     }
 
     // Permission validation already done above (before fast path check)
@@ -8388,6 +8409,7 @@ mod tests {
                 crate::state::AccountGateState::Present {
                     status: "active".to_string(),
                     verified_minor: false,
+                    email_unconfirmed: false,
                 },
             )
             .await;

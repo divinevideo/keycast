@@ -137,6 +137,7 @@ async fn test_clear_verified_minor_clears_and_returns_status() {
             keycast_api::state::AccountGateState::Present {
                 status: "active".to_string(),
                 verified_minor: true,
+                email_unconfirmed: false,
             },
         )
         .await;

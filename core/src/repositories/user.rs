@@ -2476,6 +2476,30 @@ impl UserRepository {
         .map_err(Into::into)
     }
 
+    /// Read the DM containment gates for a user in one query: the
+    /// verified_minor flag and whether a stored email is still unconfirmed.
+    /// `None` when the user row does not exist.
+    pub async fn get_dm_gates(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<Option<crate::unconfirmed_email::DmGates>, RepositoryError> {
+        let row: Option<(bool, bool)> = sqlx::query_as(&format!(
+            "SELECT verified_minor, {} FROM users WHERE pubkey = $1 AND tenant_id = $2",
+            crate::unconfirmed_email::EMAIL_UNCONFIRMED_SQL
+        ))
+        .bind(pubkey)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(
+            |(verified_minor, email_unconfirmed)| crate::unconfirmed_email::DmGates {
+                verified_minor,
+                email_unconfirmed,
+            },
+        ))
+    }
+
     /// Clear the verified_minor designation (age-up or revocation).
     /// Idempotent: clearing an already-cleared or never-minor account succeeds.
     /// Returns NotFound only when the user does not exist. Touches only the two

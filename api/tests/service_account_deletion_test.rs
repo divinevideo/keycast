@@ -168,6 +168,7 @@ async fn deletes_the_account_and_records_the_request() {
             AccountGateState::Present {
                 status: "active".to_string(),
                 verified_minor: false,
+                email_unconfirmed: false,
             },
         )
         .await;
