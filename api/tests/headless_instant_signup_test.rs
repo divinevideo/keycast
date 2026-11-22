@@ -712,3 +712,33 @@ async fn web_and_oauth_registration_are_refused_from_a_full_network() {
         "a refused registration must not create an account"
     );
 }
+
+/// A second confirm-first attempt for an address held only unconfirmed replaces the pending row
+/// instead of being refused: only a confirmed owner reserves the address.
+#[tokio::test]
+async fn a_repeated_claim_for_an_unconfirmed_address_still_waits_for_confirmation() {
+    let pool = common::setup_oauth_test_db().await;
+    let state = auth_state_with_redis(pool.clone()).await;
+    let email = format!("repeat-claim-{}@example.com", Uuid::new_v4());
+
+    let holder = body_json(register(&state, &email, Some(true)).await).await;
+    let holder_pubkey = holder["pubkey"].as_str().unwrap().to_string();
+
+    let first_claim = body_json(register(&state, &email, Some(true)).await).await;
+    assert_eq!(first_claim["verification_required"], true, "{first_claim}");
+    let second_claim = register(&state, &email, Some(true)).await;
+    assert_eq!(second_claim.status(), StatusCode::OK);
+    let second_claim = body_json(second_claim).await;
+    assert_eq!(
+        second_claim["verification_required"], true,
+        "{second_claim}"
+    );
+    assert!(second_claim["device_code"].is_string(), "{second_claim}");
+
+    let pubkeys = [
+        holder_pubkey,
+        first_claim["pubkey"].as_str().unwrap().to_string(),
+        second_claim["pubkey"].as_str().unwrap().to_string(),
+    ];
+    cleanup(&pool, &pubkeys, &email).await;
+}
