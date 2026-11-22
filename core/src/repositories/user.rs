@@ -1,7 +1,7 @@
 // ABOUTME: User repository for data access operations
 // ABOUTME: Provides methods for finding, creating, and querying user data
 
-use crate::repositories::RepositoryError;
+use crate::repositories::{EmailMarketingConsent, RepositoryError};
 use crate::types::user::{User, UserAtprotoState, UserStatus};
 use chrono::{DateTime, TimeZone, Utc};
 use nostr_sdk::PublicKey;
@@ -17,6 +17,21 @@ pub type StatusTransition = (
 
 /// Data returned when looking up a user by verification token.
 /// Includes fields needed to check async bcrypt completion state.
+/// Inputs for [`UserRepository::register_unverified_with_personal_key`].
+#[derive(Debug, Clone, Copy)]
+pub struct RegisterUnverifiedParams<'a> {
+    pub pubkey: &'a str,
+    pub tenant_id: i64,
+    pub email: &'a str,
+    pub password_hash: &'a str,
+    pub verification_token: &'a str,
+    pub verification_expires_at: DateTime<Utc>,
+    pub encrypted_secret: &'a [u8],
+    pub marketing_consent: EmailMarketingConsent,
+    pub marketing_consent_source: Option<&'a str>,
+    pub marketing_consent_app_version: Option<&'a str>,
+}
+
 #[derive(Debug, FromRow)]
 pub struct VerificationTokenData {
     pub pubkey: String,
@@ -445,6 +460,7 @@ pub struct FullAdminStatusRow {
 #[derive(Debug, FromRow)]
 struct RotatedIdentityRow {
     username: Option<String>,
+    email_verified: bool,
     status: UserStatus,
     suspended_reason: Option<String>,
     suspended_at: Option<DateTime<Utc>>,
@@ -885,25 +901,74 @@ impl UserRepository {
         verification_expires_at: DateTime<Utc>,
         encrypted_secret: &[u8],
     ) -> Result<(), RepositoryError> {
+        self.register_unverified_with_personal_key(RegisterUnverifiedParams {
+            pubkey,
+            tenant_id,
+            email,
+            password_hash,
+            verification_token,
+            verification_expires_at,
+            encrypted_secret,
+            marketing_consent: EmailMarketingConsent::NeverAsked,
+            marketing_consent_source: None,
+            marketing_consent_app_version: None,
+        })
+        .await
+    }
+
+    /// Register an unconfirmed email/password account and its personal key atomically,
+    /// recording the marketing-consent answer given at sign-up.
+    ///
+    /// The consent is stamped now, but the email-marketing sync only reads confirmed addresses;
+    /// [`Self::verify_email`] re-stamps it when the address is confirmed so the sync picks it up.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepositoryError::Duplicate`] if the email or pubkey already exists.
+    pub async fn register_unverified_with_personal_key(
+        &self,
+        params: RegisterUnverifiedParams<'_>,
+    ) -> Result<(), RepositoryError> {
         let mut tx = self.pool.begin().await?;
         let now = Utc::now();
+        let consent = params.marketing_consent;
+        let consent_at = match consent {
+            EmailMarketingConsent::NeverAsked => None,
+            _ => Some(now),
+        };
+        let (consent_source, consent_app_version) = match consent {
+            EmailMarketingConsent::NeverAsked => (None, None),
+            _ => (
+                params.marketing_consent_source,
+                params.marketing_consent_app_version,
+            ),
+        };
 
         // Insert user with email verification token.
         sqlx::query(
-            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, email_verification_token, email_verification_expires_at, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified,
+                                email_verification_token, email_verification_expires_at,
+                                created_at, updated_at, email_marketing_consent,
+                                email_marketing_consent_at, email_marketing_consent_source,
+                                email_marketing_consent_app_version)
+             VALUES ($1, $2, $3, $4, false, $5, $6, $7, $7, $8, $9, $10, $11)",
         )
-        .bind(pubkey)
-        .bind(tenant_id)
-        .bind(email)
-        .bind(password_hash)
-        .bind(false)
-        .bind(verification_token)
-        .bind(verification_expires_at)
+        .bind(params.pubkey)
+        .bind(params.tenant_id)
+        .bind(params.email)
+        .bind(params.password_hash)
+        .bind(params.verification_token)
+        .bind(params.verification_expires_at)
         .bind(now)
-        .bind(now)
+        .bind(consent.as_str())
+        .bind(consent_at)
+        .bind(consent_source)
+        .bind(consent_app_version)
         .execute(&mut *tx)
         .await?;
+        let pubkey = params.pubkey;
+        let tenant_id = params.tenant_id;
+        let encrypted_secret = params.encrypted_secret;
 
         // Insert personal key
         sqlx::query(
@@ -944,10 +1009,18 @@ impl UserRepository {
     }
 
     /// Mark user's email as verified.
+    ///
+    /// A consent answer recorded while the address was unconfirmed is re-stamped here: the
+    /// email-marketing sync pages by consent time and only reads confirmed addresses, so without a
+    /// fresh stamp its cursor would already be past the answer.
     pub async fn verify_email(&self, pubkey: &str, tenant_id: i64) -> Result<(), RepositoryError> {
         sqlx::query(
             "UPDATE users
-             SET email_verified = true, updated_at = $1
+             SET email_verified = true, updated_at = $1,
+                 email_marketing_consent_at = CASE
+                     WHEN NOT email_verified AND email_marketing_consent_at IS NOT NULL THEN $1
+                     ELSE email_marketing_consent_at
+                 END
              WHERE pubkey = $2 AND tenant_id = $3",
         )
         .bind(Utc::now())
@@ -1114,6 +1187,10 @@ impl UserRepository {
                  email_verified = true,
                  email_verification_token = NULL,
                  email_verification_expires_at = NULL,
+                 email_marketing_consent_at = CASE
+                     WHEN NOT email_verified AND email_marketing_consent_at IS NOT NULL THEN $2
+                     ELSE email_marketing_consent_at
+                 END,
                  updated_at = $2
              WHERE pubkey = $3 AND tenant_id = $4",
         )
@@ -2273,8 +2350,8 @@ impl UserRepository {
         // or lands on the row after it is orphaned; an unlocked read would copy a stale
         // value onto the live account.
         let old_identity: RotatedIdentityRow = sqlx::query_as(
-            "SELECT username, status, suspended_reason, suspended_at, verified_minor, verified_minor_at, \
-                    email_marketing_consent, email_marketing_consent_at, \
+            "SELECT username, email_verified, status, suspended_reason, suspended_at, verified_minor, \
+                    verified_minor_at, email_marketing_consent, email_marketing_consent_at, \
                     email_marketing_consent_source, email_marketing_consent_app_version, \
                     email_marketing_global_optout, email_marketing_optout_observed_at \
              FROM users WHERE pubkey = $1 AND tenant_id = $2 FOR UPDATE",
@@ -2318,7 +2395,9 @@ impl UserRepository {
         .bind(tenant_id)
         .bind(email)
         .bind(password_hash)
-        .bind(true) // Keep email verified status
+        // Carry the confirmation state over: rotating the key must not confirm an address the
+        // owner never confirmed.
+        .bind(old_identity.email_verified)
         .bind(old_identity.username)
         .bind(old_identity.status.as_str())
         .bind(old_identity.suspended_reason)

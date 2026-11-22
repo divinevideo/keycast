@@ -102,6 +102,9 @@ pub async fn list_consents(
          FROM users
           WHERE tenant_id = $4
             AND email IS NOT NULL
+            -- An unconfirmed address may belong to someone else. Confirmation re-stamps
+            -- consent_at (UserRepository::verify_email), so the cursor reaches it then.
+            AND email_verified = true
             -- Load-bearing, not redundant beside the row comparison below. It is what lets the
             -- planner use the partial index idx_users_email_marketing_cursor: the tuple comparison
             -- alone does not prove NOT NULL, because the $1 IS NULL arm admits a NULL consent_at.

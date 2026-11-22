@@ -345,6 +345,7 @@ impl OAuthCodeRepository {
                      SELECT 1 FROM users
                      WHERE users.tenant_id = EXCLUDED.tenant_id
                        AND lower(users.email) = lower(EXCLUDED.pending_email)
+                       AND users.email_verified = true
                 )
               RETURNING device_code",
         )
@@ -375,11 +376,12 @@ impl OAuthCodeRepository {
 
         // An upsert that was already waiting on the pending-row lock uses the snapshot from before
         // materialization committed. Recheck in a new statement and roll back any stale-snapshot
-        // rewrite before exposing success.
+        // rewrite before exposing success. Only a confirmed owner counts: an account holding the
+        // address unconfirmed does not reserve it, and confirming this registration takes it over.
         let materialized: bool = sqlx::query_scalar(
             "SELECT EXISTS(
                 SELECT 1 FROM users
-                WHERE tenant_id = $1 AND lower(email) = lower($2)
+                WHERE tenant_id = $1 AND lower(email) = lower($2) AND email_verified = true
             )",
         )
         .bind(params.tenant_id)
@@ -482,6 +484,14 @@ impl OAuthCodeRepository {
                     UserMaterializationOutcome::DuplicateKey
                 }
                 _ => {
+                    Self::release_unconfirmed_email_holder(
+                        &mut tx,
+                        tenant_id,
+                        email,
+                        &pending.user_pubkey,
+                        now,
+                    )
+                    .await?;
                     let email_owner: Option<(String,)> = sqlx::query_as(
                         "SELECT pubkey FROM users
                          WHERE tenant_id = $1 AND email = $2 AND pubkey <> $3
@@ -541,6 +551,14 @@ impl OAuthCodeRepository {
                 }
             }
         } else {
+            Self::release_unconfirmed_email_holder(
+                &mut tx,
+                tenant_id,
+                email,
+                &pending.user_pubkey,
+                now,
+            )
+            .await?;
             let inserted: Option<(String,)> = sqlx::query_as(
                 "INSERT INTO users
                      (pubkey, tenant_id, email, password_hash, email_verified,
@@ -788,6 +806,37 @@ impl OAuthCodeRepository {
             .execute(&mut **tx)
             .await?;
         }
+        Ok(())
+    }
+
+    /// Release `email` from any other account that holds it unconfirmed.
+    ///
+    /// Whoever confirms an address gets it: an account created before its email was confirmed
+    /// does not reserve the address against someone who proves they own it. The released account
+    /// keeps its key and sessions but loses email sign-in, its pending confirmation link, and the
+    /// marketing answer it gave for that address. A confirmed owner is never touched.
+    async fn release_unconfirmed_email_holder(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        tenant_id: i64,
+        email: &str,
+        claimant_pubkey: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "UPDATE users
+             SET email = NULL, password_hash = NULL, email_verification_token = NULL,
+                 email_verification_expires_at = NULL, email_verification_sent_at = NULL,
+                 email_marketing_consent = 'never_asked', email_marketing_consent_at = NULL,
+                 email_marketing_consent_source = NULL,
+                 email_marketing_consent_app_version = NULL, updated_at = $4
+             WHERE tenant_id = $1 AND email = $2 AND pubkey <> $3 AND email_verified = false",
+        )
+        .bind(tenant_id)
+        .bind(email)
+        .bind(claimant_pubkey)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
         Ok(())
     }
 
