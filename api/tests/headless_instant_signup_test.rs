@@ -422,8 +422,28 @@ async fn a_confirmed_owner_still_blocks_registration() {
 }
 
 /// Headless sign-in no longer waits on confirmation and reports the state.
+async fn login(state: &AuthState, email: &str, instant_access: Option<bool>) -> Response {
+    let mut request = json!({
+        "email": email,
+        "password": PASSWORD,
+        "client_id": CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+    });
+    if let Some(flag) = instant_access {
+        request["instant_access"] = json!(flag);
+    }
+    headless::headless_login(
+        common::test_tenant(),
+        State(state.clone()),
+        HeaderMap::new(),
+        Json(serde_json::from_value(request).unwrap()),
+    )
+    .await
+    .into_response()
+}
+
 #[tokio::test]
-async fn headless_login_signs_in_an_unconfirmed_account() {
+async fn headless_login_signs_in_an_unconfirmed_account_that_opts_in() {
     let pool = common::setup_oauth_test_db().await;
     let state = auth_state_with_redis(pool.clone()).await;
     let email = format!("login-{}@example.com", Uuid::new_v4());
@@ -432,27 +452,60 @@ async fn headless_login_signs_in_an_unconfirmed_account() {
         .unwrap()
         .to_string();
 
-    let response = headless::headless_login(
-        common::test_tenant(),
-        State(state.clone()),
-        HeaderMap::new(),
-        Json(
-            serde_json::from_value(json!({
-                "email": email,
-                "password": PASSWORD,
-                "client_id": CLIENT_ID,
-                "redirect_uri": REDIRECT_URI,
-            }))
-            .unwrap(),
-        ),
-    )
-    .await
-    .into_response();
+    let response = login(&state, &email, Some(true)).await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
     assert_eq!(body["email_verified"], false);
     assert_eq!(body["pubkey"], pubkey.as_str());
     assert!(body["code"].as_str().is_some_and(|code| !code.is_empty()));
+
+    cleanup(&pool, &[pubkey], &email).await;
+}
+
+/// App builds that predate instant access never send the flag, so an unconfirmed account stays
+/// confirm-first for them: the same 403 they got before this change.
+#[tokio::test]
+async fn headless_login_without_the_flag_still_refuses_an_unconfirmed_account() {
+    let pool = common::setup_oauth_test_db().await;
+    let state = auth_state_with_redis(pool.clone()).await;
+    let email = format!("login-old-{}@example.com", Uuid::new_v4());
+    let pubkey = body_json(register(&state, &email, Some(true)).await).await["pubkey"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for flag in [None, Some(false)] {
+        let response = login(&state, &email, flag).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "flag {flag:?}");
+        let body = body_json(response).await;
+        assert_eq!(body["code"], "EMAIL_NOT_VERIFIED", "{body}");
+        assert!(body.get("email_verified").is_none(), "{body}");
+    }
+
+    cleanup(&pool, &[pubkey], &email).await;
+}
+
+/// A confirmed account signs in with or without the flag, and reports itself confirmed.
+#[tokio::test]
+async fn headless_login_signs_in_a_confirmed_account_either_way() {
+    let pool = common::setup_oauth_test_db().await;
+    let state = auth_state_with_redis(pool.clone()).await;
+    let email = format!("login-confirmed-{}@example.com", Uuid::new_v4());
+    let pubkey = body_json(register(&state, &email, Some(true)).await).await["pubkey"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    sqlx::query("UPDATE users SET email_verified = true WHERE pubkey = $1")
+        .bind(&pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    for flag in [None, Some(true)] {
+        let response = login(&state, &email, flag).await;
+        assert_eq!(response.status(), StatusCode::OK, "flag {flag:?}");
+        assert_eq!(body_json(response).await["email_verified"], true);
+    }
 
     cleanup(&pool, &[pubkey], &email).await;
 }

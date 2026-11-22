@@ -514,6 +514,9 @@ pub struct HeadlessLoginRequest {
     pub code_challenge_method: Option<String>,
     /// OAuth state parameter
     pub state: Option<String>,
+    /// Sign in even though the account's email is not confirmed yet. Sent only by app builds
+    /// that handle the unconfirmed state; everyone else keeps the confirm-first refusal.
+    pub instant_access: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -777,8 +780,38 @@ pub async fn headless_login(
         login_limiter_unavailable()
     })?;
 
-    // An unconfirmed email does not block headless sign-in: the app lets an account start before
-    // its address is confirmed and reports the state back so it can keep asking.
+    // An unconfirmed email blocks sign-in unless the caller opts in with `instant_access`, the
+    // same flag registration takes. App builds that predate instant access never send it, so
+    // they keep the confirm-first behaviour (and none of the newer app's confirmation nudges).
+    if !email_verified && !req.instant_access.unwrap_or(false) {
+        super::auth_observability::record_auth_event_and_log(
+            pool,
+            &headers,
+            None,
+            super::auth_observability::AuthEvent {
+                tenant_id,
+                endpoint,
+                event_type: "login",
+                outcome: "failure",
+                reason_code: Some("email_not_verified"),
+                http_status: 403,
+                email: Some(&req.email),
+                pubkey: Some(&public_key),
+                client_id: Some(&req.client_id),
+                redirect_origin: Some(&redirect_origin),
+                metadata_json: serde_json::json!({}),
+            },
+        )
+        .await;
+        tracing::warn!(
+            event = "headless_login",
+            tenant_id = tenant_id,
+            success = false,
+            reason = "email_not_verified",
+            "Headless login failed: email not verified"
+        );
+        return Err(HeadlessError::EmailNotVerified);
+    }
 
     // Generate authorization code
     let code: String = rand::thread_rng()
