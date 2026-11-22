@@ -515,3 +515,185 @@ async fn unconfirmed_user_sign_still_signs_public_events() {
     .await
     .expect("a public note signs");
 }
+
+// ============================================================================
+// Hourly caps until confirmation
+// ============================================================================
+
+/// Install Redis-backed caps small enough to hit in a test: 2 posts, 3 comments
+/// and 1 report per hour, under a key prefix no other test shares.
+async fn install_test_caps() {
+    let redis_url = std::env::var("TEST_REDIS_URL").expect("dedicated test Redis required");
+    let connection = redis::aio::ConnectionManager::new(redis::Client::open(redis_url).unwrap())
+        .await
+        .unwrap();
+    keycast_core::unconfirmed_email::install_caps(Arc::new(
+        keycast_api::unconfirmed_caps::RedisUnconfirmedCaps::new(
+            keycast_api::PrefixedRedis::new(
+                connection,
+                Some(format!("unconfirmed-caps-test:{}", Uuid::new_v4())),
+            ),
+            keycast_api::unconfirmed_caps::UnconfirmedCapsConfig {
+                post_limit: 2,
+                comment_limit: 3,
+                report_limit: 1,
+                window: std::time::Duration::from_secs(3600),
+            },
+        ),
+    ));
+}
+
+async fn rpc_sign(
+    tenant_id: i64,
+    auth_state: &AuthState,
+    account: &TestAccount,
+    kind: u16,
+) -> Result<NostrRpcResponse, RpcError> {
+    invoke_rpc(
+        tenant_id,
+        auth_state.clone(),
+        &account.token,
+        "sign_event",
+        vec![unsigned_json(kind, &account.keys, &[])],
+    )
+    .await
+}
+
+#[tokio::test]
+#[serial]
+async fn unconfirmed_rpc_posts_stop_at_the_hourly_cap() {
+    install_test_caps().await;
+    let (tenant_id, auth_state, account) = account(EmailState::Unconfirmed, false).await;
+
+    for _ in 0..2 {
+        rpc_sign(tenant_id, &auth_state, &account, 34236)
+            .await
+            .expect("posts under the cap sign");
+    }
+    let err = rpc_sign(tenant_id, &auth_state, &account, 34236)
+        .await
+        .expect_err("the third post in an hour is refused");
+    let RpcError::UnconfirmedRateLimited { retry_after } = err else {
+        panic!("expected the unconfirmed cap, got {err:?}");
+    };
+    assert!(retry_after > 0 && retry_after <= 3600, "{retry_after}");
+
+    let response = RpcError::UnconfirmedRateLimited { retry_after }.into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response.headers()["retry-after"].to_str().unwrap(),
+        retry_after.to_string()
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["code"], "UNCONFIRMED_RATE_LIMITED");
+
+    // Each category has its own budget, and everyday actions are uncapped.
+    rpc_sign(tenant_id, &auth_state, &account, 1111)
+        .await
+        .expect("comments have their own cap");
+    for _ in 0..5 {
+        rpc_sign(tenant_id, &auth_state, &account, 7)
+            .await
+            .expect("reactions are uncapped");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn unconfirmed_rpc_reports_have_the_tightest_cap() {
+    install_test_caps().await;
+    let (tenant_id, auth_state, account) = account(EmailState::Unconfirmed, false).await;
+
+    rpc_sign(tenant_id, &auth_state, &account, 1984)
+        .await
+        .expect("the first report signs");
+    assert!(matches!(
+        rpc_sign(tenant_id, &auth_state, &account, 1984).await,
+        Err(RpcError::UnconfirmedRateLimited { .. })
+    ));
+}
+
+#[tokio::test]
+#[serial]
+async fn confirmed_accounts_and_other_accounts_are_not_counted() {
+    install_test_caps().await;
+    let (tenant_id, auth_state, confirmed) = account(EmailState::Confirmed, false).await;
+    for _ in 0..4 {
+        rpc_sign(tenant_id, &auth_state, &confirmed, 34236)
+            .await
+            .expect("a confirmed account is never capped");
+    }
+
+    // Two unconfirmed accounts do not share a budget.
+    let (tenant_id, auth_state, first) = account(EmailState::Unconfirmed, false).await;
+    for _ in 0..2 {
+        rpc_sign(tenant_id, &auth_state, &first, 34236)
+            .await
+            .unwrap();
+    }
+    let (tenant_id, auth_state, second) = account(EmailState::Unconfirmed, false).await;
+    rpc_sign(tenant_id, &auth_state, &second, 34236)
+        .await
+        .expect("another account has its own budget");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_refused_dm_does_not_spend_the_comment_budget() {
+    install_test_caps().await;
+    let (tenant_id, auth_state, account) = account(EmailState::Unconfirmed, false).await;
+    let stranger = Keys::generate();
+
+    for _ in 0..5 {
+        invoke_rpc(
+            tenant_id,
+            auth_state.clone(),
+            &account.token,
+            "sign_event",
+            vec![unsigned_json(4, &account.keys, &[stranger.public_key()])],
+        )
+        .await
+        .expect_err("DMs stay refused");
+    }
+    for _ in 0..3 {
+        rpc_sign(tenant_id, &auth_state, &account, 1)
+            .await
+            .expect("the comment budget is untouched");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn unconfirmed_user_sign_posts_stop_at_the_hourly_cap() {
+    install_test_caps().await;
+    let (tenant_id, auth_state, account) = account(EmailState::Unconfirmed, false).await;
+
+    for _ in 0..2 {
+        invoke_user_sign(
+            tenant_id,
+            auth_state.clone(),
+            &account.token,
+            unsigned_json(22, &account.keys, &[]),
+        )
+        .await
+        .expect("posts under the cap sign");
+    }
+    let err = invoke_user_sign(
+        tenant_id,
+        auth_state,
+        &account.token,
+        unsigned_json(22, &account.keys, &[]),
+    )
+    .await
+    .expect_err("the third post is refused");
+    assert!(
+        matches!(err, AuthError::UnconfirmedRateLimited { retry_after } if retry_after > 0),
+        "{err:?}"
+    );
+    let response = err.into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+    assert!(response.headers().contains_key("retry-after"));
+}

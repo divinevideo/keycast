@@ -16,7 +16,9 @@ use keycast_core::signing_session::canonicalize_event_author;
 use keycast_core::types::authorization::Authorization;
 use keycast_core::types::oauth_authorization::OAuthAuthorization;
 use keycast_core::unconfirmed_email::{
-    DmGates, EMAIL_NOT_CONFIRMED_CODE, EMAIL_NOT_CONFIRMED_MESSAGE, EMAIL_UNCONFIRMED_SQL,
+    admit_signed_event, CapAdmission, DmGates, EMAIL_NOT_CONFIRMED_CODE,
+    EMAIL_NOT_CONFIRMED_MESSAGE, EMAIL_UNCONFIRMED_SQL, UNCONFIRMED_RATE_LIMITED_CODE,
+    UNCONFIRMED_RATE_LIMITED_MESSAGE,
 };
 use moka::future::Cache;
 use nostr_sdk::prelude::*;
@@ -753,7 +755,7 @@ impl Nip46Handler {
     /// the verified_minor DM containment gate (support-trust-safety#183).
     /// Both relay-dispatched (`handle_sign_event`) and direct
     /// (`sign_event_direct`) signing must pass through here.
-    async fn check_user_sign_gates(&self, unsigned_event: &UnsignedEvent) -> SignerResult<()> {
+    async fn check_user_sign_gates(&self, unsigned_event: &UnsignedEvent) -> SignerResult<DmGates> {
         // Not denied on account status (keycast#373); the row is still read so
         // the verified_minor gate below keeps applying in every status.
         let gates = self.user_gate_state(false).await?;
@@ -772,7 +774,7 @@ impl Nip46Handler {
                 dm_containment_refusal(gates)
             })?;
         }
-        Ok(())
+        Ok(gates)
     }
 
     /// Validate permissions before signing an event.
@@ -2438,7 +2440,7 @@ impl Nip46Handler {
         self.validate_group_authorization().await?;
 
         // Check account status, minor DM gate, and policy permissions before signing
-        self.check_user_sign_gates(&unsigned_event).await?;
+        let gates = self.check_user_sign_gates(&unsigned_event).await?;
         self.validate_permissions_for_sign(&unsigned_event).await?;
         // Recheck after the awaits: clock-derived expiry can fall due mid-request.
         self.ensure_authorization_active()?;
@@ -2464,6 +2466,21 @@ impl Nip46Handler {
             })?
         };
 
+        // Counted only once signed, so a request refused for another reason never spends
+        // an unconfirmed account's hourly budget. `/api/user/sign` counts its own fast path,
+        // which is why `sign_event_direct` does not.
+        if let CapAdmission::Limited { retry_after } = admit_signed_event(
+            self.tenant_id,
+            &self.user_keys.public_key().to_hex(),
+            signed_event.kind,
+            gates,
+        )
+        .await
+        {
+            return Err(SignerError::permission_denied(format!(
+                "{UNCONFIRMED_RATE_LIMITED_CODE}: {UNCONFIRMED_RATE_LIMITED_MESSAGE} Retry after {retry_after} seconds."
+            )));
+        }
         self.finish_group_signing(group, &signed_event).await?;
         tracing::debug!("Successfully signed event: {}", signed_event.id);
 

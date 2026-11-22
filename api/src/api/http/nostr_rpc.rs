@@ -20,7 +20,9 @@ use keycast_core::repositories::{
 use keycast_core::signing_session::{parse_cache_key, CacheKey, SigningSession};
 use keycast_core::traits::CustomPermission;
 use keycast_core::unconfirmed_email::{
-    DmGates, EMAIL_NOT_CONFIRMED_CODE, EMAIL_NOT_CONFIRMED_MESSAGE, EMAIL_UNCONFIRMED_SQL,
+    admit_signed_event, CapAdmission, DmGates, EMAIL_NOT_CONFIRMED_CODE,
+    EMAIL_NOT_CONFIRMED_MESSAGE, EMAIL_UNCONFIRMED_SQL, UNCONFIRMED_RATE_LIMITED_CODE,
+    UNCONFIRMED_RATE_LIMITED_MESSAGE,
 };
 use nostr_sdk::{Event, JsonUtil, Keys, PublicKey, UnsignedEvent};
 use secrecy::ExposeSecret;
@@ -117,6 +119,10 @@ pub enum RpcError {
     Internal(String),
     /// An account whose email is not confirmed asked for a DM-shaped operation.
     EmailNotConfirmed,
+    /// An account whose email is not confirmed hit an hourly cap.
+    UnconfirmedRateLimited {
+        retry_after: u32,
+    },
 }
 
 impl IntoResponse for RpcError {
@@ -129,6 +135,17 @@ impl IntoResponse for RpcError {
                     Json(NostrRpcResponse::coded_error(
                         EMAIL_NOT_CONFIRMED_MESSAGE,
                         EMAIL_NOT_CONFIRMED_CODE,
+                    )),
+                )
+                    .into_response();
+            }
+            RpcError::UnconfirmedRateLimited { retry_after } => {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("Retry-After", retry_after.to_string())],
+                    Json(NostrRpcResponse::coded_error(
+                        UNCONFIRMED_RATE_LIMITED_MESSAGE,
+                        UNCONFIRMED_RATE_LIMITED_CODE,
                     )),
                 )
                     .into_response();
@@ -290,6 +307,22 @@ async fn nostr_rpc_inner(
             // Handler validates expiration, revocation, and permissions (all cached)
             let signed =
                 observe_handler_operation(&req.method, handler.sign_event(unsigned_event)).await?;
+
+            // Counted only once the event is signed, so a request refused for any other
+            // reason never spends an unconfirmed account's hourly budget.
+            if let CapAdmission::Limited { retry_after } =
+                admit_signed_event(tenant_id, &handler.user_pubkey_hex(), signed.kind, dm_gates)
+                    .await
+            {
+                tracing::info!(
+                    event = "unconfirmed_caps.limited",
+                    user_pubkey = %handler.user_pubkey_hex(),
+                    kind = signed.kind.as_u16(),
+                    retry_after = retry_after,
+                    "Unconfirmed account hit its hourly cap"
+                );
+                return Err(RpcError::UnconfirmedRateLimited { retry_after });
+            }
 
             tracing::info!(
                 "RPC: Signed event {} kind={}",
@@ -517,7 +550,8 @@ fn http_rpc_outcome(response: &Result<Json<NostrRpcResponse>, RpcError>) -> &'st
         | Err(RpcError::UnsupportedMethod(_))
         | Err(RpcError::SigningFailed(_))
         | Err(RpcError::EncryptionFailed(_))
-        | Err(RpcError::DecryptionFailed(_)) => "client_error",
+        | Err(RpcError::DecryptionFailed(_))
+        | Err(RpcError::UnconfirmedRateLimited { .. }) => "client_error",
         Err(RpcError::AccountSuspended(_)) => "account_restricted",
         Err(RpcError::Unavailable(_)) => "unavailable",
         Err(RpcError::Timeout(_)) => "timeout",

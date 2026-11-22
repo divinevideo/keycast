@@ -535,6 +535,10 @@ pub enum AuthError {
     Forbidden(String), // User has no authorization for this origin
     /// An account with an unconfirmed email asked to sign a DM-shaped event.
     EmailNotConfirmed,
+    /// An account with an unconfirmed email hit an hourly cap.
+    UnconfirmedRateLimited {
+        retry_after: u32,
+    },
     KeyEgressDenied,     // Policy refuses raw-key egress for this account
     RegistrationExpired, // Async bcrypt timed out (instance died)
     /// The pending registration already completed token issuance; re-mint is refused
@@ -729,6 +733,17 @@ impl IntoResponse for AuthError {
                     keycast_core::unconfirmed_email::EMAIL_NOT_CONFIRMED_MESSAGE,
                     keycast_core::unconfirmed_email::EMAIL_NOT_CONFIRMED_CODE,
                 );
+            }
+            AuthError::UnconfirmedRateLimited { retry_after } => {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("Retry-After", retry_after.to_string())],
+                    Json(serde_json::json!({
+                        "error": keycast_core::unconfirmed_email::UNCONFIRMED_RATE_LIMITED_MESSAGE,
+                        "code": keycast_core::unconfirmed_email::UNCONFIRMED_RATE_LIMITED_CODE,
+                    })),
+                )
+                    .into_response();
             }
             AuthError::RegistrationExpired => (
                 StatusCode::GONE,
@@ -4245,6 +4260,36 @@ fn enforce_minor_dm_sign(
     })
 }
 
+/// Count a signed event against an unconfirmed account's hourly cap. Runs after
+/// signing so a request refused for any other reason never spends the budget.
+async fn admit_unconfirmed_signed_event(
+    tenant_id: i64,
+    user_pubkey: &str,
+    signed_event: &nostr_sdk::Event,
+    gates: keycast_core::unconfirmed_email::DmGates,
+) -> Result<(), AuthError> {
+    match keycast_core::unconfirmed_email::admit_signed_event(
+        tenant_id,
+        user_pubkey,
+        signed_event.kind,
+        gates,
+    )
+    .await
+    {
+        keycast_core::unconfirmed_email::CapAdmission::Admitted => Ok(()),
+        keycast_core::unconfirmed_email::CapAdmission::Limited { retry_after } => {
+            tracing::info!(
+                event = "unconfirmed_caps.limited",
+                user_pubkey = %user_pubkey,
+                kind = signed_event.kind.as_u16(),
+                retry_after = retry_after,
+                "Unconfirmed account hit its hourly cap (/user/sign)"
+            );
+            Err(AuthError::UnconfirmedRateLimited { retry_after })
+        }
+    }
+}
+
 /// Fast HTTP signing endpoint - sign an event without NIP-46 relay overhead
 /// This is 10-50x faster than NIP-46 for quick operations
 pub async fn sign_event(
@@ -4287,7 +4332,9 @@ pub async fn sign_event(
     // the fast and slow paths. Fetch the flag once here (only for DM-shaped
     // kinds) so the hot fast path returns a clean 403 too, rather than the
     // signer handler's error mapping to a 503. A missing user row fails closed.
-    let dm_gates = if keycast_core::verified_minor_dm::is_minor_gated_kind(unsigned_event.kind) {
+    let dm_gates = if keycast_core::verified_minor_dm::is_minor_gated_kind(unsigned_event.kind)
+        || keycast_core::unconfirmed_email::cap_category(unsigned_event.kind).is_some()
+    {
         user_repo
             .get_dm_gates(&user_pubkey, tenant_id)
             .await?
@@ -4326,6 +4373,9 @@ pub async fn sign_event(
                 .sign_event_direct(unsigned_event)
                 .await
                 .map_err(|e| AuthError::Internal(format!("Signing failed: {}", e)))?;
+
+            admit_unconfirmed_signed_event(tenant_id, &user_pubkey, &signed_event, dm_gates)
+                .await?;
 
             let signed_json = serde_json::to_value(&signed_event)
                 .map_err(|e| AuthError::Internal(format!("JSON serialization failed: {}", e)))?;
@@ -4377,6 +4427,8 @@ pub async fn sign_event(
         .sign(&keys)
         .await
         .map_err(|e| AuthError::Internal(format!("Signing failed: {}", e)))?;
+
+    admit_unconfirmed_signed_event(tenant_id, &user_pubkey, &signed_event, dm_gates).await?;
 
     // Convert to JSON
     let signed_json = serde_json::to_value(&signed_event)
