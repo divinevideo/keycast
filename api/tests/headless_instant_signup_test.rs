@@ -641,3 +641,74 @@ async fn registration_from_a_full_network_is_refused_before_any_account_work() {
         .unwrap();
     assert_eq!(created, 0, "a refused sign-up must not create an account");
 }
+
+/// Web and OAuth registration create the same permanent unconfirmed account, so they share the
+/// sign-up limits instead of offering a way around them.
+#[tokio::test]
+async fn web_and_oauth_registration_are_refused_from_a_full_network() {
+    let pool = common::setup_oauth_test_db().await;
+    let state = auth_state_with_redis(pool.clone()).await;
+    let network = from_network("203.0.113.90");
+    let defaults = SignupLimitConfig::default();
+    let limiter = test_limiter(&state, defaults);
+    for _ in 0..defaults.source_limit {
+        assert_eq!(
+            limiter.admit(common::test_tenant().0.id, &network).await,
+            SignupAdmission::Admitted
+        );
+    }
+    let email = format!("limited-web-{}@example.com", Uuid::new_v4());
+    let request = json!({
+        "email": email,
+        "password": PASSWORD,
+        "client_id": CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+    });
+
+    let web = auth::register(
+        common::test_tenant(),
+        State(state.clone()),
+        Extension(email_sender()),
+        network.clone(),
+        Json(serde_json::from_value(request.clone()).unwrap()),
+    )
+    .await
+    .into_response();
+    let oauth_response = oauth::oauth_register(
+        common::test_tenant(),
+        State(state.clone()),
+        Extension(email_sender()),
+        network,
+        Json(serde_json::from_value(request).unwrap()),
+    )
+    .await
+    .into_response();
+
+    for (endpoint, response) in [("web", web), ("oauth", oauth_response)] {
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "{endpoint} registration must be limited"
+        );
+        assert!(
+            response.headers().contains_key("retry-after"),
+            "{endpoint} says when to retry"
+        );
+        let body = body_json(response).await;
+        assert_eq!(body["code"], "TOO_MANY_ATTEMPTS", "{endpoint}: {body}");
+        assert_eq!(
+            body["error"],
+            keycast_api::signup_limiter::SIGNUP_RATE_LIMIT_MESSAGE,
+            "{endpoint}: {body}"
+        );
+    }
+    let created: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE email = $1")
+        .bind(&email)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        created, 0,
+        "a refused registration must not create an account"
+    );
+}

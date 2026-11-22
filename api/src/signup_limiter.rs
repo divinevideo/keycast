@@ -21,6 +21,11 @@ use sha2::{Digest, Sha256};
 use std::{env, sync::OnceLock, time::Duration};
 use uuid::Uuid;
 
+/// Body of a 429 from the sign-up admission limits, shared by every
+/// registration endpoint.
+pub const SIGNUP_RATE_LIMIT_MESSAGE: &str =
+    "Too many accounts have been created from this network recently. Please try again later.";
+
 /// Bound Redis itself so a live but unresponsive socket cannot hold up sign-up.
 const REDIS_OPERATION_TIMEOUT: Duration = Duration::from_millis(250);
 

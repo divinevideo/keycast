@@ -160,6 +160,7 @@ async fn all_new_password_paths_share_policy_without_changing_legacy_login() {
                 tenant(),
                 State(state.clone()),
                 Extension(sender.clone()),
+                axum::http::HeaderMap::new(),
                 Json(serde_json::from_value(request).unwrap()),
             )
             .await
@@ -274,6 +275,7 @@ async fn all_new_password_paths_share_policy_without_changing_legacy_login() {
                 tenant(),
                 State(state.clone()),
                 Extension(sender.clone()),
+                axum::http::HeaderMap::new(),
                 Json(serde_json::from_value(request).unwrap()),
             )
             .await

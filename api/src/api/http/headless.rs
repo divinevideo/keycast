@@ -28,11 +28,7 @@ use super::auth::{
 };
 use super::oauth::{extract_origin, parse_policy_scope};
 use crate::login_attempt_limiter::{LoginAttemptAdmission, LoginAttemptLimiter};
-use crate::signup_limiter::{SignupAdmission, SignupLimiter};
-
-/// Body of a 429 from the sign-up admission limits.
-const SIGNUP_RATE_LIMIT_MESSAGE: &str =
-    "Too many accounts have been created from this network recently. Please try again later.";
+use crate::signup_limiter::{SignupAdmission, SignupLimiter, SIGNUP_RATE_LIMIT_MESSAGE};
 
 // ============================================================================
 // Headless Registration

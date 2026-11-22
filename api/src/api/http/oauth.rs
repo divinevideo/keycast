@@ -417,6 +417,10 @@ pub enum OAuthError {
     TooManyRequests {
         retry_after: u32,
     },
+    /// Registration refused by the sign-up admission limits.
+    SignupRateLimited {
+        retry_after: u32,
+    },
 }
 
 impl OAuthError {
@@ -430,7 +434,9 @@ impl OAuthError {
             Self::Database(_) | Self::Encryption(_) | Self::ServiceUnavailable => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
-            Self::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
+            Self::TooManyRequests { .. } | Self::SignupRateLimited { .. } => {
+                StatusCode::TOO_MANY_REQUESTS
+            }
             Self::ServerError(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -513,6 +519,17 @@ impl IntoResponse for OAuthError {
                     [("Retry-After", retry_after.to_string())],
                     Json(serde_json::json!({
                         "error": LOGIN_RATE_LIMIT_MESSAGE,
+                        "code": TOO_MANY_ATTEMPTS_CODE,
+                    })),
+                )
+                    .into_response();
+            }
+            OAuthError::SignupRateLimited { retry_after } => {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("Retry-After", retry_after.to_string())],
+                    Json(serde_json::json!({
+                        "error": crate::signup_limiter::SIGNUP_RATE_LIMIT_MESSAGE,
                         "code": TOO_MANY_ATTEMPTS_CODE,
                     })),
                 )
@@ -3994,6 +4011,7 @@ pub async fn oauth_register(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
     axum::Extension(email_sender): axum::Extension<Arc<dyn EmailSender>>,
+    headers: HeaderMap,
     Json(mut req): Json<OAuthRegisterRequest>,
 ) -> Result<impl IntoResponse, OAuthError> {
     let pool = &auth_state.state.db;
@@ -4001,6 +4019,24 @@ pub async fn oauth_register(
 
     req.email = normalize_registration_email(&req.email).map_err(|_| OAuthError::InvalidEmail)?;
     validate_new_password(&req.password).map_err(OAuthError::WeakPassword)?;
+
+    // Shares the sign-up limits with headless and web registration, admitted before any
+    // database, password-hashing or key work.
+    let limiter = crate::signup_limiter::SignupLimiter::new(
+        auth_state.state.redis.clone(),
+        crate::signup_limiter::configured(),
+    );
+    if let crate::signup_limiter::SignupAdmission::Limited { retry_after } =
+        limiter.admit(tenant_id, &headers).await
+    {
+        tracing::warn!(
+            event = "oauth_registration_rate_limited",
+            tenant_id = tenant_id,
+            retry_after = retry_after,
+            "OAuth registration refused by sign-up limits"
+        );
+        return Err(OAuthError::SignupRateLimited { retry_after });
+    }
 
     tracing::info!(
         "OAuth popup registration for email: {} in tenant: {}, nsec: {}, pubkey: {}, client_id: {}",
@@ -5530,6 +5566,7 @@ mod tests {
             axum::Extension(std::sync::Arc::new(
                 crate::email_service::DevEmailSender::new(),
             )),
+            HeaderMap::new(),
             axum::Json(OAuthRegisterRequest {
                 email: "person@-example.com".to_string(),
                 password: "testpassword123".to_string(),

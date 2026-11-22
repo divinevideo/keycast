@@ -1160,7 +1160,7 @@ pub async fn register(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
     axum::Extension(email_sender): axum::Extension<Arc<dyn EmailSender>>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     Json(mut req): Json<RegisterRequest>,
 ) -> Result<impl axum::response::IntoResponse, AuthError> {
     let pool = &auth_state.state.db;
@@ -1169,6 +1169,27 @@ pub async fn register(
 
     req.email = normalize_registration_email(&req.email).map_err(|_| AuthError::InvalidEmail)?;
     validate_new_password(&req.password).map_err(AuthError::WeakPassword)?;
+
+    // Web registration creates the same permanent unconfirmed account as instant access, so it
+    // shares the sign-up limits, admitted before any database, password-hashing or key work.
+    let limiter = crate::signup_limiter::SignupLimiter::new(
+        auth_state.state.redis.clone(),
+        crate::signup_limiter::configured(),
+    );
+    if let crate::signup_limiter::SignupAdmission::Limited { retry_after } =
+        limiter.admit(tenant_id, &headers).await
+    {
+        tracing::warn!(
+            event = "registration_rate_limited",
+            tenant_id = tenant_id,
+            retry_after = retry_after,
+            "Registration refused by sign-up limits"
+        );
+        return Err(AuthError::TooManyRequests {
+            message: crate::signup_limiter::SIGNUP_RATE_LIMIT_MESSAGE.to_string(),
+            retry_after,
+        });
+    }
 
     let instance_id = keycast_core::instance::instance_id();
 
