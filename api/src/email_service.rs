@@ -33,6 +33,17 @@ pub struct CapturedEmail {
     pub pin: Option<String>,
 }
 
+/// Closing line of every verification email.
+///
+/// An account can be used before its email is confirmed, so clicking the link
+/// for an account someone else created would hand them this address. The line
+/// says so plainly instead of implying that clicking is harmless.
+fn not_you_line() -> String {
+    format!(
+        "Didn't sign up for {BRAND_NAME}? Don't click the link or enter the code. Just ignore this email, and nothing will happen."
+    )
+}
+
 /// Build the HTML body of a verification email.
 ///
 /// When `pin` is present (headless registrations, keycast#262), the body shows a 6-digit code the
@@ -67,7 +78,7 @@ fn verification_email_html(verification_url: &str, pin: Option<&str>) -> String 
                 </p>
                 {pin_block}
                 <p style="color: #666; font-size: 14px; margin-top: 30px;">
-                    If you didn't sign up for {brand}, you can safely ignore this email.
+                    {not_you}
                 </p>
             </body>
             </html>
@@ -75,6 +86,7 @@ fn verification_email_html(verification_url: &str, pin: Option<&str>) -> String 
         url = verification_url,
         brand = BRAND_NAME,
         pin_block = pin_block,
+        not_you = not_you_line(),
     )
 }
 
@@ -85,10 +97,10 @@ fn verification_email_text(verification_url: &str, pin: Option<&str>) -> String 
         None => String::new(),
     };
     format!(
-        "Thanks for signing up! Please verify your email address by clicking this link:\n\n{url}{pin_block}\n\nIf you didn't sign up for {brand}, you can safely ignore this email.",
+        "Thanks for signing up! Please verify your email address by clicking this link:\n\n{url}{pin_block}\n\n{not_you}",
         url = verification_url,
         pin_block = pin_block,
-        brand = BRAND_NAME
+        not_you = not_you_line(),
     )
 }
 
@@ -1028,6 +1040,21 @@ mod tests {
         // Link is still present alongside the PIN (two transports for the same proof).
         assert!(html.contains(url));
         assert!(text.contains(url));
+    }
+
+    #[test]
+    fn verification_email_bodies_tell_someone_who_did_not_sign_up_not_to_click() {
+        let url = "https://login.example/verify-email?token=abc";
+        for body in [
+            verification_email_html(url, Some("482913")),
+            verification_email_text(url, None),
+        ] {
+            assert!(
+                body.contains("Don't click the link or enter the code"),
+                "{body}"
+            );
+            assert!(!body.contains("safely ignore"), "{body}");
+        }
     }
 
     #[test]

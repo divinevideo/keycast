@@ -110,6 +110,17 @@ struct HttpRpcAcquireKey {
 
 type HttpRpcAcquireMetric = Histogram<{ HTTP_RPC_ACQUIRE_BUCKETS.len() }>;
 
+/// Outcomes recorded by [`Metrics::observe_signup_admission`].
+pub const SIGNUP_ADMISSION_OUTCOMES: [&str; 4] = [
+    "admitted",
+    "source_limited",
+    "global_limited",
+    "unavailable",
+];
+
+/// Outcomes recorded by [`Metrics::observe_unconfirmed_cap`].
+pub const UNCONFIRMED_CAP_OUTCOMES: [&str; 3] = ["admitted", "limited", "unavailable"];
+
 /// Global metrics counters accessible from any crate
 pub struct Metrics {
     // === NIP-46 Signer Daemon Metrics ===
@@ -253,6 +264,8 @@ pub struct Metrics {
     auth_email_send_failures_total: Mutex<BTreeMap<String, u64>>,
     email_delivery_admissions_total: Mutex<BTreeMap<EmailDeliveryKey, u64>>,
     email_delivery_source_subjects: [AtomicU64; 2],
+    signup_admissions_total: [AtomicU64; SIGNUP_ADMISSION_OUTCOMES.len()],
+    unconfirmed_caps_total: [[AtomicU64; UNCONFIRMED_CAP_OUTCOMES.len()]; 3],
     email_provider_outcomes_total: Mutex<BTreeMap<EmailProviderKey, u64>>,
     email_provider_durations: Mutex<BTreeMap<EmailProviderKey, EmailProviderDurationMetric>>,
     email_provider_in_flight: AtomicU64,
@@ -344,6 +357,10 @@ impl Metrics {
             auth_email_send_failures_total: Mutex::new(BTreeMap::new()),
             email_delivery_admissions_total: Mutex::new(BTreeMap::new()),
             email_delivery_source_subjects: std::array::from_fn(|_| AtomicU64::new(0)),
+            signup_admissions_total: std::array::from_fn(|_| AtomicU64::new(0)),
+            unconfirmed_caps_total: std::array::from_fn(|_| {
+                std::array::from_fn(|_| AtomicU64::new(0))
+            }),
             email_provider_outcomes_total: Mutex::new(BTreeMap::new()),
             email_provider_durations: Mutex::new(BTreeMap::new()),
             email_provider_in_flight: AtomicU64::new(0),
@@ -754,6 +771,38 @@ impl Metrics {
             .lock()
             .expect("email delivery admission metrics lock poisoned");
         *totals.entry(key).or_insert(0) += 1;
+    }
+
+    /// Count one unconfirmed-account cap decision. `outcome` is one of
+    /// [`UNCONFIRMED_CAP_OUTCOMES`]; anything else is ignored.
+    pub fn observe_unconfirmed_cap(
+        &self,
+        category: crate::unconfirmed_email::CapCategory,
+        outcome: &str,
+    ) {
+        let Some(row) = crate::unconfirmed_email::CapCategory::ALL
+            .iter()
+            .position(|known| *known == category)
+        else {
+            return;
+        };
+        if let Some(column) = UNCONFIRMED_CAP_OUTCOMES
+            .iter()
+            .position(|known| *known == outcome)
+        {
+            self.unconfirmed_caps_total[row][column].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Count one registration admission decision. `outcome` is one of
+    /// [`SIGNUP_ADMISSION_OUTCOMES`]; anything else is ignored.
+    pub fn observe_signup_admission(&self, outcome: &str) {
+        if let Some(index) = SIGNUP_ADMISSION_OUTCOMES
+            .iter()
+            .position(|known| *known == outcome)
+        {
+            self.signup_admissions_total[index].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn observe_email_delivery_source_subject(&self, derived: bool) {
@@ -1340,6 +1389,36 @@ impl Metrics {
             output.push_str(&format!(
                 "keycast_auth_requests_total{{endpoint=\"{}\",outcome=\"{}\",reason_code=\"{}\"}} {}\n",
                 key.endpoint, key.outcome, key.reason_code, count
+            ));
+        }
+
+        output.push_str(
+            "\n# HELP keycast_unconfirmed_caps_total Signed events from unconfirmed accounts counted against their hourly caps\n",
+        );
+        output.push_str("# TYPE keycast_unconfirmed_caps_total counter\n");
+        for (row, category) in crate::unconfirmed_email::CapCategory::ALL
+            .iter()
+            .enumerate()
+        {
+            for (column, outcome) in UNCONFIRMED_CAP_OUTCOMES.iter().enumerate() {
+                output.push_str(&format!(
+                    "keycast_unconfirmed_caps_total{{category=\"{}\",outcome=\"{}\"}} {}\n",
+                    category.as_str(),
+                    outcome,
+                    self.unconfirmed_caps_total[row][column].load(Ordering::Relaxed)
+                ));
+            }
+        }
+
+        output.push_str(
+            "\n# HELP keycast_signup_admissions_total Registration admission decisions by outcome\n",
+        );
+        output.push_str("# TYPE keycast_signup_admissions_total counter\n");
+        for (index, outcome) in SIGNUP_ADMISSION_OUTCOMES.iter().enumerate() {
+            output.push_str(&format!(
+                "keycast_signup_admissions_total{{outcome=\"{}\"}} {}\n",
+                outcome,
+                self.signup_admissions_total[index].load(Ordering::Relaxed)
             ));
         }
 

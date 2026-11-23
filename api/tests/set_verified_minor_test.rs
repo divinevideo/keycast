@@ -180,6 +180,7 @@ async fn test_set_verified_minor_sets_and_invalidates_cache() {
             keycast_api::state::AccountGateState::Present {
                 status: "active".to_string(),
                 verified_minor: false,
+                email_unconfirmed: false,
             },
         )
         .await;

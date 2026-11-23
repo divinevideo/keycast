@@ -19,6 +19,11 @@ use keycast_core::repositories::{
 };
 use keycast_core::signing_session::{parse_cache_key, CacheKey, SigningSession};
 use keycast_core::traits::CustomPermission;
+use keycast_core::unconfirmed_email::{
+    admit_signed_event, CapAdmission, DmGates, EMAIL_NOT_CONFIRMED_CODE,
+    EMAIL_NOT_CONFIRMED_MESSAGE, EMAIL_UNCONFIRMED_SQL, UNCONFIRMED_RATE_LIMITED_CODE,
+    UNCONFIRMED_RATE_LIMITED_MESSAGE,
+};
 use nostr_sdk::{Event, JsonUtil, Keys, PublicKey, UnsignedEvent};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
@@ -69,6 +74,9 @@ pub struct NostrRpcResponse {
     pub result: Option<JsonValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Machine-readable refusal code, set only for refusals a client is expected to explain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
 
 impl NostrRpcResponse {
@@ -76,6 +84,7 @@ impl NostrRpcResponse {
         Self {
             result: Some(result),
             error: None,
+            code: None,
         }
     }
 
@@ -83,6 +92,15 @@ impl NostrRpcResponse {
         Self {
             result: None,
             error: Some(message.into()),
+            code: None,
+        }
+    }
+
+    fn coded_error(message: impl Into<String>, code: impl Into<String>) -> Self {
+        Self {
+            result: None,
+            error: Some(message.into()),
+            code: Some(code.into()),
         }
     }
 }
@@ -99,12 +117,39 @@ pub enum RpcError {
     Unavailable(String),
     Timeout(String),
     Internal(String),
+    /// An account whose email is not confirmed asked for a DM-shaped operation.
+    EmailNotConfirmed,
+    /// An account whose email is not confirmed hit an hourly cap.
+    UnconfirmedRateLimited {
+        retry_after: u32,
+    },
 }
 
 impl IntoResponse for RpcError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             RpcError::Auth(e) => return e.into_response(),
+            RpcError::EmailNotConfirmed => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(NostrRpcResponse::coded_error(
+                        EMAIL_NOT_CONFIRMED_MESSAGE,
+                        EMAIL_NOT_CONFIRMED_CODE,
+                    )),
+                )
+                    .into_response();
+            }
+            RpcError::UnconfirmedRateLimited { retry_after } => {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("Retry-After", retry_after.to_string())],
+                    Json(NostrRpcResponse::coded_error(
+                        UNCONFIRMED_RATE_LIMITED_MESSAGE,
+                        UNCONFIRMED_RATE_LIMITED_CODE,
+                    )),
+                )
+                    .into_response();
+            }
             RpcError::AccountSuspended(msg) => (StatusCode::FORBIDDEN, msg),
             RpcError::InvalidParams(msg) => (StatusCode::BAD_REQUEST, msg),
             RpcError::UnsupportedMethod(method) => (
@@ -234,7 +279,7 @@ async fn nostr_rpc_inner(
     // `sign_event` still reads the row, because the verified_minor gate below
     // depends on it, but is not refused on account status (keycast#373).
     let needs_status_check = !matches!(req.method.as_str(), "get_public_key");
-    let verified_minor = if needs_status_check {
+    let dm_gates = if needs_status_check {
         let deny_when_restricted = req.method.as_str() != "sign_event";
         check_user_status_active(
             &auth_state.state.account_status_cache,
@@ -245,7 +290,7 @@ async fn nostr_rpc_inner(
         )
         .await?
     } else {
-        false
+        DmGates::default()
     };
 
     // Dispatch based on method - all permission checks use cached data (no DB hits)
@@ -255,13 +300,29 @@ async fn nostr_rpc_inner(
         "sign_event" => {
             let unsigned_event = parse_unsigned_event(&req.params)?;
 
-            if verified_minor {
-                enforce_minor_dm_sign(&handler, &unsigned_event)?;
+            if dm_gates.contained() {
+                enforce_minor_dm_sign(&handler, &unsigned_event, dm_gates)?;
             }
 
             // Handler validates expiration, revocation, and permissions (all cached)
             let signed =
                 observe_handler_operation(&req.method, handler.sign_event(unsigned_event)).await?;
+
+            // Counted only once the event is signed, so a request refused for any other
+            // reason never spends an unconfirmed account's hourly budget.
+            if let CapAdmission::Limited { retry_after } =
+                admit_signed_event(tenant_id, &handler.user_pubkey_hex(), signed.kind, dm_gates)
+                    .await
+            {
+                tracing::info!(
+                    event = "unconfirmed_caps.limited",
+                    user_pubkey = %handler.user_pubkey_hex(),
+                    kind = signed.kind.as_u16(),
+                    retry_after = retry_after,
+                    "Unconfirmed account hit its hourly cap"
+                );
+                return Err(RpcError::UnconfirmedRateLimited { retry_after });
+            }
 
             tracing::info!(
                 "RPC: Signed event {} kind={}",
@@ -297,8 +358,8 @@ async fn nostr_rpc_inner(
         "nip44_encrypt" => {
             let (recipient_pubkey, plaintext) = parse_encrypt_params(&req.params)?;
 
-            if verified_minor {
-                enforce_minor_dm_encrypt(&handler, &recipient_pubkey)?;
+            if dm_gates.contained() {
+                enforce_minor_dm_encrypt(&handler, &recipient_pubkey, dm_gates)?;
             }
 
             // Handler validates expiration, revocation, and permissions (all cached)
@@ -384,8 +445,8 @@ async fn nostr_rpc_inner(
                 return Err(RpcError::Auth(AuthError::InvalidToken));
             }
 
-            if verified_minor {
-                enforce_minor_dm_rumor(&handler, &batch.rumor)?;
+            if dm_gates.contained() {
+                enforce_minor_dm_rumor(&handler, &batch.rumor, dm_gates)?;
                 // Validate every parseable encryption target before building
                 // any slot. Malformed targets cannot receive a wrap and remain
                 // isolated as `invalid_recipient` slots.
@@ -394,7 +455,7 @@ async fn nostr_rpc_inner(
                     .iter()
                     .filter_map(|recipient| recipient.as_ref().ok())
                 {
-                    enforce_minor_dm_encrypt(&handler, recipient)?;
+                    enforce_minor_dm_encrypt(&handler, recipient, dm_gates)?;
                 }
             }
 
@@ -413,8 +474,8 @@ async fn nostr_rpc_inner(
         "nip04_encrypt" => {
             let (recipient_pubkey, plaintext) = parse_encrypt_params(&req.params)?;
 
-            if verified_minor {
-                enforce_minor_dm_encrypt(&handler, &recipient_pubkey)?;
+            if dm_gates.contained() {
+                enforce_minor_dm_encrypt(&handler, &recipient_pubkey, dm_gates)?;
             }
 
             // Handler validates expiration, revocation, and permissions (all cached)
@@ -483,12 +544,14 @@ fn map_repo_error(context: &str, error: keycast_core::repositories::RepositoryEr
 fn http_rpc_outcome(response: &Result<Json<NostrRpcResponse>, RpcError>) -> &'static str {
     match response {
         Ok(_) => "success",
-        Err(RpcError::Auth(_)) => "auth_error",
+        // Same bucket as the protected-minor refusal, which is an auth Forbidden.
+        Err(RpcError::Auth(_)) | Err(RpcError::EmailNotConfirmed) => "auth_error",
         Err(RpcError::InvalidParams(_))
         | Err(RpcError::UnsupportedMethod(_))
         | Err(RpcError::SigningFailed(_))
         | Err(RpcError::EncryptionFailed(_))
-        | Err(RpcError::DecryptionFailed(_)) => "client_error",
+        | Err(RpcError::DecryptionFailed(_))
+        | Err(RpcError::UnconfirmedRateLimited { .. }) => "client_error",
         Err(RpcError::AccountSuspended(_)) => "account_restricted",
         Err(RpcError::Unavailable(_)) => "unavailable",
         Err(RpcError::Timeout(_)) => "timeout",
@@ -587,7 +650,7 @@ async fn check_user_status_active(
     user_pubkey_hex: &str,
     tenant_id: i64,
     deny_when_restricted: bool,
-) -> Result<bool, RpcError> {
+) -> Result<DmGates, RpcError> {
     let status_started = Instant::now();
     METRICS.set_http_rpc_db_pool_state(pool.size(), pool.num_idle() as u32);
     let cache_key = (tenant_id, user_pubkey_hex.to_string());
@@ -631,17 +694,25 @@ async fn check_user_status_active(
         AccountGateState::Present {
             status,
             verified_minor,
-        } if status == "active" => Ok(verified_minor),
+            email_unconfirmed,
+        } if status == "active" => Ok(DmGates {
+            verified_minor,
+            email_unconfirmed,
+        }),
         AccountGateState::Present {
             status,
             verified_minor,
+            email_unconfirmed,
         } if !deny_when_restricted => {
             tracing::info!(
                 event = "rpc.sign_allowed_for_restricted_account",
                 status = %status,
                 "Signing allowed for a restricted account (keycast#373)"
             );
-            Ok(verified_minor)
+            Ok(DmGates {
+                verified_minor,
+                email_unconfirmed,
+            })
         }
         AccountGateState::Present { .. } => {
             Err(RpcError::AccountSuspended("Account restricted".to_string()))
@@ -687,9 +758,10 @@ async fn load_account_gate_state(
         }
     };
 
-    let status: Option<(String, bool)> = sqlx::query_as(
-        "SELECT status, verified_minor FROM users WHERE pubkey = $1 AND tenant_id = $2",
-    )
+    let status: Option<(String, bool, bool)> = sqlx::query_as(&format!(
+        "SELECT status, verified_minor, {EMAIL_UNCONFIRMED_SQL} FROM users \
+         WHERE pubkey = $1 AND tenant_id = $2"
+    ))
     .bind(user_pubkey_hex)
     .bind(tenant_id)
     .fetch_optional(&mut *conn)
@@ -700,9 +772,10 @@ async fn load_account_gate_state(
     })?;
 
     Ok(match status {
-        Some((status, verified_minor)) => AccountGateState::Present {
+        Some((status, verified_minor, email_unconfirmed)) => AccountGateState::Present {
             status,
             verified_minor,
+            email_unconfirmed,
         },
         None => AccountGateState::Missing,
     })
@@ -719,7 +792,7 @@ pub(crate) async fn invalidate_account_status_cache(
     METRICS.set_http_rpc_account_status_cache_size(cache.entry_count());
 }
 
-fn http_rpc_outcome_for_status_check(result: &Result<bool, RpcError>) -> &'static str {
+fn http_rpc_outcome_for_status_check(result: &Result<DmGates, RpcError>) -> &'static str {
     match result {
         Ok(_) => "success",
         Err(RpcError::Auth(_)) => "auth_error",
@@ -733,11 +806,24 @@ fn http_rpc_outcome_for_status_check(result: &Result<bool, RpcError>) -> &'stati
 /// the policy-denial message so account state is not leaked through error text.
 const MINOR_DM_DENIED_MSG: &str = "Operation denied by policy";
 
-/// Apply the verified_minor DM containment gate to a sign request
-/// (support-trust-safety#183). The denial detail is logged server-side only.
+/// The client-facing refusal for a DM containment denial. A protected minor gets
+/// the uniform policy denial; an account that is only unconfirmed gets a coded
+/// refusal its client can explain.
+fn dm_containment_refusal(gates: DmGates) -> RpcError {
+    if gates.verified_minor {
+        RpcError::Auth(AuthError::Forbidden(MINOR_DM_DENIED_MSG.into()))
+    } else {
+        RpcError::EmailNotConfirmed
+    }
+}
+
+/// Apply the DM containment gate to a sign request: protected minors
+/// (support-trust-safety#183) and unconfirmed emails share its rules. The
+/// denial detail is logged server-side only.
 fn enforce_minor_dm_sign(
     handler: &Arc<HttpRpcHandler>,
     unsigned: &UnsignedEvent,
+    gates: DmGates,
 ) -> Result<(), RpcError> {
     keycast_core::verified_minor_dm::validate_minor_sign(handler.keys(), unsigned).map_err(
         |denied| {
@@ -746,18 +832,21 @@ fn enforce_minor_dm_sign(
                 user_pubkey = %handler.user_pubkey_hex(),
                 kind = unsigned.kind.as_u16(),
                 reason = %denied,
-                "verified_minor DM sign refused"
+                verified_minor = gates.verified_minor,
+                email_unconfirmed = gates.email_unconfirmed,
+                "DM containment sign refused"
             );
-            RpcError::Auth(AuthError::Forbidden(MINOR_DM_DENIED_MSG.into()))
+            dm_containment_refusal(gates)
         },
     )
 }
 
-/// Apply the verified_minor DM containment gate to an encrypt request
-/// (support-trust-safety#183). The denial detail is logged server-side only.
+/// Apply the DM containment gate to an encrypt request. The denial detail is
+/// logged server-side only.
 fn enforce_minor_dm_encrypt(
     handler: &Arc<HttpRpcHandler>,
     recipient: &PublicKey,
+    gates: DmGates,
 ) -> Result<(), RpcError> {
     keycast_core::verified_minor_dm::validate_minor_encrypt(&handler.public_key(), recipient)
         .map_err(|denied| {
@@ -766,17 +855,20 @@ fn enforce_minor_dm_encrypt(
                 user_pubkey = %handler.user_pubkey_hex(),
                 recipient = %recipient.to_hex(),
                 reason = %denied,
-                "verified_minor DM encrypt refused"
+                verified_minor = gates.verified_minor,
+                email_unconfirmed = gates.email_unconfirmed,
+                "DM containment encrypt refused"
             );
-            RpcError::Auth(AuthError::Forbidden(MINOR_DM_DENIED_MSG.into()))
+            dm_containment_refusal(gates)
         })
 }
 
-/// Apply the verified_minor containment gate to an already-parsed raw rumor
-/// before Keycast composes any per-recipient seals.
+/// Apply the DM containment gate to an already-parsed raw rumor before Keycast
+/// composes any per-recipient seals.
 fn enforce_minor_dm_rumor(
     handler: &Arc<HttpRpcHandler>,
     rumor: &UnsignedEvent,
+    gates: DmGates,
 ) -> Result<(), RpcError> {
     keycast_core::verified_minor_dm::validate_minor_rumor_recipients(&handler.public_key(), rumor)
         .map_err(|denied| {
@@ -785,9 +877,11 @@ fn enforce_minor_dm_rumor(
                 user_pubkey = %handler.user_pubkey_hex(),
                 kind = rumor.kind.as_u16(),
                 reason = %denied,
-                "verified_minor NIP-17 rumor refused"
+                verified_minor = gates.verified_minor,
+                email_unconfirmed = gates.email_unconfirmed,
+                "DM containment NIP-17 rumor refused"
             );
-            RpcError::Auth(AuthError::Forbidden(MINOR_DM_DENIED_MSG.into()))
+            dm_containment_refusal(gates)
         })
 }
 

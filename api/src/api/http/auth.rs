@@ -532,7 +532,13 @@ pub enum AuthError {
         description: String,
     },
     BadRequest(String),
-    Forbidden(String),   // User has no authorization for this origin
+    Forbidden(String), // User has no authorization for this origin
+    /// An account with an unconfirmed email asked to sign a DM-shaped event.
+    EmailNotConfirmed,
+    /// An account with an unconfirmed email hit an hourly cap.
+    UnconfirmedRateLimited {
+        retry_after: u32,
+    },
     KeyEgressDenied,     // Policy refuses raw-key egress for this account
     RegistrationExpired, // Async bcrypt timed out (instance died)
     /// The pending registration already completed token issuance; re-mint is refused
@@ -720,6 +726,24 @@ impl IntoResponse for AuthError {
                     KEY_EGRESS_DENIED_MESSAGE,
                     KEY_EGRESS_DENIED_CODE,
                 );
+            }
+            AuthError::EmailNotConfirmed => {
+                return coded_error_response(
+                    StatusCode::FORBIDDEN,
+                    keycast_core::unconfirmed_email::EMAIL_NOT_CONFIRMED_MESSAGE,
+                    keycast_core::unconfirmed_email::EMAIL_NOT_CONFIRMED_CODE,
+                );
+            }
+            AuthError::UnconfirmedRateLimited { retry_after } => {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("Retry-After", retry_after.to_string())],
+                    Json(serde_json::json!({
+                        "error": keycast_core::unconfirmed_email::UNCONFIRMED_RATE_LIMITED_MESSAGE,
+                        "code": keycast_core::unconfirmed_email::UNCONFIRMED_RATE_LIMITED_CODE,
+                    })),
+                )
+                    .into_response();
             }
             AuthError::RegistrationExpired => (
                 StatusCode::GONE,
@@ -1136,7 +1160,7 @@ pub async fn register(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
     axum::Extension(email_sender): axum::Extension<Arc<dyn EmailSender>>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     Json(mut req): Json<RegisterRequest>,
 ) -> Result<impl axum::response::IntoResponse, AuthError> {
     let pool = &auth_state.state.db;
@@ -1145,6 +1169,27 @@ pub async fn register(
 
     req.email = normalize_registration_email(&req.email).map_err(|_| AuthError::InvalidEmail)?;
     validate_new_password(&req.password).map_err(AuthError::WeakPassword)?;
+
+    // Web registration creates the same permanent unconfirmed account as instant access, so it
+    // shares the sign-up limits, admitted before any database, password-hashing or key work.
+    let limiter = crate::signup_limiter::SignupLimiter::new(
+        auth_state.state.redis.clone(),
+        crate::signup_limiter::configured(),
+    );
+    if let crate::signup_limiter::SignupAdmission::Limited { retry_after } =
+        limiter.admit(tenant_id, &headers).await
+    {
+        tracing::warn!(
+            event = "registration_rate_limited",
+            tenant_id = tenant_id,
+            retry_after = retry_after,
+            "Registration refused by sign-up limits"
+        );
+        return Err(AuthError::TooManyRequests {
+            message: crate::signup_limiter::SIGNUP_RATE_LIMIT_MESSAGE.to_string(),
+            retry_after,
+        });
+    }
 
     let instance_id = keycast_core::instance::instance_id();
 
@@ -4205,15 +4250,18 @@ pub struct PubkeyResponse {
     pub npub: String,   // bech32 format
 }
 
-/// Apply the verified_minor DM containment gate (support-trust-safety#183) to a
-/// `/user/sign` request, on either the fast or slow path. Refusals surface the
-/// uniform policy-denial message (no account-state leak); the specific reason is
-/// logged server-side only. `keys` is the user's signing keypair (needed to
-/// recover a kind-13 seal's recipient by trial decryption).
+/// Apply the DM containment gate to a `/user/sign` request, on either the fast
+/// or slow path. Protected minors (support-trust-safety#183) and accounts with
+/// an unconfirmed email share its rules. A minor gets the uniform policy-denial
+/// message (no account-state leak); an unconfirmed account gets a coded refusal
+/// its client can explain. The specific reason is logged server-side only.
+/// `keys` is the user's signing keypair (needed to recover a kind-13 seal's
+/// recipient by trial decryption).
 fn enforce_minor_dm_sign(
     keys: &Keys,
     unsigned_event: &UnsignedEvent,
     user_pubkey: &str,
+    gates: keycast_core::unconfirmed_email::DmGates,
 ) -> Result<(), AuthError> {
     keycast_core::verified_minor_dm::validate_minor_sign(keys, unsigned_event).map_err(|denied| {
         tracing::warn!(
@@ -4221,10 +4269,46 @@ fn enforce_minor_dm_sign(
             user_pubkey = %user_pubkey,
             kind = unsigned_event.kind.as_u16(),
             reason = %denied,
-            "verified_minor DM sign refused (/user/sign)"
+            verified_minor = gates.verified_minor,
+            email_unconfirmed = gates.email_unconfirmed,
+            "DM containment sign refused (/user/sign)"
         );
-        AuthError::Forbidden("Operation denied by policy".to_string())
+        if gates.verified_minor {
+            AuthError::Forbidden("Operation denied by policy".to_string())
+        } else {
+            AuthError::EmailNotConfirmed
+        }
     })
+}
+
+/// Count a signed event against an unconfirmed account's hourly cap. Runs after
+/// signing so a request refused for any other reason never spends the budget.
+async fn admit_unconfirmed_signed_event(
+    tenant_id: i64,
+    user_pubkey: &str,
+    signed_event: &nostr_sdk::Event,
+    gates: keycast_core::unconfirmed_email::DmGates,
+) -> Result<(), AuthError> {
+    match keycast_core::unconfirmed_email::admit_signed_event(
+        tenant_id,
+        user_pubkey,
+        signed_event.kind,
+        gates,
+    )
+    .await
+    {
+        keycast_core::unconfirmed_email::CapAdmission::Admitted => Ok(()),
+        keycast_core::unconfirmed_email::CapAdmission::Limited { retry_after } => {
+            tracing::info!(
+                event = "unconfirmed_caps.limited",
+                user_pubkey = %user_pubkey,
+                kind = signed_event.kind.as_u16(),
+                retry_after = retry_after,
+                "Unconfirmed account hit its hourly cap (/user/sign)"
+            );
+            Err(AuthError::UnconfirmedRateLimited { retry_after })
+        }
+    }
 }
 
 /// Fast HTTP signing endpoint - sign an event without NIP-46 relay overhead
@@ -4269,16 +4353,16 @@ pub async fn sign_event(
     // the fast and slow paths. Fetch the flag once here (only for DM-shaped
     // kinds) so the hot fast path returns a clean 403 too, rather than the
     // signer handler's error mapping to a 503. A missing user row fails closed.
-    let verified_minor =
-        if keycast_core::verified_minor_dm::is_minor_gated_kind(unsigned_event.kind) {
-            user_repo
-                .get_verified_minor(&user_pubkey, tenant_id)
-                .await?
-                .ok_or_else(|| AuthError::Forbidden("Operation denied by policy".to_string()))?
-                .verified_minor
-        } else {
-            false
-        };
+    let dm_gates = if keycast_core::verified_minor_dm::is_minor_gated_kind(unsigned_event.kind)
+        || keycast_core::unconfirmed_email::cap_category(unsigned_event.kind).is_some()
+    {
+        user_repo
+            .get_dm_gates(&user_pubkey, tenant_id)
+            .await?
+            .ok_or_else(|| AuthError::Forbidden("Operation denied by policy".to_string()))?
+    } else {
+        keycast_core::unconfirmed_email::DmGates::default()
+    };
 
     // FAST PATH: sign through the cached handler for the token's own
     // authorization (checked above). Tokens without one take the slow path.
@@ -4297,14 +4381,22 @@ pub async fn sign_event(
             // DM containment on the fast path returns a clean 403 here; the
             // signer handler also gates as a backstop, but its error would
             // map to a 503 through the Internal wrapper below.
-            if verified_minor {
-                enforce_minor_dm_sign(&handler.get_keys(), &unsigned_event, &user_pubkey)?;
+            if dm_gates.contained() {
+                enforce_minor_dm_sign(
+                    &handler.get_keys(),
+                    &unsigned_event,
+                    &user_pubkey,
+                    dm_gates,
+                )?;
             }
 
             let signed_event = handler
                 .sign_event_direct(unsigned_event)
                 .await
                 .map_err(|e| AuthError::Internal(format!("Signing failed: {}", e)))?;
+
+            admit_unconfirmed_signed_event(tenant_id, &user_pubkey, &signed_event, dm_gates)
+                .await?;
 
             let signed_json = serde_json::to_value(&signed_event)
                 .map_err(|e| AuthError::Internal(format!("JSON serialization failed: {}", e)))?;
@@ -4345,9 +4437,9 @@ pub async fn sign_event(
     let keys = Keys::new(secret_key.into());
 
     // verified_minor DM containment on the slow path (support-trust-safety#183);
-    // `verified_minor` was resolved once above and shared with the fast path.
-    if verified_minor {
-        enforce_minor_dm_sign(&keys, &unsigned_event, &user_pubkey)?;
+    // `dm_gates` was resolved once above and shared with the fast path.
+    if dm_gates.contained() {
+        enforce_minor_dm_sign(&keys, &unsigned_event, &user_pubkey, dm_gates)?;
     }
 
     // Permission validation already done above (before fast path check)
@@ -4356,6 +4448,8 @@ pub async fn sign_event(
         .sign(&keys)
         .await
         .map_err(|e| AuthError::Internal(format!("Signing failed: {}", e)))?;
+
+    admit_unconfirmed_signed_event(tenant_id, &user_pubkey, &signed_event, dm_gates).await?;
 
     // Convert to JSON
     let signed_json = serde_json::to_value(&signed_event)
@@ -4712,7 +4806,7 @@ pub async fn change_email(
     }
 
     // No-op if the address is unchanged.
-    if new_email == current_email {
+    if current_email.as_deref() == Some(new_email.as_str()) {
         return Ok(Json(ChangeEmailResponse {
             success: true,
             message: "That is already your email address.".to_string(),
@@ -4829,6 +4923,7 @@ pub async fn change_email(
             &old_token,
             &new_token,
             expires,
+            current_email.is_some(),
         )
         .await
     {
@@ -4841,9 +4936,16 @@ pub async fn change_email(
     let new_outcome = email_delivery
         .send_email_change_new(&new_email, &new_token)
         .await;
-    let old_outcome = email_delivery
-        .send_email_change_old(&current_email, &new_email, &old_token)
-        .await;
+    // An account with no current address (one released by an email handover) has nobody to
+    // notify on the old side; that side was stored as already confirmed.
+    let old_outcome = match current_email.as_deref() {
+        Some(current_email) => Some(
+            email_delivery
+                .send_email_change_old(current_email, &new_email, &old_token)
+                .await,
+        ),
+        None => None,
+    };
     reservation.release().await;
     record_provider_event(
         &pool,
@@ -4855,16 +4957,18 @@ pub async fn change_email(
         Some(&user_pubkey),
     )
     .await;
-    record_provider_event(
-        &pool,
-        &headers,
-        tenant_id,
-        "/api/user/change-email",
-        EmailDeliveryPurpose::EmailChangeOld,
-        &old_outcome,
-        Some(&user_pubkey),
-    )
-    .await;
+    if let Some(old_outcome) = &old_outcome {
+        record_provider_event(
+            &pool,
+            &headers,
+            tenant_id,
+            "/api/user/change-email",
+            EmailDeliveryPurpose::EmailChangeOld,
+            old_outcome,
+            Some(&user_pubkey),
+        )
+        .await;
+    }
 
     record_email_change_event(
         &pool,
@@ -5553,6 +5657,10 @@ pub async fn change_key(
             .get_credentials(&old_pubkey, tenant_id)
             .await?
             .ok_or(AuthError::UserNotFound)?;
+        // The new key's session names the account's email, so an account without one adds it first.
+        let email = email.ok_or_else(|| {
+            account_incomplete("Add an email to your account before changing its key.")
+        })?;
         let valid = verifier
             .verify(SecretString::from(password), password_hash.clone())
             .await
@@ -8388,6 +8496,7 @@ mod tests {
                 crate::state::AccountGateState::Present {
                     status: "active".to_string(),
                     verified_minor: false,
+                    email_unconfirmed: false,
                 },
             )
             .await;

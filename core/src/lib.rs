@@ -28,4 +28,5 @@ pub mod signing_session;
 pub mod tenant_query;
 pub mod traits;
 pub mod types;
+pub mod unconfirmed_email;
 pub mod verified_minor_dm;

@@ -15,6 +15,11 @@ use keycast_core::signing_handler::SigningHandler;
 use keycast_core::signing_session::canonicalize_event_author;
 use keycast_core::types::authorization::Authorization;
 use keycast_core::types::oauth_authorization::OAuthAuthorization;
+use keycast_core::unconfirmed_email::{
+    admit_signed_event, CapAdmission, DmGates, EMAIL_NOT_CONFIRMED_CODE,
+    EMAIL_NOT_CONFIRMED_MESSAGE, EMAIL_UNCONFIRMED_SQL, UNCONFIRMED_RATE_LIMITED_CODE,
+    UNCONFIRMED_RATE_LIMITED_MESSAGE,
+};
 use moka::future::Cache;
 use nostr_sdk::prelude::*;
 use secrecy::{ExposeSecret, SecretString};
@@ -97,6 +102,19 @@ const GROUP_AUTHORIZATION_STATE: &str = "
         AND m.group_id = g.id AND m.admin_pubkey = gg.admin_pubkey
     LEFT JOIN users u ON u.tenant_id = m.tenant_id AND u.pubkey = m.admin_pubkey
     WHERE g.tenant_id = $2";
+
+/// The NIP-46 error for a DM containment denial. A protected minor gets the
+/// uniform policy denial (no account-state leak); an account that is only
+/// unconfirmed gets a message naming the code its client can explain.
+fn dm_containment_refusal(gates: DmGates) -> SignerError {
+    if gates.verified_minor {
+        SignerError::permission_denied("Operation denied by policy")
+    } else {
+        SignerError::permission_denied(format!(
+            "{EMAIL_NOT_CONFIRMED_CODE}: {EMAIL_NOT_CONFIRMED_MESSAGE}"
+        ))
+    }
+}
 
 /// NIP-46 handler for a single authorization
 ///
@@ -675,7 +693,7 @@ impl Nip46Handler {
     ///
     /// Returns the account's `verified_minor` flag (same row, no extra query)
     /// so callers can apply the DM containment gate (support-trust-safety#183).
-    async fn check_user_active(&self) -> SignerResult<bool> {
+    async fn check_user_active(&self) -> SignerResult<DmGates> {
         self.user_gate_state(true).await
     }
 
@@ -690,31 +708,43 @@ impl Nip46Handler {
     /// not whether the identity can act off Divine. Encrypt and decrypt keep
     /// denying: those are communication capabilities, and re-enabling them for
     /// restricted accounts is a separate decision.
-    async fn user_gate_state(&self, deny_when_restricted: bool) -> SignerResult<bool> {
+    async fn user_gate_state(&self, deny_when_restricted: bool) -> SignerResult<DmGates> {
         if !self.is_oauth {
-            return Ok(self
-                .validate_group_authorization()
-                .await?
-                .is_some_and(|group| group.verified_minor));
+            // Group and team keys are not a person's account, so only the acting
+            // admin's minor designation applies; there is no email to confirm.
+            return Ok(DmGates {
+                verified_minor: self
+                    .validate_group_authorization()
+                    .await?
+                    .is_some_and(|group| group.verified_minor),
+                email_unconfirmed: false,
+            });
         }
         let user_pubkey = self.user_keys.public_key().to_hex();
-        let status: Option<(String, bool)> = sqlx::query_as(
-            "SELECT status, verified_minor FROM users WHERE pubkey = $1 AND tenant_id = $2",
-        )
+        let status: Option<(String, bool, bool)> = sqlx::query_as(&format!(
+            "SELECT status, verified_minor, {EMAIL_UNCONFIRMED_SQL} FROM users \
+             WHERE pubkey = $1 AND tenant_id = $2"
+        ))
         .bind(&user_pubkey)
         .bind(self.tenant_id)
         .fetch_optional(&self.pool)
         .await?;
 
         match status {
-            Some((s, verified_minor)) if s == "active" => Ok(verified_minor),
-            Some((s, verified_minor)) if !deny_when_restricted => {
+            Some((s, verified_minor, email_unconfirmed)) if s == "active" => Ok(DmGates {
+                verified_minor,
+                email_unconfirmed,
+            }),
+            Some((s, verified_minor, email_unconfirmed)) if !deny_when_restricted => {
                 tracing::info!(
                     event = "signer.sign_allowed_for_restricted_account",
                     status = %s,
                     "Signing allowed for a restricted account (keycast#373)"
                 );
-                Ok(verified_minor)
+                Ok(DmGates {
+                    verified_minor,
+                    email_unconfirmed,
+                })
             }
             Some(_) => Err(SignerError::permission_denied("Account restricted")),
             None => Err(SignerError::permission_denied("User not found")),
@@ -725,11 +755,11 @@ impl Nip46Handler {
     /// the verified_minor DM containment gate (support-trust-safety#183).
     /// Both relay-dispatched (`handle_sign_event`) and direct
     /// (`sign_event_direct`) signing must pass through here.
-    async fn check_user_sign_gates(&self, unsigned_event: &UnsignedEvent) -> SignerResult<()> {
+    async fn check_user_sign_gates(&self, unsigned_event: &UnsignedEvent) -> SignerResult<DmGates> {
         // Not denied on account status (keycast#373); the row is still read so
         // the verified_minor gate below keeps applying in every status.
-        let verified_minor = self.user_gate_state(false).await?;
-        if verified_minor {
+        let gates = self.user_gate_state(false).await?;
+        if gates.contained() {
             keycast_core::verified_minor_dm::validate_minor_sign(&self.user_keys, unsigned_event)
                 .map_err(|denied| {
                 tracing::warn!(
@@ -737,12 +767,14 @@ impl Nip46Handler {
                     user_pubkey = %self.user_keys.public_key().to_hex(),
                     kind = unsigned_event.kind.as_u16(),
                     reason = %denied,
-                    "verified_minor DM sign refused (NIP-46 signer)"
+                    verified_minor = gates.verified_minor,
+                    email_unconfirmed = gates.email_unconfirmed,
+                    "DM containment sign refused (NIP-46 signer)"
                 );
-                SignerError::permission_denied("Operation denied by policy")
+                dm_containment_refusal(gates)
             })?;
         }
-        Ok(())
+        Ok(gates)
     }
 
     /// Validate permissions before signing an event.
@@ -797,11 +829,11 @@ impl Nip46Handler {
         plaintext: &str,
         recipient_pubkey: &PublicKey,
     ) -> SignerResult<()> {
-        let verified_minor = self.check_user_active().await?;
-        // verified_minor DM containment (support-trust-safety#183): the
+        let gates = self.check_user_active().await?;
+        // DM containment (support-trust-safety#183, and unconfirmed emails): the
         // encryption primitive is where a NIP-17 seal's recipient is in the
         // clear, so this is the containment point for DM egress.
-        if verified_minor {
+        if gates.contained() {
             keycast_core::verified_minor_dm::validate_minor_encrypt(
                 &self.user_keys.public_key(),
                 recipient_pubkey,
@@ -812,9 +844,11 @@ impl Nip46Handler {
                     user_pubkey = %self.user_keys.public_key().to_hex(),
                     recipient = %recipient_pubkey.to_hex(),
                     reason = %denied,
-                    "verified_minor DM encrypt refused (NIP-46 signer)"
+                    verified_minor = gates.verified_minor,
+                    email_unconfirmed = gates.email_unconfirmed,
+                    "DM containment encrypt refused (NIP-46 signer)"
                 );
-                SignerError::permission_denied("Operation denied by policy")
+                dm_containment_refusal(gates)
             })?;
         }
         // Load permissions based on authorization type
@@ -2406,7 +2440,7 @@ impl Nip46Handler {
         self.validate_group_authorization().await?;
 
         // Check account status, minor DM gate, and policy permissions before signing
-        self.check_user_sign_gates(&unsigned_event).await?;
+        let gates = self.check_user_sign_gates(&unsigned_event).await?;
         self.validate_permissions_for_sign(&unsigned_event).await?;
         // Recheck after the awaits: clock-derived expiry can fall due mid-request.
         self.ensure_authorization_active()?;
@@ -2432,6 +2466,21 @@ impl Nip46Handler {
             })?
         };
 
+        // Counted only once signed, so a request refused for another reason never spends
+        // an unconfirmed account's hourly budget. `/api/user/sign` counts its own fast path,
+        // which is why `sign_event_direct` does not.
+        if let CapAdmission::Limited { retry_after } = admit_signed_event(
+            self.tenant_id,
+            &self.user_keys.public_key().to_hex(),
+            signed_event.kind,
+            gates,
+        )
+        .await
+        {
+            return Err(SignerError::permission_denied(format!(
+                "{UNCONFIRMED_RATE_LIMITED_CODE}: {UNCONFIRMED_RATE_LIMITED_MESSAGE} Retry after {retry_after} seconds."
+            )));
+        }
         self.finish_group_signing(group, &signed_event).await?;
         tracing::debug!("Successfully signed event: {}", signed_event.id);
 

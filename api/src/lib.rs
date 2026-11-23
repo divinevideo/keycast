@@ -12,8 +12,10 @@ pub mod login_attempt_limiter;
 pub mod nip98;
 pub mod redis;
 mod replay_reservation;
+pub mod signup_limiter;
 pub mod state;
 pub mod ucan_auth;
+pub mod unconfirmed_caps;
 
 pub use keycast_core::bcrypt_admission::BcryptAdmission;
 pub use redis::PrefixedRedis;

@@ -13,7 +13,7 @@ use keycast_core::bcrypt_admission::{BcryptAdmissionError, BcryptOperation, Bcry
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
     OAuthCodeRepository, PinAttemptRelease, PinAttemptReservation, PolicyRepository,
-    StoreOAuthCodeWithRegistrationParams, UserRepository,
+    RegisterUnverifiedParams, StoreOAuthCodeWithRegistrationParams, UserRepository,
 };
 use nostr_sdk::Keys;
 use rand::Rng;
@@ -28,6 +28,7 @@ use super::auth::{
 };
 use super::oauth::{extract_origin, parse_policy_scope};
 use crate::login_attempt_limiter::{LoginAttemptAdmission, LoginAttemptLimiter};
+use crate::signup_limiter::{SignupAdmission, SignupLimiter, SIGNUP_RATE_LIMIT_MESSAGE};
 
 // ============================================================================
 // Headless Registration
@@ -58,6 +59,11 @@ pub struct HeadlessRegisterRequest {
     /// Client app version, recorded alongside the consent answer so we can tell which wording the
     /// person was shown. Optional so the mobile change can land independently.
     pub app_version: Option<String>,
+    /// Ask for a signed-in session straight away, before the email is confirmed. The account is
+    /// created unconfirmed and the response carries an authorization `code` instead of a
+    /// `device_code`. Clients that omit it keep the confirm-first flow unchanged.
+    #[serde(default)]
+    pub instant_access: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -67,10 +73,18 @@ pub struct HeadlessRegisterResponse {
     pub pubkey: String,
     /// Email verification is required before login
     pub verification_required: bool,
-    /// Device code for polling (RFC 8628 pattern)
-    pub device_code: String,
+    /// Device code for polling (RFC 8628 pattern). Present whenever `verification_required`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_code: Option<String>,
     /// Email address for display
     pub email: String,
+    /// Authorization code to exchange at `/api/oauth/token`, returned when the account was
+    /// created for instant access and is signed in before its email is confirmed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// OAuth state (echoed back with `code`)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
 }
 
 /// POST /api/headless/register
@@ -109,18 +123,26 @@ fn bcrypt_headless_error(error: BcryptAdmissionError) -> HeadlessError {
     }
 }
 
-/// Register a new user without web UI. Returns device_code for email verification polling.
+/// Register a new user without web UI.
 ///
-/// Flow:
+/// Confirm-first flow (default):
 /// 1. Client calls this endpoint with email/password
 /// 2. Server sends verification email, returns device_code
 /// 3. Client polls GET /api/oauth/poll?device_code=xxx
 /// 4. When email verified, poll returns authorization code
 /// 5. Client exchanges code for bunker_url via POST /api/oauth/token
+///
+/// Instant-access flow (`instant_access: true`, email not held by any account): the account is
+/// created unconfirmed and the response carries the authorization code directly. The emailed link
+/// confirms the address later.
+///
+/// An address held only by an unconfirmed account does not block registration: the request takes
+/// the confirm-first flow, and whoever confirms the address gets it.
 pub async fn headless_register(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
     axum::Extension(email_sender): axum::Extension<Arc<dyn EmailSender>>,
+    headers: HeaderMap,
     Json(mut req): Json<HeadlessRegisterRequest>,
 ) -> Result<impl IntoResponse, HeadlessError> {
     let pool = &auth_state.state.db;
@@ -131,6 +153,23 @@ pub async fn headless_register(
         normalize_registration_email(&req.email).map_err(|_| HeadlessError::InvalidEmail)?;
     keycast_core::password_policy::validate_new_password(&req.password)
         .map_err(HeadlessError::WeakPassword)?;
+
+    // Admitted before any database, password-hashing or key work: an instant
+    // sign-up is a permanent account, and nothing reaps one nobody confirms.
+    let limiter = SignupLimiter::new(
+        auth_state.state.redis.clone(),
+        crate::signup_limiter::configured(),
+    );
+    if let SignupAdmission::Limited { retry_after } = limiter.admit(tenant_id, &headers).await {
+        tracing::warn!(
+            event = "headless_registration_rate_limited",
+            tenant_id = tenant_id,
+            client_id = %req.client_id,
+            retry_after = retry_after,
+            "Headless registration refused by sign-up limits"
+        );
+        return Err(HeadlessError::SignupRateLimited { retry_after });
+    }
 
     tracing::info!(
         event = "headless_registration_attempt",
@@ -191,15 +230,18 @@ pub async fn headless_register(
         }
     }
 
-    // Check if email is already registered
+    // A confirmed owner keeps the address. An unconfirmed holder does not reserve it, but this
+    // registration then has to confirm before it can take the address over.
     let user_repo = UserRepository::new(pool.clone());
-    if user_repo
-        .find_pubkey_by_email(&req.email, tenant_id)
+    let email_held_unconfirmed = match user_repo
+        .get_verification_status_by_email(&req.email, tenant_id)
         .await?
-        .is_some()
     {
-        return Err(HeadlessError::EmailAlreadyExists);
-    }
+        Some((_, true, _)) => return Err(HeadlessError::EmailAlreadyExists),
+        Some((_, false, _)) => true,
+        None => false,
+    };
+    let instant_access = req.instant_access == Some(true) && !email_held_unconfirmed;
 
     // Encrypt the secret key
     let secret_bytes = secret_key.to_secret_bytes();
@@ -228,6 +270,21 @@ pub async fn headless_register(
         )
         .await
         .map_err(bcrypt_headless_error)?;
+
+    if instant_access {
+        return register_for_instant_access(
+            &auth_state,
+            &email_sender,
+            tenant_id,
+            &req,
+            scope,
+            &public_key.to_hex(),
+            &password_hash,
+            &encrypted_secret,
+        )
+        .await
+        .map(IntoResponse::into_response);
+    }
 
     // Generate a 6-digit in-app verification PIN (keycast#262), emailed alongside the link as a
     // second transport for the same proof. Stored hashed; the device_code is the real gate.
@@ -329,8 +386,107 @@ pub async fn headless_register(
         success: true,
         pubkey: public_key.to_hex(),
         verification_required: true,
-        device_code,
+        device_code: Some(device_code),
         email: req.email,
+        code: None,
+        state: None,
+    })
+    .into_response())
+}
+
+/// Create an unconfirmed account and sign it in at once (`instant_access`).
+///
+/// Holds no transaction across the password hash, key encryption, or email send: both arrive
+/// precomputed, the account row and its personal key commit in their own short transaction, and
+/// the email goes out after that commit.
+#[allow(clippy::too_many_arguments)]
+async fn register_for_instant_access(
+    auth_state: &super::routes::AuthState,
+    email_sender: &Arc<dyn EmailSender>,
+    tenant_id: i64,
+    req: &HeadlessRegisterRequest,
+    scope: &str,
+    pubkey: &str,
+    password_hash: &str,
+    encrypted_secret: &[u8],
+) -> Result<Json<HeadlessRegisterResponse>, HeadlessError> {
+    let pool = &auth_state.state.db;
+    let verification_token = generate_secure_token();
+    let verification_expires = Utc::now() + Duration::hours(EMAIL_VERIFICATION_EXPIRY_HOURS);
+
+    UserRepository::new(pool.clone())
+        .register_unverified_with_personal_key(RegisterUnverifiedParams {
+            pubkey,
+            tenant_id,
+            email: &req.email,
+            password_hash,
+            verification_token: &verification_token,
+            verification_expires_at: verification_expires,
+            encrypted_secret,
+            marketing_consent: req.marketing_consent.into(),
+            // Derived server-side, as for confirm-first registrations.
+            marketing_consent_source: Some("mobile_create_account"),
+            marketing_consent_app_version: req.app_version.as_deref(),
+        })
+        .await
+        .map_err(|error| match error {
+            // Lost a race for the address (or a BYOK key) against another registration.
+            keycast_core::repositories::RepositoryError::Duplicate => {
+                HeadlessError::EmailAlreadyExists
+            }
+            other => other.into(),
+        })?;
+
+    METRICS.inc_registration();
+
+    if let Err(e) = email_sender
+        .send_verification_email(&req.email, &verification_token, None)
+        .await
+    {
+        tracing::error!("Failed to send verification email: {}", e);
+        // Continue - the account is usable and the user can request a resend.
+    } else {
+        tracing::info!("Sent verification email");
+    }
+
+    let code: String = rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect();
+    OAuthCodeRepository::new(pool.clone())
+        .store(keycast_core::repositories::StoreOAuthCodeParams {
+            tenant_id,
+            code: &code,
+            user_pubkey: pubkey,
+            client_id: &req.client_id,
+            redirect_uri: &req.redirect_uri,
+            scope,
+            code_challenge: req.code_challenge.as_deref(),
+            code_challenge_method: req.code_challenge_method.as_deref(),
+            expires_at: Utc::now() + Duration::minutes(10),
+            previous_auth_id: None,
+            state: req.state.as_deref(),
+            is_headless: true,
+        })
+        .await?;
+
+    tracing::info!(
+        event = "headless_registration_success",
+        tenant_id = tenant_id,
+        client_id = %req.client_id,
+        instant_access = true,
+        "Headless registration successful, signed in before email confirmation"
+    );
+
+    Ok(Json(HeadlessRegisterResponse {
+        success: true,
+        pubkey: pubkey.to_string(),
+        verification_required: false,
+        device_code: None,
+        email: req.email.clone(),
+        code: Some(code),
+        state: req.state.clone(),
     }))
 }
 
@@ -354,6 +510,9 @@ pub struct HeadlessLoginRequest {
     pub code_challenge_method: Option<String>,
     /// OAuth state parameter
     pub state: Option<String>,
+    /// Sign in even though the account's email is not confirmed yet. Sent only by app builds
+    /// that handle the unconfirmed state; everyone else keeps the confirm-first refusal.
+    pub instant_access: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -366,6 +525,8 @@ pub struct HeadlessLoginResponse {
     /// OAuth state (echoed back)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+    /// Whether the account's email is confirmed
+    pub email_verified: bool,
 }
 
 /// POST /api/headless/login
@@ -615,8 +776,10 @@ pub async fn headless_login(
         login_limiter_unavailable()
     })?;
 
-    // Check if email is verified
-    if !email_verified {
+    // An unconfirmed email blocks sign-in unless the caller opts in with `instant_access`, the
+    // same flag registration takes. App builds that predate instant access never send it, so
+    // they keep the confirm-first behaviour (and none of the newer app's confirmation nudges).
+    if !email_verified && !req.instant_access.unwrap_or(false) {
         super::auth_observability::record_auth_event_and_log(
             pool,
             &headers,
@@ -710,6 +873,7 @@ pub async fn headless_login(
         code,
         pubkey: public_key,
         state: req.state,
+        email_verified,
     }))
 }
 
@@ -1494,6 +1658,10 @@ pub enum HeadlessError {
     TooManyRequests {
         retry_after: u32,
     },
+    /// Registration refused by the sign-up admission limits.
+    SignupRateLimited {
+        retry_after: u32,
+    },
 }
 
 impl IntoResponse for HeadlessError {
@@ -1587,6 +1755,17 @@ impl IntoResponse for HeadlessError {
                     [("Retry-After", retry_after.to_string())],
                     Json(serde_json::json!({
                         "error": LOGIN_RATE_LIMIT_MESSAGE,
+                        "code": TOO_MANY_ATTEMPTS_CODE,
+                    })),
+                )
+                    .into_response();
+            }
+            HeadlessError::SignupRateLimited { retry_after } => {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("Retry-After", retry_after.to_string())],
+                    Json(serde_json::json!({
+                        "error": SIGNUP_RATE_LIMIT_MESSAGE,
                         "code": TOO_MANY_ATTEMPTS_CODE,
                     })),
                 )
@@ -1839,6 +2018,7 @@ mod tests {
             create_unit_test_tenant(),
             axum::extract::State(create_lazy_auth_state()),
             axum::Extension(test_email_sender()),
+            axum::http::HeaderMap::new(),
             axum::Json(super::HeadlessRegisterRequest {
                 email: "person@gmail..com".to_string(),
                 password: "testpassword123".to_string(),
@@ -1851,6 +2031,7 @@ mod tests {
                 state: None,
                 marketing_consent: None,
                 app_version: None,
+                instant_access: None,
             }),
         )
         .await
@@ -1928,6 +2109,7 @@ mod tests {
                     create_unit_test_tenant(),
                     axum::extract::State(auth_state),
                     axum::Extension(test_email_sender()),
+                    axum::http::HeaderMap::new(),
                     axum::Json(super::HeadlessRegisterRequest {
                         email,
                         password: password.to_string(),
@@ -1940,6 +2122,7 @@ mod tests {
                         state: None,
                         marketing_consent: None,
                         app_version: None,
+                        instant_access: None,
                     }),
                 )
                 .await
@@ -2124,6 +2307,7 @@ mod tests {
             create_unit_test_tenant(),
             axum::extract::State(auth_state),
             axum::Extension(test_email_sender()),
+            axum::http::HeaderMap::new(),
             axum::Json(super::HeadlessRegisterRequest {
                 email: email.clone(),
                 password: "testpassword123".to_string(),
@@ -2136,6 +2320,7 @@ mod tests {
                 state: None,
                 marketing_consent: None,
                 app_version: None,
+                instant_access: None,
             }),
         )
         .await;
@@ -2170,6 +2355,7 @@ mod tests {
             create_unit_test_tenant(),
             axum::extract::State(auth_state),
             axum::Extension(test_email_sender()),
+            axum::http::HeaderMap::new(),
             axum::Json(super::HeadlessRegisterRequest {
                 email: email.clone(),
                 password: "testpassword123".to_string(),
@@ -2182,6 +2368,7 @@ mod tests {
                 state: None,
                 marketing_consent: None,
                 app_version: None,
+                instant_access: None,
             }),
         )
         .await
@@ -2233,6 +2420,7 @@ mod tests {
             create_unit_test_tenant(),
             axum::extract::State(auth_state),
             axum::Extension(test_email_sender()),
+            axum::http::HeaderMap::new(),
             axum::Json(super::HeadlessRegisterRequest {
                 email: email.clone(),
                 password: "testpassword123".to_string(),
@@ -2245,6 +2433,7 @@ mod tests {
                 state: None,
                 marketing_consent: None,
                 app_version: None,
+                instant_access: None,
             }),
         )
         .await

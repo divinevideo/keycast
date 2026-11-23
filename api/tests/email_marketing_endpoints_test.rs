@@ -38,12 +38,14 @@ async fn setup_pool() -> PgPool {
 }
 
 /// Seed a user with a known consent state and updated_at, returning its pubkey.
+///
+/// The address is confirmed, as every consenting account's is once it reaches the sync.
 async fn seed(pool: &PgPool, email: &str, consent: &str, updated_at: DateTime<Utc>) -> String {
     let pubkey = Keys::generate().public_key().to_hex();
     sqlx::query(
-        "INSERT INTO users (pubkey, tenant_id, email, email_marketing_consent,
+        "INSERT INTO users (pubkey, tenant_id, email, email_verified, email_marketing_consent,
                             email_marketing_consent_at, created_at, updated_at)
-         VALUES ($1, 1, $2, $3, $4, $4, $4)",
+         VALUES ($1, 1, $2, true, $3, $4, $4, $4)",
     )
     .bind(&pubkey)
     .bind(email)
@@ -120,6 +122,43 @@ async fn consents_since(
     .into_iter()
     .map(|r| r.pubkey)
     .collect()
+}
+
+/// An account that consented before confirming its address is not synced until it confirms,
+/// and confirming re-stamps the answer so a cursor already past it still reaches it.
+#[tokio::test]
+#[serial]
+async fn an_unconfirmed_address_reaches_the_sync_only_once_confirmed() {
+    let pool = setup_pool().await;
+    let auth_state = handler_ctx(pool.clone()).await;
+    let answered_at = Utc::now() - chrono::Duration::hours(1);
+    let pubkey = seed(
+        &pool,
+        &format!("unconfirmed-{}@example.test", uuid::Uuid::new_v4()),
+        "opted_in",
+        answered_at,
+    )
+    .await;
+    sqlx::query("UPDATE users SET email_verified = false WHERE pubkey = $1")
+        .bind(&pubkey)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert!(!consents_since(&auth_state, None, None)
+        .await
+        .contains(&pubkey));
+
+    keycast_core::repositories::UserRepository::new(pool.clone())
+        .verify_email(&pubkey, 1)
+        .await
+        .unwrap();
+
+    // The worker's cursor had already moved past the original answer.
+    let listed = consents_since(&auth_state, Some(answered_at), Some(pubkey.clone())).await;
+    assert!(listed.contains(&pubkey));
+
+    cleanup(&pool, &[pubkey]).await;
 }
 
 /// NULL is "never observed", which is not the same as "not opted out". Defaulting it to false
