@@ -52,6 +52,28 @@ pub async fn count_email_marketing_queue_near_expiry(
     Ok((deletions, email_changes))
 }
 
+/// Delete legacy asynchronous-signup rows that never received a password hash.
+///
+/// Accounts that sign in through Google or Apple also have no password, on purpose. They are
+/// recognised by their linked provider and kept.
+pub async fn delete_legacy_stale_signup_rows(
+    pool: &PgPool,
+) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM users WHERE password_hash IS NULL
+         AND vine_id IS NULL
+         AND email IS NOT NULL
+         AND created_at < NOW() - INTERVAL '10 minutes'
+         AND NOT EXISTS (
+             SELECT 1 FROM user_identities identity
+             WHERE identity.user_pubkey = users.pubkey
+               AND identity.tenant_id = users.tenant_id
+         )",
+    )
+    .execute(pool)
+    .await
+}
+
 /// Remove legacy pre-#366 asynchronous-signup rows, expired OAuth rows, and expired service queues.
 pub fn spawn_cleanup_task(pool: PgPool) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -62,14 +84,7 @@ pub fn spawn_cleanup_task(pool: PgPool) -> tokio::task::JoinHandle<()> {
 
             // TODO(#377): Remove this DELETE after the bounded-bcrypt rollout no longer has
             // pre-migration first-party registration rows with password_hash IS NULL.
-            let result = sqlx::query(
-                "DELETE FROM users WHERE password_hash IS NULL
-                 AND vine_id IS NULL
-                 AND email IS NOT NULL
-                 AND created_at < NOW() - INTERVAL '10 minutes'",
-            )
-            .execute(&pool)
-            .await;
+            let result = delete_legacy_stale_signup_rows(&pool).await;
 
             match result {
                 Ok(result) if result.rows_affected() > 0 => {

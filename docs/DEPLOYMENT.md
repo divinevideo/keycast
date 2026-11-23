@@ -388,6 +388,32 @@ kubectl rollout restart deployment/keycast -n identity
 
 ---
 
+## Sign in with Google and Apple (optional)
+
+`POST /api/headless/social-login` is off until it is configured; a provider without configuration
+answers `503 PROVIDER_UNAVAILABLE` and the server starts normally. Nothing here is set in
+`cloudbuild.yaml` or the GKE overlays yet: add the values per environment once the provider
+consoles are set up.
+
+| Variable | Kind | Purpose |
+|----------|------|---------|
+| `GOOGLE_CLIENT_IDS` | plain | Comma-separated Google server (web) OAuth client IDs, the accepted `aud` |
+| `GOOGLE_AUTHORIZED_PARTIES` | plain | Comma-separated Google iOS and Android OAuth client IDs, the accepted `azp`. Google stays off unless both Google variables are set |
+| `APPLE_CLIENT_IDS` | plain | Comma-separated app bundle IDs (production and staging), the accepted `aud` |
+| `APPLE_TEAM_ID` | plain | Apple Developer team ID, issuer of the code-exchange client secret |
+| `APPLE_KEY_ID` | plain | Key ID of the Sign in with Apple key |
+| `APPLE_PRIVATE_KEY` | secret | Contents of the Sign in with Apple `.p8` key (PKCS#8 PEM; `\n` escapes are accepted) |
+
+The three `APPLE_TEAM_ID` / `APPLE_KEY_ID` / `APPLE_PRIVATE_KEY` variables only enable the
+best-effort exchange of Apple authorization codes for refresh tokens, stored encrypted in
+`user_identities.apple_refresh_token_encrypted` so the grant can later be revoked. Sign in with
+Apple works without them.
+
+The endpoint needs Redis (`REDIS_URL`) for its replay guard and attempt limiter and fails closed
+without it. Provider keys are fetched from `https://www.googleapis.com/oauth2/v3/certs` and
+`https://appleid.apple.com/auth/keys`, and Apple codes are exchanged at
+`https://appleid.apple.com/auth/token`, so egress to those hosts must be allowed.
+
 ## Support database reader (deployment prerequisite)
 
 Before deploying an image containing the `20261110180000_support_reader_column_grants`

@@ -13,7 +13,7 @@ use tower::{timeout::error::Elapsed, ServiceBuilder};
 use crate::api::http::{
     admin, ap, atproto, atproto_oauth, auth, claim, email_marketing, expensive_work, headless,
     metrics, nostr_rpc, oauth, og_diviner, policies, retention, service_deletion,
-    service_provisioning, teams,
+    service_provisioning, social_login, teams,
 };
 use crate::email_delivery::EmailDeliveryService;
 use crate::state::KeycastState;
@@ -276,6 +276,13 @@ pub fn api_routes(
         .route("/headless/authorize", post(headless::headless_authorize))
         .route("/headless/verify-pin", post(headless::headless_verify_pin))
         .route("/headless/resend-pin", post(headless::headless_resend_pin))
+        .route(
+            "/headless/social-login",
+            post(social_login::headless_social_login),
+        )
+        .layer(axum::Extension(Arc::new(
+            crate::social_identity::SocialLoginProviders::from_env(),
+        )))
         .with_state(auth_state.clone());
 
     // Admin routes (for preloaded accounts and claim tokens)

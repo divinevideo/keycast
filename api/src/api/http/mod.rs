@@ -23,6 +23,7 @@ pub mod retention;
 pub mod routes;
 pub mod service_deletion;
 pub mod service_provisioning;
+pub mod social_login;
 pub mod teams;
 
 pub use routes::*;

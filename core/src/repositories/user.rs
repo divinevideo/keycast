@@ -1452,11 +1452,13 @@ impl UserRepository {
     }
 
     /// Find user with email, password hash, and email verified status (for key export verification).
+    ///
+    /// The password hash is `None` for an account that signs in only through Google or Apple.
     pub async fn find_with_password_and_verified(
         &self,
         pubkey: &str,
         tenant_id: i64,
-    ) -> Result<Option<(String, String, bool)>, RepositoryError> {
+    ) -> Result<Option<(String, Option<String>, bool)>, RepositoryError> {
         sqlx::query_as(
             "SELECT email, password_hash, email_verified FROM users WHERE pubkey = $1 AND tenant_id = $2",
         )
@@ -1933,11 +1935,13 @@ impl UserRepository {
     }
 
     /// Get user's email and password hash for credential verification.
+    ///
+    /// The password hash is `None` for an account that signs in only through Google or Apple.
     pub async fn get_credentials(
         &self,
         pubkey: &str,
         tenant_id: i64,
-    ) -> Result<Option<(String, String)>, RepositoryError> {
+    ) -> Result<Option<(String, Option<String>)>, RepositoryError> {
         sqlx::query_as(
             "SELECT email, password_hash FROM users WHERE pubkey = $1 AND tenant_id = $2",
         )
@@ -1949,11 +1953,13 @@ impl UserRepository {
     }
 
     /// Get user's email, password hash, and verified status.
+    ///
+    /// The password hash is `None` for an account that signs in only through Google or Apple.
     pub async fn get_credentials_with_verified(
         &self,
         pubkey: &str,
         tenant_id: i64,
-    ) -> Result<Option<(String, String, bool)>, RepositoryError> {
+    ) -> Result<Option<(String, Option<String>, bool)>, RepositoryError> {
         sqlx::query_as(
             "SELECT email, password_hash, email_verified FROM users WHERE pubkey = $1 AND tenant_id = $2",
         )
@@ -2191,7 +2197,8 @@ impl UserRepository {
     /// 2. Deletes personal_keys for the old pubkey
     /// 3. Orphans the old user identity (clears email/password/username)
     /// 4. Creates new user identity with email/password/username
-    /// 5. Creates personal_keys for the new identity
+    /// 5. Moves Google / Apple sign-in links to the new identity
+    /// 6. Creates personal_keys for the new identity
     ///
     /// Returns the count of OAuth authorizations that were deleted.
     ///
@@ -2344,6 +2351,18 @@ impl UserRepository {
         sqlx::query(
             "UPDATE email_marketing_email_changes SET pubkey = $1
              WHERE pubkey = $2 AND tenant_id = $3",
+        )
+        .bind(new_pubkey)
+        .bind(old_pubkey)
+        .bind(tenant_id)
+        .execute(&mut **tx)
+        .await?;
+
+        // Google / Apple sign-in links belong to the person, not to the key. Moved after the new
+        // users row exists because the link references it.
+        sqlx::query(
+            "UPDATE user_identities SET user_pubkey = $1
+             WHERE user_pubkey = $2 AND tenant_id = $3",
         )
         .bind(new_pubkey)
         .bind(old_pubkey)
@@ -3426,7 +3445,7 @@ impl UserRepository {
 
         // 5. Delete user (cascades to personal_keys, oauth_authorizations -> refresh_tokens,
         //    email_verification_tokens, password_reset_tokens, user_profiles,
-        //    account_claim_tokens)
+        //    account_claim_tokens, user_identities)
         let result = sqlx::query("DELETE FROM users WHERE pubkey = $1 AND tenant_id = $2")
             .bind(pubkey)
             .bind(tenant_id)

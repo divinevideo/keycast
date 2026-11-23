@@ -80,6 +80,9 @@ pub(crate) const EMAIL_NOT_VERIFIED_MESSAGE: &str =
 /// Uniform refusal for raw-key egress denied by policy. The message deliberately
 /// does not say *why*, and the code is deliberately the same for every reason, so
 /// neither discloses account state (see `refuse_key_egress_for_verified_minor`).
+pub(crate) const PASSWORD_NOT_SET_CODE: &str = "PASSWORD_NOT_SET";
+pub(crate) const PASSWORD_NOT_SET_MESSAGE: &str =
+    "This account doesn't have a password yet. Use \"Forgot password\" to set one, then try again.";
 pub(crate) const KEY_EGRESS_DENIED_CODE: &str = "KEY_EGRESS_DENIED";
 pub(crate) const KEY_EGRESS_DENIED_MESSAGE: &str = "Operation denied by policy";
 pub(crate) const TOO_MANY_ATTEMPTS_CODE: &str = "TOO_MANY_ATTEMPTS";
@@ -555,6 +558,9 @@ pub enum AuthError {
         retry_after: u32,
     },
     Conflict(String),
+    /// The account signs in only through Google or Apple, so there is no password to check.
+    /// The person sets one through "Forgot password".
+    PasswordNotSet,
 }
 
 fn has_database_constraint(error: &sqlx::Error, expected_constraint: &str) -> bool {
@@ -719,6 +725,13 @@ impl IntoResponse for AuthError {
                     StatusCode::FORBIDDEN,
                     KEY_EGRESS_DENIED_MESSAGE,
                     KEY_EGRESS_DENIED_CODE,
+                );
+            }
+            AuthError::PasswordNotSet => {
+                return coded_error_response(
+                    StatusCode::CONFLICT,
+                    PASSWORD_NOT_SET_MESSAGE,
+                    PASSWORD_NOT_SET_CODE,
                 );
             }
             AuthError::RegistrationExpired => (
@@ -4441,6 +4454,7 @@ pub async fn verify_password_for_export(
         .get_credentials(&user_pubkey, tenant_id)
         .await?
         .ok_or(AuthError::UserNotFound)?;
+    let password_hash = password_hash.ok_or(AuthError::PasswordNotSet)?;
 
     let valid = bcrypt
         .verify(
@@ -4485,6 +4499,7 @@ pub async fn change_password(
         .get_credentials(&user_pubkey, tenant_id)
         .await?
         .ok_or(AuthError::UserNotFound)?;
+    let password_hash = password_hash.ok_or(AuthError::PasswordNotSet)?;
 
     let valid = bcrypt
         .verify(
@@ -4684,6 +4699,7 @@ pub async fn change_email(
         .get_credentials(&user_pubkey, tenant_id)
         .await?
         .ok_or(AuthError::UserNotFound)?;
+    let password_hash = password_hash.ok_or(AuthError::PasswordNotSet)?;
     let valid = bcrypt
         .verify(
             BcryptWorkload::Account,
@@ -5367,6 +5383,7 @@ pub async fn export_key(
             .find_with_password_and_verified(&user_pubkey, tenant_id)
             .await?;
         let (_email, password_hash, email_verified) = result.ok_or(AuthError::UserNotFound)?;
+        let password_hash = password_hash.ok_or(AuthError::PasswordNotSet)?;
         if !email_verified {
             return Ok::<PasswordOutcome, AuthError>(PasswordOutcome::EmailNotVerified);
         }
@@ -5553,6 +5570,7 @@ pub async fn change_key(
             .get_credentials(&old_pubkey, tenant_id)
             .await?
             .ok_or(AuthError::UserNotFound)?;
+        let password_hash = password_hash.ok_or(AuthError::PasswordNotSet)?;
         let valid = verifier
             .verify(SecretString::from(password), password_hash.clone())
             .await

@@ -1689,6 +1689,13 @@ mod tests {
         ) -> Result<(), crate::email_service::EmailSendError> {
             Err(crate::email_service::EmailSendError::Unavailable)
         }
+        async fn send_social_account_linked(
+            &self,
+            _email: &str,
+            _provider: &str,
+        ) -> Result<(), crate::email_service::EmailSendError> {
+            Err(crate::email_service::EmailSendError::Unavailable)
+        }
     }
 
     fn test_email_sender() -> std::sync::Arc<dyn crate::email_service::EmailSender> {

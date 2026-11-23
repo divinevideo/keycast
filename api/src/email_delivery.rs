@@ -1029,6 +1029,14 @@ mod tests {
         ) -> Result<(), EmailSendError> {
             self.send().await
         }
+
+        async fn send_social_account_linked(
+            &self,
+            _to_email: &str,
+            _provider_name: &str,
+        ) -> Result<(), EmailSendError> {
+            self.send().await
+        }
     }
 
     #[tokio::test]

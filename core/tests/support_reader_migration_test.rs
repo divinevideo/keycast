@@ -6,7 +6,7 @@ use sqlx::PgPool;
 const MIGRATION: &str =
     include_str!("../../database/migrations/20261110180000_support_reader_column_grants.sql");
 
-const HIDDEN_COLUMNS: [(&str, &str); 26] = [
+const HIDDEN_COLUMNS: [(&str, &str); 27] = [
     ("users", "password_reset_token"),
     ("users", "email_verification_token"),
     ("users", "pending_email_old_token"),
@@ -33,6 +33,7 @@ const HIDDEN_COLUMNS: [(&str, &str); 26] = [
     ("ap_actor_keys", "encrypted_private_key"),
     ("oauth_codes", "pending_encrypted_secret"),
     ("group_backups", "ciphertext"),
+    ("user_identities", "apple_refresh_token_encrypted"),
 ];
 
 #[sqlx::test(migrations = "../database/migrations")]
