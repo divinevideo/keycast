@@ -129,6 +129,16 @@ async fn test_clear_verified_minor_clears_and_returns_status() {
     let pool = common::setup_test_db().await;
     let auth_state = create_test_auth_state(pool.clone());
     let pubkey = create_verified_minor_user(&pool).await;
+    // Stored email, explicitly unconfirmed.
+    sqlx::query(
+        "UPDATE users SET email = $3, email_verified = false WHERE pubkey = $1 AND tenant_id = $2",
+    )
+    .bind(&pubkey)
+    .bind(TENANT_ID)
+    .bind(format!("{}@example.test", &pubkey[..16]))
+    .execute(&pool)
+    .await
+    .unwrap();
     auth_state
         .state
         .account_status_cache
@@ -156,6 +166,8 @@ async fn test_clear_verified_minor_clears_and_returns_status() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let raw: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(raw["email_unconfirmed"], serde_json::json!(true));
     let status: UserStatusResponse = serde_json::from_slice(&body).unwrap();
     assert!(!status.verified_minor);
     assert!(status.verified_minor_at.is_none());
