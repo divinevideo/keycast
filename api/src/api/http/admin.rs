@@ -20,7 +20,6 @@ use keycast_core::repositories::{
     AdminUserLookup, AdminUserMatchKind, AuthEventRepository, ClaimTokenRepository,
     FullAdminStatusRow, OAuthAuthorizationRepository, RegisteredClient, RegisteredClientRepository,
     RepositoryError, SetVerifiedMinorOutcome, SupportAdminRepository, UserRepository,
-    VerifiedMinorRow,
 };
 use keycast_core::types::claim_token::generate_claim_token;
 use keycast_core::types::user::UserStatus;
@@ -2498,6 +2497,9 @@ pub struct UserStatusResponse {
     pub verified_minor: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verified_minor_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Stored email that has not been confirmed (`email_verified` explicitly
+    /// false). Always serialized.
+    pub email_unconfirmed: bool,
 }
 
 pub async fn get_user_status_admin(
@@ -2516,6 +2518,7 @@ pub async fn get_user_status_admin(
         suspended_at,
         verified_minor,
         verified_minor_at,
+        email_unconfirmed,
     } = user_repo
         .get_full_admin_status(&pubkey, tenant_id)
         .await?
@@ -2528,6 +2531,7 @@ pub async fn get_user_status_admin(
         suspended_at,
         verified_minor,
         verified_minor_at,
+        email_unconfirmed,
     }))
 }
 
@@ -2646,18 +2650,20 @@ pub async fn set_user_status_admin(
         }
     }
 
-    // set_user_status doesn't return verified_minor, so fetch it separately.
-    // This is the write path (infrequent), so the extra query is acceptable.
-    let VerifiedMinorRow {
-        verified_minor,
-        verified_minor_at,
-    } = user_repo
-        .get_verified_minor(&pubkey, tenant_id)
+    // set_user_status doesn't return verified_minor or email state, so fetch
+    // them separately. This is the write path (infrequent), so the extra query
+    // is acceptable. Status fields come from the update above, not this read.
+    let (verified_minor, verified_minor_at, email_unconfirmed) = user_repo
+        .get_full_admin_status(&pubkey, tenant_id)
         .await?
-        .unwrap_or(VerifiedMinorRow {
-            verified_minor: false,
-            verified_minor_at: None,
-        });
+        .map(|row| {
+            (
+                row.verified_minor,
+                row.verified_minor_at,
+                row.email_unconfirmed,
+            )
+        })
+        .unwrap_or((false, None, false));
 
     Ok(Json(UserStatusResponse {
         pubkey,
@@ -2666,6 +2672,7 @@ pub async fn set_user_status_admin(
         suspended_at,
         verified_minor,
         verified_minor_at,
+        email_unconfirmed,
     }))
 }
 
@@ -2846,6 +2853,7 @@ pub async fn clear_verified_minor_admin(
         suspended_at,
         verified_minor,
         verified_minor_at,
+        email_unconfirmed,
     } = user_repo
         .get_full_admin_status(&pubkey, tenant_id)
         .await?
@@ -2858,6 +2866,7 @@ pub async fn clear_verified_minor_admin(
         suspended_at,
         verified_minor,
         verified_minor_at,
+        email_unconfirmed,
     }))
 }
 
@@ -2945,6 +2954,7 @@ pub async fn set_verified_minor_admin(
         suspended_at,
         verified_minor,
         verified_minor_at,
+        email_unconfirmed,
     } = user_repo
         .get_full_admin_status(&pubkey, tenant_id)
         .await?
@@ -2957,6 +2967,7 @@ pub async fn set_verified_minor_admin(
         suspended_at,
         verified_minor,
         verified_minor_at,
+        email_unconfirmed,
     }))
 }
 

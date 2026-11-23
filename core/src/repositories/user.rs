@@ -428,7 +428,7 @@ pub enum SetVerifiedMinorOutcome {
     Unclaimed,
 }
 
-/// Status + suspension + verified-minor fields for `get_full_admin_status`
+/// Status + suspension + verified-minor + email-confirmation fields for `get_full_admin_status`
 /// (admin status endpoints).
 #[derive(Debug, FromRow)]
 pub struct FullAdminStatusRow {
@@ -437,6 +437,10 @@ pub struct FullAdminStatusRow {
     pub suspended_at: Option<DateTime<Utc>>,
     pub verified_minor: bool,
     pub verified_minor_at: Option<DateTime<Utc>>,
+    /// True only when the account has a stored email AND `email_verified` is
+    /// explicitly false. NULL `email_verified` (legacy rows) or no email is not
+    /// unconfirmed.
+    pub email_unconfirmed: bool,
 }
 
 /// Identity state read off the old pubkey in `change_key_transaction` and
@@ -2491,14 +2495,20 @@ impl UserRepository {
         Ok(SetVerifiedMinorOutcome::Set)
     }
 
-    /// Combined status + verified_minor query for admin status endpoints.
+    /// Combined status + verified_minor + email_unconfirmed query for admin status endpoints.
+    ///
+    /// `email_unconfirmed` is the same rule as Keycast PR #464's `EMAIL_UNCONFIRMED_SQL`:
+    /// a stored email AND `email_verified` explicitly false (NULL or no email is not
+    /// unconfirmed).
+    // TODO(#469): use EMAIL_UNCONFIRMED_SQL once #464 lands
     pub async fn get_full_admin_status(
         &self,
         pubkey: &str,
         tenant_id: i64,
     ) -> Result<Option<FullAdminStatusRow>, RepositoryError> {
         sqlx::query_as(
-            "SELECT status, suspended_reason, suspended_at, verified_minor, verified_minor_at \
+            "SELECT status, suspended_reason, suspended_at, verified_minor, verified_minor_at, \
+             COALESCE(email IS NOT NULL AND email_verified = false, false) AS email_unconfirmed \
              FROM users WHERE pubkey = $1 AND tenant_id = $2",
         )
         .bind(pubkey)
@@ -4968,6 +4978,58 @@ mod tests {
 
         let result = repo.clear_verified_minor(&pubkey, 1).await;
         assert!(matches!(result, Err(RepositoryError::NotFound(_))));
+    }
+
+    async fn insert_email_state_user(
+        pool: &PgPool,
+        email: Option<&str>,
+        email_verified: Option<bool>,
+    ) -> String {
+        let pubkey = Keys::generate().public_key().to_hex();
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, email_verified, created_at, updated_at) \
+             VALUES ($1, 1, $2, $3, NOW(), NOW())",
+        )
+        .bind(&pubkey)
+        .bind(email.map(|e| format!("{}-{}", &pubkey[..8], e)))
+        .bind(email_verified)
+        .execute(pool)
+        .await
+        .unwrap();
+        pubkey
+    }
+
+    async fn email_unconfirmed_for(email: Option<&str>, email_verified: Option<bool>) -> bool {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let pubkey = insert_email_state_user(&pool, email, email_verified).await;
+        let row = repo
+            .get_full_admin_status(&pubkey, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        cleanup_user(&pool, &pubkey).await;
+        row.email_unconfirmed
+    }
+
+    #[tokio::test]
+    async fn test_admin_status_email_unconfirmed_when_email_and_verified_false() {
+        assert!(email_unconfirmed_for(Some("a@example.test"), Some(false)).await);
+    }
+
+    #[tokio::test]
+    async fn test_admin_status_email_confirmed_when_verified_true() {
+        assert!(!email_unconfirmed_for(Some("b@example.test"), Some(true)).await);
+    }
+
+    #[tokio::test]
+    async fn test_admin_status_email_not_unconfirmed_when_verified_null() {
+        assert!(!email_unconfirmed_for(Some("c@example.test"), None).await);
+    }
+
+    #[tokio::test]
+    async fn test_admin_status_no_email_is_not_unconfirmed_even_when_verified_false() {
+        assert!(!email_unconfirmed_for(None, Some(false)).await);
     }
 
     #[tokio::test]

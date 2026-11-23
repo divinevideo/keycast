@@ -932,3 +932,92 @@ async fn test_set_user_status_unsuspend_with_actor_writes_audit_row() {
     assert_eq!(rows[0].metadata_json["new_status"], "active");
     assert!(rows[0].metadata_json["reason"].is_null());
 }
+
+async fn create_test_user_with_email_state(pool: &PgPool, email_verified: Option<bool>) -> String {
+    let pubkey = Keys::generate().public_key().to_hex();
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, email, email_verified, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, NOW(), NOW())",
+    )
+    .bind(&pubkey)
+    .bind(TENANT_ID)
+    .bind(format!("{}@example.test", &pubkey[..16]))
+    .bind(email_verified)
+    .execute(pool)
+    .await
+    .expect("Failed to create test user");
+    pubkey
+}
+
+async fn get_status_json(app: Router, pubkey: &str) -> serde_json::Value {
+    let resp = app
+        .oneshot(
+            Request::get(format!("/admin/users/{}/status", pubkey))
+                .header("authorization", format!("Bearer {}", SERVICE_TOKEN))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&body).unwrap()
+}
+
+#[tokio::test]
+async fn test_get_user_status_reports_email_unconfirmed() {
+    common::assert_test_database_url();
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+    let pool = common::setup_test_db().await;
+    let app = build_app(create_test_auth_state(pool.clone()));
+
+    let unconfirmed = create_test_user_with_email_state(&pool, Some(false)).await;
+    let confirmed = create_test_user_with_email_state(&pool, Some(true)).await;
+    let legacy_null = create_test_user_with_email_state(&pool, None).await;
+    let no_email = create_test_user(&pool).await;
+
+    // Raw JSON: the field must always be serialized as a plain bool.
+    let json = get_status_json(app.clone(), &unconfirmed).await;
+    assert_eq!(json["email_unconfirmed"], serde_json::json!(true));
+    let json = get_status_json(app.clone(), &confirmed).await;
+    assert_eq!(json["email_unconfirmed"], serde_json::json!(false));
+    let json = get_status_json(app.clone(), &legacy_null).await;
+    assert_eq!(json["email_unconfirmed"], serde_json::json!(false));
+    let json = get_status_json(app, &no_email).await;
+    assert_eq!(json["email_unconfirmed"], serde_json::json!(false));
+}
+
+#[tokio::test]
+async fn test_set_user_status_response_carries_email_unconfirmed() {
+    common::assert_test_database_url();
+    unsafe { std::env::set_var("KEYCAST_SERVICE_TOKEN", SERVICE_TOKEN) };
+    let pool = common::setup_test_db().await;
+    let app = build_app(create_test_auth_state(pool.clone()));
+
+    let pubkey = create_test_user_with_email_state(&pool, Some(false)).await;
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/admin/users/{}/status", pubkey))
+                .header("authorization", format!("Bearer {}", SERVICE_TOKEN))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "status": "suspended",
+                        "reason": "age_review"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "suspended");
+    assert_eq!(json["email_unconfirmed"], serde_json::json!(true));
+}
