@@ -8,7 +8,7 @@ use axum::{
     extract::{Query, State},
     http::{header, HeaderMap, Request, StatusCode},
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use chrono::{Duration, Utc};
 use keycast_api::{
@@ -18,6 +18,7 @@ use keycast_api::{
         tenant::{Tenant, TenantExtractor},
     },
     handlers::http_rpc_handler::new_http_handler_cache,
+    social_identity::SocialLoginProviders,
     state::KeycastState,
     BcryptAdmission,
 };
@@ -324,8 +325,14 @@ fn build_oauth_app(pool: PgPool) -> Router {
                 move |headers: HeaderMap, Query(req): Query<AuthorizeRequest>| {
                     let auth_state = authorize_state.clone();
                     async move {
-                        authorize_get(create_test_tenant(), State(auth_state), headers, Query(req))
-                            .await
+                        authorize_get(
+                            create_test_tenant(),
+                            State(auth_state),
+                            Extension(Arc::new(SocialLoginProviders::unconfigured())),
+                            headers,
+                            Query(req),
+                        )
+                        .await
                     }
                 },
             ),

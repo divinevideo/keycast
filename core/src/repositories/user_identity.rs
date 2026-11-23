@@ -262,12 +262,15 @@ impl UserIdentityRepository {
         tenant_id: i64,
         subject: &str,
         encrypted_refresh_token: &[u8],
+        client_id: &str,
     ) -> Result<(), RepositoryError> {
         sqlx::query(
-            "UPDATE user_identities SET apple_refresh_token_encrypted = $1
-             WHERE tenant_id = $2 AND provider = 'apple' AND subject = $3",
+            "UPDATE user_identities
+             SET apple_refresh_token_encrypted = $1, apple_token_client_id = $2
+             WHERE tenant_id = $3 AND provider = 'apple' AND subject = $4",
         )
         .bind(encrypted_refresh_token)
+        .bind(client_id)
         .bind(tenant_id)
         .bind(subject)
         .execute(&self.pool)

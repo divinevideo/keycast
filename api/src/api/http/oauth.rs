@@ -6,8 +6,8 @@ use axum::{
     async_trait,
     extract::{FromRequest, Query, Request, State},
     http::{header::CONTENT_TYPE, HeaderMap, StatusCode},
-    response::{Html, IntoResponse, Redirect, Response},
-    Form, Json, RequestExt,
+    response::{AppendHeaders, Html, IntoResponse, Redirect, Response},
+    Extension, Form, Json, RequestExt,
 };
 use base64::Engine;
 use chrono::{Duration, Utc};
@@ -35,8 +35,11 @@ use super::auth::{
     LOGIN_RATE_LIMIT_MESSAGE, TOO_MANY_ATTEMPTS_CODE,
 };
 use super::html_safety::{escape_attr, escape_html, js_string_literal};
+use super::social_login::login_page_social_config;
+use super::social_login_page;
 use crate::brand::BRAND_NAME;
 use crate::login_attempt_limiter::{LoginAttemptAdmission, LoginAttemptLimiter};
+use crate::social_identity::SocialLoginProviders;
 
 /// Generate a 256-bit random authorization handle (64 hex characters)
 /// Used for silent re-authentication in OAuth flows
@@ -717,6 +720,7 @@ pub async fn auth_status(
 pub async fn authorize_get(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
+    Extension(social_providers): Extension<Arc<SocialLoginProviders>>,
     headers: HeaderMap,
     Query(params): Query<AuthorizeRequest>,
 ) -> Result<Response, OAuthError> {
@@ -1001,6 +1005,13 @@ pub async fn authorize_get(
     };
 
     let chooser_confirmed = params.screen.as_deref() == Some("consent");
+    // "Continue with Apple / Google" on the login form. Not offered when the client brings its
+    // own key (byok_pubkey): those accounts are created with that key, not a fresh one.
+    let social = if user_pubkey.is_none() && !has_byok_pubkey {
+        login_page_social_config(&social_providers, &headers)
+    } else {
+        None
+    };
 
     let html = if let Some(pubkey) = user_pubkey {
         // Convert pubkey to npub for display
@@ -2040,6 +2051,7 @@ pub async fn authorize_get(
             margin-top: 0.375rem;
             line-height: 1.4;
         }}
+{social_styles}
         /* Mobile: reduce padding for more working area */
         @media (max-width: 480px) {{
             body {{
@@ -2099,7 +2111,7 @@ pub async fn authorize_get(
                 <p>We've sent a verification link to <strong id="verification_email"></strong></p>
                 <p class="verification_subtext">Click the link in the email to verify your account and complete sign up. After verification, you'll be redirected back to the app.</p>
             </div>
-
+{social_section}
             <div id="login_view" class="form_view">
                 <form onsubmit="handleLogin(event)">
                     <div class="form_group">
@@ -2249,6 +2261,8 @@ pub async fn authorize_get(
             // Hide forms and show verification notice
             document.getElementById('login_view').classList.remove('active');
             document.getElementById('register_view').classList.remove('active');
+            const socialSignin = document.getElementById('social_signin');
+            if (socialSignin) socialSignin.hidden = true;
             hideError();
 
             const notice = document.getElementById('verification_notice');
@@ -2443,7 +2457,7 @@ pub async fn authorize_get(
                 showError('Request failed: ' + e.message);
             }}
         }}
-    </script>
+    </script>{social_scripts}
 </body>
 </html>
         "#,
@@ -2469,22 +2483,43 @@ pub async fn authorize_get(
             register_confirmation_toggle =
                 password_visibility_toggle_html("register_password-confirm"),
             register_nsec_toggle = password_visibility_toggle_html("register_nsec"),
+            social_styles = if social.is_some() {
+                social_login_page::STYLES
+            } else {
+                ""
+            },
+            social_section = social
+                .as_ref()
+                .map(social_login_page::section_html)
+                .unwrap_or_default(),
+            social_scripts = social
+                .as_ref()
+                .map(social_login_page::scripts)
+                .unwrap_or_default(),
             brand = BRAND_NAME,
         )
     };
 
+    let mut cookies = Vec::new();
     // If we detected a stale cookie, clear it
     if clear_cookie {
-        let clear_cookie_header =
-            "keycast_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0";
-        Ok((
-            [(axum::http::header::SET_COOKIE, clear_cookie_header)],
-            Html(html),
-        )
-            .into_response())
-    } else {
-        Ok(Html(html).into_response())
+        cookies.push(
+            "keycast_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0".to_string(),
+        );
     }
+    // The raw nonce behind the Google and Apple buttons stays in an HttpOnly cookie.
+    if let Some(social) = social {
+        cookies.push(social.nonce_cookie);
+    }
+    Ok((
+        AppendHeaders(
+            cookies
+                .into_iter()
+                .map(|cookie| (axum::http::header::SET_COOKIE, cookie)),
+        ),
+        Html(html),
+    )
+        .into_response())
 }
 
 /// POST /oauth/authorize

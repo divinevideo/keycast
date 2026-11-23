@@ -1,14 +1,14 @@
 #![cfg(feature = "integration-tests")]
 
-// ABOUTME: Integration tests for POST /api/headless/social-login ("Continue with Google / Apple")
+// ABOUTME: Integration tests for "Continue with Google / Apple": POST /api/headless/social-login and the login page
 // ABOUTME: Mints provider-shaped ID tokens with a local RSA key served through a stub JWKS source
 
 use axum::{
     body::Body,
-    extract::{rejection::JsonRejection, State},
-    http::{HeaderMap, Request, StatusCode},
+    extract::{rejection::JsonRejection, Query, State},
+    http::{header, HeaderMap, Request, StatusCode},
     response::IntoResponse,
-    routing::post,
+    routing::{get, post},
     Extension, Json, Router,
 };
 use base64::Engine;
@@ -19,9 +19,12 @@ use keycast_api::{
     api::{
         http::{
             auth::{change_password, export_key, ChangePasswordRequest},
-            oauth::{token, TokenRequest, TokenRequestBody},
+            oauth::{authorize_get, token, AuthorizeRequest, TokenRequest, TokenRequestBody},
             routes::AuthState,
-            social_login::{headless_social_login, HeadlessSocialLoginRequest},
+            social_login::{
+                headless_social_login, web_social_login, HeadlessSocialLoginRequest,
+                WebSocialLoginRequest,
+            },
         },
         tenant::{Tenant, TenantExtractor},
     },
@@ -29,10 +32,12 @@ use keycast_api::{
     email_service::{DevEmailSender, EmailSender},
     handlers::http_rpc_handler::new_http_handler_cache,
     social_identity::{
-        sha256_hex, AppleSettings, GoogleSettings, JwkSet, JwksFetchError, JwksFetcher,
-        SocialIdentityVerifier, SocialLoginProviders, SocialLoginSettings,
+        sha256_hex, AppleSettings, AppleWebSettings, GoogleSettings, GoogleWebSettings, JwkSet,
+        JwksFetchError, JwksFetcher, SignInChannel, SocialIdentityVerifier, SocialLoginProviders,
+        SocialLoginSettings,
     },
     state::KeycastState,
+    ucan_auth::validate_ucan_token,
     BcryptAdmission,
 };
 use keycast_core::{
@@ -60,6 +65,9 @@ mod common;
 const GOOGLE_SERVER_CLIENT: &str = "server.apps.googleusercontent.com";
 const GOOGLE_IOS_CLIENT: &str = "ios.apps.googleusercontent.com";
 const APPLE_BUNDLE: &str = "co.example.app";
+/// The login page signs in to Apple with a Services ID; bundle IDs only work in the app.
+const APPLE_SERVICES_ID: &str = "co.example.app.web";
+const APPLE_WEB_RETURN_URL: &str = "https://login.divine.example/api/oauth/authorize";
 const GOOGLE_ISSUER: &str = "https://accounts.google.com";
 const APPLE_ISSUER: &str = "https://appleid.apple.com";
 const KID: &str = "social-test-key";
@@ -144,6 +152,14 @@ fn settings() -> SocialLoginSettings {
         apple: Some(AppleSettings {
             audiences: vec![APPLE_BUNDLE.to_string()],
         }),
+        // As in production, the login page uses the same web client the apps address tokens to.
+        google_web: Some(GoogleWebSettings {
+            client_id: GOOGLE_SERVER_CLIENT.to_string(),
+        }),
+        apple_web: Some(AppleWebSettings {
+            services_id: APPLE_SERVICES_ID.to_string(),
+            redirect_uri: APPLE_WEB_RETURN_URL.to_string(),
+        }),
         apple_signing_key: None,
     }
 }
@@ -174,12 +190,16 @@ struct Context {
 }
 
 async fn context_with(jwks: Arc<StubJwks>, redis: bool) -> Context {
-    common::assert_test_database_url();
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string());
-    let pool = PgPool::connect(&database_url)
-        .await
-        .expect("connect to test database");
+    context_with_settings(jwks, redis, settings()).await
+}
+
+async fn context_with_settings(
+    jwks: Arc<StubJwks>,
+    redis: bool,
+    settings: SocialLoginSettings,
+) -> Context {
+    // Applies pending migrations, so the suite does not depend on another one running first.
+    let pool = common::setup_test_db().await;
 
     let redis = if redis {
         let redis_url = std::env::var("TEST_REDIS_URL")
@@ -217,7 +237,7 @@ async fn context_with(jwks: Arc<StubJwks>, redis: bool) -> Context {
         auth_tx: None,
     };
     let providers = Arc::new(SocialLoginProviders::new(
-        SocialIdentityVerifier::new(settings(), jwks.clone()),
+        SocialIdentityVerifier::new(settings, jwks.clone()),
         None,
     ));
 
@@ -409,6 +429,20 @@ impl TokenSpec {
         }
     }
 
+    /// A token Google Identity Services issues on the login page: `azp` is the web client.
+    fn google_web(subject: &str, email: &str, raw_nonce: &str) -> Self {
+        let mut spec = Self::google(subject, email, raw_nonce);
+        spec.claims.azp = Some(GOOGLE_SERVER_CLIENT.to_string());
+        spec
+    }
+
+    /// A token Sign in with Apple JS issues on the login page, addressed to the Services ID.
+    fn apple_web(subject: &str, email: &str, raw_nonce: &str) -> Self {
+        let mut spec = Self::apple(subject, email, raw_nonce);
+        spec.audience = APPLE_SERVICES_ID.to_string();
+        spec
+    }
+
     fn sign(self) -> String {
         let mut claims =
             Claims::with_custom_claims(self.claims, JwtDuration::from_secs(self.valid_for_secs))
@@ -440,19 +474,23 @@ fn gmail() -> String {
 
 async fn insert_password_user(pool: &PgPool, email: &str, verified: bool) -> String {
     let pubkey = Keys::generate().public_key().to_hex();
+    insert_password_user_as(pool, &pubkey, email, verified).await;
+    pubkey
+}
+
+async fn insert_password_user_as(pool: &PgPool, pubkey: &str, email: &str, verified: bool) {
     let password_hash = bcrypt::hash("correct horse battery staple", 4).unwrap();
     sqlx::query(
         "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
          VALUES ($1, 1, $2, $3, $4, NOW(), NOW())",
     )
-    .bind(&pubkey)
+    .bind(pubkey)
     .bind(email)
     .bind(password_hash)
     .bind(verified)
     .execute(pool)
     .await
     .expect("insert password user");
-    pubkey
 }
 
 async fn identity_count(pool: &PgPool, pubkey: &str) -> i64 {
@@ -921,7 +959,7 @@ async fn provider_keys_are_cached_and_kept_through_an_outage() {
     let nonce = unique("nonce");
     let token = TokenSpec::google(&unique("google-sub"), &gmail(), &nonce).sign();
     verifier
-        .verify(SocialProvider::Google, &token, &nonce)
+        .verify(SocialProvider::Google, SignInChannel::App, &token, &nonce)
         .await
         .expect("first verification fetches keys");
     assert_eq!(jwks.calls.load(Ordering::SeqCst), 1);
@@ -929,7 +967,7 @@ async fn provider_keys_are_cached_and_kept_through_an_outage() {
     // Keys are stale (TTL zero) and the provider is down: the known key keeps working.
     jwks.failing.store(true, Ordering::SeqCst);
     verifier
-        .verify(SocialProvider::Google, &token, &nonce)
+        .verify(SocialProvider::Google, SignInChannel::App, &token, &nonce)
         .await
         .expect("stale keys survive a failed refresh");
     assert_eq!(jwks.calls.load(Ordering::SeqCst), 2);
@@ -942,7 +980,7 @@ async fn provider_keys_are_cached_and_kept_through_an_outage() {
         let token = TokenSpec::google(&unique("google-sub"), &gmail(), &nonce).sign();
         ctx.providers
             .verifier
-            .verify(SocialProvider::Google, &token, &nonce)
+            .verify(SocialProvider::Google, SignInChannel::App, &token, &nonce)
             .await
             .unwrap();
     }
@@ -1193,4 +1231,435 @@ async fn changing_the_key_moves_provider_links_to_the_new_key() {
     assert_eq!(status, StatusCode::OK, "{after}");
     assert_eq!(after["pubkey"], new_pubkey.as_str());
     assert_eq!(after["created"], false);
+}
+
+// ============================================================================
+// Hosted login page (GET /api/oauth/authorize, POST /api/oauth/social-login)
+// ============================================================================
+
+const NONCE_COOKIE: &str = "keycast_social_nonce";
+
+/// A response from the login page or its sign-in endpoint.
+struct WebResponse {
+    status: StatusCode,
+    cookies: Vec<String>,
+    body: String,
+}
+
+impl WebResponse {
+    fn json(&self) -> serde_json::Value {
+        serde_json::from_str(&self.body).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Value of the named cookie this response sets, with its attributes.
+    fn cookie(&self, name: &str) -> Option<&str> {
+        self.cookies
+            .iter()
+            .map(String::as_str)
+            .find(|cookie| cookie.starts_with(&format!("{name}=")))
+    }
+
+    fn cookie_value(&self, name: &str) -> Option<String> {
+        let cookie = self.cookie(name)?;
+        let value = cookie.split(';').next()?.split_once('=')?.1;
+        Some(value.to_string())
+    }
+}
+
+impl Context {
+    fn web_app(&self) -> Router {
+        let auth_state = self.auth_state.clone();
+        let page_state = self.auth_state.clone();
+        let providers = self.providers.clone();
+        let page_providers = self.providers.clone();
+        let email_sender: Arc<dyn EmailSender> = self.email_sender.clone();
+        Router::new()
+            .route(
+                "/oauth/authorize",
+                get(
+                    move |headers: HeaderMap, Query(params): Query<AuthorizeRequest>| {
+                        let auth_state = page_state.clone();
+                        let providers = page_providers.clone();
+                        async move {
+                            match authorize_get(
+                                tenant(),
+                                State(auth_state),
+                                Extension(providers),
+                                headers,
+                                Query(params),
+                            )
+                            .await
+                            {
+                                Ok(response) => response,
+                                Err(error) => error.into_response(),
+                            }
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/oauth/social-login",
+                post(
+                    move |headers: HeaderMap,
+                          payload: Result<Json<WebSocialLoginRequest>, JsonRejection>| {
+                        let auth_state = auth_state.clone();
+                        let providers = providers.clone();
+                        let email_sender = email_sender.clone();
+                        async move {
+                            match web_social_login(
+                                tenant(),
+                                State(auth_state),
+                                Extension(providers),
+                                Extension(email_sender),
+                                headers,
+                                payload,
+                            )
+                            .await
+                            {
+                                Ok(response) => response,
+                                Err(error) => error.into_response(),
+                            }
+                        }
+                    },
+                ),
+            )
+    }
+
+    async fn web(&self, request: Request<Body>) -> WebResponse {
+        let response = self.web_app().oneshot(request).await.unwrap();
+        let status = response.status();
+        let cookies = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response = WebResponse {
+            status,
+            cookies,
+            body: String::from_utf8(bytes.to_vec()).unwrap(),
+        };
+        if let Some(pubkey) = response.json()["pubkey"].as_str() {
+            self.track(pubkey);
+        }
+        response
+    }
+
+    /// The login page a client opens, sending `cookie` when given.
+    async fn login_page(&self, query: &str, cookie: Option<&str>) -> WebResponse {
+        let mut request = Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/oauth/authorize?client_id={CLIENT_ID}&redirect_uri={}&scope=policy:full{query}",
+                urlencoding::encode(REDIRECT_URI)
+            ))
+            .header("host", "localhost");
+        if let Some(cookie) = cookie {
+            request = request.header(header::COOKIE, cookie);
+        }
+        self.web(request.body(Body::empty()).unwrap()).await
+    }
+
+    /// Open the login page and return the raw nonce its cookie carries.
+    async fn login_page_nonce(&self) -> String {
+        let page = self.login_page("", None).await;
+        assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+        page.cookie_value(NONCE_COOKIE)
+            .expect("the login page stores a nonce")
+    }
+
+    async fn web_sign_in(
+        &self,
+        provider: &str,
+        id_token: &str,
+        raw_nonce: Option<&str>,
+    ) -> WebResponse {
+        let body = serde_json::json!({
+            "provider": provider,
+            "id_token": id_token,
+            "client_id": CLIENT_ID,
+            "redirect_uri": REDIRECT_URI,
+        });
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/oauth/social-login")
+            .header("host", "localhost")
+            .header("content-type", "application/json");
+        if let Some(raw_nonce) = raw_nonce {
+            request = request.header(header::COOKIE, format!("{NONCE_COOKIE}={raw_nonce}"));
+        }
+        self.web(request.body(Body::from(body.to_string())).unwrap())
+            .await
+    }
+}
+
+async fn insert_personal_key(pool: &PgPool, pubkey: &str, keys: &Keys) {
+    sqlx::query(
+        "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
+         VALUES ($1, $2, 1, NOW(), NOW())",
+    )
+    .bind(pubkey)
+    .bind(keys.secret_key().to_secret_bytes().to_vec())
+    .execute(pool)
+    .await
+    .expect("insert personal key");
+}
+
+#[tokio::test]
+async fn login_page_offers_apple_then_google_and_keeps_the_raw_nonce_in_a_cookie() {
+    let ctx = context().await;
+
+    let page = ctx.login_page("", None).await;
+
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    let cookie = page.cookie(NONCE_COOKIE).expect("nonce cookie");
+    for attribute in ["HttpOnly", "Secure", "SameSite=Lax", "Path=/api/oauth"] {
+        assert!(cookie.contains(attribute), "{cookie}");
+    }
+    let raw_nonce = page.cookie_value(NONCE_COOKIE).unwrap();
+    assert_eq!(raw_nonce.len(), 64);
+    // The page hands Google and Apple the hash; the raw value stays in the HttpOnly cookie.
+    assert!(page.body.contains(&sha256_hex(&raw_nonce)));
+    assert!(!page.body.contains(&raw_nonce));
+    let apple = page.body.find("id=\"apple_signin\"").expect("Apple button");
+    let google = page
+        .body
+        .find("id=\"google_signin\"")
+        .expect("Google button");
+    let email_form = page.body.find("id=\"login_view\"").expect("email form");
+    assert!(apple < google && google < email_form);
+    assert!(page.body.contains("https://accounts.google.com/gsi/client"));
+    assert!(page.body.contains("appleid.auth.js"));
+    assert!(page.body.contains(APPLE_SERVICES_ID));
+    assert!(page.body.contains(APPLE_WEB_RETURN_URL));
+
+    // A second page in the same browser keeps the nonce, so either page can finish.
+    let again = ctx
+        .login_page("", Some(&format!("{NONCE_COOKIE}={raw_nonce}")))
+        .await;
+    assert_eq!(again.cookie_value(NONCE_COOKIE), Some(raw_nonce));
+}
+
+#[tokio::test]
+async fn login_page_shows_only_the_configured_providers() {
+    let jwks = Arc::new(StubJwks::new(jwks_for(signing_key())));
+    let apps_only = SocialLoginSettings {
+        google_web: None,
+        apple_web: None,
+        ..settings()
+    };
+    let ctx = context_with_settings(jwks.clone(), true, apps_only).await;
+    let page = ctx.login_page("", None).await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    assert!(!page.body.contains("id=\"social_signin\""));
+    assert!(!page.body.contains("accounts.google.com/gsi"));
+    assert!(page.cookie(NONCE_COOKIE).is_none());
+    // The endpoint agrees: Google is not available on the web.
+    let nonce = sha256_hex(&unique("nonce"));
+    let token = TokenSpec::google_web(&unique("google-sub"), &gmail(), &nonce).sign();
+    let response = ctx.web_sign_in("google", &token, Some(&nonce)).await;
+    assert_eq!(
+        response.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        response.body
+    );
+    assert_eq!(response.json()["code"], "PROVIDER_UNAVAILABLE");
+
+    let google_only = SocialLoginSettings {
+        apple_web: None,
+        ..settings()
+    };
+    let ctx = context_with_settings(jwks, true, google_only).await;
+    let page = ctx.login_page("", None).await;
+    assert!(page.body.contains("id=\"google_signin\""));
+    assert!(!page.body.contains("id=\"apple_signin\""));
+    assert!(!page.body.contains("appleid.auth.js"));
+
+    // A client bringing its own key registers with that key, never a provider account.
+    let byok = Keys::generate().public_key().to_hex();
+    let page = ctx.login_page(&format!("&byok_pubkey={byok}"), None).await;
+    assert!(!page.body.contains("id=\"social_signin\""));
+    assert!(page.cookie(NONCE_COOKIE).is_none());
+}
+
+#[tokio::test]
+async fn google_on_the_login_page_creates_an_account_and_signs_in_like_a_password() {
+    let ctx = context().await;
+    let raw_nonce = ctx.login_page_nonce().await;
+    let email = gmail();
+    let token = TokenSpec::google_web(&unique("google-sub"), &email, &raw_nonce).sign();
+
+    let response = ctx.web_sign_in("google", &token, Some(&raw_nonce)).await;
+
+    assert_eq!(response.status, StatusCode::OK, "{}", response.body);
+    let body = response.json();
+    assert_eq!(body["success"], true);
+    assert_eq!(body["created"], true);
+    let pubkey = body["pubkey"].as_str().unwrap().to_string();
+    // The nonce is spent; the session cookie is the one POST /api/oauth/login sets.
+    assert!(response
+        .cookie(NONCE_COOKIE)
+        .is_some_and(|cookie| cookie.contains("Max-Age=0")));
+    let session = response
+        .cookie_value("keycast_session")
+        .expect("session cookie");
+    let (session_pubkey, redirect_origin, _, _) =
+        validate_ucan_token(&format!("Bearer {session}"), 1)
+            .await
+            .expect("valid session UCAN");
+    assert_eq!(session_pubkey, pubkey);
+    assert_eq!(redirect_origin, "https://login.divine.example");
+    let event: (String, Option<String>) = sqlx::query_as(
+        "SELECT outcome, reason_code FROM auth_events
+         WHERE tenant_id = 1 AND endpoint = '/api/oauth/social-login' AND email = $1
+         ORDER BY occurred_at DESC, id DESC LIMIT 1",
+    )
+    .bind(&email)
+    .fetch_one(&ctx.pool)
+    .await
+    .expect("login page auth event");
+
+    // Reloading the authorize page with the session continues to the account chooser, exactly
+    // as after a password sign-in.
+    let next = ctx
+        .login_page("", Some(&format!("keycast_session={session}")))
+        .await;
+
+    ctx.cleanup().await;
+    assert_eq!(event, ("success".to_string(), None));
+    assert_eq!(next.status, StatusCode::OK, "{}", next.body);
+    assert!(
+        next.body.contains("Use a different account"),
+        "{}",
+        next.body
+    );
+    assert!(next.body.contains(&email));
+}
+
+#[tokio::test]
+async fn apple_on_the_login_page_reaches_the_account_the_app_uses() {
+    let ctx = context().await;
+    let raw_nonce = ctx.login_page_nonce().await;
+    let subject = unique("apple-sub");
+    let email = format!("{}@privaterelay.appleid.com", unique("relay"));
+    let token = TokenSpec::apple_web(&subject, &email, &raw_nonce).sign();
+
+    let response = ctx.web_sign_in("apple", &token, Some(&raw_nonce)).await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.body);
+    let web = response.json();
+    assert_eq!(web["created"], true);
+
+    // With the Services ID grouped under the app's App ID, Apple reports the same subject.
+    let nonce = unique("nonce");
+    let app_token = TokenSpec::apple(&subject, &email, &nonce).sign();
+    let (status, app) = ctx.post(request("apple", &app_token, &nonce)).await;
+
+    ctx.cleanup().await;
+    assert_eq!(status, StatusCode::OK, "{app}");
+    assert_eq!(app["pubkey"], web["pubkey"]);
+    assert_eq!(app["created"], false);
+}
+
+#[tokio::test]
+async fn login_page_and_app_tokens_are_not_interchangeable() {
+    let ctx = context().await;
+    let raw_nonce = ctx.login_page_nonce().await;
+
+    // App-issued tokens on the login page: Google's authorized party is the iOS client, Apple's
+    // audience is the bundle ID.
+    for (provider, token) in [
+        (
+            "google",
+            TokenSpec::google(&unique("google-sub"), &gmail(), &raw_nonce).sign(),
+        ),
+        (
+            "apple",
+            TokenSpec::apple(&unique("apple-sub"), &gmail(), &raw_nonce).sign(),
+        ),
+    ] {
+        let response = ctx.web_sign_in(provider, &token, Some(&raw_nonce)).await;
+        assert_eq!(
+            response.status,
+            StatusCode::UNAUTHORIZED,
+            "{provider}: {}",
+            response.body
+        );
+        assert_eq!(response.json()["code"], "INVALID_TOKEN");
+    }
+
+    // Login-page tokens in the app endpoint.
+    for (provider, token) in [
+        (
+            "google",
+            TokenSpec::google_web(&unique("google-sub"), &gmail(), &raw_nonce).sign(),
+        ),
+        (
+            "apple",
+            TokenSpec::apple_web(&unique("apple-sub"), &gmail(), &raw_nonce).sign(),
+        ),
+    ] {
+        let (status, body) = ctx.post(request(provider, &token, &raw_nonce)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{provider}: {body}");
+        assert_eq!(body["code"], "INVALID_TOKEN");
+    }
+}
+
+#[tokio::test]
+async fn login_page_sign_in_needs_the_pages_nonce_cookie() {
+    let ctx = context().await;
+    let raw_nonce = ctx.login_page_nonce().await;
+    let token = TokenSpec::google_web(&unique("google-sub"), &gmail(), &raw_nonce).sign();
+
+    let without_cookie = ctx.web_sign_in("google", &token, None).await;
+    assert_eq!(without_cookie.status, StatusCode::BAD_REQUEST);
+    assert_eq!(without_cookie.json()["code"], "INVALID_REQUEST");
+
+    // A token minted for another page's nonce does not match this browser's cookie.
+    let other_nonce = ctx.login_page_nonce().await;
+    let mismatched = ctx.web_sign_in("google", &token, Some(&other_nonce)).await;
+    assert_eq!(mismatched.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(mismatched.json()["code"], "INVALID_TOKEN");
+}
+
+#[tokio::test]
+async fn login_page_links_like_the_app_and_refuses_what_the_app_refuses() {
+    let ctx = context().await;
+    let raw_nonce = ctx.login_page_nonce().await;
+
+    // A verified password account on Gmail is linked, and its session is that account's.
+    let email = gmail();
+    let keys = Keys::generate();
+    let pubkey = keys.public_key().to_hex();
+    insert_password_user_as(&ctx.pool, &pubkey, &email, true).await;
+    ctx.track(&pubkey);
+    insert_personal_key(&ctx.pool, &pubkey, &keys).await;
+    let token = TokenSpec::google_web(&unique("google-sub"), &email, &raw_nonce).sign();
+    let linked = ctx.web_sign_in("google", &token, Some(&raw_nonce)).await;
+
+    // An address on another domain stays an explicit choice, shown on the page.
+    let other = format!("{}@example.com", unique("person"));
+    let other_pubkey = insert_password_user(&ctx.pool, &other, true).await;
+    ctx.track(&other_pubkey);
+    let raw_nonce = ctx.login_page_nonce().await;
+    let token = TokenSpec::google_web(&unique("google-sub"), &other, &raw_nonce).sign();
+    let refused = ctx.web_sign_in("google", &token, Some(&raw_nonce)).await;
+    let notified = ctx
+        .email_sender
+        .get_captured_emails()
+        .iter()
+        .any(|captured| captured.to == email && captured.subject.contains("Google"));
+
+    ctx.cleanup().await;
+    assert_eq!(linked.status, StatusCode::OK, "{}", linked.body);
+    assert_eq!(linked.json()["pubkey"], pubkey.as_str());
+    assert_eq!(linked.json()["created"], false);
+    assert!(linked.cookie("keycast_session").is_some());
+    assert!(notified, "the owner hears about the new sign-in method");
+    assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.body);
+    assert_eq!(refused.json()["code"], "ACCOUNT_LINK_REQUIRED");
+    assert!(refused.cookie("keycast_session").is_none());
 }

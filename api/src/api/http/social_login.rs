@@ -1,17 +1,17 @@
-// ABOUTME: Headless "Continue with Google / Apple" for native apps
-// ABOUTME: Verifies a provider ID token, then signs in, links or creates the account and returns an auth code
+// ABOUTME: "Continue with Google / Apple" for native apps and Keycast's hosted login page
+// ABOUTME: Verifies a provider ID token, signs in, links or creates the account, then issues a code or a session
 
 use axum::{
     extract::{rejection::JsonRejection, State},
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    http::{header::SET_COOKIE, HeaderMap, StatusCode},
+    response::{AppendHeaders, IntoResponse, Response},
     Extension, Json,
 };
 use chrono::{Duration, Utc};
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
-    OAuthCodeRepository, PolicyRepository, RepositoryError, StoreOAuthCodeParams,
-    UserIdentityRepository,
+    OAuthCodeRepository, PersonalKeysRepository, PolicyRepository, RepositoryError,
+    StoreOAuthCodeParams, UserIdentityRepository, UserRepository,
 };
 use keycast_core::social_login::{
     resolve_social_account, SocialAccountResolution, SocialLoginError, SocialLoginRefusal,
@@ -22,7 +22,7 @@ use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use super::auth::{LOGIN_RATE_LIMIT_MESSAGE, TOO_MANY_ATTEMPTS_CODE};
+use super::auth::{generate_ucan_token, LOGIN_RATE_LIMIT_MESSAGE, TOO_MANY_ATTEMPTS_CODE};
 use super::auth_observability::{record_auth_event_and_log, AuthEvent};
 use super::oauth::{extract_origin, parse_policy_scope};
 use crate::email_service::EmailSender;
@@ -31,11 +31,23 @@ use crate::replay_reservation::{
     reservation_ttl_seconds, reserve_shared, SharedReservationOutcome,
 };
 use crate::social_identity::{
-    SocialLoginProviders, SocialTokenError, VerifiedIdToken, CLOCK_SKEW_SECONDS,
-    MAX_AUTHORIZATION_CODE_BYTES,
+    sha256_hex, AppleWebSettings, SignInChannel, SocialLoginProviders, SocialTokenError,
+    VerifiedIdToken, CLOCK_SKEW_SECONDS, MAX_AUTHORIZATION_CODE_BYTES,
 };
 
 pub const SOCIAL_LOGIN_ENDPOINT: &str = "/api/headless/social-login";
+pub const WEB_SOCIAL_LOGIN_ENDPOINT: &str = "/api/oauth/social-login";
+/// Cookie holding the raw nonce of the hosted login page. The page only sees its SHA-256.
+pub const SOCIAL_NONCE_COOKIE: &str = "keycast_social_nonce";
+/// Covers the login page (`/api/oauth/authorize`) and `/api/oauth/social-login`.
+const SOCIAL_NONCE_COOKIE_PATH: &str = "/api/oauth";
+/// A login page can be left open this long before its Google and Apple buttons stop working.
+const SOCIAL_NONCE_MAX_AGE_SECONDS: u32 = 60 * 60;
+/// Raw nonces are 32 random bytes, hex.
+const SOCIAL_NONCE_BYTES: usize = 32;
+/// Same lifetime as the session `POST /api/oauth/login` sets.
+const SESSION_COOKIE_MAX_AGE_SECONDS: u32 = 24 * 60 * 60;
+const LOGIN_PAGE_EXPIRED_MESSAGE: &str = "This sign-in page has expired. Reload it and try again.";
 const AUTH_EVENT_TYPE: &str = "login";
 /// Same lifetime as the code `POST /api/headless/login` issues.
 const AUTH_CODE_LIFETIME_MINUTES: i64 = 10;
@@ -211,6 +223,8 @@ struct Audit<'a> {
     pool: &'a sqlx::PgPool,
     headers: &'a HeaderMap,
     tenant_id: i64,
+    /// Which endpoint is answering: the native apps' or the hosted login page's.
+    channel: SignInChannel,
     client_id: Option<String>,
     redirect_origin: Option<String>,
     email: Option<String>,
@@ -218,9 +232,81 @@ struct Audit<'a> {
     metadata: serde_json::Map<String, serde_json::Value>,
 }
 
-impl Audit<'_> {
+impl<'a> Audit<'a> {
+    fn new(
+        pool: &'a sqlx::PgPool,
+        headers: &'a HeaderMap,
+        tenant_id: i64,
+        channel: SignInChannel,
+    ) -> Self {
+        Self {
+            pool,
+            headers,
+            tenant_id,
+            channel,
+            client_id: None,
+            redirect_origin: None,
+            email: None,
+            pubkey: None,
+            metadata: serde_json::Map::new(),
+        }
+    }
+
+    fn endpoint(&self) -> &'static str {
+        match self.channel {
+            SignInChannel::App => SOCIAL_LOGIN_ENDPOINT,
+            SignInChannel::Web => WEB_SOCIAL_LOGIN_ENDPOINT,
+        }
+    }
+
+    /// Log event name.
+    fn event(&self) -> &'static str {
+        match self.channel {
+            SignInChannel::App => "headless_social_login",
+            SignInChannel::Web => "web_social_login",
+        }
+    }
+
     fn note(&mut self, key: &str, value: impl Into<serde_json::Value>) {
         self.metadata.insert(key.to_string(), value.into());
+    }
+
+    async fn invalid_body(&mut self, rejection: &JsonRejection) -> SocialLoginHttpError {
+        let message = format!("Invalid request body: {}", rejection.body_text());
+        self.fail(
+            "invalid_request",
+            Some("invalid_body"),
+            SocialLoginHttpError::InvalidRequest(message),
+        )
+        .await
+    }
+
+    /// Parse the requested provider and note it.
+    async fn provider(
+        &mut self,
+        value: &str,
+        client_id: &str,
+    ) -> Result<SocialProvider, SocialLoginHttpError> {
+        let Some(provider) = SocialProvider::parse(value) else {
+            return Err(self
+                .fail(
+                    "invalid_request",
+                    Some("unknown_provider"),
+                    SocialLoginHttpError::InvalidRequest(
+                        "provider must be \"google\" or \"apple\"".to_string(),
+                    ),
+                )
+                .await);
+        };
+        self.note("provider", provider.as_str());
+        tracing::info!(
+            event = self.event(),
+            tenant_id = self.tenant_id,
+            provider = provider.as_str(),
+            client_id = %client_id,
+            "Social login attempt"
+        );
+        Ok(provider)
     }
 
     async fn record(&self, outcome: &'static str, reason_code: Option<&str>, http_status: i32) {
@@ -230,7 +316,7 @@ impl Audit<'_> {
             None,
             AuthEvent {
                 tenant_id: self.tenant_id,
-                endpoint: SOCIAL_LOGIN_ENDPOINT,
+                endpoint: self.endpoint(),
                 event_type: AUTH_EVENT_TYPE,
                 outcome,
                 reason_code,
@@ -257,12 +343,12 @@ impl Audit<'_> {
         let status = error_status(&error);
         self.record("failure", Some(reason_code), status).await;
         tracing::warn!(
-            event = "headless_social_login",
+            event = self.event(),
             tenant_id = self.tenant_id,
             success = false,
             reason = reason_code,
             detail = detail.unwrap_or(""),
-            "Headless social login failed"
+            "Social login failed"
         );
         error
     }
@@ -305,29 +391,11 @@ pub async fn headless_social_login(
 ) -> Result<Json<HeadlessSocialLoginResponse>, SocialLoginHttpError> {
     let pool = &auth_state.state.db;
     let tenant_id = tenant.0.id;
-    let mut audit = Audit {
-        pool,
-        headers: &headers,
-        tenant_id,
-        client_id: None,
-        redirect_origin: None,
-        email: None,
-        pubkey: None,
-        metadata: serde_json::Map::new(),
-    };
+    let mut audit = Audit::new(pool, &headers, tenant_id, SignInChannel::App);
 
     let req = match payload {
         Ok(Json(req)) => req,
-        Err(rejection) => {
-            let message = format!("Invalid request body: {}", rejection.body_text());
-            return Err(audit
-                .fail(
-                    "invalid_request",
-                    Some("invalid_body"),
-                    SocialLoginHttpError::InvalidRequest(message),
-                )
-                .await);
-        }
+        Err(rejection) => return Err(audit.invalid_body(&rejection).await),
     };
     audit.client_id = Some(req.client_id.clone());
     if let Some(version) = req.app_version.as_deref() {
@@ -340,25 +408,7 @@ pub async fn headless_social_login(
         );
     }
 
-    let Some(provider) = SocialProvider::parse(&req.provider) else {
-        return Err(audit
-            .fail(
-                "invalid_request",
-                Some("unknown_provider"),
-                SocialLoginHttpError::InvalidRequest(
-                    "provider must be \"google\" or \"apple\"".to_string(),
-                ),
-            )
-            .await);
-    };
-    audit.note("provider", provider.as_str());
-    tracing::info!(
-        event = "headless_social_login_attempt",
-        tenant_id,
-        provider = provider.as_str(),
-        client_id = %req.client_id,
-        "Headless social login attempt"
-    );
+    let provider = audit.provider(&req.provider, &req.client_id).await?;
 
     let scope = req.scope.as_deref().unwrap_or("policy:full").to_string();
     match validate_request(pool, &req, &scope).await {
@@ -372,9 +422,189 @@ pub async fn headless_social_login(
         }
     }
 
+    let verified = verify_token(
+        &mut audit,
+        &providers,
+        provider,
+        &req.id_token,
+        &req.raw_nonce,
+    )
+    .await?;
+    let resolution = admit_and_resolve(&mut audit, &auth_state, provider, &verified).await?;
+
+    let code =
+        match issue_authorization_code(pool, tenant_id, &req, &scope, resolution.pubkey()).await {
+            Ok(code) => code,
+            Err(message) => {
+                return Err(audit
+                    .fail(
+                        "service_unavailable",
+                        Some("code_store_failed"),
+                        SocialLoginHttpError::Internal(message),
+                    )
+                    .await);
+            }
+        };
+
+    complete_sign_in(
+        &mut audit,
+        &auth_state,
+        &providers,
+        email_sender.as_ref(),
+        &verified,
+        &resolution,
+        req.authorization_code.as_deref(),
+    )
+    .await;
+
+    Ok(Json(HeadlessSocialLoginResponse {
+        success: true,
+        code,
+        pubkey: resolution.pubkey().to_string(),
+        state: req.state,
+        created: matches!(resolution, SocialAccountResolution::Created { .. }),
+    }))
+}
+
+/// Not `Debug`: it carries the ID token and Apple's one-time code, which must never be logged.
+#[derive(Deserialize)]
+pub struct WebSocialLoginRequest {
+    /// `google` or `apple`.
+    pub provider: String,
+    /// ID token Google Identity Services or Sign in with Apple JS returned to the login page.
+    pub id_token: String,
+    /// Apple only: one-time authorization code, exchanged for a refresh token.
+    #[serde(default)]
+    pub authorization_code: Option<String>,
+    /// The OAuth client the login page was opened for.
+    pub client_id: String,
+    /// The OAuth redirect URI the login page was opened for.
+    pub redirect_uri: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WebSocialLoginResponse {
+    pub success: bool,
+    /// Nostr public key (hex).
+    pub pubkey: String,
+    /// `true` when this request created the account.
+    pub created: bool,
+}
+
+/// POST /api/oauth/social-login
+///
+/// "Continue with Google / Apple" on the hosted login page (`GET /api/oauth/authorize`). The
+/// account is found exactly as for `POST /api/headless/social-login`. Like `POST /api/oauth/login`
+/// it then sets the session cookie, and the page reloads the authorize URL, which asks for consent
+/// and sends the code to the client's `redirect_uri` with its `state`.
+///
+/// The token's `nonce` must be the SHA-256 of the raw nonce the login page stored in its
+/// `keycast_social_nonce` cookie; the raw value never reaches the page's script.
+pub async fn web_social_login(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<super::routes::AuthState>,
+    Extension(providers): Extension<Arc<SocialLoginProviders>>,
+    Extension(email_sender): Extension<Arc<dyn EmailSender>>,
+    headers: HeaderMap,
+    payload: Result<Json<WebSocialLoginRequest>, JsonRejection>,
+) -> Result<Response, SocialLoginHttpError> {
+    let pool = &auth_state.state.db;
+    let tenant_id = tenant.0.id;
+    let mut audit = Audit::new(pool, &headers, tenant_id, SignInChannel::Web);
+
+    let req = match payload {
+        Ok(Json(req)) => req,
+        Err(rejection) => return Err(audit.invalid_body(&rejection).await),
+    };
+    audit.client_id = Some(req.client_id.clone());
+    let provider = audit.provider(&req.provider, &req.client_id).await?;
+    // Answered before the nonce check: the page shows no button for this provider anyway.
+    if !providers
+        .verifier
+        .is_configured(provider, SignInChannel::Web)
+    {
+        return Err(audit
+            .fail(
+                "provider_unavailable",
+                Some("not_configured"),
+                SocialLoginHttpError::ProviderUnavailable {
+                    provider,
+                    retry_after: None,
+                },
+            )
+            .await);
+    }
+
+    let redirect_origin = match validate_web_request(&req) {
+        Ok(origin) => origin,
+        Err(error) => return Err(audit.fail("invalid_request", None, error).await),
+    };
+    audit.redirect_origin = Some(redirect_origin.clone());
+
+    let Some(raw_nonce) = social_nonce_from_headers(&headers) else {
+        return Err(audit
+            .fail(
+                "invalid_request",
+                Some("missing_nonce_cookie"),
+                SocialLoginHttpError::InvalidRequest(LOGIN_PAGE_EXPIRED_MESSAGE.to_string()),
+            )
+            .await);
+    };
+
+    let verified =
+        verify_token(&mut audit, &providers, provider, &req.id_token, &raw_nonce).await?;
+    let resolution = admit_and_resolve(&mut audit, &auth_state, provider, &verified).await?;
+
+    let session = match session_cookie(
+        &auth_state,
+        tenant_id,
+        resolution.pubkey(),
+        &redirect_origin,
+    )
+    .await
+    {
+        Ok(cookie) => cookie,
+        Err((detail, error)) => {
+            return Err(audit.fail("service_unavailable", Some(detail), error).await);
+        }
+    };
+
+    complete_sign_in(
+        &mut audit,
+        &auth_state,
+        &providers,
+        email_sender.as_ref(),
+        &verified,
+        &resolution,
+        req.authorization_code.as_deref(),
+    )
+    .await;
+
+    Ok((
+        AppendHeaders([
+            (SET_COOKIE, session),
+            (SET_COOKIE, clear_social_nonce_cookie()),
+        ]),
+        Json(WebSocialLoginResponse {
+            success: true,
+            pubkey: resolution.pubkey().to_string(),
+            created: matches!(resolution, SocialAccountResolution::Created { .. }),
+        }),
+    )
+        .into_response())
+}
+
+/// Verify the provider token for the audit's channel, answering failures.
+async fn verify_token(
+    audit: &mut Audit<'_>,
+    providers: &SocialLoginProviders,
+    provider: SocialProvider,
+    id_token: &str,
+    raw_nonce: &str,
+) -> Result<VerifiedIdToken, SocialLoginHttpError> {
     let verified = match providers
         .verifier
-        .verify(provider, &req.id_token, &req.raw_nonce)
+        .verify(provider, audit.channel, id_token, raw_nonce)
         .await
     {
         Ok(verified) => verified,
@@ -413,7 +643,19 @@ pub async fn headless_social_login(
         }
     };
     audit.email = verified.identity.email.clone();
+    Ok(verified)
+}
 
+/// Accept the token once, admit one attempt for the provider account, and find, link or create
+/// the Keycast account.
+async fn admit_and_resolve(
+    audit: &mut Audit<'_>,
+    auth_state: &super::routes::AuthState,
+    provider: SocialProvider,
+    verified: &VerifiedIdToken,
+) -> Result<SocialAccountResolution, SocialLoginHttpError> {
+    let pool = &auth_state.state.db;
+    let tenant_id = audit.tenant_id;
     let Some(redis) = auth_state.state.redis.clone() else {
         // Without shared replay protection a stolen token could be used twice. Fail closed.
         return Err(audit
@@ -424,7 +666,7 @@ pub async fn headless_social_login(
             )
             .await);
     };
-    if let Err((reason, detail, error)) = reserve_token(&redis, &verified).await {
+    if let Err((reason, detail, error)) = reserve_token(&redis, verified).await {
         return Err(audit.fail(reason, Some(detail), error).await);
     }
 
@@ -494,33 +736,44 @@ pub async fn headless_social_login(
         };
     audit.pubkey = Some(resolution.pubkey().to_string());
     audit.note("outcome", resolution.label());
+    Ok(resolution)
+}
 
-    let code =
-        match issue_authorization_code(pool, tenant_id, &req, &scope, resolution.pubkey()).await {
-            Ok(code) => code,
-            Err(message) => {
-                return Err(audit
-                    .fail(
-                        "service_unavailable",
-                        Some("code_store_failed"),
-                        SocialLoginHttpError::Internal(message),
-                    )
-                    .await);
-            }
-        };
-
-    if let SocialAccountResolution::Linked { email, .. } = &resolution {
-        notify_link(email_sender.as_ref(), email, provider).await;
+/// After the caller handed out a code or a session: tell the owner about a new link, keep Apple's
+/// refresh token, and record the success.
+async fn complete_sign_in(
+    audit: &mut Audit<'_>,
+    auth_state: &super::routes::AuthState,
+    providers: &SocialLoginProviders,
+    email_sender: &dyn EmailSender,
+    verified: &VerifiedIdToken,
+    resolution: &SocialAccountResolution,
+    apple_authorization_code: Option<&str>,
+) {
+    let provider = verified.identity.provider;
+    if let SocialAccountResolution::Linked { email, .. } = resolution {
+        notify_link(email_sender, email, provider).await;
     }
     if provider == SocialProvider::Apple {
-        if let Some(authorization_code) = req.authorization_code.as_deref() {
+        if let Some(authorization_code) = apple_authorization_code {
+            // Codes Sign in with Apple JS issued must be exchanged with the page's return URL.
+            let redirect_uri = match audit.channel {
+                SignInChannel::App => None,
+                SignInChannel::Web => providers
+                    .verifier
+                    .settings()
+                    .apple_web
+                    .as_ref()
+                    .map(|apple| apple.redirect_uri.as_str()),
+            };
             let stored = store_apple_refresh_token(
-                &providers,
-                pool,
-                key_manager,
-                tenant_id,
-                &verified,
+                providers,
+                &auth_state.state.db,
+                auth_state.state.key_manager.as_ref().as_ref(),
+                audit.tenant_id,
+                verified,
                 authorization_code,
+                redirect_uri,
             )
             .await;
             audit.note("apple_refresh_token_stored", stored);
@@ -533,21 +786,13 @@ pub async fn headless_social_login(
     }
     audit.record("success", None, 200).await;
     tracing::info!(
-        event = "headless_social_login",
-        tenant_id,
+        event = audit.event(),
+        tenant_id = audit.tenant_id,
         provider = provider.as_str(),
         outcome = resolution.label(),
         success = true,
-        "Headless social login successful"
+        "Social login successful"
     );
-
-    Ok(Json(HeadlessSocialLoginResponse {
-        success: true,
-        code,
-        pubkey: resolution.pubkey().to_string(),
-        state: req.state,
-        created: matches!(resolution, SocialAccountResolution::Created { .. }),
-    }))
 }
 
 /// Check the OAuth parameters before touching the provider token. Returns the redirect origin.
@@ -599,6 +844,186 @@ async fn validate_request(
             })?;
     }
     Ok(origin)
+}
+
+/// Check the login page's OAuth parameters. Returns the redirect origin.
+///
+/// No code is issued here, so scope and PKCE are checked later, when the reloaded authorize page
+/// issues the code.
+fn validate_web_request(req: &WebSocialLoginRequest) -> Result<String, SocialLoginHttpError> {
+    let origin = extract_origin(&req.redirect_uri).map_err(|error| {
+        SocialLoginHttpError::InvalidRequest(format!("Invalid redirect_uri: {error:?}"))
+    })?;
+    if req.client_id.trim().is_empty() {
+        return Err(SocialLoginHttpError::InvalidRequest(
+            "client_id is required".to_string(),
+        ));
+    }
+    if req
+        .authorization_code
+        .as_deref()
+        .is_some_and(|code| code.len() > MAX_AUTHORIZATION_CODE_BYTES)
+    {
+        return Err(SocialLoginHttpError::InvalidRequest(
+            "authorization_code is too long".to_string(),
+        ));
+    }
+    Ok(origin)
+}
+
+/// The session cookie `POST /api/oauth/login` sets, for a signed-in social account.
+async fn session_cookie(
+    auth_state: &super::routes::AuthState,
+    tenant_id: i64,
+    pubkey: &str,
+    redirect_origin: &str,
+) -> Result<String, (&'static str, SocialLoginHttpError)> {
+    let pool = &auth_state.state.db;
+    let repository_failure = |detail: &'static str, error: RepositoryError| match error {
+        RepositoryError::Unavailable(message) => {
+            tracing::warn!("Social login database unavailable: {message}");
+            (detail, login_unavailable())
+        }
+        other => (
+            detail,
+            SocialLoginHttpError::Internal(format!("Social login session setup failed: {other}")),
+        ),
+    };
+
+    let account = UserRepository::new(pool.clone())
+        .get_account_status(pubkey, tenant_id)
+        .await
+        .map_err(|error| repository_failure("account_lookup_failed", error))?
+        .ok_or((
+            "account_missing",
+            SocialLoginHttpError::Internal("Signed-in account no longer exists".to_string()),
+        ))?;
+    let encrypted_secret = PersonalKeysRepository::new(pool.clone())
+        .find_encrypted_key_for_tenant(pubkey, tenant_id)
+        .await
+        .map_err(|error| repository_failure("key_lookup_failed", error))?
+        // Same answer as `POST /api/oauth/login` for an account whose registration never
+        // reached the token exchange.
+        .ok_or((
+            "key_missing",
+            SocialLoginHttpError::InvalidRequest(
+                "Account setup incomplete. Please complete the OAuth flow to finalize your \
+                 account."
+                    .to_string(),
+            ),
+        ))?;
+    let secret = auth_state
+        .state
+        .key_manager
+        .decrypt(&encrypted_secret)
+        .await
+        .map_err(|error| {
+            tracing::error!("Social login key decryption failed: {error}");
+            ("decryption_failed", login_unavailable())
+        })?;
+    let secret_key = nostr_sdk::secp256k1::SecretKey::from_slice(&secret).map_err(|error| {
+        (
+            "invalid_key",
+            SocialLoginHttpError::Internal(format!("Stored key is unusable: {error}")),
+        )
+    })?;
+    let keys = nostr_sdk::Keys::new(secret_key.into());
+
+    let status = (!account.status.is_active()).then_some(&account.status);
+    let email = account.email.unwrap_or_default();
+    let token = generate_ucan_token(&keys, tenant_id, &email, redirect_origin, None, status)
+        .await
+        .map_err(|error| {
+            (
+                "session_failed",
+                SocialLoginHttpError::Internal(format!("UCAN generation failed: {error:?}")),
+            )
+        })?;
+    Ok(format!(
+        "keycast_session={token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={SESSION_COOKIE_MAX_AGE_SECONDS}"
+    ))
+}
+
+// ============================================================================
+// Hosted login page
+// ============================================================================
+
+/// What the hosted login page needs to offer Google and Apple.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginPageSocialConfig {
+    /// Web client ID for Google Identity Services, when Google is offered.
+    pub google_client_id: Option<String>,
+    /// Services ID and return URL for Sign in with Apple JS, when Apple is offered.
+    pub apple: Option<AppleWebSettings>,
+    /// Lowercase hex SHA-256 of the raw nonce: what the page hands Google and Apple.
+    pub nonce_hash: String,
+    /// `Set-Cookie` value that stores the raw nonce for `POST /api/oauth/social-login`.
+    pub nonce_cookie: String,
+}
+
+/// The login page's Google and Apple setup, or `None` when neither is configured for the web.
+///
+/// A raw nonce the browser already holds is kept, so several open login pages share one and each
+/// can still finish. Tokens are single-use, so sharing a nonce does not let one be replayed.
+pub fn login_page_social_config(
+    providers: &SocialLoginProviders,
+    headers: &HeaderMap,
+) -> Option<LoginPageSocialConfig> {
+    let settings = providers.verifier.settings();
+    let google_client_id = settings
+        .google_web
+        .as_ref()
+        .map(|google| google.client_id.clone());
+    let apple = settings.apple_web.clone();
+    if google_client_id.is_none() && apple.is_none() {
+        return None;
+    }
+    let raw_nonce = social_nonce_from_headers(headers).unwrap_or_else(new_social_nonce);
+    Some(LoginPageSocialConfig {
+        google_client_id,
+        apple,
+        nonce_hash: sha256_hex(&raw_nonce),
+        nonce_cookie: social_nonce_cookie(&raw_nonce),
+    })
+}
+
+fn new_social_nonce() -> String {
+    let mut bytes = [0u8; SOCIAL_NONCE_BYTES];
+    rand::thread_rng().fill(&mut bytes);
+    hex::encode(bytes)
+}
+
+/// The raw nonce from the login page's cookie, when it holds a well-formed one.
+pub fn social_nonce_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get_all(axum::http::header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|cookie| cookie.trim().split_once('='))
+        .filter(|(name, _)| *name == SOCIAL_NONCE_COOKIE)
+        .map(|(_, value)| value)
+        .find(|value| {
+            value.len() == SOCIAL_NONCE_BYTES * 2
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .map(str::to_string)
+}
+
+fn social_nonce_cookie(raw_nonce: &str) -> String {
+    format!(
+        "{SOCIAL_NONCE_COOKIE}={raw_nonce}; HttpOnly; Secure; SameSite=Lax; \
+         Path={SOCIAL_NONCE_COOKIE_PATH}; Max-Age={SOCIAL_NONCE_MAX_AGE_SECONDS}"
+    )
+}
+
+fn clear_social_nonce_cookie() -> String {
+    format!(
+        "{SOCIAL_NONCE_COOKIE}=; HttpOnly; Secure; SameSite=Lax; \
+         Path={SOCIAL_NONCE_COOKIE_PATH}; Max-Age=0"
+    )
 }
 
 type ReplayFailure = (&'static str, &'static str, SocialLoginHttpError);
@@ -742,15 +1167,18 @@ async fn store_apple_refresh_token(
     tenant_id: i64,
     verified: &VerifiedIdToken,
     authorization_code: &str,
+    redirect_uri: Option<&str>,
 ) -> bool {
     let Some(apple_tokens) = providers.apple_tokens.as_ref() else {
         tracing::warn!("Apple code exchange is not configured; no refresh token stored");
         return false;
     };
     let identity: &VerifiedSocialIdentity = &verified.identity;
+    // The code was issued to the client the ID token is addressed to: a bundle ID or the
+    // Services ID.
     let exchanged = tokio::time::timeout(
         APPLE_EXCHANGE_TIMEOUT,
-        apple_tokens.exchange_code(&verified.audience, authorization_code),
+        apple_tokens.exchange_code(&verified.audience, authorization_code, redirect_uri),
     )
     .await;
     let refresh_token = match exchanged {
@@ -779,7 +1207,7 @@ async fn store_apple_refresh_token(
         }
     };
     match UserIdentityRepository::new(pool.clone())
-        .store_apple_refresh_token(tenant_id, &identity.subject, &encrypted)
+        .store_apple_refresh_token(tenant_id, &identity.subject, &encrypted, &verified.audience)
         .await
     {
         Ok(()) => true,

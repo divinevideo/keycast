@@ -1559,6 +1559,7 @@ fn normalize_auth_endpoint(endpoint: &str) -> &'static str {
         "/api/auth/cancel-email-change" => "/api/auth/cancel-email-change",
         "/api/oauth/login" => "/api/oauth/login",
         "/api/oauth/register" => "/api/oauth/register",
+        "/api/oauth/social-login" => "/api/oauth/social-login",
         "/api/oauth/authorize" => "/api/oauth/authorize",
         "/api/oauth/token" => "/api/oauth/token",
         "/api/oauth/poll" => "/api/oauth/poll",

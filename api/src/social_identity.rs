@@ -65,6 +65,36 @@ pub struct AppleSettings {
     pub audiences: Vec<String>,
 }
 
+/// Google on Keycast's hosted login page, through Google Identity Services.
+///
+/// The page renders Google's button with this public web client ID, so the token's `aud` and
+/// `azp` are both this client.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GoogleWebSettings {
+    pub client_id: String,
+}
+
+/// Apple on Keycast's hosted login page, through Sign in with Apple JS.
+///
+/// App bundle IDs cannot be used on the web: the page signs in with a Services ID, which becomes
+/// the token's `aud`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppleWebSettings {
+    pub services_id: String,
+    /// Return URL registered for the Services ID. Apple's popup only answers a page on this URL's
+    /// origin, and the code exchange must repeat it.
+    pub redirect_uri: String,
+}
+
+/// Where an ID token was obtained, which decides the audiences it may carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignInChannel {
+    /// A native app, through `POST /api/headless/social-login`.
+    App,
+    /// Keycast's hosted login page, through `POST /api/oauth/social-login`.
+    Web,
+}
+
 /// Sign in with Apple key used to mint client secrets for the code exchange.
 #[derive(Clone)]
 pub struct AppleSigningKey {
@@ -89,14 +119,21 @@ impl std::fmt::Debug for AppleSigningKey {
 /// answers `503 PROVIDER_UNAVAILABLE`, so the server starts without any of these variables.
 #[derive(Clone, Debug, Default)]
 pub struct SocialLoginSettings {
+    /// Native apps.
     pub google: Option<GoogleSettings>,
+    /// Native apps.
     pub apple: Option<AppleSettings>,
+    /// The hosted login page.
+    pub google_web: Option<GoogleWebSettings>,
+    /// The hosted login page.
+    pub apple_web: Option<AppleWebSettings>,
     pub apple_signing_key: Option<AppleSigningKey>,
 }
 
 impl SocialLoginSettings {
-    /// Read `GOOGLE_CLIENT_IDS`, `GOOGLE_AUTHORIZED_PARTIES`, `APPLE_CLIENT_IDS`,
-    /// `APPLE_TEAM_ID`, `APPLE_KEY_ID` and `APPLE_PRIVATE_KEY`.
+    /// Read `GOOGLE_CLIENT_IDS`, `GOOGLE_AUTHORIZED_PARTIES`, `APPLE_CLIENT_IDS` (native apps),
+    /// `GOOGLE_WEB_CLIENT_ID`, `APPLE_SERVICES_ID`, `APPLE_WEB_REDIRECT_URI` (hosted login page),
+    /// and `APPLE_TEAM_ID`, `APPLE_KEY_ID` and `APPLE_PRIVATE_KEY` (Apple code exchange).
     pub fn from_env() -> Self {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
@@ -124,6 +161,36 @@ impl SocialLoginSettings {
             audiences: apple_audiences,
         });
 
+        let google_web = non_empty(lookup("GOOGLE_WEB_CLIENT_ID"))
+            .map(|client_id| GoogleWebSettings { client_id });
+
+        let apple_web = match (
+            non_empty(lookup("APPLE_SERVICES_ID")),
+            non_empty(lookup("APPLE_WEB_REDIRECT_URI")),
+        ) {
+            (Some(services_id), Some(redirect_uri)) if is_web_redirect_uri(&redirect_uri) => {
+                Some(AppleWebSettings {
+                    services_id,
+                    redirect_uri,
+                })
+            }
+            (Some(_), Some(_)) => {
+                tracing::warn!(
+                    "APPLE_WEB_REDIRECT_URI must be an absolute http(s) URL; \
+                     Sign in with Apple on the login page stays off"
+                );
+                None
+            }
+            (None, None) => None,
+            _ => {
+                tracing::warn!(
+                    "Sign in with Apple on the login page needs both APPLE_SERVICES_ID and \
+                     APPLE_WEB_REDIRECT_URI; it stays off"
+                );
+                None
+            }
+        };
+
         let team_id = non_empty(lookup("APPLE_TEAM_ID"));
         let key_id = non_empty(lookup("APPLE_KEY_ID"));
         let private_key = non_empty(lookup("APPLE_PRIVATE_KEY"));
@@ -147,9 +214,18 @@ impl SocialLoginSettings {
         Self {
             google,
             apple,
+            google_web,
+            apple_web,
             apple_signing_key,
         }
     }
+}
+
+fn is_web_redirect_uri(value: &str) -> bool {
+    reqwest::Url::parse(value).is_ok_and(|url| {
+        matches!(url.scheme(), "https" | "http")
+            && url.host_str().is_some_and(|host| !host.is_empty())
+    })
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -473,11 +549,49 @@ impl SocialIdentityVerifier {
         &self.settings
     }
 
-    pub fn is_configured(&self, provider: SocialProvider) -> bool {
-        match provider {
-            SocialProvider::Google => self.settings.google.is_some(),
-            SocialProvider::Apple => self.settings.apple.is_some(),
-        }
+    /// Whether `provider` can be used from `channel`.
+    pub fn is_configured(&self, provider: SocialProvider, channel: SignInChannel) -> bool {
+        self.audience_rule(provider, channel).is_ok()
+    }
+
+    /// The issuers, audiences and authorized parties a token from `channel` may carry.
+    fn audience_rule(
+        &self,
+        provider: SocialProvider,
+        channel: SignInChannel,
+    ) -> Result<AudienceRule, SocialTokenError> {
+        let not_configured = SocialTokenError::NotConfigured(provider);
+        let rule = match (provider, channel) {
+            (SocialProvider::Google, SignInChannel::App) => {
+                let google = self.settings.google.as_ref().ok_or(not_configured)?;
+                AudienceRule {
+                    audiences: google.audiences.iter().cloned().collect(),
+                    party: PartyRule::OneOf(google.authorized_parties.iter().cloned().collect()),
+                }
+            }
+            (SocialProvider::Google, SignInChannel::Web) => {
+                let google = self.settings.google_web.as_ref().ok_or(not_configured)?;
+                AudienceRule {
+                    audiences: HashSet::from([google.client_id.clone()]),
+                    party: PartyRule::AudienceItself,
+                }
+            }
+            (SocialProvider::Apple, SignInChannel::App) => {
+                let apple = self.settings.apple.as_ref().ok_or(not_configured)?;
+                AudienceRule {
+                    audiences: apple.audiences.iter().cloned().collect(),
+                    party: PartyRule::Ignored,
+                }
+            }
+            (SocialProvider::Apple, SignInChannel::Web) => {
+                let apple = self.settings.apple_web.as_ref().ok_or(not_configured)?;
+                AudienceRule {
+                    audiences: HashSet::from([apple.services_id.clone()]),
+                    party: PartyRule::Ignored,
+                }
+            }
+        };
+        Ok(rule)
     }
 
     fn keys(&self, provider: SocialProvider) -> &ProviderKeys {
@@ -487,37 +601,23 @@ impl SocialIdentityVerifier {
         }
     }
 
-    /// Verify a provider ID token: RS256 signature by a current provider key, issuer, audience
-    /// (and Google's authorized party), expiry, issue time, and `nonce == sha256(raw_nonce)`.
+    /// Verify a provider ID token: RS256 signature by a current provider key, issuer, an audience
+    /// (and for Google an authorized party) configured for `channel`, expiry, issue time, and
+    /// `nonce == sha256(raw_nonce)`.
     pub async fn verify(
         &self,
         provider: SocialProvider,
+        channel: SignInChannel,
         id_token: &str,
         raw_nonce: &str,
     ) -> Result<VerifiedIdToken, SocialTokenError> {
-        let (issuers, audiences): (HashSet<String>, &[String]) = match provider {
-            SocialProvider::Google => {
-                let google = self
-                    .settings
-                    .google
-                    .as_ref()
-                    .ok_or(SocialTokenError::NotConfigured(provider))?;
-                (
-                    GOOGLE_ISSUERS
-                        .iter()
-                        .map(|issuer| issuer.to_string())
-                        .collect(),
-                    &google.audiences,
-                )
-            }
-            SocialProvider::Apple => {
-                let apple = self
-                    .settings
-                    .apple
-                    .as_ref()
-                    .ok_or(SocialTokenError::NotConfigured(provider))?;
-                (HashSet::from([APPLE_ISSUER.to_string()]), &apple.audiences)
-            }
+        let rule = self.audience_rule(provider, channel)?;
+        let issuers: HashSet<String> = match provider {
+            SocialProvider::Google => GOOGLE_ISSUERS
+                .iter()
+                .map(|issuer| issuer.to_string())
+                .collect(),
+            SocialProvider::Apple => HashSet::from([APPLE_ISSUER.to_string()]),
         };
 
         if id_token.is_empty() || id_token.len() > MAX_ID_TOKEN_BYTES {
@@ -538,10 +638,9 @@ impl SocialIdentityVerifier {
             .to_string();
         let key = self.signing_key(provider, &kid).await?;
 
-        let allowed_audiences: HashSet<String> = audiences.iter().cloned().collect();
         let options = VerificationOptions {
             allowed_issuers: Some(issuers),
-            allowed_audiences: Some(allowed_audiences.clone()),
+            allowed_audiences: Some(rule.audiences.clone()),
             required_nonce: Some(sha256_hex(raw_nonce)),
             time_tolerance: Some(JwtDuration::from_secs(CLOCK_SKEW_SECONDS)),
             max_token_length: Some(MAX_ID_TOKEN_BYTES),
@@ -562,22 +661,20 @@ impl SocialIdentityVerifier {
             .subject
             .filter(|subject| !subject.is_empty() && subject.len() <= MAX_SUBJECT_BYTES)
             .ok_or(SocialTokenError::Invalid("missing_subject"))?;
-        let audience = matched_audience(claims.audiences.as_ref(), &allowed_audiences)
+        let audience = matched_audience(claims.audiences.as_ref(), &rule.audiences)
             .ok_or(SocialTokenError::Invalid("wrong_audience"))?;
 
         let custom = claims.custom;
-        if provider == SocialProvider::Google {
-            let authorized = self.settings.google.as_ref().is_some_and(|google| {
-                custom.azp.as_deref().is_some_and(|azp| {
-                    google
-                        .authorized_parties
-                        .iter()
-                        .any(|party| party.as_str() == azp)
-                })
-            });
-            if !authorized {
-                return Err(SocialTokenError::Invalid("unauthorized_party"));
-            }
+        let authorized = match &rule.party {
+            PartyRule::Ignored => true,
+            PartyRule::OneOf(parties) => custom
+                .azp
+                .as_deref()
+                .is_some_and(|azp| parties.contains(azp)),
+            PartyRule::AudienceItself => custom.azp.as_deref().is_none_or(|azp| azp == audience),
+        };
+        if !authorized {
+            return Err(SocialTokenError::Invalid("unauthorized_party"));
         }
 
         let email = custom
@@ -674,6 +771,23 @@ impl SocialIdentityVerifier {
     }
 }
 
+/// What a token from one channel must be addressed to.
+struct AudienceRule {
+    audiences: HashSet<String>,
+    party: PartyRule,
+}
+
+/// How Google's `azp` (authorized party) is checked.
+enum PartyRule {
+    /// Apple tokens: no authorized party to check.
+    Ignored,
+    /// Native Google tokens: `azp` is the iOS or Android client that asked for the token.
+    OneOf(HashSet<String>),
+    /// Google Identity Services tokens: `azp`, when present, is the web client itself, so a
+    /// token a native app obtained for the same server client is not accepted here.
+    AudienceItself,
+}
+
 fn matched_audience(audiences: Option<&Audiences>, allowed: &HashSet<String>) -> Option<String> {
     match audiences? {
         Audiences::AsString(audience) => allowed.contains(audience).then(|| audience.clone()),
@@ -768,22 +882,30 @@ impl AppleTokenClient {
     }
 
     /// Exchange a one-time authorization code. Returns the refresh token when Apple issued one.
+    ///
+    /// `redirect_uri` is required for codes issued to a web page (Sign in with Apple JS) and must
+    /// be the one the page passed to Apple; codes issued to an app have none.
     pub async fn exchange_code(
         &self,
         client_id: &str,
         authorization_code: &str,
+        redirect_uri: Option<&str>,
     ) -> Result<Option<SecretString>, AppleExchangeError> {
         let client_secret = self.client_secret(client_id)?;
+        let mut form = vec![
+            ("client_id", client_id),
+            ("client_secret", client_secret.as_str()),
+            ("code", authorization_code),
+            ("grant_type", "authorization_code"),
+        ];
+        if let Some(redirect_uri) = redirect_uri {
+            form.push(("redirect_uri", redirect_uri));
+        }
         let _permit = admit_remote_fetch().map_err(|_| AppleExchangeError::Busy)?;
         let response = self
             .client
             .post(&self.token_url)
-            .form(&[
-                ("client_id", client_id),
-                ("client_secret", client_secret.as_str()),
-                ("code", authorization_code),
-                ("grant_type", "authorization_code"),
-            ])
+            .form(&form)
             .send()
             .await
             .map_err(|error| AppleExchangeError::Remote(format!("request failed: {error}")))?;
@@ -828,6 +950,18 @@ impl SocialLoginProviders {
         }
     }
 
+    /// No provider configured: every sign-in answers `503 PROVIDER_UNAVAILABLE` and the login
+    /// page shows no provider buttons.
+    pub fn unconfigured() -> Self {
+        Self::new(
+            SocialIdentityVerifier::new(
+                SocialLoginSettings::default(),
+                Arc::new(HttpJwksFetcher::new()),
+            ),
+            None,
+        )
+    }
+
     /// Configure providers from the environment and fetch keys from Google and Apple.
     pub fn from_env() -> Self {
         let settings = SocialLoginSettings::from_env();
@@ -835,6 +969,8 @@ impl SocialLoginProviders {
         tracing::info!(
             google = settings.google.is_some(),
             apple = settings.apple.is_some(),
+            google_web = settings.google_web.is_some(),
+            apple_web = settings.apple_web.is_some(),
             apple_code_exchange = apple_tokens.is_some(),
             "Social login providers configured"
         );
@@ -863,7 +999,64 @@ mod tests {
         let settings = SocialLoginSettings::from_lookup(lookup(&[]));
         assert!(settings.google.is_none());
         assert!(settings.apple.is_none());
+        assert!(settings.google_web.is_none());
+        assert!(settings.apple_web.is_none());
         assert!(settings.apple_signing_key.is_none());
+    }
+
+    #[test]
+    fn login_page_providers_are_configured_apart_from_the_apps() {
+        let settings = SocialLoginSettings::from_lookup(lookup(&[
+            ("GOOGLE_WEB_CLIENT_ID", " web.apps "),
+            ("APPLE_SERVICES_ID", "co.example.web"),
+            (
+                "APPLE_WEB_REDIRECT_URI",
+                "https://login.example/api/oauth/authorize",
+            ),
+        ]));
+        assert!(settings.google.is_none());
+        assert!(settings.apple.is_none());
+        assert_eq!(
+            settings.google_web,
+            Some(GoogleWebSettings {
+                client_id: "web.apps".to_string()
+            })
+        );
+        assert_eq!(
+            settings.apple_web,
+            Some(AppleWebSettings {
+                services_id: "co.example.web".to_string(),
+                redirect_uri: "https://login.example/api/oauth/authorize".to_string(),
+            })
+        );
+
+        let verifier = SocialIdentityVerifier::new(settings, Arc::new(HttpJwksFetcher::new()));
+        for provider in [SocialProvider::Google, SocialProvider::Apple] {
+            assert!(verifier.is_configured(provider, SignInChannel::Web));
+            assert!(!verifier.is_configured(provider, SignInChannel::App));
+        }
+    }
+
+    #[test]
+    fn apple_on_the_login_page_needs_a_services_id_and_a_usable_return_url() {
+        for values in [
+            vec![("APPLE_SERVICES_ID", "co.example.web")],
+            vec![(
+                "APPLE_WEB_REDIRECT_URI",
+                "https://login.example/api/oauth/authorize",
+            )],
+            vec![
+                ("APPLE_SERVICES_ID", "co.example.web"),
+                ("APPLE_WEB_REDIRECT_URI", "/api/oauth/authorize"),
+            ],
+            vec![
+                ("APPLE_SERVICES_ID", "co.example.web"),
+                ("APPLE_WEB_REDIRECT_URI", "intent://login.example/"),
+            ],
+        ] {
+            let settings = SocialLoginSettings::from_lookup(lookup(&values));
+            assert!(settings.apple_web.is_none(), "{values:?}");
+        }
     }
 
     #[test]
@@ -1043,7 +1236,7 @@ mod tests {
         let client = apple_client(&key_pair).with_token_url(url);
 
         let refresh = client
-            .exchange_code("co.example.app", "one-time-code")
+            .exchange_code("co.example.app", "one-time-code", None)
             .await
             .unwrap()
             .expect("refresh token");
@@ -1054,10 +1247,46 @@ mod tests {
         assert_eq!(form["client_id"], "co.example.app");
         assert_eq!(form["code"], "one-time-code");
         assert_eq!(form["grant_type"], "authorization_code");
+        assert!(!form.contains_key("redirect_uri"), "app codes carry none");
         assert!(key_pair
             .public_key()
             .verify_token::<NoCustomClaims>(&form["client_secret"], None)
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn apple_code_exchange_repeats_the_web_return_url() {
+        let (url, received) = serve_token_endpoint(
+            axum::http::StatusCode::OK,
+            serde_json::json!({"refresh_token": "refresh-web"}),
+        )
+        .await;
+        let key_pair = ES256KeyPair::generate();
+        let client = apple_client(&key_pair).with_token_url(url);
+
+        let refresh = client
+            .exchange_code(
+                "co.example.web",
+                "web-code",
+                Some("https://login.example/api/oauth/authorize"),
+            )
+            .await
+            .unwrap()
+            .expect("refresh token");
+        assert_eq!(refresh.expose_secret(), "refresh-web");
+
+        let forms = received.lock().unwrap();
+        let form = forms.first().expect("token endpoint called");
+        assert_eq!(form["client_id"], "co.example.web");
+        assert_eq!(
+            form["redirect_uri"],
+            "https://login.example/api/oauth/authorize"
+        );
+        let claims = key_pair
+            .public_key()
+            .verify_token::<NoCustomClaims>(&form["client_secret"], None)
+            .unwrap();
+        assert_eq!(claims.subject.as_deref(), Some("co.example.web"));
     }
 
     #[tokio::test]
@@ -1070,7 +1299,7 @@ mod tests {
         let client = apple_client(&ES256KeyPair::generate()).with_token_url(url);
 
         let error = client
-            .exchange_code("co.example.app", "used-code")
+            .exchange_code("co.example.app", "used-code", None)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("invalid_grant"), "{error}");

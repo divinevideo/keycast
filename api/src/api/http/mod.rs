@@ -24,6 +24,7 @@ pub mod routes;
 pub mod service_deletion;
 pub mod service_provisioning;
 pub mod social_login;
+pub mod social_login_page;
 pub mod teams;
 
 pub use routes::*;
