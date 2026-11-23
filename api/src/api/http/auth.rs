@@ -4806,7 +4806,7 @@ pub async fn change_email(
     }
 
     // No-op if the address is unchanged.
-    if new_email == current_email {
+    if current_email.as_deref() == Some(new_email.as_str()) {
         return Ok(Json(ChangeEmailResponse {
             success: true,
             message: "That is already your email address.".to_string(),
@@ -4923,6 +4923,7 @@ pub async fn change_email(
             &old_token,
             &new_token,
             expires,
+            current_email.is_some(),
         )
         .await
     {
@@ -4935,9 +4936,16 @@ pub async fn change_email(
     let new_outcome = email_delivery
         .send_email_change_new(&new_email, &new_token)
         .await;
-    let old_outcome = email_delivery
-        .send_email_change_old(&current_email, &new_email, &old_token)
-        .await;
+    // An account with no current address (one released by an email handover) has nobody to
+    // notify on the old side; that side was stored as already confirmed.
+    let old_outcome = match current_email.as_deref() {
+        Some(current_email) => Some(
+            email_delivery
+                .send_email_change_old(current_email, &new_email, &old_token)
+                .await,
+        ),
+        None => None,
+    };
     reservation.release().await;
     record_provider_event(
         &pool,
@@ -4949,16 +4957,18 @@ pub async fn change_email(
         Some(&user_pubkey),
     )
     .await;
-    record_provider_event(
-        &pool,
-        &headers,
-        tenant_id,
-        "/api/user/change-email",
-        EmailDeliveryPurpose::EmailChangeOld,
-        &old_outcome,
-        Some(&user_pubkey),
-    )
-    .await;
+    if let Some(old_outcome) = &old_outcome {
+        record_provider_event(
+            &pool,
+            &headers,
+            tenant_id,
+            "/api/user/change-email",
+            EmailDeliveryPurpose::EmailChangeOld,
+            old_outcome,
+            Some(&user_pubkey),
+        )
+        .await;
+    }
 
     record_email_change_event(
         &pool,
@@ -5647,6 +5657,10 @@ pub async fn change_key(
             .get_credentials(&old_pubkey, tenant_id)
             .await?
             .ok_or(AuthError::UserNotFound)?;
+        // The new key's session names the account's email, so an account without one adds it first.
+        let email = email.ok_or_else(|| {
+            account_incomplete("Add an email to your account before changing its key.")
+        })?;
         let valid = verifier
             .verify(SecretString::from(password), password_hash.clone())
             .await

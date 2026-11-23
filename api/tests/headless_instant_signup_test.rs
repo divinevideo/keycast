@@ -371,7 +371,10 @@ async fn confirming_an_address_takes_it_from_an_unconfirmed_holder() {
 
     let released = user_row(&pool, &first_pubkey).await;
     assert_eq!(released.email, None);
-    assert!(!released.has_password);
+    assert!(
+        released.has_password,
+        "the released account keeps its password so it can add a new address"
+    );
     assert_eq!(released.verification_token, None);
     assert_eq!(released.consent, "never_asked");
     let has_key: bool =
@@ -741,4 +744,92 @@ async fn a_repeated_claim_for_an_unconfirmed_address_still_waits_for_confirmatio
         second_claim["pubkey"].as_str().unwrap().to_string(),
     ];
     cleanup(&pool, &pubkeys, &email).await;
+}
+
+/// An account that loses its unconfirmed address to the person who confirmed it can add a new
+/// address with its password, confirm it, and sign in by email again.
+#[tokio::test]
+async fn a_released_account_gets_email_sign_in_back_through_change_email() {
+    let pool = common::setup_oauth_test_db().await;
+    let state = auth_state_with_redis(pool.clone()).await;
+    let taken = format!("released-{}@example.com", Uuid::new_v4());
+    let replacement = format!("replacement-{}@example.com", Uuid::new_v4());
+
+    // A signs up instantly with the address and gets a session.
+    let a = body_json(register(&state, &taken, Some(true)).await).await;
+    let a_pubkey = a["pubkey"].as_str().unwrap().to_string();
+    let a_token = body_json(exchange(&state, a["code"].as_str().unwrap()).await).await
+        ["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // B registers the same address and confirms it, so A is released.
+    let b = body_json(register(&state, &taken, Some(true)).await).await;
+    let b_pubkey = b["pubkey"].as_str().unwrap().to_string();
+    let pending_token: String = sqlx::query_scalar(
+        "SELECT pending_email_verification_token FROM oauth_codes WHERE device_code = $1",
+    )
+    .bind(b["device_code"].as_str().unwrap())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        verify_link(&state, &pending_token).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(user_row(&pool, &a_pubkey).await.email, None);
+
+    // A's session asks for a new address, re-verifying its password.
+    let sender = Arc::new(DevEmailSender::new());
+    let delivery = EmailDeliveryService::unrestricted_for_tests(sender.clone());
+    let response = auth::change_email(
+        common::test_tenant(),
+        State(pool.clone()),
+        Extension(state.state.bcrypt.clone()),
+        Extension(delivery.clone()),
+        bearer(&a_token),
+        Json(auth::ChangeEmailRequest {
+            new_email: replacement.clone(),
+            password: PASSWORD.to_string(),
+        }),
+    )
+    .await
+    .expect("change-email works for an account with no current address");
+    assert!(response.0.success);
+    let sent = delivery.captured_emails();
+    assert_eq!(
+        sent.len(),
+        1,
+        "only the new address is written to: {sent:?}"
+    );
+    assert_eq!(sent[0].to, replacement);
+
+    // Confirming the new address finishes the change on its own: there is no old side.
+    let new_token: String =
+        sqlx::query_scalar("SELECT pending_email_new_token FROM users WHERE pubkey = $1")
+            .bind(&a_pubkey)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let confirmed = auth::confirm_email_change(
+        common::test_tenant(),
+        State(pool.clone()),
+        HeaderMap::new(),
+        Json(auth::ConfirmEmailChangeRequest { token: new_token }),
+    )
+    .await
+    .expect("the new address confirms");
+    assert!(confirmed.0.success);
+    let row = user_row(&pool, &a_pubkey).await;
+    assert_eq!(row.email.as_deref(), Some(replacement.as_str()));
+    assert_eq!(row.email_verified, Some(true));
+
+    // A signs in by email again, confirm-first and all.
+    let response = login(&state, &replacement, None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await["pubkey"], a_pubkey.as_str());
+
+    cleanup(&pool, std::slice::from_ref(&a_pubkey), &replacement).await;
+    cleanup(&pool, &[a_pubkey, b_pubkey], &taken).await;
 }

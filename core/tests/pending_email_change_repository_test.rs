@@ -91,6 +91,7 @@ async fn stale_confirm_token_does_not_confirm_fresh_change() {
         &stale_old,
         "stale-new",
         expires,
+        true,
     )
     .await
     .unwrap();
@@ -104,6 +105,7 @@ async fn stale_confirm_token_does_not_confirm_fresh_change() {
         &fresh_old,
         "fresh-new",
         expires,
+        true,
     )
     .await
     .unwrap();
@@ -150,6 +152,7 @@ async fn valid_confirm_token_marks_side() {
         &old_tok,
         "new-tok",
         expires,
+        true,
     )
     .await
     .unwrap();
@@ -191,6 +194,7 @@ async fn stale_cancel_token_does_not_clear_fresh_change() {
         &stale_old,
         "stale-new",
         expires,
+        true,
     )
     .await
     .unwrap();
@@ -202,6 +206,7 @@ async fn stale_cancel_token_does_not_clear_fresh_change() {
         &fresh_old,
         "fresh-new",
         expires,
+        true,
     )
     .await
     .unwrap();
@@ -247,6 +252,7 @@ async fn valid_cancel_token_clears_change() {
         "old-tok",
         &new_tok,
         expires,
+        true,
     )
     .await
     .unwrap();
@@ -291,6 +297,7 @@ async fn reinitiation_resets_prior_confirmations() {
         &old_tok_a,
         "new-a",
         expires,
+        true,
     )
     .await
     .unwrap();
@@ -312,6 +319,7 @@ async fn reinitiation_resets_prior_confirmations() {
         &format!("old-b-{}", Uuid::new_v4()),
         "new-b",
         expires,
+        true,
     )
     .await
     .unwrap();

@@ -813,8 +813,10 @@ impl OAuthCodeRepository {
     ///
     /// Whoever confirms an address gets it: an account created before its email was confirmed
     /// does not reserve the address against someone who proves they own it. The released account
-    /// keeps its key and sessions but loses email sign-in, its pending confirmation link, and the
-    /// marketing answer it gave for that address. A confirmed owner is never touched.
+    /// keeps its key, its sessions and its password, so it can add and confirm a new address
+    /// through `/api/user/change-email` and get email sign-in back. It loses the address, its
+    /// pending confirmation link, and the marketing answer it gave for that address. A confirmed
+    /// owner is never touched.
     async fn release_unconfirmed_email_holder(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         tenant_id: i64,
@@ -824,7 +826,7 @@ impl OAuthCodeRepository {
     ) -> Result<(), RepositoryError> {
         sqlx::query(
             "UPDATE users
-             SET email = NULL, password_hash = NULL, email_verification_token = NULL,
+             SET email = NULL, email_verification_token = NULL,
                  email_verification_expires_at = NULL, email_verification_sent_at = NULL,
                  email_marketing_consent = 'never_asked', email_marketing_consent_at = NULL,
                  email_marketing_consent_source = NULL,

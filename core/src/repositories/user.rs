@@ -1218,8 +1218,12 @@ impl UserRepository {
         old_token: &str,
         new_token: &str,
         expires_at: DateTime<Utc>,
+        has_current_email: bool,
     ) -> Result<(), RepositoryError> {
         let now = Utc::now();
+        // An account with no current address has no old side to confirm, so that side starts
+        // confirmed and the change finalizes once the new address confirms.
+        let old_confirmed_at = (!has_current_email).then_some(now);
         sqlx::query(
             "UPDATE users
              SET pending_email = $1,
@@ -1227,7 +1231,7 @@ impl UserRepository {
                  pending_email_new_token = $3,
                  pending_email_expires_at = $4,
                  pending_email_sent_at = $5,
-                 pending_email_old_confirmed_at = NULL,
+                 pending_email_old_confirmed_at = $8,
                  pending_email_new_confirmed_at = NULL,
                  updated_at = $5
              WHERE pubkey = $6 AND tenant_id = $7",
@@ -1239,6 +1243,7 @@ impl UserRepository {
         .bind(now)
         .bind(pubkey)
         .bind(tenant_id)
+        .bind(old_confirmed_at)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -2010,11 +2015,14 @@ impl UserRepository {
     }
 
     /// Get user's email and password hash for credential verification.
+    ///
+    /// The email is `None` for an account that has none, such as one whose unconfirmed address was
+    /// handed to the person who confirmed it.
     pub async fn get_credentials(
         &self,
         pubkey: &str,
         tenant_id: i64,
-    ) -> Result<Option<(String, String)>, RepositoryError> {
+    ) -> Result<Option<(Option<String>, String)>, RepositoryError> {
         sqlx::query_as(
             "SELECT email, password_hash FROM users WHERE pubkey = $1 AND tenant_id = $2",
         )
