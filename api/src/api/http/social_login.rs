@@ -47,6 +47,8 @@ const SOCIAL_NONCE_MAX_AGE_SECONDS: u32 = 60 * 60;
 const SOCIAL_NONCE_BYTES: usize = 32;
 /// Same lifetime as the session `POST /api/oauth/login` sets.
 const SESSION_COOKIE_MAX_AGE_SECONDS: u32 = 24 * 60 * 60;
+/// Reason on the success event when unconfirmed accounts gave up the email.
+pub const UNCONFIRMED_EMAIL_RELEASED: &str = "unconfirmed_email_released";
 const LOGIN_PAGE_EXPIRED_MESSAGE: &str = "This sign-in page has expired. Reload it and try again.";
 const AUTH_EVENT_TYPE: &str = "login";
 /// Same lifetime as the code `POST /api/headless/login` issues.
@@ -376,11 +378,12 @@ fn error_status(error: &SocialLoginHttpError) -> i32 {
 /// `POST /api/headless/login` returns for email and password.
 ///
 /// 1. A provider subject already linked to an account signs in to it.
-/// 2. Otherwise an account whose verified email matches, when the provider is authoritative for
+/// 2. Otherwise the one confirmed account with the email, when the provider is authoritative for
 ///    the address, is linked and signed in, and its owner is emailed about the new sign-in method.
-/// 3. Otherwise a new account is created with a fresh Nostr key and no password.
+/// 3. Otherwise, with no confirmed account, a new account is created with a fresh Nostr key and
+///    no password. Accounts that never confirmed the email cannot sign in, so they give it up.
 ///
-/// Matching accounts that cannot be linked safely answer `409 ACCOUNT_LINK_REQUIRED`.
+/// Confirmed accounts that cannot be linked safely answer `409 ACCOUNT_LINK_REQUIRED`.
 pub async fn headless_social_login(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
@@ -784,7 +787,28 @@ async fn complete_sign_in(
     if matches!(resolution, SocialAccountResolution::Created { .. }) {
         METRICS.inc_registration();
     }
-    audit.record("success", None, 200).await;
+    // Recorded on the success event itself, so the request still counts once in the auth metrics
+    // while the reason label shows how often an email was released.
+    let released = match resolution {
+        SocialAccountResolution::Created {
+            released_accounts, ..
+        } => released_accounts.as_slice(),
+        _ => &[],
+    };
+    let reason = if released.is_empty() {
+        None
+    } else {
+        audit.note("released_unconfirmed_accounts", released.to_vec());
+        tracing::info!(
+            event = audit.event(),
+            tenant_id = audit.tenant_id,
+            provider = provider.as_str(),
+            released = released.len(),
+            "Email released from unconfirmed accounts to the provider sign-in"
+        );
+        Some(UNCONFIRMED_EMAIL_RELEASED)
+    };
+    audit.record("success", reason, 200).await;
     tracing::info!(
         event = audit.event(),
         tenant_id = audit.tenant_id,

@@ -76,17 +76,21 @@ pub enum SocialAccountResolution {
     SignedIn { pubkey: String },
     /// The subject was linked to an existing account with the same verified email.
     Linked { pubkey: String, email: String },
-    /// A new account was created for the subject.
-    Created { pubkey: String },
+    /// A new account was created for the subject. `released_accounts` names the unconfirmed
+    /// accounts the email was removed from; usually none.
+    Created {
+        pubkey: String,
+        released_accounts: Vec<String>,
+    },
 }
 
 impl SocialAccountResolution {
     #[must_use]
     pub fn pubkey(&self) -> &str {
         match self {
-            Self::SignedIn { pubkey } | Self::Linked { pubkey, .. } | Self::Created { pubkey } => {
-                pubkey
-            }
+            Self::SignedIn { pubkey }
+            | Self::Linked { pubkey, .. }
+            | Self::Created { pubkey, .. } => pubkey,
         }
     }
 
@@ -104,11 +108,9 @@ impl SocialAccountResolution {
 /// Why an existing account with the same email cannot be linked automatically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkRefusalReason {
-    /// The Keycast account never verified its email.
-    AccountEmailNotVerified,
     /// The provider verified the address but is not authoritative for it.
     ProviderEmailNotAuthoritative,
-    /// Several accounts use the address in different letter case.
+    /// Several confirmed accounts use the address in different letter case.
     AmbiguousEmail,
 }
 
@@ -117,7 +119,6 @@ impl LinkRefusalReason {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::AccountEmailNotVerified => "account_email_not_verified",
             Self::ProviderEmailNotAuthoritative => "provider_email_not_authoritative",
             Self::AmbiguousEmail => "ambiguous_email",
         }
@@ -148,6 +149,7 @@ pub enum SocialLoginError {
 /// What to do with the accounts that share the provider's email.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmailDecision {
+    /// Create an account. Any unconfirmed accounts with the email give it up.
     Create,
     Link(String),
     Refuse(LinkRefusalReason),
@@ -155,18 +157,18 @@ pub enum EmailDecision {
 
 /// Decide between creating, linking and refusing from the accounts that share the email.
 ///
-/// Linking happens only when exactly one account matches, that account verified its email, and
-/// the provider is authoritative for the address.
+/// Only confirmed accounts count. An account that never confirmed its email cannot sign in, so
+/// it does not hold the address against the provider sign-in. Linking happens only when exactly
+/// one confirmed account matches and the provider is authoritative for the address; with none,
+/// an account is created.
 #[must_use]
 pub fn decide_for_email_matches(
     matches: &[EmailMatch],
     email_authoritative: bool,
 ) -> EmailDecision {
-    match matches {
+    let confirmed: Vec<&EmailMatch> = matches.iter().filter(|m| m.email_verified).collect();
+    match confirmed.as_slice() {
         [] => EmailDecision::Create,
-        [only] if !only.email_verified => {
-            EmailDecision::Refuse(LinkRefusalReason::AccountEmailNotVerified)
-        }
         [_] if !email_authoritative => {
             EmailDecision::Refuse(LinkRefusalReason::ProviderEmailNotAuthoritative)
         }
@@ -183,8 +185,9 @@ const MAX_RESOLUTION_ATTEMPTS: usize = 2;
 ///
 /// 1. A linked subject signs in to its account.
 /// 2. Otherwise the email must be present and verified by the provider.
-/// 3. No account with the email: a new account is created with a fresh Nostr key.
-/// 4. Exactly one verified account and an authoritative provider: the subject is linked to it.
+/// 3. No confirmed account with the email: a new account is created with a fresh Nostr key, and
+///    accounts that never confirmed the email give it up.
+/// 4. Exactly one confirmed account and an authoritative provider: the subject is linked to it.
 /// 5. Anything else is refused with [`SocialLoginRefusal::AccountLinkRequired`].
 pub async fn resolve_social_account(
     pool: &PgPool,
@@ -266,9 +269,10 @@ pub async fn resolve_social_account(
                     })
                     .await?
                 {
-                    CreateSocialAccountOutcome::Created => {
+                    CreateSocialAccountOutcome::Created { released } => {
                         return Ok(SocialAccountResolution::Created {
                             pubkey: pubkey.clone(),
+                            released_accounts: released,
                         });
                     }
                     CreateSocialAccountOutcome::EmailTaken
@@ -334,17 +338,50 @@ mod tests {
     }
 
     #[test]
-    fn unverified_account_is_never_linked() {
+    fn unconfirmed_accounts_never_link_and_give_up_the_email() {
+        for authoritative in [true, false] {
+            assert_eq!(
+                decide_for_email_matches(&[email_match("a", false)], authoritative),
+                EmailDecision::Create
+            );
+            assert_eq!(
+                decide_for_email_matches(
+                    &[email_match("a", false), email_match("b", false)],
+                    authoritative
+                ),
+                EmailDecision::Create
+            );
+        }
+    }
+
+    #[test]
+    fn a_confirmed_account_links_whatever_unconfirmed_variants_exist() {
+        let matches = [
+            email_match("a", false),
+            email_match("b", true),
+            email_match("c", false),
+        ];
         assert_eq!(
-            decide_for_email_matches(&[email_match("a", false)], true),
-            EmailDecision::Refuse(LinkRefusalReason::AccountEmailNotVerified)
+            decide_for_email_matches(&matches, true),
+            EmailDecision::Link("b".to_string())
+        );
+        assert_eq!(
+            decide_for_email_matches(&matches, false),
+            EmailDecision::Refuse(LinkRefusalReason::ProviderEmailNotAuthoritative)
         );
     }
 
     #[test]
-    fn case_variants_of_one_address_are_ambiguous() {
+    fn confirmed_case_variants_of_one_address_are_ambiguous() {
         assert_eq!(
-            decide_for_email_matches(&[email_match("a", true), email_match("b", true)], true),
+            decide_for_email_matches(
+                &[
+                    email_match("a", true),
+                    email_match("b", false),
+                    email_match("c", true)
+                ],
+                true
+            ),
             EmailDecision::Refuse(LinkRefusalReason::AmbiguousEmail)
         );
     }

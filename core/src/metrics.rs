@@ -1634,6 +1634,7 @@ fn normalize_auth_reason(reason_code: Option<&str>) -> &'static str {
         "email_missing" => "email_missing",
         "provider_unavailable" => "provider_unavailable",
         "replayed_token" => "replayed_token",
+        "unconfirmed_email_released" => "unconfirmed_email_released",
         _ => "other",
     }
 }

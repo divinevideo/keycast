@@ -32,10 +32,13 @@ pub struct NewSocialAccount<'a> {
 }
 
 /// Result of [`UserIdentityRepository::create_account`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateSocialAccountOutcome {
-    Created,
-    /// Another account took this email first. Resolve again.
+    /// The account was created. `released` names the unconfirmed accounts the email was removed
+    /// from, in pubkey order; usually none.
+    Created { released: Vec<String> },
+    /// A confirmed account holds this email now, for example because its owner confirmed it
+    /// meanwhile. Resolve again.
     EmailTaken,
     /// Another request linked this provider subject first. Resolve again.
     SubjectTaken,
@@ -45,7 +48,7 @@ pub enum CreateSocialAccountOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkSocialIdentityOutcome {
     Linked,
-    /// The email no longer resolves to exactly this verified account. Resolve again.
+    /// The email no longer belongs to exactly this confirmed account. Resolve again.
     AccountChanged,
     /// Another request linked this provider subject first. Resolve again.
     SubjectTaken,
@@ -56,9 +59,6 @@ pub enum LinkSocialIdentityOutcome {
 pub struct UserIdentityRepository {
     pool: PgPool,
 }
-
-/// Most matches a lookup ever needs: one is linkable, two are ambiguous.
-const EMAIL_MATCH_LIMIT: i64 = 2;
 
 impl UserIdentityRepository {
     pub fn new(pool: PgPool) -> Self {
@@ -111,8 +111,8 @@ impl UserIdentityRepository {
 
     /// Accounts whose email equals `normalized_email` ignoring case.
     ///
-    /// The unique email index is case-sensitive, so older rows may differ only in case. Returns at
-    /// most two rows: callers only need to tell "one" from "more than one".
+    /// The unique email index is case-sensitive, so older rows may differ only in case. All of
+    /// them are returned, confirmed or not, because the decision depends on the confirmed ones.
     pub async fn find_users_by_email(
         &self,
         tenant_id: i64,
@@ -122,12 +122,10 @@ impl UserIdentityRepository {
             "SELECT pubkey, email, COALESCE(email_verified, false) AS email_verified
              FROM users
              WHERE tenant_id = $1 AND LOWER(email) = $2
-             ORDER BY pubkey
-             LIMIT $3",
+             ORDER BY pubkey",
         )
         .bind(tenant_id)
         .bind(normalized_email)
-        .bind(EMAIL_MATCH_LIMIT)
         .fetch_all(&self.pool)
         .await
         .map_err(Into::into)
@@ -135,8 +133,9 @@ impl UserIdentityRepository {
 
     /// Link a provider subject to an existing account found by email.
     ///
-    /// Re-checks inside the transaction that the email still resolves to exactly this verified
-    /// account, so a concurrent email change or duplicate cannot be linked by accident.
+    /// Re-checks inside the transaction that exactly this account is still the only confirmed
+    /// one with the email, so a concurrent email change or duplicate cannot be linked by
+    /// accident. Unconfirmed accounts with the same email are left as they are.
     pub async fn link(
         &self,
         tenant_id: i64,
@@ -148,23 +147,9 @@ impl UserIdentityRepository {
         let mut tx = self.pool.begin().await?;
         lock_email(&mut tx, tenant_id, normalized_email).await?;
 
-        let matches: Vec<EmailMatch> = sqlx::query_as(
-            "SELECT pubkey, email, COALESCE(email_verified, false) AS email_verified
-             FROM users
-             WHERE tenant_id = $1 AND LOWER(email) = $2
-             ORDER BY pubkey
-             LIMIT $3
-             FOR UPDATE",
-        )
-        .bind(tenant_id)
-        .bind(normalized_email)
-        .bind(EMAIL_MATCH_LIMIT)
-        .fetch_all(&mut *tx)
-        .await?;
-        let still_linkable = matches!(
-            matches.as_slice(),
-            [only] if only.pubkey == user_pubkey && only.email_verified
-        );
+        let matches = lock_email_matches(&mut tx, tenant_id, normalized_email).await?;
+        let confirmed: Vec<&EmailMatch> = matches.iter().filter(|m| m.email_verified).collect();
+        let still_linkable = matches!(confirmed.as_slice(), [only] if only.pubkey == user_pubkey);
         if !still_linkable {
             return Ok(LinkSocialIdentityOutcome::AccountChanged);
         }
@@ -190,6 +175,11 @@ impl UserIdentityRepository {
     ///
     /// The account has a verified email and no password. Encryption of the new key happens
     /// before this call so no transaction is held across the key manager.
+    ///
+    /// Accounts that never confirmed this email cannot sign in, so the email is released to the
+    /// provider sign-in: in the same transaction, it is removed from them along with their
+    /// verification, password reset and email change tokens. They are released only while still
+    /// unconfirmed; once one is confirmed this answers [`CreateSocialAccountOutcome::EmailTaken`].
     pub async fn create_account(
         &self,
         account: NewSocialAccount<'_>,
@@ -197,14 +187,17 @@ impl UserIdentityRepository {
         let mut tx = self.pool.begin().await?;
         lock_email(&mut tx, account.tenant_id, account.email).await?;
 
-        let existing: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM users WHERE tenant_id = $1 AND LOWER(email) = $2",
-        )
-        .bind(account.tenant_id)
-        .bind(account.email)
-        .fetch_one(&mut *tx)
-        .await?;
-        if existing > 0 {
+        let matches = lock_email_matches(&mut tx, account.tenant_id, account.email).await?;
+        if matches.iter().any(|m| m.email_verified) {
+            return Ok(CreateSocialAccountOutcome::EmailTaken);
+        }
+        let released = if matches.is_empty() {
+            Vec::new()
+        } else {
+            release_unconfirmed_email(&mut tx, account.tenant_id, account.email).await?
+        };
+        if released.len() != matches.len() {
+            // Not expected while the rows are locked; resolve again rather than guess.
             return Ok(CreateSocialAccountOutcome::EmailTaken);
         }
 
@@ -253,10 +246,11 @@ impl UserIdentityRepository {
         }
 
         tx.commit().await?;
-        Ok(CreateSocialAccountOutcome::Created)
+        Ok(CreateSocialAccountOutcome::Created { released })
     }
 
-    /// Store the encrypted Apple refresh token for a linked Apple subject.
+    /// Store the encrypted Apple refresh token for a linked Apple subject, with the client (bundle
+    /// ID or Services ID) it was issued to.
     pub async fn store_apple_refresh_token(
         &self,
         tenant_id: i64,
@@ -311,6 +305,84 @@ async fn lock_email(
         .execute(&mut **tx)
         .await?;
     Ok(())
+}
+
+/// Every account with this email ignoring case, locked until the transaction ends.
+async fn lock_email_matches(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant_id: i64,
+    normalized_email: &str,
+) -> Result<Vec<EmailMatch>, RepositoryError> {
+    sqlx::query_as(
+        "SELECT pubkey, email, COALESCE(email_verified, false) AS email_verified
+         FROM users
+         WHERE tenant_id = $1 AND LOWER(email) = $2
+         ORDER BY pubkey
+         FOR UPDATE",
+    )
+    .bind(tenant_id)
+    .bind(normalized_email)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(Into::into)
+}
+
+/// Remove the email from every account that never confirmed it, together with the links that
+/// could still act on it: email verification, password reset and pending email change. Returns
+/// the pubkeys of those accounts.
+///
+/// The rows stay, without an email: nothing can sign in to them or reset them any more, and
+/// their pubkeys remain for support and audit. Only rows still unconfirmed are changed, so a
+/// confirmation that commits first keeps its email.
+async fn release_unconfirmed_email(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant_id: i64,
+    normalized_email: &str,
+) -> Result<Vec<String>, RepositoryError> {
+    // As when an account is deleted: an opted-in address may already be a contact on the email
+    // platform, and once no account holds it nothing else would tell the sync to remove it.
+    sqlx::query(
+        "INSERT INTO email_marketing_deletions (tenant_id, email, deleted_at)
+         SELECT tenant_id, email, NOW() FROM users
+         WHERE tenant_id = $1 AND LOWER(email) = $2
+           AND email_verified IS NOT TRUE
+           AND email_marketing_consent = 'opted_in'",
+    )
+    .bind(tenant_id)
+    .bind(normalized_email)
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query_scalar(
+        "UPDATE users
+         SET email = NULL,
+             email_verification_token = NULL,
+             email_verification_expires_at = NULL,
+             email_verification_sent_at = NULL,
+             password_reset_token = NULL,
+             password_reset_expires_at = NULL,
+             pending_email = NULL,
+             pending_email_old_token = NULL,
+             pending_email_new_token = NULL,
+             pending_email_expires_at = NULL,
+             pending_email_sent_at = NULL,
+             pending_email_old_confirmed_at = NULL,
+             pending_email_new_confirmed_at = NULL,
+             updated_at = $3
+         WHERE tenant_id = $1 AND LOWER(email) = $2
+           AND email_verified IS NOT TRUE
+         RETURNING pubkey",
+    )
+    .bind(tenant_id)
+    .bind(normalized_email)
+    .bind(Utc::now())
+    .fetch_all(&mut **tx)
+    .await
+    .map(|mut released: Vec<String>| {
+        released.sort();
+        released
+    })
+    .map_err(Into::into)
 }
 
 /// Insert a provider link. Returns `false` when the subject is already linked.

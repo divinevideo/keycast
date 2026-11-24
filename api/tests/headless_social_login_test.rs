@@ -18,7 +18,11 @@ use keycast_api::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
 use keycast_api::{
     api::{
         http::{
-            auth::{change_password, export_key, ChangePasswordRequest},
+            auth::{
+                change_password, confirm_email_change, export_key, reset_password, verify_email,
+                ChangePasswordRequest, ConfirmEmailChangeRequest, ResetPasswordRequest,
+                VerifyEmailRequest,
+            },
             oauth::{authorize_get, token, AuthorizeRequest, TokenRequest, TokenRequestBody},
             routes::AuthState,
             social_login::{
@@ -42,7 +46,9 @@ use keycast_api::{
 };
 use keycast_core::{
     encryption::{KeyManager, KeyManagerError},
-    repositories::{UserIdentityRepository, UserRepository},
+    repositories::{
+        CreateSocialAccountOutcome, NewSocialAccount, UserIdentityRepository, UserRepository,
+    },
     secret_pool::SecretPool,
     social_login::SocialProvider,
 };
@@ -698,26 +704,267 @@ async fn google_address_on_another_domain_needs_a_manual_link() {
     );
 }
 
+/// Links an unconfirmed sign-up still holds, as they would be after registering and starting an
+/// email change and a password reset.
+struct PendingLinks {
+    verification: String,
+    reset: String,
+    email_change: String,
+}
+
+async fn give_pending_links(pool: &PgPool, pubkey: &str) -> PendingLinks {
+    let links = PendingLinks {
+        verification: unique("verify"),
+        reset: unique("reset"),
+        email_change: unique("change"),
+    };
+    sqlx::query(
+        "UPDATE users SET
+             email_verification_token = $2,
+             email_verification_expires_at = NOW() + INTERVAL '1 day',
+             email_verification_sent_at = NOW(),
+             password_reset_token = $3,
+             password_reset_expires_at = NOW() + INTERVAL '1 hour',
+             pending_email = $4,
+             pending_email_new_token = $5,
+             pending_email_old_token = $6,
+             pending_email_expires_at = NOW() + INTERVAL '1 day',
+             pending_email_sent_at = NOW(),
+             email_marketing_consent = 'opted_in',
+             email_marketing_consent_at = NOW()
+         WHERE pubkey = $1",
+    )
+    .bind(pubkey)
+    .bind(&links.verification)
+    .bind(&links.reset)
+    .bind(format!("{}@example.com", unique("next")))
+    .bind(&links.email_change)
+    .bind(unique("old-side"))
+    .execute(pool)
+    .await
+    .expect("give pending links");
+    links
+}
+
+/// Whether a JSON handler answered with a 2xx status.
+fn succeeded<T: IntoResponse, E: IntoResponse>(result: Result<T, E>) -> bool {
+    match result {
+        Ok(response) => response.into_response().status().is_success(),
+        Err(error) => error.into_response().status().is_success(),
+    }
+}
+
 #[tokio::test]
-async fn unverified_keycast_email_is_never_linked() {
+async fn an_unconfirmed_account_gives_up_its_email_to_a_new_account() {
     let ctx = context().await;
     let email = gmail();
-    let existing = insert_password_user(&ctx.pool, &email, false).await;
-    ctx.track(&existing);
+    let unconfirmed = insert_password_user(&ctx.pool, &email, false).await;
+    ctx.track(&unconfirmed);
+    let links = give_pending_links(&ctx.pool, &unconfirmed).await;
     let nonce = unique("nonce");
     let token = TokenSpec::google(&unique("google-sub"), &email, &nonce).sign();
 
     let (status, body) = ctx.post(request("google", &token, &nonce)).await;
 
-    let identities = identity_count(&ctx.pool, &existing).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["created"], true);
+    let pubkey = body["pubkey"].as_str().unwrap().to_string();
+    assert_ne!(pubkey, unconfirmed);
+
+    // The new account holds the address; the unconfirmed row stays, with no email and no links.
+    let new_email: Option<String> = sqlx::query_scalar("SELECT email FROM users WHERE pubkey = $1")
+        .bind(&pubkey)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+    #[allow(clippy::type_complexity)]
+    let old: (
+        Option<String>,
+        bool,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        bool,
+    ) = sqlx::query_as(
+        "SELECT email, COALESCE(email_verified, false), email_verification_token,
+                password_reset_token, pending_email, pending_email_new_token,
+                pending_email_old_token, password_hash IS NOT NULL
+         FROM users WHERE pubkey = $1",
+    )
+    .bind(&unconfirmed)
+    .fetch_one(&ctx.pool)
+    .await
+    .expect("the unconfirmed row is kept");
+    let event: (String, Option<String>, serde_json::Value) = sqlx::query_as(
+        "SELECT outcome, reason_code, metadata_json FROM auth_events
+         WHERE tenant_id = 1 AND endpoint = '/api/headless/social-login' AND email = $1
+         ORDER BY occurred_at DESC, id DESC LIMIT 1",
+    )
+    .bind(&email)
+    .fetch_one(&ctx.pool)
+    .await
+    .expect("social-login auth event");
+    let marketing_tombstones: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM email_marketing_deletions WHERE email = $1")
+            .bind(&email)
+            .fetch_one(&ctx.pool)
+            .await
+            .unwrap();
+
+    // The links sent to the address before can no longer act on either account.
+    let verified = succeeded(
+        verify_email(
+            tenant(),
+            State(ctx.auth_state.clone()),
+            HeaderMap::new(),
+            Json(VerifyEmailRequest {
+                token: links.verification.clone(),
+            }),
+        )
+        .await,
+    );
+    let reset = succeeded(
+        reset_password(
+            tenant(),
+            State(ctx.auth_state.clone()),
+            HeaderMap::new(),
+            Json(ResetPasswordRequest {
+                token: links.reset.clone(),
+                new_password: "a brand new passphrase 123".to_string(),
+            }),
+        )
+        .await,
+    );
+    let email_changed = succeeded(
+        confirm_email_change(
+            tenant(),
+            State(ctx.pool.clone()),
+            HeaderMap::new(),
+            Json(ConfirmEmailChangeRequest {
+                token: links.email_change.clone(),
+            }),
+        )
+        .await,
+    );
+    let old_row_verified: bool =
+        sqlx::query_scalar("SELECT COALESCE(email_verified, false) FROM users WHERE pubkey = $1")
+            .bind(&unconfirmed)
+            .fetch_one(&ctx.pool)
+            .await
+            .unwrap();
+
+    sqlx::query("DELETE FROM email_marketing_deletions WHERE email = $1")
+        .bind(&email)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
     ctx.cleanup().await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["code"], "ACCOUNT_LINK_REQUIRED");
-    assert_eq!(identities, 0);
+    assert_eq!(new_email.as_deref(), Some(email.as_str()));
+    assert_eq!(old.0, None, "email removed");
+    assert!(!old.1, "still unconfirmed");
+    assert_eq!(
+        (&old.2, &old.3, &old.4, &old.5, &old.6),
+        (&None, &None, &None, &None, &None),
+        "verification, reset and email-change links cleared"
+    );
+    assert!(old.7, "the row itself is kept as it was");
+    assert_eq!(event.0, "success");
+    assert_eq!(event.1.as_deref(), Some("unconfirmed_email_released"));
+    assert_eq!(
+        event.2["released_unconfirmed_accounts"],
+        serde_json::json!([unconfirmed])
+    );
+    assert_eq!(
+        marketing_tombstones, 1,
+        "an opted-in address no account holds any more is removed from the email platform"
+    );
+    assert!(!verified, "old verification link");
+    assert!(!reset, "old password reset link");
+    assert!(!email_changed, "old email change link");
+    assert!(
+        !old_row_verified,
+        "the verification link did not confirm the old row"
+    );
 }
 
 #[tokio::test]
-async fn case_variants_of_one_address_are_refused() {
+async fn a_confirmed_account_beside_unconfirmed_case_variants_still_links() {
+    let ctx = context().await;
+    let local = unique("variants");
+    let lower = format!("{local}@gmail.com");
+    let upper = format!("{}@gmail.com", local.to_uppercase());
+    let confirmed = insert_password_user(&ctx.pool, &lower, true).await;
+    let unconfirmed = insert_password_user(&ctx.pool, &upper, false).await;
+    ctx.track(&confirmed);
+    ctx.track(&unconfirmed);
+    let nonce = unique("nonce");
+    let token = TokenSpec::google(&unique("google-sub"), &lower, &nonce).sign();
+
+    let (status, body) = ctx.post(request("google", &token, &nonce)).await;
+
+    let unconfirmed_email: Option<String> =
+        sqlx::query_scalar("SELECT email FROM users WHERE pubkey = $1")
+            .bind(&unconfirmed)
+            .fetch_one(&ctx.pool)
+            .await
+            .unwrap();
+    ctx.cleanup().await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["pubkey"], confirmed.as_str());
+    assert_eq!(body["created"], false);
+    // Linking takes nothing from anyone; only creating an account releases an address.
+    assert_eq!(unconfirmed_email.as_deref(), Some(upper.as_str()));
+}
+
+#[tokio::test]
+async fn an_account_confirmed_meanwhile_keeps_its_email_and_is_linked() {
+    let ctx = context().await;
+    let email = gmail();
+    let account = insert_password_user(&ctx.pool, &email, false).await;
+    ctx.track(&account);
+
+    // The owner confirms between the decision to create and the transaction that would create:
+    // the transaction sees the confirmed row and leaves it alone.
+    sqlx::query("UPDATE users SET email_verified = true WHERE pubkey = $1")
+        .bind(&account)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+    let keys = Keys::generate();
+    let late = UserIdentityRepository::new(ctx.pool.clone())
+        .create_account(NewSocialAccount {
+            tenant_id: 1,
+            pubkey: &keys.public_key().to_hex(),
+            email: &email,
+            encrypted_secret: &keys.secret_key().to_secret_bytes(),
+            provider: SocialProvider::Google,
+            subject: &unique("google-sub"),
+        })
+        .await
+        .expect("create account");
+    let kept: Option<String> = sqlx::query_scalar("SELECT email FROM users WHERE pubkey = $1")
+        .bind(&account)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+
+    // Resolving again, as the sign-in does after EmailTaken, links to the confirmed account.
+    let nonce = unique("nonce");
+    let token = TokenSpec::google(&unique("google-sub"), &email, &nonce).sign();
+    let (status, body) = ctx.post(request("google", &token, &nonce)).await;
+
+    ctx.cleanup().await;
+    assert_eq!(late, CreateSocialAccountOutcome::EmailTaken);
+    assert_eq!(kept.as_deref(), Some(email.as_str()));
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["pubkey"], account.as_str());
+    assert_eq!(body["created"], false);
+}
+
+#[tokio::test]
+async fn confirmed_case_variants_of_one_address_are_refused() {
     let ctx = context().await;
     let local = unique("twins");
     let lower = format!("{local}@gmail.com");

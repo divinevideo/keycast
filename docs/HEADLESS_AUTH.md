@@ -113,15 +113,20 @@ How the account is found:
 1. The provider account (`sub`) is already linked: sign in to that account.
 2. Otherwise the provider must report a verified email (`400 EMAIL_MISSING`,
    `403 EMAIL_NOT_VERIFIED`).
-3. No Keycast account uses that email (compared ignoring case): create one with a fresh Nostr key,
-   the verified email and no password.
-4. Exactly one account uses it, that account verified its email, and the provider is
-   authoritative for the address: link and sign in, and email the account owner that the sign-in
-   method was added. Google is authoritative for `@gmail.com` / `@googlemail.com` addresses and
-   for Google Workspace accounts (`hd` claim); Apple for every address it reports as verified.
-5. Anything else (unverified Keycast email, a Google address on another domain, several accounts
-   that differ only in letter case) answers `409 ACCOUNT_LINK_REQUIRED`: the person signs in with
-   their password instead.
+3. Only accounts that confirmed the email (compared ignoring case) count. An account that never
+   confirmed it cannot sign in, so it does not hold the address.
+4. No confirmed account uses the email: create one with a fresh Nostr key, the verified email and
+   no password. In the same transaction the email is removed from any unconfirmed accounts that
+   still carry it, together with their verification, password reset and email change links, so
+   none of those links works any more. Their rows are kept without an email. The success audit
+   event then has the reason `unconfirmed_email_released` and lists them.
+5. Exactly one confirmed account uses it and the provider is authoritative for the address: link
+   and sign in, and email the account owner that the sign-in method was added. Google is
+   authoritative for `@gmail.com` / `@googlemail.com` addresses and for Google Workspace accounts
+   (`hd` claim); Apple for every address it reports as verified.
+6. Anything else (a Google address on another domain, several confirmed accounts that differ only
+   in letter case) answers `409 ACCOUNT_LINK_REQUIRED`: the person signs in with their password
+   instead.
 
 An account created this way has no password. Password-protected operations (export key, change
 password, email or key) answer `409 PASSWORD_NOT_SET` until the person sets one through
