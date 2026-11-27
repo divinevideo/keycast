@@ -3117,13 +3117,40 @@ pub async fn forgot_password(
     let reset_token = generate_secure_token();
     let reset_expires = Utc::now() + Duration::hours(PASSWORD_RESET_EXPIRY_HOURS);
 
-    // Store reset token (reusing user_repo from above)
-    if let Err(error) = user_repo
-        .set_password_reset_token(&public_key, tenant_id, &reset_token, reset_expires)
+    // Passwordless provider accounts start setup from a signed-in account session.
+    // Require a bearer to avoid turning a public form into a cookie-authenticated action.
+    let authenticated_owner = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("Bearer "))
+        && extract_user_for_authorization_management(&headers, tenant_id)
+            .await
+            .is_ok_and(|owner| owner == public_key);
+    match user_repo
+        .set_password_reset_token(
+            &public_key,
+            tenant_id,
+            &req.email,
+            &reset_token,
+            reset_expires,
+            authenticated_owner,
+        )
         .await
     {
-        reservation.release().await;
-        return Err(error.into());
+        Ok(true) => {}
+        Ok(false) => {
+            reservation.release().await;
+            return Ok(Json(ForgotPasswordResponse {
+                success: true,
+                message:
+                    "If an account exists with that email, a password reset link has been sent."
+                        .to_string(),
+            }));
+        }
+        Err(error) => {
+            reservation.release().await;
+            return Err(error.into());
+        }
     }
 
     // Send password reset email (optional - don't fail if email service unavailable)
@@ -3281,9 +3308,12 @@ pub async fn reset_password(
     // Update password, clear reset token, and mark email as verified
     // (user proved email ownership by receiving and using the reset link)
     let user_repo = UserRepository::new(pool.clone());
-    user_repo
-        .reset_password(&public_key, tenant_id, &password_hash)
-        .await?;
+    if !user_repo
+        .reset_password(&public_key, tenant_id, &password_hash, &req.token)
+        .await?
+    {
+        return Err(AuthError::InvalidToken);
+    }
 
     super::auth_observability::record_auth_event_and_log(
         pool,

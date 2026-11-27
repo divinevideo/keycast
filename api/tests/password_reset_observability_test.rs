@@ -197,6 +197,69 @@ async fn public_recovery_responses_match_for_existing_missing_admitted_and_suppr
 }
 
 #[tokio::test]
+async fn provider_only_account_requires_signed_in_setup_before_email_recovery() {
+    use keycast_core::repositories::UserRepository;
+
+    let pool = setup_pool().await;
+    let email = format!("provider-recovery-{}@example.com", Uuid::new_v4());
+    let pubkey = Keys::generate().public_key().to_hex();
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, email, email_verified) VALUES ($1, 1, $2, true)",
+    )
+    .bind(&pubkey)
+    .bind(&email)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO user_identities (tenant_id, user_pubkey, provider, subject) VALUES (1, $1, 'google', $2)")
+        .bind(&pubkey).bind(Uuid::new_v4().to_string()).execute(&pool).await.unwrap();
+
+    let sender = Arc::new(DevEmailSender::new());
+    let app = public_recovery_app(
+        pool.clone(),
+        EmailDeliveryService::unrestricted_for_tests(sender.clone()),
+    );
+    let refused = public_recovery_response(&app, "/auth/forgot-password", &email).await;
+    let missing = format!("missing-{}@example.com", Uuid::new_v4());
+    assert_eq!(
+        refused,
+        public_recovery_response(&app, "/auth/forgot-password", &missing).await
+    );
+    assert!(sender.get_captured_emails().is_empty());
+
+    let repo = UserRepository::new(pool.clone());
+    let token = Uuid::new_v4().to_string();
+    assert!(repo
+        .set_password_reset_token(
+            &pubkey,
+            1,
+            &email,
+            &token,
+            Utc::now() + Duration::hours(1),
+            true
+        )
+        .await
+        .unwrap());
+    let password_hash = hash("fixture-password", 4).unwrap();
+    assert!(repo
+        .reset_password(&pubkey, 1, &password_hash, &token)
+        .await
+        .unwrap());
+    assert!(!repo
+        .reset_password(&pubkey, 1, &password_hash, &token)
+        .await
+        .unwrap());
+
+    assert_eq!(
+        public_recovery_response(&app, "/auth/forgot-password", &email).await,
+        refused
+    );
+    assert_eq!(sender.get_captured_emails().len(), 1);
+    cleanup_by_email(&pool, &email).await;
+    cleanup_by_email(&pool, &missing).await;
+}
+
+#[tokio::test]
 async fn test_forgot_password_records_accepted_event_for_missing_email() {
     let pool = setup_pool().await;
     let email = format!("missing-reset-{}@example.com", Uuid::new_v4());

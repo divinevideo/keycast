@@ -129,8 +129,10 @@ How the account is found:
    instead.
 
 An account created this way has no password. Password-protected operations (export key, change
-password, email or key) answer `409 PASSWORD_NOT_SET` until the person sets one through
-"Forgot password".
+password, email or key) answer `409 PASSWORD_NOT_SET` until the person sets one. First-password
+setup for a provider account requires a signed-in account bearer on the password-reset request,
+then completion of the link sent to the account's email. An anonymous "Forgot password" request
+cannot start setup. Once a password is set, ordinary password recovery is available.
 
 When Apple sends `authorization_code` and the Apple signing key is configured, Keycast stores the
 encrypted grant only after verifying that the exchanged identity matches the signed-in account and

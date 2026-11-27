@@ -1058,27 +1058,36 @@ impl UserRepository {
     // Password reset methods
     // =========================================================================
 
-    /// Set password reset token.
+    /// Set a reset token only for the requested account and address.
+    /// A passwordless provider account must initiate setup from its own session.
     pub async fn set_password_reset_token(
         &self,
         pubkey: &str,
         tenant_id: i64,
+        email: &str,
         token: &str,
         expires_at: DateTime<Utc>,
-    ) -> Result<(), RepositoryError> {
-        sqlx::query(
+        authenticated_owner: bool,
+    ) -> Result<bool, RepositoryError> {
+        let result = sqlx::query(
             "UPDATE users
              SET password_reset_token = $1, password_reset_expires_at = $2, updated_at = $3
-             WHERE pubkey = $4 AND tenant_id = $5",
+             WHERE pubkey = $4 AND tenant_id = $5 AND email = $6
+               AND ($7 OR password_hash IS NOT NULL OR NOT EXISTS (
+                   SELECT 1 FROM user_identities identity
+                   WHERE identity.tenant_id = users.tenant_id AND identity.user_pubkey = users.pubkey
+               ))",
         )
         .bind(token)
         .bind(expires_at)
         .bind(Utc::now())
         .bind(pubkey)
         .bind(tenant_id)
+        .bind(email)
+        .bind(authenticated_owner)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() == 1)
     }
 
     /// Find user by password reset token.
@@ -1105,8 +1114,9 @@ impl UserRepository {
         pubkey: &str,
         tenant_id: i64,
         password_hash: &str,
-    ) -> Result<(), RepositoryError> {
-        sqlx::query(
+        token: &str,
+    ) -> Result<bool, RepositoryError> {
+        let result = sqlx::query(
             "UPDATE users
              SET password_hash = $1,
                  password_reset_token = NULL,
@@ -1115,15 +1125,17 @@ impl UserRepository {
                  email_verification_token = NULL,
                  email_verification_expires_at = NULL,
                  updated_at = $2
-             WHERE pubkey = $3 AND tenant_id = $4",
+             WHERE pubkey = $3 AND tenant_id = $4 AND password_reset_token = $5
+               AND (password_reset_expires_at IS NULL OR password_reset_expires_at >= NOW())",
         )
         .bind(password_hash)
         .bind(Utc::now())
         .bind(pubkey)
         .bind(tenant_id)
+        .bind(token)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() == 1)
     }
 
     // =========================================================================
@@ -1327,6 +1339,8 @@ impl UserRepository {
             "UPDATE users
              SET email = pending_email,
                  email_verified = true,
+                 password_reset_token = NULL,
+                 password_reset_expires_at = NULL,
                  pending_email = NULL,
                  pending_email_old_token = NULL,
                  pending_email_new_token = NULL,
