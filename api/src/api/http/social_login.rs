@@ -771,8 +771,7 @@ async fn complete_sign_in(
             };
             let stored = store_apple_refresh_token(
                 providers,
-                &auth_state.state.db,
-                auth_state.state.key_manager.as_ref().as_ref(),
+                &auth_state.state,
                 audit.tenant_id,
                 verified,
                 resolution.pubkey(),
@@ -1187,8 +1186,7 @@ async fn notify_link(email_sender: &dyn EmailSender, email: &str, provider: Soci
 /// grant can be revoked when the account is deleted. Returns whether a token was stored.
 async fn store_apple_refresh_token(
     providers: &SocialLoginProviders,
-    pool: &sqlx::PgPool,
-    key_manager: &dyn keycast_core::encryption::KeyManager,
+    state: &crate::state::KeycastState,
     tenant_id: i64,
     verified: &VerifiedIdToken,
     user_pubkey: &str,
@@ -1231,7 +1229,8 @@ async fn store_apple_refresh_token(
             return false;
         }
     };
-    let encrypted = match key_manager
+    let encrypted = match state
+        .key_manager
         .encrypt(grant.refresh_token.expose_secret().as_bytes())
         .await
     {
@@ -1241,7 +1240,7 @@ async fn store_apple_refresh_token(
             return false;
         }
     };
-    match UserIdentityRepository::new(pool.clone())
+    match UserIdentityRepository::new(state.db.clone())
         .store_apple_refresh_token(
             tenant_id,
             &identity.subject,
