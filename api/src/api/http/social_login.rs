@@ -1200,15 +1200,24 @@ async fn store_apple_refresh_token(
     let identity: &VerifiedSocialIdentity = &verified.identity;
     // The code was issued to the client the ID token is addressed to: a bundle ID or the
     // Services ID.
-    let exchanged = tokio::time::timeout(
-        APPLE_EXCHANGE_TIMEOUT,
-        apple_tokens.exchange_code(&verified.audience, authorization_code, redirect_uri),
-    )
+    let exchanged = tokio::time::timeout(APPLE_EXCHANGE_TIMEOUT, async {
+        let grant = apple_tokens
+            .exchange_code(&verified.audience, authorization_code, redirect_uri)
+            .await?;
+        if let Some(grant) = &grant {
+            providers
+                .verifier
+                .verify_apple_grant(grant.id_token.expose_secret(), verified)
+                .await
+                .map_err(|_| crate::social_identity::AppleExchangeError::UnverifiedIdentity)?;
+        }
+        Ok::<_, crate::social_identity::AppleExchangeError>(grant)
+    })
     .await;
-    let refresh_token = match exchanged {
+    let grant = match exchanged {
         Ok(Ok(Some(token))) => token,
         Ok(Ok(None)) => {
-            tracing::warn!("Apple code exchange returned no refresh token");
+            tracing::warn!("Apple code exchange returned no complete grant");
             return false;
         }
         Ok(Err(error)) => {
@@ -1221,7 +1230,7 @@ async fn store_apple_refresh_token(
         }
     };
     let encrypted = match key_manager
-        .encrypt(refresh_token.expose_secret().as_bytes())
+        .encrypt(grant.refresh_token.expose_secret().as_bytes())
         .await
     {
         Ok(encrypted) => encrypted,

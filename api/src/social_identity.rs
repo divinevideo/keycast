@@ -6,8 +6,8 @@ use crate::api::http::expensive_work::admit_remote_fetch;
 use async_trait::async_trait;
 use base64::Engine;
 use jwt_simple::prelude::{
-    Audiences, Claims, Duration as JwtDuration, ECDSAP256KeyPairLike, ES256KeyPair, RS256PublicKey,
-    RSAPublicKeyLike, Token, VerificationOptions,
+    Audiences, Claims, Duration as JwtDuration, ECDSAP256KeyPairLike, ES256KeyPair, JWTClaims,
+    RS256PublicKey, RSAPublicKeyLike, Token, VerificationOptions,
 };
 use jwt_simple::JWTError;
 use keycast_core::social_login::{SocialProvider, VerifiedSocialIdentity};
@@ -620,23 +620,9 @@ impl SocialIdentityVerifier {
             SocialProvider::Apple => HashSet::from([APPLE_ISSUER.to_string()]),
         };
 
-        if id_token.is_empty() || id_token.len() > MAX_ID_TOKEN_BYTES {
-            return Err(SocialTokenError::Invalid("malformed"));
-        }
         if raw_nonce.is_empty() || raw_nonce.len() > MAX_RAW_NONCE_BYTES {
             return Err(SocialTokenError::Invalid("invalid_nonce"));
         }
-
-        let metadata =
-            Token::decode_metadata(id_token).map_err(|_| SocialTokenError::Invalid("malformed"))?;
-        if metadata.algorithm() != "RS256" {
-            return Err(SocialTokenError::Invalid("unsupported_algorithm"));
-        }
-        let kid = metadata
-            .key_id()
-            .ok_or(SocialTokenError::Invalid("missing_key_id"))?
-            .to_string();
-        let key = self.signing_key(provider, &kid).await?;
 
         let options = VerificationOptions {
             allowed_issuers: Some(issuers),
@@ -646,9 +632,7 @@ impl SocialIdentityVerifier {
             max_token_length: Some(MAX_ID_TOKEN_BYTES),
             ..Default::default()
         };
-        let claims = key
-            .verify_token::<ProviderClaims>(id_token, Some(options))
-            .map_err(|error| SocialTokenError::Invalid(classify_jwt_error(&error)))?;
+        let claims = self.verify_claims(provider, id_token, options).await?;
 
         let expires_at = claims
             .expires_at
@@ -707,6 +691,56 @@ impl SocialIdentityVerifier {
             token_hash: sha256_hex(id_token),
             expires_at,
         })
+    }
+
+    async fn verify_claims(
+        &self,
+        provider: SocialProvider,
+        id_token: &str,
+        options: VerificationOptions,
+    ) -> Result<JWTClaims<ProviderClaims>, SocialTokenError> {
+        if id_token.is_empty() || id_token.len() > MAX_ID_TOKEN_BYTES {
+            return Err(SocialTokenError::Invalid("malformed"));
+        }
+        let metadata =
+            Token::decode_metadata(id_token).map_err(|_| SocialTokenError::Invalid("malformed"))?;
+        if metadata.algorithm() != "RS256" {
+            return Err(SocialTokenError::Invalid("unsupported_algorithm"));
+        }
+        let kid = metadata
+            .key_id()
+            .ok_or(SocialTokenError::Invalid("missing_key_id"))?;
+        self.signing_key(provider, kid)
+            .await?
+            .verify_token::<ProviderClaims>(id_token, Some(options))
+            .map_err(|error| SocialTokenError::Invalid(classify_jwt_error(&error)))
+    }
+
+    pub(crate) async fn verify_apple_grant(
+        &self,
+        id_token: &str,
+        login: &VerifiedIdToken,
+    ) -> Result<(), SocialTokenError> {
+        let claims = self
+            .verify_claims(
+                SocialProvider::Apple,
+                id_token,
+                VerificationOptions {
+                    allowed_issuers: Some(HashSet::from([APPLE_ISSUER.to_string()])),
+                    allowed_audiences: Some(HashSet::from([login.audience.clone()])),
+                    time_tolerance: Some(JwtDuration::from_secs(CLOCK_SKEW_SECONDS)),
+                    max_token_length: Some(MAX_ID_TOKEN_BYTES),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        if claims.subject.as_deref() != Some(login.identity.subject.as_str())
+            || claims.expires_at.is_none()
+            || claims.issued_at.is_none()
+        {
+            return Err(SocialTokenError::Invalid("invalid_grant_identity"));
+        }
+        Ok(())
     }
 
     async fn signing_key(
@@ -821,6 +855,8 @@ fn classify_jwt_error(error: &jwt_simple::Error) -> &'static str {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppleExchangeError {
+    #[error("grant identity could not be verified")]
+    UnverifiedIdentity,
     #[error("remote fetch capacity is busy")]
     Busy,
     #[error("client secret could not be signed: {0}")]
@@ -833,6 +869,13 @@ pub enum AppleExchangeError {
 struct AppleTokenResponse {
     #[serde(default)]
     refresh_token: Option<String>,
+    #[serde(default)]
+    id_token: Option<String>,
+}
+
+pub(crate) struct AppleGrant {
+    pub(crate) refresh_token: SecretString,
+    pub(crate) id_token: SecretString,
 }
 
 /// Exchanges Apple authorization codes for refresh tokens, so a grant can later be revoked.
@@ -885,12 +928,12 @@ impl AppleTokenClient {
     ///
     /// `redirect_uri` is required for codes issued to a web page (Sign in with Apple JS) and must
     /// be the one the page passed to Apple; codes issued to an app have none.
-    pub async fn exchange_code(
+    pub(crate) async fn exchange_code(
         &self,
         client_id: &str,
         authorization_code: &str,
         redirect_uri: Option<&str>,
-    ) -> Result<Option<SecretString>, AppleExchangeError> {
+    ) -> Result<Option<AppleGrant>, AppleExchangeError> {
         let client_secret = self.client_secret(client_id)?;
         let mut form = vec![
             ("client_id", client_id),
@@ -928,7 +971,11 @@ impl AppleTokenClient {
         Ok(parsed
             .refresh_token
             .filter(|token| !token.is_empty())
-            .map(SecretString::from))
+            .zip(parsed.id_token.filter(|token| !token.is_empty()))
+            .map(|(refresh_token, id_token)| AppleGrant {
+                refresh_token: SecretString::from(refresh_token),
+                id_token: SecretString::from(id_token),
+            }))
     }
 }
 
@@ -984,7 +1031,53 @@ impl SocialLoginProviders {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jwt_simple::prelude::{ECDSAP256PublicKeyLike, JWTClaims, NoCustomClaims};
+    use jwt_simple::prelude::{
+        ECDSAP256PublicKeyLike, NoCustomClaims, RS256KeyPair, RSAKeyPairLike,
+    };
+
+    #[tokio::test]
+    async fn apple_grant_must_match_the_signed_in_subject_and_client() {
+        let key = RS256KeyPair::generate(2048)
+            .unwrap()
+            .with_key_id("test-key");
+        let verifier = SocialIdentityVerifier::new(
+            SocialLoginSettings::default(),
+            Arc::new(HttpJwksFetcher::new()),
+        );
+        verifier
+            .apple_keys
+            .replace(HashMap::from([("test-key".into(), key.public_key())]));
+        let login = VerifiedIdToken {
+            identity: VerifiedSocialIdentity {
+                provider: SocialProvider::Apple,
+                subject: "subject-a".into(),
+                email: None,
+                email_verified: false,
+                email_authoritative: false,
+            },
+            audience: "co.example.app".into(),
+            token_hash: String::new(),
+            expires_at: 0,
+        };
+        for (subject, audience, expected) in [
+            ("subject-a", "co.example.app", true),
+            ("subject-b", "co.example.app", false),
+            ("subject-a", "co.example.web", false),
+        ] {
+            let token = key
+                .sign(
+                    Claims::create(JwtDuration::from_secs(60))
+                        .with_issuer(APPLE_ISSUER)
+                        .with_subject(subject)
+                        .with_audience(audience),
+                )
+                .unwrap();
+            assert_eq!(
+                verifier.verify_apple_grant(&token, &login).await.is_ok(),
+                expected
+            );
+        }
+    }
 
     fn lookup(values: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let values: HashMap<String, String> = values
@@ -1240,7 +1333,7 @@ mod tests {
             .await
             .unwrap()
             .expect("refresh token");
-        assert_eq!(refresh.expose_secret(), "refresh-123");
+        assert_eq!(refresh.refresh_token.expose_secret(), "refresh-123");
 
         let forms = received.lock().unwrap();
         let form = forms.first().expect("token endpoint called");
@@ -1258,7 +1351,7 @@ mod tests {
     async fn apple_code_exchange_repeats_the_web_return_url() {
         let (url, received) = serve_token_endpoint(
             axum::http::StatusCode::OK,
-            serde_json::json!({"refresh_token": "refresh-web"}),
+            serde_json::json!({"refresh_token": "refresh-web", "id_token": "identity-web"}),
         )
         .await;
         let key_pair = ES256KeyPair::generate();
@@ -1273,7 +1366,7 @@ mod tests {
             .await
             .unwrap()
             .expect("refresh token");
-        assert_eq!(refresh.expose_secret(), "refresh-web");
+        assert_eq!(refresh.refresh_token.expose_secret(), "refresh-web");
 
         let forms = received.lock().unwrap();
         let form = forms.first().expect("token endpoint called");
@@ -1301,7 +1394,8 @@ mod tests {
         let error = client
             .exchange_code("co.example.app", "used-code", None)
             .await
-            .unwrap_err();
+            .err()
+            .expect("rejected code");
         assert!(error.to_string().contains("invalid_grant"), "{error}");
     }
 }
