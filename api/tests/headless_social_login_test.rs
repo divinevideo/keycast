@@ -1444,7 +1444,7 @@ async fn deleting_the_account_removes_its_provider_links() {
 
 #[tokio::test]
 async fn apple_sign_in_stores_a_verified_exchanged_grant() {
-    use jwt_simple::prelude::{ECDSAP256KeyPairLike, ES256KeyPair};
+    use jwt_simple::prelude::ES256KeyPair;
     use keycast_api::social_identity::{AppleSigningKey, AppleTokenClient};
     use secrecy::SecretString;
 

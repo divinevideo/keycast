@@ -70,7 +70,7 @@ async fn revoke_apple_grants(
 #[cfg(all(test, feature = "integration-tests"))]
 mod tests {
     use super::*;
-    use jwt_simple::prelude::{ECDSAP256KeyPairLike, ES256KeyPair};
+    use jwt_simple::prelude::ES256KeyPair;
     use keycast_core::encryption::{KeyManager, KeyManagerError};
     use secrecy::SecretString;
     use std::collections::HashMap;
