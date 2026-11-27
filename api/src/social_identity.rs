@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 pub const GOOGLE_JWKS_URL: &str = "https://www.googleapis.com/oauth2/v3/certs";
 pub const APPLE_JWKS_URL: &str = "https://appleid.apple.com/auth/keys";
 pub const APPLE_TOKEN_URL: &str = "https://appleid.apple.com/auth/token";
+const APPLE_REVOCATION_URL: &str = "https://appleid.apple.com/auth/revoke";
 const GOOGLE_ISSUERS: [&str; 2] = ["https://accounts.google.com", "accounts.google.com"];
 const APPLE_ISSUER: &str = "https://appleid.apple.com";
 /// Google is authoritative for these addresses: nobody else can own them.
@@ -888,6 +889,34 @@ pub struct AppleTokenClient {
 }
 
 impl AppleTokenClient {
+    pub(crate) async fn revoke(
+        &self,
+        client_id: &str,
+        token: &str,
+    ) -> Result<(), AppleExchangeError> {
+        let secret = self.client_secret(client_id)?;
+        let _permit = admit_remote_fetch().map_err(|_| AppleExchangeError::Busy)?;
+        let response = self
+            .client
+            .post(APPLE_REVOCATION_URL)
+            .form(&[
+                ("client_id", client_id),
+                ("client_secret", secret.as_str()),
+                ("token", token),
+                ("token_type_hint", "refresh_token"),
+            ])
+            .send()
+            .await
+            .map_err(|_| AppleExchangeError::Remote("revocation request failed".into()))?;
+        if !response.status().is_success() {
+            return Err(AppleExchangeError::Remote(format!(
+                "revocation returned {}",
+                response.status()
+            )));
+        }
+        Ok(())
+    }
+
     /// Build a client from configured settings. `None` when no signing key is configured or the
     /// key cannot be read; sign-in still works, but no refresh token is stored.
     pub fn from_settings(settings: &SocialLoginSettings) -> Option<Self> {

@@ -255,21 +255,26 @@ impl UserIdentityRepository {
         &self,
         tenant_id: i64,
         subject: &str,
+        user_pubkey: &str,
         encrypted_refresh_token: &[u8],
         client_id: &str,
-    ) -> Result<(), RepositoryError> {
-        sqlx::query(
-            "UPDATE user_identities
-             SET apple_refresh_token_encrypted = $1, apple_token_client_id = $2
-             WHERE tenant_id = $3 AND provider = 'apple' AND subject = $4",
+    ) -> Result<bool, RepositoryError> {
+        let result = sqlx::query(
+            "INSERT INTO apple_identity_grants (identity_id, client_id, encrypted_token)
+             SELECT id, $2, $1 FROM user_identities
+             WHERE tenant_id = $3 AND provider = 'apple' AND subject = $4 AND user_pubkey = $5
+             FOR UPDATE
+             ON CONFLICT (identity_id, client_id) DO UPDATE
+             SET encrypted_token = EXCLUDED.encrypted_token",
         )
         .bind(encrypted_refresh_token)
         .bind(client_id)
         .bind(tenant_id)
         .bind(subject)
+        .bind(user_pubkey)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() != 0)
     }
 
     /// Providers linked to an account, in a stable order.

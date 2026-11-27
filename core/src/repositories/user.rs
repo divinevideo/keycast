@@ -3443,6 +3443,27 @@ impl UserRepository {
         )
         .await?;
 
+        // Serialize grant writes before staging the revocations in this transaction.
+        sqlx::query(
+            "SELECT id FROM user_identities WHERE tenant_id = $1 AND user_pubkey = $2
+             AND provider = 'apple' FOR UPDATE",
+        )
+        .bind(tenant_id)
+        .bind(pubkey)
+        .fetch_all(&mut **tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO apple_grant_revocations (client_id, encrypted_token)
+             SELECT grant_row.client_id, grant_row.encrypted_token
+             FROM apple_identity_grants grant_row JOIN user_identities identity
+               ON grant_row.identity_id = identity.id
+             WHERE identity.tenant_id = $1 AND identity.user_pubkey = $2",
+        )
+        .bind(tenant_id)
+        .bind(pubkey)
+        .execute(&mut **tx)
+        .await?;
+
         // 5. Delete user (cascades to personal_keys, oauth_authorizations -> refresh_tokens,
         //    email_verification_tokens, password_reset_tokens, user_profiles,
         //    account_claim_tokens, user_identities)

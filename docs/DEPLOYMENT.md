@@ -409,15 +409,17 @@ consoles are set up.
 | `APPLE_KEY_ID` | plain | Key ID of the Sign in with Apple key |
 | `APPLE_PRIVATE_KEY` | secret | Contents of the Sign in with Apple `.p8` key (PKCS#8 PEM; `\n` escapes are accepted) |
 
-The three `APPLE_TEAM_ID` / `APPLE_KEY_ID` / `APPLE_PRIVATE_KEY` variables only enable the
-best-effort exchange of Apple authorization codes for refresh tokens, stored encrypted in
-`user_identities.apple_refresh_token_encrypted` so the grant can later be revoked. Sign in with
-Apple works without them.
+The three `APPLE_TEAM_ID` / `APPLE_KEY_ID` / `APPLE_PRIVATE_KEY` variables enable the exchange and
+revocation of Apple grants. Verified grants are encrypted and stored per client in
+`apple_identity_grants`. Account deletion stages them in `apple_grant_revocations`, where the
+cleanup task retries failed revocations for up to seven days. Sign in with Apple works without
+the variables, but automatic revocation requires them.
 
 The endpoints need Redis (`REDIS_URL`) for their replay guard and attempt limiter and fail closed
 without it. Provider keys are fetched from `https://www.googleapis.com/oauth2/v3/certs` and
 `https://appleid.apple.com/auth/keys`, and Apple codes are exchanged at
-`https://appleid.apple.com/auth/token`, so egress to those hosts must be allowed.
+`https://appleid.apple.com/auth/token`. Revocation uses `https://appleid.apple.com/auth/revoke`, so
+egress to those hosts must be allowed.
 
 ### Console setup for the login page
 

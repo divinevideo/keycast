@@ -1481,9 +1481,6 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         .build();
     tracing::info!("✔︎ Tenant cache initialized (preload deferred)");
 
-    let _bcrypt_cleanup_handle =
-        keycast_api::auth_cleanup::spawn_cleanup_task(database.pool.clone());
-
     // Create secret pool for instant authorization creation
     // Background producer pre-computes (secret, bcrypt_hash) pairs
     let secret_pool = keycast_core::secret_pool::SecretPool::default();
@@ -1529,6 +1526,10 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         secret_pool: secret_pool_receiver,
         activity_logger,
     });
+    let _auth_cleanup_handle = keycast_api::auth_cleanup::spawn_cleanup_task(
+        api_state.db.clone(),
+        api_state.key_manager.clone(),
+    );
 
     // Set global state for routes that use it
     keycast_api::state::KEYCAST_STATE

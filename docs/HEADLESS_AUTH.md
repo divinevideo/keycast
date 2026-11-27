@@ -132,9 +132,10 @@ An account created this way has no password. Password-protected operations (expo
 password, email or key) answer `409 PASSWORD_NOT_SET` until the person sets one through
 "Forgot password".
 
-When Apple sends `authorization_code` and the Apple signing key is configured, Keycast exchanges it
-for a refresh token and stores it encrypted, so the grant can be revoked when the account is
-deleted. Failures there never fail the sign-in.
+When Apple sends `authorization_code` and the Apple signing key is configured, Keycast stores the
+encrypted grant only after verifying that the exchanged identity matches the signed-in account and
+client. Deletion queues each stored grant for revocation, without waiting for Apple to respond.
+If no grant was stored, the user can [revoke access manually](https://support.apple.com/en-us/102571).
 
 #### On the hosted login page
 

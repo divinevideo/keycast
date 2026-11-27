@@ -2,6 +2,63 @@
 
 use keycast_core::{metrics::METRICS, repositories::AdminAuditEventRepository};
 use sqlx::PgPool;
+use std::sync::Arc;
+
+use crate::social_identity::{AppleTokenClient, SocialLoginSettings};
+
+async fn revoke_apple_grants(
+    pool: &PgPool,
+    key_manager: &dyn keycast_core::encryption::KeyManager,
+    client: Option<&AppleTokenClient>,
+) -> Result<(), sqlx::Error> {
+    let expired = sqlx::query("DELETE FROM apple_grant_revocations WHERE expires_at <= NOW()")
+        .execute(pool)
+        .await?
+        .rows_affected();
+    if expired != 0 {
+        tracing::warn!(
+            expired,
+            "Apple grant revocations expired without confirmation"
+        );
+    }
+    let Some(client) = client else {
+        return Ok(());
+    };
+    for _ in 0..16 {
+        // Claim just one at a time. The retry lease is longer than the outbound deadline.
+        // No transaction or connection is held while decrypting or calling Apple.
+        let job: Option<(i64, String, Vec<u8>)> = sqlx::query_as(
+            "WITH next_job AS (
+                 SELECT id FROM apple_grant_revocations
+                 WHERE next_attempt_at <= NOW() AND expires_at > NOW()
+                 ORDER BY next_attempt_at, id LIMIT 1 FOR UPDATE SKIP LOCKED
+             )
+             UPDATE apple_grant_revocations job SET next_attempt_at = NOW() + INTERVAL '15 minutes'
+             FROM next_job WHERE job.id = next_job.id
+             RETURNING job.id, job.client_id, job.encrypted_token",
+        )
+        .fetch_optional(pool)
+        .await?;
+        let Some((id, client_id, encrypted)) = job else {
+            break;
+        };
+        let revoked = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let plaintext = key_manager.decrypt(&encrypted).await.map_err(|_| ())?;
+            let token = std::str::from_utf8(&plaintext).map_err(|_| ())?;
+            client.revoke(&client_id, token).await.map_err(|_| ())
+        })
+        .await;
+        if matches!(revoked, Ok(Ok(()))) {
+            sqlx::query("DELETE FROM apple_grant_revocations WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await?;
+        } else {
+            tracing::warn!("Apple grant revocation did not complete; will retry");
+        }
+    }
+    Ok(())
+}
 
 /// Remove expired email-marketing queue rows independently of the sync consumer.
 ///
@@ -75,12 +132,21 @@ pub async fn delete_legacy_stale_signup_rows(
 }
 
 /// Remove legacy pre-#366 asynchronous-signup rows, expired OAuth rows, and expired service queues.
-pub fn spawn_cleanup_task(pool: PgPool) -> tokio::task::JoinHandle<()> {
+pub fn spawn_cleanup_task(
+    pool: PgPool,
+    key_manager: Arc<Box<dyn keycast_core::encryption::KeyManager>>,
+) -> tokio::task::JoinHandle<()> {
+    let apple = AppleTokenClient::from_settings(&SocialLoginSettings::from_env());
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
 
         loop {
             interval.tick().await;
+            if let Err(error) =
+                revoke_apple_grants(&pool, key_manager.as_ref().as_ref(), apple.as_ref()).await
+            {
+                tracing::error!(%error, "Apple grant revocation queue processing failed");
+            }
 
             // TODO(#377): Remove this DELETE after the bounded-bcrypt rollout no longer has
             // pre-migration first-party registration rows with password_hash IS NULL.

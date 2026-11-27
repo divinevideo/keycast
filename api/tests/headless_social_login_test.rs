@@ -1443,6 +1443,42 @@ async fn deleting_the_account_removes_its_provider_links() {
 }
 
 #[tokio::test]
+async fn apple_account_deletion_stages_each_client_grant() {
+    let ctx = context().await;
+    let subject = unique("apple-sub");
+    let nonce = unique("nonce");
+    let token = TokenSpec::apple(&subject, &gmail(), &nonce).sign();
+    let (status, body) = ctx.post(request("apple", &token, &nonce)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let pubkey = body["pubkey"].as_str().unwrap();
+    ctx.track(pubkey);
+    let repo = keycast_core::repositories::UserIdentityRepository::new(ctx.pool.clone());
+    let native = unique("native-client");
+    let hosted = unique("hosted-client");
+    for client in [&native, &hosted] {
+        assert!(repo
+            .store_apple_refresh_token(1, &subject, pubkey, b"fixture", client)
+            .await
+            .unwrap());
+    }
+    UserRepository::new(ctx.pool.clone())
+        .delete_account(pubkey, 1)
+        .await
+        .unwrap();
+    let grants: Vec<String> = sqlx::query_scalar(
+        "DELETE FROM apple_grant_revocations WHERE client_id IN ($1, $2) RETURNING client_id",
+    )
+    .bind(native)
+    .bind(hosted)
+    .fetch_all(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(grants.len(), 2);
+    assert_eq!(identity_count(&ctx.pool, pubkey).await, 0);
+    ctx.cleanup().await;
+}
+
+#[tokio::test]
 async fn changing_the_key_moves_provider_links_to_the_new_key() {
     let ctx = context().await;
     let email = gmail();

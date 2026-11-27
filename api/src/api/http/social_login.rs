@@ -775,6 +775,7 @@ async fn complete_sign_in(
                 auth_state.state.key_manager.as_ref().as_ref(),
                 audit.tenant_id,
                 verified,
+                resolution.pubkey(),
                 authorization_code,
                 redirect_uri,
             )
@@ -1190,6 +1191,7 @@ async fn store_apple_refresh_token(
     key_manager: &dyn keycast_core::encryption::KeyManager,
     tenant_id: i64,
     verified: &VerifiedIdToken,
+    user_pubkey: &str,
     authorization_code: &str,
     redirect_uri: Option<&str>,
 ) -> bool {
@@ -1240,10 +1242,16 @@ async fn store_apple_refresh_token(
         }
     };
     match UserIdentityRepository::new(pool.clone())
-        .store_apple_refresh_token(tenant_id, &identity.subject, &encrypted, &verified.audience)
+        .store_apple_refresh_token(
+            tenant_id,
+            &identity.subject,
+            user_pubkey,
+            &encrypted,
+            &verified.audience,
+        )
         .await
     {
-        Ok(()) => true,
+        Ok(stored) => stored,
         Err(error) => {
             tracing::warn!("Apple refresh token could not be stored: {error}");
             false
