@@ -401,6 +401,7 @@ pub struct AccountStatusRow {
 pub struct AccountStatusWithMinorRow {
     pub email: Option<String>,
     pub email_verified: Option<bool>,
+    pub has_password: bool,
     pub status: UserStatus,
     pub suspended_reason: Option<String>,
     pub verified_minor: bool,
@@ -1058,27 +1059,55 @@ impl UserRepository {
     // Password reset methods
     // =========================================================================
 
-    /// Set password reset token.
+    /// Find the recovery account and whether it requires signed-in setup.
+    pub async fn find_password_reset_account(
+        &self,
+        email: &str,
+        tenant_id: i64,
+    ) -> Result<Option<(String, bool)>, RepositoryError> {
+        sqlx::query_as(
+            "SELECT pubkey, password_hash IS NULL AND EXISTS (
+                 SELECT 1 FROM user_identities identity
+                 WHERE identity.tenant_id = users.tenant_id AND identity.user_pubkey = users.pubkey
+             ) FROM users WHERE email = $1 AND tenant_id = $2",
+        )
+        .bind(email)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Set a reset token only for the requested account and address.
+    /// A passwordless provider account must initiate setup from its own session.
     pub async fn set_password_reset_token(
         &self,
         pubkey: &str,
         tenant_id: i64,
+        email: &str,
         token: &str,
         expires_at: DateTime<Utc>,
-    ) -> Result<(), RepositoryError> {
-        sqlx::query(
+        authenticated_owner: bool,
+    ) -> Result<bool, RepositoryError> {
+        let result = sqlx::query(
             "UPDATE users
              SET password_reset_token = $1, password_reset_expires_at = $2, updated_at = $3
-             WHERE pubkey = $4 AND tenant_id = $5",
+             WHERE pubkey = $4 AND tenant_id = $5 AND email = $6
+               AND ($7 OR password_hash IS NOT NULL OR NOT EXISTS (
+                   SELECT 1 FROM user_identities identity
+                   WHERE identity.tenant_id = users.tenant_id AND identity.user_pubkey = users.pubkey
+               ))",
         )
         .bind(token)
         .bind(expires_at)
         .bind(Utc::now())
         .bind(pubkey)
         .bind(tenant_id)
+        .bind(email)
+        .bind(authenticated_owner)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() == 1)
     }
 
     /// Find user by password reset token.
@@ -1105,8 +1134,9 @@ impl UserRepository {
         pubkey: &str,
         tenant_id: i64,
         password_hash: &str,
-    ) -> Result<(), RepositoryError> {
-        sqlx::query(
+        token: &str,
+    ) -> Result<bool, RepositoryError> {
+        let result = sqlx::query(
             "UPDATE users
              SET password_hash = $1,
                  password_reset_token = NULL,
@@ -1115,15 +1145,17 @@ impl UserRepository {
                  email_verification_token = NULL,
                  email_verification_expires_at = NULL,
                  updated_at = $2
-             WHERE pubkey = $3 AND tenant_id = $4",
+             WHERE pubkey = $3 AND tenant_id = $4 AND password_reset_token = $5
+               AND (password_reset_expires_at IS NULL OR password_reset_expires_at >= NOW())",
         )
         .bind(password_hash)
         .bind(Utc::now())
         .bind(pubkey)
         .bind(tenant_id)
+        .bind(token)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() == 1)
     }
 
     // =========================================================================
@@ -1327,6 +1359,8 @@ impl UserRepository {
             "UPDATE users
              SET email = pending_email,
                  email_verified = true,
+                 password_reset_token = NULL,
+                 password_reset_expires_at = NULL,
                  pending_email = NULL,
                  pending_email_old_token = NULL,
                  pending_email_new_token = NULL,
@@ -1452,11 +1486,13 @@ impl UserRepository {
     }
 
     /// Find user with email, password hash, and email verified status (for key export verification).
+    ///
+    /// The password hash is `None` for an account that signs in only through Google or Apple.
     pub async fn find_with_password_and_verified(
         &self,
         pubkey: &str,
         tenant_id: i64,
-    ) -> Result<Option<(String, String, bool)>, RepositoryError> {
+    ) -> Result<Option<(String, Option<String>, bool)>, RepositoryError> {
         sqlx::query_as(
             "SELECT email, password_hash, email_verified FROM users WHERE pubkey = $1 AND tenant_id = $2",
         )
@@ -1527,7 +1563,8 @@ impl UserRepository {
         tenant_id: i64,
     ) -> Result<Option<AccountStatusWithMinorRow>, RepositoryError> {
         sqlx::query_as(
-            "SELECT email, email_verified, status, suspended_reason, verified_minor, verified_minor_at \
+            "SELECT email, email_verified, password_hash IS NOT NULL AS has_password, \
+                    status, suspended_reason, verified_minor, verified_minor_at \
              FROM users WHERE pubkey = $1 AND tenant_id = $2",
         )
         .bind(pubkey)
@@ -1933,11 +1970,13 @@ impl UserRepository {
     }
 
     /// Get user's email and password hash for credential verification.
+    ///
+    /// The password hash is `None` for an account that signs in only through Google or Apple.
     pub async fn get_credentials(
         &self,
         pubkey: &str,
         tenant_id: i64,
-    ) -> Result<Option<(String, String)>, RepositoryError> {
+    ) -> Result<Option<(String, Option<String>)>, RepositoryError> {
         sqlx::query_as(
             "SELECT email, password_hash FROM users WHERE pubkey = $1 AND tenant_id = $2",
         )
@@ -1949,11 +1988,13 @@ impl UserRepository {
     }
 
     /// Get user's email, password hash, and verified status.
+    ///
+    /// The password hash is `None` for an account that signs in only through Google or Apple.
     pub async fn get_credentials_with_verified(
         &self,
         pubkey: &str,
         tenant_id: i64,
-    ) -> Result<Option<(String, String, bool)>, RepositoryError> {
+    ) -> Result<Option<(String, Option<String>, bool)>, RepositoryError> {
         sqlx::query_as(
             "SELECT email, password_hash, email_verified FROM users WHERE pubkey = $1 AND tenant_id = $2",
         )
@@ -2191,7 +2232,8 @@ impl UserRepository {
     /// 2. Deletes personal_keys for the old pubkey
     /// 3. Orphans the old user identity (clears email/password/username)
     /// 4. Creates new user identity with email/password/username
-    /// 5. Creates personal_keys for the new identity
+    /// 5. Moves Google / Apple sign-in links to the new identity
+    /// 6. Creates personal_keys for the new identity
     ///
     /// Returns the count of OAuth authorizations that were deleted.
     ///
@@ -2344,6 +2386,18 @@ impl UserRepository {
         sqlx::query(
             "UPDATE email_marketing_email_changes SET pubkey = $1
              WHERE pubkey = $2 AND tenant_id = $3",
+        )
+        .bind(new_pubkey)
+        .bind(old_pubkey)
+        .bind(tenant_id)
+        .execute(&mut **tx)
+        .await?;
+
+        // Google / Apple sign-in links belong to the person, not to the key. Moved after the new
+        // users row exists because the link references it.
+        sqlx::query(
+            "UPDATE user_identities SET user_pubkey = $1
+             WHERE user_pubkey = $2 AND tenant_id = $3",
         )
         .bind(new_pubkey)
         .bind(old_pubkey)
@@ -3424,9 +3478,30 @@ impl UserRepository {
         )
         .await?;
 
+        // Serialize grant writes before staging the revocations in this transaction.
+        sqlx::query(
+            "SELECT id FROM user_identities WHERE tenant_id = $1 AND user_pubkey = $2
+             AND provider = 'apple' FOR UPDATE",
+        )
+        .bind(tenant_id)
+        .bind(pubkey)
+        .fetch_all(&mut **tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO apple_grant_revocations (client_id, encrypted_token)
+             SELECT grant_row.client_id, grant_row.encrypted_token
+             FROM apple_identity_grants grant_row JOIN user_identities identity
+               ON grant_row.identity_id = identity.id
+             WHERE identity.tenant_id = $1 AND identity.user_pubkey = $2",
+        )
+        .bind(tenant_id)
+        .bind(pubkey)
+        .execute(&mut **tx)
+        .await?;
+
         // 5. Delete user (cascades to personal_keys, oauth_authorizations -> refresh_tokens,
         //    email_verification_tokens, password_reset_tokens, user_profiles,
-        //    account_claim_tokens)
+        //    account_claim_tokens, user_identities)
         let result = sqlx::query("DELETE FROM users WHERE pubkey = $1 AND tenant_id = $2")
             .bind(pubkey)
             .bind(tenant_id)

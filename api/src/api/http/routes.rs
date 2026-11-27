@@ -13,7 +13,7 @@ use tower::{timeout::error::Elapsed, ServiceBuilder};
 use crate::api::http::{
     admin, ap, atproto, atproto_oauth, auth, claim, email_marketing, expensive_work, headless,
     metrics, nostr_rpc, oauth, og_diviner, policies, retention, service_deletion,
-    service_provisioning, teams,
+    service_provisioning, social_login, teams,
 };
 use crate::email_delivery::EmailDeliveryService;
 use crate::state::KeycastState;
@@ -88,6 +88,8 @@ pub fn api_routes(
 
     let email_sender = email_delivery.sender();
     let auth_state = AuthState { state, auth_tx };
+    // One instance, so the native and login-page sign-ins share the provider key cache.
+    let social_providers = Arc::new(crate::social_identity::SocialLoginProviders::from_env());
 
     // Routes that need restricted CORS (first-party only + credentials)
     // These endpoints accept user credentials and must prevent phishing
@@ -96,6 +98,8 @@ pub fn api_routes(
         .route("/auth/login", post(auth::login))
         .route("/oauth/login", post(oauth::oauth_login))
         .route("/oauth/register", post(oauth::oauth_register))
+        .route("/oauth/social-login", post(social_login::web_social_login))
+        .layer(axum::Extension(social_providers.clone()))
         .layer(auth_cors.clone())
         .with_state(auth_state.clone());
 
@@ -140,6 +144,7 @@ pub fn api_routes(
         .route("/oauth/token", post(oauth::token))
         .route("/oauth/poll", get(oauth::poll)) // iOS PWA polling endpoint
         .route("/oauth/connect", post(oauth::connect_post))
+        .layer(axum::Extension(social_providers.clone()))
         .layer(public_cors.clone())
         .with_state(auth_state.clone());
 
@@ -204,6 +209,10 @@ pub fn api_routes(
             post(auth::verify_password_for_export),
         )
         .route("/user/change-password", post(auth::change_password))
+        .route(
+            "/user/start-password-setup",
+            post(auth::start_password_setup),
+        )
         .route("/user/change-email", post(auth::change_email))
         .layer(axum::Extension(auth_state.state.bcrypt.clone()))
         .layer(axum::Extension(email_delivery.clone()))
@@ -276,6 +285,11 @@ pub fn api_routes(
         .route("/headless/authorize", post(headless::headless_authorize))
         .route("/headless/verify-pin", post(headless::headless_verify_pin))
         .route("/headless/resend-pin", post(headless::headless_resend_pin))
+        .route(
+            "/headless/social-login",
+            post(social_login::headless_social_login),
+        )
+        .layer(axum::Extension(social_providers))
         .with_state(auth_state.clone());
 
     // Admin routes (for preloaded accounts and claim tokens)

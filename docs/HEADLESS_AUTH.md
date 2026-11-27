@@ -62,6 +62,103 @@ Login existing user. Returns authorization code directly.
 }
 ```
 
+### POST /api/headless/social-login
+
+"Continue with Google" (iOS, Android) and "Continue with Apple" (iOS). The app gets an ID token
+from Google or Apple natively and hands it to Keycast. Keycast verifies it and returns an
+authorization code, exactly like `POST /api/headless/login`. The provider is only another way into
+the same custodial account: the account's email, Nostr key and permissions do not change.
+
+**Request:**
+```json
+{
+  "provider": "google",
+  "id_token": "<ID token from Google or Apple>",
+  "raw_nonce": "<nonce the app generated>",
+  "authorization_code": "<Apple only, optional>",
+  "client_id": "Divine Video",
+  "redirect_uri": "https://login.divine.video/app/callback",
+  "scope": "policy:full",
+  "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+  "code_challenge_method": "S256",
+  "state": "random-csrf-token",
+  "app_version": "1.2.3"
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "code": "authorization-code-here",
+  "pubkey": "abc123...",
+  "state": "random-csrf-token",
+  "created": false
+}
+```
+
+`created` is `true` only when this request created the account.
+
+How the token is checked:
+- RS256 signature by a current Google or Apple signing key (fetched from the provider's JWKS,
+  cached for an hour, refetched at most once a minute for an unknown key id, and kept when a
+  refresh fails).
+- `iss` is Google's or Apple's issuer. `aud` is a configured client: for Google the server (web)
+  client ID, with `azp` one of the configured iOS/Android client IDs; for Apple a bundle ID.
+- `exp`, `iat` and `nonce` are present, and `nonce` is the lowercase hex SHA-256 of `raw_nonce`.
+- Each token is accepted once: a SHA-256 of the token is reserved in Redis until it expires.
+  Without Redis the endpoint fails closed with `503 SERVICE_UNAVAILABLE`.
+
+How the account is found:
+1. The provider account (`sub`) is already linked: sign in to that account.
+2. Otherwise the provider must report a verified email (`400 EMAIL_MISSING`,
+   `403 EMAIL_NOT_VERIFIED`).
+3. Only accounts that confirmed the email (compared ignoring case) count. An account that never
+   confirmed it cannot sign in, so it does not hold the address.
+4. No confirmed account uses the email: create one with a fresh Nostr key, the verified email and
+   no password. In the same transaction the email is removed from any unconfirmed accounts that
+   still carry it, together with their verification, password reset and email change links, so
+   none of those links works any more. Their rows are kept without an email. The success audit
+   event then has the reason `unconfirmed_email_released` and lists them.
+5. Exactly one confirmed account uses it and the provider is authoritative for the address: link
+   and sign in, and email the account owner that the sign-in method was added. Google is
+   authoritative for `@gmail.com` / `@googlemail.com` addresses and for Google Workspace accounts
+   (`hd` claim); Apple for every address it reports as verified.
+6. Anything else (a Google address on another domain, several confirmed accounts that differ only
+   in letter case) answers `409 ACCOUNT_LINK_REQUIRED`: the person signs in with their password
+   instead.
+
+An account created this way has no password. Password-protected operations (export key, change
+password, email or key) answer `409 PASSWORD_NOT_SET` until the person sets one. First-password
+setup for a provider account requires a signed-in account bearer on the password-reset request,
+then completion of the link sent to the account's email. An anonymous "Forgot password" request
+cannot start setup. Once a password is set, ordinary password recovery is available.
+Hosted users can start setup from **Account & Security** in the same site that signed them in.
+
+When Apple sends `authorization_code` and the Apple signing key is configured, Keycast stores the
+encrypted grant only after verifying that the exchanged identity matches the signed-in account and
+client. Deletion queues each stored grant for revocation, without waiting for Apple to respond.
+If no grant was stored, the user can [revoke access manually](https://support.apple.com/en-us/102571).
+
+#### On the hosted login page
+
+Web clients (divine-web and other apps that redirect to `GET /api/oauth/authorize`) get the same
+buttons on Keycast's login page, above the email form: "Continue with Apple" through Sign in with
+Apple JS and a Services ID, and "Continue with Google" through Google Identity Services and the
+web client ID. A button only appears when its provider is configured for the web.
+
+The page posts the provider's ID token to `POST /api/oauth/social-login`
+(`{"provider", "id_token", "authorization_code"?, "client_id", "redirect_uri"}`). The account is
+found exactly as above, with the same errors. On success the endpoint sets the session cookie,
+exactly like `POST /api/oauth/login`, and the page reloads the authorize URL, which shows the
+consent screen and sends the code to the client's `redirect_uri` with its `state`. Nothing changes
+for the client.
+
+The nonce is generated by the server: the login page stores the raw nonce in the HttpOnly
+`keycast_social_nonce` cookie (path `/api/oauth`, one hour) and hands only its SHA-256 to Google and
+Apple. Tokens the apps obtain are not accepted there, and login-page tokens are not accepted by
+`POST /api/headless/social-login`: Google's `azp` and Apple's `aud` tell them apart.
+
 ### POST /api/headless/authorize
 
 Create authorization for already-authenticated user (requires Bearer token).
@@ -279,9 +376,15 @@ class KeycastAuth {
 | HTTP Status | Code | Description |
 |-------------|------|-------------|
 | 400 | INVALID_REQUEST | Missing or invalid parameters |
+| 400 | EMAIL_MISSING | Social login: the provider shared no usable email |
 | 401 | INVALID_CREDENTIALS | Wrong email or password |
-| 403 | EMAIL_NOT_VERIFIED | User needs to verify email first |
+| 401 | INVALID_TOKEN | Social login: the ID token failed verification or was already used |
+| 403 | EMAIL_NOT_VERIFIED | User needs to verify email first (social login: the provider did not verify it) |
 | 409 | CONFLICT | Email or Nostr key already registered |
+| 409 | ACCOUNT_LINK_REQUIRED | Social login: an account with this email exists and must be signed in with its password |
+| 409 | PASSWORD_NOT_SET | Sign in with the provider, start password setup from the account session, then complete the link sent to the account email |
+| 429 | TOO_MANY_ATTEMPTS | Too many attempts; retry after `Retry-After` seconds |
+| 503 | PROVIDER_UNAVAILABLE | Social login: the provider is not configured or its keys cannot be fetched |
 | 503 | SERVICE_UNAVAILABLE | Server at capacity, retry later |
 
 ## Policies

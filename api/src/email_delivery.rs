@@ -680,10 +680,21 @@ impl EmailDeliveryService {
         destination: &str,
         reason: EmailAdmissionRefusal,
     ) -> bool {
+        self.should_record_anonymous_refusal(tenant_id, purpose, destination, reason.as_str())
+            .await
+    }
+
+    pub(crate) async fn should_record_anonymous_refusal(
+        &self,
+        tenant_id: i64,
+        purpose: EmailDeliveryPurpose,
+        destination: &str,
+        reason: &'static str,
+    ) -> bool {
         let key = format!(
             "email_delivery:{{shared}}:audit:{}:{}:{}",
             purpose.as_str(),
-            reason.as_str(),
+            reason,
             subject_hash(tenant_id, destination)
         );
         let redis = match &self.backend {
@@ -1026,6 +1037,14 @@ mod tests {
             _new_email: &str,
             _confirm_token: &str,
             _cancel_token: &str,
+        ) -> Result<(), EmailSendError> {
+            self.send().await
+        }
+
+        async fn send_social_account_linked(
+            &self,
+            _to_email: &str,
+            _provider_name: &str,
         ) -> Result<(), EmailSendError> {
             self.send().await
         }

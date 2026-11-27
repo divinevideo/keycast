@@ -25,6 +25,7 @@ pub mod secret_pool;
 pub mod secret_types;
 pub mod signing_handler;
 pub mod signing_session;
+pub mod social_login;
 pub mod tenant_query;
 pub mod traits;
 pub mod types;

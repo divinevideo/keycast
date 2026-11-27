@@ -1559,12 +1559,14 @@ fn normalize_auth_endpoint(endpoint: &str) -> &'static str {
         "/api/auth/cancel-email-change" => "/api/auth/cancel-email-change",
         "/api/oauth/login" => "/api/oauth/login",
         "/api/oauth/register" => "/api/oauth/register",
+        "/api/oauth/social-login" => "/api/oauth/social-login",
         "/api/oauth/authorize" => "/api/oauth/authorize",
         "/api/oauth/token" => "/api/oauth/token",
         "/api/oauth/poll" => "/api/oauth/poll",
         "/api/oauth/connect" => "/api/oauth/connect",
         "/api/headless/register" => "/api/headless/register",
         "/api/headless/login" => "/api/headless/login",
+        "/api/headless/social-login" => "/api/headless/social-login",
         "/api/headless/authorize" => "/api/headless/authorize",
         "/api/claim" => "/api/claim",
         "/api/admin/auth-debug" => "/api/admin/auth-debug",
@@ -1628,6 +1630,11 @@ fn normalize_auth_reason(reason_code: Option<&str>) -> &'static str {
         "email_already_registered" => "email_already_registered",
         "finalized" => "finalized",
         "cancelled" => "cancelled",
+        "account_link_required" => "account_link_required",
+        "email_missing" => "email_missing",
+        "provider_unavailable" => "provider_unavailable",
+        "replayed_token" => "replayed_token",
+        "unconfirmed_email_released" => "unconfirmed_email_released",
         _ => "other",
     }
 }
@@ -1639,6 +1646,7 @@ fn normalize_email_template(template: &str) -> &'static str {
         "resend_verification" => "resend_verification",
         "email_change_new" => "email_change_new",
         "email_change_old" => "email_change_old",
+        "social_account_linked" => "social_account_linked",
         _ => "other",
     }
 }

@@ -21,6 +21,7 @@ mod stored_key;
 mod support_admin;
 mod team;
 mod user;
+mod user_identity;
 
 pub use admin_audit_event::{AdminAuditEventRecord, AdminAuditEventRepository, AdminAuditEventRow};
 pub use ap_actor_keys::{ApActorKeyRow, ApActorKeysRepository};
@@ -68,4 +69,8 @@ pub use user::{
     DeleteAccountResult, FinalizeEmailOutcome, FullAdminStatusRow, PendingEmailChange,
     PendingEmailSide, SetVerifiedMinorOutcome, UserRepository, VerificationTokenData,
     VerifiedMinorRow,
+};
+pub use user_identity::{
+    CreateSocialAccountOutcome, EmailMatch, LinkSocialIdentityOutcome, LinkedIdentity,
+    NewSocialAccount, UserIdentityRepository,
 };

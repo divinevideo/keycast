@@ -179,6 +179,14 @@ pub trait EmailSender: Send + Sync {
         cancel_token: &str,
     ) -> Result<(), EmailSendError>;
 
+    /// Tell the account owner that a sign-in provider (Google, Apple) was linked to their
+    /// account, so an unexpected link does not go unnoticed. `provider_name` is the display name.
+    async fn send_social_account_linked(
+        &self,
+        to_email: &str,
+        provider_name: &str,
+    ) -> Result<(), EmailSendError>;
+
     /// Get captured emails (only available in dev/test mode)
     fn get_captured_emails(&self) -> Vec<CapturedEmail> {
         vec![]
@@ -448,6 +456,25 @@ impl EmailSender for DevEmailSender {
                 // Store the confirm link for test inspection; cancel link goes in reset_url.
                 verification_url: Some(confirm_url),
                 reset_url: Some(cancel_url),
+                pin: None,
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn send_social_account_linked(
+        &self,
+        to_email: &str,
+        provider_name: &str,
+    ) -> Result<(), EmailSendError> {
+        let reset_url = format!("{}/forgot-password", self.base_url);
+        if let Ok(mut captured) = self.captured.lock() {
+            captured.push(CapturedEmail {
+                to: to_email.to_string(),
+                subject: social_account_linked_subject(provider_name),
+                verification_url: None,
+                reset_url: Some(reset_url),
                 pin: None,
             });
         }
@@ -873,6 +900,50 @@ impl EmailSender for SendGridEmailSender {
         self.send_email(to_old_email, &subject, &html_content, &text_content)
             .await
     }
+
+    async fn send_social_account_linked(
+        &self,
+        to_email: &str,
+        provider_name: &str,
+    ) -> Result<(), EmailSendError> {
+        let reset_url = format!("{}/forgot-password", self.base_url);
+        let provider_html = html_escape(provider_name);
+        let subject = social_account_linked_subject(provider_name);
+        let html_content = format!(
+            r#"
+            <html>
+            <body style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+                <h1 style="color: #00B488;">{provider} sign-in added</h1>
+                <p>You can now sign in to your {brand} account with {provider}. Your account, your posts and your key stay exactly as they were.</p>
+                <p style="margin: 20px 0;">
+                    <strong>Wasn't you?</strong> Reset your password right away and let the {brand} team know.
+                </p>
+                <div style="margin: 20px 0;">
+                    <a href="{reset_url}"
+                       style="background: #b00020; color: #fff; padding: 10px 20px; text-decoration: none; border-radius: 4px; display: inline-block; font-weight: bold;">
+                        Reset Password
+                    </a>
+                </div>
+            </body>
+            </html>
+            "#,
+            provider = provider_html,
+            reset_url = reset_url,
+            brand = BRAND_NAME
+        );
+        let text_content = format!(
+            "You can now sign in to your {brand} account with {provider}. Your account, your posts and your key stay exactly as they were.\n\nWasn't you? Reset your password right away and let the {brand} team know:\n{reset_url}",
+            provider = provider_name, reset_url = reset_url, brand = BRAND_NAME
+        );
+
+        self.send_email(to_email, &subject, &html_content, &text_content)
+            .await
+    }
+}
+
+/// Subject of the "sign-in provider linked" notification.
+fn social_account_linked_subject(provider_name: &str) -> String {
+    format!("{provider_name} sign-in was added to your {BRAND_NAME} account")
 }
 
 /// Create the appropriate email sender based on environment

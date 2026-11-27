@@ -388,6 +388,66 @@ kubectl rollout restart deployment/keycast -n identity
 
 ---
 
+## Sign in with Google and Apple (optional)
+
+`POST /api/headless/social-login` (native apps) and the buttons on the hosted login page
+(`POST /api/oauth/social-login`) are off until they are configured; a provider without
+configuration answers `503 PROVIDER_UNAVAILABLE`, the login page shows no button for it, and the
+server starts normally. The apps and the login page are configured separately. `cloudbuild.yaml`
+contains the Cloud Run configuration; the GKE overlays do not configure these providers.
+
+| Variable | Kind | Purpose |
+|----------|------|---------|
+| `GOOGLE_CLIENT_IDS` | plain | Comma-separated Google server (web) OAuth client IDs, the accepted `aud` |
+| `GOOGLE_AUTHORIZED_PARTIES` | plain | Comma-separated Google iOS and Android OAuth client IDs, the accepted `azp`. Google stays off unless both Google variables are set |
+| `APPLE_CLIENT_IDS` | plain | Comma-separated app bundle IDs (production and staging), the accepted `aud` |
+| `GOOGLE_WEB_CLIENT_ID` | plain | Login page: the Google web client ID that renders the button, the accepted `aud` (and `azp`). Usually the same value as `GOOGLE_CLIENT_IDS` |
+| `APPLE_SERVICES_ID` | plain | Login page: the Sign in with Apple Services ID, the accepted `aud` |
+| `APPLE_WEB_REDIRECT_URI` | plain | Login page: the Return URL registered for the Services ID, e.g. `https://login.divine.video/api/oauth/authorize`. Apple on the login page stays off unless both Apple web variables are set |
+| `APPLE_TEAM_ID` | plain | Apple Developer team ID, issuer of the code-exchange client secret |
+| `APPLE_KEY_ID` | plain | Key ID of the Sign in with Apple key |
+| `APPLE_PRIVATE_KEY` | secret | Contents of the Sign in with Apple `.p8` key (PKCS#8 PEM; `\n` escapes are accepted) |
+
+The three `APPLE_TEAM_ID` / `APPLE_KEY_ID` / `APPLE_PRIVATE_KEY` variables enable the exchange and
+revocation of Apple grants. Verified grants are encrypted and stored per client in
+`apple_identity_grants`. Account deletion stages them in `apple_grant_revocations`, where the
+cleanup task retries failed revocations for up to seven days. Sign in with Apple works without
+the variables, but automatic revocation requires them.
+
+The endpoints need Redis (`REDIS_URL`) for their replay guard and attempt limiter and fail closed
+without it. Provider keys are fetched from `https://www.googleapis.com/oauth2/v3/certs` and
+`https://appleid.apple.com/auth/keys`, and Apple codes are exchanged at
+`https://appleid.apple.com/auth/token`. Revocation uses `https://appleid.apple.com/auth/revoke`, so
+egress to those hosts must be allowed.
+
+### Console setup for the login page
+
+Google Cloud console, on the web OAuth client whose ID goes into `GOOGLE_WEB_CLIENT_ID`:
+- Authorized JavaScript origins: every login domain that serves `/api/oauth/authorize`, e.g.
+  `https://login.divine.video` (and staging's). Google Identity Services needs no redirect URI for
+  this button.
+- The OAuth consent screen must be External and published, or only test users can sign in.
+
+Apple Developer, Certificates, Identifiers & Profiles:
+- Create a Services ID (`APPLE_SERVICES_ID`) and enable Sign in with Apple on it.
+- Group it with the app's primary App ID, so the website and the app get the same user identifier
+  (`sub`) and the same private relay address, and reach the same Keycast account.
+- Add each login domain (e.g. `login.divine.video`) and its Return URL
+  (`https://login.divine.video/api/oauth/authorize`, the value of `APPLE_WEB_REDIRECT_URI`).
+  Apple's popup only answers a page on the Return URL's origin, so the login page hides the Apple
+  button on any other domain.
+- If Apple asks to verify the domain with a file, it has to be served at
+  `https://<login domain>/.well-known/apple-developer-domain-association.txt`; Keycast does not
+  serve one yet.
+- Register an email source for the private relay service if Keycast's own emails to relay
+  addresses should be delivered; that applies to the apps as well.
+
+Content Security Policy: Keycast sets none today. A CSP added in front of the login page must allow
+scripts from `https://accounts.google.com/gsi/client` and
+`https://appleid.cdn-apple.com`, frames and styles from `https://accounts.google.com/gsi/`, and
+connections to `https://accounts.google.com/gsi/`. A `Cross-Origin-Opener-Policy` stricter than
+`same-origin-allow-popups` breaks both providers' popups.
+
 ## Support database reader (deployment prerequisite)
 
 Before deploying an image containing the `20261110180000_support_reader_column_grants`

@@ -7,17 +7,24 @@ mod common;
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
+use axum::Extension;
 use chrono::{Duration, Utc};
 use http_body_util::BodyExt;
 use keycast_api::api::http::auth::generate_server_signed_ucan;
 use keycast_api::api::http::oauth::{authorize_get, AuthorizeRequest};
+use keycast_api::social_identity::SocialLoginProviders;
 use keycast_core::repositories::{CreateOAuthAuthorizationParams, OAuthAuthorizationRepository};
 use nostr_sdk::Keys;
 use serial_test::serial;
 use sqlx::PgPool;
+use std::sync::Arc;
 use uuid::Uuid;
 
 const APP: &str = "https://app.example";
+
+fn no_social_login() -> Extension<Arc<SocialLoginProviders>> {
+    Extension(Arc::new(SocialLoginProviders::unconfigured()))
+}
 const OTHER_APP: &str = "https://other-app.example";
 
 struct SignedInUser {
@@ -144,6 +151,7 @@ async fn page_for(
     let response = authorize_get(
         common::test_tenant(),
         State(auth_state),
+        no_social_login(),
         headers,
         Query(request),
     )
@@ -461,9 +469,15 @@ async fn configured_permission_errors_prevent_consent_html() {
         headers.insert(header::COOKIE, HeaderValue::from_str(&user.cookie).unwrap());
         let request: AuthorizeRequest = serde_json::from_value(serde_json::json!({"client_id":"test-app","redirect_uri":format!("{APP}/callback"),"scope":format!("policy:{slug}"),"prompt":"consent","screen":"consent"})).unwrap();
         assert!(
-            authorize_get(common::test_tenant(), State(state), headers, Query(request))
-                .await
-                .is_err(),
+            authorize_get(
+                common::test_tenant(),
+                State(state),
+                no_social_login(),
+                headers,
+                Query(request),
+            )
+            .await
+            .is_err(),
             "invalid permission must prevent consent HTML"
         );
         producer.abort();
@@ -493,9 +507,15 @@ async fn challenge_permission_is_disclosed_in_real_consent_html() {
     let mut headers = HeaderMap::new();
     headers.insert(header::COOKIE, HeaderValue::from_str(&user.cookie).unwrap());
     let request:AuthorizeRequest=serde_json::from_value(serde_json::json!({"client_id":"test-app","redirect_uri":format!("{APP}/callback"),"scope":format!("policy:{slug}"),"prompt":"consent","screen":"consent"})).unwrap();
-    let response = authorize_get(common::test_tenant(), State(state), headers, Query(request))
-        .await
-        .unwrap();
+    let response = authorize_get(
+        common::test_tenant(),
+        State(state),
+        no_social_login(),
+        headers,
+        Query(request),
+    )
+    .await
+    .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let html = String::from_utf8(
         response
