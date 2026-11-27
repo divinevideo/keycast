@@ -38,6 +38,7 @@
 	let newPassword = $state('');
 	let confirmNewPassword = $state('');
 	let isChangingPassword = $state(false);
+	let isStartingPasswordSetup = $state(false);
 
 	// Change Email Section
 	let newEmail = $state('');
@@ -49,14 +50,27 @@
 	let isChanging = $state(false);
 	let showConfirmModal = $state(false);
 
-	// Only allow cookie-based users (email/password) to use this page
+	// Only allow hosted account sessions to use this page.
 	// Use untrack to prevent infinite loops during navigation
 	$effect(() => {
 		if (authMethod && authMethod !== 'cookie') {
-			toast.error('This page is only for email/password users');
+			toast.error('Sign in to your Keycast account to manage security settings');
 			goto('/', { replaceState: true });
 		}
 	});
+
+	async function handleStartPasswordSetup() {
+		isStartingPasswordSetup = true;
+		try {
+			const response = await fetch('/api/user/start-password-setup', { method: 'POST' });
+			if (!response.ok) throw new Error('Could not start password setup');
+			toast.success('Check your account email for a password setup link. If you recently requested one, use the latest email.');
+		} catch {
+			toast.error('Could not start password setup. Sign in again and retry.');
+		} finally {
+			isStartingPasswordSetup = false;
+		}
+	}
 
 	async function handleVerifyPassword() {
 		if (!mainPassword) {
@@ -238,7 +252,18 @@
 		<p class="subtitle">Manage your account security and Nostr keys</p>
 	</div>
 
-	{#if !emailVerified}
+	{#if authMethod === 'cookie' && accountStatus?.public_key === user?.pubkey && accountStatus?.email && accountStatus.has_password === false}
+		<div class="section">
+			<div class="section-header">
+				<h2>Set a Keycast password</h2>
+				<p>Follow the link we send to your account email to set a password and enable email recovery.</p>
+			</div>
+			<button class="btn-primary" onclick={handleStartPasswordSetup} disabled={isStartingPasswordSetup}>
+				{isStartingPasswordSetup ? 'Requesting link…' : 'Send password setup link'}
+			</button>
+		</div>
+		{#if emailVerified}<AtprotoSettingsCard />{/if}
+	{:else if !emailVerified}
 		<!-- Email Not Verified Message -->
 		<div class="verification-required">
 			<div class="verification-icon">

@@ -13,8 +13,8 @@ use chrono::{Duration, Utc};
 use keycast_api::api::{
     http::{
         auth::{
-            forgot_password, resend_verification, reset_password, ForgotPasswordRequest,
-            ResendVerificationRequest, ResetPasswordRequest,
+            forgot_password, resend_verification, reset_password, start_password_setup,
+            ForgotPasswordRequest, ResendVerificationRequest, ResetPasswordRequest,
         },
         auth_observability::request_id_middleware,
     },
@@ -60,10 +60,28 @@ fn create_test_tenant() -> TenantExtractor {
 }
 
 fn public_recovery_app(pool: PgPool, delivery: EmailDeliveryService) -> Router {
+    let setup_pool = pool.clone();
+    let setup_delivery = delivery.clone();
     let reset_pool = pool.clone();
     let resend_pool = pool;
     let reset_delivery = delivery.clone();
     Router::new()
+        .route(
+            "/user/start-password-setup",
+            post(move |headers: HeaderMap| {
+                let pool = setup_pool.clone();
+                let delivery = setup_delivery.clone();
+                async move {
+                    start_password_setup(
+                        create_test_tenant(),
+                        State(pool),
+                        Extension(delivery),
+                        headers,
+                    )
+                    .await
+                }
+            }),
+        )
         .route(
             "/auth/forgot-password",
             post(
@@ -198,11 +216,14 @@ async fn public_recovery_responses_match_for_existing_missing_admitted_and_suppr
 
 #[tokio::test]
 async fn provider_only_account_requires_signed_in_setup_before_email_recovery() {
+    use keycast_api::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
     use keycast_core::repositories::UserRepository;
+    use ucan::builder::UcanBuilder;
 
     let pool = setup_pool().await;
     let email = format!("provider-recovery-{}@example.com", Uuid::new_v4());
-    let pubkey = Keys::generate().public_key().to_hex();
+    let keys = Keys::generate();
+    let pubkey = keys.public_key().to_hex();
     sqlx::query(
         "INSERT INTO users (pubkey, tenant_id, email, email_verified) VALUES ($1, 1, $2, true)",
     )
@@ -227,19 +248,39 @@ async fn provider_only_account_requires_signed_in_setup_before_email_recovery() 
     );
     assert!(sender.get_captured_emails().is_empty());
 
-    let repo = UserRepository::new(pool.clone());
-    let token = Uuid::new_v4().to_string();
-    assert!(repo
-        .set_password_reset_token(
-            &pubkey,
-            1,
-            &email,
-            &token,
-            Utc::now() + Duration::hours(1),
-            true
-        )
+    let did = nostr_pubkey_to_did(&keys.public_key());
+    let key_material = NostrKeyMaterial::from_keys(keys);
+    let session = UcanBuilder::default()
+        .issued_by(&key_material)
+        .for_audience(&did)
+        .with_lifetime(3600)
+        .with_fact(serde_json::json!({"tenant_id": 1, "redirect_origin": "https://localhost"}))
+        .build()
+        .unwrap()
+        .sign()
         .await
-        .unwrap());
+        .unwrap()
+        .encode()
+        .unwrap();
+    let setup = |fetch_site| {
+        Request::post("/user/start-password-setup")
+            .header("sec-fetch-site", fetch_site)
+            .header("cookie", format!("keycast_session={session}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let response = app.clone().oneshot(setup("same-origin")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(sender.get_captured_emails().len(), 1);
+
+    let repo = UserRepository::new(pool.clone());
+    let token: String = sqlx::query_scalar(
+        "SELECT password_reset_token FROM users WHERE pubkey = $1 AND tenant_id = 1",
+    )
+    .bind(&pubkey)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     let password_hash = hash("fixture-password", 4).unwrap();
     assert!(repo
         .reset_password(&pubkey, 1, &password_hash, &token)
@@ -254,7 +295,7 @@ async fn provider_only_account_requires_signed_in_setup_before_email_recovery() 
         public_recovery_response(&app, "/auth/forgot-password", &email).await,
         refused
     );
-    assert_eq!(sender.get_captured_emails().len(), 1);
+    assert_eq!(sender.get_captured_emails().len(), 2);
     cleanup_by_email(&pool, &email).await;
     cleanup_by_email(&pool, &missing).await;
 }

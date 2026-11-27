@@ -3,6 +3,7 @@ import { KeycastApi } from '$lib/keycast_api.svelte';
 export interface AccountStatus {
     email: string;
     email_verified: boolean;
+    has_password: boolean;
     public_key: string;
 }
 

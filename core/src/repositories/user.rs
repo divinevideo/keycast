@@ -401,6 +401,7 @@ pub struct AccountStatusRow {
 pub struct AccountStatusWithMinorRow {
     pub email: Option<String>,
     pub email_verified: Option<bool>,
+    pub has_password: bool,
     pub status: UserStatus,
     pub suspended_reason: Option<String>,
     pub verified_minor: bool,
@@ -1058,6 +1059,25 @@ impl UserRepository {
     // Password reset methods
     // =========================================================================
 
+    /// Find the recovery account and whether it requires signed-in setup.
+    pub async fn find_password_reset_account(
+        &self,
+        email: &str,
+        tenant_id: i64,
+    ) -> Result<Option<(String, bool)>, RepositoryError> {
+        sqlx::query_as(
+            "SELECT pubkey, password_hash IS NULL AND EXISTS (
+                 SELECT 1 FROM user_identities identity
+                 WHERE identity.tenant_id = users.tenant_id AND identity.user_pubkey = users.pubkey
+             ) FROM users WHERE email = $1 AND tenant_id = $2",
+        )
+        .bind(email)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     /// Set a reset token only for the requested account and address.
     /// A passwordless provider account must initiate setup from its own session.
     pub async fn set_password_reset_token(
@@ -1543,7 +1563,8 @@ impl UserRepository {
         tenant_id: i64,
     ) -> Result<Option<AccountStatusWithMinorRow>, RepositoryError> {
         sqlx::query_as(
-            "SELECT email, email_verified, status, suspended_reason, verified_minor, verified_minor_at \
+            "SELECT email, email_verified, password_hash IS NOT NULL AS has_password, \
+                    status, suspended_reason, verified_minor, verified_minor_at \
              FROM users WHERE pubkey = $1 AND tenant_id = $2",
         )
         .bind(pubkey)

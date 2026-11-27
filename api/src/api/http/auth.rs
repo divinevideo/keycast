@@ -82,7 +82,7 @@ pub(crate) const EMAIL_NOT_VERIFIED_MESSAGE: &str =
 /// neither discloses account state (see `refuse_key_egress_for_verified_minor`).
 pub(crate) const PASSWORD_NOT_SET_CODE: &str = "PASSWORD_NOT_SET";
 pub(crate) const PASSWORD_NOT_SET_MESSAGE: &str =
-    "This account doesn't have a password yet. Use \"Forgot password\" to set one, then try again.";
+    "This account doesn't have a password yet. Sign in with your provider and start password setup in Account & Security, then follow the link in your email.";
 pub(crate) const KEY_EGRESS_DENIED_CODE: &str = "KEY_EGRESS_DENIED";
 pub(crate) const KEY_EGRESS_DENIED_MESSAGE: &str = "Operation denied by policy";
 pub(crate) const TOO_MANY_ATTEMPTS_CODE: &str = "TOO_MANY_ATTEMPTS";
@@ -441,6 +441,7 @@ pub struct ResetPasswordResponse {
 pub struct AccountStatusResponse {
     pub email: String,
     pub email_verified: bool,
+    pub has_password: bool,
     pub public_key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account_status: Option<String>,
@@ -462,19 +463,21 @@ impl AccountStatusResponse {
     /// approved minor is `active`), whereas `account_status` / `suspended_reason` are
     /// only populated when the account is *not* active. Extracted so this branching —
     /// the load-bearing behavior of this endpoint — is unit-testable without a DB.
-    fn from_account_row(
-        public_key: String,
-        email: Option<String>,
-        email_verified: Option<bool>,
-        status: keycast_core::types::user::UserStatus,
-        suspended_reason: Option<String>,
-        verified_minor: bool,
-        verified_minor_at: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Self {
+    fn from_account_row(public_key: String, row: AccountStatusWithMinorRow) -> Self {
+        let AccountStatusWithMinorRow {
+            email,
+            email_verified,
+            has_password,
+            status,
+            suspended_reason,
+            verified_minor,
+            verified_minor_at,
+        } = row;
         let active = status.is_active();
         AccountStatusResponse {
             email: email.unwrap_or_default(),
             email_verified: email_verified.unwrap_or(false),
+            has_password,
             public_key,
             account_status: if active {
                 None
@@ -559,7 +562,7 @@ pub enum AuthError {
     },
     Conflict(String),
     /// The account signs in only through Google or Apple, so there is no password to check.
-    /// The person sets one through "Forgot password".
+    /// First-password setup requires a signed-in session and an inbox link.
     PasswordNotSet,
 }
 
@@ -2996,19 +2999,114 @@ pub async fn forgot_password(
     State(pool): State<PgPool>,
     Extension(email_delivery): Extension<EmailDeliveryService>,
     headers: HeaderMap,
-    Json(mut req): Json<ForgotPasswordRequest>,
+    Json(req): Json<ForgotPasswordRequest>,
 ) -> Result<Json<ForgotPasswordResponse>, AuthError> {
-    let tenant_id = tenant.0.id;
-    let endpoint = "/api/auth/forgot-password";
-    req.email = normalize_registration_email(&req.email)
+    let email = normalize_registration_email(&req.email)
         .unwrap_or_else(|_| req.email.trim().to_ascii_lowercase());
+    request_password_reset(tenant.0.id, pool, email_delivery, headers, email, None).await
+}
+
+/// Start recovery setup from the hosted account's browser session.
+pub async fn start_password_setup(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(pool): State<PgPool>,
+    Extension(email_delivery): Extension<EmailDeliveryService>,
+    headers: HeaderMap,
+) -> Result<Json<ForgotPasswordResponse>, AuthError> {
+    // SameSite alone permits sibling origins. Require browser-provided same-origin metadata.
+    if headers
+        .get("sec-fetch-site")
+        .is_none_or(|site| site != "same-origin")
+        || headers.contains_key(axum::http::header::AUTHORIZATION)
+    {
+        return Err(AuthError::Forbidden(
+            "Password setup requires a same-origin browser session".into(),
+        ));
+    }
+    let tenant_id = tenant.0.id;
+    let owner = extract_user_for_authorization_management(&headers, tenant_id).await?;
+    let email = UserRepository::new(pool.clone())
+        .get_email(&owner, tenant_id)
+        .await?;
+    request_password_reset(tenant_id, pool, email_delivery, headers, email, Some(owner)).await
+}
+
+fn accepted_password_reset() -> Json<ForgotPasswordResponse> {
+    Json(ForgotPasswordResponse {
+        success: true,
+        message: "If an account exists with that email, a password reset link has been sent."
+            .to_string(),
+    })
+}
+
+async fn request_password_reset(
+    tenant_id: i64,
+    pool: PgPool,
+    email_delivery: EmailDeliveryService,
+    headers: HeaderMap,
+    email: String,
+    hosted_owner: Option<String>,
+) -> Result<Json<ForgotPasswordResponse>, AuthError> {
+    let hosted = hosted_owner.is_some();
+    let endpoint = if hosted {
+        "/api/user/start-password-setup"
+    } else {
+        "/api/auth/forgot-password"
+    };
+    let user_repo = UserRepository::new(pool.clone());
+    let account = user_repo
+        .find_password_reset_account(&email, tenant_id)
+        .await?;
+    let session_owner = if hosted {
+        hosted_owner
+    } else if account
+        .as_ref()
+        .is_some_and(|(_, requires_setup)| *requires_setup)
+        && headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("Bearer "))
+    {
+        extract_user_for_authorization_management(&headers, tenant_id)
+            .await
+            .ok()
+    } else {
+        None
+    };
+    let authenticated_owner = account
+        .as_ref()
+        .is_some_and(|(pubkey, _)| session_owner.as_ref() == Some(pubkey));
+    // If the address changed after the hosted lookup, do not send to a different account.
+    if hosted && !authenticated_owner {
+        return Ok(accepted_password_reset());
+    }
+    if let Some((pubkey, true)) = &account {
+        const REASON: &str = "setup_session_required";
+        if !authenticated_owner {
+            if email_delivery
+                .should_record_anonymous_refusal(
+                    tenant_id,
+                    EmailDeliveryPurpose::PasswordReset,
+                    &email,
+                    REASON,
+                )
+                .await
+            {
+                record_password_reset_refusal(
+                    &pool, &headers, tenant_id, endpoint, &email, pubkey, REASON,
+                )
+                .await;
+            }
+            return Ok(accepted_password_reset());
+        }
+    }
     let source = email_delivery.coarse_source(&headers);
     let reservation = match email_delivery
         .admit(EmailAdmissionRequest {
             tenant_id,
             purpose: EmailDeliveryPurpose::PasswordReset,
-            destinations: &[&req.email],
-            account: None,
+            destinations: &[&email],
+            account: session_owner.as_deref().filter(|_| authenticated_owner),
             source: source.as_deref(),
             delivery_slots: 1,
         })
@@ -3020,7 +3118,7 @@ pub async fn forgot_password(
                 .should_record_anonymous_suppression(
                     tenant_id,
                     EmailDeliveryPurpose::PasswordReset,
-                    &req.email,
+                    &email,
                     denied.reason,
                 )
                 .await
@@ -3037,28 +3135,13 @@ pub async fn forgot_password(
                 )
                 .await;
             }
-            return Ok(Json(ForgotPasswordResponse {
-                success: true,
-                message:
-                    "If an account exists with that email, a password reset link has been sent."
-                        .to_string(),
-            }));
-        }
-    };
-
-    // Check if user exists in this tenant
-    let user_repo = UserRepository::new(pool.clone());
-    let user_pubkey = match user_repo.find_pubkey_by_email(&req.email, tenant_id).await {
-        Ok(user_pubkey) => user_pubkey,
-        Err(error) => {
-            reservation.release().await;
-            return Err(error.into());
+            return Ok(accepted_password_reset());
         }
     };
 
     // Always return success even if email doesn't exist (security best practice)
-    let public_key = match user_pubkey {
-        Some(pubkey) => pubkey,
+    let public_key = match account {
+        Some((pubkey, _)) => pubkey,
         None => {
             record_email_delivery_event(
                 &pool,
@@ -3082,7 +3165,7 @@ pub async fn forgot_password(
                     outcome: "accepted",
                     reason_code: Some("user_not_found"),
                     http_status: 200,
-                    email: Some(&req.email),
+                    email: Some(&email),
                     pubkey: None,
                     client_id: None,
                     redirect_origin: None,
@@ -3091,14 +3174,45 @@ pub async fn forgot_password(
             )
             .await;
             reservation.release().await;
-            return Ok(Json(ForgotPasswordResponse {
-                success: true,
-                message:
-                    "If an account exists with that email, a password reset link has been sent."
-                        .to_string(),
-            }));
+            return Ok(accepted_password_reset());
         }
     };
+
+    // Generate reset token
+    let reset_token = generate_secure_token();
+    let reset_expires = Utc::now() + Duration::hours(PASSWORD_RESET_EXPIRY_HOURS);
+
+    match user_repo
+        .set_password_reset_token(
+            &public_key,
+            tenant_id,
+            &email,
+            &reset_token,
+            reset_expires,
+            authenticated_owner,
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            reservation.release().await;
+            record_password_reset_refusal(
+                &pool,
+                &headers,
+                tenant_id,
+                endpoint,
+                &email,
+                &public_key,
+                "account_changed",
+            )
+            .await;
+            return Ok(accepted_password_reset());
+        }
+        Err(error) => {
+            reservation.release().await;
+            return Err(error.into());
+        }
+    }
 
     let mut reason_code = None;
     record_email_delivery_event(
@@ -3112,50 +3226,9 @@ pub async fn forgot_password(
         Some(&public_key),
     )
     .await;
-
-    // Generate reset token
-    let reset_token = generate_secure_token();
-    let reset_expires = Utc::now() + Duration::hours(PASSWORD_RESET_EXPIRY_HOURS);
-
-    // Passwordless provider accounts start setup from a signed-in account session.
-    // Require a bearer to avoid turning a public form into a cookie-authenticated action.
-    let authenticated_owner = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.starts_with("Bearer "))
-        && extract_user_for_authorization_management(&headers, tenant_id)
-            .await
-            .is_ok_and(|owner| owner == public_key);
-    match user_repo
-        .set_password_reset_token(
-            &public_key,
-            tenant_id,
-            &req.email,
-            &reset_token,
-            reset_expires,
-            authenticated_owner,
-        )
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            reservation.release().await;
-            return Ok(Json(ForgotPasswordResponse {
-                success: true,
-                message:
-                    "If an account exists with that email, a password reset link has been sent."
-                        .to_string(),
-            }));
-        }
-        Err(error) => {
-            reservation.release().await;
-            return Err(error.into());
-        }
-    }
-
     // Send password reset email (optional - don't fail if email service unavailable)
     let provider_outcome = email_delivery
-        .send_password_reset(&req.email, &reset_token)
+        .send_password_reset(&email, &reset_token)
         .await;
     if provider_outcome.is_err() {
         METRICS.inc_auth_email_send_failure("password_reset");
@@ -3184,7 +3257,7 @@ pub async fn forgot_password(
             outcome: "accepted",
             reason_code,
             http_status: 200,
-            email: Some(&req.email),
+            email: Some(&email),
             pubkey: Some(&public_key),
             client_id: None,
             redirect_origin: None,
@@ -3193,11 +3266,48 @@ pub async fn forgot_password(
     )
     .await;
 
-    Ok(Json(ForgotPasswordResponse {
-        success: true,
-        message: "If an account exists with that email, a password reset link has been sent."
-            .to_string(),
-    }))
+    Ok(accepted_password_reset())
+}
+
+async fn record_password_reset_refusal(
+    pool: &PgPool,
+    headers: &HeaderMap,
+    tenant_id: i64,
+    endpoint: &'static str,
+    email: &str,
+    pubkey: &str,
+    reason: &str,
+) {
+    record_email_delivery_event(
+        pool,
+        headers,
+        tenant_id,
+        endpoint,
+        EmailDeliveryPurpose::PasswordReset,
+        "suppressed",
+        Some(reason),
+        Some(pubkey),
+    )
+    .await;
+    super::auth_observability::record_auth_event_and_log(
+        pool,
+        headers,
+        None,
+        super::auth_observability::AuthEvent {
+            tenant_id,
+            endpoint,
+            event_type: "password_reset_request",
+            outcome: "accepted",
+            reason_code: Some(reason),
+            http_status: 200,
+            email: Some(email),
+            pubkey: Some(pubkey),
+            client_id: None,
+            redirect_origin: None,
+            metadata_json: serde_json::json!({}),
+        },
+    )
+    .await;
 }
 
 /// Reset password with token
@@ -3408,21 +3518,9 @@ pub async fn get_account_status(
         .await?;
 
     match user {
-        Some(AccountStatusWithMinorRow {
-            email,
-            email_verified,
-            status,
-            suspended_reason,
-            verified_minor,
-            verified_minor_at,
-        }) => Ok(Json(AccountStatusResponse::from_account_row(
+        Some(row) => Ok(Json(AccountStatusResponse::from_account_row(
             user_pubkey,
-            email,
-            email_verified,
-            status,
-            suspended_reason,
-            verified_minor,
-            verified_minor_at,
+            row,
         ))),
         None => Err(AuthError::UserNotFound),
     }
@@ -5961,9 +6059,9 @@ mod tests {
     use super::generate_server_signed_ucan;
     use super::validate_origin;
     use super::verify_html_page;
-    use super::AccountStatusResponse;
     use super::BRAND_NAME;
     use super::{bcrypt_auth_error, BcryptAdmissionError};
+    use super::{AccountStatusResponse, AccountStatusWithMinorRow};
     #[cfg(feature = "integration-tests")]
     use super::{VERIFICATION_LINK_SUPERSEDED_CODE, VERIFICATION_LINK_SUPERSEDED_HEADING};
     use axum::response::IntoResponse;
@@ -6214,12 +6312,15 @@ mod tests {
     fn account_status_active_minor_surfaces_flag_without_status() {
         let resp = AccountStatusResponse::from_account_row(
             "pk".to_string(),
-            Some("a@b.com".to_string()),
-            Some(true),
-            keycast_core::types::user::UserStatus::Active,
-            None,
-            true,
-            Some(chrono::Utc::now()),
+            AccountStatusWithMinorRow {
+                email: Some("a@b.com".to_string()),
+                email_verified: Some(true),
+                has_password: true,
+                status: keycast_core::types::user::UserStatus::Active,
+                suspended_reason: None,
+                verified_minor: true,
+                verified_minor_at: Some(chrono::Utc::now()),
+            },
         );
         // verified_minor surfaces even though the account is active (not gated).
         assert!(resp.verified_minor);
@@ -6234,12 +6335,15 @@ mod tests {
     fn account_status_suspended_minor_still_surfaces_flag() {
         let resp = AccountStatusResponse::from_account_row(
             "pk".to_string(),
-            None,
-            None,
-            keycast_core::types::user::UserStatus::Suspended,
-            Some("reason".to_string()),
-            true,
-            None,
+            AccountStatusWithMinorRow {
+                email: None,
+                email_verified: None,
+                has_password: false,
+                status: keycast_core::types::user::UserStatus::Suspended,
+                suspended_reason: Some("reason".to_string()),
+                verified_minor: true,
+                verified_minor_at: None,
+            },
         );
         // Regression guard: verified_minor stays true when suspended, while
         // account_status / suspended_reason now populate.

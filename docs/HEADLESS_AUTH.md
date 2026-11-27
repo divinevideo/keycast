@@ -133,6 +133,7 @@ password, email or key) answer `409 PASSWORD_NOT_SET` until the person sets one.
 setup for a provider account requires a signed-in account bearer on the password-reset request,
 then completion of the link sent to the account's email. An anonymous "Forgot password" request
 cannot start setup. Once a password is set, ordinary password recovery is available.
+Hosted users can start setup from **Account & Security** in the same site that signed them in.
 
 When Apple sends `authorization_code` and the Apple signing key is configured, Keycast stores the
 encrypted grant only after verifying that the exchanged identity matches the signed-in account and
@@ -381,7 +382,7 @@ class KeycastAuth {
 | 403 | EMAIL_NOT_VERIFIED | User needs to verify email first (social login: the provider did not verify it) |
 | 409 | CONFLICT | Email or Nostr key already registered |
 | 409 | ACCOUNT_LINK_REQUIRED | Social login: an account with this email exists and must be signed in with its password |
-| 409 | PASSWORD_NOT_SET | The account signs in through Google or Apple only; set a password via "Forgot password" first |
+| 409 | PASSWORD_NOT_SET | Sign in with the provider, start password setup from the account session, then complete the link sent to the account email |
 | 429 | TOO_MANY_ATTEMPTS | Too many attempts; retry after `Retry-After` seconds |
 | 503 | PROVIDER_UNAVAILABLE | Social login: the provider is not configured or its keys cannot be fetched |
 | 503 | SERVICE_UNAVAILABLE | Server at capacity, retry later |

@@ -209,6 +209,10 @@ pub fn api_routes(
             post(auth::verify_password_for_export),
         )
         .route("/user/change-password", post(auth::change_password))
+        .route(
+            "/user/start-password-setup",
+            post(auth::start_password_setup),
+        )
         .route("/user/change-email", post(auth::change_email))
         .layer(axum::Extension(auth_state.state.bcrypt.clone()))
         .layer(axum::Extension(email_delivery.clone()))
