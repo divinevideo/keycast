@@ -43,9 +43,15 @@ async fn revoke_apple_grants(
             break;
         };
         let revoked = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            let plaintext = key_manager.decrypt(&encrypted).await.map_err(|_| ())?;
-            let token = std::str::from_utf8(&plaintext).map_err(|_| ())?;
-            client.revoke(&client_id, token).await.map_err(|_| ())
+            let plaintext = key_manager
+                .decrypt(&encrypted)
+                .await
+                .map_err(|_| "decrypt")?;
+            let token = std::str::from_utf8(&plaintext).map_err(|_| "decode")?;
+            client
+                .revoke(&client_id, token)
+                .await
+                .map_err(|_| "request")
         })
         .await;
         if matches!(revoked, Ok(Ok(()))) {
@@ -54,10 +60,87 @@ async fn revoke_apple_grants(
                 .execute(pool)
                 .await?;
         } else {
-            tracing::warn!("Apple grant revocation did not complete; will retry");
+            let stage = revoked.ok().and_then(Result::err).unwrap_or("timeout");
+            tracing::warn!(stage, "Apple grant revocation did not complete; will retry");
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "integration-tests"))]
+mod tests {
+    use super::*;
+    use jwt_simple::prelude::{ECDSAP256KeyPairLike, ES256KeyPair};
+    use keycast_core::encryption::{KeyManager, KeyManagerError};
+    use secrecy::SecretString;
+    use std::collections::HashMap;
+    use zeroize::Zeroizing;
+
+    struct FixtureKeyManager;
+
+    #[async_trait::async_trait]
+    impl KeyManager for FixtureKeyManager {
+        async fn encrypt(&self, bytes: &[u8]) -> Result<Vec<u8>, KeyManagerError> {
+            Ok(bytes.to_vec())
+        }
+
+        async fn decrypt(&self, bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, KeyManagerError> {
+            Ok(Zeroizing::new(bytes.to_vec()))
+        }
+    }
+
+    #[sqlx::test(migrations = "../database/migrations")]
+    async fn apple_revocation_removes_successes_and_leases_failures(pool: PgPool) {
+        use axum::{http::StatusCode, routing::post, Form, Router};
+        let endpoint = Router::new().route(
+            "/revoke",
+            post(|Form(form): Form<HashMap<String, String>>| async move {
+                assert_eq!(form["token"], "fixture");
+                assert_eq!(form["token_type_hint"], "refresh_token");
+                assert!(!form["client_secret"].is_empty());
+                match form["client_id"].as_str() {
+                    "success" => StatusCode::OK,
+                    "retry" => StatusCode::SERVICE_UNAVAILABLE,
+                    other => panic!("unexpected client: {other}"),
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, endpoint).await.unwrap() });
+        let settings = SocialLoginSettings {
+            apple_signing_key: Some(crate::social_identity::AppleSigningKey {
+                team_id: "fixture-team".into(),
+                key_id: "fixture-key".into(),
+                private_key_pem: SecretString::from(ES256KeyPair::generate().to_pem().unwrap()),
+            }),
+            ..Default::default()
+        };
+        let client = AppleTokenClient::from_settings(&settings)
+            .unwrap()
+            .with_revoke_url(format!("http://{address}/revoke"));
+        sqlx::query(
+            "INSERT INTO apple_grant_revocations (client_id, encrypted_token, expires_at)
+                     VALUES ('success', $1, NOW() + INTERVAL '1 day'),
+                            ('retry', $1, NOW() + INTERVAL '1 day'),
+                            ('expired', $1, NOW() - INTERVAL '1 day')",
+        )
+        .bind(b"fixture".as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+        revoke_apple_grants(&pool, &FixtureKeyManager, Some(&client))
+            .await
+            .unwrap();
+        let queued: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT client_id, next_attempt_at > NOW() FROM apple_grant_revocations",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(queued, vec![("retry".into(), true)]);
+        server.abort();
+    }
 }
 
 /// Remove expired email-marketing queue rows independently of the sync consumer.

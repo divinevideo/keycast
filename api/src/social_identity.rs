@@ -885,6 +885,7 @@ pub struct AppleTokenClient {
     /// Carries the Sign in with Apple key id, which Apple requires in the secret's header.
     key_pair: ES256KeyPair,
     token_url: String,
+    revoke_url: String,
     client: reqwest::Client,
 }
 
@@ -898,7 +899,7 @@ impl AppleTokenClient {
         let _permit = admit_remote_fetch().map_err(|_| AppleExchangeError::Busy)?;
         let response = self
             .client
-            .post(APPLE_REVOCATION_URL)
+            .post(&self.revoke_url)
             .form(&[
                 ("client_id", client_id),
                 ("client_secret", secret.as_str()),
@@ -926,6 +927,7 @@ impl AppleTokenClient {
                 team_id: signing_key.team_id.clone(),
                 key_pair: key_pair.with_key_id(&signing_key.key_id),
                 token_url: APPLE_TOKEN_URL.to_string(),
+                revoke_url: APPLE_REVOCATION_URL.to_string(),
                 client: bounded_client(),
             }),
             Err(error) => {
@@ -939,6 +941,12 @@ impl AppleTokenClient {
     #[must_use]
     pub fn with_token_url(mut self, token_url: impl Into<String>) -> Self {
         self.token_url = token_url.into();
+        self
+    }
+
+    #[cfg(all(test, feature = "integration-tests"))]
+    pub(crate) fn with_revoke_url(mut self, url: String) -> Self {
+        self.revoke_url = url;
         self
     }
 

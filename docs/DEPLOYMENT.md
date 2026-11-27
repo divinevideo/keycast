@@ -393,9 +393,8 @@ kubectl rollout restart deployment/keycast -n identity
 `POST /api/headless/social-login` (native apps) and the buttons on the hosted login page
 (`POST /api/oauth/social-login`) are off until they are configured; a provider without
 configuration answers `503 PROVIDER_UNAVAILABLE`, the login page shows no button for it, and the
-server starts normally. The apps and the login page are configured separately. Nothing here is set
-in `cloudbuild.yaml` or the GKE overlays yet: add the values per environment once the provider
-consoles are set up.
+server starts normally. The apps and the login page are configured separately. `cloudbuild.yaml`
+contains the Cloud Run configuration; the GKE overlays do not configure these providers.
 
 | Variable | Kind | Purpose |
 |----------|------|---------|

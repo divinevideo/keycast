@@ -1443,6 +1443,66 @@ async fn deleting_the_account_removes_its_provider_links() {
 }
 
 #[tokio::test]
+async fn apple_sign_in_stores_a_verified_exchanged_grant() {
+    use jwt_simple::prelude::{ECDSAP256KeyPairLike, ES256KeyPair};
+    use keycast_api::social_identity::{AppleSigningKey, AppleTokenClient};
+    use secrecy::SecretString;
+
+    let mut ctx = context().await;
+    let subject = unique("apple-sub");
+    let nonce = unique("nonce");
+    let email = gmail();
+    let id_token = TokenSpec::apple(&subject, &email, &nonce).sign();
+    let mut grant = TokenSpec::apple(&subject, &email, &nonce);
+    grant.nonce = None;
+    let grant_id = grant.sign();
+    let endpoint =
+        Router::new().route(
+            "/token",
+            post(move || {
+                let grant_id = grant_id.clone();
+                async move {
+                    Json(serde_json::json!({"id_token": grant_id, "refresh_token": "fixture"}))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, endpoint).await.unwrap() });
+    let mut config = settings();
+    config.apple_signing_key = Some(AppleSigningKey {
+        team_id: "fixture-team".into(),
+        key_id: "fixture-key".into(),
+        private_key_pem: SecretString::from(ES256KeyPair::generate().to_pem().unwrap()),
+    });
+    let exchange = AppleTokenClient::from_settings(&config)
+        .unwrap()
+        .with_token_url(format!("http://{address}/token"));
+    ctx.providers = Arc::new(SocialLoginProviders::new(
+        SocialIdentityVerifier::new(config, ctx.jwks.clone()),
+        Some(exchange),
+    ));
+    let mut payload = request("apple", &id_token, &nonce);
+    payload["authorization_code"] = serde_json::json!("fixture-code");
+    let (status, body) = ctx.post(payload).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let pubkey = body["pubkey"].as_str().unwrap();
+    ctx.track(pubkey);
+    let client: String = sqlx::query_scalar(
+        "SELECT grant_row.client_id FROM apple_identity_grants grant_row
+         JOIN user_identities identity ON grant_row.identity_id = identity.id
+         WHERE identity.user_pubkey = $1",
+    )
+    .bind(pubkey)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(client, APPLE_BUNDLE);
+    ctx.cleanup().await;
+    server.abort();
+}
+
+#[tokio::test]
 async fn apple_account_deletion_stages_each_client_grant() {
     let ctx = context().await;
     let subject = unique("apple-sub");
